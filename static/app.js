@@ -1,0 +1,1254 @@
+/* app.js — the testboard home screen.
+ *
+ * A triage-first dashboard in four sections, all scoped by the single
+ * environment filter in the toolbar:
+ *
+ *   1. "Last night"  — KPI tiles from /api/summary (pass-rate hero + counts).
+ *   2. Charts        — nightly failing-run trend, failing-by-environment,
+ *                      most-failing scripts (see charts.js).
+ *   3. Triage        — tabbed work queues (new failures, still failing,
+ *                      fixed, stale annotations, my actions) with a
+ *                      one-click "Take" assign action.
+ *   4. All tests     — the estate, ONE PAGE AT A TIME.
+ *
+ * The estate can hold tens of thousands of tests, so this page never
+ * downloads it. Filtering, searching, sorting and paging of the test list
+ * are all query parameters on /api/dashboard, and only the rows on screen
+ * are ever in memory.
+ *
+ * Data: one /api/summary call + one page of /api/dashboard per refresh,
+ * in parallel. While refreshing, previous renders are held at reduced
+ * opacity (no skeletons, no layout jumps). All data reaches the DOM via
+ * textContent only.
+ */
+
+"use strict";
+
+import {
+  RESULTS,
+  clearError,
+  clearNode,
+  el,
+  assigneeSelect,
+  fetchJson,
+  fillOutput,
+  formatDuration,
+  formatTime,
+  getUsername,
+  postJson,
+  putJson,
+  renderUserWidget,
+  requireUsername,
+  resultChip,
+  resultClass,
+  showError,
+  testApiPath,
+} from "./api.js";
+import {
+  barRows,
+  formatNight,
+  stackedColumnChart,
+} from "./charts.js";
+
+/** Rows fetched per page of the All-tests table ("Show more" adds one). */
+const CHUNK = 250;
+
+const state = {
+  environment: "",        // "" = all environments
+  summary: null,          // last /api/summary payload
+  activeQueue: "new_failures",
+  // The test list: only the rows currently on screen, plus the server's
+  // exact total for the active filters.
+  browseRows: [],
+  browseTotal: 0,
+  script: "",             // "" = all scripts
+  sortKey: "environment",
+  sortAsc: true,
+  activeResults: new Set(),
+  staleOnly: false,
+  qText: "",
+  qTimer: null,
+  requestSeq: 0,
+  browseSeq: 0,
+  showRetired: false,
+  // Triage rows whose review panel is open, so an assign or a comment
+  // does not collapse what the user was reading.
+  openReviews: new Set(),
+};
+
+const envSelect = document.getElementById("filter-environment");
+const scriptSelect = document.getElementById("filter-script");
+const qInput = document.getElementById("filter-q");
+const tbody = document.getElementById("dashboard-body");
+
+const SECTIONS = ["status-section", "charts-section", "triage-section",
+  "browse-section"];
+
+/* ================= data loading ================= */
+
+function summaryUrl() {
+  const qs = new URLSearchParams();
+  if (state.environment) {
+    qs.append("environment", state.environment);
+  }
+  // The "my actions" queue is filtered server-side: picking a user's
+  // tests out of an already-capped queue would hide their own work.
+  const me = getUsername();
+  if (me) {
+    qs.append("assignee", me);
+  }
+  const query = qs.toString();
+  return query ? "/api/summary?" + query : "/api/summary";
+}
+
+/** URL for one page of the test list under the current filters. */
+function browseUrl(offset) {
+  const qs = new URLSearchParams();
+  if (state.environment) {
+    qs.append("environment", state.environment);
+  }
+  if (state.script) {
+    qs.append("script", state.script);
+  }
+  for (const result of state.activeResults) {
+    qs.append("result", result);
+  }
+  if (state.staleOnly) {
+    qs.append("stale", "1");
+  }
+  if (state.showRetired) {
+    qs.append("retired", "1");
+  }
+  const query = state.qText.trim();
+  if (query) {
+    qs.append("q", query);
+  }
+  qs.append("sort", state.sortKey);
+  qs.append("order", state.sortAsc ? "asc" : "desc");
+  qs.append("limit", String(CHUNK));
+  qs.append("offset", String(offset));
+  return "/api/dashboard?" + qs.toString();
+}
+
+/** Reload the summary and the first page of tests; re-render everything. */
+async function refreshAll() {
+  const seq = ++state.requestSeq;
+  state.browseSeq++;  // any in-flight page load is now stale
+  clearError();
+  setLoading(true);
+  try {
+    const [summary, page] = await Promise.all([
+      fetchJson(summaryUrl()),
+      fetchJson(browseUrl(0)),
+    ]);
+    if (seq !== state.requestSeq) {
+      return;
+    }
+    state.summary = summary;
+    state.browseRows = page.tests;
+    state.browseTotal = page.total;
+    renderAll();
+  } catch (err) {
+    if (seq === state.requestSeq) {
+      showError(err.message);
+    }
+  } finally {
+    if (seq === state.requestSeq) {
+      setLoading(false);
+      document.getElementById("loading-state").hidden = true;
+    }
+  }
+}
+
+/**
+ * Fetch the test list under the current filters.
+ *
+ * `append` continues after the rows already shown ("Show more");
+ * otherwise this is a new filter/sort and paging restarts at the top.
+ */
+async function loadBrowse(append) {
+  const seq = ++state.browseSeq;
+  const offset = append ? state.browseRows.length : 0;
+  try {
+    const page = await fetchJson(browseUrl(offset));
+    if (seq !== state.browseSeq) {
+      return;  // a newer filter change already superseded this request
+    }
+    state.browseRows = append
+      ? state.browseRows.concat(page.tests) : page.tests;
+    state.browseTotal = page.total;
+    renderBrowse(page.tests, append);
+  } catch (err) {
+    if (seq === state.browseSeq) {
+      showError(err.message);
+    }
+  }
+}
+
+/** Reload the summary only (after a quick action like "Take"). */
+async function refreshSummary() {
+  try {
+    state.summary = await fetchJson(summaryUrl());
+    renderStatus();
+    renderCharts();
+    renderQueues();
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+function setLoading(loading) {
+  for (const id of SECTIONS) {
+    document.getElementById(id).classList.toggle("is-loading", loading);
+  }
+}
+
+function renderAll() {
+  for (const id of SECTIONS) {
+    document.getElementById(id).hidden = false;
+  }
+  renderToolbar();
+  renderStatus();
+  renderCharts();
+  renderQueues();
+  populateScriptOptions();
+  renderBrowse(state.browseRows, false);
+}
+
+/* ================= toolbar ================= */
+
+function renderToolbar() {
+  const summary = state.summary;
+  fillSelect(envSelect, summary.environments, "All environments",
+    state.environment);
+  const at = summary.generated_at;
+  document.getElementById("refreshed-at").textContent =
+    "Updated " + String(at).slice(11, 16) + " UTC";
+}
+
+function fillSelect(select, values, allLabel, selected) {
+  clearNode(select);
+  const allOpt = el("option", "", allLabel);
+  allOpt.value = "";
+  select.appendChild(allOpt);
+  for (const value of values) {
+    const opt = el("option", "", value);
+    opt.value = value;
+    select.appendChild(opt);
+  }
+  select.value = values.indexOf(selected) !== -1 ? selected : "";
+}
+
+/**
+ * Scope the whole page to `environment` ("" = all) and reload.
+ *
+ * The script filter belongs to the environment that was showing, so it
+ * is dropped — unless the caller has just chosen a script deliberately
+ * (`keepScript`), which is how clicking a script in the chart works.
+ */
+function setEnvironment(environment, keepScript) {
+  state.environment = environment;
+  if (!keepScript) {
+    state.script = "";
+  }
+  const url = new URL(window.location.href);
+  if (environment) {
+    url.searchParams.set("environment", environment);
+  } else {
+    url.searchParams.delete("environment");
+  }
+  window.history.replaceState(null, "", url.toString());
+  refreshAll();
+}
+
+/* ================= "Last night" tiles ================= */
+
+function buildTile(spec) {
+  const tile = el(spec.onClick ? "button" : "div",
+    "tile" + (spec.hero ? " tile-hero" : "")
+    + (spec.accent ? " " + spec.accent : ""));
+  if (spec.onClick) {
+    tile.type = "button";
+    tile.addEventListener("click", spec.onClick);
+  }
+  tile.appendChild(el("span", "tile-label", spec.label));
+  tile.appendChild(el("span", "tile-value", spec.value));
+  if (spec.sub) {
+    tile.appendChild(el("span", "tile-sub", spec.sub));
+  }
+  if (spec.delta) {
+    tile.appendChild(
+      el("span", "tile-delta " + spec.delta.cls, spec.delta.text));
+  }
+  return tile;
+}
+
+function renderStatus() {
+  const summary = state.summary;
+  const status = summary.status;
+  const container = document.getElementById("stat-tiles");
+  clearNode(container);
+
+  // Retired tests are context, not a work queue — they belong in the
+  // header line rather than taking a tile away from something actionable.
+  const meta = document.getElementById("status-meta");
+  clearNode(meta);
+  meta.appendChild(document.createTextNode(
+    status.total_tests.toLocaleString() + " tests tracked"
+    + (state.environment ? " in " + state.environment : "")));
+  if (status.retired > 0) {
+    meta.appendChild(document.createTextNode(" · "));
+    const link = el("button", "link-btn",
+      status.retired.toLocaleString() + " retired");
+    link.type = "button";
+    link.title = "Tests approved as no longer in the suite";
+    link.addEventListener("click", () => {
+      state.showRetired = true;
+      state.staleOnly = false;
+      syncStaleToggle();
+      syncRetiredToggle();
+      refilterBrowse();
+      scrollTo("browse-section");
+    });
+    meta.appendChild(link);
+  }
+
+  const ran = status.ran_recently;
+  const failRecent = status.recent_results.FAIL;
+  const diff = status.new_failures - status.fixed;
+  let delta;
+  if (ran === 0) {
+    delta = null;
+  } else if (diff > 0) {
+    delta = { cls: "delta-bad",
+      text: "▲ " + diff + " more failing than before" };
+  } else if (diff < 0) {
+    delta = { cls: "delta-good",
+      text: "▼ " + (-diff) + " fewer failing than before" };
+  } else {
+    delta = { cls: "delta-flat", text: "no net change" };
+  }
+  let rate = "—";
+  if (ran > 0) {
+    const pct = ((ran - failRecent) / ran) * 100;
+    rate = (pct === 100 ? "100" : pct.toFixed(1)) + "%";
+  }
+
+  container.appendChild(buildTile({
+    hero: true,
+    label: "Pass rate last night",
+    value: rate,
+    sub: ran > 0
+      ? failRecent.toLocaleString() + " of "
+        + ran.toLocaleString() + " runs failed"
+      : "no runs in the last " + summary.recent_hours + "h",
+    delta: delta,
+  }));
+  container.appendChild(buildTile({
+    label: "Ran last night",
+    value: ran.toLocaleString(),
+    sub: "of " + status.total_tests.toLocaleString() + " tests",
+  }));
+  container.appendChild(buildTile({
+    label: "New failures",
+    value: status.new_failures.toLocaleString(),
+    accent: status.new_failures > 0 ? "accent-fail" : "accent-zero",
+    sub: "were passing before",
+    onClick: () => openQueue("new_failures"),
+  }));
+  container.appendChild(buildTile({
+    label: "Still failing",
+    value: status.still_failing.toLocaleString(),
+    accent: status.still_failing > 0 ? "accent-fail-soft" : "accent-zero",
+    sub: "failed before too",
+    onClick: () => openQueue("still_failing"),
+  }));
+  container.appendChild(buildTile({
+    label: "Fixed last night",
+    value: status.fixed.toLocaleString(),
+    accent: status.fixed > 0 ? "accent-pass" : "accent-zero",
+    sub: "worth verifying",
+    onClick: () => openQueue("fixed"),
+  }));
+  container.appendChild(buildTile({
+    label: "Stale annotations",
+    value: status.results.UNEXPECTED_PASS.toLocaleString(),
+    accent: status.results.UNEXPECTED_PASS > 0
+      ? "accent-up" : "accent-zero",
+    sub: "known failures that passed",
+    onClick: () => openQueue("unexpected_passes"),
+  }));
+  container.appendChild(buildTile({
+    label: "Not run",
+    value: status.not_run.toLocaleString(),
+    accent: status.not_run > 0 ? "accent-warn" : "accent-zero",
+    sub: "silent for " + summary.recent_hours + "h+",
+    onClick: () => openQueue("not_run"),
+  }));
+}
+
+/* ================= charts ================= */
+
+const TREND_SERIES = [
+  { key: "FAIL", label: "Failed", segClass: "seg-fail",
+    swatchClass: "swatch-fail" },
+  { key: "UNEXPECTED_PASS", label: "Unexpected pass",
+    segClass: "seg-up", swatchClass: "swatch-up" },
+];
+
+function renderCharts() {
+  const summary = state.summary;
+
+  // 1. Nightly trend (stacked columns) + its table twin.
+  stackedColumnChart(
+    document.getElementById("trend-chart"),
+    summary.trend.nights, TREND_SERIES);
+  const twin = document.getElementById("trend-table-body");
+  clearNode(twin);
+  for (const night of summary.trend.nights) {
+    const tr = document.createElement("tr");
+    tr.appendChild(el("td", "", formatNight(night.date)));
+    tr.appendChild(el("td", "num", night.FAIL.toLocaleString()));
+    tr.appendChild(el("td", "num",
+      night.UNEXPECTED_PASS.toLocaleString()));
+    tr.appendChild(el("td", "num", night.total.toLocaleString()));
+    twin.appendChild(tr);
+  }
+
+  // 2. Failing tests by environment (click to scope).
+  const envItems = summary.by_environment
+    .filter((entry) => entry.failed > 0)
+    .sort((a, b) => b.failed - a.failed)
+    .map((entry) => ({
+      label: entry.environment,
+      value: entry.failed,
+      tooltipRows: [
+        { swatchClass: "swatch-fail", label: "failing",
+          value: entry.failed.toLocaleString() },
+        { swatchClass: "", label: "new failures",
+          value: entry.new_failures.toLocaleString() },
+        { swatchClass: "", label: "tests",
+          value: entry.total_tests.toLocaleString() },
+      ],
+      onClick: () => setEnvironment(entry.environment),
+    }));
+  barRows(document.getElementById("env-chart"), envItems, {});
+  document.getElementById("env-chart-empty").hidden =
+    envItems.length !== 0;
+
+  // 3. Most-failing scripts (click to open in the test list).
+  // Cap at 7 rows so the card stays in balance with its neighbours.
+  const scriptItems = summary.top_failing_scripts.slice(0, 7).map((entry) => ({
+    label: entry.script,
+    sublabel: entry.environment,
+    value: entry.failing,
+    tooltipRows: [
+      { swatchClass: "swatch-fail", label: "failing tests",
+        value: entry.failing.toLocaleString() },
+    ],
+    onClick: () => openScriptInBrowse(entry),
+  }));
+  barRows(document.getElementById("scripts-chart"), scriptItems, {});
+  document.getElementById("scripts-chart-empty").hidden =
+    scriptItems.length !== 0;
+}
+
+function openScriptInBrowse(entry) {
+  state.script = entry.script;
+  state.activeResults = new Set(["FAIL"]);
+  syncResultToggles();
+  state.staleOnly = false;
+  syncStaleToggle();
+  if (entry.environment !== state.environment) {
+    // Scope the whole page to the script's environment, keeping the
+    // script just chosen; the reload picks up the filters set above.
+    setEnvironment(entry.environment, true);
+  } else {
+    scriptSelect.value = entry.script;
+    refilterBrowse();
+  }
+  scrollTo("browse-section");
+}
+
+/* ================= triage queues ================= */
+
+const QUEUE_TABS = [
+  { id: "new_failures", label: "New failures" },
+  { id: "still_failing", label: "Still failing" },
+  { id: "fixed", label: "Fixed last night" },
+  { id: "unexpected_passes", label: "Stale annotations" },
+  { id: "not_run", label: "Not run" },
+  { id: "mine", label: "My actions" },
+];
+
+const QUEUE_EMPTY_TEXT = {
+  new_failures: "No new failures — nothing broke that was passing before.",
+  still_failing: "Nothing is stuck failing.",
+  fixed: "No tests went from failing to passing last night.",
+  unexpected_passes:
+    "No stale annotations — every known failure still fails.",
+  not_run: "Every test reported in — nothing has gone silent.",
+  mine: "Nothing is assigned to you.",
+};
+
+function queueEntries(queueId) {
+  // Every queue — "mine" included — arrives filtered, ordered and capped
+  // from the server, with its exact total alongside.
+  return state.summary.queues[queueId].tests;
+}
+
+function queueCount(queueId) {
+  return state.summary.queues[queueId].total;
+}
+
+function openQueue(queueId) {
+  state.activeQueue = queueId;
+  renderQueues();
+  scrollTo("triage-section");
+}
+
+function renderQueues() {
+  renderQueueTabs();
+  renderQueueTable();
+}
+
+/**
+ * Refresh the counts after an in-row action, WITHOUT rebuilding the table.
+ *
+ * Assigning from a row must not yank the rows out from under the person
+ * doing it — the dropdown they just used would be replaced mid-gesture
+ * and any open review panel would close.
+ */
+async function refreshQueueCounts() {
+  try {
+    state.summary = await fetchJson(summaryUrl());
+    renderQueueTabs();
+    renderStatus();
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+function renderQueueTabs() {
+  const summary = state.summary;
+  const tabs = document.getElementById("queue-tabs");
+  clearNode(tabs);
+  for (const tab of QUEUE_TABS) {
+    const count = queueCount(tab.id);
+    const btn = el("button", "tab");
+    btn.type = "button";
+    btn.setAttribute("role", "tab");
+    btn.setAttribute("aria-selected",
+      tab.id === state.activeQueue ? "true" : "false");
+    btn.appendChild(el("span", "", tab.label));
+    btn.appendChild(el("span",
+      "tab-count" + (tab.id === "new_failures" && count > 0
+        ? " tab-count-hot" : ""),
+      String(count)));
+    btn.addEventListener("click", () => {
+      state.activeQueue = tab.id;
+      renderQueues();
+    });
+    tabs.appendChild(btn);
+  }
+
+  const problems = summary.queues.new_failures.total
+    + summary.queues.still_failing.total
+    + summary.queues.unexpected_passes.total;
+  document.getElementById("all-clear").hidden = problems !== 0;
+  document.getElementById("triage-meta").textContent =
+    problems === 0 ? "" : problems.toLocaleString() + " open items";
+}
+
+/** Column sets per queue: header + cell builder. */
+function queueColumns(queueId) {
+  const testCol = {
+    header: "Test",
+    cell: (entry) => {
+      const cell = el("td", "wrap");
+      const link = document.createElement("a");
+      const params = new URLSearchParams();
+      params.append("environment", entry.environment);
+      params.append("script", entry.script);
+      params.append("test_name", entry.test_name);
+      link.href = "test.html?" + params.toString();
+      link.textContent = entry.test_name;
+      cell.appendChild(link);
+      cell.appendChild(el("span", "row-sub",
+        entry.environment + " · " + entry.script));
+      return cell;
+    },
+  };
+  // Assigning happens IN the row: a dropdown that saves on change, plus
+  // a one-click path to take it yourself. Neither needs a panel opened
+  // or a page visited.
+  const assigneeCol = {
+    header: "Assignee",
+    cell: (entry) => {
+      const cell = el("td", "assignee-cell");
+      cell.appendChild(assigneeSelect(entry, () => refreshQueueCounts()));
+      if (!entry.assignee) {
+        const btn = el("button", "take-btn", "Take");
+        btn.type = "button";
+        btn.title = "Assign this test to me";
+        btn.addEventListener("click", () => takeTest(entry, btn));
+        cell.appendChild(btn);
+      }
+      return cell;
+    },
+  };
+  const when = (header, key) => ({
+    header: header,
+    cell: (entry) => el("td", "",
+      entry[key] ? formatTime(entry[key]) : "—"),
+  });
+  const failingSinceCol = {
+    header: "Failing since",
+    cell: (entry) => {
+      const cell = el("td");
+      if (!entry.failing_since) {
+        cell.textContent = "—";
+        return cell;
+      }
+      cell.appendChild(document.createTextNode(
+        formatNight(entry.failing_since)));
+      const nights = nightsBetween(entry.failing_since,
+        state.summary.generated_at);
+      if (nights >= 1) {
+        cell.appendChild(el("span", "row-sub",
+          nights + (nights === 1 ? " night" : " nights")));
+      }
+      return cell;
+    },
+  };
+  // What someone already found out. Without it, triage means opening
+  // each test to discover it was looked at yesterday.
+  const commentCol = {
+    header: "Latest comment",
+    cell: (entry) => {
+      const cell = el("td", "wrap comment-cell");
+      if (entry.latest_comment) {
+        cell.appendChild(
+          el("span", "comment-text", entry.latest_comment.text));
+        cell.appendChild(el("span", "row-sub",
+          entry.latest_comment.author + " · "
+          + formatTime(entry.latest_comment.created_at)));
+      } else {
+        cell.appendChild(el("span", "muted", "—"));
+      }
+      return cell;
+    },
+  };
+
+  const resultCol = {
+    header: "Result",
+    cell: (entry) => {
+      const cell = el("td");
+      cell.appendChild(resultChip(entry.result));
+      return cell;
+    },
+  };
+
+  switch (queueId) {
+    case "new_failures":
+      return [testCol,
+        when("Failed at", "start_time"),
+        { header: "Previous run",
+          cell: (entry) => {
+            const cell = el("td");
+            if (entry.prev_result) {
+              cell.appendChild(resultChip(entry.prev_result));
+            } else {
+              cell.appendChild(el("span", "muted", "first run"));
+            }
+            return cell;
+          } },
+        commentCol,
+        assigneeCol];
+    case "still_failing":
+      return [testCol, failingSinceCol,
+        when("Last pass", "last_pass_time"),
+        commentCol,
+        assigneeCol];
+    case "fixed":
+      // No "failing since" here: these tests are passing now, so the
+      // summary reports no streak for them.
+      return [testCol,
+        when("Passed at", "start_time"),
+        { header: "Previously",
+          cell: (entry) => {
+            const cell = el("td");
+            if (entry.prev_result) {
+              cell.appendChild(resultChip(entry.prev_result));
+            } else {
+              cell.appendChild(el("span", "muted", "first run"));
+            }
+            return cell;
+          } },
+        commentCol,
+        { header: "Assignee",
+          cell: (entry) => el("td", "", entry.assignee || "—") }];
+    case "unexpected_passes":
+      return [testCol,
+        { header: "Known-failure reason",
+          cell: (entry) => el("td", "wrap reason-cell",
+            entry.known_failure_reason || "—") },
+        commentCol,
+        assigneeCol];
+    case "not_run":
+      return [testCol,
+        when("Last seen", "start_time"),
+        { header: "Last result",
+          cell: (entry) => {
+            const cell = el("td");
+            cell.appendChild(resultChip(entry.result));
+            return cell;
+          } },
+        commentCol,
+        assigneeCol];
+    default:  // mine
+      return [testCol, resultCol, failingSinceCol, commentCol,
+        assigneeCol];
+  }
+}
+
+/* ---- inline review: output + assign + comment, without leaving here ---- */
+
+/** Cached user list for the assignee picker (fetched once). */
+let knownUsers = null;
+
+async function loadUsers() {
+  if (knownUsers === null) {
+    try {
+      knownUsers = (await fetchJson("/api/users")).users.map((u) =>
+        u.username);
+    } catch (err) {
+      knownUsers = [];
+    }
+  }
+  return knownUsers;
+}
+
+/** True when a test has not reported inside the recency window. */
+function isStale(entry) {
+  if (!state.summary) {
+    return false;
+  }
+  const cutoff = new Date(state.summary.generated_at + "Z");
+  cutoff.setTime(cutoff.getTime()
+    - state.summary.recent_hours * 3600 * 1000);
+  return new Date(entry.start_time + "Z") < cutoff;
+}
+
+/** Key identifying a queue entry's expanded state. */
+function entryKey(entry) {
+  return [entry.environment, entry.script, entry.test_name].join(" ");
+}
+
+function toggleReview(entry, row, button) {
+  const key = entryKey(entry);
+  const existing = row.nextSibling;
+  if (existing && existing.dataset && existing.dataset.reviewFor === key) {
+    existing.remove();
+    state.openReviews.delete(key);
+    button.setAttribute("aria-expanded", "false");
+    button.textContent = "Review";
+    return;
+  }
+  state.openReviews.add(key);
+  button.setAttribute("aria-expanded", "true");
+  button.textContent = "Close";
+  const panelRow = document.createElement("tr");
+  panelRow.className = "review-row";
+  panelRow.dataset.reviewFor = key;
+  const cell = document.createElement("td");
+  cell.colSpan = row.children.length;
+  panelRow.appendChild(cell);
+  row.parentNode.insertBefore(panelRow, row.nextSibling);
+  buildReviewPanel(entry, cell);
+}
+
+async function buildReviewPanel(entry, container) {
+  clearNode(container);
+  const panel = el("div", "review-panel");
+  container.appendChild(panel);
+
+  const head = el("div", "review-head");
+  const params = new URLSearchParams();
+  params.append("environment", entry.environment);
+  params.append("script", entry.script);
+  params.append("test_name", entry.test_name);
+  const full = document.createElement("a");
+  full.href = "test.html?" + params.toString();
+  full.textContent = "Open full test page →";
+  head.appendChild(el("span", "review-title", "Latest run output"));
+  head.appendChild(full);
+  panel.appendChild(head);
+
+  // Actions FIRST. The output block is tall, so anything below it is
+  // off-screen for a real failure — which is how "I can't comment from
+  // triage" happens even though the box was there all along.
+  panel.appendChild(buildReviewActions(entry));
+
+  const pre = el("pre", "review-output", "Loading output…");
+  panel.appendChild(pre);
+
+  try {
+    const run = await fetchJson("/api/runs/" + entry.run_id);
+    const truncated = fillOutput(pre, run.output);
+    if (truncated) {
+      pre.parentNode.insertBefore(
+        el("p", "review-note",
+          truncated + " Open the full test page for all of it."),
+        pre);
+    }
+  } catch (err) {
+    pre.textContent = "Could not load the output: " + err.message;
+  }
+}
+
+function buildReviewActions(entry) {
+  const actions = el("div", "review-actions");
+
+  /* --- assign to anyone --- */
+  const assignGroup = el("div", "review-group");
+  assignGroup.appendChild(el("label", "review-label", "Assign to"));
+  assignGroup.appendChild(
+    assigneeSelect(entry, () => refreshQueueCounts()));
+  actions.appendChild(assignGroup);
+
+  /* --- comment --- */
+  const commentGroup = el("div", "review-group review-group-wide");
+  commentGroup.appendChild(el("label", "review-label", "Add a comment"));
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "review-input";
+  input.placeholder = "What did you find?";
+  const post = el("button", "", "Post");
+  post.type = "button";
+  post.addEventListener("click", async () => {
+    const me = requireUsername();
+    if (!me) {
+      showError(
+        "Set a username first (the “Change” button, top right) "
+        + "— comments are recorded against a name.");
+      return;
+    }
+    if (!input.value.trim()) {
+      input.focus();
+      return;
+    }
+    post.disabled = true;
+    try {
+      await postJson(
+        testApiPath(entry.environment, entry.script, entry.test_name,
+          "/comments"),
+        { username: me, text: input.value.trim() });
+      input.value = "";
+      post.textContent = "Posted";
+      window.setTimeout(() => { post.textContent = "Post"; }, 1500);
+    } catch (err) {
+      showError(err.message);
+    } finally {
+      post.disabled = false;
+    }
+  });
+  commentGroup.appendChild(input);
+  commentGroup.appendChild(post);
+  actions.appendChild(commentGroup);
+
+  /* --- retire: only offered where it makes sense --- */
+  // Offered for any test that has stopped reporting, wherever it is
+  // being looked at — the triage queue or the full test list.
+  if (isStale(entry) && !entry.retired_at) {
+    const retireGroup = el("div", "review-group review-group-wide");
+    retireGroup.appendChild(el("label", "review-label",
+      "This test has stopped reporting"));
+    const why = document.createElement("input");
+    why.type = "text";
+    why.className = "review-input";
+    why.placeholder = "Why is it gone? (required — e.g. deleted in 4.2)";
+    const retire = el("button", "danger-btn",
+      "Mark as no longer in the suite");
+    retire.type = "button";
+    retire.addEventListener("click", async () => {
+      const me = requireUsername();
+      if (!me) {
+        return;
+      }
+      if (!why.value.trim()) {
+        why.focus();
+        showError("Say why the test is gone — the note is kept with it.");
+        return;
+      }
+      retire.disabled = true;
+      try {
+        await putJson(
+          testApiPath(entry.environment, entry.script, entry.test_name,
+            "/retired"),
+          { retired: true, username: me, comment: why.value.trim() });
+        await refreshSummary();
+      } catch (err) {
+        showError(err.message);
+        retire.disabled = false;
+      }
+    });
+    retireGroup.appendChild(why);
+    retireGroup.appendChild(retire);
+    actions.appendChild(retireGroup);
+  }
+  return actions;
+}
+
+function renderQueueTable() {
+  const queueId = state.activeQueue;
+  const entries = queueEntries(queueId);
+  const table = document.getElementById("queue-table");
+  const headRow = document.getElementById("queue-head-row");
+  const body = document.getElementById("queue-body");
+  const emptyNote = document.getElementById("queue-empty");
+  const capNote = document.getElementById("queue-cap-note");
+
+  clearNode(headRow);
+  clearNode(body);
+
+  if (queueId === "mine" && !getUsername()) {
+    table.hidden = true;
+    emptyNote.textContent =
+      "Set a username (top right) to see tests assigned to you.";
+    emptyNote.hidden = false;
+    capNote.hidden = true;
+    return;
+  }
+  if (entries.length === 0) {
+    table.hidden = true;
+    emptyNote.textContent = QUEUE_EMPTY_TEXT[queueId];
+    emptyNote.hidden = false;
+    capNote.hidden = true;
+    return;
+  }
+
+  const columns = queueColumns(queueId);
+  for (const column of columns) {
+    headRow.appendChild(el("th", "", column.header));
+  }
+  // An explicit, labelled action column: the review panel has to be
+  // obvious to someone who has never used the page before.
+  headRow.appendChild(el("th", "", "Output"));
+
+  for (const entry of entries) {
+    const tr = document.createElement("tr");
+    const marker = resultClass(entry.result);
+    if (marker) {
+      tr.className = marker;
+    }
+    for (const column of columns) {
+      tr.appendChild(column.cell(entry));
+    }
+    const actionCell = el("td", "review-cell");
+    const reviewBtn = el("button", "review-btn", "Review");
+    reviewBtn.type = "button";
+    reviewBtn.setAttribute("aria-expanded", "false");
+    reviewBtn.title = "Show this run's output, and assign it";
+    reviewBtn.addEventListener(
+      "click", () => toggleReview(entry, tr, reviewBtn));
+    actionCell.appendChild(reviewBtn);
+    tr.appendChild(actionCell);
+    body.appendChild(tr);
+
+    // Keep panels open across the re-render that follows an action.
+    if (state.openReviews.has(entryKey(entry))) {
+      state.openReviews.delete(entryKey(entry));
+      toggleReview(entry, tr, reviewBtn);
+    }
+  }
+  table.hidden = false;
+  emptyNote.hidden = true;
+
+  const total = queueCount(queueId);
+  if (total > entries.length) {
+    capNote.textContent = "Showing the first "
+      + entries.length.toLocaleString() + " of "
+      + total.toLocaleString()
+      + " — filter by environment to narrow the queue.";
+    capNote.hidden = false;
+  } else {
+    capNote.hidden = true;
+  }
+}
+
+async function takeTest(entry, btn) {
+  const username = requireUsername();
+  if (!username) {
+    return;
+  }
+  btn.disabled = true;
+  try {
+    await putJson(
+      testApiPath(entry.environment, entry.script, entry.test_name,
+        "/assignee"),
+      { username: username, assigned_by: username });
+    await refreshSummary();
+  } catch (err) {
+    btn.disabled = false;
+    showError(err.message);
+  }
+}
+
+/* ================= all tests (browse) ================= */
+
+function populateScriptOptions() {
+  const scripts = state.summary.scripts;
+  // Defensive: if the selected script is not in scope any more, the
+  // dropdown would show "All scripts" while the list stayed filtered to
+  // something invisible. Drop the filter and reload instead.
+  if (state.script && scripts.indexOf(state.script) === -1) {
+    state.script = "";
+    refilterBrowse();
+  }
+  fillSelect(scriptSelect, scripts, "All scripts", state.script);
+}
+
+/** A link to one suite's execution history. */
+function scriptLink(environment, script, text) {
+  const params = new URLSearchParams();
+  params.append("environment", environment);
+  params.append("script", script);
+  const link = document.createElement("a");
+  link.href = "script.html?" + params.toString();
+  link.textContent = text || script;
+  link.title = "Execution history for this suite";
+  return link;
+}
+
+/** Whole nights between two ISO timestamps (date difference in days). */
+function nightsBetween(fromIso, toIso) {
+  const from = new Date(fromIso.slice(0, 10) + "T00:00:00Z");
+  const to = new Date(toIso.slice(0, 10) + "T00:00:00Z");
+  return Math.round((to - from) / 86400000);
+}
+
+/** Apply a change to the test-list filters and reload it from the top. */
+function refilterBrowse() {
+  loadBrowse(false);
+}
+
+/**
+ * Render the test list. `rows` are the rows just fetched; when `append`
+ * they are added below what is already there, otherwise they replace it.
+ */
+function renderBrowse(rows, append) {
+  if (!append) {
+    clearNode(tbody);
+  }
+  for (const row of rows) {
+    tbody.appendChild(buildRow(row));
+  }
+  updateSortIndicators();
+
+  const shown = state.browseRows.length;
+  const total = state.browseTotal;
+  document.getElementById("empty-state").hidden = total !== 0;
+  document.getElementById("browse-meta").textContent = state.summary
+    ? state.summary.status.total_tests.toLocaleString() + " tests"
+    : "";
+
+  const count = document.getElementById("browse-count");
+  const moreBtn = document.getElementById("show-more");
+  if (total > shown) {
+    count.textContent = "Showing " + shown.toLocaleString()
+      + " of " + total.toLocaleString() + " matching tests";
+    moreBtn.textContent = "Show "
+      + Math.min(CHUNK, total - shown).toLocaleString() + " more";
+    moreBtn.hidden = false;
+  } else {
+    count.textContent = total === 0 ? ""
+      : total.toLocaleString() + " matching tests";
+    moreBtn.hidden = true;
+  }
+}
+
+function buildRow(row) {
+  const tr = document.createElement("tr");
+  const marker = resultClass(row.result);
+  if (marker) {
+    tr.className = marker;
+  }
+  tr.appendChild(el("td", "", row.environment));
+
+  // The script is a link to that suite's execution history — the way to
+  // answer "how did the whole suite do last night?".
+  const scriptCell = document.createElement("td");
+  scriptCell.appendChild(scriptLink(row.environment, row.script));
+  tr.appendChild(scriptCell);
+
+  const testCell = document.createElement("td");
+  testCell.className = "wrap";
+  const link = document.createElement("a");
+  const params = new URLSearchParams();
+  params.append("environment", row.environment);
+  params.append("script", row.script);
+  params.append("test_name", row.test_name);
+  link.href = "test.html?" + params.toString();
+  link.textContent = row.test_name;
+  testCell.appendChild(link);
+  tr.appendChild(testCell);
+
+  const resultCell = document.createElement("td");
+  const chip = resultChip(row.result);
+  if (row.known_failure_reason) {
+    chip.title = "Known failure: " + row.known_failure_reason;
+  }
+  resultCell.appendChild(chip);
+  tr.appendChild(resultCell);
+
+  tr.appendChild(el("td", "", formatTime(row.start_time)));
+  tr.appendChild(el("td", "num", formatDuration(row.duration_seconds)));
+
+  const ownerCell = el("td", "assignee-cell");
+  ownerCell.appendChild(assigneeSelect(row, null));
+  tr.appendChild(ownerCell);
+
+  // Every test gets the review panel, not just failing ones: a passing
+  // test is exactly where you want to record "this only passes because
+  // the fixture is stubbed" while you still remember it.
+  const actionCell = el("td", "review-cell");
+  const reviewBtn = el("button", "review-btn", "Review");
+  reviewBtn.type = "button";
+  reviewBtn.setAttribute("aria-expanded", "false");
+  reviewBtn.title = "Show this run's output, assign it, or comment";
+  reviewBtn.addEventListener(
+    "click", () => toggleReview(row, tr, reviewBtn));
+  actionCell.appendChild(reviewBtn);
+  tr.appendChild(actionCell);
+  return tr;
+}
+
+function updateSortIndicators() {
+  const buttons =
+    document.querySelectorAll("#dashboard-table thead .sort-btn");
+  for (const btn of buttons) {
+    const th = btn.closest("th");
+    const arrow = btn.querySelector(".sort-arrow");
+    if (btn.dataset.key === state.sortKey) {
+      arrow.textContent = state.sortAsc ? " ▲" : " ▼";
+      th.setAttribute("aria-sort",
+        state.sortAsc ? "ascending" : "descending");
+    } else {
+      arrow.textContent = "";
+      th.setAttribute("aria-sort", "none");
+    }
+  }
+}
+
+/* ================= filter controls ================= */
+
+function buildResultToggles() {
+  const container = document.getElementById("result-toggles");
+  for (const result of RESULTS) {
+    const btn = el("button", "toggle " + resultClass(result), result);
+    btn.type = "button";
+    btn.dataset.result = result;
+    btn.setAttribute("aria-pressed", "false");
+    btn.addEventListener("click", () => {
+      if (state.activeResults.has(result)) {
+        state.activeResults.delete(result);
+      } else {
+        state.activeResults.add(result);
+      }
+      syncResultToggles();
+      refilterBrowse();
+    });
+    container.appendChild(btn);
+  }
+}
+
+function syncResultToggles() {
+  const buttons = document.querySelectorAll("#result-toggles .toggle");
+  for (const btn of buttons) {
+    btn.setAttribute("aria-pressed",
+      state.activeResults.has(btn.dataset.result) ? "true" : "false");
+  }
+}
+
+function syncStaleToggle() {
+  document.getElementById("stale-toggle")
+    .setAttribute("aria-pressed", state.staleOnly ? "true" : "false");
+}
+
+function syncRetiredToggle() {
+  document.getElementById("retired-toggle")
+    .setAttribute("aria-pressed", state.showRetired ? "true" : "false");
+}
+
+function scrollTo(sectionId) {
+  document.getElementById(sectionId)
+    .scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+/* ================= init ================= */
+
+function init() {
+  // "My actions" is scoped server-side to the signed-in user, so a
+  // username change has to go back to the server for it.
+  renderUserWidget(document.getElementById("user-widget"),
+    () => { if (state.summary) { refreshSummary(); } });
+  buildResultToggles();
+
+  const url = new URL(window.location.href);
+  state.environment = url.searchParams.get("environment") || "";
+
+  envSelect.addEventListener("change",
+    () => setEnvironment(envSelect.value));
+  scriptSelect.addEventListener("change", () => {
+    state.script = scriptSelect.value;
+    refilterBrowse();
+  });
+  qInput.addEventListener("input", () => {
+    if (state.qTimer) {
+      window.clearTimeout(state.qTimer);
+    }
+    // Debounced: one query per pause in typing, not one per keystroke.
+    state.qTimer = window.setTimeout(() => {
+      state.qText = qInput.value;
+      refilterBrowse();
+    }, 250);
+  });
+  document.getElementById("stale-toggle")
+    .addEventListener("click", () => {
+      state.staleOnly = !state.staleOnly;
+      syncStaleToggle();
+      refilterBrowse();
+    });
+  document.getElementById("retired-toggle")
+    .addEventListener("click", () => {
+      state.showRetired = !state.showRetired;
+      syncRetiredToggle();
+      refilterBrowse();
+    });
+  document.getElementById("reload-btn")
+    .addEventListener("click", () => refreshAll());
+  document.getElementById("show-more").addEventListener("click", () => {
+    loadBrowse(true);
+  });
+
+  for (const btn of
+    document.querySelectorAll("#dashboard-table thead .sort-btn")) {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.key;
+      if (state.sortKey === key) {
+        state.sortAsc = !state.sortAsc;
+      } else {
+        state.sortKey = key;
+        state.sortAsc = true;
+      }
+      // Sorting is a server-side ORDER BY over the whole matching set,
+      // not a reshuffle of the page on screen.
+      refilterBrowse();
+    });
+  }
+
+  refreshAll();
+}
+
+init();

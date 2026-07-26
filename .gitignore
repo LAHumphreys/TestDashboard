@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+testboard.db*
+*.db
+*.db-wal
+*.db-shm
+*.db.bak
+*.sqlite*
+feeder_state.json
+testboard_failed_batch_*.json
+internal_*.py
+.idea/
+demo.jsonl

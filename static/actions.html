@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>testboard — open actions</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="home">
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html">Dashboard</a>
+      <a href="actions.html" aria-current="page">Open actions</a>
+    </nav>
+    <div id="user-widget" class="user-widget"></div>
+  </header>
+
+  <main class="wide">
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <section class="toolbar" aria-label="Filters">
+      <label>Environment
+        <select id="filter-environment"></select>
+      </label>
+      <label>Result
+        <select id="filter-result">
+          <option value="open">Needs action (failing or stale annotation)</option>
+          <option value="FAIL">Failing only</option>
+          <option value="UNEXPECTED_PASS">Stale annotations only</option>
+        </select>
+      </label>
+      <span class="toolbar-spacer"></span>
+      <button id="reload-btn" type="button">Refresh</button>
+    </section>
+
+    <section id="owner-section" aria-labelledby="owner-heading">
+      <div class="section-head">
+        <h2 id="owner-heading" class="eyebrow">Owner</h2>
+        <span id="owner-meta" class="muted"></span>
+      </div>
+      <!-- Repeatable assignee filter: pick any number of people, and/or
+           everything nobody has picked up yet. -->
+      <div id="owner-filters" class="owner-filters" role="group"
+           aria-label="Filter by assignee"></div>
+    </section>
+
+    <section id="actions-section" aria-labelledby="actions-heading">
+      <div class="section-head">
+        <h2 id="actions-heading" class="eyebrow">Open actions</h2>
+        <span id="actions-meta" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="actions-table">
+          <thead>
+            <tr>
+              <th>Test</th>
+              <th>Result</th>
+              <th>Assignee</th>
+              <th>Latest comment</th>
+              <th>Last run (UTC)</th>
+            </tr>
+          </thead>
+          <tbody id="actions-body"></tbody>
+        </table>
+      </div>
+      <p id="loading-state" class="muted">Loading…</p>
+      <p id="empty-state" class="empty-state" hidden>Nothing matches these filters.</p>
+      <div class="browse-footer">
+        <span id="actions-count" class="muted"></span>
+        <button id="show-more" type="button" hidden>Show more</button>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="actions.js"></script>
+</body>
+</html>

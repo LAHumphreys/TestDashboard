@@ -1,0 +1,1549 @@
+"""Unit tests for :mod:`testboard.storage`.
+
+Covers: migration idempotency, explicit upsert insert/update counts and
+idempotent re-import, dashboard latest-run-per-test with every filter and
+LIKE escaping, history pagination, runs_since bounds, implicit user
+creation via comments/assignments, assignment history and clearing,
+output-column hygiene (only get_run fetches it), thread-local connections,
+and a 5000-record single-transaction batch import under 10 seconds.
+
+Windows-safe cleanup: sqlite connections are closed before the temp
+directory is removed, and rmtree uses ignore_errors=True.
+"""
+
+import datetime
+import os
+import shutil
+import sqlite3
+import tempfile
+import threading
+import time
+import unittest
+from typing import List, Optional
+
+from testboard import analytics, model, storage
+from testboard.model import Result, RunRecord
+from testboard.storage import Storage
+
+BASE = datetime.datetime(2026, 7, 1, 2, 0, 0)
+CREATED = datetime.datetime(2026, 7, 1, 9, 0, 0)
+
+
+def make_record(
+    environment: str = "linux-sim",
+    script: str = "suite.py",
+    test_name: str = "test_a",
+    result: Result = Result.PASS,
+    start: Optional[datetime.datetime] = None,
+    end: Optional[datetime.datetime] = None,
+    output: str = "all good\n",
+    source_link: str = "https://example.com/suite.py#L1",
+    known_failure_reason: Optional[str] = None,
+) -> RunRecord:
+    """Build a RunRecord with sensible defaults for tests."""
+    if start is None:
+        start = BASE
+    if end is None:
+        end = start + datetime.timedelta(seconds=3)
+    return RunRecord(
+        environment=environment,
+        script=script,
+        test_name=test_name,
+        result=result,
+        start_time=start,
+        end_time=end,
+        output=output,
+        source_link=source_link,
+        known_failure_reason=known_failure_reason,
+    )
+
+
+class StorageTestBase(unittest.TestCase):
+    """Creates a Storage on a temp-file database with safe cleanup."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="testboard_storage_")
+        # LIFO cleanup: connections are closed before the dir is removed.
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.store = Storage(self.db_path)
+        self.addCleanup(self.store.close)
+
+
+class TestMigrations(StorageTestBase):
+    """Schema creation, versioning and idempotency."""
+
+    def _fetch_schema(self) -> List[str]:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type IN ('table', 'index')"
+            ).fetchall()
+            return [row[0] for row in rows]
+        finally:
+            conn.close()
+
+    def test_creates_all_tables_and_indexes(self) -> None:
+        names = self._fetch_schema()
+        for expected in (
+            "schema_version",
+            "runs",
+            "users",
+            "comments",
+            "assignments",
+            "idx_comments_triple",
+            "idx_assignments_triple",
+        ):
+            self.assertIn(expected, names)
+
+    def test_schema_version_is_current(self) -> None:
+        latest = storage.MIGRATIONS[-1][0]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute("SELECT version FROM schema_version").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(rows, [(latest,)])
+
+    def test_wal_mode_enabled(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(str(mode).lower(), "wal")
+
+    def test_migrations_idempotent_reopen_same_file(self) -> None:
+        self.store.upsert_runs([make_record()])
+        second = Storage(self.db_path)
+        self.addCleanup(second.close)
+        # Version unchanged, single row, data intact.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute("SELECT version FROM schema_version").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(rows, [(storage.MIGRATIONS[-1][0],)])
+        self.assertTrue(second.test_exists("linux-sim", "suite.py", "test_a"))
+
+    def test_memory_database_works_single_threaded(self) -> None:
+        mem = Storage(":memory:")
+        self.addCleanup(mem.close)
+        counts = mem.upsert_runs([make_record()])
+        self.assertEqual(counts, storage.UpsertCounts(inserted=1, updated=0))
+        self.assertTrue(mem.test_exists("linux-sim", "suite.py", "test_a"))
+
+
+class TestUpsertRuns(StorageTestBase):
+    """Explicit upsert semantics and counts."""
+
+    def test_insert_counts(self) -> None:
+        counts = self.store.upsert_runs(
+            [
+                make_record(test_name="test_a"),
+                make_record(test_name="test_b"),
+            ]
+        )
+        self.assertEqual(counts, storage.UpsertCounts(inserted=2, updated=0))
+
+    def test_mixed_insert_and_update_counts(self) -> None:
+        self.store.upsert_runs([make_record(test_name="test_a")])
+        counts = self.store.upsert_runs(
+            [
+                make_record(test_name="test_a", result=Result.FAIL),
+                make_record(test_name="test_b"),
+            ]
+        )
+        self.assertEqual(counts, storage.UpsertCounts(inserted=1, updated=1))
+
+    def test_reimport_identical_batch_all_updated_no_duplicates(self) -> None:
+        batch = [
+            make_record(test_name="test_a"),
+            make_record(test_name="test_b"),
+            make_record(test_name="test_c"),
+        ]
+        first = self.store.upsert_runs(batch)
+        second = self.store.upsert_runs(batch)
+        self.assertEqual(first, storage.UpsertCounts(inserted=3, updated=0))
+        self.assertEqual(second, storage.UpsertCounts(inserted=0, updated=3))
+        self.assertEqual(len(self.store.dashboard()), 3)
+        history = self.store.run_history("linux-sim", "suite.py", "test_a")
+        self.assertEqual(len(history), 1)
+
+    def test_update_replaces_mutable_fields_and_keeps_run_id(self) -> None:
+        self.store.upsert_runs([make_record()])
+        original = self.store.latest_run("linux-sim", "suite.py", "test_a")
+        assert original is not None
+        changed = make_record(
+            result=Result.FAIL,
+            end=BASE + datetime.timedelta(seconds=99),
+            output="Traceback: boom\n",
+            source_link="https://example.com/new#L5",
+            known_failure_reason="JIRA-123",
+        )
+        counts = self.store.upsert_runs([changed])
+        self.assertEqual(counts, storage.UpsertCounts(inserted=0, updated=1))
+        run = self.store.get_run(original.run_id)
+        assert run is not None
+        self.assertEqual(run.run_id, original.run_id)  # rowid preserved
+        self.assertEqual(run.result, Result.FAIL)
+        self.assertEqual(
+            run.end_time, BASE + datetime.timedelta(seconds=99)
+        )
+        self.assertEqual(run.output, "Traceback: boom\n")
+        self.assertEqual(run.source_link, "https://example.com/new#L5")
+        self.assertEqual(run.known_failure_reason, "JIRA-123")
+
+    def test_same_test_name_different_start_times_are_distinct(self) -> None:
+        counts = self.store.upsert_runs(
+            [
+                make_record(start=BASE),
+                make_record(start=BASE + datetime.timedelta(days=1)),
+            ]
+        )
+        self.assertEqual(counts, storage.UpsertCounts(inserted=2, updated=0))
+        history = self.store.run_history("linux-sim", "suite.py", "test_a")
+        self.assertEqual(len(history), 2)
+
+    def test_empty_batch(self) -> None:
+        counts = self.store.upsert_runs([])
+        self.assertEqual(counts, storage.UpsertCounts(inserted=0, updated=0))
+
+
+class TestDashboard(StorageTestBase):
+    """Latest-run-per-test query with all filters."""
+
+    def setUp(self) -> None:
+        super(TestDashboard, self).setUp()
+        day = datetime.timedelta(days=1)
+        self.store.upsert_runs(
+            [
+                # test_a: old PASS then newer FAIL (dashboard must show FAIL)
+                make_record(test_name="test_a", start=BASE, result=Result.PASS),
+                make_record(
+                    test_name="test_a", start=BASE + day, result=Result.FAIL
+                ),
+                make_record(
+                    test_name="test_b",
+                    start=BASE,
+                    result=Result.FAILED_AS_EXPECTED,
+                    known_failure_reason="known",
+                ),
+                make_record(
+                    environment="win-uat",
+                    script="other.py",
+                    test_name="test_c",
+                    start=BASE,
+                    result=Result.UNEXPECTED_PASS,
+                ),
+            ]
+        )
+
+    def test_latest_run_per_test(self) -> None:
+        rows = self.store.dashboard()
+        self.assertEqual(len(rows), 3)
+        by_name = {row.test_name: row for row in rows}
+        self.assertEqual(by_name["test_a"].result, Result.FAIL)
+        self.assertEqual(
+            by_name["test_a"].start_time,
+            BASE + datetime.timedelta(days=1),
+        )
+
+    def test_ordering(self) -> None:
+        rows = self.store.dashboard()
+        triples = [(r.environment, r.script, r.test_name) for r in rows]
+        self.assertEqual(triples, sorted(triples))
+
+    def test_row_shape_has_no_output_field(self) -> None:
+        self.assertNotIn("output", storage.TestSummaryRow._fields)
+
+    def test_filter_environment(self) -> None:
+        rows = self.store.dashboard(environment="win-uat")
+        self.assertEqual([r.test_name for r in rows], ["test_c"])
+        self.assertEqual(self.store.dashboard(environment="nope"), [])
+
+    def test_filter_script(self) -> None:
+        rows = self.store.dashboard(script="other.py")
+        self.assertEqual([r.test_name for r in rows], ["test_c"])
+
+    def test_filter_results(self) -> None:
+        rows = self.store.dashboard(results=[Result.FAIL])
+        self.assertEqual([r.test_name for r in rows], ["test_a"])
+        rows = self.store.dashboard(
+            results=[Result.FAIL, Result.UNEXPECTED_PASS]
+        )
+        self.assertEqual(
+            sorted(r.test_name for r in rows), ["test_a", "test_c"]
+        )
+
+    def test_filter_results_matches_latest_only(self) -> None:
+        # test_a has an older PASS run, but its latest run is FAIL, so a
+        # PASS filter must not resurface it.
+        rows = self.store.dashboard(results=[Result.PASS])
+        self.assertEqual(rows, [])
+
+    def test_filter_results_empty_sequence_matches_nothing(self) -> None:
+        self.assertEqual(self.store.dashboard(results=[]), [])
+
+    def test_filter_q_substring_case_insensitive(self) -> None:
+        rows = self.store.dashboard(q="EST_A")
+        self.assertEqual([r.test_name for r in rows], ["test_a"])
+
+    def test_filter_combination(self) -> None:
+        rows = self.store.dashboard(
+            environment="linux-sim",
+            script="suite.py",
+            results=[Result.FAIL, Result.FAILED_AS_EXPECTED],
+            q="test_a",
+        )
+        self.assertEqual([r.test_name for r in rows], ["test_a"])
+        rows = self.store.dashboard(environment="win-uat", q="test_a")
+        self.assertEqual(rows, [])
+
+    def test_assignee_joined_and_none_when_unassigned(self) -> None:
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED
+        )
+        by_name = {row.test_name: row for row in self.store.dashboard()}
+        self.assertEqual(by_name["test_a"].assignee, "alice")
+        self.assertIsNone(by_name["test_b"].assignee)
+
+    def test_assignee_reflects_latest_assignment(self) -> None:
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED
+        )
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", None, "bob",
+            CREATED + datetime.timedelta(minutes=1),
+        )
+        by_name = {row.test_name: row for row in self.store.dashboard()}
+        self.assertIsNone(by_name["test_a"].assignee)
+
+
+class TestDashboardLikeEscaping(StorageTestBase):
+    """q filter must treat %, _ and backslash literally."""
+
+    def setUp(self) -> None:
+        super(TestDashboardLikeEscaping, self).setUp()
+        minute = datetime.timedelta(minutes=1)
+        names = ["load_100%", "load_1000", "a_b", "aXb", "back\\slash"]
+        self.store.upsert_runs(
+            [
+                make_record(test_name=name, start=BASE + i * minute)
+                for i, name in enumerate(names)
+            ]
+        )
+
+    def test_percent_is_literal(self) -> None:
+        rows = self.store.dashboard(q="100%")
+        self.assertEqual([r.test_name for r in rows], ["load_100%"])
+
+    def test_underscore_is_literal(self) -> None:
+        rows = self.store.dashboard(q="a_b")
+        self.assertEqual([r.test_name for r in rows], ["a_b"])
+
+    def test_backslash_is_literal(self) -> None:
+        rows = self.store.dashboard(q="back\\slash")
+        self.assertEqual([r.test_name for r in rows], ["back\\slash"])
+
+    def test_plain_substring_still_matches(self) -> None:
+        rows = self.store.dashboard(q="load_")
+        self.assertEqual(
+            sorted(r.test_name for r in rows), ["load_100%", "load_1000"]
+        )
+
+
+class TestRunQueries(StorageTestBase):
+    """test_exists / latest_run / run_history / runs_since / get_run."""
+
+    def setUp(self) -> None:
+        super(TestRunQueries, self).setUp()
+        self.day = datetime.timedelta(days=1)
+        self.starts = [BASE + i * self.day for i in range(5)]
+        self.store.upsert_runs(
+            [
+                make_record(
+                    start=start,
+                    result=Result.PASS if i % 2 == 0 else Result.FAIL,
+                    output="run {}\n".format(i),
+                )
+                for i, start in enumerate(self.starts)
+            ]
+        )
+
+    def test_test_exists(self) -> None:
+        self.assertTrue(
+            self.store.test_exists("linux-sim", "suite.py", "test_a")
+        )
+        self.assertFalse(
+            self.store.test_exists("linux-sim", "suite.py", "missing")
+        )
+        self.assertFalse(
+            self.store.test_exists("other-env", "suite.py", "test_a")
+        )
+
+    def test_latest_run(self) -> None:
+        run = self.store.latest_run("linux-sim", "suite.py", "test_a")
+        assert run is not None
+        self.assertEqual(run.start_time, self.starts[-1])
+        self.assertIsNone(run.output)
+
+    def test_latest_run_unknown_triple(self) -> None:
+        self.assertIsNone(
+            self.store.latest_run("linux-sim", "suite.py", "missing")
+        )
+
+    def test_history_newest_first_without_output(self) -> None:
+        runs = self.store.run_history("linux-sim", "suite.py", "test_a")
+        self.assertEqual(
+            [r.start_time for r in runs], list(reversed(self.starts))
+        )
+        for run in runs:
+            self.assertIsNone(run.output)
+
+    def test_history_limit(self) -> None:
+        runs = self.store.run_history(
+            "linux-sim", "suite.py", "test_a", limit=2
+        )
+        self.assertEqual(
+            [r.start_time for r in runs], [self.starts[4], self.starts[3]]
+        )
+
+    def test_history_before_is_strict(self) -> None:
+        runs = self.store.run_history(
+            "linux-sim", "suite.py", "test_a", before=self.starts[2]
+        )
+        self.assertEqual(
+            [r.start_time for r in runs], [self.starts[1], self.starts[0]]
+        )
+
+    def test_history_pagination_chain(self) -> None:
+        seen = []  # type: List[datetime.datetime]
+        before = None  # type: Optional[datetime.datetime]
+        while True:
+            page = self.store.run_history(
+                "linux-sim", "suite.py", "test_a", limit=2, before=before
+            )
+            if not page:
+                break
+            seen.extend(run.start_time for run in page)
+            before = page[-1].start_time
+        self.assertEqual(seen, list(reversed(self.starts)))
+
+    def test_runs_since_inclusive_bound(self) -> None:
+        runs = self.store.runs_since(
+            "linux-sim", "suite.py", "test_a", self.starts[2], 50
+        )
+        self.assertEqual(
+            [r.start_time for r in runs],
+            [self.starts[4], self.starts[3], self.starts[2]],
+        )
+        for run in runs:
+            self.assertIsNone(run.output)
+
+    def test_runs_since_limit_keeps_newest(self) -> None:
+        runs = self.store.runs_since(
+            "linux-sim", "suite.py", "test_a", self.starts[0], 2
+        )
+        self.assertEqual(
+            [r.start_time for r in runs], [self.starts[4], self.starts[3]]
+        )
+
+    def test_runs_since_nothing_in_window(self) -> None:
+        runs = self.store.runs_since(
+            "linux-sim", "suite.py", "test_a",
+            self.starts[-1] + self.day, 50,
+        )
+        self.assertEqual(runs, [])
+
+    def test_get_run_includes_output(self) -> None:
+        latest = self.store.latest_run("linux-sim", "suite.py", "test_a")
+        assert latest is not None
+        run = self.store.get_run(latest.run_id)
+        assert run is not None
+        self.assertEqual(run.output, "run 4\n")
+        self.assertEqual(run.run_id, latest.run_id)
+        self.assertEqual(run.test_name, "test_a")
+
+    def test_get_run_unknown_id(self) -> None:
+        self.assertIsNone(self.store.get_run(999999))
+
+
+class TestUsers(StorageTestBase):
+    """ensure_user / create_user / list_users."""
+
+    def test_create_user_new_then_existing(self) -> None:
+        user, created = self.store.create_user("alice", CREATED)
+        self.assertTrue(created)
+        self.assertEqual(user, storage.User("alice", CREATED))
+        later = CREATED + datetime.timedelta(days=1)
+        again, created_again = self.store.create_user("alice", later)
+        self.assertFalse(created_again)
+        # Existing user returned unchanged: original created_at kept.
+        self.assertEqual(again, storage.User("alice", CREATED))
+
+    def test_ensure_user_is_idempotent(self) -> None:
+        self.store.ensure_user("bob", CREATED)
+        self.store.ensure_user(
+            "bob", CREATED + datetime.timedelta(days=1)
+        )
+        users = self.store.list_users()
+        self.assertEqual(users, [storage.User("bob", CREATED)])
+
+    def test_list_users_ordered_by_username(self) -> None:
+        for name in ("carol", "alice", "bob"):
+            self.store.ensure_user(name, CREATED)
+        self.assertEqual(
+            [u.username for u in self.store.list_users()],
+            ["alice", "bob", "carol"],
+        )
+
+    def test_list_users_empty(self) -> None:
+        self.assertEqual(self.store.list_users(), [])
+
+
+class TestComments(StorageTestBase):
+    """Comment storage and implicit user creation."""
+
+    def test_add_comment_implicitly_creates_author(self) -> None:
+        comment = self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "alice", "looks flaky",
+            CREATED,
+        )
+        self.assertEqual(comment.author, "alice")
+        self.assertEqual(comment.text, "looks flaky")
+        self.assertEqual(comment.created_at, CREATED)
+        self.assertEqual(comment.environment, "linux-sim")
+        self.assertEqual(comment.script, "suite.py")
+        self.assertEqual(comment.test_name, "test_a")
+        self.assertEqual(
+            [u.username for u in self.store.list_users()], ["alice"]
+        )
+
+    def test_comments_oldest_first(self) -> None:
+        first = self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "alice", "first", CREATED
+        )
+        second = self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "bob", "second",
+            CREATED + datetime.timedelta(minutes=1),
+        )
+        listed = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertEqual(
+            [c.comment_id for c in listed],
+            [first.comment_id, second.comment_id],
+        )
+        self.assertEqual([c.text for c in listed], ["first", "second"])
+        self.assertLess(first.comment_id, second.comment_id)
+
+    def test_comments_scoped_to_triple(self) -> None:
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "alice", "here", CREATED
+        )
+        self.assertEqual(
+            self.store.comments("linux-sim", "suite.py", "test_b"), []
+        )
+
+    def test_comment_roundtrip_from_storage(self) -> None:
+        added = self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "alice", "hi", CREATED
+        )
+        listed = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertEqual(listed, [added])
+
+
+class TestAssignments(StorageTestBase):
+    """Assignment history, current assignee, clearing, implicit users."""
+
+    TRIPLE = ("linux-sim", "suite.py", "test_a")
+
+    def test_set_assignee_implicitly_creates_both_users(self) -> None:
+        self.store.set_assignee(
+            self.TRIPLE[0], self.TRIPLE[1], self.TRIPLE[2],
+            "alice", "bob", CREATED,
+        )
+        self.assertEqual(
+            [u.username for u in self.store.list_users()],
+            ["alice", "bob"],
+        )
+        self.assertEqual(
+            self.store.current_assignee(*self.TRIPLE), "alice"
+        )
+
+    def test_reassignment_latest_wins(self) -> None:
+        self.store.set_assignee(
+            self.TRIPLE[0], self.TRIPLE[1], self.TRIPLE[2],
+            "alice", "bob", CREATED,
+        )
+        self.store.set_assignee(
+            self.TRIPLE[0], self.TRIPLE[1], self.TRIPLE[2],
+            "carol", "bob", CREATED + datetime.timedelta(minutes=1),
+        )
+        self.assertEqual(
+            self.store.current_assignee(*self.TRIPLE), "carol"
+        )
+
+    def test_clearing_with_none_only_creates_assigned_by(self) -> None:
+        self.store.set_assignee(
+            self.TRIPLE[0], self.TRIPLE[1], self.TRIPLE[2],
+            "alice", "bob", CREATED,
+        )
+        self.store.set_assignee(
+            self.TRIPLE[0], self.TRIPLE[1], self.TRIPLE[2],
+            None, "dave", CREATED + datetime.timedelta(minutes=1),
+        )
+        self.assertIsNone(self.store.current_assignee(*self.TRIPLE))
+        self.assertEqual(
+            [u.username for u in self.store.list_users()],
+            ["alice", "bob", "dave"],
+        )
+
+    def test_never_assigned_is_none(self) -> None:
+        self.assertIsNone(self.store.current_assignee(*self.TRIPLE))
+
+    def test_assignment_scoped_to_triple(self) -> None:
+        self.store.set_assignee(
+            self.TRIPLE[0], self.TRIPLE[1], self.TRIPLE[2],
+            "alice", "bob", CREATED,
+        )
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b")
+        )
+
+
+class TestThreading(StorageTestBase):
+    """Per-thread connections: writes in one thread visible in another."""
+
+    def test_write_in_worker_thread_visible_in_main_thread(self) -> None:
+        errors = []  # type: List[BaseException]
+
+        def worker() -> None:
+            try:
+                self.store.upsert_runs(
+                    [make_record(test_name="from_thread")]
+                )
+            except BaseException as exc:  # pragma: no cover - diagnostics
+                errors.append(exc)
+            finally:
+                # Each thread must close its own connection.
+                self.store.close()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        self.assertEqual(errors, [])
+        self.assertTrue(
+            self.store.test_exists("linux-sim", "suite.py", "from_thread")
+        )
+
+    def test_close_is_per_thread_and_reopens_lazily(self) -> None:
+        self.store.upsert_runs([make_record()])
+        self.store.close()
+        self.store.close()  # double close is harmless
+        # A subsequent call lazily reopens the calling thread's connection.
+        self.assertTrue(
+            self.store.test_exists("linux-sim", "suite.py", "test_a")
+        )
+
+
+class TestLargeBatch(StorageTestBase):
+    """5000-record import in one call must be fast (single transaction)."""
+
+    def test_5000_runs_import_under_10_seconds(self) -> None:
+        minute = datetime.timedelta(minutes=1)
+        records = []  # type: List[RunRecord]
+        for i in range(5000):
+            records.append(
+                make_record(
+                    script="suite_{}.py".format(i % 10),
+                    test_name="test_{}".format(i % 50),
+                    start=BASE + i * minute,
+                    result=Result.PASS if i % 3 else Result.FAIL,
+                    output="line one\nline two for run {}\n".format(i),
+                )
+            )
+        started = time.monotonic()
+        counts = self.store.upsert_runs(records)
+        elapsed = time.monotonic() - started
+        self.assertEqual(
+            counts, storage.UpsertCounts(inserted=5000, updated=0)
+        )
+        self.assertLess(
+            elapsed,
+            10.0,
+            "5000-record batch took {:.2f}s (must be < 10s)".format(elapsed),
+        )
+        # i % 10 is determined by i % 50, so there are exactly 50 distinct
+        # (script, test_name) pairs -> 50 dashboard rows.
+        self.assertEqual(len(self.store.dashboard()), 50)
+
+
+class TestPreviousResult(StorageTestBase):
+    """latest_runs.prev_result, the pair every triage queue is built on."""
+
+    def prev_result(self) -> Optional[str]:
+        """Read prev_result straight out of the table, bypassing the API."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT prev_result FROM latest_runs"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_start_time_index_created(self) -> None:
+        """Migrations add the covering (start_time, result) trend index."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+        finally:
+            conn.close()
+        self.assertIn("idx_runs_start_time_result", names)
+        self.assertNotIn("idx_runs_start_time", names)
+        self.assertIn("idx_latest_runs_result", names)
+
+    def test_single_run_has_no_prev(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        self.assertIsNone(self.prev_result())
+
+    def test_prev_is_run_immediately_before_latest(self) -> None:
+        """prev_result is the second-newest run, not any older one."""
+        self.store.upsert_runs([
+            make_record(result=Result.PASS, start=BASE),
+            make_record(
+                result=Result.FAILED_AS_EXPECTED,
+                start=BASE + datetime.timedelta(days=1),
+            ),
+            make_record(
+                result=Result.FAIL,
+                start=BASE + datetime.timedelta(days=2),
+            ),
+        ])
+        self.assertEqual(self.prev_result(), "FAILED_AS_EXPECTED")
+
+    def test_prev_tracks_separate_nightly_imports(self) -> None:
+        """The common path: one batch per night, each its own transaction."""
+        for offset, result in enumerate(
+            [Result.PASS, Result.PASS, Result.FAIL]
+        ):
+            self.store.upsert_runs([make_record(
+                result=result, start=BASE + datetime.timedelta(days=offset)
+            )])
+        self.assertEqual(self.prev_result(), "PASS")
+
+    def test_reimporting_the_latest_run_keeps_its_predecessor(self) -> None:
+        """A corrected re-import changes result, never prev_result."""
+        newer = BASE + datetime.timedelta(days=1)
+        self.store.upsert_runs([
+            make_record(result=Result.PASS, start=BASE),
+            make_record(result=Result.FAIL, start=newer),
+        ])
+        self.store.upsert_runs([
+            make_record(result=Result.FAILED_AS_EXPECTED, start=newer)
+        ])
+        self.assertEqual(self.prev_result(), "PASS")
+        self.assertIs(
+            self.store.dashboard()[0].result, Result.FAILED_AS_EXPECTED
+        )
+
+    def test_backfilled_run_becomes_the_new_predecessor(self) -> None:
+        """A late arrival that lands between two runs re-derives the pair."""
+        self.store.upsert_runs([
+            make_record(result=Result.PASS, start=BASE),
+            make_record(
+                result=Result.FAIL,
+                start=BASE + datetime.timedelta(days=2),
+            ),
+        ])
+        self.assertEqual(self.prev_result(), "PASS")
+        self.store.upsert_runs([make_record(
+            result=Result.UNEXPECTED_PASS,
+            start=BASE + datetime.timedelta(days=1),
+        )])
+        self.assertEqual(self.prev_result(), "UNEXPECTED_PASS")
+
+    def test_first_sighting_derives_prev_from_existing_runs(self) -> None:
+        """Out-of-order arrival inside one batch still pairs correctly."""
+        self.store.upsert_runs([
+            make_record(
+                result=Result.FAIL,
+                start=BASE + datetime.timedelta(days=1),
+            ),
+            make_record(result=Result.PASS, start=BASE),
+        ])
+        self.assertEqual(self.prev_result(), "PASS")
+
+    def test_environments_listing(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-b"),
+            make_record(environment="env-a", test_name="test_b"),
+        ])
+        self.assertEqual(self.store.environments(), ["env-a", "env-b"])
+
+    def test_scripts_listing(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-b", script="z.py"),
+            make_record(environment="env-a", script="a.py"),
+            make_record(environment="env-a", script="m.py"),
+        ])
+        self.assertEqual(self.store.scripts(), ["a.py", "m.py", "z.py"])
+        self.assertEqual(
+            self.store.scripts(environment="env-a"), ["a.py", "m.py"]
+        )
+
+
+class TestLatestRunsMaintenance(StorageTestBase):
+    """latest_runs stays in lockstep with upserts, including backfills."""
+
+    def latest_pointer(self) -> Optional[tuple]:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT run_id, start_time FROM latest_runs WHERE "
+                "environment = 'linux-sim' AND script = 'suite.py' "
+                "AND test_name = 'test_a'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def test_insert_creates_pointer(self) -> None:
+        self.store.upsert_runs([make_record()])
+        pointer = self.latest_pointer()
+        self.assertIsNotNone(pointer)
+        self.assertEqual(pointer[1], model.format_iso(BASE))
+
+    def test_newer_run_moves_pointer(self) -> None:
+        self.store.upsert_runs([make_record(start=BASE)])
+        newer = BASE + datetime.timedelta(days=1)
+        self.store.upsert_runs([
+            make_record(start=newer, result=Result.FAIL)
+        ])
+        self.assertEqual(self.latest_pointer()[1], model.format_iso(newer))
+        rows = self.store.dashboard()
+        self.assertIs(rows[0].result, Result.FAIL)
+
+    def test_backfilled_older_run_leaves_pointer(self) -> None:
+        self.store.upsert_runs([make_record(start=BASE)])
+        older = BASE - datetime.timedelta(days=7)
+        self.store.upsert_runs([
+            make_record(start=older, result=Result.FAIL)
+        ])
+        self.assertEqual(self.latest_pointer()[1], model.format_iso(BASE))
+        rows = self.store.dashboard()
+        self.assertIs(rows[0].result, Result.PASS)
+
+    def test_reimport_of_latest_updates_in_place(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.PASS)])
+        before = self.latest_pointer()
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        after = self.latest_pointer()
+        self.assertEqual(before, after)  # same row, same time
+        rows = self.store.dashboard()
+        self.assertIs(rows[0].result, Result.FAIL)
+
+
+class TestDailyResultCounts(StorageTestBase):
+    """Per-day, per-result run counts for the trend chart."""
+
+    def test_groups_by_day_and_result(self) -> None:
+        day2 = BASE + datetime.timedelta(days=1)
+        self.store.upsert_runs([
+            make_record(test_name="t1", start=BASE),
+            make_record(test_name="t2", start=BASE, result=Result.FAIL),
+            make_record(test_name="t3", start=BASE),
+            make_record(test_name="t1", start=day2, result=Result.FAIL),
+        ])
+        counts = self.store.daily_result_counts(
+            BASE - datetime.timedelta(days=1)
+        )
+        as_tuples = [(c.day, c.result, c.count) for c in counts]
+        self.assertEqual(as_tuples, [
+            (BASE.date(), Result.FAIL, 1),
+            (BASE.date(), Result.PASS, 2),
+            (day2.date(), Result.FAIL, 1),
+        ])
+
+    def test_since_is_inclusive_lower_bound(self) -> None:
+        day2 = BASE + datetime.timedelta(days=1)
+        self.store.upsert_runs([
+            make_record(test_name="t1", start=BASE),
+            make_record(test_name="t1", start=day2),
+        ])
+        counts = self.store.daily_result_counts(day2)
+        self.assertEqual(
+            [(c.day, c.count) for c in counts], [(day2.date(), 1)]
+        )
+
+    def test_environment_filter(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-a", start=BASE),
+            make_record(environment="env-b", start=BASE),
+        ])
+        counts = self.store.daily_result_counts(
+            BASE - datetime.timedelta(days=1), environment="env-a"
+        )
+        self.assertEqual([(c.day, c.count) for c in counts],
+                         [(BASE.date(), 1)])
+
+
+class TestDescribeOpenError(unittest.TestCase):
+    """A failure to open the database must name the cause AND the fix.
+
+    "Check that the directory exists and is writable" is wrong advice
+    for a corrupt file, a locked database or a full disk — and an
+    operator reading it should not have to work out which one they hit.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="testboard-openerr-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def describe(self, path: str, message: str) -> str:
+        return storage.describe_open_error(
+            path, sqlite3.OperationalError(message)
+        )
+
+    def test_not_a_database_suggests_the_path_or_a_restore(self) -> None:
+        path = os.path.join(self.tmp, "junk.db")
+        with open(path, "wb") as handle:
+            handle.write(b"not a database at all")
+        text = self.describe(path, "file is not a database")
+        self.assertIn("not a SQLite database", text)
+        self.assertIn("backup", text)
+        self.assertNotIn("writable", text)
+
+    def test_corruption_suggests_recovery(self) -> None:
+        text = self.describe(
+            os.path.join(self.tmp, "x.db"), "database disk image is malformed"
+        )
+        self.assertIn("corrupt", text)
+        self.assertIn(".recover", text)
+
+    def test_full_disk_points_at_the_prune_tool(self) -> None:
+        text = self.describe(
+            os.path.join(self.tmp, "x.db"), "database or disk is full"
+        )
+        self.assertIn("full", text)
+        self.assertIn("prune_runs.py", text)
+
+    def test_locked_explains_the_contention(self) -> None:
+        text = self.describe(
+            os.path.join(self.tmp, "x.db"), "database is locked"
+        )
+        self.assertIn("locked by another process", text)
+
+    def test_missing_directory_is_named_with_the_mkdir(self) -> None:
+        missing = os.path.join(self.tmp, "no", "such", "dir")
+        text = self.describe(
+            os.path.join(missing, "x.db"), "unable to open database file"
+        )
+        self.assertIn("does not exist", text)
+        self.assertIn("mkdir", text)
+        self.assertIn(missing, text)
+
+    def test_directory_given_instead_of_a_file(self) -> None:
+        path = os.path.join(self.tmp, "adir.db")
+        os.mkdir(path)
+        text = self.describe(path, "unable to open database file")
+        self.assertIn("is a directory", text)
+
+    def test_unrecognised_error_still_quotes_sqlite(self) -> None:
+        text = self.describe(
+            os.path.join(self.tmp, "x.db"), "something entirely new"
+        )
+        self.assertIn("something entirely new", text)
+
+
+class TestSchemaVersionGuard(StorageTestBase):
+    """A database from a newer testboard is refused, not silently used."""
+
+    def test_newer_schema_is_refused_with_both_versions(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("UPDATE schema_version SET version = ?",
+                         (storage.MIGRATIONS[-1][0] + 5,))
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(RuntimeError) as caught:
+            Storage(self.db_path).close()
+        message = str(caught.exception)
+        self.assertIn("NEWER version", message)
+        self.assertIn(str(storage.MIGRATIONS[-1][0] + 5), message)
+
+    def test_schema_is_created_by_a_single_migration(self) -> None:
+        """Nothing is deployed, so there is no migration history to keep."""
+        self.assertEqual(len(storage.MIGRATIONS), 1)
+        self.assertEqual(storage.MIGRATIONS[0][0], 1)
+
+
+class EstateTestBase(StorageTestBase):
+    """A seeded estate covering every triage classification.
+
+    Each test gets two nights so the latest/previous pair is meaningful:
+    ``NIGHT_1`` then ``NIGHT_2``, except ``test_first_fail`` which only
+    ever ran once (so its previous result is NULL).
+    """
+
+    NIGHT_1 = BASE
+    NIGHT_2 = BASE + datetime.timedelta(days=1)
+
+    #: name -> (previous result, latest result)
+    ESTATE = {
+        "test_steady": (Result.PASS, Result.PASS),
+        "test_new_fail": (Result.PASS, Result.FAIL),
+        "test_still_fail": (Result.FAIL, Result.FAIL),
+        "test_fixed": (Result.FAIL, Result.PASS),
+        "test_stale_note": (Result.FAILED_AS_EXPECTED,
+                            Result.UNEXPECTED_PASS),
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        records = []  # type: List[RunRecord]
+        for name, (previous, latest) in sorted(self.ESTATE.items()):
+            records.append(make_record(
+                test_name=name, result=previous, start=self.NIGHT_1
+            ))
+            records.append(make_record(
+                test_name=name, result=latest, start=self.NIGHT_2
+            ))
+        # Ran for the first time last night: no previous result at all.
+        records.append(make_record(
+            test_name="test_first_fail", result=Result.FAIL,
+            start=self.NIGHT_2,
+        ))
+        # Stopped being reported, and a human has approved that. It is
+        # failing AND stale, so it would show up in several places if
+        # retirement were not applied everywhere.
+        records.append(make_record(
+            test_name="test_deleted", result=Result.FAIL,
+            start=self.NIGHT_1,
+        ))
+        self.store.upsert_runs(records)
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_deleted", True, "alice",
+            "Removed from the suite in release 4.2.", CREATED,
+        )
+
+
+class TestStatusQueues(EstateTestBase):
+    """The SQL triage queues, and that they agree with the pure classifier."""
+
+    def queue_names(self, kind: str, **kwargs: object) -> List[str]:
+        return [
+            row.test_name
+            for row in self.store.status_queue(kind, **kwargs)
+        ]
+
+    def test_new_failures_includes_first_ever_run(self) -> None:
+        self.assertEqual(
+            self.queue_names("new_failures"),
+            ["test_first_fail", "test_new_fail"],
+        )
+
+    def test_still_failing(self) -> None:
+        self.assertEqual(
+            self.queue_names("still_failing"), ["test_still_fail"]
+        )
+
+    def test_fixed(self) -> None:
+        self.assertEqual(self.queue_names("fixed"), ["test_fixed"])
+
+    def test_unexpected_passes(self) -> None:
+        self.assertEqual(
+            self.queue_names("unexpected_passes"), ["test_stale_note"]
+        )
+
+    def test_assigned_spans_fail_and_unexpected_pass(self) -> None:
+        for name in ("test_steady", "test_still_fail", "test_stale_note"):
+            self.store.set_assignee(
+                "linux-sim", "suite.py", name, "alice", "bob", CREATED
+            )
+        # test_steady is assigned but passing, so it is not an open action.
+        self.assertEqual(
+            self.queue_names("assigned"),
+            ["test_stale_note", "test_still_fail"],
+        )
+
+    def test_assignee_filter_is_applied_in_sql(self) -> None:
+        """"My actions" must not be a client-side filter of a capped list."""
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_still_fail", "alice", "bob",
+            CREATED,
+        )
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_new_fail", "carol", "bob",
+            CREATED,
+        )
+        self.assertEqual(
+            self.queue_names("assigned", assignee="alice"),
+            ["test_still_fail"],
+        )
+        self.assertEqual(
+            self.store.status_queue_count("assigned", assignee="carol"), 1
+        )
+
+    def test_not_run_queue_is_where_retirement_happens(self) -> None:
+        """Stale tests get their own queue — the one with the approve action."""
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        names = self.queue_names("not_run", stale_before=cutoff)
+        # Every test except the ones that ran on NIGHT_2, and never the
+        # retired one (which is the point: approving it clears it here).
+        self.assertNotIn("test_deleted", names)
+        self.assertNotIn("test_first_fail", names)
+        self.assertEqual(
+            self.store.status_queue_count(
+                "not_run", stale_before=cutoff),
+            len(names),
+        )
+
+    def test_counts_match_the_pure_classifier(self) -> None:
+        """The SQL predicates and summarize_rollup must define the same thing.
+
+        These are two independent implementations of "new failure",
+        "still failing" and "fixed" — one in SQL over latest_runs, one in
+        Python over the rollup counts. This test is what stops them
+        drifting apart, on an estate small enough that no queue cap
+        applies.
+        """
+        status = analytics.summarize_rollup(
+            self.store.summary_rollup(self.NIGHT_1),
+            self.store.assigned_open_count(),
+        ).status
+        for kind, expected in (
+            ("new_failures", status.new_failures),
+            ("still_failing", status.still_failing),
+            ("fixed", status.fixed),
+            ("unexpected_passes", status.results[Result.UNEXPECTED_PASS]),
+            ("assigned", status.assigned_open),
+        ):
+            self.assertEqual(
+                self.store.status_queue_count(kind), expected,
+                "queue {!r} disagrees with the rollup".format(kind),
+            )
+            self.assertEqual(
+                len(self.store.status_queue(kind)), expected,
+                "queue {!r} rows disagree with its count".format(kind),
+            )
+
+    def test_environment_scoping(self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        self.assertEqual(
+            self.store.status_queue_count("new_failures"), 3
+        )
+        self.assertEqual(
+            self.queue_names("new_failures", environment="win-sim"),
+            ["test_win_fail"],
+        )
+
+    def test_limit_caps_rows_but_not_the_count(self) -> None:
+        self.assertEqual(
+            len(self.store.status_queue("new_failures", limit=1)), 1
+        )
+        self.assertEqual(
+            self.store.status_queue_count("new_failures"), 2
+        )
+
+    def test_unknown_kind_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.status_queue("everything")
+
+    def test_retired_tests_are_absent_from_every_queue(self) -> None:
+        """A retired test is failing and stale, and appears nowhere."""
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        for kind in storage.QUEUE_KINDS:
+            self.assertNotIn(
+                "test_deleted",
+                self.queue_names(kind, stale_before=cutoff),
+                "retired test leaked into the {!r} queue".format(kind),
+            )
+            self.assertNotIn("test_deleted", [
+                row.test_name
+                for row in self.store.dashboard(limit=100)
+            ])
+
+    def test_retired_test_is_still_reachable_when_asked_for(self) -> None:
+        """Retirement hides a test from the estate; it does not erase it."""
+        names = [
+            row.test_name
+            for row in self.store.dashboard(include_retired=True, limit=100)
+        ]
+        self.assertIn("test_deleted", names)
+        self.assertTrue(
+            self.store.is_retired("linux-sim", "suite.py", "test_deleted")
+        )
+        # Its history and its comment thread are untouched.
+        self.assertEqual(
+            len(self.store.run_history(
+                "linux-sim", "suite.py", "test_deleted", limit=10)),
+            1,
+        )
+        comments = self.store.comments(
+            "linux-sim", "suite.py", "test_deleted")
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].author, "alice")
+        self.assertIn("release 4.2", comments[0].text)
+
+    def test_retired_test_returns_when_it_runs_again(self) -> None:
+        """A test that reports a run is back in the suite, automatically."""
+        self.store.upsert_runs([make_record(
+            test_name="test_deleted", result=Result.PASS,
+            start=self.NIGHT_2 + datetime.timedelta(days=1),
+        )])
+        self.assertFalse(
+            self.store.is_retired("linux-sim", "suite.py", "test_deleted")
+        )
+        self.assertIn("test_deleted", [
+            row.test_name for row in self.store.dashboard(limit=100)
+        ])
+        # ...and the thread says why the approval lapsed.
+        texts = [
+            c.text for c in
+            self.store.comments("linux-sim", "suite.py", "test_deleted")
+        ]
+        self.assertTrue(
+            any("un-retired" in text for text in texts), texts
+        )
+
+    def test_retiring_is_reversible_by_hand(self) -> None:
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_deleted", False, "bob",
+            "Actually it was only skipped; putting it back.", CREATED,
+        )
+        self.assertFalse(
+            self.store.is_retired("linux-sim", "suite.py", "test_deleted")
+        )
+        # It has a single FAIL run, so it comes back as a first failure.
+        self.assertIn("test_deleted", self.queue_names("new_failures"))
+
+    def test_summary_rollup_cells(self) -> None:
+        cells = {
+            (c.result, c.prev_result): c.count
+            for c in self.store.summary_rollup(self.NIGHT_1)
+        }
+        self.assertEqual(cells[(Result.FAIL, Result.PASS)], 1)
+        self.assertEqual(cells[(Result.FAIL, Result.FAIL)], 1)
+        self.assertEqual(cells[(Result.FAIL, None)], 1)
+        self.assertEqual(cells[(Result.PASS, Result.FAIL)], 1)
+
+    def test_top_failing_scripts(self) -> None:
+        self.store.upsert_runs([make_record(
+            script="other.py", test_name="test_o", result=Result.FAIL,
+            start=self.NIGHT_2,
+        )])
+        top = self.store.top_failing_scripts()
+        self.assertEqual(
+            [(s.script, s.failing) for s in top],
+            [("suite.py", 3), ("other.py", 1)],
+        )
+        self.assertEqual(len(self.store.top_failing_scripts(limit=1)), 1)
+
+
+class TestFailureStreakBounds(StorageTestBase):
+    """failing_since / last_pass_before, via index seeks over the history."""
+
+    def seed(self, results: List[Result]) -> datetime.datetime:
+        """Import one run per day, oldest first; return the latest start."""
+        records = []  # type: List[RunRecord]
+        for offset, result in enumerate(results):
+            records.append(make_record(
+                result=result, start=BASE + datetime.timedelta(days=offset)
+            ))
+        self.store.upsert_runs(records)
+        return BASE + datetime.timedelta(days=len(results) - 1)
+
+    def bounds(self, results: List[Result]) -> storage.FailureStreak:
+        latest = self.seed(results)
+        return self.store.failure_streak_bounds(
+            "linux-sim", "suite.py", "test_a", latest
+        )
+
+    def test_streak_starts_after_the_last_non_fail(self) -> None:
+        streak = self.bounds([
+            Result.PASS, Result.PASS, Result.FAIL, Result.FAIL
+        ])
+        self.assertEqual(
+            streak.failing_since, BASE + datetime.timedelta(days=2)
+        )
+        self.assertEqual(
+            streak.last_pass_before, BASE + datetime.timedelta(days=1)
+        )
+
+    def test_single_failing_run(self) -> None:
+        streak = self.bounds([Result.PASS, Result.FAIL])
+        self.assertEqual(
+            streak.failing_since, BASE + datetime.timedelta(days=1)
+        )
+        self.assertEqual(streak.last_pass_before, BASE)
+
+    def test_never_passed(self) -> None:
+        streak = self.bounds([Result.FAIL, Result.FAIL])
+        self.assertEqual(streak.failing_since, BASE)
+        self.assertIsNone(streak.last_pass_before)
+
+    def test_non_fail_results_bound_the_streak_without_being_a_pass(
+        self
+    ) -> None:
+        """FAILED_AS_EXPECTED ends a streak but is not the "last pass"."""
+        streak = self.bounds([
+            Result.PASS, Result.FAILED_AS_EXPECTED, Result.FAIL
+        ])
+        self.assertEqual(
+            streak.failing_since, BASE + datetime.timedelta(days=2)
+        )
+        self.assertEqual(streak.last_pass_before, BASE)
+
+    def test_streak_is_not_truncated_by_history_length(self) -> None:
+        """A long-broken test reports its true start, however far back."""
+        streak = self.bounds([Result.PASS] + [Result.FAIL] * 300)
+        self.assertEqual(
+            streak.failing_since, BASE + datetime.timedelta(days=1)
+        )
+        self.assertEqual(streak.last_pass_before, BASE)
+
+
+class TestDashboardPaging(StorageTestBase):
+    """Server-side paging, sorting and counting for the test list."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_{:02d}".format(i),
+                        result=Result.FAIL if i % 5 == 0 else Result.PASS)
+            for i in range(30)
+        ])
+
+    def test_page_and_total(self) -> None:
+        rows = self.store.dashboard(limit=10)
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(rows[0].test_name, "test_00")
+        self.assertEqual(self.store.dashboard_count(), 30)
+
+    def test_offset_pages_without_gaps_or_repeats(self) -> None:
+        seen = []  # type: List[str]
+        for offset in range(0, 30, 7):
+            seen.extend(
+                row.test_name
+                for row in self.store.dashboard(limit=7, offset=offset)
+            )
+        self.assertEqual(len(seen), 30)
+        self.assertEqual(len(set(seen)), 30)
+        self.assertEqual(seen, sorted(seen))
+
+    def test_descending_sort(self) -> None:
+        rows = self.store.dashboard(
+            sort="test_name", descending=True, limit=3
+        )
+        self.assertEqual(
+            [r.test_name for r in rows],
+            ["test_29", "test_28", "test_27"],
+        )
+
+    def test_every_advertised_sort_key_works(self) -> None:
+        for key in storage.DASHBOARD_SORTS:
+            for descending in (False, True):
+                rows = self.store.dashboard(
+                    sort=key, descending=descending, limit=5
+                )
+                self.assertEqual(
+                    len(rows), 5, "sort {!r} returned no page".format(key)
+                )
+
+    def test_unknown_sort_key_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.dashboard(sort="output")
+
+    def test_count_matches_filters(self) -> None:
+        self.assertEqual(
+            self.store.dashboard_count(results=[Result.FAIL]), 6
+        )
+        self.assertEqual(self.store.dashboard_count(q="test_1"), 10)
+        self.assertEqual(self.store.dashboard_count(results=[]), 0)
+
+    def test_stale_filter(self) -> None:
+        """"Not run recently" keeps only tests whose latest run is old."""
+        self.store.upsert_runs([make_record(
+            test_name="test_fresh",
+            start=BASE + datetime.timedelta(days=10),
+        )])
+        cutoff = BASE + datetime.timedelta(days=5)
+        rows = self.store.dashboard(stale_before=cutoff, limit=100)
+        self.assertEqual(len(rows), 30)
+        self.assertNotIn("test_fresh", [r.test_name for r in rows])
+        self.assertEqual(self.store.dashboard_count(stale_before=cutoff), 30)
+
+
+class TestRunOutputs(StorageTestBase):
+    """Output lives in its own table so metadata reads never touch it."""
+
+    def test_output_column_removed_from_runs(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(runs)")
+            }
+            self.assertNotIn("output", columns)
+            self.assertIn(
+                "output",
+                {row[1] for row in
+                 conn.execute("PRAGMA table_info(run_outputs)")},
+            )
+        finally:
+            conn.close()
+
+    def test_output_round_trips(self) -> None:
+        self.store.upsert_runs([make_record(output="line one\nline two\n")])
+        run_id = self.store.dashboard()[0].run_id
+        self.assertEqual(
+            self.store.get_run(run_id).output, "line one\nline two\n"
+        )
+
+    def test_reimport_replaces_output(self) -> None:
+        self.store.upsert_runs([make_record(output="first\n")])
+        self.store.upsert_runs([make_record(output="corrected\n")])
+        run_id = self.store.dashboard()[0].run_id
+        self.assertEqual(self.store.get_run(run_id).output, "corrected\n")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM run_outputs"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            conn.close()
+
+    def test_output_is_stored_compressed(self) -> None:
+        """Log text is ~75% of the database at scale, so it is deflated."""
+        text = "2026-07-26 02:14:33 INFO harness: step done\n" * 400
+        self.store.upsert_runs([make_record(output=text)])
+        run_id = self.store.dashboard()[0].run_id
+        conn = sqlite3.connect(self.db_path)
+        try:
+            stored = conn.execute(
+                "SELECT output FROM run_outputs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertIsInstance(stored, bytes)
+        self.assertLess(len(stored), len(text.encode("utf-8")) // 4)
+        # ...and it comes back byte-for-byte.
+        self.assertEqual(self.store.get_run(run_id).output, text)
+
+    def test_unicode_output_round_trips(self) -> None:
+        text = "Ünïcödé ✓ — 日本語\ttab\r\nCRLF\n"
+        self.store.upsert_runs([make_record(output=text)])
+        run_id = self.store.dashboard()[0].run_id
+        self.assertEqual(self.store.get_run(run_id).output, text)
+
+    def test_empty_output_round_trips(self) -> None:
+        self.store.upsert_runs([make_record(output="")])
+        run_id = self.store.dashboard()[0].run_id
+        self.assertEqual(self.store.get_run(run_id).output, "")
+
+    def test_plain_text_output_still_reads(self) -> None:
+        """A row written before output was compressed must still read."""
+        self.store.upsert_runs([make_record()])
+        run_id = self.store.dashboard()[0].run_id
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE run_outputs SET output = ? WHERE run_id = ?",
+                ("legacy uncompressed text\n", run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            self.store.get_run(run_id).output,
+            "legacy uncompressed text\n",
+        )
+
+
+class TestPruneRuns(StorageTestBase):
+    """Retention: old runs go, the estate's current state does not."""
+
+    def seed_history(self, days: int = 10) -> None:
+        self.store.upsert_runs([
+            make_record(
+                test_name="test_a", start=BASE + datetime.timedelta(days=i),
+                output="output for day {}\n".format(i),
+            )
+            for i in range(days)
+        ] + [
+            # A test that stopped running long ago.
+            make_record(test_name="test_gone", start=BASE)
+        ])
+
+    def test_deletes_old_runs_and_their_outputs(self) -> None:
+        self.seed_history()
+        cutoff = BASE + datetime.timedelta(days=5)
+        deleted = self.store.prune_runs_before(cutoff)
+        self.assertEqual(deleted, 5)
+        remaining = self.store.run_history(
+            "linux-sim", "suite.py", "test_a", limit=100
+        )
+        self.assertEqual(len(remaining), 5)
+        self.assertTrue(all(r.start_time >= cutoff for r in remaining))
+        conn = sqlite3.connect(self.db_path)
+        try:
+            outputs = conn.execute(
+                "SELECT COUNT(*) FROM run_outputs"
+            ).fetchone()[0]
+            runs = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+            self.assertEqual(outputs, runs)
+        finally:
+            conn.close()
+
+    def test_never_deletes_a_tests_latest_run(self) -> None:
+        """A test that stopped running must still show as "not run"."""
+        self.seed_history()
+        self.store.prune_runs_before(BASE + datetime.timedelta(days=365))
+        names = [row.test_name for row in self.store.dashboard()]
+        self.assertIn("test_gone", names)
+        self.assertEqual(len(names), 2)
+
+    def test_prev_result_is_rederived(self) -> None:
+        """Pruning the run a status row pointed back at cannot leave a lie."""
+        self.store.upsert_runs([
+            make_record(result=Result.PASS, start=BASE),
+            make_record(
+                result=Result.FAIL,
+                start=BASE + datetime.timedelta(days=1),
+            ),
+        ])
+        self.store.prune_runs_before(BASE + datetime.timedelta(days=1))
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT prev_result FROM latest_runs"
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        # The test is now a first-ever failure rather than a regression.
+        self.assertEqual(
+            self.store.status_queue_count("still_failing"), 0
+        )
+        self.assertEqual(self.store.status_queue_count("new_failures"), 1)
+
+    def test_nothing_to_prune(self) -> None:
+        self.seed_history(days=3)
+        self.assertEqual(self.store.prune_runs_before(BASE), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

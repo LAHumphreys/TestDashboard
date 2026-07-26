@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Test detail — testboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html">Dashboard</a>
+      <a href="actions.html">Open actions</a>
+    </nav>
+    <div id="user-widget" class="user-widget"></div>
+  </header>
+
+  <main>
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <section id="test-header">
+      <h1 id="test-title">Test detail</h1>
+      <p id="test-identity" class="muted identity-line"></p>
+      <p id="source-line" hidden>Source: <a id="source-link" rel="noopener" hidden></a><span id="source-text" hidden></span></p>
+      <div class="assignee-box">
+        <label for="assignee-select">Assignee</label>
+        <select id="assignee-select" disabled></select>
+        <span id="assignee-status" class="muted" role="status"></span>
+      </div>
+      <div id="latest-run" class="latest-run"></div>
+      <!-- Why this failure is expected, when the import says so. -->
+      <div id="known-failure" class="known-failure" hidden></div>
+    </section>
+
+    <section id="analytics-section" hidden>
+      <h2>Analytics</h2>
+      <p id="window-info" class="muted"></p>
+      <div class="cards">
+        <div class="card">
+          <h3>Failing since</h3>
+          <div id="failing-since"></div>
+        </div>
+        <div class="card">
+          <h3>Flakiness</h3>
+          <div id="flakiness"></div>
+        </div>
+        <div class="card">
+          <h3>Duration</h3>
+          <div id="duration-stats"></div>
+        </div>
+      </div>
+      <!-- Collapsed by default: these are the "dig deeper" views, and
+           leaving them open pushed the discussion below the fold. -->
+      <details id="charts-details" class="charts-details">
+        <summary class="charts-summary">Charts — results over time, and failure rate by weekday</summary>
+        <div class="detail-chart-grid">
+          <div class="card chart-card">
+            <h3>Results by day</h3>
+            <div id="by-day-chart"></div>
+            <p class="chart-caption">One column per day in the window. Gaps are days the test did not run.</p>
+            <details>
+              <summary>Data table</summary>
+              <table class="data-table small">
+                <thead>
+                  <tr>
+                    <th>Day</th>
+                    <th class="num">Passed</th>
+                    <th class="num">Failed</th>
+                    <th class="num">Expected fail</th>
+                    <th class="num">Unexpected pass</th>
+                  </tr>
+                </thead>
+                <tbody id="by-day-table-body"></tbody>
+              </table>
+            </details>
+          </div>
+
+          <div class="card chart-card">
+            <h3>Failure rate by day of week</h3>
+            <div id="dow-chart"></div>
+            <p class="chart-caption">Bar height = failure rate (FAIL only). Number under each day = runs in window.</p>
+            <details>
+              <summary>Data table</summary>
+              <table class="data-table small">
+                <thead>
+                  <tr>
+                    <th>Day</th>
+                    <th class="num">Runs</th>
+                    <th class="num">Failures</th>
+                    <th class="num">Failure rate</th>
+                    <th class="num">Unexpected passes</th>
+                  </tr>
+                </thead>
+                <tbody id="dow-table-body"></tbody>
+              </table>
+            </details>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- Discussion sits ABOVE the run history: what people have already
+         worked out about a test is the most useful thing on this page,
+         and nobody scrolls past a year of runs to find it. -->
+    <section id="comments-section" hidden>
+      <h2>Discussion</h2>
+      <form id="comment-form" class="comment-form">
+        <textarea id="comment-text" rows="2" placeholder="Add a comment — what did you find?" aria-label="New comment"></textarea>
+        <button type="submit">Post comment</button>
+      </form>
+      <p id="comments-empty" class="empty-state" hidden>No comments yet. If you work out what is wrong with this test, say so here.</p>
+      <div id="comments-list"></div>
+    </section>
+
+    <section id="run-output-section" hidden>
+      <h2>Run output</h2>
+      <p id="run-output-meta" class="muted"></p>
+      <pre id="run-output" class="output"></pre>
+    </section>
+
+    <section id="history-section" hidden>
+      <h2>History</h2>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Result</th>
+              <th>Start (UTC)</th>
+              <th class="num">Duration</th>
+              <th>Known failure reason</th>
+              <th>Output</th>
+            </tr>
+          </thead>
+          <tbody id="history-body"></tbody>
+        </table>
+      </div>
+      <p id="history-empty" class="empty-state" hidden>No runs recorded for this test.</p>
+      <button id="load-more" type="button" hidden>Load more</button>
+    </section>
+  </main>
+
+  <script type="module" src="test.js"></script>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>testboard — suite history</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="home">
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html">Dashboard</a>
+      <a href="actions.html">Open actions</a>
+    </nav>
+    <div id="user-widget" class="user-widget"></div>
+  </header>
+
+  <main class="wide">
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <section id="script-header">
+      <h1 id="script-title">Suite history</h1>
+      <p id="script-identity" class="muted identity-line"></p>
+    </section>
+
+    <section class="toolbar" aria-label="Window">
+      <label>Window
+        <select id="filter-days">
+          <option value="7">Last 7 days</option>
+          <option value="14" selected>Last 14 days</option>
+          <option value="30">Last 30 days</option>
+          <option value="90">Last 90 days</option>
+        </select>
+      </label>
+      <span class="toolbar-spacer"></span>
+      <button id="reload-btn" type="button">Refresh</button>
+    </section>
+
+    <section id="executions-section" aria-labelledby="executions-heading">
+      <div class="section-head">
+        <h2 id="executions-heading" class="eyebrow">Executions</h2>
+        <span id="executions-meta" class="muted"></span>
+      </div>
+      <!-- One bar per execution of the suite, NOT per calendar day: a
+           suite that ran twice in a day gets two bars. -->
+      <div class="chart-card">
+        <div id="executions-chart"></div>
+        <p id="executions-note" class="chart-note"></p>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table" id="executions-table">
+          <thead>
+            <tr>
+              <th>Started (UTC)</th>
+              <th class="num">Tests</th>
+              <th class="num">Failed</th>
+              <th class="num">Pass rate</th>
+              <th class="num">Wall clock</th>
+              <th>Breakdown</th>
+            </tr>
+          </thead>
+          <tbody id="executions-body"></tbody>
+        </table>
+      </div>
+      <p id="loading-state" class="muted">Loading…</p>
+      <p id="empty-state" class="empty-state" hidden>No runs of this suite in the selected window.</p>
+    </section>
+
+    <section id="tests-section" aria-labelledby="tests-heading">
+      <div class="section-head">
+        <h2 id="tests-heading" class="eyebrow">Tests in this suite</h2>
+        <span id="tests-meta" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Test</th>
+              <th>Latest result</th>
+              <th>Last run (UTC)</th>
+              <th>Assignee</th>
+            </tr>
+          </thead>
+          <tbody id="tests-body"></tbody>
+        </table>
+      </div>
+      <div class="browse-footer">
+        <span id="tests-count" class="muted"></span>
+        <button id="show-more" type="button" hidden>Show more</button>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="script.js"></script>
+</body>
+</html>

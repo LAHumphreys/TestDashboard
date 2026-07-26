@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>testboard — dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="home">
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html" aria-current="page">Dashboard</a>
+      <a href="actions.html">Open actions</a>
+    </nav>
+    <div id="user-widget" class="user-widget"></div>
+  </header>
+
+  <main class="wide">
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <!-- The one filter row: scopes every section below it. -->
+    <section class="toolbar" aria-label="Scope">
+      <label class="toolbar-field">Environment
+        <select id="filter-environment" aria-label="Environment filter"></select>
+      </label>
+      <span id="refreshed-at" class="muted toolbar-meta"></span>
+      <button id="reload-btn" type="button">Refresh</button>
+    </section>
+
+    <p id="loading-state" class="empty-state">Loading…</p>
+
+    <!-- ============ Last night ============ -->
+    <section id="status-section" aria-labelledby="status-heading" hidden>
+      <div class="section-head">
+        <h2 id="status-heading" class="eyebrow">Last night</h2>
+        <span id="status-meta" class="muted"></span>
+      </div>
+      <div id="stat-tiles" class="tile-row"></div>
+    </section>
+
+    <!-- ============ Charts ============ -->
+    <section id="charts-section" aria-label="Charts" hidden>
+      <div class="chart-grid">
+        <div class="card">
+          <!-- Per DAY, not per night: a suite can run more than once in
+               a day, and this chart counts runs in a calendar day. Open a
+               suite's page for its individual executions. -->
+          <h3>Failing runs per day</h3>
+          <div id="trend-chart"></div>
+          <details>
+            <summary>Data table</summary>
+            <table class="data-table small">
+              <thead>
+                <tr>
+                  <th>Night</th>
+                  <th class="num">Failed</th>
+                  <th class="num">Unexpected pass</th>
+                  <th class="num">Runs</th>
+                </tr>
+              </thead>
+              <tbody id="trend-table-body"></tbody>
+            </table>
+          </details>
+        </div>
+        <div class="card">
+          <h3>Failing tests by environment</h3>
+          <div id="env-chart"></div>
+          <p id="env-chart-empty" class="empty-state" hidden>No failing tests. 🎉</p>
+          <p class="chart-caption">Tests whose latest run failed. Click an environment to scope the page to it.</p>
+        </div>
+        <div class="card">
+          <h3>Most-failing scripts</h3>
+          <div id="scripts-chart"></div>
+          <p id="scripts-chart-empty" class="empty-state" hidden>No failing scripts.</p>
+          <p class="chart-caption">Click a script to open it in the test list below.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ Triage queues ============ -->
+    <section id="triage-section" aria-labelledby="triage-heading" hidden>
+      <div class="section-head">
+        <h2 id="triage-heading" class="eyebrow">Triage</h2>
+        <span id="triage-meta" class="muted"></span>
+      </div>
+      <div id="queue-tabs" class="tab-row" role="tablist" aria-label="Triage queues"></div>
+      <div id="all-clear" class="all-clear" hidden>
+        <span class="all-clear-mark" aria-hidden="true">✓</span>
+        <div>
+          <strong>All clear.</strong>
+          <span class="muted">No new failures, nothing still failing, no stale annotations.</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="queue-table" hidden>
+          <thead><tr id="queue-head-row"></tr></thead>
+          <tbody id="queue-body"></tbody>
+        </table>
+      </div>
+      <p id="queue-empty" class="empty-state" hidden></p>
+      <p id="queue-cap-note" class="muted cap-note" hidden></p>
+    </section>
+
+    <!-- ============ All tests (browse) ============ -->
+    <section id="browse-section" aria-labelledby="browse-heading" hidden>
+      <div class="section-head">
+        <h2 id="browse-heading" class="eyebrow">All tests</h2>
+        <span id="browse-meta" class="muted"></span>
+      </div>
+      <div class="filter-row" aria-label="Test list filters">
+        <label>Script
+          <select id="filter-script"></select>
+        </label>
+        <div id="result-toggles" class="result-toggles" role="group" aria-label="Filter by result"></div>
+        <button id="stale-toggle" class="toggle" type="button" aria-pressed="false">Not run recently</button>
+        <button id="retired-toggle" class="toggle" type="button" aria-pressed="false">Include retired</button>
+        <input id="filter-q" type="search" placeholder="Search test name…" autocomplete="off" aria-label="Search test name">
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="dashboard-table">
+          <thead>
+            <tr>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="environment">Environment<span class="sort-arrow"></span></button></th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="script">Script<span class="sort-arrow"></span></button></th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="test_name">Test<span class="sort-arrow"></span></button></th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="result">Result<span class="sort-arrow"></span></button></th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="start_time">Last run (UTC)<span class="sort-arrow"></span></button></th>
+              <th aria-sort="none" class="num"><button type="button" class="sort-btn" data-key="duration">Duration<span class="sort-arrow"></span></button></th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="assignee">Assignee<span class="sort-arrow"></span></button></th>
+              <th>Output</th>
+            </tr>
+          </thead>
+          <tbody id="dashboard-body"></tbody>
+        </table>
+      </div>
+      <p id="empty-state" class="empty-state" hidden>No tests match the current filters.</p>
+      <div class="browse-footer">
+        <span id="browse-count" class="muted"></span>
+        <button id="show-more" type="button" hidden>Show more</button>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

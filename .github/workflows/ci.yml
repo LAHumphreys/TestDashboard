@@ -1,0 +1,40 @@
+# CI for testboard.
+#
+# Two jobs:
+#   - modern:         proves the suite runs warning-clean on current Pythons (dev machines).
+#   - python36-rhel8: THE AUTHORITATIVE GATE. Runs inside Red Hat's ubi8/python-36
+#                     container — the exact RHEL 8 platform Python (3.6.8) the
+#                     production server uses. Dev machines run newer interpreters,
+#                     so this job is how 3.6 compatibility is really verified.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  modern:
+    name: Python ${{ matrix.python-version }} (ubuntu)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run test suite
+        run: python -m unittest discover -v
+
+  python36-rhel8:
+    name: Python 3.6.8 (RHEL 8 ubi8 container — authoritative target)
+    runs-on: ubuntu-latest
+    container: registry.access.redhat.com/ubi8/python-36
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show interpreter version
+        run: python3 --version
+      - name: Run test suite
+        run: python3 -m unittest discover -v
