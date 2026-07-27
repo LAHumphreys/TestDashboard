@@ -27,7 +27,7 @@ these are the ones that get forgotten:
 | # | Package | State | Commit |
 |---|---|---|---|
 | — | Plan + MariaDB runbook | **done** | *(this commit)* |
-| WP-0 | Migration registry guard | pending | |
+| WP-0 | Migration registry guard | **done** | `tests/test_migrations.py`, 19 tests |
 | WP-11 | Vendor PyMySQL | pending | |
 | WP-4 | Deactivate users (migration 2) | pending | |
 | WP-5 | `duration_seconds` (migration 3) | pending | |
@@ -61,3 +61,21 @@ tree otherwise clean at `964e0b4`.
 Still outstanding and **not** a code task: `tools/diagnose_db.py --compare-local`
 has not been run on production since the worker-pool fix. Every timing predating
 that fix describes a server that discarded its page cache every request.
+
+### WP-0 — migration registry guard — **done**
+
+`tests/test_migrations.py`, 19 tests. Migration 1 is pinned by a
+whitespace- and comment-insensitive SHA-256 of its DDL
+(`9b9dd4d0…`). Suite 808 → 827.
+
+Two things worth knowing if this file is ever revisited:
+
+- The first version of the fingerprint collapsed runs of whitespace but not
+  spacing *around punctuation*, so re-indenting the DDL changed the digest.
+  A freeze that trips on reformatting gets its constant updated as routine
+  maintenance and stops meaning anything. Caught by
+  `test_the_fingerprint_ignores_formatting_but_not_content`, which exists for
+  exactly that reason. The digest changed when it was fixed.
+- The planted regression was run for real, not just asserted at string level:
+  a `planted_column TEXT` added to entry 1 in `storage.py` fails
+  `test_migration_one_matches_what_was_deployed`. Verified, then reverted.
