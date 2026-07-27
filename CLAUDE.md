@@ -16,8 +16,10 @@ This is a greenfield project. The only content so far is two specification brief
 1. **Python 3.6 exactly.** No 3.7+ features. Specifically forbidden: `dataclasses` (use `typing.NamedTuple` class syntax), `http.server.ThreadingHTTPServer` (compose from `socketserver.ThreadingMixIn` + `http.server.HTTPServer`), `datetime.fromisoformat` (write one `strptime`-based ISO-8601 parser, unit-test it, use it everywhere), `subprocess.run(capture_output=...)`, `typing.Protocol`/`Literal`, walrus operator, positional-only params, `breakpoint()`, `contextlib.nullcontext`. f-strings and `async`/`await` are fine.
 2. **Standard library only.** No pip installs. `unittest` (not pytest), `sqlite3`, `http.server`, `json`, `urllib.request`.
 3. **No npm, no build step, no CDN.** Frontend is static HTML + vanilla ES6 JS + CSS served by the same process; assume browsers have no internet access.
-4. **Full type annotations** on every function/method (3.6-compatible). No `Any` except at JSON boundaries, converted to typed structures immediately.
+4. **Full type annotations** on every function/method (3.6-compatible). No `Any` except at JSON boundaries, converted to typed structures immediately. Use `typing.List`/`Dict`/`Optional` — **never** PEP 585 builtin generics (`list[str]`) or PEP 604 unions (`int | None`), which are a runtime `TypeError` on 3.6 while looking perfectly fine on a modern interpreter.
 5. **No global mutable state**; the storage object is injected into handlers.
+
+`tests/test_python36_compat.py` enforces constraints 1 and 4 statically on every test run, so a 3.6 violation fails the suite on whatever interpreter you are holding rather than waiting for the RHEL 8 CI job. It parses every file with `ast.parse(..., feature_version=(3, 6))`, rejects builtin generics *anywhere* (including `cast(list[str], x)` and module-level aliases), whitelists `typing` names against 3.6.0, forces every annotation to evaluate (3.14 defers them under PEP 649, so a green suite is otherwise no evidence), and keeps `run_server.py`/`run_feeder.py` free of inline annotations and f-strings so they still parse under Python 2. It carries planted-regression tests to prove the detectors can actually fail.
 
 ## Commands
 
