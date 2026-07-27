@@ -87,7 +87,12 @@ def make_fake_submitter(
 
 
 class ComputeSinceTest(unittest.TestCase):
-    """The compute_since matrix: backfill +/- since, daily +/- hwm, overlap."""
+    """The compute_since matrix: backfill +/- since, catchup +/- hwm, overlap.
+
+    What catchup mode *means* — that it resumes from the mark rather than
+    from today, and that ``daily`` remains an accepted alias — is pinned in
+    tests/test_feeder_range.py::ModeTest. This class is the arithmetic.
+    """
 
     def test_backfill_with_since_arg(self) -> None:
         """Backfill uses --since verbatim."""
@@ -108,24 +113,24 @@ class ComputeSinceTest(unittest.TestCase):
         )
         self.assertIsNone(run_feeder.compute_since("backfill", HWM, None, 1))
 
-    def test_daily_without_hwm_imports_everything(self) -> None:
-        """First daily run (no saved mark) has no lower bound."""
-        self.assertIsNone(run_feeder.compute_since("daily", None, None, 1))
+    def test_catchup_without_hwm_imports_everything(self) -> None:
+        """A first catchup run (no saved mark) has no lower bound."""
+        self.assertIsNone(run_feeder.compute_since("catchup", None, None, 1))
 
-    def test_daily_ignores_since_arg(self) -> None:
-        """Daily mode ignores --since even when given."""
+    def test_catchup_ignores_since_arg(self) -> None:
+        """Catchup mode ignores --since even when given."""
         since = datetime.datetime(2026, 1, 1)
-        self.assertIsNone(run_feeder.compute_since("daily", None, since, 1))
+        self.assertIsNone(run_feeder.compute_since("catchup", None, since, 1))
         self.assertEqual(
-            run_feeder.compute_since("daily", HWM, since, 1),
+            run_feeder.compute_since("catchup", HWM, since, 1),
             HWM - datetime.timedelta(days=1),
         )
 
-    def test_daily_subtracts_overlap_days(self) -> None:
-        """Daily mode rewinds the mark by --overlap-days."""
+    def test_catchup_subtracts_overlap_days(self) -> None:
+        """Catchup mode rewinds the mark by --overlap-days."""
         for overlap in (0, 1, 3):
             self.assertEqual(
-                run_feeder.compute_since("daily", HWM, None, overlap),
+                run_feeder.compute_since("catchup", HWM, None, overlap),
                 HWM - datetime.timedelta(days=overlap),
             )
 
@@ -473,7 +478,7 @@ class FirstRunFeedbackTest(CliTestBase):
     def test_no_arguments_shows_usage_and_a_command_to_copy(self) -> None:
         message = self.stderr_of([])
         self.assertIn("usage:", message)
-        self.assertIn("--url http://dashboard-host:8000 --mode daily",
+        self.assertIn("--url http://dashboard-host:8000 --mode catchup",
                       message)
 
     def test_no_arguments_points_at_the_wizard_and_the_help(self) -> None:
@@ -871,6 +876,153 @@ class ReaderFailureTest(CliTestBase):
         code, _ = self.run_main_with_fake(
             self.base_args() + ["--reader", spec], make_stats())
         self.assertEqual(code, 1)
+
+
+class WindowFlagTest(CliTestBase):
+    """--since / --until as the CLI sees them, and what it refuses."""
+
+    def error_of(self, argv: List[str]) -> Tuple[int, str]:
+        """Run main() and return (exit code, ERROR log text)."""
+        with self.capture_logs("ERROR") as caught:
+            code = run_feeder.main(argv)
+        return code, "\n".join(caught.output)
+
+    def test_both_bounds_reach_the_submitter(self) -> None:
+        source = self.write_jsonl([{"environment": "e"}])
+        _, created = self.run_main_with_fake(
+            self.base_args() + [
+                "--source", source,
+                "--since", "2024-08-01T00:00:00",
+                "--until", "2025-08-01T00:00:00"],
+            make_stats(read=1, valid=1, sent=1, inserted=1))
+        call = created[0].submit_calls[0]
+        self.assertEqual(call["since"], datetime.datetime(2024, 8, 1))
+        self.assertEqual(
+            call["options"]["until"], datetime.datetime(2025, 8, 1))
+
+    def test_the_window_is_stated_before_anything_is_read(self) -> None:
+        """So a mistyped bound is obvious in the log, not in the results."""
+        source = self.write_jsonl([{"environment": "e"}])
+        fake_cls, _ = make_fake_submitter(make_stats(), None)
+        with mock.patch("feeder.submitter.Submitter", fake_cls):
+            with self.capture_logs() as caught:
+                run_feeder.main(self.base_args() + [
+                    "--source", source,
+                    "--since", "2024-08-01T00:00:00",
+                    "--until", "2025-08-01T00:00:00"])
+        self.assertIn("[2024-08-01T00:00:00.000000", "\n".join(caught.output))
+
+    def test_an_inverted_window_is_refused_with_the_rule(self) -> None:
+        """Exclusivity is the thing to explain here, not the ordering."""
+        code, message = self.error_of(
+            self.base_args() + ["--since", "2025-01-01T00:00:00",
+                                "--until", "2024-01-01T00:00:00"])
+        self.assertEqual(code, 2)
+        self.assertIn("--until is exclusive", message)
+
+    def test_an_empty_window_is_refused(self) -> None:
+        code, message = self.error_of(
+            self.base_args() + ["--since", "2025-01-01T00:00:00",
+                                "--until", "2025-01-01T00:00:00"])
+        self.assertEqual(code, 2)
+        self.assertIn("window is empty", message)
+
+    def test_until_in_catchup_mode_is_refused_not_ignored(self) -> None:
+        """Silently ignoring it would stall the feed at that date forever."""
+        code, message = self.error_of(
+            self.base_args("catchup") + ["--until", "2025-01-01T00:00:00"])
+        self.assertEqual(code, 2)
+        self.assertIn("only applies to --mode backfill", message)
+
+    def test_a_bare_date_is_rejected_with_the_format(self) -> None:
+        """'2026-07-01' is the natural thing to type and is not enough."""
+        code, message = self.error_of(
+            self.base_args() + ["--until", "2026-07-01"])
+        self.assertEqual(code, 2)
+        self.assertIn("2026-07-01T00:00:00", message)
+
+    def test_limit_stops_the_read_and_says_it_was_a_sample(self) -> None:
+        """A silent cap is indistinguishable from a source running out."""
+        source = self.write_jsonl([
+            {"environment": "prod", "script": "s", "test_name": "t%d" % i,
+             "result": "PASS", "output": "",
+             "start_time": "2026-07-25T01:00:0%d.000000" % i,
+             "end_time": "2026-07-25T01:00:0%d.000000" % i}
+            for i in range(5)])
+        logging.disable(logging.NOTSET)
+        self.addCleanup(logging.disable, logging.CRITICAL)
+        with self.assertLogs("run_feeder", level="WARNING") as caught:
+            _, created = self.run_main_with_fake(
+                self.base_args() + ["--source", source, "--limit", "2"],
+                make_stats(read=2, valid=2, sent=2, inserted=2))
+        self.assertEqual(len(created[0].submit_calls[0]["records"]), 2)
+        self.assertIn("SAMPLE", "\n".join(caught.output))
+
+    def test_limit_on_check_reader_also_says_it_was_a_sample(self) -> None:
+        """'reader OK' over 1000 of 4,000,000 records proves very little."""
+        source = self.write_jsonl([
+            {"environment": "prod", "script": "s", "test_name": "t%d" % i,
+             "result": "PASS", "output": "",
+             "start_time": "2026-07-25T01:00:0%d.000000" % i,
+             "end_time": "2026-07-25T01:00:0%d.000000" % i}
+            for i in range(5)])
+        with self.capture_logs("WARNING") as caught:
+            code = run_feeder.main(
+                ["--check-reader", "--source", source, "--limit", "2"])
+        self.assertEqual(code, 0)
+        message = "\n".join(caught.output)
+        self.assertIn("SAMPLE", message)
+        self.assertIn("Re-run without", message)
+
+    def test_max_batch_bytes_reaches_the_submitter(self) -> None:
+        source = self.write_jsonl([{"environment": "e"}])
+        _, created = self.run_main_with_fake(
+            self.base_args() + ["--source", source,
+                                "--max-batch-bytes", "12345"],
+            make_stats(read=1, valid=1, sent=1, inserted=1))
+        self.assertEqual(created[0].options["max_batch_bytes"], 12345)
+
+
+class CatchupModeTest(CliTestBase):
+    """The mode formerly called ``daily``."""
+
+    def test_catchup_reads_the_state_file(self) -> None:
+        feeder.state.save_high_water_mark(self.state_file, HWM)
+        source = self.write_jsonl([{"environment": "e"}])
+        _, created = self.run_main_with_fake(
+            self.base_args("catchup") + ["--source", source],
+            make_stats(read=1, valid=1, sent=1, inserted=1))
+        self.assertEqual(created[0].submit_calls[0]["since"],
+                         HWM - datetime.timedelta(days=1))
+
+    def test_daily_behaves_identically(self) -> None:
+        """The old name must keep working: cron entries already say it."""
+        feeder.state.save_high_water_mark(self.state_file, HWM)
+        source = self.write_jsonl([{"environment": "e"}])
+        _, created = self.run_main_with_fake(
+            self.base_args("daily") + ["--source", source],
+            make_stats(read=1, valid=1, sent=1, inserted=1))
+        self.assertEqual(created[0].submit_calls[0]["since"],
+                         HWM - datetime.timedelta(days=1))
+
+    def test_an_older_backfill_does_not_rewind_the_mark(self) -> None:
+        """Bringing in an older window after a newer one is the normal
+        order for a large history, and must not cost a re-read."""
+        feeder.state.save_high_water_mark(self.state_file, HWM)
+        source = self.write_jsonl([{"environment": "e"}])
+        self.run_main_with_fake(
+            self.base_args() + ["--source", source],
+            make_stats(read=1, valid=1, sent=1, inserted=1),
+            hwm=datetime.datetime(2024, 1, 1))
+        self.assertEqual(
+            feeder.state.load_high_water_mark(self.state_file), HWM)
+
+    def test_the_help_explains_that_catchup_is_not_about_today(self) -> None:
+        """The old name invited exactly that reading."""
+        parser = run_feeder.build_parser()
+        mode = [a for a in parser._actions if "--mode" in a.option_strings][0]
+        self.assertIn("not from today's date", mode.help)
+        self.assertIn("off for a week", mode.help)
 
 
 class ForgetStateTest(CliTestBase):

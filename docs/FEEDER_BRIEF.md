@@ -137,6 +137,86 @@ Notes on `read()`:
 - The generator must be robust: one unparseable record must be **skipped with a
   logged warning**, never allowed to raise and kill the whole import.
 
+## Make it efficient — this is a requirement too
+
+Assume the source is **very large**: years of history, tens of gigabytes,
+millions of runs. A reader that is merely correct on a sample can be
+unusable on the real thing — it exhausts memory, or it takes so long that
+nobody ever completes a backfill. Everything downstream of `read()` is
+lazy and streams, so the reader is the only place this can go wrong.
+
+**Stream. Never accumulate.** `yield` each record as you parse it. Do not
+build a list of all records and return it at the end; that puts the entire
+history in memory at once, and it also delays the first record until the
+last one is parsed, so the import appears to hang.
+
+```python
+def read(self, since):
+    for path in self._files():
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line_number, line in enumerate(fh, 1):   # streams
+                record = self._convert(line, path, line_number)
+                if record is not None:
+                    yield record                          # one at a time
+```
+
+**Never read a whole file into memory.** `fh.read()`, `fh.readlines()` and
+`json.load()` on a multi-gigabyte file all do. Iterate the file object for
+text; for XML use `xml.etree.ElementTree.iterparse` and clear elements as
+you go; for a database use a server-side cursor and `fetchmany`, not
+`fetchall`.
+
+**Use the `since` hint — this is the biggest lever you have.** It is a
+naive UTC datetime or `None`. If the source can be asked for "runs newer
+than X" — an indexed column, a date-partitioned directory, files named by
+date — then use it and read nothing older. The framework filters again
+afterwards, so *correctness* never depends on you honouring it, but the
+difference between skipping three years of data and parsing it only to
+have it discarded is the difference between a five-minute nightly import
+and an hour-long one.
+
+If your source can also bound the far end cheaply, implement the optional
+
+```python
+def read_window(self, since, until):   # both may be None
+```
+
+and the framework will use it whenever `--until` is given, so a history
+imported in chunks reads each chunk once instead of re-reading everything
+from `since` each time.
+
+**Watch `output`.** It is the captured log of a test run and it dominates
+the data volume — everything else in a record is a few hundred bytes.
+So: do not open a log file you are going to discard (check the outcome
+first), do not read a 500 MB log to send it whole, and truncate what you
+do send to something a human would actually read — the last few thousand
+lines of a failure, not the whole build. `output` may be `""`.
+
+**Do not do per-record work that could be done once.** Compile regexes at
+module level, not inside the loop. Read a lookup table once into a dict
+instead of querying it per record. If the source is a database, one query
+returning N rows beats N queries returning one row by orders of
+magnitude.
+
+**Do not sort, group, or de-duplicate the whole history in memory.** The
+dashboard does not care what order records arrive in, and re-sending a run
+is harmless — the server upserts.
+
+**Check it against the real volume before you trust it.** `--limit`
+reads only the first N records, so a reader can be exercised against a
+huge source in seconds:
+
+```
+python run_feeder.py --check-reader --reader internal_reader:create_reader \
+    --source ... --limit 1000 --show-records 3
+```
+
+Then time a real slice with `--dry-run` (which validates and counts but
+sends nothing) before committing to a full backfill. The import prints a
+progress line every 30 seconds with a records-per-second rate; if that
+rate means the backfill would take days, the reader needs work rather than
+patience.
+
 ## Make it debuggable — this is a requirement, not advice
 
 Whoever runs this reader in production will not be whoever wrote it, will
@@ -384,7 +464,7 @@ updates rather than duplicates.
 python run_feeder.py --url http://HOST:8000 --mode backfill --reader internal_reader:create_reader
 ```
 
-### Backfilling a year of history
+### Backfilling history, a slice at a time
 
 This is the first real import, and it is big: roughly 12,000 tests × 365 nights
 = 4.4 million runs. Measured end to end, the feeder sustains **~2,000 records a
@@ -434,6 +514,28 @@ to your factory, so for a custom reader it means whatever you want),
 `--state-file` (default `feeder_state.json`), `--replay-dir` (default `.`),
 `--dry-run`, `--check-reader`, `--allow-empty`, `--max-consecutive-failures`
 (default 3), `--verbose`.
+
+### Importing a large history in chunks
+
+`--since` and `--until` bound `start_time`: inclusive below, **exclusive**
+above, so adjacent windows tile the history exactly once with no overlap and
+no gap. A source with three years in it does not have to arrive all at once —
+and usually should not, since the most recent data is the data anyone wants
+first:
+
+```
+# the last 12 months, which is what makes the dashboard useful
+python run_feeder.py --url http://HOST:8000 --mode backfill \
+    --since 2025-08-01T00:00:00 --reader internal_reader:create_reader
+
+# then fill in older years at leisure, one window at a time
+python run_feeder.py --url http://HOST:8000 --mode backfill \
+    --since 2024-08-01T00:00:00 --until 2025-08-01T00:00:00 \
+    --reader internal_reader:create_reader
+```
+
+Importing an older window after a newer one does not rewind the feed: the
+high-water mark records the newest run ever pushed and only moves forwards.
 
 ### Exit codes
 
@@ -622,6 +724,13 @@ The reader is finished when all of these are true:
       (file:line, row id, URL) **and** the offending value, so it can be looked
       up. `logging` is used throughout; there is no `print` in the file.
 - [ ] There is no bare `except:` and no `except Exception: pass` anywhere.
+- [ ] `read()` streams: it `yield`s records and never builds a list of them,
+      and no whole file is read into memory.
+- [ ] The `since` hint is honoured wherever the source can filter on it, so a
+      nightly import does not re-read the entire history.
+- [ ] `--check-reader --limit 1000` against the real source completes in
+      seconds, and a `--dry-run` of one real window completes at a rate that
+      makes a full backfill practical.
 - [ ] `python run_feeder.py --test-connection --url http://HOST:8000` exits 0.
 - [ ] `--dry-run` against the real server URL shows `skipped=0`.
 - [ ] No proprietary hostname, path, or field name appears in any file other

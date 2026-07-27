@@ -11,7 +11,7 @@ Modules:
   class, the built-in JSON-lines reader, and the reader-spec loader.
 - :mod:`feeder.submitter` — validation, batching, HTTP submission with
   retry/backoff, and failed-batch replay files.
-- :mod:`feeder.state` — the daily-mode high-water-mark state file.
+- :mod:`feeder.state` — the catchup-mode high-water-mark state file.
 - :mod:`feeder.check` — offline validation of a reader, no server needed.
 - :mod:`feeder.config` — the optional JSON config file.
 - :mod:`feeder.preflight` — checks run before an import does any work.

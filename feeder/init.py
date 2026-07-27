@@ -107,8 +107,8 @@ def _wizard(
     settings["state_file"] = _ask_writable_file(
         out, inp, "state file",
         os.path.join(home, "feeder_state.json"),
-        "daily mode records how far it got here, so it does not re-read "
-        "everything each night",
+        "catchup mode records how far it got here, so it does not "
+        "re-read everything each time",
     )
     settings["replay_dir"] = _ask_writable_dir(
         out, inp, "replay directory", os.path.join(home, "replay"),
@@ -175,11 +175,15 @@ def _ask_mode(out: TextIO, inp: TextIO) -> str:
     """Ask which of the two import modes this deployment schedules."""
     _say(out, "\nImport mode")
     _say(out, (
-        "  daily    - import what is new since last time. This is what you "
-        "schedule.\n"
-        "  backfill - import history. Usually run once, by hand, first."
+        "  catchup  - import everything since the newest run already "
+        "pushed. This is\n             what you schedule: it resumes from "
+        "where it got to, not from\n             today's date, so a "
+        "machine that was off for a week catches up.\n"
+        "  backfill - import history, bounded by --since / --until. "
+        "Usually run once,\n             by hand, first."
     ))
-    return _ask_choice(out, inp, "Mode", ["daily", "backfill"], "daily")
+    return _ask_choice(
+        out, inp, "Mode", ["catchup", "backfill"], "catchup")
 
 
 def _ask_reader(out: TextIO, inp: TextIO) -> Any:
@@ -326,13 +330,13 @@ def _print_next_steps(
     _say(out, "Import the history once:")
     _say(out, "\n  {0} --mode backfill\n".format(command))
     if os.name == "nt":
-        _say(out, "Then schedule the daily import (runs at 06:30):")
+        _say(out, "Then schedule the catchup import (runs at 06:30):")
         _say(out, (
             "\n  schtasks /Create /TN testboard-feeder /SC DAILY /ST 06:30 "
             "/TR \"{0}\"\n".format(command)
         ))
     else:
-        _say(out, "Then schedule the daily import (crontab -e):")
+        _say(out, "Then schedule the catchup import (crontab -e):")
         _say(out, (
             "\n  30 6 * * * {0} >> /var/log/testboard-feeder.log "
             "2>&1\n".format(command)

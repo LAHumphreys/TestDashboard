@@ -98,7 +98,26 @@ class Reader(abc.ABC):
 
         Implementations must NOT raise on a bad record: log a WARNING with
         enough detail to find the record at its source, skip it, continue.
+
+        Implementations should *stream*: yield each record as it is
+        parsed rather than building a list. A site's history can be tens
+        of gigabytes, and the whole pipeline downstream of here is lazy,
+        so a reader that accumulates is the only thing that would make
+        an import proportional to the size of the estate in memory.
         """
+
+    #: Optional. Readers whose source can also filter by an *upper* bound
+    #: may implement::
+    #:
+    #:     def read_window(self, since, until): ...
+    #:
+    #: and :func:`iter_records` will prefer it whenever ``--until`` is in
+    #: play. Without it a bounded backfill still works — the framework
+    #: drops out-of-range records — but the reader is asked for
+    #: everything from ``since`` onwards, which for a history imported in
+    #: chunks means re-reading the same data once per chunk. There is no
+    #: default implementation on purpose: a reader that cannot cheaply
+    #: bound the far end should not pretend it can.
 
 
 def _truncate(text: str, limit: int = _MAX_LOGGED_CHARS) -> str:
@@ -219,7 +238,8 @@ class JsonLinesReader(Reader):
 
 
 def iter_records(
-    reader: Reader, since: Optional[datetime.datetime]
+    reader: Reader, since: Optional[datetime.datetime],
+    until: Optional[datetime.datetime] = None,
 ) -> Iterator[Dict[str, Any]]:
     """Yield everything ``reader`` produces, diagnosing it if it breaks.
 
@@ -231,11 +251,23 @@ def iter_records(
     which of the three distinct failures it was, how many records had
     already been produced, and which one was last.
 
+    Lazy throughout: records are handed on one at a time, so a reader that
+    streams stays streaming.
+
+    ``until`` is pushed down to the reader when it implements the optional
+    ``read_window(since, until)``; otherwise the reader is asked for
+    everything from ``since`` and the caller filters.
+
     Raises:
         ReaderFailed: on any of them, carrying the reader's own traceback.
     """
     try:
-        produced = reader.read(since)
+        window = getattr(reader, "read_window", None)
+        if until is not None and callable(window):
+            logger.debug("reader supports read_window; pushing --until down")
+            produced = window(since, until)
+        else:
+            produced = reader.read(since)
     except Exception:
         raise ReaderFailed(
             "the reader's read() raised before it returned anything, so no "

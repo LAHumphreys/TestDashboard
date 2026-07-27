@@ -6,7 +6,7 @@ Examples::
 
     python3 run_feeder.py --url http://127.0.0.1:8000 --mode backfill \
         --source "results/*.jsonl"
-    python3 run_feeder.py --url http://127.0.0.1:8000 --mode daily \
+    python3 run_feeder.py --url http://127.0.0.1:8000 --mode catchup \
         --reader internal_reader:create_reader
 
 Exit codes: 0 = all valid records accepted; 1 = some records were rejected
@@ -37,6 +37,17 @@ except ImportError:  # pragma: no cover - Python 2: main() exits before use
 #: for a tenth of the estate must not report success.
 _SKIP_RATE_LIMIT = 0.10
 
+#: The two import modes. ``catchup`` resumes from the high-water mark;
+#: ``daily`` is accepted as an alias for it because that is what the mode
+#: was called first, and scheduled commands already say it. The name was
+#: wrong: it invites the reading "import today's runs", which is neither
+#: what it does nor what anyone wants - a machine that was off for a week
+#: must catch the week up, and nothing should depend on the hour a cron
+#: job happens to fire.
+BACKFILL = "backfill"
+CATCHUP = "catchup"
+MODES = (CATCHUP, BACKFILL, "daily")
+
 #: Printed after the option list by --help, and on its own when the feeder
 #: is run with no arguments at all. It carries the two things the option
 #: list cannot: complete commands to copy, and the timezone rule, which is
@@ -62,10 +73,49 @@ setting an import up
           --mode backfill --since 2026-01-01T00:00:00 \\
           --reader /opt/testboard/internal_reader.py:create_reader
 
-  The nightly import, with everything in a config file so the command
+  The scheduled import, with everything in a config file so the command
   does not depend on the directory it runs in:
 
       python3 run_feeder.py --config /etc/testboard/feeder.json
+
+importing only part of a long history
+  --since and --until bound start_time: inclusive below, EXCLUSIVE above,
+  so adjacent windows tile a history exactly once - no overlap, no gap.
+  A source with years in it does not have to arrive all at once, and
+  usually should not: the recent data is the data anyone wants first.
+
+      # the last 12 months, which is what makes the dashboard useful
+      python3 run_feeder.py --config ... --mode backfill \\
+          --since 2025-08-01T00:00:00
+
+      # then fill older years in, a window at a time
+      python3 run_feeder.py --config ... --mode backfill \\
+          --since 2024-08-01T00:00:00 --until 2025-08-01T00:00:00
+
+  Importing an older window after a newer one does not rewind the feed:
+  the high-water mark records the newest run ever pushed and only moves
+  forwards. Once the windows are in, schedule --mode catchup and it
+  resumes from there.
+
+the source is enormous
+  --limit N stops after N records, so a reader can be exercised against a
+  huge source in seconds rather than hours:
+
+      python3 run_feeder.py --check-reader --reader PATH.py:create_reader \\
+          --limit 1000 --show-records 3
+
+  Then time one real window with --dry-run before committing to a full
+  backfill. A long import prints a progress line every 30 seconds with a
+  records-per-second rate; if that rate says the backfill would take
+  days, the reader needs work rather than patience - see "make it
+  efficient" in docs/FEEDER_BRIEF.md, above all honouring the `since`
+  hint so a nightly run does not re-read the whole history.
+
+  Batches are flushed at whichever comes first, --batch-size records or
+  --max-batch-bytes of encoded data. The byte cap matters because
+  captured test output varies by orders of magnitude: without it, a
+  handful of tests that dump megabytes produce a request the server
+  refuses.
 
 finding out what is going on
   Is the dashboard reachable, and is it really a testboard? Needs only
@@ -116,7 +166,7 @@ re-importing after fixing a reader
       python3 run_feeder.py --config ... --forget-state   # re-do everything
 
   --forget-state deletes the high-water mark, which is what otherwise
-  stops daily mode from looking back at runs it has already seen.
+  stops catchup mode from looking back at runs it has already seen.
 
 timestamps are UTC
   Every time the feeder sends is UTC, written with no timezone suffix:
@@ -155,7 +205,7 @@ NO_ARGUMENTS = """\
 run_feeder.py imports test results into a testboard dashboard. It needs to
 know, at least, which dashboard and which mode:
 
-    python3 run_feeder.py --url http://dashboard-host:8000 --mode daily
+    python3 run_feeder.py --url http://dashboard-host:8000 --mode catchup
 
 Setting this up for the first time? The wizard asks for what it needs,
 checks each answer, and writes a config file:
@@ -182,12 +232,18 @@ def compute_since(mode, hwm, since_arg, overlap_days):
     """Return the lower bound (naive UTC) for this import, or None for all.
 
     - ``backfill``: exactly ``since_arg`` (which may be None = everything).
-    - ``daily``: ``hwm - overlap_days`` days; None when there is no saved
-      high-water mark yet (first daily run imports everything). ``since_arg``
-      is ignored in daily mode. The overlap is free because the server
-      upserts on (environment, script, test_name, start_time).
+    - ``catchup``: ``hwm - overlap_days`` days; None when there is no saved
+      high-water mark yet (the first catchup run imports everything).
+      ``since_arg`` is ignored in catchup mode. The overlap is free
+      because the server upserts on
+      (environment, script, test_name, start_time).
+
+    Note what catchup is NOT: it has nothing to do with today's date, and
+    no part of it depends on when in the day it runs. It resumes from the
+    newest run previously accepted, so a machine that was off for a week
+    catches up the week.
     """
-    if mode == "backfill":
+    if mode == BACKFILL:
         return since_arg
     if hwm is None:
         return None
@@ -231,6 +287,58 @@ def load_config_settings(argv, parser, config_module):
     settings = config_module.load_config(known.config)
     config_module.apply_to_parser(parser, settings)
     return settings
+
+
+def feeder_default_batch_bytes():
+    # type: () -> int
+    """The submitter's default batch byte ceiling, imported lazily."""
+    try:
+        import feeder.submitter
+        return feeder.submitter.DEFAULT_MAX_BATCH_BYTES
+    except Exception:  # pragma: no cover - only if the package is broken
+        return 8 * 1024 * 1024
+
+
+def describe_window(since, until, model):
+    # type: (Optional[datetime.datetime], Optional[datetime.datetime], Any) -> str
+    """Describe the start_time window this run will import."""
+    if since is None and until is None:
+        return "any start_time (no bounds given)"
+    if until is None:
+        return "start_time >= " + model.format_iso(since)
+    if since is None:
+        return "start_time < " + model.format_iso(until)
+    return "start_time in [{0}, {1})".format(
+        model.format_iso(since), model.format_iso(until))
+
+
+def limited(records, limit, log):
+    # type: (Any, Optional[int], logging.Logger) -> Any
+    """Yield at most ``limit`` records, saying so when it cuts the stream.
+
+    A silent cap would be indistinguishable from a source that ran out,
+    which is the one thing a sampled run must not look like.
+    """
+    if limit is None:
+        return records
+    return _take(records, limit, log)
+
+
+def _take(records, limit, log):
+    # type: (Any, int, logging.Logger) -> Any
+    """Generator behind limited(); see there."""
+    count = 0
+    for record in records:
+        if count >= limit:
+            log.warning(
+                "stopping after %d records because --limit %d was given. "
+                "This is a SAMPLE: there is more in the source that has "
+                "not been looked at, and which records you got is "
+                "whatever the reader happened to yield first",
+                count, limit)
+            return
+        count += 1
+        yield record
 
 
 def report_reader_failure(exc, log):
@@ -308,9 +416,9 @@ def run_preflight(args, log, preflight_module):
             args.replay_dir, "failed-batch replay files")
         if problem is not None:
             problems.append(problem)
-        if args.mode == "daily":
+        if args.mode != BACKFILL:
             problem = preflight_module.check_writable_file(
-                args.state_file, "the daily-mode state file")
+                args.state_file, "the catchup-mode state file")
             if problem is not None:
                 problems.append(problem)
     if not problems and not args.dry_run:
@@ -366,11 +474,14 @@ def build_parser():
               "machine running run_server.py, which need not be this one. "
               "Required unless --check-reader is given"))
     parser.add_argument(
-        "--mode", default=None, choices=["backfill", "daily"],
-        help=("backfill: import history (optionally bounded by --since); "
-              "daily: import everything after the saved high-water mark "
-              "minus --overlap-days. Required unless --check-reader is "
-              "given"))
+        "--mode", default=None, choices=list(MODES),
+        help=("catchup: import everything since the newest run previously "
+              "accepted (less --overlap-days). This is what you schedule; "
+              "it resumes from where it got to, not from today's date, so "
+              "a machine that was off for a week catches the week up. "
+              "backfill: import history, bounded by --since/--until. "
+              "'daily' is accepted as an alias for catchup. Required "
+              "unless --check-reader is given"))
     parser.add_argument(
         "--status", action="store_true",
         help=("report how far the feed has got: the high-water mark and "
@@ -394,8 +505,22 @@ def build_parser():
               "server and no --url. Use this while writing a reader"))
     parser.add_argument(
         "--since", default=None, metavar="ISO",
-        help=("backfill lower bound on start_time, as UTC with no timezone "
-              "suffix: 2026-07-01T00:00:00. Ignored in daily mode"))
+        help=("backfill lower bound on start_time (inclusive), as UTC with "
+              "no timezone suffix: 2026-07-01T00:00:00. Ignored in catchup "
+              "mode"))
+    parser.add_argument(
+        "--until", default=None, metavar="ISO",
+        help=("backfill upper bound on start_time, EXCLUSIVE, same format "
+              "as --since. Adjacent windows therefore tile a history "
+              "exactly once, with no overlap and no gap, which is how a "
+              "large estate is brought in one manageable chunk at a time. "
+              "Ignored in catchup mode"))
+    parser.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help=("stop after reading N records. For sizing up a reader "
+              "against a large source without waiting for all of it; use "
+              "with --check-reader or --dry-run. Not for real imports - "
+              "which records you get is whatever the reader yields first"))
     parser.add_argument(
         "--reader", default="jsonl", metavar="SPEC",
         help=("where records come from: 'jsonl' for the built-in "
@@ -411,6 +536,14 @@ def build_parser():
     parser.add_argument(
         "--batch-size", type=int, default=500, metavar="N",
         help="records per POST batch (default: %(default)s)")
+    parser.add_argument(
+        "--max-batch-bytes", type=int,
+        default=feeder_default_batch_bytes(), metavar="BYTES",
+        help=("send a batch as soon as it reaches this encoded size, even "
+              "if it holds fewer than --batch-size records (default: "
+              "%(default)s). Captured test output varies by orders of "
+              "magnitude, so a fixed record count alone gives batches that "
+              "are sometimes enormous"))
     parser.add_argument(
         "--state-file", default="feeder_state.json", metavar="PATH",
         help=("daily-mode high-water-mark file; must be writable by "
@@ -573,14 +706,37 @@ def main(argv=None):
             return 2
 
     since_arg = None  # type: Optional[datetime.datetime]
-    if args.since is not None:
+    until = None  # type: Optional[datetime.datetime]
+    for name, raw in (("--since", args.since), ("--until", args.until)):
+        if raw is None:
+            continue
         try:
-            since_arg = testboard.model.parse_iso(args.since)
+            parsed = testboard.model.parse_iso(raw)
         except ValueError as exc:
             log.error(
-                "bad --since value: %s. Expected ISO-8601 naive UTC like "
-                "2026-07-01T00:00:00", exc)
+                "bad %s value: %s. Expected ISO-8601 naive UTC like "
+                "2026-07-01T00:00:00 (a bare date is not enough - write "
+                "2026-07-01T00:00:00)", name, exc)
             return 2
+        if name == "--since":
+            since_arg = parsed
+        else:
+            until = parsed
+    if since_arg is not None and until is not None and until <= since_arg:
+        log.error(
+            "--until %s is not after --since %s, so the window is empty "
+            "and nothing could be imported. --until is exclusive: to "
+            "import a single day, use --since <day>T00:00:00 --until "
+            "<next day>T00:00:00",
+            testboard.model.format_iso(until),
+            testboard.model.format_iso(since_arg))
+        return 2
+    if until is not None and args.mode != BACKFILL:
+        log.error(
+            "--until only applies to --mode backfill. Catchup mode imports "
+            "everything new since the last run, and an upper bound would "
+            "silently stop it ever moving past that date")
+        return 2
 
     sources = args.source if args.source is not None else []
     try:
@@ -597,12 +753,23 @@ def main(argv=None):
         # what is wrong.
         try:
             report = feeder.check.check_reader(
-                feeder.reader.iter_records(reader, None),
-                show=args.show_records)
+                feeder.reader.iter_records(reader, since_arg, until),
+                max_records=args.limit, show=args.show_records)
         except feeder.reader.ReaderFailed as exc:
             report_reader_failure(exc, log)
             return 2
         feeder.check.log_report(report, log)
+        if args.limit is not None and report.read >= args.limit:
+            # A cap that does not announce itself reads as "this is all
+            # the reader produced", which is the one conclusion a sampled
+            # run must not support: 'reader OK' over 1000 of 4,000,000
+            # records says almost nothing about the other 3,999,000.
+            log.warning(
+                "this was a SAMPLE: reading stopped at --limit %d, so "
+                "anything wrong with records the reader would have "
+                "produced later has not been looked at. Re-run without "
+                "--limit before trusting a clean result",
+                args.limit)
         return 0 if report.ok else 1
 
     # Before anything is read: a wrong URL, an unreachable dashboard or a
@@ -613,22 +780,21 @@ def main(argv=None):
             return 2
 
     hwm = None  # type: Optional[datetime.datetime]
-    if args.mode == "daily":
+    if args.mode != BACKFILL:
         hwm = feeder.state.load_high_water_mark(args.state_file)
     since = compute_since(args.mode, hwm, since_arg, args.overlap_days)
-    if since is not None:
-        log.info("importing runs with start_time >= %s",
-                 testboard.model.format_iso(since))
-    else:
-        log.info("importing all available runs (no lower bound)")
+    log.info("importing runs with %s", describe_window(
+        since, until, testboard.model))
 
     submitter = feeder.submitter.Submitter(
         args.url, batch_size=args.batch_size, replay_dir=args.replay_dir,
-        max_consecutive_failures=args.max_consecutive_failures)
+        max_consecutive_failures=args.max_consecutive_failures,
+        max_batch_bytes=args.max_batch_bytes)
     try:
         stats = submitter.submit(
-            feeder.reader.iter_records(reader, since),
-            dry_run=args.dry_run, since=since,
+            limited(feeder.reader.iter_records(reader, since, until),
+                    args.limit, log),
+            dry_run=args.dry_run, since=since, until=until,
             show=args.show_records)
     except feeder.reader.ReaderFailed as exc:
         report_reader_failure(exc, log)
@@ -648,7 +814,8 @@ def main(argv=None):
             # Failure here is reported and survived, not raised: the data
             # is already in the dashboard, and a traceback would turn a
             # successful import into a failed scheduled task.
-            if feeder.state.save_high_water_mark(args.state_file, new_hwm):
+            if feeder.state.advance_high_water_mark(
+                    args.state_file, new_hwm):
                 log.info("saved high-water mark %s to %s",
                          testboard.model.format_iso(new_hwm), args.state_file)
 

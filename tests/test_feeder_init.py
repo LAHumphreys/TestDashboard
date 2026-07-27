@@ -89,7 +89,7 @@ class WizardTestBase(unittest.TestCase):
         answers = {
             "config": "",                       # accept default path
             "url": "http://dashboard:8000",
-            "mode": "",                         # daily
+            "mode": "",                         # catchup
             "reader": self.reader_path + ":create_reader",
             "source": "",                       # reader finds its own data
             "check": "n",
@@ -135,7 +135,7 @@ class HappyPathTest(WizardTestBase):
         self.assertEqual(code, 0)
         settings = self.written()
         self.assertEqual(settings["url"], "http://dashboard:8000")
-        self.assertEqual(settings["mode"], "daily")
+        self.assertEqual(settings["mode"], "catchup")
         self.assertEqual(settings["reader"],
                          self.reader_path + ":create_reader")
 

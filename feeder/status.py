@@ -137,7 +137,7 @@ def describe(
             model.format_iso(hwm), describe_gap(hwm, now)))
         floor = hwm - datetime.timedelta(days=overlap_days)
         lines.append(
-            "                a daily run now would import every run at or "
+            "                a catchup run now would import every run at or "
             "after")
         lines.append(
             "                {0} - the mark, less --overlap-days "
@@ -164,7 +164,7 @@ def _no_mark_lines(state_file: str) -> List[str]:
         return [
             "  pushed up to  UNKNOWN - the state file exists but could not "
             "be read",
-            "                (see the warning above). The next daily run "
+            "                (see the warning above). The next catchup run "
             "will import",
             "                everything, which is safe: the server "
             "upserts.",
@@ -172,7 +172,7 @@ def _no_mark_lines(state_file: str) -> List[str]:
     return [
         "  pushed up to  nothing yet - no state file, so nothing has been "
         "recorded",
-        "                as pushed. The next daily run imports everything "
+        "                as pushed. The next catchup run imports everything "
         "the reader",
         "                offers. This is also what you see if the feed has "
         "only ever",

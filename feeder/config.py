@@ -1,6 +1,6 @@
 """The feeder's optional JSON config file.
 
-A working daily import is a long command line — a URL, a reader spec, one
+A working scheduled import is a long command line — a URL, a reader spec, one
 or more sources, a state file and a replay directory, none of which have
 a sensible default once the feeder stops running from the directory it
 was installed in. Kept in a scheduler entry that line is write-only: it
@@ -39,20 +39,20 @@ DEFAULT_CONFIG_NAME = "feeder.config.json"
 #: validate a file, to write one, and to explain a rejected key.
 CONFIG_KEYS = (
     ("url", "string", "dashboard base URL, e.g. http://dashboard-host:8000"),
-    ("mode", "string", "'backfill' or 'daily'"),
+    ("mode", "string", "'catchup' or 'backfill'"),
     ("reader", "string",
      "'jsonl', or 'PATH.py:create_reader' for a site-specific reader"),
     ("source", "list of strings",
      "input files, globs or directories for the reader"),
     ("batch_size", "integer", "records per POST batch"),
     ("state_file", "string",
-     "where daily mode remembers how far it got; must be writable"),
+     "where catchup mode remembers how far it got; must be writable"),
     ("replay_dir", "string",
      "where failed batches are saved; must be writable"),
     ("max_consecutive_failures", "integer",
      "give up after this many batches fail in a row"),
     ("overlap_days", "integer",
-     "daily mode: how far before the high-water mark to re-import"),
+     "catchup mode: how far before the high-water mark to re-import"),
     ("allow_empty", "boolean", "treat reading zero records as success"),
     ("verbose", "boolean", "DEBUG logging"),
 )
@@ -67,7 +67,7 @@ _BOOL_KEYS = frozenset(
 _LIST_KEYS = frozenset(
     name for name, kind, _ in CONFIG_KEYS if kind.startswith("list"))
 
-_VALID_MODES = ("backfill", "daily")
+_VALID_MODES = ("catchup", "backfill", "daily")
 
 
 class ConfigError(Exception):
@@ -130,7 +130,7 @@ def load_config(path: str) -> Dict[str, Any]:
         raise ConfigError(
             "the config file {0} is not valid JSON ({1}). It must be a "
             "single JSON object, e.g. {{\"url\": \"http://host:8000\", "
-            "\"mode\": \"daily\"}}. Note JSON has no comments and needs "
+            "\"mode\": \"catchup\"}}. Note JSON has no comments and needs "
             "double quotes around every key and string".format(
                 os.path.abspath(resolved), exc)
         )

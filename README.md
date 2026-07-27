@@ -500,7 +500,7 @@ does not depend on which directory it runs from:
 ```json
 {
   "url": "http://dashboard-host:8000",
-  "mode": "daily",
+  "mode": "catchup",
   "reader": "/opt/testboard-feeder/internal_reader.py:create_reader",
   "state_file": "/var/lib/testboard/feeder_state.json",
   "replay_dir": "/var/lib/testboard/replay"
@@ -532,33 +532,91 @@ files works. A dotted `module.path:create_reader` also works, but is resolved on
 Python's import path — which contains the directory holding `run_feeder.py` and
 `PYTHONPATH`, and *not* the directory you happen to be standing in.
 
-### One-off backfill (import everything, or everything since a date)
+### The two modes
+
+**`--mode backfill`** imports history, bounded by `--since` and `--until`. Run by
+hand, usually once.
+
+**`--mode catchup`** imports everything since the newest run already pushed. This
+is the one you schedule. It resumes from where it got to — **not** from today's
+date — so nothing depends on the hour the job fires, and a machine that was off
+for a week catches the week up on its next run. (`--mode daily` is still accepted
+as an alias; the name was misleading.)
+
+Catchup keeps a **high-water mark** (the newest accepted `start_time`) in the
+state file and imports everything newer than `hwm - overlap_days` (default
+`--overlap-days 1`). The overlap plus server-side upserting means re-imports are
+always safe and gaps from clock skew are covered. A successful backfill also
+primes the mark, so `backfill` then `catchup` is the standard sequence; with no
+state file yet, catchup imports everything.
 
 ```
+# import history
 python run_feeder.py --url http://127.0.0.1:8000 --mode backfill \
     --reader jsonl --source 'results/*.jsonl' --since 2026-01-01T00:00:00
-```
 
-### Daily incremental import
-
-```
-python run_feeder.py --url http://127.0.0.1:8000 --mode daily \
+# then keep it fed
+python run_feeder.py --url http://127.0.0.1:8000 --mode catchup \
     --reader jsonl --source 'results/*.jsonl' \
     --state-file /var/lib/testboard/feeder_state.json
 ```
 
-Daily mode keeps a **high-water mark** (max accepted `start_time`) in the state file
-(default `feeder_state.json`) and on the next run imports everything newer than
-`hwm - overlap_days` (default `--overlap-days 1`). The overlap plus server-side
-upserting means re-imports are always safe and gaps from clock skew are covered. A
-successful backfill also primes the state file, so `backfill` then `daily` is the
-standard sequence. With no state file yet, daily mode imports everything.
+### Importing a long history a slice at a time
 
-All flags: `--init`, `--config PATH`, `--url` (required), `--mode backfill|daily`
+`--since` and `--until` bound `start_time`: **inclusive** below, **exclusive**
+above, so adjacent windows tile a history exactly once — nothing imported twice,
+nothing lost in the seam. A source with three years in it does not have to arrive
+all at once, and usually should not: the recent data is what makes the dashboard
+useful, so import that first and fill in the rest later.
+
+```
+# the last 12 months
+python run_feeder.py --config feeder.json --mode backfill \
+    --since 2025-08-01T00:00:00
+
+# then older years, a window at a time
+python run_feeder.py --config feeder.json --mode backfill \
+    --since 2024-08-01T00:00:00 --until 2025-08-01T00:00:00
+```
+
+Importing an older window after a newer one does **not** rewind the feed: the
+high-water mark records the newest run ever pushed and only moves forwards.
+`--until` is refused in catchup mode, where an upper bound would silently stop
+the feed ever moving past that date.
+
+### Very large sources
+
+The whole pipeline downstream of the reader is lazy and streams, so memory does
+not scale with the size of the history — provided the reader streams too, which
+is a requirement in [the reader brief](docs/FEEDER_BRIEF.md).
+
+- **`--limit N`** stops after N records, so a reader can be exercised against a
+  huge source in seconds: `--check-reader --limit 1000 --show-records 3`. The run
+  says loudly that it was a sample, because a silent cap is indistinguishable
+  from a source that ran out.
+- **`--since` is passed to the reader** as an optimisation hint. Honouring it is
+  the single biggest lever on import time: the framework filters anyway, so
+  correctness never depends on it, but reading three years to discard two is the
+  difference between a five-minute nightly import and an hour-long one.
+- A reader whose source can bound the far end cheaply may also implement
+  `read_window(since, until)`; the framework prefers it when `--until` is given,
+  so chunked importing reads each chunk once instead of re-reading from `since`
+  every time.
+- **Batches flush on whichever comes first**, `--batch-size` records or
+  `--max-batch-bytes` of encoded data (default 8 MB). The byte ceiling matters
+  because captured `output` varies by orders of magnitude: without it a handful
+  of tests that dump megabytes produce a request the server refuses, and pin the
+  largest 500 records in memory.
+- A long import logs progress every 30 seconds with a records-per-second rate. If
+  that rate says the backfill would take days, the reader needs work.
+
+All flags: `--init`, `--config PATH`, `--url` (required), `--mode catchup|backfill`
 (required), `--status`, `--test-connection`, `--check-reader`, `--forget-state`,
-`--since ISO` (backfill lower bound), `--reader
-jsonl|PATH.py:factory|module:factory` (default `jsonl`), `--source` (repeatable;
-files, globs or directories), `--show-records N`, `--batch-size` (default 500),
+`--since ISO` / `--until ISO` (backfill window, lower inclusive, upper
+exclusive), `--limit N`, `--reader jsonl|PATH.py:factory|module:factory` (default
+`jsonl`), `--source` (repeatable; files, globs or directories),
+`--show-records N`, `--batch-size` (default 500), `--max-batch-bytes`
+(default 8 MB),
 `--state-file` (default `feeder_state.json`), `--replay-dir` (default `.`),
 `--max-consecutive-failures` (default 3), `--overlap-days` (default 1),
 `--skip-preflight`, `--dry-run`, `--allow-empty`, `--verbose`, `--version`.
@@ -603,7 +661,7 @@ writes nothing — then reads the result back, so it proves both directions and
 reports the endpoint posts will go to, how many tests the dashboard already
 holds, and the newest run in it. Exit 0 means the feeder can deliver.
 
-`--status` prints the high-water mark and its age, what a daily run now would
+`--status` prints the high-water mark and its age, what a catchup run now would
 re-read (the mark less `--overlap-days`), and what the dashboard holds. It
 deliberately does **not** read the source system — a status command that takes as
 long as the import is a status command nobody runs — so for the outstanding
@@ -629,7 +687,7 @@ python run_feeder.py --config feeder.json
 ```
 
 `--forget-state` deletes the saved high-water mark, which is the only thing that
-would otherwise stop daily mode from revisiting runs it has already seen.
+would otherwise stop catchup mode from revisiting runs it has already seen.
 
 ### When the reader itself breaks
 
@@ -683,9 +741,9 @@ HTTP, so all the feeder host needs is:
   files. One directory, named in the config.
 - **Its reader**, anywhere on disk, named by path.
 
-### Scheduling the daily import
+### Scheduling the catchup import
 
-RHEL 8 cron (crontab -e), run daily at 06:30 after the overnight runs finish:
+RHEL 8 cron (crontab -e), run at 06:30 each day, after the overnight runs finish:
 
 ```cron
 30 6 * * * /usr/bin/python3 /opt/testboard/run_feeder.py --config /etc/testboard/feeder.json >> /var/log/testboard-feeder.log 2>&1
@@ -970,7 +1028,7 @@ Layout:
 
 ```
 run_server.py           # server entry point
-run_feeder.py           # feeder CLI (backfill / daily)
+run_feeder.py           # feeder CLI (backfill / catchup, --init, --status)
 testboard/              # model, storage (all SQL), analytics (pure), api, server
 feeder/                 # reader interface + jsonl reader, submitter, state file,
                         #   offline reader check, config file, preflight, --init

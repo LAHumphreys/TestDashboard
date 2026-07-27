@@ -59,6 +59,17 @@ IMPORT_PATH = "/api/import"
 #: How often a long-running import reports progress (seconds).
 _PROGRESS_INTERVAL_SECONDS = 30.0
 
+#: Default ceiling on the encoded size of one batch. Batching purely by
+#: record count assumes records are of comparable size, and ``output`` —
+#: a test's whole captured log — breaks that assumption badly: a suite
+#: whose failures dump megabytes produces batches thousands of times
+#: larger than a suite of quiet passes. The consequences are a request
+#: the server refuses (it caps bodies at 256 MB), and a resident set that
+#: grows with the largest 500 records rather than staying flat. 8 MB is
+#: comfortably under any proxy's default limit and still amortizes the
+#: per-request cost over hundreds of ordinary records.
+DEFAULT_MAX_BATCH_BYTES = 8 * 1024 * 1024
+
 #: Per-record warnings logged for each DISTINCT problem before falling
 #: silent. One systematic mistake in a reader affects every record it
 #: touches: over a year of history that is millions of near-identical
@@ -66,6 +77,11 @@ _PROGRESS_INTERVAL_SECONDS = 30.0
 #: the problem and can fill the disk with log. The first few examples are
 #: what a human needs; the exact total is in the summary either way.
 _MAX_LOGGED_PER_REASON = 5
+
+#: Assumed encoded size of a record's fields other than ``output``: the
+#: identity triple, two timestamps, a source link. Used only to decide
+#: when to flush a batch, so being approximately right is enough.
+_RECORD_OVERHEAD_BYTES = 400
 
 
 def _log_reason_suppressed(prefix: str) -> None:
@@ -259,6 +275,7 @@ class Submitter:
                  sleep: Callable[[float], None] = time.sleep,
                  replay_dir: str = ".",
                  max_consecutive_failures: int = 3,
+                 max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
                  clock: Callable[[], float] = time.time) -> None:
         """Configure the submitter.
 
@@ -270,6 +287,11 @@ class Submitter:
         attempt N and N+1 the submitter sleeps
         ``backoff_seconds * 2**(N-1)`` seconds (N is 1-based), i.e.
         exponential backoff.
+
+        ``max_batch_bytes`` caps the encoded size of a batch, which is
+        sent as soon as either that or ``batch_size`` is reached. A single
+        record larger than the cap is still sent on its own - splitting a
+        record is not possible, and refusing it would lose data.
 
         ``max_consecutive_failures`` stops the whole import once that many
         batches fail back to back. Without it, a server that goes away
@@ -286,22 +308,27 @@ class Submitter:
         self._sleep = sleep
         self._replay_dir = replay_dir
         self._max_consecutive_failures = max(1, int(max_consecutive_failures))
+        self._max_batch_bytes = max(1, int(max_batch_bytes))
         self._clock = clock
         self._max_accepted = None  # type: Optional[datetime.datetime]
 
     def submit(self, records: Iterable[Dict[str, Any]],
                dry_run: bool = False,
                since: Optional[datetime.datetime] = None,
+               until: Optional[datetime.datetime] = None,
                show: int = 0,
                out: Optional[TextIO] = None) -> SubmitStats:
         """Validate, filter, batch and send ``records``; return the counters.
 
         Per record: :func:`testboard.model.parse_run_record`; invalid records
         are logged at WARNING (reason + identity + truncated repr) and
-        counted as ``skipped``. When ``since`` is given, valid records with
-        ``start_time < since`` are dropped silently (counted in ``read`` but
-        neither ``valid`` nor ``skipped``). In dry-run mode no HTTP request
-        is made — records are only validated and counted.
+        counted as ``skipped``. ``since`` and ``until`` bound
+        ``start_time`` — inclusive below, exclusive above — and records
+        outside them are dropped silently (counted in ``read`` but neither
+        ``valid`` nor ``skipped``). The exclusive upper bound is what
+        makes adjacent windows tile a history exactly once. In dry-run
+        mode no HTTP request is made — records are only validated and
+        counted.
 
         Ends by logging a summary line with every counter plus a breakdown of
         skip/reject reasons grouped by message prefix, each with an example
@@ -317,6 +344,7 @@ class Submitter:
         skipped = 0
         reasons = OrderedDict()  # type: OrderedDict[str, List[Any]]
         batch = []  # type: List[model.RunRecord]
+        batch_bytes = 0
         batch_number = 0
         outcomes = []  # type: List[Tuple[int, _BatchResult]]
         consecutive_failures = 0
@@ -346,15 +374,24 @@ class Submitter:
                 continue
             if since is not None and record.start_time < since:
                 continue
+            if until is not None and record.start_time >= until:
+                continue
             valid += 1
             if dry_run:
                 continue
             batch.append(record)
-            if len(batch) >= self._batch_size:
+            # Rough, and deliberately so: an exact size would mean
+            # encoding every record twice. output dominates by orders of
+            # magnitude, and this is a flush threshold rather than a
+            # limit that has to hold precisely.
+            batch_bytes += len(record.output) + _RECORD_OVERHEAD_BYTES
+            if (len(batch) >= self._batch_size
+                    or batch_bytes >= self._max_batch_bytes):
                 batch_number += 1
                 result = self._send_batch(batch_number, batch, reasons)
                 outcomes.append((len(batch), result))
                 batch = []
+                batch_bytes = 0
                 consecutive_failures = (
                     0 if result.ok else consecutive_failures + 1
                 )
@@ -445,7 +482,7 @@ class Submitter:
     def max_accepted_start_time(self) -> Optional[datetime.datetime]:
         """Max ``start_time`` across records in batches that got HTTP 200.
 
-        This is the value the CLI persists as the daily-mode high-water mark.
+        This is the value the CLI persists as the catchup high-water mark.
         ``None`` when no batch has been accepted yet (or in dry-run mode).
         """
         return self._max_accepted

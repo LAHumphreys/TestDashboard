@@ -1,8 +1,8 @@
-"""High-water-mark state file for the feeder's daily mode.
+"""High-water-mark state file for the feeder's catchup mode.
 
 The state file is a tiny JSON document ``{"high_water_mark": "<ISO>"}``
-recording the newest ``start_time`` the dashboard has accepted. Daily runs
-import everything from that mark minus a safety overlap; because the server
+recording the newest ``start_time`` the dashboard has accepted. Catchup
+runs import everything from that mark minus a safety overlap; because the server
 upserts, the overlap is free and a lost/corrupt state file only means a
 harmless full re-import.
 
@@ -46,11 +46,41 @@ def load_high_water_mark(path: str) -> Optional[datetime.datetime]:
         return None
 
 
+def advance_high_water_mark(path: str, hwm: datetime.datetime) -> bool:
+    """Save ``hwm`` only if it is newer than what is already recorded.
+
+    The mark means "the newest run we have successfully pushed", so it can
+    only ever move forwards. Saving unconditionally is wrong as soon as
+    history is imported in pieces: bringing in 2024 after 2026 — the
+    natural order for a large backfill, newest first so the dashboard is
+    useful immediately — would rewind the mark by two years, and the next
+    catchup run would silently re-read everything since. Harmless, because
+    the server upserts, but slow and baffling.
+
+    Returns True when the file was written.
+    """
+    existing = load_high_water_mark(path)
+    if existing is not None and existing >= hwm:
+        logger.info(
+            "the saved high-water mark is %s, which is at or after the "
+            "newest run this import accepted (%s), so it was left alone - "
+            "the mark records the newest run ever pushed and only moves "
+            "forwards",
+            model.format_iso(existing), model.format_iso(hwm),
+        )
+        return False
+    return save_high_water_mark(path, hwm)
+
+
 def save_high_water_mark(path: str, hwm: datetime.datetime) -> bool:
     """Atomically write ``{"high_water_mark": iso}`` to ``path``.
 
     Writes to a temporary sibling file first and then replaces the target,
     so a crash mid-write cannot corrupt the previous state.
+
+    Callers that are recording progress want
+    :func:`advance_high_water_mark`, which will not move the mark
+    backwards. This one writes whatever it is given.
 
     Returns True on success. A failure to write is reported at ERROR and
     returns False rather than raising: by the time this is called the
@@ -67,7 +97,7 @@ def save_high_water_mark(path: str, hwm: datetime.datetime) -> bool:
     except OSError as exc:
         logger.error(
             "the import SUCCEEDED, but the high-water mark %s could not be "
-            "saved to %s (%s). Nothing is lost - tomorrow's daily run will "
+            "saved to %s (%s). Nothing is lost - the next catchup run will "
             "simply re-import from further back, and the server upserts so "
             "no duplicates are possible. To stop this recurring, point "
             "--state-file at a file the feeder can write (the checkout it "
