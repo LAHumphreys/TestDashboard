@@ -49,13 +49,14 @@ import http.server
 import json
 import logging
 import os
+import queue
 import socketserver
 import threading
 import urllib.parse
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type, cast
 
 from testboard import api
-from testboard.storage import Storage
+from testboard.storage import DEFAULT_MAX_CONNECTIONS, Storage
 
 __all__ = ["ThreadingHTTPServer", "create_server"]
 
@@ -107,15 +108,46 @@ class _CachedFile(NamedTuple):
     content: bytes
 
 
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """A threaded HTTP server (one thread per request, daemon threads).
+#: Worker threads serving requests. Each holds one SQLite connection for
+#: its lifetime, so this is also the connection count — which is why it
+#: is the same number Storage divides a --cache-mb budget by, taken from
+#: there rather than restated here so that the two cannot drift apart.
+DEFAULT_WORKERS = DEFAULT_MAX_CONNECTIONS
 
-    Python 3.6's :mod:`http.server` does not ship
-    ``ThreadingHTTPServer`` (added in 3.7), so it is composed here from
-    ``ThreadingMixIn`` + ``HTTPServer``. Instances created via
-    :func:`create_server` additionally carry the injected ``storage``
-    and ``static_dir`` attributes used by the request handler, plus the
-    static-file cache those handlers share.
+#: Connections allowed to wait per worker before the accept loop blocks.
+_QUEUE_DEPTH_PER_WORKER = 16
+
+#: How long server_close() waits for a worker to finish its request.
+_WORKER_JOIN_SECONDS = 10.0
+
+
+class ThreadingHTTPServer(http.server.HTTPServer):
+    """A threaded HTTP server serving requests from a FIXED worker pool.
+
+    Python 3.6 does not ship ``http.server.ThreadingHTTPServer`` (added
+    in 3.7), so the threading is hand-built here. It is a pool rather
+    than the obvious ``socketserver.ThreadingMixIn`` for one reason, and
+    it is a large one:
+
+    ``ThreadingMixIn`` starts a NEW THREAD PER REQUEST. Storage keeps its
+    SQLite connections in ``threading.local()``, so a new thread means a
+    new connection, which means a brand-new empty page cache. Measured on
+    the mixin: twenty requests opened twenty connections. The cache
+    therefore never warmed - every request paid full price for every page
+    it touched, and ``--cache-mb`` could not help, because a cache that
+    is discarded after one request has nothing to accumulate.
+
+    A fixed pool of long-lived worker threads fixes that without Storage
+    changing at all: the same handful of threads serve every request, so
+    each keeps its connection and its cache across them. It also bounds
+    what was unbounded - connections, threads and memory now have a
+    ceiling instead of growing with concurrent load - and makes the
+    "budget divided by connection count" arithmetic in Storage exact
+    rather than a guess.
+
+    Instances created via :func:`create_server` additionally carry the
+    injected ``storage`` and ``static_dir`` attributes used by the
+    request handler, plus the static-file cache those handlers share.
     """
 
     daemon_threads = True
@@ -132,6 +164,68 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     static_dir = ""  # type: str
     static_cache = None  # type: Dict[str, _CachedFile]
     static_cache_lock = None  # type: threading.Lock
+
+    def __init__(self, server_address: Any, handler: Any,
+                 workers: int = DEFAULT_WORKERS) -> None:
+        """Bind the socket and start the worker pool."""
+        http.server.HTTPServer.__init__(self, server_address, handler)
+        self.workers = max(1, int(workers))
+        # Bounded on purpose. A full queue blocks the accept loop, which
+        # is back-pressure: the alternative to making a client wait is
+        # accepting work the server has no capacity for and running out
+        # of memory instead.
+        self._pending = queue.Queue(
+            maxsize=self.workers * _QUEUE_DEPTH_PER_WORKER
+        )  # type: Any
+        self._threads = []  # type: List[threading.Thread]
+        for index in range(self.workers):
+            thread = threading.Thread(
+                target=self._serve_from_queue,
+                name="testboard-worker-{0}".format(index),
+            )
+            thread.daemon = True
+            thread.start()
+            self._threads.append(thread)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        """Hand the connection to the pool instead of spawning a thread."""
+        self._pending.put((request, client_address))
+
+    def _serve_from_queue(self) -> None:
+        """One worker: serve requests until the server closes.
+
+        The connection this thread's Storage opens on its first request
+        is still there on its thousandth, which is the entire point.
+        """
+        while True:
+            item = self._pending.get()
+            if item is None:
+                break
+            request, client_address = item
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request)
+        # Close this worker's database connection deterministically,
+        # rather than leaving it to whenever the thread's locals are
+        # collected.
+        storage = self.storage
+        if storage is not None:
+            try:
+                storage.close()
+            except Exception:  # pragma: no cover - shutdown is best-effort
+                pass
+
+    def server_close(self) -> None:
+        """Stop the workers, then close the listening socket."""
+        for _ in self._threads:
+            self._pending.put(None)
+        for thread in self._threads:
+            thread.join(timeout=_WORKER_JOIN_SECONDS)
+        self._threads = []
+        http.server.HTTPServer.server_close(self)
 
 
 def _is_api_path(raw_path: str) -> bool:
@@ -440,6 +534,7 @@ def create_server(
     port: int,
     storage: Storage,
     static_dir: str,
+    workers: Optional[int] = None,
 ) -> ThreadingHTTPServer:
     """Create (and bind) the dashboard HTTP server; caller serves/closes it.
 
@@ -451,7 +546,12 @@ def create_server(
     handler = cast(
         Type[http.server.BaseHTTPRequestHandler], _DashboardRequestHandler
     )
-    server = ThreadingHTTPServer((host, port), handler)
+    # The pool size IS the connection count, so it comes from the same
+    # place the cache budget was divided by - otherwise the two drift and
+    # the arithmetic silently stops being true.
+    if workers is None:
+        workers = storage.max_connections
+    server = ThreadingHTTPServer((host, port), handler, workers=workers)
     server.storage = storage
     server.static_dir = static_dir
     server.static_cache = {}

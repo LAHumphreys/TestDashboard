@@ -671,6 +671,34 @@ long as the import is a status command nobody runs — so for the outstanding
 and as they would be sent to `/api/import`. The pair is what catches a field the
 reader invented (silently dropped) or one it omitted (silently defaulted).
 
+### Why the pool matters, and what actually caches
+
+Two things in testboard hold data between requests, and it is worth knowing
+which is which when a screen feels fast and then feels slow again later.
+
+**SQLite's page cache** is the big one, and it lives on a *connection*.
+Connections are thread-local, so before the worker pool existed — with a
+thread per request — every request got a new connection and therefore a new,
+empty cache. Twenty requests opened twenty connections; nothing ever warmed
+up, and `--cache-mb` could not have helped, because a cache thrown away after
+one request has nothing to accumulate. With the pool, the same handful of
+connections serve everything, so their caches fill and stay filled for as long
+as the process runs. Nothing expires them on a timer.
+
+**The nightly-trend memo** is the small one: `daily_result_counts` is cached
+for 60 seconds, so the home chart can be up to a minute stale after a write
+made by a *different* process (an offline prune). Writes made by the server
+itself clear it immediately. This is the only time-based invalidation in the
+system.
+
+If a screen is fast for a while and cold again later **with no data change and
+no restart**, and the database is on a network mount, the cache that decayed
+is almost certainly the *operating system's*, not testboard's — a mount's page
+cache is evicted on inactivity in a way local disk's usually is not. That is
+exactly what raising `--cache-mb` addresses, because it moves the caching into
+a process you control. Confirm it first with `tools/diagnose_db.py
+--compare-local`.
+
 ### Fixing data that has already been pushed
 
 Nothing is stuck. A run is keyed by `(environment, script, test_name,
@@ -1035,7 +1063,10 @@ deployment constraint is "no installs beyond the OS". So the code targets 3.6
 exactly: no `dataclasses`, no `datetime.fromisoformat`, no
 `http.server.ThreadingHTTPServer`, no walrus operator, `typing.NamedTuple` instead of
 dataclasses, a hand-rolled (and unit-tested) ISO-8601 parser, and a threading HTTP
-server composed from `socketserver.ThreadingMixIn` + `http.server.HTTPServer`.
+server composed on `http.server.HTTPServer`, serving requests from a fixed
+pool of worker threads (`--workers`, default 8) rather than a thread per
+request. The pool is what lets a database connection — and its page cache —
+outlive a single request; see *Why the pool matters* below.
 
 At the same time, the suite runs clean on modern Pythons (CI covers up to 3.14), so
 development on a current interpreter is painless. The dedicated CI job running inside

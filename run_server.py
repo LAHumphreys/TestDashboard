@@ -67,6 +67,14 @@ def build_parser():
               "connections, not given to each; measure the effect first "
               "with: python3 tools/diagnose_db.py --db PATH --cache-mb MB"))
     parser.add_argument(
+        "--workers", type=int, default=None, metavar="N",
+        help=("worker threads serving requests (default: 8). Each holds "
+              "one database connection for its whole life, so this is "
+              "also the connection count and the number a --cache-mb "
+              "budget is split between. Raise it if requests queue "
+              "behind each other; lower it to give each connection a "
+              "bigger share of the cache"))
+    parser.add_argument(
         "--mmap-mb", type=int, default=None, metavar="MB",
         help=("map this much of the database instead of reading it, so "
               "the OS page cache serves pages with no copy. A large win "
@@ -118,7 +126,10 @@ def main(argv=None):
 
     try:
         storage = testboard.storage.Storage(
-            args.db, cache_mb=args.cache_mb, mmap_mb=args.mmap_mb)
+            args.db, cache_mb=args.cache_mb, mmap_mb=args.mmap_mb,
+            max_connections=(
+                args.workers if args.workers is not None
+                else testboard.storage.DEFAULT_MAX_CONNECTIONS))
     except Exception as exc:
         sys.stderr.write("Cannot open the database:\n  {0}\n".format(
             testboard.storage.describe_open_error(args.db, exc)))

@@ -84,11 +84,14 @@ _TREND_CACHE_MAX_ENTRIES = 32
 
 #: Connections are thread-local and the page cache is per connection, so
 #: a cache budget has to be divided by the number of threads that might
-#: hold one — not handed to each of them. This is the divisor: the
-#: threaded server creates a thread per request, but only a handful are
-#: ever live at once against a dashboard, and over-estimating here costs
-#: nothing but a smaller share.
-DEFAULT_MAX_CONNECTIONS = 16
+#: hold one — not handed to each of them.
+#:
+#: This is not an estimate. The server serves requests from a fixed pool
+#: of exactly this many worker threads, each holding one connection for
+#: its lifetime, so the divisor is the true count. Eight is generous for
+#: a dashboard whose reads are milliseconds once warm, and small enough
+#: that eight page caches fit any sensible budget.
+DEFAULT_MAX_CONNECTIONS = 8
 
 #: Never shrink a connection below SQLite's own default; a budget so
 #: small that it makes things worse is a configuration mistake, not an
@@ -724,6 +727,17 @@ class Storage:
         if self._mmap_mb is not None:
             conn.execute("PRAGMA mmap_size={0}".format(
                 max(0, int(self._mmap_mb)) * 1024 * 1024))
+
+    @property
+    def max_connections(self) -> int:
+        """Connections this Storage was sized for.
+
+        The server uses this as its worker-pool size, because the pool
+        size *is* the connection count: one long-lived connection per
+        worker thread. Deriving one from the other keeps the cache
+        arithmetic true instead of leaving two numbers to drift apart.
+        """
+        return self._max_connections
 
     def cache_bytes_per_connection(self) -> Optional[int]:
         """The per-connection cache this Storage asks for, or None."""
