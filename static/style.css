@@ -1270,3 +1270,64 @@ button.bar-row:focus-visible {
   font-size: 13px;
   color: var(--muted);
 }
+
+/* ---------- Time drill-down (time.html) ---------- */
+
+/* ONE hue, and deliberately not from the result palette: this is
+   magnitude, not status. Reusing the pass/fail colours here would have
+   people reading "red = bad" into a bar that only means "slow". */
+.bar-fill.fill-time { background: #3d6b8e; }
+
+.time-scope { margin: 0 0 14px; }
+
+.time-card { max-width: none; }
+
+.time-total {
+  margin: 0 0 16px;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 16px;
+  font-size: 13px;
+}
+
+.crumb {
+  background: none;
+  border: 0;
+  padding: 2px 4px;
+  font: inherit;
+  color: #1a4d7a;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.crumb:hover { color: #0d2f4d; }
+
+.crumb-current {
+  color: var(--ink);
+  font-weight: 600;
+  text-decoration: none;
+  cursor: default;
+}
+
+.crumb-sep { color: var(--muted); }
+
+/* A sort control that is switched off says why in its tooltip; make it
+   look unavailable too, so nobody clicks it expecting a reorder. */
+.sort-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Durations can read "8h 40m"; keep the value column from wrapping. */
+.time-card .bar-value {
+  min-width: 84px;
+  white-space: nowrap;
+}

@@ -492,6 +492,36 @@ class RollupCount(NamedTuple):
     count: int
 
 
+class DurationSlice(NamedTuple):
+    """One row of the "where is the time going" drill-down.
+
+    ``key`` is an environment, a script or a test name depending on the
+    level asked for; ``total_seconds`` is the sum of the newest run of
+    each test underneath it, and ``test_count`` is how many tests that
+    sum covers.
+    """
+
+    key: str
+    total_seconds: float
+    test_count: int
+
+
+class DurationRollup(NamedTuple):
+    """A level of the drill-down, plus what it does NOT include.
+
+    ``excluded_tests`` counts tests left out because they have not
+    reported inside the recency window. They still have a duration on
+    file, and counting it would claim time was spent that was not — so
+    they are dropped, and reported, rather than silently included or
+    silently ignored.
+    """
+
+    slices: List[DurationSlice]
+    total_seconds: float
+    test_count: int
+    excluded_tests: int
+
+
 class ScriptFailures(NamedTuple):
     """A script ranked by how many of its tests currently fail."""
 
@@ -612,6 +642,16 @@ DASHBOARD_SORTS = {
     # is a separate piece of work with its own measurements.
     "duration": ("lr.duration_seconds",) + _PK_ORDER,
 }  # type: Dict[str, Tuple[str, ...]]
+
+#: Levels the duration drill-down can group by, mapped to their column.
+#: A GROUP BY column cannot be a bound parameter, so — exactly like
+#: :data:`DASHBOARD_SORTS` — callers choose from this table and anything
+#: else is refused before it reaches the database.
+_DURATION_GROUPS = {
+    "environment": "lr.environment",
+    "script": "lr.script",
+    "test_name": "lr.test_name",
+}  # type: Dict[str, str]
 
 #: Triage queue membership, as SQL predicates over ``lr`` (latest_runs)
 #: and ``ca`` (current_assignments). These are the SQL half of the same
@@ -1469,6 +1509,104 @@ class Storage:
             sql += " AND lr.environment = ?"
             params.append(environment)
         return int(self._conn().execute(sql, params).fetchone()[0])
+
+    def duration_rollup(
+        self,
+        group_by: str,
+        recent_cutoff: Optional[datetime.datetime],
+        environment: Optional[str] = None,
+        script: Optional[str] = None,
+    ) -> DurationRollup:
+        """Where the suite's time went, grouped one level at a time.
+
+        *group_by* is ``"environment"``, ``"script"`` or ``"test_name"``
+        — validated against :data:`_DURATION_GROUPS` rather than
+        interpolated, because a GROUP BY column cannot be a parameter.
+
+        Aggregates ``latest_runs.duration_seconds``: **the newest run of
+        each test**, not a historical window. So it answers "where did
+        the last run of the suite spend its time", which is cheap (one
+        row per test, ~12k) and is what the page has to say it means. A
+        windowed version needs a real aggregate table and is a different
+        piece of work.
+
+        Two exclusions, both deliberate:
+
+        - **Retired tests**, consistent with every other estate view:
+          they are not in the suite.
+        - **Tests that have not reported since** *recent_cutoff*. Their
+          duration is still on file, and including it would claim time
+          was spent last night that was not. They are counted into
+          ``excluded_tests`` so the page can say how many rather than
+          quietly dropping them.
+
+        Pass ``recent_cutoff=None`` to include them anyway. That is not
+        the default and should not become it — but an all-or-nothing
+        cutoff turns the whole page into "0.0s across 0 tests" whenever
+        the suite has not run for a day and a half, which is a long
+        weekend or one bad night. Refusing to show anything is not more
+        honest than showing it clearly labelled.
+        """
+        column = _DURATION_GROUPS.get(group_by)
+        if column is None:
+            raise ValueError(
+                "group_by must be one of {0}, got {1!r}".format(
+                    sorted(_DURATION_GROUPS), group_by
+                )
+            )
+        conn = self._conn()
+        where = [
+            "tr.environment IS NULL",
+        ]
+        params = []  # type: List[Any]
+        if environment is not None:
+            where.append("lr.environment = ?")
+            params.append(environment)
+        if script is not None:
+            where.append("lr.script = ?")
+            params.append(script)
+        joined = (
+            "FROM latest_runs lr "
+            "LEFT JOIN test_retirements tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script "
+            " AND tr.test_name = lr.test_name "
+            "WHERE " + " AND ".join(where)
+        )
+        recency = "" if recent_cutoff is None else "AND lr.start_time >= ? "
+        recency_params = (
+            () if recent_cutoff is None
+            else (model.format_iso(recent_cutoff),)
+        )
+
+        rows = conn.execute(
+            "SELECT {0}, SUM(lr.duration_seconds), COUNT(*) {1} "
+            "{2}GROUP BY {0} "
+            "ORDER BY SUM(lr.duration_seconds) DESC, {0}".format(
+                column, joined, recency),
+            tuple(params) + recency_params,
+        ).fetchall()
+        slices = [
+            DurationSlice(
+                key=row[0],
+                total_seconds=float(row[1] or 0.0),
+                test_count=int(row[2]),
+            )
+            for row in rows
+        ]
+        if recent_cutoff is None:
+            excluded = 0
+        else:
+            excluded = conn.execute(
+                "SELECT COUNT(*) {0} AND lr.start_time < ?".format(joined),
+                tuple(params) + recency_params,
+            ).fetchone()[0]
+        return DurationRollup(
+            slices=slices,
+            total_seconds=sum(s.total_seconds for s in slices),
+            test_count=sum(s.test_count for s in slices),
+            excluded_tests=int(excluded),
+        )
 
     def top_failing_scripts(
         self, environment: Optional[str] = None, limit: int = 10

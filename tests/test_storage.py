@@ -794,6 +794,106 @@ class TestLatestRunDuration(StorageTestBase):
         self.assertEqual(descending, ["t2", "t0", "t3", "t1"])
 
 
+class TestDurationRollup(StorageTestBase):
+    """Where the suite's time went, one level at a time (WP-6)."""
+
+    def setUp(self) -> None:
+        StorageTestBase.setUp(self)
+        self.cutoff = BASE - datetime.timedelta(hours=1)
+        records = []
+        for env, script, name, secs in (
+            ("linux", "a.py", "one", 10),
+            ("linux", "a.py", "two", 5),
+            ("linux", "b.py", "three", 20),
+            ("win", "a.py", "four", 2),
+        ):
+            records.append(make_record(
+                environment=env, script=script, test_name=name,
+                start=BASE, end=BASE + datetime.timedelta(seconds=secs)))
+        self.store.upsert_runs(records)
+
+    def test_environments_are_ranked_by_total_time(self) -> None:
+        rollup = self.store.duration_rollup("environment", self.cutoff)
+        self.assertEqual(
+            [(s.key, s.total_seconds, s.test_count) for s in rollup.slices],
+            [("linux", 35.0, 3), ("win", 2.0, 1)])
+        self.assertEqual(rollup.total_seconds, 37.0)
+        self.assertEqual(rollup.test_count, 4)
+
+    def test_drilling_into_an_environment_groups_by_script(self) -> None:
+        rollup = self.store.duration_rollup(
+            "script", self.cutoff, environment="linux")
+        self.assertEqual(
+            [(s.key, s.total_seconds) for s in rollup.slices],
+            [("b.py", 20.0), ("a.py", 15.0)])
+
+    def test_drilling_into_a_script_groups_by_test(self) -> None:
+        rollup = self.store.duration_rollup(
+            "test_name", self.cutoff, environment="linux", script="a.py")
+        self.assertEqual(
+            [(s.key, s.total_seconds) for s in rollup.slices],
+            [("one", 10.0), ("two", 5.0)])
+
+    def test_retired_tests_are_excluded(self) -> None:
+        """Consistent with every other estate view: not in the suite."""
+        self.store.set_retired(
+            "linux", "b.py", "three", True, "alice", "gone", CREATED)
+        rollup = self.store.duration_rollup("environment", self.cutoff)
+        self.assertEqual(rollup.total_seconds, 17.0)
+        self.assertEqual(rollup.test_count, 3)
+
+    def test_stale_tests_are_excluded_and_counted(self) -> None:
+        """A test that last ran three weeks ago still has a duration.
+
+        Counting it would claim time was spent last night that was not.
+        Dropping it silently would present a smaller number as the
+        whole, so the count comes back with the answer.
+        """
+        rollup = self.store.duration_rollup(
+            "environment", BASE + datetime.timedelta(days=1))
+        self.assertEqual(rollup.slices, [])
+        self.assertEqual(rollup.excluded_tests, 4)
+
+    def test_stale_tests_can_be_included_deliberately(self) -> None:
+        """An all-or-nothing cutoff blanks the page after a long
+        weekend. Including them is opt-in, and reports nothing excluded
+        because nothing was."""
+        rollup = self.store.duration_rollup("environment", None)
+        self.assertEqual(rollup.total_seconds, 37.0)
+        self.assertEqual(rollup.excluded_tests, 0)
+
+    def test_an_unknown_group_by_is_refused(self) -> None:
+        """GROUP BY cannot be parameterised, so the whitelist IS the
+        security boundary — same rule as DASHBOARD_SORTS."""
+        for bad in ("lr.environment; DROP TABLE runs", "output", ""):
+            with self.assertRaises(ValueError):
+                self.store.duration_rollup(bad, self.cutoff)
+
+    def test_the_rollup_reads_one_row_per_test(self) -> None:
+        """It must not become proportional to the run count."""
+        for day in range(1, 30):
+            self.store.upsert_runs([make_record(
+                environment="linux", script="a.py", test_name="one",
+                start=BASE - datetime.timedelta(days=day),
+                end=BASE - datetime.timedelta(days=day) +
+                datetime.timedelta(seconds=99))])
+        rollup = self.store.duration_rollup("environment", self.cutoff)
+        # Still the LATEST run's 10s, not any of the 99s history.
+        self.assertEqual(rollup.total_seconds, 37.0)
+        plan = self.store._conn().execute(
+            "EXPLAIN QUERY PLAN SELECT lr.environment, "
+            "SUM(lr.duration_seconds), COUNT(*) FROM latest_runs lr "
+            "LEFT JOIN test_retirements tr "
+            "ON tr.environment = lr.environment AND tr.script = lr.script "
+            "AND tr.test_name = lr.test_name "
+            "WHERE tr.environment IS NULL GROUP BY lr.environment"
+        ).fetchall()
+        detail = " ".join(str(row[-1]) for row in plan)
+        self.assertNotIn(
+            "runs", detail.replace("latest_runs", ""),
+            "the rollup must not touch the runs table: " + detail)
+
+
 class TestMigrationThreeBackfill(unittest.TestCase):
     """Migration 3 against a database that already holds runs.
 

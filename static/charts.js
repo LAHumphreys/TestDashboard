@@ -356,7 +356,10 @@ export function barRows(container, items, options) {
     track.appendChild(fill);
     row.appendChild(track);
 
-    row.appendChild(el("span", "bar-value", item.value.toLocaleString()));
+    // valueText lets a caller print the value in its own units — "4m 12s"
+    // rather than "252" — without this helper knowing what it is showing.
+    row.appendChild(el("span", "bar-value",
+      item.valueText || item.value.toLocaleString()));
 
     if (item.tooltipRows) {
       const show = (event) => {

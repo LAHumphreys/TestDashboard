@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>testboard — where the time goes</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="home">
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html">Dashboard</a>
+      <a href="actions.html">Open actions</a>
+      <a href="time.html" aria-current="page">Time</a>
+    </nav>
+    <div id="user-widget" class="user-widget"></div>
+  </header>
+
+  <main class="wide">
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <section class="section-head">
+      <h2 class="eyebrow">Where the time goes</h2>
+      <span id="time-meta" class="muted"></span>
+    </section>
+
+    <!-- Says what is being measured. Without it the page invites the
+         reading "total time ever", which is not what it shows. -->
+    <p class="chart-caption time-scope">
+      The <strong>most recent run of each test</strong>, added up. Click a bar
+      to break it down.
+    </p>
+
+    <nav id="breadcrumb" class="breadcrumb" aria-label="Drill-down"></nav>
+
+    <div class="filter-row" aria-label="Scope">
+      <button id="stale-toggle" class="toggle" type="button" aria-pressed="false">
+        Include tests that have not run recently
+      </button>
+    </div>
+
+    <div class="card time-card">
+      <p id="time-total" class="time-total"></p>
+      <div id="time-chart"></div>
+      <p id="time-empty" class="empty-state" hidden>Nothing to show here.</p>
+      <p id="time-excluded" class="muted cap-note" hidden></p>
+      <details>
+        <summary>Data table</summary>
+        <div class="table-wrap">
+          <table class="data-table small" id="time-table">
+            <thead>
+              <tr>
+                <th><button type="button" class="sort-btn" data-key="key">Name<span class="sort-arrow"></span></button></th>
+                <th class="num"><button type="button" class="sort-btn" data-key="total_seconds">Total<span class="sort-arrow"></span></button></th>
+                <th class="num"><button type="button" class="sort-btn" data-key="test_count">Tests<span class="sort-arrow"></span></button></th>
+                <th class="num"><button type="button" class="sort-btn" data-key="mean">Mean<span class="sort-arrow"></span></button></th>
+              </tr>
+            </thead>
+            <tbody id="time-table-body"></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+  </main>
+
+  <script type="module" src="time.js"></script>
+</body>
+</html>

@@ -1014,6 +1014,89 @@ class TestAssignee(ApiCase):
                   body={"active": False, "changed_by": "bob"})
 
 
+class TestTimeEndpoint(ApiCase):
+    """GET /api/time — the "where is the time going" drill-down."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux", script="a.py", test_name="one",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=10))),
+            record(environment="linux", script="b.py", test_name="two",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=4))),
+            record(environment="win", script="a.py", test_name="three",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=1))),
+        ])
+
+    def test_default_level_is_environment(self) -> None:
+        data = self.call("GET", "/api/time")
+        self.assertEqual(data["group_by"], "environment")
+        self.assertEqual(
+            [(i["key"], i["total_seconds"]) for i in data["items"]],
+            [("linux", 14.0), ("win", 1.0)])
+        self.assertEqual(data["total_seconds"], 15.0)
+        self.assertEqual(data["test_count"], 3)
+
+    def test_scoping_drills_down(self) -> None:
+        scripts = self.call(
+            "GET", "/api/time",
+            query={"group_by": ["script"], "environment": ["linux"]})
+        self.assertEqual(
+            [i["key"] for i in scripts["items"]], ["a.py", "b.py"])
+        tests = self.call(
+            "GET", "/api/time",
+            query={"group_by": ["test_name"], "environment": ["linux"],
+                   "script": ["a.py"]})
+        self.assertEqual([i["key"] for i in tests["items"]], ["one"])
+
+    def test_an_unknown_group_by_is_400(self) -> None:
+        data = self.call(
+            "GET", "/api/time", query={"group_by": ["output"]}, expect=400)
+        self.assertIn("group_by", data["error"])
+
+    def test_stale_tests_are_excluded_and_reported(self) -> None:
+        self.import_runs([
+            record(environment="linux", script="c.py", test_name="old",
+                   start_time=format_iso(NOW - datetime.timedelta(days=10)),
+                   end_time=format_iso(NOW - datetime.timedelta(days=10)
+                                       + datetime.timedelta(seconds=500))),
+        ])
+        data = self.call("GET", "/api/time")
+        self.assertEqual(data["excluded_tests"], 1)
+        self.assertEqual(data["total_seconds"], 15.0)
+        self.assertFalse(data["include_stale"])
+
+    def test_stale_tests_can_be_included_on_request(self) -> None:
+        """Without this the page is blank after any quiet day."""
+        self.import_runs([
+            record(environment="linux", script="c.py", test_name="old",
+                   start_time=format_iso(NOW - datetime.timedelta(days=10)),
+                   end_time=format_iso(NOW - datetime.timedelta(days=10)
+                                       + datetime.timedelta(seconds=500))),
+        ])
+        data = self.call(
+            "GET", "/api/time", query={"include_stale": ["1"]})
+        self.assertTrue(data["include_stale"])
+        self.assertEqual(data["total_seconds"], 515.0)
+        self.assertEqual(data["excluded_tests"], 0)
+
+    def test_retired_tests_are_excluded(self) -> None:
+        self.call(
+            "PUT", test_path("win", "a.py", "three", "/retired"),
+            body={"retired": True, "username": "bob", "comment": "gone"})
+        data = self.call("GET", "/api/time")
+        self.assertEqual([i["key"] for i in data["items"]], ["linux"])
+
+    def test_wrong_method(self) -> None:
+        self.assert_405("POST", "/api/time", "GET", body={})
+
+
 class TestUsers(ApiCase):
     """GET/POST /api/users: listing, idempotent creation, validation."""
 

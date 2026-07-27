@@ -35,7 +35,7 @@ these are the ones that get forgotten:
 | WP-2 | Review on Open actions | **done** | 893 tests |
 | WP-3 | Triage result emphasis | **done** | 893 tests |
 | WP-7 | Sortable columns | pending | |
-| WP-6 | Time analysis tab | pending | |
+| WP-6 | Time analysis tab | **done** | `/api/time`, 908 tests |
 | WP-8 | Last pass + flaky signal | pending | |
 | WP-9 | SQL portability groundwork | pending | |
 | WP-10 | MariaDB export tool | pending | |
@@ -274,3 +274,34 @@ reloads, because it removes the test from every estate view.
 One ordering detail worth keeping: `reopenIfOpen` runs after the row is appended
 to the table, not inside `buildRow`. It inserts a sibling row, which needs a
 parent to insert into.
+
+### WP-6 — where the time goes — **done**
+
+`GET /api/time` + `static/time.html` / `time.js`. Nav added to all four existing
+pages. Suite 893 → 908.
+
+Scoped to the newest run of each test, as planned: a `GROUP BY` over ~12k rows,
+and a test asserts the query plan never touches `runs`. `group_by` is whitelisted
+(`_DURATION_GROUPS`) because a GROUP BY column cannot be a bound parameter —
+the same rule as `DASHBOARD_SORTS`, and tested with `"; DROP TABLE runs"`.
+
+Form: horizontal bars (reusing `barRows`), breadcrumb drill-down, data table
+alongside. One hue, deliberately **not** the result palette — this is magnitude,
+and borrowing the pass/fail colours would have people reading "red = bad" into a
+bar that only means "slow".
+
+**A design flaw found by running it, not by testing it.** The stale-test
+exclusion is right in principle — counting a test that last ran three weeks ago
+claims time that was not spent — but as an all-or-nothing cutoff it rendered
+"0.0s across 0 tests" on the production copy, whose data is older than the 36h
+window. That is not a test-data artefact: any long weekend, CI outage, or
+Monday-afternoon visit produces the same dead page. Fixed with an explicit
+`include_stale` opt-in: the honest filter stays the default, the empty state
+explains *why* it is empty and points at the toggle, and turning it on says
+plainly that some of the time shown was not spent recently.
+
+`formatDuration` grew hours. Totalling a suite produced "520m 22s", which is
+correct and which nobody reads as "most of a working day".
+
+`static/sorting.js` landed here rather than in WP-7 because this page needed it
+first. WP-7 adopts it elsewhere.

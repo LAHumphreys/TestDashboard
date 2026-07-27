@@ -1081,6 +1081,65 @@ def _handle_retired(
     )
 
 
+def _handle_time(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """GET /api/time — where the suite's runtime went, one level at a time.
+
+    Query parameters: ``group_by`` (``environment`` | ``script`` |
+    ``test_name``, default ``environment``), plus ``environment`` and
+    ``script`` to scope a drill-down.
+
+    Aggregates the newest run of each test, so it answers "where did the
+    last run of the suite spend its time" — not a historical window.
+    Retired tests and tests that have stopped reporting are excluded;
+    the count of the latter is returned so the page can say so rather
+    than quietly presenting a smaller number as the whole.
+    """
+    group_by = _query_single(request.query, "group_by") or "environment"
+    environment = _query_single(request.query, "environment")
+    script = _query_single(request.query, "script")
+    # Off by default: counting a test that last ran three weeks ago as
+    # part of "where the time went" claims time that was not spent. But
+    # an all-or-nothing cutoff empties the page after any quiet day, so
+    # it can be turned off deliberately and the page says which it is.
+    include_stale = _query_single(
+        request.query, "include_stale") in ("1", "true")
+    cutoff = (
+        None if include_stale
+        else now() - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
+    )
+    try:
+        rollup = storage.duration_rollup(
+            group_by, cutoff, environment=environment, script=script
+        )
+    except ValueError as exc:
+        raise _HttpError(400, "group_by: {}".format(exc))
+    return _json_response(
+        200,
+        {
+            "group_by": group_by,
+            "environment": environment,
+            "script": script,
+            "items": [
+                {
+                    "key": item.key,
+                    "total_seconds": round(item.total_seconds, 3),
+                    "test_count": item.test_count,
+                }
+                for item in rollup.slices
+            ],
+            "total_seconds": round(rollup.total_seconds, 3),
+            "test_count": rollup.test_count,
+            "excluded_tests": rollup.excluded_tests,
+            "include_stale": include_stale,
+            "recent_hours": _SUMMARY_RECENT_HOURS,
+        },
+    )
+
+
 def _handle_users_list(storage: Storage, request: Request) -> Response:
     """GET /api/users — users ordered by username.
 
@@ -1210,6 +1269,10 @@ def _route(
     if rest == ["summary"]:
         _check_method(request.method, ("GET",))
         return _handle_summary(storage, request, now)
+
+    if rest == ["time"]:
+        _check_method(request.method, ("GET",))
+        return _handle_time(storage, request, now)
 
     if rest == ["users"]:
         _check_method(request.method, ("GET", "POST"))

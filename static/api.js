@@ -428,7 +428,14 @@ export function formatTime(iso) {
   return iso.slice(0, 19).replace("T", " ");
 }
 
-/** Human-friendly duration from seconds (e.g. "1.9s", "2m 05s"). */
+/**
+ * Human-friendly duration from seconds (e.g. "1.9s", "2m 05s", "8h 40m").
+ *
+ * Hours matter now that whole suites are being totalled: "520m 22s" is
+ * technically correct and nobody reads it as "most of a working day".
+ * Seconds are dropped once there are hours — at that scale they are
+ * noise, and the extra characters push the value out of its column.
+ */
 export function formatDuration(seconds) {
   if (typeof seconds !== "number" || !isFinite(seconds)) {
     return "—";
@@ -436,9 +443,14 @@ export function formatDuration(seconds) {
   if (seconds < 60) {
     return seconds.toFixed(1) + "s";
   }
-  const minutes = Math.floor(seconds / 60);
-  const rest = Math.round(seconds % 60);
-  return minutes + "m " + String(rest).padStart(2, "0") + "s";
+  if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    const rest = Math.round(seconds % 60);
+    return minutes + "m " + String(rest).padStart(2, "0") + "s";
+  }
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.round((seconds % 3600) / 60);
+  return hours + "h " + String(minutes).padStart(2, "0") + "m";
 }
 
 /* ---------------- error banner ---------------- */
