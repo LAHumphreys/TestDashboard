@@ -68,13 +68,30 @@ ENTRY_SCRIPTS = ("run_server.py", "run_feeder.py")
 #: empty match costs nothing since the walk already filters to .py.
 _SKIP_DIRS = frozenset(["__pycache__", "node_modules", "static"])
 
+#: Vendored third-party source (see ``third_party/README.md``). Held to a
+#: DIFFERENT standard, deliberately, and :class:`VendoredCodeTest` is where
+#: that standard lives.
+#:
+#: The rules in this file are of two kinds, and only one of them applies to
+#: code we did not write. ``list[str]`` is a *runtime TypeError on 3.6* —
+#: that is correctness, and vendored code must pass it. "Use typing.List,
+#: annotate everything, no f-strings in the entry scripts" are *our
+#: conventions* — holding upstream to them would mean either editing
+#: upstream (so it can never be updated by replacing the directory) or
+#: permanently excusing the failures (so the gate rots).
+#:
+#: So the split is: vendored code must PARSE as 3.6 and must not use
+#: constructs that fail at import on 3.6. It need not look like ours.
+VENDORED_DIRS = frozenset(["third_party"])
+
 #: The 3.6 parser produces ast.Str for string literals; 3.8+ produces
 #: ast.Constant; 3.12 removed ast.Str altogether.
 _AST_STR = getattr(ast, "Str", None)
 
 
-def python_files() -> List[str]:
-    """Every .py file that ships, as absolute paths.
+def _walk_python(skip: frozenset, only: Optional[frozenset] = None
+                 ) -> List[str]:
+    """Every .py file under the repo, filtered by top-level directory.
 
     Dot-prefixed directories are skipped, which conveniently excludes
     ``.git``, ``.github``, ``.idea`` and any local ``.venv`` — a virtual
@@ -83,14 +100,33 @@ def python_files() -> List[str]:
     """
     found = []  # type: List[str]
     for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
-        dirnames[:] = sorted(
-            name for name in dirnames
-            if not name.startswith(".") and name not in _SKIP_DIRS
-        )
+        if only is not None and dirpath == REPO_ROOT:
+            dirnames[:] = sorted(name for name in dirnames if name in only)
+        else:
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if not name.startswith(".") and name not in skip
+            )
         for name in sorted(filenames):
             if name.endswith(".py"):
+                if only is not None and dirpath == REPO_ROOT:
+                    continue
                 found.append(os.path.join(dirpath, name))
     return found
+
+
+def python_files() -> List[str]:
+    """Every .py file WE wrote, as absolute paths.
+
+    Vendored third-party source is excluded here and checked separately
+    (see :data:`VENDORED_DIRS`).
+    """
+    return _walk_python(_SKIP_DIRS | VENDORED_DIRS)
+
+
+def vendored_files() -> List[str]:
+    """Every .py file under a vendored third-party directory."""
+    return _walk_python(_SKIP_DIRS, only=VENDORED_DIRS)
 
 
 def read(path: str) -> str:
@@ -169,12 +205,26 @@ def builtin_generics(tree: ast.AST) -> List[Tuple[int, str]]:
     return found
 
 
-def pep604_unions(tree: ast.AST) -> List[Tuple[int, str]]:
+def pep604_unions(tree: ast.AST,
+                  module_assignments: bool = True) -> List[Tuple[int, str]]:
     """``X | Y`` where it would be evaluated as a type on 3.6.
 
     Restricted to annotations, ``cast()`` type arguments and top-level
     assignments; a blanket search would flag ordinary bitwise-or and
     set-union code.
+
+    *module_assignments* covers the module-level type alias
+    (``Number = int | float``), which is a real ``TypeError`` on 3.6. It
+    is a heuristic and not a sound one: it cannot distinguish a type
+    alias from integer flag arithmetic at module scope, because telling
+    them apart needs to know what the names are bound to.
+
+    That over-approximation is safe for code we write — we do not do
+    module-level bitwise-or on integers, and if we started, narrowing the
+    rule would be the right response. It is NOT safe for vendored code,
+    where ``CAPABILITIES = LONG_PASSWORD | LONG_FLAG | ...`` is ordinary
+    and correct. Vendored callers pass False; see :class:`VendoredCodeTest`
+    for what covers the gap that leaves.
     """
     found = []  # type: List[Tuple[int, str]]
 
@@ -190,9 +240,10 @@ def pep604_unions(tree: ast.AST) -> List[Tuple[int, str]]:
             name = dotted_name(node.func)
             if name in ("cast", "typing.cast") and node.args:
                 scan(node.args[0])
-    for node in getattr(tree, "body", []):
-        if isinstance(node, ast.Assign):
-            scan(node.value)
+    if module_assignments:
+        for node in getattr(tree, "body", []):
+            if isinstance(node, ast.Assign):
+                scan(node.value)
     return found
 
 
@@ -256,6 +307,21 @@ class SourceCompatibilityTest(unittest.TestCase):
         for expected in ("testboard/storage.py", "testboard/api.py",
                          "feeder/submitter.py", "run_server.py"):
             self.assertIn(expected, names)
+
+    def test_vendored_code_is_not_in_the_project_scan(self) -> None:
+        """The exclusion must exclude vendored code and nothing else.
+
+        An exclusion that accidentally matched everything would leave
+        every test in this class passing over an empty set.
+        """
+        leaked = sorted(
+            relative(path) for path in self.sources
+            if relative(path).split("/")[0] in VENDORED_DIRS
+        )
+        self.assertEqual(
+            leaked, [],
+            "vendored files reached the project-style scan; they are "
+            "checked by VendoredCodeTest instead")
 
     def test_grammar_accepts_every_file_as_python_36(self) -> None:
         """The exhaustive syntax gate.
@@ -385,6 +451,91 @@ class AnnotationsEvaluateTest(unittest.TestCase):
         self.assertEqual(failures, [], "annotations fail to evaluate")
         self.assertGreater(checked, 200,
                            "annotation sweep covered almost nothing")
+
+
+class VendoredCodeTest(unittest.TestCase):
+    """Vendored third-party source: correctness gates only.
+
+    The project vendors pure-Python dependencies rather than installing
+    them, so that nothing has to be set up on the deployment host (see
+    ``third_party/README.md``). That makes their 3.6 compatibility OUR
+    problem — nobody else is checking it, and the failure mode is an
+    ImportError on the production server and a green suite here.
+
+    What is checked is exactly what would break at import on 3.6. What is
+    NOT checked is anything that only expresses this project's style: a
+    missing annotation upstream is not a defect, and treating it as one
+    would force us either to edit vendored code (making it un-updatable)
+    or to carry a growing list of excuses (making the gate meaningless).
+
+    One gap is accepted knowingly. The PEP 604 scan drops its
+    module-level-assignment arm here, because that arm cannot tell a type
+    alias from integer flag arithmetic and PyMySQL's constants modules are
+    full of the latter (``CAPABILITIES = LONG_PASSWORD | LONG_FLAG | ...``).
+    A vendored module-level type alias written with ``|`` would therefore
+    slip past. What catches it instead is the ubi8/python-36 CI job, where
+    such an alias is a TypeError at import and the suite does not start.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.sources = {}  # type: Dict[str, str]
+        cls.trees = {}  # type: Dict[str, ast.Module]
+        for path in vendored_files():
+            source = read(path)
+            cls.sources[path] = source
+            cls.trees[path] = ast.parse(source, filename=path)
+
+    def test_the_vendor_scan_finds_what_is_on_disk(self) -> None:
+        """A walk that matches nothing would pass every test below."""
+        for name in sorted(VENDORED_DIRS):
+            directory = os.path.join(REPO_ROOT, name)
+            if not os.path.isdir(directory):
+                continue
+            found = [p for p in self.sources if relative(p).startswith(name)]
+            self.assertTrue(
+                found, name + "/ exists but the scan found no Python in it")
+
+    def test_vendored_code_parses_as_python_36(self) -> None:
+        """The whole reason a specific version is pinned.
+
+        "Whatever is current" is how you end up shipping a driver that
+        uses the walrus operator to a RHEL 8 box.
+        """
+        if sys.version_info < (3, 8):
+            self.skipTest("feature_version needs Python 3.8+")
+        bad = []  # type: List[str]
+        for path, source in sorted(self.sources.items()):
+            problem = parses_as_python36(source, path)
+            if problem is not None:
+                bad.append(relative(path) + " " + problem)
+        self.assertEqual(bad, [], "vendored code is not 3.6-parseable")
+
+    def test_vendored_code_has_no_import_time_36_failures(self) -> None:
+        """PEP 585/604 and PEP 563 all fail at import on 3.6.
+
+        Unlike the style rules, these are not opinions: each one is a
+        TypeError or SyntaxError on the target interpreter.
+        """
+        bad = []  # type: List[str]
+        for path, tree in sorted(self.trees.items()):
+            for lineno, text in builtin_generics(tree):
+                bad.append("%s:%d PEP 585 `%s`"
+                           % (relative(path), lineno, text))
+            for lineno, text in pep604_unions(tree, module_assignments=False):
+                bad.append("%s:%d PEP 604 `%s`"
+                           % (relative(path), lineno, text))
+            for lineno in future_annotations(tree):
+                bad.append("%s:%d `from __future__ import annotations`"
+                           % (relative(path), lineno))
+            for lineno, name in typing_imports(tree):
+                if name not in TYPING_36:
+                    bad.append("%s:%d typing.%s does not exist in 3.6"
+                               % (relative(path), lineno, name))
+        self.assertEqual(
+            bad, [],
+            "vendored code would fail at import on Python 3.6. Pin an "
+            "older release of the package; do not edit the vendored files")
 
 
 class PlantedRegressionTest(unittest.TestCase):

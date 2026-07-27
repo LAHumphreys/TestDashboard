@@ -675,10 +675,16 @@ the parse assertion), `tests/test_vendored_driver.py` (new), `CLAUDE.md`
 (constraint wording), `README.md`.
 
 **Tests.** `tests/test_vendored_driver.py`: the package imports; it exposes the
-DB-API 2.0 surface actually needed (`connect`, `paramstyle == "format"`,
-`Error`, `IntegrityError`, `OperationalError`); its `LICENSE` file is present
-and says MIT; **it makes no network call and starts no thread at import time**;
-every `.py` under `third_party/` parses at `feature_version=(3, 6)`.
+DB-API 2.0 surface actually needed (`connect`, `paramstyle`, the exception
+hierarchy); its `LICENSE` file is present and says MIT; **it makes no network
+call and starts no thread at import time**; every `.py` under `third_party/`
+parses at `feature_version=(3, 6)`.
+
+Note for the eventual port: PyMySQL's `paramstyle` is **`pyformat`**, not
+`format` — it accepts `%(name)s` and positional `%s`. `sqlite3` is `qmark`
+(`?`). Every parameterised statement changes, and a stray `?` reaches MariaDB as
+a literal question mark rather than failing loudly, so the value is pinned by a
+test rather than assumed.
 
 **Risks.** Amending a stated project constraint is a real change, not a
 footnote. `CLAUDE.md` must say what the rule now is and why: *"standard library

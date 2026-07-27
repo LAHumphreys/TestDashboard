@@ -1119,6 +1119,29 @@ asserts the table headers in `static/index.html` never drift from it.
 - Charting libraries — every chart (nightly trend, per-environment bars,
   day-of-week profile) is hand-rolled SVG/HTML.
 
+## Third-party code
+
+testboard has no dependencies to install. Everything it needs is either in the
+standard library or vendored into the tree under
+[`third_party/`](third_party/README.md), where it is *present* rather than
+*installed* — copy the checkout and run it, with no pip, no compiler and no
+network access on the server.
+
+That directory is a narrow exemption to the stdlib-only rule, not an open door:
+it is for pure-Python packages, with no dependencies of their own, that fill a
+gap the standard library genuinely leaves.
+
+| Package | Version | Licence | Why |
+|---|---|---|---|
+| [PyMySQL](https://pypi.org/project/PyMySQL/1.0.2/) | 1.0.2 | MIT | The stdlib has no MySQL/MariaDB driver, and the database is moving to MariaDB. 1.0.2 is the last release supporting Python 3.6. |
+
+Vendored code is exempt from this project's style rules but not from the 3.6
+compatibility gate; `tests/test_python36_compat.py` re-checks on every run that
+every vendored file parses as 3.6, so an update cannot quietly raise the floor.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Luke Humphreys.
+
+Vendored third-party code keeps its own licence, shipped alongside it
+(`third_party/pymysql/LICENSE`, MIT).

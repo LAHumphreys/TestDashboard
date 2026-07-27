@@ -94,6 +94,24 @@ primary keys on load. `utf8mb4_nopad_bin` restores the SQLite behaviour exactly.
 Replace `WEBHOST` with the web server's hostname or IP as MariaDB sees it, and
 choose two distinct strong passwords.
 
+**Create both accounts with `mysql_native_password`** — that is MariaDB's
+default, so on a stock server the plain `IDENTIFIED BY` below already does it.
+If this server has been configured to default to a sha256-based plugin, say so
+explicitly (`IDENTIFIED VIA mysql_native_password USING PASSWORD('...')`).
+
+The reason is not preference. testboard's MySQL driver is vendored into the repo
+so that nothing has to be installed on the web server, and PyMySQL needs the
+compiled `cryptography` package for the `sha256_password` and
+`caching_sha2_password` plugins. `cryptography` is deliberately **not** vendored
+— vendoring a package that needs a compiler would give up the whole "nothing to
+build on the server" property. So an account created with a sha256 plugin
+produces, at connect time:
+
+> `'cryptography' package is required for sha256_password or
+> caching_sha2_password auth methods`
+
+The fix is the auth plugin, not an install.
+
 ```sql
 -- The application. Data only: it can never alter the schema.
 CREATE USER 'testboard_app'@'WEBHOST' IDENTIFIED BY 'APP_PASSWORD_HERE';
@@ -613,3 +631,4 @@ that kind of claim testable rather than to make it confidently.
 | `Cannot add or update a child row: a foreign key constraint fails` | Orphan rows, or wrong load order | §B.6 and §C.1 |
 | Blob comparison fails in §E.4 | Hex round-trip; usually a missing `UNHEX()` or a client charset mangling the hex text | Re-check `load.sql`; blobs must never pass through a character-set conversion |
 | Dashboard works, is slow, buffer pool is large | Pool not warm yet, or not actually applied | `SHOW ENGINE INNODB STATUS`; confirm `@@innodb_buffer_pool_size` is what §A.3 set |
+| `'cryptography' package is required for sha256_password…` at connect | The account uses a sha256 auth plugin; the vendored driver cannot do those without a compiled package | §A.2 — recreate the account with `mysql_native_password`. Do **not** install `cryptography` on the server; "nothing to build on the server" is the property this whole design protects |

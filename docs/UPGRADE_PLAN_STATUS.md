@@ -28,7 +28,7 @@ these are the ones that get forgotten:
 |---|---|---|---|
 | — | Plan + MariaDB runbook | **done** | *(this commit)* |
 | WP-0 | Migration registry guard | **done** | `tests/test_migrations.py`, 19 tests |
-| WP-11 | Vendor PyMySQL | pending | |
+| WP-11 | Vendor PyMySQL | **done** | `third_party/pymysql` 1.0.2, 13 tests |
 | WP-4 | Deactivate users (migration 2) | pending | |
 | WP-5 | `duration_seconds` (migration 3) | pending | |
 | WP-1 | Extract `review.js` | pending | |
@@ -79,3 +79,34 @@ Two things worth knowing if this file is ever revisited:
 - The planted regression was run for real, not just asserted at string level:
   a `planted_column TEXT` added to entry 1 in `storage.py` fails
   `test_migration_one_matches_what_was_deployed`. Verified, then reverted.
+
+### WP-11 — vendor PyMySQL — **done**
+
+`third_party/pymysql` 1.0.2 (last release supporting 3.6; 1.1.0 raised its floor
+to 3.7). MIT, pure Python, no dependencies of its own, 18 files. Wired to
+nothing — a test enforces that, so reverting stays a one-commit operation.
+Suite 827 → 844.
+
+Four things found on the way that are not obvious from the diff:
+
+- **`cryptography` is an optional PyMySQL dependency** needed for
+  `sha256_password` / `caching_sha2_password`. It is compiled, so vendoring it
+  would destroy the "nothing to build on the server" property. MariaDB defaults
+  to `mysql_native_password` and needs none of it — but the DB account must be
+  created with that plugin. Added to the runbook §A.2 and its troubleshooting
+  table, because the error message names a Python package and the fix is a SQL
+  grant.
+- **`paramstyle` is `pyformat`, not `format`.** The plan said `format`. Pinned
+  by a test, because a stray `?` reaches MariaDB as a literal question mark
+  rather than failing loudly.
+- **The PEP 604 detector false-positived on vendored code.** Its
+  module-level-assignment arm cannot distinguish `Number = int | float` from
+  `CAPABILITIES = LONG_PASSWORD | LONG_FLAG | ...`, and PyMySQL's constants
+  modules are full of the latter. That arm is now optional and off for vendored
+  code; the gap it leaves (a vendored type alias using `|`) is caught by the
+  ubi8/python-36 CI job, where it is a TypeError at import.
+- **The "opens no socket at import" test could not be written as a
+  monkeypatch.** Replacing `socket.socket` breaks `ssl.SSLSocket`, which
+  subclasses it, so the test failed inside the standard library before reaching
+  the driver. It uses `sys.addaudithook` instead, plus a companion test proving
+  the hook actually fires on a real network call.
