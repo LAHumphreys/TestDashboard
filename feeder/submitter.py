@@ -115,7 +115,7 @@ class _BatchResult(NamedTuple):
     replay_path: Optional[str]
 
 
-def _urllib_opener(url: str, body: bytes, headers: Dict[str, str]) -> Tuple[int, bytes]:
+def urllib_opener(url: str, body: bytes, headers: Dict[str, str]) -> Tuple[int, bytes]:
     """Default :data:`Opener`: POST via urllib.request with a 60s timeout.
 
     HTTP error statuses (4xx/5xx) are returned as ``(status, body)`` rather
@@ -172,7 +172,7 @@ def describe_connection_error(url: str, exc: BaseException) -> str:
     )
 
 
-def _normalize_url(url: str) -> str:
+def normalize_url(url: str) -> str:
     """Accept a dashboard base URL or a full /api/import URL; return the latter."""
     trimmed = url.rstrip("/")
     if not trimmed.endswith(_IMPORT_PATH):
@@ -285,11 +285,11 @@ class Submitter:
         history means thousands of files and hours of retry backoff for
         an import that cannot succeed.
         """
-        self._url = _normalize_url(url)
+        self._url = normalize_url(url)
         self._batch_size = max(1, int(batch_size))
         self._max_retries = max(1, int(max_retries))
         self._backoff_seconds = float(backoff_seconds)
-        self._opener = opener if opener is not None else _urllib_opener
+        self._opener = opener if opener is not None else urllib_opener
         self._sleep = sleep
         self._replay_dir = replay_dir
         self._max_consecutive_failures = max(1, int(max_consecutive_failures))

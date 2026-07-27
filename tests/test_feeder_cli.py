@@ -147,6 +147,20 @@ class CliTestBase(unittest.TestCase):
         logging.disable(logging.CRITICAL)
         self.addCleanup(logging.disable, logging.NOTSET)
 
+    @contextlib.contextmanager
+    def capture_logs(self, level: str = "INFO") -> Any:
+        """assertLogs on run_feeder, with setUp's global mute lifted.
+
+        setUp silences logging so the suite is quiet; a test that is
+        *about* what the feeder tells someone has to hear it again.
+        """
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs("run_feeder", level=level) as caught:
+                yield caught
+        finally:
+            logging.disable(logging.CRITICAL)
+
     def write_jsonl(self, records: List[Dict[str, Any]]) -> str:
         """Write records to a JSON-lines file in the temp dir."""
         path = os.path.join(self.tmp, "runs.jsonl")
@@ -156,12 +170,19 @@ class CliTestBase(unittest.TestCase):
         return path
 
     def base_args(self, mode: str = "backfill") -> List[str]:
-        """Common CLI arguments pointing all file outputs at the temp dir."""
+        """Common CLI arguments pointing all file outputs at the temp dir.
+
+        ``--skip-preflight`` because these tests are about what main()
+        does with a Submitter, and preflight would try to reach a
+        dashboard that deliberately is not there. The preflight itself is
+        covered by :class:`PreflightTest`.
+        """
         return [
             "--url", "http://127.0.0.1:9",
             "--mode", mode,
             "--state-file", self.state_file,
             "--replay-dir", self.tmp,
+            "--skip-preflight",
         ]
 
     def run_main_with_fake(
@@ -429,6 +450,271 @@ class WiringTest(CliTestBase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(created[0].submit_calls[0]["records"], [record])
+
+
+class FirstRunFeedbackTest(CliTestBase):
+    """What someone who does not yet know the tool is told.
+
+    Running it wrong is the most likely first interaction, and argparse's
+    own answer to it — "the following arguments are required" — names the
+    flags without saying what they are for or how to find out.
+    """
+
+    def stderr_of(self, argv: List[str]) -> str:
+        """Run main() with argv and return what it wrote to stderr."""
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            run_feeder.main(argv)
+        return stream.getvalue()
+
+    def test_no_arguments_shows_usage_and_a_command_to_copy(self) -> None:
+        message = self.stderr_of([])
+        self.assertIn("usage:", message)
+        self.assertIn("--url http://dashboard-host:8000 --mode daily",
+                      message)
+
+    def test_no_arguments_points_at_the_wizard_and_the_help(self) -> None:
+        message = self.stderr_of([])
+        self.assertIn("--init", message)
+        self.assertIn("--help", message)
+
+    def test_no_arguments_exits_2(self) -> None:
+        self.assertEqual(run_feeder.main([]), 2)
+
+    def test_a_missing_url_explains_what_a_url_is_here(self) -> None:
+        """'--url is required' does not help someone who has two servers."""
+        with self.capture_logs("ERROR") as captured:
+            code = run_feeder.main(["--reader", "jsonl", "--source", "x"])
+        self.assertEqual(code, 2)
+        message = "\n".join(captured.output)
+        self.assertIn("--url and --mode are required", message)
+        self.assertIn("running the dashboard", message)
+        self.assertIn("--init", message)
+
+    def test_the_help_carries_the_timezone_rule(self) -> None:
+        """The one mistake that produces no error message at all."""
+        epilog = run_feeder.EPILOG
+        self.assertIn("timestamps are UTC", epilog)
+        self.assertIn("local time", epilog)
+        self.assertIn("--check-reader", epilog)
+
+    def test_the_help_carries_complete_commands(self) -> None:
+        self.assertIn("--mode backfill", run_feeder.EPILOG)
+        self.assertIn("--config", run_feeder.EPILOG)
+        self.assertIn(":create_reader", run_feeder.EPILOG)
+
+    def test_the_help_explains_the_exit_codes(self) -> None:
+        """A scheduled task reports only this number."""
+        for code in ("0", "1", "2"):
+            self.assertIn("  " + code + "  ", run_feeder.EPILOG)
+
+    def test_version_is_reported(self) -> None:
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            code = run_feeder.main(["--version"])
+        self.assertEqual(code, 0)
+        self.assertIn("testboard feeder", stream.getvalue())
+
+
+class PreflightTest(CliTestBase):
+    """The checks that run before a single record is read.
+
+    Each of these would otherwise be discovered only after the reader had
+    been run over the whole estate — and, for the state file, only after
+    a successful import.
+    """
+
+    def run_with_probe(
+        self, argv: List[str], problem: Optional[str] = None
+    ) -> Tuple[int, str]:
+        """Run main() with the dashboard probe stubbed; return (code, log)."""
+        stats = make_stats(read=1, valid=1, sent=1, inserted=1)
+        fake_cls, _ = make_fake_submitter(stats, None)
+        with mock.patch("feeder.preflight.probe_dashboard",
+                        return_value=problem):
+            with mock.patch("feeder.submitter.Submitter", fake_cls):
+                with self.capture_logs() as caught:
+                    code = run_feeder.main(argv)
+        return code, "\n".join(caught.output)
+
+    def live_args(self, mode: str = "backfill") -> List[str]:
+        """base_args without the --skip-preflight that suppresses it."""
+        return [arg for arg in self.base_args(mode)
+                if arg != "--skip-preflight"]
+
+    def test_an_unreachable_dashboard_stops_before_reading(self) -> None:
+        source = self.write_jsonl([{"environment": "e"}])
+        code, log = self.run_with_probe(
+            self.live_args() + ["--source", source],
+            problem="Cannot reach the dashboard at http://x (refused).")
+        self.assertEqual(code, 2)
+        self.assertIn("Cannot reach the dashboard", log)
+        self.assertIn("stopping before reading anything", log)
+
+    def test_a_malformed_url_never_reaches_the_network(self) -> None:
+        code, log = self.run_with_probe(
+            ["--url", "dashboard:8000", "--mode", "backfill",
+             "--replay-dir", self.tmp, "--source", "x"])
+        self.assertEqual(code, 2)
+        self.assertIn("has no scheme", log)
+
+    def test_an_unwritable_state_file_is_caught_before_the_import(
+        self
+    ) -> None:
+        """The failure that otherwise appears only after success."""
+        code, log = self.run_with_probe(
+            ["--url", "http://127.0.0.1:9", "--mode", "daily",
+             "--replay-dir", self.tmp, "--source", "x",
+             "--state-file", os.path.join(self.tmp, "absent", "s.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", log)
+
+    def test_an_unwritable_replay_directory_is_caught(self) -> None:
+        code, log = self.run_with_probe(
+            ["--url", "http://127.0.0.1:9", "--mode", "backfill",
+             "--replay-dir", os.path.join(self.tmp, "absent"),
+             "--source", "x"])
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", log)
+
+    def test_a_good_setup_says_so_and_proceeds(self) -> None:
+        source = self.write_jsonl([{"environment": "e"}])
+        code, log = self.run_with_probe(
+            self.live_args() + ["--source", source])
+        self.assertEqual(code, 0)
+        self.assertIn("preflight OK", log)
+
+    def test_skip_preflight_does_not_contact_the_dashboard(self) -> None:
+        source = self.write_jsonl([{"environment": "e"}])
+        with mock.patch("feeder.preflight.probe_dashboard") as probe:
+            self.run_main_with_fake(
+                self.base_args() + ["--source", source],
+                make_stats(read=1, valid=1, sent=1, inserted=1))
+        probe.assert_not_called()
+
+    def test_a_dry_run_needs_no_dashboard_and_no_writable_paths(self) -> None:
+        """--dry-run sends nothing and writes nothing, so it checks neither."""
+        source = self.write_jsonl([{"environment": "e"}])
+        with mock.patch("feeder.preflight.probe_dashboard") as probe:
+            code, log = self.run_with_probe(
+                ["--url", "http://127.0.0.1:9", "--mode", "daily",
+                 "--dry-run", "--source", source,
+                 "--replay-dir", os.path.join(self.tmp, "absent"),
+                 "--state-file", os.path.join(self.tmp, "absent", "s.json")])
+        self.assertEqual(code, 0)
+        self.assertIn("dry run", log)
+        probe.assert_not_called()
+
+
+class ConfigFileTest(CliTestBase):
+    """Settings read from a file rather than typed on the command line."""
+
+    def write_config(self, settings: Dict[str, Any]) -> str:
+        """Write a config file into the temp dir and return its path."""
+        path = os.path.join(self.tmp, "feeder.config.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle)
+        return path
+
+    def test_a_config_file_can_replace_every_flag(self) -> None:
+        source = self.write_jsonl([{"environment": "e"}])
+        path = self.write_config({
+            "url": "http://127.0.0.1:9", "mode": "backfill",
+            "source": [source], "state_file": self.state_file,
+            "replay_dir": self.tmp,
+        })
+        code, created = self.run_main_with_fake(
+            ["--config", path, "--skip-preflight"],
+            make_stats(read=1, valid=1, sent=1, inserted=1))
+        self.assertEqual(code, 0)
+        self.assertEqual(created[0].url, "http://127.0.0.1:9")
+
+    def test_a_flag_overrides_the_config_file(self) -> None:
+        source = self.write_jsonl([{"environment": "e"}])
+        path = self.write_config({
+            "url": "http://from-config:8000", "mode": "backfill",
+            "source": [source], "replay_dir": self.tmp,
+        })
+        _, created = self.run_main_with_fake(
+            ["--config", path, "--url", "http://from-flag:8000",
+             "--skip-preflight"],
+            make_stats(read=1, valid=1, sent=1, inserted=1))
+        self.assertEqual(created[0].url, "http://from-flag:8000")
+
+    def test_a_source_flag_replaces_rather_than_extends_the_config(
+        self
+    ) -> None:
+        """--source is an append option; a default would silently add to it."""
+        from_config = self.write_jsonl([{"environment": "config"}])
+        from_flag = os.path.join(self.tmp, "flag.jsonl")
+        with open(from_flag, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(
+                {"environment": "flag", "script": "s", "test_name": "t",
+                 "result": "PASS", "output": "",
+                 "start_time": "2026-07-25T01:00:00.000000",
+                 "end_time": "2026-07-25T01:00:01.000000"}) + "\n")
+        path = self.write_config({
+            "url": "http://127.0.0.1:9", "mode": "backfill",
+            "source": [from_config], "replay_dir": self.tmp,
+        })
+        _, created = self.run_main_with_fake(
+            ["--config", path, "--source", from_flag, "--skip-preflight"],
+            make_stats(read=1, valid=1, sent=1, inserted=1))
+        environments = {record["environment"]
+                        for record in created[0].submit_calls[0]["records"]}
+        self.assertEqual(environments, {"flag"})
+
+    def test_a_broken_config_stops_the_run_with_the_reason(self) -> None:
+        path = self.write_config({"batchsize": 100})
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            code = run_feeder.main(["--config", path])
+        self.assertEqual(code, 2)
+        self.assertIn("batchsize", stream.getvalue())
+        self.assertIn("batch_size", stream.getvalue())
+
+    def test_check_reader_uses_the_config_so_it_need_not_be_retyped(
+        self
+    ) -> None:
+        """A deployed site has a config; re-checking its reader should use it."""
+        source = self.write_jsonl([{
+            "environment": "prod", "script": "s", "test_name": "t",
+            "result": "PASS", "output": "",
+            "start_time": "2026-07-25T01:00:00.000000",
+            "end_time": "2026-07-25T01:00:01.000000"}])
+        path = self.write_config({
+            "url": "http://127.0.0.1:9", "mode": "daily",
+            "reader": "jsonl", "source": [source],
+        })
+        with self.capture_logs() as caught:
+            code = run_feeder.main(["--config", path, "--check-reader"])
+        self.assertEqual(code, 0)
+        self.assertIn("read=1 valid=1 invalid=0", "\n".join(caught.output))
+
+    def test_init_is_reached_and_carries_the_config_path(self) -> None:
+        """--init must route through main() before --url/--mode are demanded."""
+        with mock.patch("feeder.init.run_init", return_value=0) as wizard:
+            code = run_feeder.main(["--init", "--config", "/tmp/x.json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            wizard.call_args[1]["config_path"], "/tmp/x.json")
+
+    def test_init_without_a_terminal_refuses_rather_than_hanging(self) -> None:
+        """It is an interactive mode in a tool designed for cron."""
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            with mock.patch.object(sys, "stdin", io.StringIO("")):
+                code = run_feeder.main(["--init"])
+        self.assertEqual(code, 2)
+        self.assertIn("not a tty", stream.getvalue())
+
+    def test_a_missing_config_names_the_wizard(self) -> None:
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            code = run_feeder.main(
+                ["--config", os.path.join(self.tmp, "absent.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("--init", stream.getvalue())
 
 
 class SourceFileHygieneTest(unittest.TestCase):

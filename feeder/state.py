@@ -46,13 +46,37 @@ def load_high_water_mark(path: str) -> Optional[datetime.datetime]:
         return None
 
 
-def save_high_water_mark(path: str, hwm: datetime.datetime) -> None:
+def save_high_water_mark(path: str, hwm: datetime.datetime) -> bool:
     """Atomically write ``{"high_water_mark": iso}`` to ``path``.
 
     Writes to a temporary sibling file first and then replaces the target,
     so a crash mid-write cannot corrupt the previous state.
+
+    Returns True on success. A failure to write is reported at ERROR and
+    returns False rather than raising: by the time this is called the
+    import has already succeeded, and the records are safely in the
+    dashboard. Losing the mark costs one redundant re-import tomorrow —
+    turning that into an uncaught traceback would instead make a
+    successful run look like a failed one to whatever scheduled it.
     """
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump({_KEY: model.format_iso(hwm)}, handle)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump({_KEY: model.format_iso(hwm)}, handle)
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        logger.error(
+            "the import SUCCEEDED, but the high-water mark %s could not be "
+            "saved to %s (%s). Nothing is lost - tomorrow's daily run will "
+            "simply re-import from further back, and the server upserts so "
+            "no duplicates are possible. To stop this recurring, point "
+            "--state-file at a file the feeder can write (the checkout it "
+            "runs from is often read-only)",
+            model.format_iso(hwm), os.path.abspath(path), exc,
+        )
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+    return True

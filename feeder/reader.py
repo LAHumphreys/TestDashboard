@@ -18,9 +18,11 @@ import abc
 import datetime
 import glob
 import importlib
+import importlib.util
 import json
 import logging
 import os
+import sys
 from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,18 @@ logger = logging.getLogger(__name__)
 #: The contract a ``module.path:factory`` reader spec must satisfy. Quoted in
 #: every load-failure message so the fix is obvious from the log alone.
 FACTORY_SIGNATURE = "factory(sources: List[str]) -> feeder.reader.Reader"
+
+#: The two accepted shapes of ``--reader``, quoted whenever one fails to
+#: load. The file-path form exists because the feeder commonly runs from a
+#: checkout it cannot write to, so dropping a module into the repo root —
+#: the obvious answer, and the one the old message gave — is not an option.
+SPEC_FORMS = (
+    "'jsonl' (built-in), "
+    "'/abs/path/to/internal_reader.py:create_reader' (a file anywhere on "
+    "this machine), or "
+    "'module.path:create_reader' (importable from the testboard checkout "
+    "or PYTHONPATH)"
+)
 
 _MAX_LOGGED_CHARS = 200
 
@@ -181,50 +195,175 @@ class JsonLinesReader(Reader):
         return found
 
 
+def _looks_like_a_path(text: str) -> bool:
+    """True when *text* is more plausibly a file path than a dotted name."""
+    return (
+        "/" in text
+        or "\\" in text
+        or text.startswith(".")
+        or (len(text) > 1 and text[1] == ":")  # a Windows drive letter
+    )
+
+
+def _load_module_from_file(path: str, spec: str) -> Any:
+    """Import the Python file at *path* as a standalone module.
+
+    The file's directory is prepended to ``sys.path`` first, so a reader
+    split across a few files (``internal_reader.py`` plus its helpers) works
+    without the author having to package it.
+    """
+    absolute = os.path.abspath(path)
+    if not os.path.exists(absolute):
+        raise ReaderLoadError(
+            "cannot load reader '{spec}': no such file '{path}'. The part "
+            "before the ':' must be the path to your reader's .py file and "
+            "the part after it the factory function inside it, e.g. "
+            "'{guess}:create_reader' where {sig}".format(
+                spec=spec, path=absolute,
+                guess=os.path.join(os.path.dirname(absolute) or ".",
+                                   "internal_reader.py"),
+                sig=FACTORY_SIGNATURE,
+            )
+        )
+    if not os.path.isfile(absolute):
+        raise ReaderLoadError(
+            "cannot load reader '{spec}': '{path}' is a directory, not a "
+            "Python file. Name the .py file itself, e.g. "
+            "'{path}/internal_reader.py:create_reader'".format(
+                spec=spec, path=absolute)
+        )
+    directory = os.path.dirname(absolute)
+    if directory and directory not in sys.path:
+        sys.path.insert(0, directory)
+    module_name = os.path.splitext(os.path.basename(absolute))[0]
+    if module_name in sys.modules:
+        # A reader called json.py or logging.py would otherwise be
+        # installed over the real one for everything imported after it.
+        logger.debug(
+            "a module named %r is already loaded; registering the reader "
+            "under a private name instead", module_name)
+        module_name = "_testboard_reader_" + module_name
+    try:
+        module_spec = importlib.util.spec_from_file_location(
+            module_name, absolute)
+        if module_spec is None or module_spec.loader is None:
+            raise ImportError("not importable as a Python module")
+        module = importlib.util.module_from_spec(module_spec)
+        # Registered before exec so that a reader doing `import <itself>`
+        # or using pickle/dataclass-style module lookups resolves to this
+        # very object rather than importing a second copy.
+        sys.modules[module_name] = module
+        module_spec.loader.exec_module(module)
+    except Exception as exc:
+        sys.modules.pop(module_name, None)
+        raise ReaderLoadError(
+            "cannot load reader '{spec}': executing '{path}' raised "
+            "{etype}: {err}. The file must import cleanly on its own - try "
+            "'python3 {path}' to see the failure in isolation. Anything it "
+            "imports must be installed for the Python running the feeder, "
+            "or sit next to it (its directory is on the import "
+            "path)".format(
+                spec=spec, path=absolute, etype=type(exc).__name__, err=exc,
+            )
+        )
+    return module
+
+
+def _load_module_by_name(module_name: str, spec: str) -> Any:
+    """Import a dotted module name, explaining the search path on failure."""
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ReaderLoadError(
+            "cannot load reader '{spec}': importing module '{mod}' failed "
+            "({err}). A dotted name is searched on Python's import path, "
+            "which does NOT include the directory you happen to be in - it "
+            "is the directory holding run_feeder.py, plus PYTHONPATH. If "
+            "your reader lives elsewhere (for instance because the "
+            "checkout is read-only), give its path instead: "
+            "--reader /path/to/{mod}.py:{attr} - where {sig}".format(
+                spec=spec, mod=module_name, err=exc,
+                attr=spec.rpartition(":")[2].strip() or "create_reader",
+                sig=FACTORY_SIGNATURE,
+            )
+        )
+
+
 def load_reader(spec: str, sources: List[str]) -> Reader:
     """Resolve a ``--reader`` spec into a :class:`Reader` instance.
 
-    ``spec`` is either the built-in ``"jsonl"`` (returns
-    ``JsonLinesReader(sources)``) or ``"module.path:factory"``, in which case
-    ``module.path`` is imported and ``factory(sources)`` must return a
-    :class:`Reader`.
+    ``spec`` is one of:
+
+    - ``"jsonl"`` — the built-in :class:`JsonLinesReader`;
+    - ``"/path/to/internal_reader.py:create_reader"`` — a Python file
+      anywhere on this machine, loaded directly. This is the form to use
+      when the feeder runs from a checkout it cannot write to, since the
+      reader then has nowhere to live inside the repository;
+    - ``"module.path:create_reader"`` — a dotted module name resolved on
+      the normal import path.
+
+    In both factory forms ``factory(sources)`` must return a :class:`Reader`.
 
     Raises:
         ReaderLoadError: with an actionable message on any failure (unknown
-            spec, import failure, missing/uncallable attribute, factory
-            error, or a factory returning something that is not a Reader).
+            spec, missing file, import failure, missing/uncallable
+            attribute, factory error, or a factory returning something that
+            is not a Reader).
     """
     if spec == "jsonl":
         return JsonLinesReader(sources)
-    if ":" not in spec:
+    # Checked before the colon test below: a Windows path carries a colon
+    # of its own ('C:\\readers\\r.py'), so "has a colon" does not mean "has
+    # a factory name", and splitting one at the drive letter produces a
+    # baffling error about a module called 'C'.
+    if spec.lower().endswith(".py"):
         raise ReaderLoadError(
-            "cannot load reader '{spec}': unknown reader spec. Use the "
-            "built-in 'jsonl' reader, or 'module.path:factory' naming a "
-            "factory function with signature {sig}".format(
-                spec=spec, sig=FACTORY_SIGNATURE
+            "cannot load reader '{spec}': this is a file path with no "
+            "factory function on the end. Append ':' and the name of the "
+            "function in that file which builds the reader, e.g. "
+            "'{spec}:create_reader' where {sig}".format(
+                spec=spec, sig=FACTORY_SIGNATURE)
+        )
+    if ":" not in spec:
+        hint = ""
+        if _looks_like_a_path(spec):
+            hint = (" It looks like you gave a path - name the .py file "
+                    "itself and the factory in it, e.g. "
+                    "'{0}.py:create_reader'.".format(spec))
+        raise ReaderLoadError(
+            "cannot load reader '{spec}': a reader spec is one of "
+            "{forms}.{hint} The factory must be {sig}".format(
+                spec=spec, forms=SPEC_FORMS, hint=hint,
+                sig=FACTORY_SIGNATURE,
             )
         )
-    module_name, _, attr_name = spec.partition(":")
+    # rpartition, not partition: a Windows path ('C:\\readers\\r.py') has a
+    # colon of its own, and only the last one separates off the factory.
+    module_name, _, attr_name = spec.rpartition(":")
     module_name = module_name.strip()
     attr_name = attr_name.strip()
     if not module_name or not attr_name:
         raise ReaderLoadError(
-            "cannot load reader '{spec}': both a module and an attribute "
-            "are required, e.g. 'internal_reader:create_reader' where "
+            "cannot load reader '{spec}': both a module/file and a factory "
+            "name are required, e.g. "
+            "'/opt/testboard/internal_reader.py:create_reader' where "
             "{sig}".format(spec=spec, sig=FACTORY_SIGNATURE)
         )
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as exc:
+    if module_name.lower().endswith(".py"):
+        module = _load_module_from_file(module_name, spec)
+    elif _looks_like_a_path(module_name):
+        # A path, but not at a .py file: almost always the extension
+        # left off. Saying so beats trying to import it as a dotted name
+        # and reporting that 'opt/readers/internal_reader' is not a module.
         raise ReaderLoadError(
-            "cannot load reader '{spec}': importing module '{mod}' failed "
-            "({err}). Check that the module is importable from the "
-            "directory you run the feeder in (e.g. a file '{mod}.py' in "
-            "the repo root) and that the spec is 'module.path:factory' "
-            "where {sig}".format(
-                spec=spec, mod=module_name, err=exc, sig=FACTORY_SIGNATURE
-            )
+            "cannot load reader '{spec}': '{mod}' looks like a file path "
+            "but does not end in '.py'. Name the Python file itself, e.g. "
+            "'{mod}.py:{attr}' where {sig}".format(
+                spec=spec, mod=module_name, attr=attr_name,
+                sig=FACTORY_SIGNATURE)
         )
+    else:
+        module = _load_module_by_name(module_name, spec)
     try:
         factory = getattr(module, attr_name)
     except AttributeError:

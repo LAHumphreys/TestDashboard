@@ -9,6 +9,7 @@ specs, and every load-failure path with its actionable error message).
 import datetime
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from typing import Any, Dict, Iterator, List, Optional
@@ -276,6 +277,146 @@ class LoadReaderTest(unittest.TestCase):
         self.assertIn("dict", message)
         self.assertIn("Reader", message)
         self.assertIn(FACTORY_SIGNATURE, message)
+
+
+#: A reader that imports a sibling module, so the file-path loader is shown
+#: to put the reader's own directory on the import path.
+_SITE_READER = """\
+from site_helper import ENVIRONMENT
+from feeder.reader import Reader
+
+
+class SiteReader(Reader):
+    def __init__(self, sources):
+        self.sources = sources
+
+    def read(self, since):
+        return iter([{"environment": ENVIRONMENT}])
+
+
+def create_reader(sources):
+    return SiteReader(sources)
+"""
+
+
+class LoadReaderFromFileTest(unittest.TestCase):
+    """Loading a reader from a path rather than an importable module.
+
+    This is not a convenience. The feeder is expected to run against a
+    checkout it has only read access to, and the site-specific reader is
+    the one piece of code a rollout must supply — so if it can only be
+    loaded from somewhere inside the repository, there is nowhere to put
+    it and the tool cannot be deployed as specified.
+    """
+
+    def setUp(self) -> None:
+        """A scratch directory holding a reader and its helper."""
+        self.tmp = tempfile.mkdtemp(prefix="testboard_readerfile_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "internal_reader.py")
+        self._write(self.path, _SITE_READER)
+        self._write(os.path.join(self.tmp, "site_helper.py"),
+                    "ENVIRONMENT = 'prod'\n")
+
+    def _write(self, path: str, text: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_file_path_spec_loads_the_reader(self) -> None:
+        reader = load_reader(self.path + ":create_reader", ["a", "b"])
+        self.assertIsInstance(reader, Reader)
+        self.assertEqual(reader.sources, ["a", "b"])
+
+    def test_the_readers_own_directory_is_importable_from_it(self) -> None:
+        """A real reader is rarely one file; its helpers must resolve."""
+        reader = load_reader(self.path + ":create_reader", [])
+        self.assertEqual(list(reader.read(None)), [{"environment": "prod"}])
+
+    def test_a_relative_path_works_too(self) -> None:
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.tmp)
+        reader = load_reader("internal_reader.py:create_reader", [])
+        self.assertIsInstance(reader, Reader)
+
+    def test_a_missing_file_names_the_absolute_path_it_tried(self) -> None:
+        missing = os.path.join(self.tmp, "absent.py")
+        with self.assertRaises(ReaderLoadError) as ctx:
+            load_reader(missing + ":create_reader", [])
+        message = str(ctx.exception)
+        self.assertIn(os.path.abspath(missing), message)
+        self.assertIn("no such file", message)
+
+    def test_a_path_with_no_factory_says_which_half_is_missing(self) -> None:
+        """A Windows path has a colon of its own, so this needs its own test."""
+        with self.assertRaises(ReaderLoadError) as ctx:
+            load_reader(self.path, [])
+        message = str(ctx.exception)
+        self.assertIn("no factory function", message)
+        self.assertIn(self.path + ":create_reader", message)
+
+    def test_a_windows_style_path_is_not_split_at_the_drive_letter(
+        self
+    ) -> None:
+        """Splitting at the first colon reports a module called 'C'."""
+        with self.assertRaises(ReaderLoadError) as ctx:
+            load_reader(r"C:\readers\internal_reader.py:create_reader", [])
+        message = str(ctx.exception)
+        self.assertIn("internal_reader.py", message)
+        self.assertNotIn("module 'C'", message)
+
+    def test_a_path_missing_the_py_extension_is_told_so(self) -> None:
+        with self.assertRaises(ReaderLoadError) as ctx:
+            load_reader(os.path.join(self.tmp, "internal_reader") +
+                        ":create_reader", [])
+        self.assertIn("does not end in '.py'", str(ctx.exception))
+
+    def test_a_directory_is_not_a_reader(self) -> None:
+        with self.assertRaises(ReaderLoadError) as ctx:
+            load_reader(self.tmp + ".py:create_reader", [])
+        self.assertIn("no such file", str(ctx.exception))
+
+    def test_a_reader_that_fails_to_import_reports_the_real_error(
+        self
+    ) -> None:
+        broken = os.path.join(self.tmp, "broken_reader.py")
+        self._write(broken, "import a_module_that_is_not_installed\n")
+        with self.assertRaises(ReaderLoadError) as ctx:
+            load_reader(broken + ":create_reader", [])
+        message = str(ctx.exception)
+        self.assertIn("a_module_that_is_not_installed", message)
+        self.assertIn(os.path.abspath(broken), message)
+
+    def test_a_dotted_spec_that_fails_offers_the_file_path_form(self) -> None:
+        """The old message told people to put it in the repo root.
+
+        That is the one place a read-only checkout forbids, and it was
+        wrong about the working directory besides. The remedy has to be
+        the form that actually works.
+        """
+        with self.assertRaises(ReaderLoadError) as ctx:
+            load_reader("no_such_site_reader:create_reader", [])
+        message = str(ctx.exception)
+        self.assertIn(
+            "--reader /path/to/no_such_site_reader.py:create_reader", message)
+        self.assertIn("read-only", message)
+
+    def test_a_reader_named_after_a_stdlib_module_does_not_shadow_it(
+        self
+    ) -> None:
+        """Registering it as 'json' would replace the real one for good."""
+        impostor = os.path.join(self.tmp, "json.py")
+        self._write(impostor,
+                    "from feeder.reader import Reader\n\n\n"
+                    "class R(Reader):\n"
+                    "    def read(self, since):\n"
+                    "        return iter([])\n\n\n"
+                    "def create_reader(sources):\n"
+                    "    return R()\n")
+        load_reader(impostor + ":create_reader", [])
+        import json as real_json
+        self.assertTrue(hasattr(real_json, "loads"))
+        self.assertIs(sys.modules["json"], real_json)
 
 
 if __name__ == "__main__":

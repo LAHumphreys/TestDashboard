@@ -66,6 +66,18 @@ so internal hostnames, URLs, file paths, and parsing logic can never be committe
 the open-source repo by accident. **Never put proprietary details in any other
 file**, and never commit this one.
 
+At deployment time the file does not have to stay there — and often cannot, because
+the feeder is commonly run against a checkout it has only read access to. `--reader`
+accepts a **path** as well as a module name, so the same file works from anywhere:
+
+```
+--reader /opt/testboard-feeder/internal_reader.py:create_reader
+```
+
+The directory holding it goes on the import path, so a reader split over several
+files works too. Write it in the repo root while developing; put it wherever it
+belongs when you deploy. Nothing about the code changes.
+
 ## The interface to implement
 
 The framework defines (in `feeder/reader.py`):
@@ -450,6 +462,13 @@ after the overnight runs finish (adjust time and paths):
 schtasks /Create /TN "testboard-daily-feed" /SC DAILY /ST 06:30 ^
   /TR "cmd /c cd /d C:\path\to\TestDashboard && python run_feeder.py --url http://HOST:8000 --mode daily --reader internal_reader:create_reader >> feeder.log 2>&1"
 ```
+
+The `cd` is there only because `--reader internal_reader:create_reader` is resolved
+relative to the checkout, and because the state file and replay files default to the
+working directory. If the checkout is read-only — or you would rather the scheduled
+command not depend on a directory at all — run `python run_feeder.py --init` once. It
+checks the dashboard, the reader and the paths as you answer, writes a config file,
+and prints the scheduler line for it.
 
 Check `feeder.log` and the task's Last Result (should be `0`) after the first
 scheduled run.

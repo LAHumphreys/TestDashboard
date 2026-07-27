@@ -12,6 +12,15 @@ Modules:
 - :mod:`feeder.submitter` — validation, batching, HTTP submission with
   retry/backoff, and failed-batch replay files.
 - :mod:`feeder.state` — the daily-mode high-water-mark state file.
+- :mod:`feeder.check` — offline validation of a reader, no server needed.
+- :mod:`feeder.config` — the optional JSON config file.
+- :mod:`feeder.preflight` — checks run before an import does any work.
+- :mod:`feeder.init` — the interactive ``--init`` setup wizard.
 
 Python 3.6 compatible; standard library only.
 """
+
+#: Reported by ``run_feeder.py --version``. The feeder and the dashboard
+#: ship together, so this identifies the checkout rather than a separately
+#: released package.
+__version__ = "1.0.0"

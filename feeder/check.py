@@ -20,6 +20,7 @@ Python 3.6 compatible; standard library only.
 import collections
 import datetime
 import logging
+import time
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional
 
 from feeder.submitter import group_reason, identity_of, render_reasons
@@ -40,6 +41,10 @@ _ANCIENT = datetime.timedelta(days=3650)
 #: Sample size for the "what did the reader produce" digest.
 _MAX_LISTED = 10
 
+#: Below this, the machine is effectively on UTC and the local-time trap
+#: cannot bite, so the note about it is noise.
+_TRIVIAL_OFFSET_HOURS = 0.01
+
 #: Heuristics about the SHAPE of the data ("everything is a PASS", "every
 #: duration is zero") only mean something over a real sample — below this
 #: many valid records they are as likely to be true as to be a bug.
@@ -59,6 +64,7 @@ class CheckReport(NamedTuple):
     results: "collections.Counter"
     earliest: Optional[datetime.datetime]
     latest: Optional[datetime.datetime]
+    now: datetime.datetime
 
     @property
     def ok(self) -> bool:
@@ -132,6 +138,7 @@ def check_reader(
         results=results,
         earliest=earliest,
         latest=latest,
+        now=now,
     )
 
 
@@ -183,6 +190,81 @@ def _sanity_warnings(
     return warnings
 
 
+def local_utc_offset_hours() -> float:
+    """This machine's current offset from UTC, in hours.
+
+    ``time.timezone``/``time.altzone`` are seconds *west* of UTC, so the
+    sign is flipped to the conventional one: UTC+1 returns ``1.0``.
+    """
+    if time.daylight and time.localtime().tm_isdst > 0:
+        seconds = -time.altzone
+    else:
+        seconds = -time.timezone
+    return seconds / 3600.0
+
+
+def format_offset(hours: float) -> str:
+    """Render a UTC offset the way a person writes it: ``UTC+1``, ``UTC-4:30``."""
+    if abs(hours) < _TRIVIAL_OFFSET_HOURS:
+        return "UTC"
+    sign = "+" if hours > 0 else "-"
+    whole = int(abs(hours))
+    minutes = int(round((abs(hours) - whole) * 60))
+    if minutes:
+        return "UTC{0}{1}:{2:02d}".format(sign, whole, minutes)
+    return "UTC{0}{1}".format(sign, whole)
+
+
+def describe_age(latest: datetime.datetime, now: datetime.datetime) -> str:
+    """Describe how far the newest record sits from UTC now."""
+    seconds = (now - latest).total_seconds()
+    direction = "before" if seconds >= 0 else "AFTER"
+    seconds = abs(seconds)
+    days, remainder = divmod(int(seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        size = "{0}d {1}h".format(days, hours)
+    elif hours:
+        size = "{0}h {1:02d}m".format(hours, minutes)
+    else:
+        size = "{0}m".format(minutes)
+    return "{0} {1} UTC now".format(size, direction)
+
+
+def _log_clock(report: CheckReport, log: logging.Logger) -> None:
+    """Show the newest record against UTC now and this machine's offset.
+
+    The local-time trap has no reliable automatic detector. A reader in a
+    zone *ahead* of UTC produces future-dated records, which
+    :func:`_sanity_warnings` catches outright; one in a zone *behind* UTC
+    just makes every run look older than it is, which is indistinguishable
+    from a suite that ran earlier. So the numbers are put side by side and
+    named, because the person reading them knows when their suite last ran
+    and can tell in a second.
+    """
+    if report.latest is None:
+        return
+    offset = local_utc_offset_hours()
+    log.info(
+        "  newest run:   %s (this machine's clock is %s)",
+        describe_age(report.latest, report.now), format_offset(offset),
+    )
+    if abs(offset) >= _TRIVIAL_OFFSET_HOURS:
+        log.info(
+            "                If that is not when the suite actually ran, "
+            "suspect the reader: times must be UTC, and local time passed "
+            "through unchanged puts every run %s.", _shift_phrase(offset),
+        )
+
+
+def _shift_phrase(offset: float) -> str:
+    """Describe the error un-converted local time would cause."""
+    whole = abs(offset)
+    amount = "{0:g} hour{1}".format(whole, "" if whole == 1 else "s")
+    return amount + (" late" if offset > 0 else " early")
+
+
 def log_report(report: CheckReport, log: logging.Logger) -> None:
     """Log a check report as an operator-readable verdict."""
     log.info(
@@ -208,6 +290,7 @@ def log_report(report: CheckReport, log: logging.Logger) -> None:
             model.format_iso(report.earliest),
             model.format_iso(report.latest),
         )
+        _log_clock(report, log)
 
     if report.invalid:
         log.error(

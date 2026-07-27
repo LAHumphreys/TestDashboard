@@ -478,18 +478,73 @@ complete brief on writing one (aimed at an AI assistant, usable by anyone).
 Out of the box, a JSON-lines reader is included (`--reader jsonl`): one transport
 JSON object per line, blank lines skipped, malformed lines logged and skipped.
 
+### Start here: `--init`
+
+```
+python3 run_feeder.py --init
+```
+
+An interactive wizard that **checks each answer as you give it** rather than just
+collecting them: it sends an empty import to the URL you type (so a wrong host or
+port fails at the prompt), loads the reader you name and offers to run it over
+your data, and writes-and-deletes a probe file in each path you choose. It ends by
+writing a config file and printing the exact `cron`/`schtasks` line for it.
+
+It refuses to run without a terminal, so it can never hang a scheduled job.
+
+### The config file
+
+Everything the feeder needs can live in a JSON file, so the scheduled command
+does not depend on which directory it runs from:
+
+```json
+{
+  "url": "http://dashboard-host:8000",
+  "mode": "daily",
+  "reader": "/opt/testboard-feeder/internal_reader.py:create_reader",
+  "state_file": "/var/lib/testboard/feeder_state.json",
+  "replay_dir": "/var/lib/testboard/replay"
+}
+```
+
+```
+python3 run_feeder.py --config /etc/testboard/feeder.json
+```
+
+Keys are the long flag names with underscores (`--batch-size` → `"batch_size"`);
+run `--init` or `--help` for the full list. A flag on the command line overrides
+the file, so `--dry-run`, `--since` and a one-off `--mode backfill` still work
+against a deployed config. An unrecognized key is **refused by name**, with the
+nearest real one suggested — a typo'd setting that is silently ignored looks
+applied and is not.
+
+### Where the reader lives
+
+The reader is the only site-specific code, and the feeder usually runs from a
+checkout it cannot write to — so name it by **path**, not as an importable module:
+
+```
+--reader /opt/testboard-feeder/internal_reader.py:create_reader
+```
+
+The file's own directory goes on the import path, so a reader split over several
+files works. A dotted `module.path:create_reader` also works, but is resolved on
+Python's import path — which contains the directory holding `run_feeder.py` and
+`PYTHONPATH`, and *not* the directory you happen to be standing in.
+
 ### One-off backfill (import everything, or everything since a date)
 
 ```
 python run_feeder.py --url http://127.0.0.1:8000 --mode backfill \
-    --reader jsonl --source results/*.jsonl --since 2026-01-01T00:00:00
+    --reader jsonl --source 'results/*.jsonl' --since 2026-01-01T00:00:00
 ```
 
 ### Daily incremental import
 
 ```
 python run_feeder.py --url http://127.0.0.1:8000 --mode daily \
-    --reader jsonl --source results/*.jsonl --state-file feeder_state.json
+    --reader jsonl --source 'results/*.jsonl' \
+    --state-file /var/lib/testboard/feeder_state.json
 ```
 
 Daily mode keeps a **high-water mark** (max accepted `start_time`) in the state file
@@ -499,11 +554,39 @@ upserting means re-imports are always safe and gaps from clock skew are covered.
 successful backfill also primes the state file, so `backfill` then `daily` is the
 standard sequence. With no state file yet, daily mode imports everything.
 
-All flags: `--url` (required), `--mode backfill|daily` (required), `--since ISO`
-(backfill lower bound), `--reader jsonl|module:factory` (default `jsonl`), `--source`
-(repeatable; file paths and/or globs), `--batch-size` (default 500), `--state-file`
-(default `feeder_state.json`), `--replay-dir` (default `.`), `--overlap-days`
-(default 1), `--dry-run`, `--verbose`.
+All flags: `--init`, `--config PATH`, `--url` (required), `--mode backfill|daily`
+(required), `--since ISO` (backfill lower bound), `--reader
+jsonl|PATH.py:factory|module:factory` (default `jsonl`), `--source` (repeatable;
+files, globs or directories), `--batch-size` (default 500), `--state-file`
+(default `feeder_state.json`), `--replay-dir` (default `.`),
+`--max-consecutive-failures` (default 3), `--overlap-days` (default 1),
+`--skip-preflight`, `--dry-run`, `--allow-empty`, `--verbose`, `--version`.
+
+> **Writable paths.** `--state-file` and `--replay-dir` both default to the
+> working directory. The feeder commonly runs from a read-only checkout, so point
+> them at somewhere the scheduled user owns. Preflight checks both before reading
+> anything, and a state file that cannot be written is reported without failing an
+> import that already succeeded.
+
+### Timestamps are UTC
+
+Every time the feeder sends is UTC with no timezone suffix
+(`2026-07-25T02:14:07.000000`), and so is `--since`. If your test system records
+local time, **converting it is the reader's job**. Nothing downstream can tell the
+difference: the records validate, import cleanly, and put every run in the wrong
+hour, quietly shifting "failing since", the day-of-week profile and the trend.
+
+`--check-reader` prints the newest record's distance from UTC now beside this
+machine's own offset, so an hour-sized discrepancy is visible in one line.
+
+### Preflight
+
+Before a single record is read, a normal run checks that `--url` is a URL, that
+`--replay-dir` and `--state-file` can actually be written (by writing to them, not
+by asking the permission bits), and that the dashboard is a dashboard — by POSTing
+an empty `{"runs": []}` import, which inserts nothing and whose reply identifies
+the service. A typo therefore costs a second rather than a full read of the
+estate. `--dry-run` skips the network parts; `--skip-preflight` skips all of it.
 
 ### Reliability behaviour
 
@@ -524,23 +607,42 @@ All flags: `--url` (required), `--mode backfill|daily` (required), `--since ISO`
   guesswork.
 
 **Exit codes:** `0` — all valid records accepted (no rejects, no failed batches);
-`1` — some records rejected or batches failed; `2` — fatal error (bad arguments,
-reader failed to load).
+`1` — some records rejected or batches failed; `2` — the run never started (bad
+arguments, unusable config, unreachable dashboard, unwritable path, reader failed
+to load).
+
+### Running the feeder on a different machine
+
+This is the normal shape: the feeder runs where the results are, the dashboard
+runs somewhere else, and neither can read the other's disk. Everything crosses by
+HTTP, so all the feeder host needs is:
+
+- **Python 3.6+ and this checkout.** No packages to install, no virtualenv, no
+  environment variables. `python3 /path/to/run_feeder.py` works from any directory
+  — the checkout may be a read-only copy or an NFS mount shared with the dashboard
+  host.
+- **Somewhere writable that is not the checkout**, for the state file and replay
+  files. One directory, named in the config.
+- **Its reader**, anywhere on disk, named by path.
 
 ### Scheduling the daily import
 
 RHEL 8 cron (crontab -e), run daily at 06:30 after the overnight runs finish:
 
 ```cron
-30 6 * * * cd /opt/testboard && /usr/bin/python3 run_feeder.py --url http://dashboard-host:8000 --mode daily --reader internal_reader:create_reader >> /var/log/testboard-feeder.log 2>&1
+30 6 * * * /usr/bin/python3 /opt/testboard/run_feeder.py --config /etc/testboard/feeder.json >> /var/log/testboard-feeder.log 2>&1
 ```
 
 Windows Task Scheduler (`schtasks`, from an elevated prompt):
 
 ```bat
 schtasks /Create /TN "testboard-daily-feed" /SC DAILY /ST 06:30 ^
-  /TR "cmd /c cd /d C:\opt\testboard && python run_feeder.py --url http://dashboard-host:8000 --mode daily --reader internal_reader:create_reader >> C:\opt\testboard\feeder.log 2>&1"
+  /TR "python C:\opt\testboard\run_feeder.py --config C:\ProgramData\testboard\feeder.json"
 ```
+
+Both commands carry no paths of their own beyond the config, and no `cd` — so the
+import does not depend on the scheduler's working directory, and nothing is
+written into the checkout. `--init` prints the line for the config it just wrote.
 
 Non-zero exit codes surface in cron mail / Task Scheduler history, so a silently
 broken feed is visible.
@@ -722,7 +824,7 @@ A port already in use, or a missing `static/` directory, likewise.
 |---|---|---|
 | `0` | everything valid was accepted | nothing |
 | `1` | needs attention | read the grouped reasons at the end of the log |
-| `2` | fatal — bad arguments or the reader wouldn't load | the message names the fix |
+| `2` | the run never started | the message names the fix |
 
 Exit `1` includes three cases that would otherwise pass silently: the server
 rejected records, **nothing was read at all** (a `--source` that stopped
@@ -751,9 +853,17 @@ them.
 space.
 
 **A reader is being written or changed.** `python3 run_feeder.py --check-reader
---reader mymodule:create_reader --source …` validates every record with no
-server and no network, and reports what the reader actually produced. See
-[`docs/FEEDER_BRIEF.md`](docs/FEEDER_BRIEF.md).
+--reader /path/to/internal_reader.py:create_reader --source …` validates every
+record with no server, no network and no config, and reports what the reader
+actually produced — including how far its newest record sits from UTC now, which
+is where an un-converted local timezone shows up. On a deployed site,
+`--check-reader --config <yours>` reuses the reader and sources already
+configured. See [`docs/FEEDER_BRIEF.md`](docs/FEEDER_BRIEF.md).
+
+**Setting the feeder up on a new machine.** `python3 run_feeder.py --init` walks
+through it and checks each answer against the real dashboard, the real reader and
+the real paths as you give it. Run with no arguments at all, the feeder prints
+what it needs and how to find the rest.
 
 ---
 
@@ -761,10 +871,12 @@ server and no network, and reports what the reader actually produced. See
 
 This repo is public-friendly by construction:
 
-- The **only** site-specific code is your feeder reader. Name it `internal_reader.py`
-  (or anything matching `internal_*.py`) in the repo root — that pattern is in
-  `.gitignore`, so proprietary hostnames, URLs, parsing logic and credentials can
-  never be committed by accident.
+- The **only** site-specific code is your feeder reader. Keep it *outside* the
+  checkout and name it by path (`--reader /opt/testboard-feeder/internal_reader.py:create_reader`),
+  which is also what a read-only checkout forces. If you would rather keep it in
+  the repo root, name it `internal_reader.py` (or anything matching
+  `internal_*.py`) — that pattern is in `.gitignore`, so proprietary hostnames,
+  URLs, parsing logic and credentials can never be committed by accident.
 - Databases (`testboard.db*`, `*.sqlite*`), feeder state (`feeder_state.json`),
   failed-batch replay files (`testboard_failed_batch_*.json`) and demo data
   (`demo.jsonl`) are gitignored too — real test output never lands in git.
@@ -799,7 +911,8 @@ Layout:
 run_server.py           # server entry point
 run_feeder.py           # feeder CLI (backfill / daily)
 testboard/              # model, storage (all SQL), analytics (pure), api, server
-feeder/                 # reader interface + jsonl reader, submitter, state file
+feeder/                 # reader interface + jsonl reader, submitter, state file,
+                        #   offline reader check, config file, preflight, --init
 tools/                  # demo data generator, self-test collector, demo_bootstrap,
                         #   prune_runs (retention)
 static/                 # vanilla ES6 frontend, no build step:
