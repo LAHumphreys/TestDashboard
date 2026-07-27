@@ -258,21 +258,28 @@ row and inserts a new one**. The new row gets a **new `id`**.
 MariaDB's `INSERT ... ON DUPLICATE KEY UPDATE` **updates the existing row in
 place**. The `id` is **unchanged**.
 
-testboard's import is an idempotent upsert on
-`(environment, script, test_name, start_time)`, and `runs.id` is referenced by
-`run_outputs.run_id` and `latest_runs.run_id`. So the two backends behave
-differently on exactly the operation the feeder performs every night, and on the
-operation the user asked for when they asked for "a way of force re-loading
-already-loaded runs".
+**Checked, and the news is better than that paragraph suggests.**
+`tests/test_sql_portability.py` now pins what the code actually does:
 
-Before porting, pin today's behaviour with a test on SQLite (plan WP-9.3):
-re-import an identical batch and assert what happens to `runs.id` and to the
-rows referencing it. Whatever it does now **is** the contract. Then make MariaDB
-match it, or change the contract deliberately and write down that you did.
+- **`runs` never uses `INSERT OR REPLACE`.** The import path deliberately does
+  SELECT-then-UPDATE-or-INSERT, so **`runs.id` is stable across re-import** —
+  asserted by a test, along with `run_outputs` and `latest_runs` following the
+  repair rather than being orphaned. That is the contract, it is what the feeder
+  relies on every night and what `--force` relies on deliberately, and the
+  MariaDB port has to reproduce it. `ON DUPLICATE KEY UPDATE` does.
+- The only two `INSERT OR REPLACE` sites are `run_outputs` (keyed by `run_id`)
+  and `test_retirements` (keyed by the test triple). **Neither has a generated
+  id to churn and nothing holds a foreign key to either**, so delete-and-reinsert
+  and update-in-place are indistinguishable from outside. Either MariaDB form
+  works.
 
-MariaDB's `REPLACE INTO` reproduces SQLite's delete-and-reinsert semantics if
-that turns out to be the contract. It is the closer equivalent; it is also
-slower, and it fires `ON DELETE` behaviour. Choose with the test in front of you.
+So this is not the blocker it looked like — but it was worth checking rather
+than assuming, and the test now fails if a third `INSERT OR REPLACE` appears on
+a table where it *would* matter.
+
+`REPLACE INTO` reproduces SQLite's delete-and-reinsert exactly if you ever need
+it. It is slower and it fires `ON DELETE` behaviour, so prefer
+`ON DUPLICATE KEY UPDATE` unless a test says otherwise.
 
 ### B.6 Foreign keys become real
 

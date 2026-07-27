@@ -37,7 +37,7 @@ these are the ones that get forgotten:
 | WP-7 | Sortable columns | **done** | `sorting.js`, 917 tests |
 | WP-6 | Time analysis tab | **done** | `/api/time`, 908 tests |
 | WP-8 | Last pass + flaky signal | **done** | `with_streak=1`, 936 tests |
-| WP-9 | SQL portability groundwork | pending | |
+| WP-9 | SQL portability groundwork | **done** | inventory + id pins, 947 tests |
 | WP-10 | MariaDB export tool | pending | |
 | — | Performance pass | pending | |
 
@@ -371,3 +371,28 @@ would bury a test that broke this week.
 
 Placement follows the plan's default — sentence in the row, strip in the panel.
 Rows are already dense, and WP-3 exists because one got visually noisy.
+
+### WP-9 — SQL portability groundwork — **done**
+
+`tests/test_sql_portability.py`, 11 tests. Suite 936 → 947.
+
+An inventory of the SQLite-specific surface, counted against a committed
+expectation, so a tenth construct is a test failure rather than a 3am surprise —
+and so the runbook's §B translation table cannot silently go stale.
+
+**It corrected the runbook.** §B.5 warned that `INSERT OR REPLACE` →
+`ON DUPLICATE KEY UPDATE` is a behaviour change that would churn `runs.id`.
+Checking rather than assuming:
+
+- `runs` **never** uses `INSERT OR REPLACE`. The import path does
+  SELECT-then-UPDATE-or-INSERT precisely so ids survive, and a test now pins
+  that — including that `run_outputs` and `latest_runs` follow the repair.
+- The only two uses are `run_outputs` and `test_retirements`. Neither has a
+  generated id and nothing references either, so the two upsert forms are
+  indistinguishable from outside.
+
+Not the blocker it looked like. The test still fails if a third appears on a
+table where it *would* matter.
+
+Placeholders are pinned too (`?` count > 50, `%s` count 0), because a leftover
+`?` reaches MariaDB as a literal question mark rather than failing loudly.
