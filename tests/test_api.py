@@ -2048,3 +2048,90 @@ class TestFrontendSortContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDashboardStreaks(ApiCase):
+    """with_streak=1: last pass + the flaky-vs-broken signal (WP-8)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        rows = []
+        # A test that broke and stayed broken.
+        for day in range(10):
+            rows.append(record(
+                environment="linux", script="s.py", test_name="broken",
+                result="PASS" if day < 5 else "FAIL",
+                start_time=format_iso(NOW - datetime.timedelta(days=9 - day)),
+                end_time=format_iso(
+                    NOW - datetime.timedelta(days=9 - day)
+                    + datetime.timedelta(seconds=1))))
+        # A test that fails every other night.
+        for day in range(10):
+            rows.append(record(
+                environment="linux", script="s.py", test_name="flaky",
+                result="FAIL" if day % 2 else "PASS",
+                start_time=format_iso(NOW - datetime.timedelta(days=9 - day)),
+                end_time=format_iso(
+                    NOW - datetime.timedelta(days=9 - day)
+                    + datetime.timedelta(seconds=1))))
+        self.import_runs(rows)
+
+    def test_streaks_are_off_by_default(self) -> None:
+        data = self.call("GET", "/api/dashboard")
+        self.assertFalse(data["with_streak"])
+        for row in data["tests"]:
+            self.assertNotIn("stability", row)
+
+    def test_a_broken_test_reports_when_it_broke_and_last_passed(
+        self
+    ) -> None:
+        data = self.call(
+            "GET", "/api/dashboard",
+            query={"with_streak": ["1"], "q": ["broken"]})
+        row = data["tests"][0]
+        self.assertIsNotNone(row["failing_since"])
+        self.assertIsNotNone(row["last_pass_time"])
+        self.assertEqual(row["stability"]["classification"], "stable-fail")
+
+    def test_a_flaky_test_is_told_apart_from_a_broken_one(self) -> None:
+        """The whole point of item 8: the last-pass DATE alone cannot."""
+        data = self.call(
+            "GET", "/api/dashboard",
+            query={"with_streak": ["1"], "q": ["flaky"]})
+        row = data["tests"][0]
+        self.assertEqual(row["stability"]["classification"], "flaky")
+        self.assertGreater(row["stability"]["transitions"], 1)
+
+    def test_non_failing_rows_get_history_but_no_streak(self) -> None:
+        self.import_runs([record(
+            environment="linux", script="s.py", test_name="healthy",
+            result="PASS",
+            start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+            end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                + datetime.timedelta(seconds=1)))])
+        data = self.call(
+            "GET", "/api/dashboard",
+            query={"with_streak": ["1"], "q": ["healthy"]})
+        row = data["tests"][0]
+        self.assertIsNone(row["failing_since"])
+        self.assertIsNone(row["last_pass_time"])
+        self.assertEqual(row["stability"]["classification"], "stable-pass")
+
+    def test_the_recent_results_are_capped_and_ordered(self) -> None:
+        data = self.call(
+            "GET", "/api/dashboard",
+            query={"with_streak": ["1"], "q": ["broken"]})
+        results = data["tests"][0]["stability"]["recent_results"]
+        self.assertLessEqual(len(results), 20)
+        self.assertEqual(results[-1], "FAIL")
+        self.assertEqual(results[0], "PASS")
+
+    def test_the_count_query_is_not_enriched(self) -> None:
+        """Streaks are for the RETURNED PAGE only. The total must not
+        pay for rows nobody asked to see."""
+        page = self.call(
+            "GET", "/api/dashboard",
+            query={"with_streak": ["1"], "limit": ["1"]})
+        self.assertEqual(len(page["tests"]), 1)
+        self.assertGreater(page["total"], 1)
+        self.assertIn("stability", page["tests"][0])

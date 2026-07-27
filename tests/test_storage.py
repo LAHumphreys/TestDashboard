@@ -2181,3 +2181,97 @@ class TestPruneRuns(StorageTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecentResults(StorageTestBase):
+    """The list-view result history must not be a query per row (WP-8).
+
+    A page of a hundred tests asking "how has this one been behaving"
+    one at a time is a hundred round trips. That is the same shape of
+    bug tests/test_frontend_calls.py exists to catch on the frontend,
+    and it is no better on the server.
+    """
+
+    def _seed(self, tests: int, runs_each: int) -> List[Tuple[str, str, str]]:
+        records = []
+        for index in range(tests):
+            for run in range(runs_each):
+                start = BASE + datetime.timedelta(days=run)
+                records.append(make_record(
+                    environment="linux", script="s.py",
+                    test_name="t%03d" % index,
+                    result=Result.FAIL if run % 2 else Result.PASS,
+                    start=start,
+                    end=start + datetime.timedelta(seconds=1)))
+        self.store.upsert_runs(records)
+        return [("linux", "s.py", "t%03d" % i) for i in range(tests)]
+
+    def test_it_returns_results_oldest_first(self) -> None:
+        triples = self._seed(1, 4)
+        history = self.store.recent_results(
+            triples, BASE - datetime.timedelta(days=1))
+        self.assertEqual(
+            history[triples[0]],
+            [Result.PASS, Result.FAIL, Result.PASS, Result.FAIL])
+
+    def test_it_keeps_only_the_newest_n(self) -> None:
+        triples = self._seed(1, 10)
+        history = self.store.recent_results(
+            triples, BASE - datetime.timedelta(days=1), per_test_limit=3)
+        # Runs 7, 8, 9 -> FAIL, PASS, FAIL
+        self.assertEqual(len(history[triples[0]]), 3)
+        self.assertEqual(history[triples[0]][-1], Result.FAIL)
+
+    def test_it_honours_the_since_cutoff(self) -> None:
+        triples = self._seed(1, 6)
+        history = self.store.recent_results(
+            triples, BASE + datetime.timedelta(days=4))
+        self.assertEqual(len(history[triples[0]]), 2)
+
+    def test_an_unknown_test_is_simply_absent(self) -> None:
+        history = self.store.recent_results(
+            [("nope", "nope.py", "nope")], BASE)
+        self.assertEqual(history, {})
+
+    def test_no_triples_issues_no_query_at_all(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        conn.set_trace_callback(seen.append)
+        try:
+            self.assertEqual(self.store.recent_results([], BASE), {})
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(seen, [])
+
+    def test_the_query_count_is_bounded_by_chunks_not_rows(self) -> None:
+        """The assertion this class exists for.
+
+        250 tests must not mean 250 queries. With a chunk size of 100 it
+        is 3, and it stays 3 however much history each test has.
+        """
+        triples = self._seed(250, 4)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        conn.set_trace_callback(seen.append)
+        try:
+            history = self.store.recent_results(
+                triples, BASE - datetime.timedelta(days=1))
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(history), 250)
+        selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
+        self.assertEqual(
+            len(selects), 3,
+            "expected ceil(250/100) queries, got {0}".format(len(selects)))
+
+    def test_duplicate_triples_are_not_fetched_twice(self) -> None:
+        triples = self._seed(2, 2)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        conn.set_trace_callback(seen.append)
+        try:
+            self.store.recent_results(triples + triples + triples, BASE)
+        finally:
+            conn.set_trace_callback(None)
+        selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
+        self.assertEqual(len(selects), 1)

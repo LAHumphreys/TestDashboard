@@ -1331,3 +1331,28 @@ button.bar-row:focus-visible {
   min-width: 84px;
   white-space: nowrap;
 }
+
+/* ---------- Run strip: what a test has been doing lately ---------- */
+
+/* Supports the sentence beside it; never the only carrier of meaning.
+   Each cell has a title naming its result. */
+.run-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  align-items: center;
+}
+
+.run-cell {
+  width: 10px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--border);
+}
+
+.run-cell.result-pass { background: var(--c-pass); }
+.run-cell.result-fail { background: var(--c-fail); }
+.run-cell.result-failed-as-expected { background: var(--c-fae); }
+.run-cell.result-unexpected-pass { background: var(--c-up); }
+
+.history-cell .row-sub { display: block; }

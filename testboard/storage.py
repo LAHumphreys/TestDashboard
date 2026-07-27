@@ -643,6 +643,12 @@ DASHBOARD_SORTS = {
     "duration": ("lr.duration_seconds",) + _PK_ORDER,
 }  # type: Dict[str, Tuple[str, ...]]
 
+#: How many test identities go into one :meth:`Storage.recent_results`
+#: query. Each costs three bound parameters and SQLite caps a statement
+#: at 999, so 100 leaves room and keeps the query count proportional to
+#: page-size-over-100 rather than to page size.
+_RECENT_CHUNK = 100
+
 #: Levels the duration drill-down can group by, mapped to their column.
 #: A GROUP BY column cannot be a bound parameter, so — exactly like
 #: :data:`DASHBOARD_SORTS` — callers choose from this table and anything
@@ -1741,6 +1747,63 @@ class Storage:
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN + where
         return int(self._conn().execute(sql, params).fetchone()[0])
+
+    def recent_results(
+        self,
+        triples: Sequence[Tuple[str, str, str]],
+        since: datetime.datetime,
+        per_test_limit: int = 20,
+    ) -> Dict[Tuple[str, str, str], List[Result]]:
+        """The last few results of each of a PAGE of tests.
+
+        Returns ``{triple: [oldest, ..., newest]}``, at most
+        *per_test_limit* entries each, for runs at or after *since*.
+
+        The point of this method is what it refuses to be: a query per
+        row. A page of a hundred tests asking "how has this one been
+        behaving" one at a time is a hundred round trips, which is the
+        shape of bug ``tests/test_frontend_calls.py`` exists to catch on
+        the frontend and which is no better here.
+
+        Triples are batched into groups of :data:`_RECENT_CHUNK`, so the
+        query count is proportional to the PAGE SIZE divided by the
+        chunk — never to the page size itself, and never to the size of
+        the estate. Batching rather than one giant query is not a
+        style choice: SQLite caps a statement at 999 bound parameters
+        and each triple costs three.
+        """
+        found = {}  # type: Dict[Tuple[str, str, str], List[Result]]
+        if not triples:
+            return found
+        cutoff = model.format_iso(since)
+        conn = self._conn()
+        unique = list(dict.fromkeys(tuple(t) for t in triples))
+        for start in range(0, len(unique), _RECENT_CHUNK):
+            chunk = unique[start:start + _RECENT_CHUNK]
+            clause = " OR ".join(
+                "(environment = ? AND script = ? AND test_name = ?)"
+                for _ in chunk
+            )
+            params = []  # type: List[Any]
+            for triple in chunk:
+                params.extend(triple)
+            params.append(cutoff)
+            rows = conn.execute(
+                "SELECT environment, script, test_name, result, start_time "
+                "FROM runs WHERE ({0}) AND start_time >= ? "
+                "ORDER BY environment, script, test_name, start_time".format(
+                    clause),
+                tuple(params),
+            ).fetchall()
+            for row in rows:
+                key = (row[0], row[1], row[2])
+                series = found.setdefault(key, [])
+                series.append(Result(row[3]))
+        # Keep the newest `per_test_limit`, still oldest-first.
+        limit = max(1, int(per_test_limit))
+        return {
+            key: series[-limit:] for key, series in found.items()
+        }
 
     def failure_streak_bounds(
         self,

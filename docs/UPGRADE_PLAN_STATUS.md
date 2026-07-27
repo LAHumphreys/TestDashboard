@@ -36,7 +36,7 @@ these are the ones that get forgotten:
 | WP-3 | Triage result emphasis | **done** | 893 tests |
 | WP-7 | Sortable columns | **done** | `sorting.js`, 917 tests |
 | WP-6 | Time analysis tab | **done** | `/api/time`, 908 tests |
-| WP-8 | Last pass + flaky signal | pending | |
+| WP-8 | Last pass + flaky signal | **done** | `with_streak=1`, 936 tests |
 | WP-9 | SQL portability groundwork | pending | |
 | WP-10 | MariaDB export tool | pending | |
 | — | Performance pass | pending | |
@@ -338,3 +338,36 @@ three pages, asserting 40 rows come back with no repeats. That is what catches a
 missing primary-key tiebreak — a sort on `result` (four distinct values estate-
 wide) otherwise lets SQLite order ties differently between pages, so a row shows
 up twice and another never, with no error anywhere.
+
+### WP-8 — last pass, and broken vs flaky — **done**
+
+`GET /api/dashboard?with_streak=1` adds `failing_since`, `last_pass_time` and a
+`stability` block; Open actions gains a **Last pass** column carrying the date
+plus a plain sentence, and the review panel shows a 20-run strip. Suite 917 →
+936.
+
+Item 8 is the reason item 7 is not enough on its own: a last-pass date cannot
+separate "broke on the 14th and has failed every night since" from "fails about
+one night in three", and those need different responses — bisect a regression,
+or stabilise a test.
+
+`analytics.stability_of` classifies a bare result sequence and **shares its
+definition of a transition with `_compute_flakiness`**, the detail page's
+version. A test asserts the two agree across five patterns; two definitions of
+"flaky" that can disagree would be worse than one imperfect one.
+
+**Cost is bounded by the page, and measured.** Against the production copy
+(12,008 tests, 540k runs): plain page 10 ms, with streaks 69 ms at 148 rows —
++14 ms at 10 rows, +63 ms at 100. Flat in estate size.
+
+`Storage.recent_results` batches identities 100 at a time, so 250 tests is
+**three** queries rather than 250 — asserted directly by tracing the connection.
+Batching is not stylistic: SQLite caps a statement at 999 bound parameters and
+each identity triple costs three. Duplicate triples are collapsed first.
+
+The stability window is 30 days / 20 runs, deliberately shorter than the detail
+page's 90: this answers "what is it doing lately", and a quarter of history
+would bury a test that broke this week.
+
+Placement follows the plan's default — sentence in the row, strip in the panel.
+Rows are already dense, and WP-3 exists because one got visually noisy.

@@ -65,6 +65,9 @@
                    by something else would be worse than none. -->
               <th>Latest comment</th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="start_time">Last run (UTC)<span class="sort-arrow"></span></button></th>
+              <!-- Not sortable: last_pass_time is computed for the
+                   returned page, so the server cannot order by it. -->
+              <th>Last pass</th>
               <th>Review</th>
             </tr>
           </thead>

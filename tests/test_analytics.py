@@ -12,6 +12,7 @@ import datetime
 import unittest
 from typing import List, Optional, Sequence
 
+from testboard import analytics
 from testboard.analytics import (
     DurationStats,
     analytics_to_dict,
@@ -881,3 +882,77 @@ class SummarizeRollupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStabilityOf(unittest.TestCase):
+    """The list-view stability signal (WP-8).
+
+    It exists so a row can say "broken since Tuesday" rather than "last
+    passed Tuesday" — a date alone cannot separate a regression from a
+    test that fails one night in three, and those need different
+    responses.
+    """
+
+    P = Result.PASS
+    F = Result.FAIL
+
+    def test_a_clean_break_is_not_flaky(self) -> None:
+        stability = analytics.stability_of(
+            [self.P] * 10 + [self.F] * 10)
+        self.assertEqual(stability.classification, "stable-fail")
+        self.assertEqual(stability.transitions, 1)
+
+    def test_alternating_results_are_flaky(self) -> None:
+        stability = analytics.stability_of([self.P, self.F] * 8)
+        self.assertEqual(stability.classification, "flaky")
+
+    def test_all_passing_is_stable(self) -> None:
+        self.assertEqual(
+            analytics.stability_of([self.P] * 5).classification,
+            "stable-pass")
+
+    def test_no_runs_is_no_data(self) -> None:
+        stability = analytics.stability_of([])
+        self.assertEqual(stability.classification, "no-data")
+        self.assertEqual(stability.score, 0.0)
+
+    def test_a_single_run_scores_zero(self) -> None:
+        self.assertEqual(analytics.stability_of([self.F]).score, 0.0)
+
+    def test_it_agrees_with_the_detail_page_calculation(self) -> None:
+        """Two definitions of "flaky" that can disagree is worse than
+        one that is imperfect. This asserts they cannot.
+
+        _compute_flakiness takes whole runs newest-first; stability_of
+        takes bare results oldest-first. Same window, same verdict.
+        """
+        base = datetime.datetime(2026, 7, 1, 2, 0, 0)
+        for pattern in (
+            [self.P] * 6,
+            [self.F] * 6,
+            [self.P, self.F] * 4,
+            [self.P] * 4 + [self.F] * 4,
+            [self.P, self.P, self.F, self.P, self.F, self.F],
+        ):
+            runs = [
+                StoredRun(
+                    run_id=index,
+                    environment="e", script="s", test_name="t",
+                    result=result,
+                    start_time=base + datetime.timedelta(days=index),
+                    end_time=base + datetime.timedelta(
+                        days=index, seconds=1),
+                    source_link="", known_failure_reason=None,
+                    output="",
+                )
+                for index, result in enumerate(pattern)
+            ]
+            newest_first = list(reversed(runs))
+            detail = analytics._compute_flakiness(
+                newest_first, analytics.DEFAULT_FLAKY_THRESHOLD)
+            listed = analytics.stability_of(pattern)
+            self.assertEqual(
+                (detail.transitions, detail.classification),
+                (listed.transitions, listed.classification),
+                "disagreement on pattern {0}".format(
+                    [r.name for r in pattern]))

@@ -453,6 +453,58 @@ export function formatDuration(seconds) {
   return hours + "h " + String(minutes).padStart(2, "0") + "m";
 }
 
+/* ---------------- stability: broken, or just flaky? ---------------- */
+
+/**
+ * One sentence saying what a test has been DOING lately.
+ *
+ * A last-pass date on its own cannot separate "this broke on the 14th
+ * and has failed every night since" from "this fails about one night in
+ * three". Those need completely different responses — one is a
+ * regression to bisect, the other is a test to stabilise — and until
+ * now they looked identical in every list.
+ */
+export function stabilitySentence(stability) {
+  if (!stability || !stability.runs) {
+    return "no recent runs";
+  }
+  if (stability.classification === "flaky") {
+    const period = Math.max(
+      2, Math.round(stability.runs / Math.max(1, stability.transitions)));
+    return "flaky — flips about 1 run in " + period;
+  }
+  if (stability.classification === "stable-fail") {
+    return stability.transitions === 0
+      ? "failed every one of the last " + stability.runs + " runs"
+      : "failing steadily since it broke";
+  }
+  return "passing steadily";
+}
+
+/**
+ * A strip of the last N results, oldest to newest.
+ *
+ * Supports the sentence rather than replacing it: the SHAPE of a
+ * failure pattern is what people actually want to see, but colour alone
+ * carries nothing for a reader who cannot separate the hues — so the
+ * sentence is the primary encoding and every cell keeps a title naming
+ * its result.
+ */
+export function runStrip(stability) {
+  const strip = el("div", "run-strip");
+  const results = (stability && stability.recent_results) || [];
+  if (!results.length) {
+    strip.appendChild(el("span", "muted", "no recent runs"));
+    return strip;
+  }
+  results.forEach((result, index) => {
+    const cell = el("span", "run-cell " + resultClass(result));
+    cell.title = result + " (" + (results.length - index) + " runs ago)";
+    strip.appendChild(cell);
+  });
+  return strip;
+}
+
 /* ---------------- error banner ---------------- */
 
 /** Show `message` in the page's #error-banner element. */

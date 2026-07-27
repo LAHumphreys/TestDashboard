@@ -104,6 +104,13 @@ _EXECUTION_GAP_MINUTES = 60
 #: latest run is not a failure, or show the previous result instead.
 _STREAK_QUEUES = ("still_failing",)
 
+#: Window used for the list-view stability signal ("broken since Tuesday"
+#: vs "fails about one night in three"). Deliberately shorter than the
+#: detail page's 90 days: this answers "what is it doing lately", and a
+#: quarter of history would bury a test that broke this week.
+_STABILITY_WINDOW_DAYS = 30
+_STABILITY_RUNS = 20
+
 
 class Request(NamedTuple):
     """A parsed-but-undecoded HTTP request handed to :func:`handle_api`.
@@ -532,6 +539,11 @@ def _handle_dashboard(
         request.query, "retired") in ("1", "true")
     with_comment = _query_single(
         request.query, "with_comment") in ("1", "true")
+    # Failure streaks and recent-result history cost extra seeks, so they
+    # are opt-in and computed for the RETURNED PAGE ONLY — never for the
+    # count query, and never for rows nobody asked to see.
+    with_streak = _query_single(
+        request.query, "with_streak") in ("1", "true")
     include_unassigned = _query_single(
         request.query, "unassigned") in ("1", "true")
     assignees = request.query.get("assignee") or []
@@ -570,15 +582,72 @@ def _handle_dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,
         offset=offset, with_latest_comment=with_comment, **filters
     )
+    payload = [_summary_row_json(row) for row in rows]
+    if with_streak:
+        _add_streaks(storage, rows, payload, now())
     return _json_response(
         200,
         {
-            "tests": [_summary_row_json(row) for row in rows],
+            "tests": payload,
             "total": storage.dashboard_count(**filters),
             "limit": limit,
             "offset": offset,
+            "with_streak": with_streak,
         },
     )
+
+
+def _add_streaks(
+    storage: Storage,
+    rows: Sequence[TestSummaryRow],
+    payload: List[Dict[str, Any]],
+    now_value: datetime.datetime,
+) -> None:
+    """Attach failing-since, last-pass and stability to a PAGE of rows.
+
+    Two questions a triage list has to answer and could not: when did
+    this last pass, and did it break on that date or does it just fail
+    sometimes? A last-pass date alone cannot tell those apart, and they
+    need different responses.
+
+    Cost is bounded by the page, not the estate. The streak bounds are
+    three index seeks and are looked up only for rows whose latest run
+    is a FAIL — the others have no streak to report. The result history
+    is fetched for the whole page in a handful of batched queries (see
+    Storage.recent_results), never one per row.
+    """
+    triples = [
+        (row.environment, row.script, row.test_name) for row in rows
+    ]
+    since = now_value - datetime.timedelta(days=_STABILITY_WINDOW_DAYS)
+    history = storage.recent_results(
+        triples, since, per_test_limit=_STABILITY_RUNS)
+    for row, item in zip(rows, payload):
+        key = (row.environment, row.script, row.test_name)
+        if row.result is Result.FAIL:
+            streak = storage.failure_streak_bounds(
+                row.environment, row.script, row.test_name, row.start_time
+            )
+            item["failing_since"] = (
+                None if streak.failing_since is None
+                else model.format_iso(streak.failing_since)
+            )
+            item["last_pass_time"] = (
+                None if streak.last_pass_before is None
+                else model.format_iso(streak.last_pass_before)
+            )
+        else:
+            item["failing_since"] = None
+            item["last_pass_time"] = None
+        results = history.get(key, [])
+        stability = analytics.stability_of(results)
+        item["stability"] = {
+            "classification": stability.classification,
+            "transitions": stability.transitions,
+            "score": round(stability.score, 3),
+            "runs": len(results),
+            "recent_results": [result.value for result in results],
+        }
 
 
 def _result_counts_json(counts: Dict[Result, int]) -> Dict[str, int]:

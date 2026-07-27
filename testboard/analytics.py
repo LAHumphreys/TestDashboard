@@ -60,6 +60,8 @@ __all__ = [
     "DayResults",
     "DurationStats",
     "Flakiness",
+    "DEFAULT_FLAKY_THRESHOLD",
+    "stability_of",
     "AnalyticsSummary",
     "select_window",
     "compute_analytics",
@@ -93,6 +95,11 @@ class DurationStats(NamedTuple):
     min: float
     median: float
     max: float
+
+
+#: Transitions-per-run at or above which a test is called flaky rather
+#: than stably passing or stably failing. One flip in five runs.
+DEFAULT_FLAKY_THRESHOLD = 0.2
 
 
 class Flakiness(NamedTuple):
@@ -171,6 +178,43 @@ def _compute_flakiness(
     elif score >= flaky_threshold:
         classification = "flaky"
     elif window[0].result is Result.FAIL:
+        classification = "stable-fail"
+    else:
+        classification = "stable-pass"
+    return Flakiness(
+        transitions=transitions, score=score, classification=classification
+    )
+
+
+def stability_of(
+    results: Sequence[Result], flaky_threshold: float = DEFAULT_FLAKY_THRESHOLD
+) -> Flakiness:
+    """Classify a bare sequence of results, oldest first.
+
+    Exists so a LIST view can say "broken since Tuesday" versus "fails
+    about one night in three" without loading whole runs. It applies the
+    same definition of a transition as :func:`_compute_flakiness` — a
+    change in whether the result is FAIL — so the two cannot end up
+    disagreeing about what flaky means. ``tests/test_analytics.py``
+    asserts they agree on the same window.
+
+    The distinction is the point: a last-pass date on its own cannot
+    separate "this broke on the 14th and has failed every night since"
+    from "this fails one night in three", and those need different
+    responses.
+    """
+    ordered = list(results)
+    run_count = len(ordered)
+    transitions = 0
+    for older, newer in zip(ordered, ordered[1:]):
+        if (older is Result.FAIL) != (newer is Result.FAIL):
+            transitions += 1
+    score = 0.0 if run_count < 2 else transitions / run_count
+    if run_count == 0:
+        classification = "no-data"
+    elif score >= flaky_threshold:
+        classification = "flaky"
+    elif ordered[-1] is Result.FAIL:
         classification = "stable-fail"
     else:
         classification = "stable-pass"
@@ -261,7 +305,7 @@ def compute_analytics(
     now: datetime.datetime,
     max_days: int = 90,
     max_runs: int = 200,
-    flaky_threshold: float = 0.2,
+    flaky_threshold: float = DEFAULT_FLAKY_THRESHOLD,
 ) -> AnalyticsSummary:
     """Compute the full analytics summary for one test.
 

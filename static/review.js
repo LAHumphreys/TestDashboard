@@ -28,6 +28,7 @@ import {
   el,
   fetchJson,
   fillOutput,
+  runStrip,
   postJson,
   putJson,
   requireUsername,
@@ -165,6 +166,17 @@ function buildReviewActions(entry, opts) {
   assignGroup.appendChild(assigneeSelect(
     entry, (name) => changed({ kind: "assigned", value: name })));
   actions.appendChild(assignGroup);
+
+  /* --- what it has been doing lately --- */
+  // The strip lives in the panel rather than the row: rows are already
+  // dense, and item 4 exists precisely because one got visually noisy.
+  if (opts.stability && opts.stability.runs) {
+    const historyGroup = el("div", "review-group review-group-wide");
+    historyGroup.appendChild(el("label", "review-label",
+      "Last " + opts.stability.runs + " runs (oldest first)"));
+    historyGroup.appendChild(runStrip(opts.stability));
+    actions.appendChild(historyGroup);
+  }
 
   /* --- comment --- */
   const commentGroup = el("div", "review-group review-group-wide");
