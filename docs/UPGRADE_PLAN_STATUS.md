@@ -32,7 +32,7 @@ these are the ones that get forgotten:
 | WP-4 | Deactivate users (migration 2) | **done** | migration 2, 869 tests |
 | WP-5 | `duration_seconds` (migration 3) | **done** | migration 3, 882 tests |
 | WP-1 | Extract `review.js` | **done** | pure move, 887 tests |
-| WP-2 | Review on Open actions | pending | |
+| WP-2 | Review on Open actions | **done** | 893 tests |
 | WP-3 | Triage result emphasis | **done** | 893 tests |
 | WP-7 | Sortable columns | pending | |
 | WP-6 | Time analysis tab | pending | |
@@ -252,3 +252,25 @@ UNEXPECTED_PASS on every row; a per-row chip there is a column of identical
 values, which is more of the noise this item is about. Those state it once above
 the table (`QUEUE_INVARIANT_RESULT`) and carry no result column. `not_run`
 already had one and was left alone.
+
+### WP-2 — review expander on Open actions — **done**
+
+`actions.js` imports the shared panel. Suite unchanged at 893 (the behaviour is
+covered by the WP-1 guards plus the browser check).
+
+The three improvements deliberately held back from WP-1's pure move land here,
+where they are the subject: Enter posts a comment, the panel reports what
+changed, and retiring with no username set says so instead of silently doing
+nothing.
+
+**Rows are patched in place; the page is not refetched.** The old `onSaved`
+handler called `refresh(false)`, which refetches 100 rows and rebuilds the
+table — closing every open panel. On a queue somebody is working down, that
+throws away what they were reading the moment they act on it. `onChanged` now
+carries `{kind, value}`, so the assignee cell and the comment cell are rewritten
+from data already in hand and no request is made at all. Retirement still
+reloads, because it removes the test from every estate view.
+
+One ordering detail worth keeping: `reopenIfOpen` runs after the row is appended
+to the table, not inside `buildRow`. It inserts a sibling row, which needs a
+parent to insert into.

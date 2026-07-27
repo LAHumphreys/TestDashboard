@@ -73,9 +73,13 @@ export function reopenIfOpen(entry, row, button, options) {
  *   staleBefore — ISO timestamp; a test whose latest run started before
  *                 this has stopped reporting, and is offered retirement.
  *                 Omit (or null) to never offer it.
- *   onChanged   — called after an assignment or a comment; the caller
- *                 decides whether that means refreshing counts, the row,
- *                 or nothing.
+ *   onChanged   — called after an assignment or a comment, with a
+ *                 {kind, value} describing what happened. The caller
+ *                 decides whether that means refreshing counts, patching
+ *                 the row, or nothing. It is told WHAT changed so it can
+ *                 update a row in place instead of refetching a page —
+ *                 refetching closes every open panel, which on a queue
+ *                 being worked down is the wrong behaviour.
  *   onRetired   — called after a successful retirement. Retirement
  *                 removes the test from every estate view, so a caller
  *                 usually has to reload rather than patch a row.
@@ -158,7 +162,8 @@ function buildReviewActions(entry, opts) {
   /* --- assign to anyone --- */
   const assignGroup = el("div", "review-group");
   assignGroup.appendChild(el("label", "review-label", "Assign to"));
-  assignGroup.appendChild(assigneeSelect(entry, () => changed()));
+  assignGroup.appendChild(assigneeSelect(
+    entry, (name) => changed({ kind: "assigned", value: name })));
   actions.appendChild(assignGroup);
 
   /* --- comment --- */
@@ -170,7 +175,7 @@ function buildReviewActions(entry, opts) {
   input.placeholder = "What did you find?";
   const post = el("button", "", "Post");
   post.type = "button";
-  post.addEventListener("click", async () => {
+  const submit = async () => {
     const me = requireUsername();
     if (!me) {
       showError(
@@ -178,7 +183,8 @@ function buildReviewActions(entry, opts) {
         + "— comments are recorded against a name.");
       return;
     }
-    if (!input.value.trim()) {
+    const text = input.value.trim();
+    if (!text) {
       input.focus();
       return;
     }
@@ -187,14 +193,25 @@ function buildReviewActions(entry, opts) {
       await postJson(
         testApiPath(entry.environment, entry.script, entry.test_name,
           "/comments"),
-        { username: me, text: input.value.trim() });
+        { username: me, text: text });
       input.value = "";
       post.textContent = "Posted";
       window.setTimeout(() => { post.textContent = "Post"; }, 1500);
+      changed({ kind: "commented", value: { author: me, text: text } });
     } catch (err) {
       showError(err.message);
     } finally {
       post.disabled = false;
+    }
+  };
+  post.addEventListener("click", submit);
+  // Enter posts. Typing a sentence and pressing Enter is what people
+  // do; without this the keypress does nothing and the comment is lost
+  // the moment the panel closes.
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submit();
     }
   });
   commentGroup.appendChild(input);
@@ -218,6 +235,10 @@ function buildReviewActions(entry, opts) {
     retire.addEventListener("click", async () => {
       const me = requireUsername();
       if (!me) {
+        // Silently doing nothing here read as a broken button.
+        showError(
+          "Set a username first (the “Change” button, top "
+          + "right) — retirements record who approved them.");
         return;
       }
       if (!why.value.trim()) {
