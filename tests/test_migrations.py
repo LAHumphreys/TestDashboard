@@ -33,7 +33,11 @@ import tempfile
 import unittest
 from typing import Dict, List, Optional, Tuple
 
-from testboard.storage import MIGRATIONS, Storage
+from testboard.storage import (
+    MIGRATIONS,
+    Storage,
+    apply_migration_statement,
+)
 
 #: SHA-256 of migration 1's normalised DDL, recorded when testboard was
 #: deployed. Whitespace and comments are normalised away first, so this
@@ -97,6 +101,12 @@ def build_at(path: str, version: int) -> None:
 
     This is how a production database is simulated: it was created by an
     older build that knew nothing of the migrations added since.
+
+    Steps go through ``storage.apply_migration_statement`` rather than
+    straight to ``conn.execute`` so that this helper and the real
+    migration runner cannot disagree about what applying a migration
+    means — a migration list can contain marked Python steps as well as
+    SQL.
     """
     conn = sqlite3.connect(path)
     try:
@@ -109,7 +119,7 @@ def build_at(path: str, version: int) -> None:
             if entry_version > version:
                 break
             for statement in statements:
-                conn.execute(statement)
+                apply_migration_statement(conn, statement)
             applied = entry_version
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?)", (applied,)

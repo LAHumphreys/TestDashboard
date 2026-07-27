@@ -680,6 +680,320 @@ class TestMigrationTwoAgainstExistingData(unittest.TestCase):
             len(store.list_users(include_inactive=True)), 1)
 
 
+class TestLatestRunDuration(StorageTestBase):
+    """Migration 3: how long the newest run of each test took.
+
+    Denormalised onto ``latest_runs`` so that "where is the time going"
+    is a GROUP BY over one row per test, and so the duration sort stops
+    evaluating a date expression over the whole filtered set.
+    """
+
+    def _duration(self, test_name: str = "test_a") -> float:
+        row = self.store._conn().execute(
+            "SELECT duration_seconds FROM latest_runs WHERE test_name = ?",
+            (test_name,),
+        ).fetchone()
+        return row[0]
+
+    def test_it_is_set_on_first_import(self) -> None:
+        self.store.upsert_runs([
+            make_record(start=BASE, end=BASE + datetime.timedelta(seconds=7))
+        ])
+        self.assertAlmostEqual(self._duration(), 7.0)
+
+    def test_a_newer_run_replaces_the_duration(self) -> None:
+        self.store.upsert_runs([
+            make_record(start=BASE, end=BASE + datetime.timedelta(seconds=7))
+        ])
+        later = BASE + datetime.timedelta(days=1)
+        self.store.upsert_runs([
+            make_record(start=later,
+                        end=later + datetime.timedelta(seconds=2))
+        ])
+        self.assertAlmostEqual(self._duration(), 2.0)
+
+    def test_reimporting_a_run_corrects_its_duration(self) -> None:
+        """A re-import exists to repair a record.
+
+        If the duration did not follow, the repair would leave a stale
+        number behind — which is exactly the case the feeder's
+        force-reload flag is for.
+        """
+        self.store.upsert_runs([
+            make_record(start=BASE, end=BASE + datetime.timedelta(seconds=7))
+        ])
+        self.store.upsert_runs([
+            make_record(start=BASE, end=BASE + datetime.timedelta(seconds=99))
+        ])
+        self.assertAlmostEqual(self._duration(), 99.0)
+
+    def test_an_older_backfilled_run_does_not_touch_the_duration(
+        self
+    ) -> None:
+        """latest_runs describes the NEWEST run. Importing an older one
+        must not repoint the duration at it."""
+        self.store.upsert_runs([
+            make_record(start=BASE, end=BASE + datetime.timedelta(seconds=7))
+        ])
+        earlier = BASE - datetime.timedelta(days=1)
+        self.store.upsert_runs([
+            make_record(start=earlier,
+                        end=earlier + datetime.timedelta(seconds=500))
+        ])
+        self.assertAlmostEqual(self._duration(), 7.0)
+
+    def test_sub_second_durations_survive(self) -> None:
+        """REAL, not INTEGER: most tests take well under a second, and
+        rounding them all to zero would make the time view useless."""
+        self.store.upsert_runs([
+            make_record(
+                start=BASE,
+                end=BASE + datetime.timedelta(milliseconds=250))
+        ])
+        self.assertAlmostEqual(self._duration(), 0.25)
+
+    def test_every_row_agrees_with_the_run_it_points_at(self) -> None:
+        """The invariant, checked against the source of truth."""
+        records = []
+        for index in range(12):
+            start = BASE + datetime.timedelta(hours=index)
+            records.append(make_record(
+                test_name="t%02d" % index,
+                start=start,
+                end=start + datetime.timedelta(seconds=index * 1.5),
+            ))
+        self.store.upsert_runs(records)
+        rows = self.store._conn().execute(
+            "SELECT lr.duration_seconds, r.start_time, r.end_time "
+            "FROM latest_runs lr JOIN runs r ON r.id = lr.run_id"
+        ).fetchall()
+        self.assertEqual(len(rows), 12)
+        for stored, start_iso, end_iso in rows:
+            expected = model.duration_seconds(
+                model.parse_iso(start_iso), model.parse_iso(end_iso))
+            self.assertAlmostEqual(stored, expected)
+
+    def test_the_duration_sort_still_orders_by_duration(self) -> None:
+        lengths = [5, 1, 9, 3]
+        for index, seconds in enumerate(lengths):
+            self.store.upsert_runs([make_record(
+                test_name="t%d" % index,
+                start=BASE,
+                end=BASE + datetime.timedelta(seconds=seconds),
+            )])
+        ascending = [
+            row.test_name
+            for row in self.store.dashboard(sort="duration", limit=10)
+        ]
+        self.assertEqual(ascending, ["t1", "t3", "t0", "t2"])
+        descending = [
+            row.test_name
+            for row in self.store.dashboard(
+                sort="duration", descending=True, limit=10)
+        ]
+        self.assertEqual(descending, ["t2", "t0", "t3", "t1"])
+
+
+class TestMigrationThreeBackfill(unittest.TestCase):
+    """Migration 3 against a database that already holds runs.
+
+    The backfill is the only part of this round that touches existing
+    rows, so it is the only part that can be wrong in a way an empty
+    database would never show.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="testboard_migrate3_")
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.db_path = os.path.join(self.tmpdir, "v2.db")
+
+    def _build_at_version_two(self, tests: int = 5) -> List[float]:
+        """Build a v2 database with *tests* tests; return their durations."""
+        conn = sqlite3.connect(self.db_path)
+        expected = []  # type: List[float]
+        try:
+            conn.execute(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            for version, statements in storage.MIGRATIONS:
+                if version > 2:
+                    break
+                for statement in statements:
+                    storage.apply_migration_statement(conn, statement)
+            conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+            for index in range(tests):
+                start = BASE + datetime.timedelta(hours=index)
+                end = start + datetime.timedelta(seconds=index * 2 + 0.5)
+                expected.append((end - start).total_seconds())
+                conn.execute(
+                    "INSERT INTO runs (environment, script, test_name, "
+                    "result, start_time, end_time, source_link) "
+                    "VALUES ('linux', 's.py', ?, 'PASS', ?, ?, '')",
+                    ("t%d" % index, model.format_iso(start),
+                     model.format_iso(end)),
+                )
+                run_id = conn.execute(
+                    "SELECT id FROM runs WHERE test_name = ?",
+                    ("t%d" % index,)).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO latest_runs (environment, script, "
+                    "test_name, run_id, start_time, result) "
+                    "VALUES ('linux', 's.py', ?, ?, ?, 'PASS')",
+                    ("t%d" % index, run_id, model.format_iso(start)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return expected
+
+    def test_every_existing_row_is_backfilled(self) -> None:
+        expected = self._build_at_version_two()
+        store = Storage(self.db_path)
+        self.addCleanup(store.close)
+        rows = store._conn().execute(
+            "SELECT test_name, duration_seconds FROM latest_runs "
+            "ORDER BY test_name"
+        ).fetchall()
+        self.assertEqual(len(rows), len(expected))
+        for (name, stored), want in zip(rows, expected):
+            self.assertAlmostEqual(stored, want, msg=name)
+
+    def test_no_row_is_left_at_the_placeholder_default(self) -> None:
+        """DEFAULT 0 exists only so SQLite can add a NOT NULL column
+        without rewriting the table. A row still holding it after the
+        migration means the backfill missed it."""
+        self._build_at_version_two()
+        store = Storage(self.db_path)
+        self.addCleanup(store.close)
+        zeros = store._conn().execute(
+            "SELECT COUNT(*) FROM latest_runs WHERE duration_seconds = 0"
+        ).fetchone()[0]
+        self.assertEqual(zeros, 0)
+
+    def test_the_backfill_reads_one_row_per_test_not_per_run(self) -> None:
+        """The reason it is affordable in a startup migration.
+
+        latest_runs holds one row per test; `runs` holds every run ever.
+        A backfill that walked `runs` would be minutes of held
+        transaction against production instead of milliseconds.
+        """
+        self._build_at_version_two(tests=3)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # Add history: many runs, still only three tests.
+            for index in range(3):
+                for extra in range(1, 40):
+                    start = BASE + datetime.timedelta(hours=index,
+                                                      minutes=extra)
+                    conn.execute(
+                        "INSERT INTO runs (environment, script, test_name, "
+                        "result, start_time, end_time, source_link) "
+                        "VALUES ('linux', 's.py', ?, 'PASS', ?, ?, '')",
+                        ("t%d" % index, model.format_iso(start),
+                         model.format_iso(
+                             start + datetime.timedelta(seconds=1))),
+                    )
+            conn.commit()
+            total_runs = conn.execute(
+                "SELECT COUNT(*) FROM runs").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertGreater(total_runs, 100)
+
+        seen = []  # type: List[str]
+        store = Storage(self.db_path)
+        self.addCleanup(store.close)
+        conn = store._conn()
+        conn.set_trace_callback(seen.append)
+        try:
+            storage._backfill_latest_durations(conn)
+        finally:
+            conn.set_trace_callback(None)
+        # One SELECT plus the executemany, regardless of run count.
+        selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
+        self.assertEqual(len(selects), 1, seen)
+        self.assertIn("latest_runs", selects[0])
+
+
+class TestNoSqliteDateFunctions(unittest.TestCase):
+    """julianday() is gone, and must stay gone.
+
+    It was the codebase's only SQLite-specific date function. Removing
+    it (migration 3) is the one piece of MariaDB portability work that
+    could be finished and verified without a MariaDB anywhere near the
+    machine, so it is worth a guard that says so.
+    """
+
+    #: SQLite date/time functions. MariaDB either lacks these or gives
+    #: them different semantics, and all of them would silently return
+    #: something rather than failing loudly.
+    BANNED = ("julianday", "strftime", "unixepoch")
+
+    def _sql_literals(self) -> List[str]:
+        """Every non-docstring string literal in storage.py.
+
+        Scanning the raw file text does not work: ``date(`` is a
+        substring of ``update(`` and ``validate(``, and ``datetime(`` is
+        ordinary Python. Only string literals can reach the database, so
+        those are what get scanned — and docstrings are excluded,
+        because prose explaining why julianday was removed must not
+        register as a use of it.
+        """
+        import ast
+        import io
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "testboard", "storage.py")
+        with io.open(path, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), filename=path)
+
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef,
+                                 ast.FunctionDef, ast.AsyncFunctionDef)):
+                body = getattr(node, "body", None)
+                if body and isinstance(body[0], ast.Expr):
+                    docstrings.add(id(body[0].value))
+
+        found = []  # type: List[str]
+        for node in ast.walk(tree):
+            if id(node) in docstrings:
+                continue
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                found.append(node.value)
+        return found
+
+    def test_the_literal_scan_finds_the_sql(self) -> None:
+        """A scan that matched nothing would pass forever."""
+        literals = self._sql_literals()
+        self.assertGreater(len(literals), 100)
+        self.assertTrue(
+            any("SELECT" in text and "latest_runs" in text
+                for text in literals),
+            "the scan did not find storage.py's SQL")
+
+    def test_no_sqlite_date_function_reaches_the_database(self) -> None:
+        pattern = re.compile(
+            r"\b(" + "|".join(self.BANNED) + r")\s*\(", re.IGNORECASE)
+        offenders = [
+            text for text in self._sql_literals() if pattern.search(text)
+        ]
+        self.assertEqual(
+            offenders, [],
+            "SQLite-specific date functions have no MariaDB equivalent "
+            "with the same semantics. Compute the value in Python and "
+            "store it, the way migration 3 did for durations")
+
+    def test_the_detector_would_catch_a_reintroduction(self) -> None:
+        pattern = re.compile(
+            r"\b(" + "|".join(self.BANNED) + r")\s*\(", re.IGNORECASE)
+        self.assertTrue(pattern.search(
+            "ORDER BY julianday(r.end_time) - julianday(r.start_time)"))
+        self.assertTrue(pattern.search("SELECT strftime('%s', start_time)"))
+        # ...and would not fire on ordinary identifiers that contain it.
+        self.assertIsNone(pattern.search("UPDATE latest_runs SET x = ?"))
+        self.assertIsNone(pattern.search("SELECT validate(x)"))
+
+
 class TestComments(StorageTestBase):
     """Comment storage and implicit user creation."""
 

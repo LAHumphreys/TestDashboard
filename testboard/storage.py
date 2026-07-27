@@ -302,7 +302,116 @@ MIGRATIONS = [
             "ALTER TABLE users ADD COLUMN deactivated_by TEXT",
         ],
     ),
+    (
+        3,
+        [
+            # How long a test's newest run took, denormalised onto the
+            # row every estate-wide read already goes through.
+            #
+            # One column, three unrelated wins:
+            #
+            #  1. "Where is the time going" becomes a GROUP BY over
+            #     ~12k rows instead of an aggregate over millions.
+            #  2. The duration sort stops evaluating an expression over
+            #     the whole filtered set on every sorted page.
+            #  3. It removes the only call to a SQLite date function in
+            #     the codebase, which was a blocker for the MariaDB
+            #     port (see docs/MARIADB_MIGRATION.md).
+            #
+            # DEFAULT 0 rather than NULL: SQLite needs a non-null
+            # default to add a NOT NULL column without rewriting the
+            # table, and every row is filled in by the backfill below
+            # before this migration commits.
+            "ALTER TABLE latest_runs "
+            "ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 0",
+            # The backfill is a CALLABLE, not SQL, on purpose: the
+            # duration has to be computed by model.duration_seconds, the
+            # same function the API uses, or the stored value and the
+            # displayed one can disagree. Doing it in SQL would mean
+            # julianday() — reintroducing exactly what this migration
+            # exists to remove.
+            #
+            # It touches latest_runs (one row per TEST, ~12k) and never
+            # `runs` (~4.4M). That is what makes it affordable in a
+            # startup migration; keep it that way.
+            "python: backfill_latest_durations",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
+
+#: Prefix marking a migration step that runs Python instead of SQL.
+#:
+#: Migrations stay a list of STRINGS rather than a mix of strings and
+#: callables: the list is hashed by tests/test_migrations.py to freeze
+#: the deployed schema, it is read by people, and a function object in
+#: the middle of it is neither hashable in a stable way nor legible.
+#: A marked string keeps the structure uniform and the dispatch
+#: greppable.
+_PYTHON_STEP_PREFIX = "python:"
+
+
+def _backfill_latest_durations(conn: sqlite3.Connection) -> None:
+    """Fill ``latest_runs.duration_seconds`` for migration 3.
+
+    Reads the timestamps of the runs ``latest_runs`` already points at
+    and computes durations with :func:`model.duration_seconds` — the
+    same function the API uses, so the stored value can never disagree
+    with a displayed one.
+
+    Bounded by the number of TESTS, not the number of runs: the join is
+    on ``latest_runs.run_id``, which is one row per test.
+    """
+    rows = conn.execute(
+        "SELECT lr.environment, lr.script, lr.test_name, "
+        "       r.start_time, r.end_time "
+        "FROM latest_runs lr JOIN runs r ON r.id = lr.run_id"
+    ).fetchall()
+    updates = [
+        (
+            model.duration_seconds(
+                model.parse_iso(row[3]), model.parse_iso(row[4])
+            ),
+            row[0], row[1], row[2],
+        )
+        for row in rows
+    ]
+    conn.executemany(
+        "UPDATE latest_runs SET duration_seconds = ? "
+        "WHERE environment = ? AND script = ? AND test_name = ?",
+        updates,
+    )
+
+
+#: Python migration steps, by the name used after the prefix.
+_MIGRATION_STEPS = {
+    "backfill_latest_durations": _backfill_latest_durations,
+}  # type: Dict[str, Any]
+
+
+def apply_migration_statement(
+    conn: sqlite3.Connection, statement: str
+) -> None:
+    """Apply one migration step — SQL, or a marked Python step.
+
+    Shared by :meth:`Storage._migrate` and the tests that build a
+    database at a given version, so the two can never disagree about
+    what applying a migration means.
+
+    A Python step runs inside the caller's transaction and must not
+    commit or roll back.
+    """
+    stripped = statement.strip()
+    if not stripped.startswith(_PYTHON_STEP_PREFIX):
+        conn.execute(statement)
+        return
+    name = stripped[len(_PYTHON_STEP_PREFIX):].strip()
+    step = _MIGRATION_STEPS.get(name)
+    if step is None:
+        raise RuntimeError(
+            "migration refers to an unknown Python step {0!r}; known "
+            "steps are {1}".format(name, sorted(_MIGRATION_STEPS))
+        )
+    step(conn)
 
 
 class TestSummaryRow(NamedTuple):
@@ -484,11 +593,24 @@ DASHBOARD_SORTS = {
     "result": ("lr.result",) + _PK_ORDER,
     "start_time": ("lr.start_time",) + _PK_ORDER,
     "assignee": ("ca.assignee",) + _PK_ORDER,
-    # end_time - start_time cannot be compared lexically, so the duration
-    # sort (and only the sort) goes through SQLite's date parser.
-    "duration": (
-        "(julianday(r.end_time) - julianday(r.start_time))",
-    ) + _PK_ORDER,
+    # Reads the denormalised column on latest_runs (migration 3) rather
+    # than `julianday(r.end_time) - julianday(r.start_time)`.
+    #
+    # The reason is PORTABILITY, not speed. julianday() was the only
+    # SQLite-specific date function in the codebase and has no MariaDB
+    # equivalent with the same semantics, so it blocked the port.
+    # Measured on 12,008 tests / 540,192 runs, replacing it made this
+    # sort 1.1x faster — real but marginal, and nothing like the win the
+    # first version of this comment claimed.
+    #
+    # What the sort actually costs is the sort: the same query without
+    # ORDER BY runs in 3.9ms and with it in 155ms. An index does not
+    # help, because every DASHBOARD_SORTS entry orders its first column
+    # in the requested direction and the primary-key tiebreak ASC, and a
+    # mixed-direction ORDER BY cannot be served by an all-ASC index.
+    # Fixing that needs per-direction indexes for every sort key, which
+    # is a separate piece of work with its own measurements.
+    "duration": ("lr.duration_seconds",) + _PK_ORDER,
 }  # type: Dict[str, Tuple[str, ...]]
 
 #: Triage queue membership, as SQL predicates over ``lr`` (latest_runs)
@@ -862,7 +984,7 @@ class Storage:
         try:
             for _version, statements in pending:
                 for statement in statements:
-                    conn.execute(statement)
+                    apply_migration_statement(conn, statement)
             conn.execute(
                 "UPDATE schema_version SET version = ?", (pending[-1][0],)
             )
@@ -1000,11 +1122,14 @@ class Storage:
             "WHERE environment = ? AND script = ? AND test_name = ?",
             (rec.environment, rec.script, rec.test_name),
         ).fetchone()
+        # Computed with the same function the API serialises with, so a
+        # stored duration and a displayed one cannot disagree.
+        duration = model.duration_seconds(rec.start_time, rec.end_time)
         if row is None:
             conn.execute(
                 "INSERT INTO latest_runs (environment, script, test_name, "
-                "run_id, start_time, result, prev_result) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "run_id, start_time, result, prev_result, duration_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     rec.environment,
                     rec.script,
@@ -1016,6 +1141,7 @@ class Storage:
                         conn, rec.environment, rec.script, rec.test_name,
                         start,
                     ),
+                    duration,
                 ),
             )
             return
@@ -1025,15 +1151,21 @@ class Storage:
         if start > latest_start:
             conn.execute(
                 "UPDATE latest_runs SET run_id = ?, start_time = ?, "
-                "result = ?, prev_result = ? "
+                "result = ?, prev_result = ?, duration_seconds = ? "
                 "WHERE environment = ? AND script = ? AND test_name = ?",
-                (run_id, start, rec.result.value, latest_result) + key,
+                (run_id, start, rec.result.value, latest_result, duration)
+                + key,
             )
         elif start == latest_start:
+            # The same run re-imported. Its end_time may have been
+            # corrected, so the duration is rewritten too — a re-import
+            # exists to repair a record, and a stale duration would
+            # survive the repair.
             conn.execute(
-                "UPDATE latest_runs SET run_id = ?, result = ? "
+                "UPDATE latest_runs SET run_id = ?, result = ?, "
+                "duration_seconds = ? "
                 "WHERE environment = ? AND script = ? AND test_name = ?",
-                (run_id, rec.result.value) + key,
+                (run_id, rec.result.value, duration) + key,
             )
         else:
             conn.execute(

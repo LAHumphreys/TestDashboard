@@ -154,3 +154,40 @@ Two things found by running it rather than by testing it:
   and once) are exempt; a second fetch of the *assignable* list, which is what
   caused the original 250-request stampede, is still banned. A new test keeps
   the exemption narrow.
+
+### WP-5 — `latest_runs.duration_seconds` — **done**
+
+Migration **3**: the column, maintained in `_maintain_latest`, backfilled over
+`latest_runs` only. `DASHBOARD_SORTS["duration"]` repointed; `julianday()` gone.
+Suite 869 → 882.
+
+**Migrations 2+3 against a copy of the real database** (218 MB, 540,192 runs,
+12,008 tests): **466 ms** total. Backfill verified against the source of truth —
+0 rows left at the placeholder default, 0 mismatches in a 2,000-row sample
+recomputed from `runs`.
+
+**Migrations can now contain Python steps**, written as `"python: <name>"` and
+dispatched through `storage.apply_migration_statement`. The backfill has to use
+`model.duration_seconds` — the same function the API serialises with, or a stored
+duration and a displayed one could disagree — and doing it in SQL would have
+meant `julianday()`, which is the thing being removed. The list stays all
+strings so the entry-1 freeze can still hash it and a human can still read it,
+and the tests build databases through the same dispatch function so they cannot
+diverge from the real runner.
+
+**A measurement that contradicted the plan, recorded because it did.** The plan
+justified this partly as a speed win for the duration sort. Measured: **1.1x**,
+not the "stops evaluating an expression over the whole filtered set" the first
+version of the comment claimed. The `julianday` call was never the bottleneck.
+
+- Same query without `ORDER BY`: **3.9 ms**. With it: **155 ms**. The sort is
+  ~97% of the cost.
+- An index does **not** help and is not even used. Every `DASHBOARD_SORTS` entry
+  orders its first column in the requested direction and the primary-key
+  tiebreak ASC, so a descending sort needs a mixed-direction ORDER BY, which no
+  all-ASC index can serve. Measured with a composite index in place: 0.98x, plan
+  unchanged (`USE TEMP B-TREE FOR ORDER BY`).
+
+So the real justifications for this column are portability (julianday gone) and
+WP-6 (a GROUP BY over 12k rows instead of millions). **Per-direction indexes for
+every sort key is a separate piece of work — logged for the performance pass.**
