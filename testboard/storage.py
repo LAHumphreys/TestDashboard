@@ -276,6 +276,32 @@ MIGRATIONS = [
             """,
         ],
     ),
+    (
+        2,
+        [
+            # Deactivating a user hides them from the assignee pickers
+            # without touching anything they did. The estate already has
+            # one person holding two usernames, and nothing could retire
+            # the spare.
+            #
+            # Presence of `deactivated_at` IS the state, the same shape
+            # as test_retirements: reversible by clearing it, and no
+            # boolean that can disagree with its own timestamp.
+            #
+            # History is deliberately untouched. Comments and assignment
+            # records keep the name they were made under, because "this
+            # account is no longer used" is not "this person never said
+            # anything" — the same reasoning that keeps a retired test's
+            # runs intact.
+            #
+            # Two ADD COLUMNs, no backfill: NULL already means "active",
+            # which is what every existing row should mean. SQLite adds a
+            # column without rewriting the table, so this is O(1) against
+            # the production database rather than O(users).
+            "ALTER TABLE users ADD COLUMN deactivated_at TEXT",
+            "ALTER TABLE users ADD COLUMN deactivated_by TEXT",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 
@@ -391,10 +417,25 @@ class Comment(NamedTuple):
 
 
 class User(NamedTuple):
-    """A dashboard user: unique username plus creation timestamp."""
+    """A dashboard user: unique username plus creation timestamp.
+
+    ``deactivated_at`` is None for an active user. A deactivated user is
+    hidden from the assignee pickers and keeps every comment and
+    assignment they ever made; see migration 2.
+
+    No field defaults: ``typing.NamedTuple`` only learned them in 3.6.1,
+    and the target is stated as 3.6 without a micro version.
+    """
 
     username: str
     created_at: datetime.datetime
+    deactivated_at: Optional[datetime.datetime]
+    deactivated_by: Optional[str]
+
+    @property
+    def active(self) -> bool:
+        """True while this account is offered in assignee pickers."""
+        return self.deactivated_at is None
 
 
 class UpsertCounts(NamedTuple):
@@ -402,6 +443,23 @@ class UpsertCounts(NamedTuple):
 
     inserted: int
     updated: int
+
+
+#: Every column of ``users``, in :class:`User` field order. One place, so
+#: adding a field cannot leave one query returning a short row.
+_USER_SELECT = (
+    "SELECT username, created_at, deactivated_at, deactivated_by FROM users"
+)
+
+
+def _user_from_row(row: Sequence[Any]) -> "User":
+    """Build a :class:`User` from a :data:`_USER_SELECT` row."""
+    return User(
+        username=row[0],
+        created_at=model.parse_iso(row[1]),
+        deactivated_at=None if row[2] is None else model.parse_iso(row[2]),
+        deactivated_by=row[3],
+    )
 
 
 # Columns fetched for a StoredRun in list contexts (output lives in its
@@ -1903,11 +1961,10 @@ class Storage:
         """
         conn = self._conn()
         row = conn.execute(
-            "SELECT username, created_at FROM users WHERE username = ?",
-            (username,),
+            _USER_SELECT + " WHERE username = ?", (username,)
         ).fetchone()
         if row is not None:
-            return User(row[0], model.parse_iso(row[1])), False
+            return _user_from_row(row), False
         try:
             conn.execute(
                 "INSERT INTO users (username, created_at) VALUES (?, ?)",
@@ -1916,18 +1973,125 @@ class Storage:
         except sqlite3.IntegrityError:
             # Lost a race with another thread: fetch what it created.
             row = conn.execute(
-                "SELECT username, created_at FROM users WHERE username = ?",
-                (username,),
+                _USER_SELECT + " WHERE username = ?", (username,)
             ).fetchone()
-            return User(row[0], model.parse_iso(row[1])), False
-        return User(username, created_at), True
+            return _user_from_row(row), False
+        return User(username, created_at, None, None), True
 
-    def list_users(self) -> List[User]:
-        """Return all users ordered by username."""
-        rows = self._conn().execute(
-            "SELECT username, created_at FROM users ORDER BY username"
+    def list_users(self, include_inactive: bool = False) -> List[User]:
+        """Users ordered by username; active only unless asked otherwise.
+
+        Active-only is the default because the overwhelmingly common
+        caller is an assignee picker, and the whole point of
+        deactivation is that those get shorter. A caller that wants the
+        full roster — the management view — has to say so.
+        """
+        sql = _USER_SELECT
+        if not include_inactive:
+            sql += " WHERE deactivated_at IS NULL"
+        rows = self._conn().execute(sql + " ORDER BY username").fetchall()
+        return [_user_from_row(row) for row in rows]
+
+    def get_user(self, username: str) -> Optional[User]:
+        """One user by name, active or not; None if unknown."""
+        row = self._conn().execute(
+            _USER_SELECT + " WHERE username = ?", (username,)
+        ).fetchone()
+        return None if row is None else _user_from_row(row)
+
+    def open_assignments_held_by(
+        self, username: str, limit: int = 20
+    ) -> Tuple[int, List[Tuple[str, str, str]]]:
+        """How many live tests *username* owns, and a sample of them.
+
+        Retired tests are excluded. They are not in the suite any more,
+        so counting them would block deactivation over work that no
+        longer exists — and retirement deliberately does not clear an
+        assignment, so those rows stick around forever.
+
+        Returns ``(total, sample)``; the sample is capped so a user
+        holding a thousand tests does not produce a thousand-line error
+        message.
+        """
+        conn = self._conn()
+        where = (
+            "FROM current_assignments ca "
+            "LEFT JOIN test_retirements tr "
+            "  ON tr.environment = ca.environment "
+            " AND tr.script = ca.script "
+            " AND tr.test_name = ca.test_name "
+            "WHERE ca.assignee = ? AND tr.environment IS NULL"
+        )
+        total = conn.execute(
+            "SELECT COUNT(*) " + where, (username,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT ca.environment, ca.script, ca.test_name " + where
+            + " ORDER BY ca.environment, ca.script, ca.test_name LIMIT ?",
+            (username, max(0, int(limit))),
         ).fetchall()
-        return [User(row[0], model.parse_iso(row[1])) for row in rows]
+        return int(total), [(row[0], row[1], row[2]) for row in rows]
+
+    def set_user_active(
+        self,
+        username: str,
+        active: bool,
+        changed_by: str,
+        changed_at: datetime.datetime,
+    ) -> User:
+        """Deactivate or reactivate *username*; return its new state.
+
+        Raises :class:`KeyError` if the user does not exist. Callers are
+        expected to have checked :meth:`open_assignments_held_by` first —
+        this method does not enforce it, because "can this be
+        deactivated" is a policy question the API answers, and storage
+        that silently refused would be impossible to use for a repair.
+
+        *changed_by* is recorded only for a deactivation; reactivating
+        clears both columns, so the account returns to being
+        indistinguishable from one that was never deactivated.
+        """
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(username)
+            if active:
+                conn.execute(
+                    "UPDATE users SET deactivated_at = NULL, "
+                    "deactivated_by = NULL WHERE username = ?",
+                    (username,),
+                )
+            else:
+                self.ensure_user(changed_by, changed_at)
+                conn.execute(
+                    "UPDATE users SET deactivated_at = ?, "
+                    "deactivated_by = ? WHERE username = ?",
+                    (model.format_iso(changed_at), changed_by, username),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        user = self.get_user(username)
+        assert user is not None  # it existed inside the transaction
+        return user
+
+    def is_active_user(self, username: str) -> bool:
+        """True if *username* is unknown or active; False if deactivated.
+
+        Unknown reads as active on purpose: usernames are created
+        implicitly by the act of commenting or assigning, so "not in the
+        table yet" is a new person, not a retired one.
+        """
+        row = self._conn().execute(
+            "SELECT deactivated_at FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        return row is None or row[0] is None
 
     # ------------------------------------------------------------------
     # Comments

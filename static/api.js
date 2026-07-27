@@ -246,6 +246,16 @@ export function assigneeSelect(entry, onSaved) {
     none.value = "";
     select.appendChild(none);
 
+    // The current assignee is added even when the fetched list omits
+    // them, and that is DELIBERATE — do not "fix" it.
+    //
+    // /api/users returns active users only, so a test still owned by a
+    // deactivated account would otherwise render with an empty
+    // dropdown, silently looking unassigned. Injecting the name keeps
+    // the row honest about who holds it, and reassigning away is the
+    // one action that has to keep working.
+    //
+    // The same line covers you before the server has heard of you.
     const names = users.slice();
     for (const extra of [me, entry.assignee]) {
       if (extra && names.indexOf(extra) === -1) {

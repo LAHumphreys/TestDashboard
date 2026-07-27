@@ -13,6 +13,7 @@ directory is removed, and rmtree uses ignore_errors=True.
 
 import datetime
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -476,12 +477,12 @@ class TestUsers(StorageTestBase):
     def test_create_user_new_then_existing(self) -> None:
         user, created = self.store.create_user("alice", CREATED)
         self.assertTrue(created)
-        self.assertEqual(user, storage.User("alice", CREATED))
+        self.assertEqual(user, storage.User("alice", CREATED, None, None))
         later = CREATED + datetime.timedelta(days=1)
         again, created_again = self.store.create_user("alice", later)
         self.assertFalse(created_again)
         # Existing user returned unchanged: original created_at kept.
-        self.assertEqual(again, storage.User("alice", CREATED))
+        self.assertEqual(again, storage.User("alice", CREATED, None, None))
 
     def test_ensure_user_is_idempotent(self) -> None:
         self.store.ensure_user("bob", CREATED)
@@ -489,7 +490,7 @@ class TestUsers(StorageTestBase):
             "bob", CREATED + datetime.timedelta(days=1)
         )
         users = self.store.list_users()
-        self.assertEqual(users, [storage.User("bob", CREATED)])
+        self.assertEqual(users, [storage.User("bob", CREATED, None, None)])
 
     def test_list_users_ordered_by_username(self) -> None:
         for name in ("carol", "alice", "bob"):
@@ -501,6 +502,182 @@ class TestUsers(StorageTestBase):
 
     def test_list_users_empty(self) -> None:
         self.assertEqual(self.store.list_users(), [])
+
+
+class TestUserDeactivation(StorageTestBase):
+    """Migration 2: hiding a user without erasing what they did.
+
+    The motivating case is real: one person in the estate holds two
+    usernames, and until now nothing could take the spare out of the
+    assignee pickers.
+    """
+
+    def setUp(self) -> None:
+        StorageTestBase.setUp(self)
+        for name in ("alice", "bob"):
+            self.store.ensure_user(name, CREATED)
+
+    def test_a_new_user_is_active(self) -> None:
+        user, _created = self.store.create_user("carol", CREATED)
+        self.assertTrue(user.active)
+        self.assertIsNone(user.deactivated_at)
+
+    def test_deactivating_hides_the_user_from_the_default_listing(
+        self
+    ) -> None:
+        """The whole feature, in one assertion.
+
+        The assignee pickers read the default listing, so this is what
+        makes a duplicate account stop being offered.
+        """
+        self.store.set_user_active("bob", False, "alice", CREATED)
+        self.assertEqual(
+            [u.username for u in self.store.list_users()], ["alice"])
+
+    def test_the_full_roster_is_still_available_on_request(self) -> None:
+        self.store.set_user_active("bob", False, "alice", CREATED)
+        everyone = self.store.list_users(include_inactive=True)
+        self.assertEqual([u.username for u in everyone], ["alice", "bob"])
+        self.assertEqual([u.active for u in everyone], [True, False])
+
+    def test_deactivation_records_who_and_when(self) -> None:
+        when = CREATED + datetime.timedelta(days=3)
+        user = self.store.set_user_active("bob", False, "alice", when)
+        self.assertEqual(user.deactivated_at, when)
+        self.assertEqual(user.deactivated_by, "alice")
+        self.assertFalse(user.active)
+
+    def test_reactivating_leaves_no_trace(self) -> None:
+        """Reversible means indistinguishable, not "flagged as back"."""
+        self.store.set_user_active("bob", False, "alice", CREATED)
+        user = self.store.set_user_active("bob", True, "alice", CREATED)
+        self.assertTrue(user.active)
+        self.assertIsNone(user.deactivated_at)
+        self.assertIsNone(user.deactivated_by)
+
+    def test_history_is_untouched_by_deactivation(self) -> None:
+        """A dead account is not a person who never said anything.
+
+        Same reasoning as retiring a test: it leaves the runs alone.
+        """
+        self.store.add_comment(
+            "linux", "a.py", "t", "bob", "looked at this", CREATED)
+        self.store.set_user_active("bob", False, "alice", CREATED)
+        comments = self.store.comments("linux", "a.py", "t")
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].author, "bob")
+        self.assertEqual(comments[0].text, "looked at this")
+
+    def test_deactivating_an_unknown_user_raises(self) -> None:
+        with self.assertRaises(KeyError):
+            self.store.set_user_active("nobody", False, "alice", CREATED)
+
+    def test_an_unknown_username_counts_as_active(self) -> None:
+        """Usernames are created implicitly by commenting or assigning,
+        so "not in the table" is a new person, not a retired one."""
+        self.assertTrue(self.store.is_active_user("brand_new"))
+        self.assertTrue(self.store.is_active_user("alice"))
+        self.store.set_user_active("alice", False, "bob", CREATED)
+        self.assertFalse(self.store.is_active_user("alice"))
+
+    def test_open_assignments_are_counted(self) -> None:
+        self.store.upsert_runs([
+            make_record("linux", "a.py", "one"),
+            make_record("linux", "a.py", "two"),
+        ])
+        for name in ("one", "two"):
+            self.store.set_assignee(
+                "linux", "a.py", name, "bob", "alice", CREATED)
+        total, sample = self.store.open_assignments_held_by("bob")
+        self.assertEqual(total, 2)
+        self.assertEqual(
+            sample,
+            [("linux", "a.py", "one"), ("linux", "a.py", "two")])
+
+    def test_retired_tests_do_not_count_as_open_work(self) -> None:
+        """Retirement deliberately leaves the assignment in place.
+
+        Counting those would block deactivation over work that no
+        longer exists, and it would never clear on its own.
+        """
+        self.store.upsert_runs([make_record("linux", "a.py", "gone")])
+        self.store.set_assignee(
+            "linux", "a.py", "gone", "bob", "alice", CREATED)
+        self.assertEqual(
+            self.store.open_assignments_held_by("bob")[0], 1)
+        self.store.set_retired(
+            "linux", "a.py", "gone", True, "alice",
+            "no longer in the suite", CREATED)
+        self.assertEqual(
+            self.store.open_assignments_held_by("bob")[0], 0)
+
+    def test_a_cleared_assignment_is_not_open_work(self) -> None:
+        self.store.upsert_runs([make_record("linux", "a.py", "one")])
+        self.store.set_assignee(
+            "linux", "a.py", "one", "bob", "alice", CREATED)
+        self.store.set_assignee(
+            "linux", "a.py", "one", None, "alice", CREATED)
+        self.assertEqual(
+            self.store.open_assignments_held_by("bob")[0], 0)
+
+    def test_the_sample_is_capped_but_the_total_is_not(self) -> None:
+        """A user holding a thousand tests must not produce a
+        thousand-line error message."""
+        records = [make_record("linux", "a.py", "t%03d" % i) for i in range(30)]
+        self.store.upsert_runs(records)
+        for record in records:
+            self.store.set_assignee(
+                "linux", "a.py", record.test_name, "bob", "alice", CREATED)
+        total, sample = self.store.open_assignments_held_by("bob", limit=5)
+        self.assertEqual(total, 30)
+        self.assertEqual(len(sample), 5)
+
+
+class TestMigrationTwoAgainstExistingData(unittest.TestCase):
+    """Migration 2 runs against a database that already has users.
+
+    An empty-database test proves the DDL parses. Production is not
+    empty, and that is the only place this will ever really run.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="testboard_migrate2_")
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.db_path = os.path.join(self.tmpdir, "v1.db")
+
+    def _build_at_version_one(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            for statement in storage.MIGRATIONS[0][1]:
+                conn.execute(statement)
+            conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+            conn.execute(
+                "INSERT INTO users (username, created_at) VALUES (?, ?)",
+                ("existing", model.format_iso(CREATED)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_existing_users_survive_and_read_as_active(self) -> None:
+        self._build_at_version_one()
+        store = Storage(self.db_path)
+        self.addCleanup(store.close)
+        users = store.list_users()
+        self.assertEqual([u.username for u in users], ["existing"])
+        self.assertTrue(users[0].active)
+        self.assertEqual(users[0].created_at, CREATED)
+
+    def test_the_upgraded_database_can_then_deactivate(self) -> None:
+        self._build_at_version_one()
+        store = Storage(self.db_path)
+        self.addCleanup(store.close)
+        store.set_user_active("existing", False, "existing", CREATED)
+        self.assertEqual(store.list_users(), [])
+        self.assertEqual(
+            len(store.list_users(include_inactive=True)), 1)
 
 
 class TestComments(StorageTestBase):
@@ -977,10 +1154,53 @@ class TestSchemaVersionGuard(StorageTestBase):
         self.assertIn("NEWER version", message)
         self.assertIn(str(storage.MIGRATIONS[-1][0] + 5), message)
 
-    def test_schema_is_created_by_a_single_migration(self) -> None:
-        """Nothing is deployed, so there is no migration history to keep."""
-        self.assertEqual(len(storage.MIGRATIONS), 1)
-        self.assertEqual(storage.MIGRATIONS[0][0], 1)
+    def test_migration_one_creates_the_schema_and_the_rest_extend_it(
+        self
+    ) -> None:
+        """This test used to assert there was exactly ONE migration.
+
+        That was right while nothing was deployed: with no database in
+        service there is no history to preserve, so the schema was kept
+        as a single entry that could be edited freely.
+
+        testboard went live on 2026-07-26 and the premise expired. Entry
+        1 now describes a database that exists, so the rule inverted:
+        never edit it, always append. The count is no longer meaningful
+        — it only tells you how many changes have shipped.
+
+        What is still worth asserting is the SHAPE that replaced it:
+        entry 1 creates everything outright, and every later entry only
+        extends. A later entry containing CREATE TABLE for something
+        entry 1 already created would mean the two disagree about the
+        same object, and which one a given database got would depend on
+        when it was first opened.
+
+        The freeze itself lives in tests/test_migrations.py.
+        """
+        first = [s.strip().upper() for s in storage.MIGRATIONS[0][1]]
+        self.assertTrue(
+            all(s.startswith("CREATE") for s in first),
+            "migration 1 should create the schema outright")
+
+        created = set()
+        for statement in storage.MIGRATIONS[0][1]:
+            match = re.search(
+                r"CREATE\s+TABLE\s+(\w+)", statement, re.IGNORECASE)
+            if match:
+                created.add(match.group(1).lower())
+        self.assertIn("runs", created)
+
+        for version, statements in storage.MIGRATIONS[1:]:
+            for statement in statements:
+                match = re.search(
+                    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+                    statement, re.IGNORECASE)
+                if match:
+                    self.assertNotIn(
+                        match.group(1).lower(), created,
+                        "migration {0} re-creates table '{1}', which "
+                        "migration 1 already creates".format(
+                            version, match.group(1)))
 
 
 class EstateTestBase(StorageTestBase):

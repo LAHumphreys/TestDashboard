@@ -1186,3 +1186,76 @@ button.bar-row:focus-visible {
 }
 
 .detail-chart-grid .chart-card svg { max-width: none; }
+
+/* ==========================================================================
+   Round 1 additions (see docs/UPGRADE_PLAN.md)
+   ========================================================================== */
+
+/* ---------- Ghost chip: a result that is NOT the current one ----------
+ *
+ * Triage rows were reported as misleading, and they were: the previous
+ * result was drawn as a solid, saturated chip while the CURRENT result
+ * showed only as a 3px stripe on the row edge. The loudest thing in the
+ * row was the wrong value — and it is wrong in the worst direction both
+ * times, because a new failure's previous result is usually PASS and a
+ * fixed test's previous result is FAIL.
+ *
+ * So a superseded result keeps its colour (it still has to be readable
+ * at a glance) but gives up its fill. Solid means "this is true now";
+ * outlined means "this was true before". Do not simplify this back into
+ * a plain .chip — the distinction is the entire point.
+ *
+ * The text label stays in both cases: colour is never the only carrier.
+ */
+.chip.chip-ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 2px 11px;   /* 1px less, so the border does not change the size */
+  font-weight: 500;
+}
+
+.chip.chip-ghost.result-pass { border-color: var(--c-pass); color: var(--c-pass); }
+.chip.chip-ghost.result-fail { border-color: var(--c-fail); color: var(--c-fail); }
+.chip.chip-ghost.result-failed-as-expected { border-color: var(--c-fae); color: #8a6d00; }
+.chip.chip-ghost.result-unexpected-pass { border-color: var(--c-up); color: var(--c-up); }
+
+/* The arrow between a previous and current result. Muted on purpose:
+   it is punctuation, not data. */
+.chip-transition {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chip-transition .transition-arrow {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---------- Manage people (open actions) ---------- */
+
+#people-section {
+  margin-top: 28px;
+}
+
+#people-heading {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.people-note {
+  max-width: 62ch;
+  margin: 10px 0 14px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+#people-table tr.is-inactive td:first-child {
+  color: var(--muted);
+  text-decoration: line-through;
+}

@@ -29,7 +29,7 @@ these are the ones that get forgotten:
 | — | Plan + MariaDB runbook | **done** | *(this commit)* |
 | WP-0 | Migration registry guard | **done** | `tests/test_migrations.py`, 19 tests |
 | WP-11 | Vendor PyMySQL | **done** | `third_party/pymysql` 1.0.2, 13 tests |
-| WP-4 | Deactivate users (migration 2) | pending | |
+| WP-4 | Deactivate users (migration 2) | **done** | migration 2, 869 tests |
 | WP-5 | `duration_seconds` (migration 3) | pending | |
 | WP-1 | Extract `review.js` | pending | |
 | WP-2 | Review on Open actions | pending | |
@@ -110,3 +110,47 @@ Four things found on the way that are not obvious from the diff:
   subclasses it, so the test failed inside the standard library before reaching
   the driver. It uses `sys.addaudithook` instead, plus a companion test proving
   the hook actually fires on a real network call.
+
+### WP-4 — deactivate users — **done**
+
+Migration **2**: `users.deactivated_at`, `users.deactivated_by`. Presence of the
+timestamp is the state, matching `test_retirements` — reversible, and no boolean
+that can disagree with its own timestamp. Suite 844 → 869.
+
+**Migration timing, measured not estimated.** Applied to a copy of the real
+database (218 MB, 540,192 runs, 12,008 tests): **31 ms**, including opening the
+connection. `ALTER TABLE ADD COLUMN` does not rewrite rows in SQLite, so this
+does not grow with the database — production being larger changes nothing.
+Verified afterwards: row counts unchanged, existing users read as active.
+
+Exercised against that copy through the running server, not only through tests.
+The 409 fired on real data — `priya` genuinely owned two tests — then reassigning
+them let the deactivation through, the picker list dropped to two names, and an
+attempt to assign to the deactivated account was refused.
+
+Decisions worth not re-litigating:
+
+- **Deactivating an owner is a hard 409, not a warning.** Work assigned to a
+  name no picker offers is an invisible queue; nothing would ever surface it.
+- **Retired tests do not count as open work.** Retirement deliberately leaves
+  the assignment in place, so counting them would block deactivation forever
+  over work that no longer exists.
+- **Clearing an assignment is never blocked** — it is the way out of the
+  situation, not another instance of it.
+- **`assigneeSelect` injects `entry.assignee` even when absent from the fetched
+  list, and that is deliberate.** With active-only listing, a test still owned
+  by a deactivated account would otherwise render with an empty dropdown and
+  look unassigned. There is now a comment there saying so.
+
+Two things found by running it rather than by testing it:
+
+- The `<details>` panel loaded its list on the `toggle` event only. `toggle`
+  fires on a *change*, so a panel that is already open on arrival — markup, or
+  browser-restored state — showed an empty table forever. Now it also loads if
+  it is open at init.
+- `tests/test_frontend_calls.py` fired, correctly: `actions.js` now names
+  `/api/users` twice more. **Widened, not weakened** — mutations (`putJson`) and
+  the admin roster (`include_inactive=1`, a different result set, fetched lazily
+  and once) are exempt; a second fetch of the *assignable* list, which is what
+  caused the original 250-request stampede, is still banned. A new test keeps
+  the exemption narrow.

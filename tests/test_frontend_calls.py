@@ -90,30 +90,72 @@ class CoverageTest(unittest.TestCase):
 class UserListTest(unittest.TestCase):
     """One page, one request for the user list."""
 
-    def test_only_one_place_fetches_the_user_list(self) -> None:
+    def test_only_one_place_fetches_the_picker_user_list(self) -> None:
         """The assertion that stops the stampede coming back.
 
         A second fetch site is not merely a duplicated request: it is a
         second cache, which by construction cannot dedupe against the
         first.
+
+        WIDENED (not weakened) when user deactivation landed. Two kinds
+        of call now name this endpoint and neither is a second picker
+        cache:
+
+        - mutations (POST to create, PUT .../active to deactivate),
+        - the administrative roster, which asks for
+          ``include_inactive=1`` and is a genuinely different result set
+          — every user rather than the assignable ones — fetched once,
+          lazily, when a fold-out section is opened.
+
+        What is still banned is the thing that caused the outage: a
+        second place fetching the *assignable* list, which is what every
+        dropdown is built from. That list has exactly one source.
         """
         offenders = {}  # type: Dict[str, List[int]]
         for name, source in scripts().items():
-            lines = fetch_sites(source, "/api/users")
-            # POSTing to create a user is not fetching the list.
-            lines = [
-                number for number in lines
-                if "postJson" not in source.split("\n")[number - 1]
-            ]
+            lines = []  # type: List[int]
+            for number in fetch_sites(source, "/api/users"):
+                line = source.split("\n")[number - 1]
+                if "postJson" in line or "putJson" in line:
+                    continue          # a mutation, not a listing
+                if "include_inactive" in line:
+                    continue          # the admin roster, not the picker
+                lines.append(number)
             if lines:
                 offenders[name] = lines
         self.assertEqual(
             offenders, {"api.js": offenders.get("api.js", [])},
-            "the user list must be fetched in exactly one place "
-            "(api.js loadUsers); found " + repr(offenders))
+            "the assignable user list must be fetched in exactly one "
+            "place (api.js loadUsers); found " + repr(offenders))
         self.assertEqual(
             len(offenders.get("api.js", [])), 1,
-            "api.js must fetch /api/users exactly once")
+            "api.js must fetch the assignable /api/users exactly once")
+
+    def test_the_admin_roster_is_fetched_at_most_once_and_lazily(
+        self
+    ) -> None:
+        """The exemption above must stay narrow.
+
+        One place, asking explicitly for the full roster. If a second
+        appears, or if it stops being explicit, the exemption has
+        started covering something it was not written for.
+        """
+        sites = []  # type: List[str]
+        for name, source in scripts().items():
+            for number in fetch_sites(source, "/api/users"):
+                line = source.split("\n")[number - 1]
+                if "include_inactive" in line:
+                    sites.append("%s:%d" % (name, number))
+        self.assertLessEqual(
+            len(sites), 1,
+            "more than one place fetches the full user roster: "
+            + repr(sites))
+        if sites:
+            body = _function_body(read("actions.js"), "async function loadPeople()")
+            self.assertIn(
+                "include_inactive", body,
+                "the roster fetch must live in loadPeople(), which runs "
+                "only when the Manage people section is opened")
 
     def test_the_promise_is_cached_not_the_result(self) -> None:
         """Caching the resolved value is the bug; it looks identical."""

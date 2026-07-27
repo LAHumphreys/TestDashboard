@@ -72,6 +72,37 @@
         <button id="show-more" type="button" hidden>Show more</button>
       </div>
     </section>
+
+    <!-- Deactivating a user is rare and administrative, so it is folded
+         away rather than given a page of its own. It lives here because
+         this is the page where you notice a name that should not be in
+         the list. -->
+    <section id="people-section" aria-labelledby="people-heading">
+      <details id="people-details">
+        <summary id="people-heading">Manage people</summary>
+        <p class="muted people-note">
+          Deactivating someone removes them from every assignee dropdown.
+          Their comments and past assignments are kept exactly as they are.
+          Reassign anything they still own first — testboard will refuse
+          otherwise, because work assigned to a name nobody can select
+          never resurfaces.
+        </p>
+        <div class="table-wrap">
+          <table class="data-table" id="people-table">
+            <thead>
+              <tr>
+                <th>Person</th>
+                <th>Status</th>
+                <th>Since</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="people-body"></tbody>
+          </table>
+        </div>
+        <p id="people-empty" class="empty-state" hidden>No people yet.</p>
+      </details>
+    </section>
   </main>
 
   <script type="module" src="actions.js"></script>

@@ -952,12 +952,76 @@ class TestAssignee(ApiCase):
             body={"username": "alice", "assigned_by": "bob"},
         )
 
+    def test_a_deactivated_user_cannot_be_assigned_work(self) -> None:
+        """The picker will not offer them, but the picker is not the
+        boundary: a stale page or a script would still get through, and
+        the resulting assignment is invisible to everyone."""
+        self.call("POST", "/api/users", body={"username": "alice"},
+                  expect=201)
+        self.call("PUT", "/api/users/alice/active",
+                  body={"active": False, "changed_by": "bob"})
+        data = self.call(
+            "PUT", self.path,
+            body={"username": "alice", "assigned_by": "bob"}, expect=400)
+        self.assertIn("deactivated", data["error"])
+        self.assertIn("alice", data["error"])
+
+    def test_clearing_an_assignment_is_never_blocked(self) -> None:
+        """Unassigning must keep working whatever the account's state —
+        it is the way out of the situation, not another instance of it."""
+        self.call("PUT", self.path,
+                  body={"username": "alice", "assigned_by": "bob"})
+        self.call("PUT", "/api/users/alice/active",
+                  body={"active": False, "changed_by": "bob"}, expect=409)
+        self.call("PUT", self.path,
+                  body={"username": None, "assigned_by": "bob"})
+        self.call("PUT", "/api/users/alice/active",
+                  body={"active": False, "changed_by": "bob"})
+
+    def test_deactivating_an_owner_is_refused_and_says_what_they_hold(
+        self
+    ) -> None:
+        """The invisible-queue guard.
+
+        Deactivating someone who still owns live tests leaves that work
+        assigned to a name no picker offers. Nothing would ever surface
+        it again, so this is a hard refusal rather than a warning.
+        """
+        self.call("PUT", self.path,
+                  body={"username": "alice", "assigned_by": "bob"})
+        data = self.call("PUT", "/api/users/alice/active",
+                         body={"active": False, "changed_by": "bob"},
+                         expect=409)
+        self.assertIn("alice", data["error"])
+        self.assertIn(self.NAME, data["error"])
+        self.assertIn("Reassign", data["error"])
+        # And it really did not happen.
+        listed = self.call("GET", "/api/users")["users"]
+        self.assertIn("alice", [u["username"] for u in listed])
+
+    def test_retiring_the_test_unblocks_deactivation(self) -> None:
+        """A retired test is not open work, and retirement deliberately
+        leaves the assignment in place — so it would block forever."""
+        self.call("PUT", self.path,
+                  body={"username": "alice", "assigned_by": "bob"})
+        self.call("PUT", "/api/users/alice/active",
+                  body={"active": False, "changed_by": "bob"}, expect=409)
+        self.call(
+            "PUT", self.detail_path + "/retired",
+            body={"retired": True, "username": "bob",
+                  "comment": "suite dropped it"})
+        self.call("PUT", "/api/users/alice/active",
+                  body={"active": False, "changed_by": "bob"})
+
 
 class TestUsers(ApiCase):
     """GET/POST /api/users: listing, idempotent creation, validation."""
 
     def test_list_empty(self) -> None:
-        self.assertEqual(self.call("GET", "/api/users"), {"users": []})
+        self.assertEqual(
+            self.call("GET", "/api/users"),
+            {"users": [], "include_inactive": False},
+        )
 
     def test_create_then_idempotent(self) -> None:
         created = self.call(
@@ -969,6 +1033,9 @@ class TestUsers(ApiCase):
                 "user": {
                     "username": "alice",
                     "created_at": format_iso(NOW),
+                    "active": True,
+                    "deactivated_at": None,
+                    "deactivated_by": None,
                 },
                 "created": True,
             },
@@ -985,6 +1052,76 @@ class TestUsers(ApiCase):
         )
         self.assertEqual(data["user"]["username"], "dave")
 
+    def test_deactivated_users_are_absent_from_the_default_listing(
+        self
+    ) -> None:
+        """This is the whole feature.
+
+        Every assignee picker in the frontend reads this endpoint with
+        no parameters, so a deactivated user stops being offered without
+        a single line of frontend change.
+        """
+        for name in ("alice", "bob"):
+            self.call("POST", "/api/users", body={"username": name},
+                      expect=201)
+        self.call("PUT", "/api/users/bob/active",
+                  body={"active": False, "changed_by": "alice"})
+        listed = self.call("GET", "/api/users")["users"]
+        self.assertEqual([u["username"] for u in listed], ["alice"])
+
+    def test_the_full_roster_is_available_on_request(self) -> None:
+        for name in ("alice", "bob"):
+            self.call("POST", "/api/users", body={"username": name},
+                      expect=201)
+        self.call("PUT", "/api/users/bob/active",
+                  body={"active": False, "changed_by": "alice"})
+        data = self.call("GET", "/api/users",
+                         query={"include_inactive": ["1"]})
+        self.assertTrue(data["include_inactive"])
+        self.assertEqual(
+            [(u["username"], u["active"]) for u in data["users"]],
+            [("alice", True), ("bob", False)],
+        )
+        bob = data["users"][1]
+        self.assertEqual(bob["deactivated_at"], format_iso(NOW))
+        self.assertEqual(bob["deactivated_by"], "alice")
+
+    def test_reactivating_restores_the_user(self) -> None:
+        self.call("POST", "/api/users", body={"username": "bob"},
+                  expect=201)
+        self.call("PUT", "/api/users/bob/active",
+                  body={"active": False, "changed_by": "bob"})
+        self.assertEqual(self.call("GET", "/api/users")["users"], [])
+        data = self.call("PUT", "/api/users/bob/active",
+                         body={"active": True, "changed_by": "bob"})
+        self.assertTrue(data["user"]["active"])
+        self.assertIsNone(data["user"]["deactivated_at"])
+        self.assertEqual(
+            [u["username"] for u in self.call("GET", "/api/users")["users"]],
+            ["bob"])
+
+    def test_deactivating_an_unknown_user_404s(self) -> None:
+        self.call("PUT", "/api/users/ghost/active",
+                  body={"active": False, "changed_by": "alice"},
+                  expect=404)
+
+    def test_active_field_is_validated(self) -> None:
+        self.call("POST", "/api/users", body={"username": "bob"},
+                  expect=201)
+        missing = self.call("PUT", "/api/users/bob/active",
+                            body={"changed_by": "bob"}, expect=400)
+        self.assertIn("active", missing["error"])
+        wrong = self.call("PUT", "/api/users/bob/active",
+                          body={"active": "yes", "changed_by": "bob"},
+                          expect=400)
+        self.assertIn("true or false", wrong["error"])
+        no_actor = self.call("PUT", "/api/users/bob/active",
+                             body={"active": False}, expect=400)
+        self.assertIn("changed_by", no_actor["error"])
+
+    def test_wrong_method_on_active(self) -> None:
+        self.assert_405("GET", "/api/users/bob/active", "PUT")
+
     def test_list_sorted_by_username(self) -> None:
         self.call("POST", "/api/users", body={"username": "bob"}, expect=201)
         self.call(
@@ -996,7 +1133,9 @@ class TestUsers(ApiCase):
         )
         for user in users:
             self.assertEqual(
-                set(user.keys()), {"username", "created_at"}
+                set(user.keys()),
+                {"username", "created_at", "active", "deactivated_at",
+                 "deactivated_by"},
             )
 
     def test_validation_errors_400(self) -> None:
@@ -1109,7 +1248,8 @@ class TestRoutingAndEncoding(ApiCase):
 
     def test_trailing_slash_tolerated(self) -> None:
         self.assertEqual(
-            self.call("GET", "/api/users/"), {"users": []}
+            self.call("GET", "/api/users/"),
+            {"users": [], "include_inactive": False},
         )
 
 

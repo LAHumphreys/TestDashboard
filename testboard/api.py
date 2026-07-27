@@ -386,10 +386,22 @@ def _comment_json(comment: Comment) -> Dict[str, Any]:
 
 
 def _user_json(user: User) -> Dict[str, Any]:
-    """Serialize a user to its JSON shape."""
+    """Serialize a user to its JSON shape.
+
+    ``active`` is sent as well as ``deactivated_at`` even though one
+    implies the other: every consumer wants the boolean, and deriving it
+    from a timestamp in four different places is how three of them end
+    up agreeing and one does not.
+    """
     return {
         "username": user.username,
         "created_at": model.format_iso(user.created_at),
+        "active": user.active,
+        "deactivated_at": (
+            None if user.deactivated_at is None
+            else model.format_iso(user.deactivated_at)
+        ),
+        "deactivated_by": user.deactivated_by,
     }
 
 
@@ -941,6 +953,16 @@ def _handle_assignee(
     assignee = None  # type: Optional[str]
     if obj["username"] is not None:
         assignee = _validate_username(obj, "username")
+        # The picker will not offer a deactivated user, but the picker is
+        # not the boundary — a stale page or a script would still get
+        # through, and the resulting assignment is invisible to everyone.
+        if not storage.is_active_user(assignee):
+            raise _HttpError(
+                400,
+                "{} has been deactivated and cannot be assigned work. "
+                "Reactivate the account first if this is "
+                "intended.".format(assignee),
+            )
     assigned_by = _validate_username(obj, "assigned_by")
     storage.set_assignee(
         environment, script, test_name, assignee, assigned_by, now()
@@ -1059,11 +1081,83 @@ def _handle_retired(
     )
 
 
-def _handle_users_list(storage: Storage) -> Response:
-    """GET /api/users — all known users, ordered by username."""
+def _handle_users_list(storage: Storage, request: Request) -> Response:
+    """GET /api/users — users ordered by username.
+
+    ACTIVE users only, unless ``include_inactive=1``. That default is
+    what makes deactivation work with no frontend change at all: the
+    assignee pickers already read this endpoint, so a deactivated user
+    simply stops being offered.
+    """
+    include_inactive = _query_single(
+        request.query, "include_inactive") in ("1", "true")
+    users = storage.list_users(include_inactive=include_inactive)
     return _json_response(
-        200, {"users": [_user_json(u) for u in storage.list_users()]}
+        200,
+        {
+            "users": [_user_json(u) for u in users],
+            "include_inactive": include_inactive,
+        },
     )
+
+
+def _handle_user_active(
+    storage: Storage,
+    request: Request,
+    username: str,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """PUT /api/users/{username}/active — deactivate or reactivate.
+
+    Body: ``{"active": bool, "changed_by": str}``.
+
+    Deactivating a user who still owns live tests answers **409** and
+    lists them. Letting it through would leave work assigned to a name
+    that no picker offers — an invisible queue, which is the single most
+    likely way to lose track of open work here. Reassigning first is a
+    deliberate step, not a nuisance.
+
+    Retired tests do not count: they are not in the suite, and
+    retirement deliberately leaves an assignment in place, so counting
+    them would block deactivation over work that no longer exists.
+    """
+    obj = _parse_json_object(request.body)
+    if "active" not in obj:
+        raise _HttpError(400, "active: required field is missing")
+    if not isinstance(obj["active"], bool):
+        raise _HttpError(
+            400,
+            "active: must be true or false, got {}".format(
+                type(obj["active"]).__name__
+            ),
+        )
+    active = obj["active"]
+    changed_by = _validate_username(obj, "changed_by")
+
+    if storage.get_user(username) is None:
+        raise _HttpError(404, "unknown user: {}".format(username))
+
+    if not active:
+        total, sample = storage.open_assignments_held_by(username)
+        if total:
+            listed = ", ".join(
+                "{}/{}/{}".format(*triple) for triple in sample
+            )
+            more = "" if total <= len(sample) else " (and {} more)".format(
+                total - len(sample)
+            )
+            raise _HttpError(
+                409,
+                "{} still owns {} test{} that {} not been reassigned: "
+                "{}{}. Reassign them first — otherwise the work stays "
+                "assigned to a name nobody can select.".format(
+                    username, total, "" if total == 1 else "s",
+                    "has" if total == 1 else "have", listed, more,
+                ),
+            )
+
+    user = storage.set_user_active(username, active, changed_by, now())
+    return _json_response(200, {"user": _user_json(user)})
 
 
 def _handle_users_create(
@@ -1120,8 +1214,12 @@ def _route(
     if rest == ["users"]:
         _check_method(request.method, ("GET", "POST"))
         if request.method == "GET":
-            return _handle_users_list(storage)
+            return _handle_users_list(storage, request)
         return _handle_users_create(storage, request, now)
+
+    if len(rest) == 3 and rest[0] == "users" and rest[2] == "active":
+        _check_method(request.method, ("PUT",))
+        return _handle_user_active(storage, request, rest[1], now)
 
     if len(rest) == 2 and rest[0] == "runs":
         _check_method(request.method, ("GET",))
