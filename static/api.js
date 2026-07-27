@@ -178,26 +178,52 @@ function refreshUserWidget() {
 
 /* ---------------- assignment ---------------- */
 
-/* Known usernames, fetched once per page load. */
-let knownUsers = null;
+/*
+ * The in-flight request for the user list, or null before the first one.
+ *
+ * The PROMISE is cached, not the array it resolves to, and that is the
+ * whole point. Caching the result looks equivalent and is not: the
+ * assignment happens after an `await`, so every caller that runs before
+ * the first response arrives sees an empty cache and starts its own
+ * request. `assigneeSelect()` below is a per-row cell builder and the
+ * row loop is synchronous, so a 250-row page issued 250 concurrent
+ * GET /api/users for one identical list.
+ *
+ * Caching the promise collapses them: the second caller and the
+ * two-hundred-and-fiftieth get the same pending promise as the first.
+ *
+ * This is the ONLY place the frontend fetches /api/users. Adding a
+ * second one brings the stampede back, so tests/test_frontend_calls.py
+ * fails the build if one appears.
+ */
+let usersPromise = null;
+
+/* Names assigned during this page's life, not in the fetched list. */
+const addedUsers = [];
 
 /** Every username the server knows, for the assignee pickers. */
-export async function loadUsers() {
-  if (knownUsers === null) {
-    try {
-      const data = await fetchJson("/api/users");
-      knownUsers = data.users.map((user) => user.username);
-    } catch (err) {
-      knownUsers = [];
-    }
+export function loadUsers() {
+  if (usersPromise === null) {
+    usersPromise = fetchJson("/api/users")
+      .then((data) => data.users.map((user) => user.username))
+      // A missing user list must not break assigning: the dropdown still
+      // offers you, the current assignee, and anyone added since.
+      .catch(() => []);
   }
-  return knownUsers;
+  return usersPromise.then((names) => names.concat(addedUsers));
 }
 
-/** Add a username to the cached list (after assigning to a new person). */
+/**
+ * Add a username to the cached list, after assigning to a new person.
+ *
+ * Kept separately from the fetched names rather than pushed into them:
+ * the fetched array lives inside a promise that may not have resolved
+ * yet, and mutating it later would be a race. Concatenating on read
+ * costs nothing at these sizes and cannot lose a name.
+ */
 export function rememberUser(name) {
-  if (knownUsers !== null && name && knownUsers.indexOf(name) === -1) {
-    knownUsers.push(name);
+  if (name && addedUsers.indexOf(name) === -1) {
+    addedUsers.push(name);
   }
 }
 

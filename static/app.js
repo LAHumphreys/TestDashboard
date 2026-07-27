@@ -185,10 +185,48 @@ async function loadBrowse(append) {
   }
 }
 
+/*
+ * At most one /api/summary request in the air at a time.
+ *
+ * /api/summary is the heaviest endpoint there is - rollups, the trend,
+ * every queue, the top failing scripts - and every in-row action asks
+ * for it again so the counts stay honest. Triaging a queue means
+ * assigning a dozen tests in a few seconds, and each of those fired its
+ * own full summary. On a large estate that is the same expensive answer
+ * computed a dozen times, mostly to be thrown away by the next one.
+ *
+ * Coalescing keeps the behaviour and drops the duplicate work: a caller
+ * arriving while a request is running waits for it instead of starting
+ * another, and exactly one more request follows so the final counts
+ * still reflect the final action. A burst of any size costs two
+ * requests rather than one per action.
+ */
+let summaryInFlight = null;
+let summaryStale = false;
+
+async function fetchSummary() {
+  summaryStale = true;
+  if (summaryInFlight !== null) {
+    // Someone else is already asking. Their answer may predate our
+    // action, but the loop below will issue one more once it lands.
+    await summaryInFlight;
+    return;
+  }
+  while (summaryStale) {
+    summaryStale = false;
+    summaryInFlight = fetchJson(summaryUrl());
+    try {
+      state.summary = await summaryInFlight;
+    } finally {
+      summaryInFlight = null;
+    }
+  }
+}
+
 /** Reload the summary only (after a quick action like "Take"). */
 async function refreshSummary() {
   try {
-    state.summary = await fetchJson(summaryUrl());
+    await fetchSummary();
     renderStatus();
     renderCharts();
     renderQueues();
@@ -521,7 +559,7 @@ function renderQueues() {
  */
 async function refreshQueueCounts() {
   try {
-    state.summary = await fetchJson(summaryUrl());
+    await fetchSummary();
     renderQueueTabs();
     renderStatus();
   } catch (err) {
@@ -714,20 +752,6 @@ function queueColumns(queueId) {
 
 /* ---- inline review: output + assign + comment, without leaving here ---- */
 
-/** Cached user list for the assignee picker (fetched once). */
-let knownUsers = null;
-
-async function loadUsers() {
-  if (knownUsers === null) {
-    try {
-      knownUsers = (await fetchJson("/api/users")).users.map((u) =>
-        u.username);
-    } catch (err) {
-      knownUsers = [];
-    }
-  }
-  return knownUsers;
-}
 
 /** True when a test has not reported inside the recency window. */
 function isStale(entry) {
