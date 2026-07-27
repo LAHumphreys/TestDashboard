@@ -54,6 +54,7 @@ import {
   reopenIfOpen,
   toggleReview,
 } from "./review.js";
+import { attachSorting, sortRows } from "./sorting.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
@@ -76,6 +77,10 @@ const state = {
   requestSeq: 0,
   browseSeq: 0,
   showRetired: false,
+  // Triage queue sort (client-side; see renderQueueTable for why that is
+  // only valid while the queue is under its cap).
+  queueSortKey: null,
+  queueSortDesc: false,
 };
 
 const envSelect = document.getElementById("filter-environment");
@@ -620,6 +625,7 @@ const QUEUE_INVARIANT_RESULT = {
 function queueColumns(queueId) {
   const testCol = {
     header: "Test",
+    sortKey: "test_name",
     cell: (entry) => {
       const cell = el("td", "wrap");
       const link = document.createElement("a");
@@ -640,6 +646,7 @@ function queueColumns(queueId) {
   // or a page visited.
   const assigneeCol = {
     header: "Assignee",
+    sortKey: "assignee",
     cell: (entry) => {
       const cell = el("td", "assignee-cell");
       cell.appendChild(assigneeSelect(entry, () => refreshQueueCounts()));
@@ -655,11 +662,13 @@ function queueColumns(queueId) {
   };
   const when = (header, key) => ({
     header: header,
+    sortKey: key,
     cell: (entry) => el("td", "",
       entry[key] ? formatTime(entry[key]) : "—"),
   });
   const failingSinceCol = {
     header: "Failing since",
+    sortKey: "failing_since",
     cell: (entry) => {
       const cell = el("td");
       if (!entry.failing_since) {
@@ -680,6 +689,10 @@ function queueColumns(queueId) {
   // What someone already found out. Without it, triage means opening
   // each test to discover it was looked at yesterday.
   const commentCol = {
+    // No sortKey: ordering by comment time needs a field the
+    // summary does not carry. A header that looked sortable and
+    // quietly sorted by something else is worse than one that
+    // does not sort at all.
     header: "Latest comment",
     cell: (entry) => {
       const cell = el("td", "wrap comment-cell");
@@ -698,6 +711,7 @@ function queueColumns(queueId) {
 
   const resultCol = {
     header: "Result",
+    sortKey: "result",
     cell: (entry) => {
       const cell = el("td");
       cell.appendChild(resultChip(entry.result));
@@ -715,6 +729,7 @@ function queueColumns(queueId) {
   // wrong in the misleading direction in both queues.
   const transitionCol = {
     header: "Result",
+    sortKey: "result",
     cell: (entry) => resultTransition(
       el("td"), entry.prev_result, entry.result),
   };
@@ -793,7 +808,7 @@ function reviewOptions() {
 
 function renderQueueTable() {
   const queueId = state.activeQueue;
-  const entries = queueEntries(queueId);
+  const allEntries = queueEntries(queueId);
   const table = document.getElementById("queue-table");
   const headRow = document.getElementById("queue-head-row");
   const body = document.getElementById("queue-body");
@@ -821,7 +836,7 @@ function renderQueueTable() {
     resultNote.hidden = true;
     return;
   }
-  if (entries.length === 0) {
+  if (allEntries.length === 0) {
     table.hidden = true;
     emptyNote.textContent = QUEUE_EMPTY_TEXT[queueId];
     emptyNote.hidden = false;
@@ -831,8 +846,30 @@ function renderQueueTable() {
   }
 
   const columns = queueColumns(queueId);
+  // These queues are CAPPED slices of a larger set, so sorting them in
+  // the browser is only honest while nothing has been cut off. Past the
+  // cap, "the oldest failure" would silently mean "the oldest among the
+  // 500 that happen to have been sent" — the same lie that keeps Open
+  // actions on server-side sorting. The controls are switched off with
+  // a reason rather than quietly reordering a truncated list.
+  const capped = queueCount(queueId) > allEntries.length;
+  const entries = capped
+    ? allEntries
+    : sortRows(allEntries, state.queueSortKey || "", state.queueSortDesc);
+
   for (const column of columns) {
-    headRow.appendChild(el("th", "", column.header));
+    const th = el("th");
+    if (column.sortKey) {
+      th.setAttribute("aria-sort", "none");
+      const button = el("button", "sort-btn", column.header);
+      button.type = "button";
+      button.dataset.key = column.sortKey;
+      button.appendChild(el("span", "sort-arrow"));
+      th.appendChild(button);
+    } else {
+      th.textContent = column.header;
+    }
+    headRow.appendChild(th);
   }
   // An explicit, labelled action column: the review panel has to be
   // obvious to someone who has never used the page before.
@@ -861,6 +898,19 @@ function renderQueueTable() {
     // Keep panels open across the re-render that follows an action.
     reopenIfOpen(entry, tr, reviewBtn, reviewOptions());
   }
+  const sorter = attachSorting(table, (key, descending) => {
+    state.queueSortKey = key;
+    state.queueSortDesc = descending;
+    renderQueueTable();
+  }, { key: state.queueSortKey, descending: state.queueSortDesc });
+  if (capped) {
+    sorter.disable(
+      "This queue is showing the first " + allEntries.length.toLocaleString()
+      + " of " + queueCount(queueId).toLocaleString()
+      + ". Sorting them here would order that slice, not the whole "
+      + "queue. Narrow the filters to sort.");
+  }
+
   table.hidden = false;
   emptyNote.hidden = true;
 

@@ -1014,6 +1014,83 @@ class TestAssignee(ApiCase):
                   body={"active": False, "changed_by": "bob"})
 
 
+class TestSortingIsStable(ApiCase):
+    """Every sort key must page without repeating or skipping a row.
+
+    This is the test that catches a missing primary-key tiebreak. A sort
+    on a column with duplicate values — ``result`` has four possible
+    values across the whole estate — leaves SQLite free to order the
+    ties however it likes, and it need not choose the same order twice.
+    Page 1 and page 2 then overlap: a row appears on both, another
+    appears on neither, and nothing anywhere reports an error.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        rows = []
+        for index in range(40):
+            rows.append(record(
+                environment="env%d" % (index % 3),
+                script="s%d.py" % (index % 5),
+                test_name="t%02d" % index,
+                # Deliberately few distinct values: ties are the bug.
+                result=["PASS", "FAIL"][index % 2],
+                start_time=format_iso(
+                    NOW - datetime.timedelta(minutes=index % 4)),
+                end_time=format_iso(
+                    NOW - datetime.timedelta(minutes=index % 4)
+                    + datetime.timedelta(seconds=index % 3)),
+            ))
+        self.import_runs(rows)
+
+    def _identities(self, data):
+        return [
+            (row["environment"], row["script"], row["test_name"])
+            for row in data["tests"]
+        ]
+
+    def test_every_sort_key_pages_without_repeats(self) -> None:
+        for key in sorted(api.DASHBOARD_SORTS):
+            for order in ("asc", "desc"):
+                seen = []
+                for offset in (0, 15, 30):
+                    page = self.call(
+                        "GET", "/api/dashboard",
+                        query={"sort": [key], "order": [order],
+                               "limit": ["15"], "offset": [str(offset)]})
+                    seen.extend(self._identities(page))
+                self.assertEqual(
+                    len(seen), 40, "%s/%s lost rows" % (key, order))
+                self.assertEqual(
+                    len(set(seen)), 40,
+                    "%s/%s repeated a row across pages — the sort needs "
+                    "the full primary key as a tiebreak" % (key, order))
+
+    def test_descending_is_the_exact_reverse_for_a_unique_key(self) -> None:
+        ascending = self._identities(self.call(
+            "GET", "/api/dashboard",
+            query={"sort": ["test_name"], "order": ["asc"],
+                   "limit": ["40"]}))
+        descending = self._identities(self.call(
+            "GET", "/api/dashboard",
+            query={"sort": ["test_name"], "order": ["desc"],
+                   "limit": ["40"]}))
+        self.assertEqual(ascending, list(reversed(descending)))
+
+    def test_an_unknown_sort_is_refused(self) -> None:
+        """ORDER BY takes no parameters, so the whitelist is the
+        security boundary, not a convenience."""
+        data = self.call(
+            "GET", "/api/dashboard",
+            query={"sort": ["duration; DROP TABLE runs"]}, expect=400)
+        self.assertIn("sort", data["error"])
+
+    def test_an_unknown_order_is_refused(self) -> None:
+        self.call(
+            "GET", "/api/dashboard",
+            query={"order": ["sideways"]}, expect=400)
+
+
 class TestTimeEndpoint(ApiCase):
     """GET /api/time — the "where is the time going" drill-down."""
 

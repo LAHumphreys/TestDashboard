@@ -374,6 +374,61 @@ def read_text(name: str) -> str:
         return handle.read().decode("utf-8")
 
 
+class SortingTest(unittest.TestCase):
+    """A paged table must not be sorted in the browser.
+
+    The two cases look identical in the UI and one of them lies. A table
+    holding a COMPLETE result set can be reordered locally — nothing is
+    hidden. A table holding ONE PAGE cannot: sorting the hundred rows in
+    hand and labelling the column "sorted" turns "the oldest failure"
+    into "the oldest among those that happen to be loaded", which is
+    wrong and looks right.
+    """
+
+    def test_open_actions_sorts_on_the_server(self) -> None:
+        code = _strip_comments(read("actions.js"))
+        self.assertIn('qs.append("sort", state.sortKey)', code)
+        self.assertIn('qs.append("order"', code)
+        self.assertNotIn(
+            "sortRows(", code,
+            "actions.js pages its results, so it must not sort them in "
+            "the browser — that reorders the page, not the queue")
+
+    def test_re_sorting_a_paged_table_returns_to_the_first_page(
+        self
+    ) -> None:
+        """Keeping the offset across a sort change shows an arbitrary
+        slice of the newly-ordered list."""
+        body = _function_body(read("actions.js"), "function init()")
+        self.assertIn("attachSorting", body)
+        self.assertIn("refresh(false)", body)
+
+    def test_the_triage_queues_stop_sorting_when_truncated(self) -> None:
+        """The queues are capped slices, so client-side sorting is only
+        honest below the cap. Past it the control is disabled with a
+        reason rather than quietly reordering part of the queue."""
+        code = _strip_comments(read("app.js"))
+        self.assertIn("const capped = queueCount(queueId)", code)
+        self.assertIn("sorter.disable(", code)
+        self.assertIn("sortRows(allEntries", code)
+
+    def test_the_time_page_may_sort_locally(self) -> None:
+        """It holds the whole level, so reordering shows everything."""
+        code = _strip_comments(read("time.js"))
+        self.assertIn("sortRows(state.items", code)
+
+    def test_sorting_is_implemented_once(self) -> None:
+        offenders = [
+            name for name, source in scripts().items()
+            if name != "sorting.js"
+            and "function attachSorting" in _strip_comments(source)
+        ]
+        self.assertEqual(
+            offenders, [],
+            "sorting belongs in sorting.js; found copies in "
+            + repr(offenders))
+
+
 class PerRowFetchTest(unittest.TestCase):
     """Nothing that runs per row may reach the network.
 

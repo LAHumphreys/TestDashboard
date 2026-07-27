@@ -34,7 +34,7 @@ these are the ones that get forgotten:
 | WP-1 | Extract `review.js` | **done** | pure move, 887 tests |
 | WP-2 | Review on Open actions | **done** | 893 tests |
 | WP-3 | Triage result emphasis | **done** | 893 tests |
-| WP-7 | Sortable columns | pending | |
+| WP-7 | Sortable columns | **done** | `sorting.js`, 917 tests |
 | WP-6 | Time analysis tab | **done** | `/api/time`, 908 tests |
 | WP-8 | Last pass + flaky signal | pending | |
 | WP-9 | SQL portability groundwork | pending | |
@@ -305,3 +305,36 @@ correct and which nobody reads as "most of a working day".
 
 `static/sorting.js` landed here rather than in WP-7 because this page needed it
 first. WP-7 adopts it elsewhere.
+
+### WP-7 — sortable columns (items 6 and 9, the same item) — **done**
+
+Suite 908 → 917. `static/sorting.js` is the one implementation; a test enforces
+that.
+
+The split the plan insisted on, unchanged:
+
+| Table | Sorted | Why |
+|---|---|---|
+| All tests | server (already) | paged |
+| Open actions | **server** | paged — 100 of 148 |
+| Triage queues | **client, only under the cap** | capped slice of a larger set |
+| Time | client | holds the whole level |
+
+Open actions re-sorting returns to offset 0: a re-ordered list has a different
+first page, and keeping the offset would show an arbitrary slice of it.
+
+**Triage sorting disables itself when the queue is truncated.** Below
+`_SUMMARY_QUEUE_CAP` the browser holds the whole queue and reordering it is
+honest; past it, "the oldest failure" would mean "the oldest among the 500 that
+happen to have been sent". The controls grey out with that explanation rather
+than silently reordering part of a queue.
+
+`Latest comment` is deliberately not sortable anywhere. It needs a whitelist
+entry and a join that does not exist; a header that looked sortable and quietly
+ordered by something else would be worse than one that does not sort.
+
+The load-bearing test is `TestSortingIsStable`: every key, both directions,
+three pages, asserting 40 rows come back with no repeats. That is what catches a
+missing primary-key tiebreak — a sort on `result` (four distinct values estate-
+wide) otherwise lets SQLite order ties differently between pages, so a row shows
+up twice and another never, with no error anywhere.

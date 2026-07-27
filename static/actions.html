@@ -56,11 +56,15 @@
         <table class="data-table" id="actions-table">
           <thead>
             <tr>
-              <th>Test</th>
-              <th>Result</th>
-              <th>Assignee</th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="test_name">Test<span class="sort-arrow"></span></button></th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="result">Result<span class="sort-arrow"></span></button></th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="assignee">Assignee<span class="sort-arrow"></span></button></th>
+              <!-- Latest comment has no sort: ordering by comment time
+                   needs a whitelist entry and a join that does not exist
+                   yet. A header that looked sortable and silently sorted
+                   by something else would be worse than none. -->
               <th>Latest comment</th>
-              <th>Last run (UTC)</th>
+              <th aria-sort="none"><button type="button" class="sort-btn" data-key="start_time">Last run (UTC)<span class="sort-arrow"></span></button></th>
               <th>Review</th>
             </tr>
           </thead>
