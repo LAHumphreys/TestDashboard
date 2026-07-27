@@ -58,6 +58,21 @@ def build_parser():
         help=("directory with the frontend files "
               "(default: the static/ folder next to run_server.py)"))
     parser.add_argument(
+        "--cache-mb", type=int, default=None, metavar="MB",
+        help=("page cache budget for the whole process, in MB. SQLite's "
+              "default is 2 MB per connection, which against a database "
+              "of a few hundred MB means nearly every read goes to the "
+              "filesystem. That is invisible on local disk and expensive "
+              "on a network mount. The budget is DIVIDED among "
+              "connections, not given to each; measure the effect first "
+              "with: python3 tools/diagnose_db.py --db PATH --cache-mb MB"))
+    parser.add_argument(
+        "--mmap-mb", type=int, default=None, metavar="MB",
+        help=("map this much of the database instead of reading it, so "
+              "the OS page cache serves pages with no copy. A large win "
+              "on local disk; worth little or nothing on a network mount, "
+              "where the pages are not local to cache. Off by default"))
+    parser.add_argument(
         "--verbose", action="store_true",
         help="DEBUG logging plus full tracebacks on fatal errors")
     return parser
@@ -102,7 +117,8 @@ def main(argv=None):
         return 2
 
     try:
-        storage = testboard.storage.Storage(args.db)
+        storage = testboard.storage.Storage(
+            args.db, cache_mb=args.cache_mb, mmap_mb=args.mmap_mb)
     except Exception as exc:
         sys.stderr.write("Cannot open the database:\n  {0}\n".format(
             testboard.storage.describe_open_error(args.db, exc)))

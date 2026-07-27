@@ -967,6 +967,31 @@ re-running is always the right recovery. Individual failed batches are saved as
 `testboard_failed_batch_NNNN.json` with the exact `curl` command to re-send
 them.
 
+**A dashboard screen takes seconds.** Do not guess between "the storage is
+slow" and "a query is wrong" — they have opposite fixes. Measure:
+
+```
+python3 tools/diagnose_db.py --db <path>                  # settings, timings, plans
+python3 tools/diagnose_db.py --db <path> --compare-local  # the decisive test
+```
+
+It reports the database's **real** PRAGMA values (asking for WAL is not the same
+as getting it — WAL cannot work on most network filesystems, and
+`PRAGMA journal_mode` returns the mode you ended up in rather than failing),
+times every query behind every screen, prints their plans, and — with
+`--compare-local` — copies the database to local disk and runs the same timings
+again. If local is fast and the original is slow, it is the storage,
+definitively. If both are slow, moving the database would be wasted work and the
+query is at fault.
+
+Note that SQLite's default page cache is **2 MB per connection**, and testboard's
+connections are per-thread. Against a database of a few hundred MB that means
+nearly every read goes to the filesystem: invisible on local disk, where the OS
+page cache absorbs it, and expensive on a network mount. `run_server.py
+--cache-mb N` raises it — N is a budget for the whole process and is *divided*
+among connections, not given to each. Try it with
+`tools/diagnose_db.py --cache-mb N` before deploying it.
+
 **The disk is filling up.** See [Scale and retention](#scale-and-retention):
 `tools/prune_runs.py` with `--dry-run` first, then `--vacuum` to return the
 space.
@@ -1033,7 +1058,7 @@ testboard/              # model, storage (all SQL), analytics (pure), api, serve
 feeder/                 # reader interface + jsonl reader, submitter, state file,
                         #   offline reader check, config file, preflight, --init
 tools/                  # demo data generator, self-test collector, demo_bootstrap,
-                        #   prune_runs (retention)
+                        #   prune_runs (retention), diagnose_db (why is it slow)
 static/                 # vanilla ES6 frontend, no build step:
                         #   index.html   dashboard + triage
                         #   actions.html open actions by owner

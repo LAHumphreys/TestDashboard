@@ -82,6 +82,19 @@ _TREND_CACHE_TTL_SECONDS = 60.0
 #: grow the cache without limit.
 _TREND_CACHE_MAX_ENTRIES = 32
 
+#: Connections are thread-local and the page cache is per connection, so
+#: a cache budget has to be divided by the number of threads that might
+#: hold one — not handed to each of them. This is the divisor: the
+#: threaded server creates a thread per request, but only a handful are
+#: ever live at once against a dashboard, and over-estimating here costs
+#: nothing but a smaller share.
+DEFAULT_MAX_CONNECTIONS = 16
+
+#: Never shrink a connection below SQLite's own default; a budget so
+#: small that it makes things worse is a configuration mistake, not an
+#: instruction to obey.
+_MIN_CACHE_KIB = 2000
+
 #: zlib level for stored test output. Measured on a year of realistic
 #: harness logs: level 3 and level 6 both deflate ~16.5x, level 9 adds
 #: nothing for twice the CPU. 6 is zlib's default and the safer choice
@@ -641,9 +654,29 @@ class Storage:
     the same pragmas (WAL journal, 10s busy timeout, foreign keys on).
     """
 
-    def __init__(self, path: str) -> None:
-        """Open the database at *path* and run migrations immediately."""
+    def __init__(self, path: str, cache_mb: Optional[int] = None,
+                 mmap_mb: Optional[int] = None,
+                 max_connections: int = DEFAULT_MAX_CONNECTIONS) -> None:
+        """Open the database at *path* and run migrations immediately.
+
+        ``cache_mb`` is a budget for the WHOLE process, not per
+        connection. That distinction is the entire reason this parameter
+        exists: connections are thread-local, so a value passed straight
+        to ``PRAGMA cache_size`` is multiplied by however many threads
+        the server happens to have open. Asking for 512 MB and getting
+        10 GB is a memory exhaustion bug, not a tuning win. The budget is
+        therefore divided by ``max_connections`` before it is used.
+
+        ``mmap_mb`` maps the database instead of read()ing it, letting
+        the OS page cache serve pages with no copy. It is a large win on
+        local disk and worth nothing - occasionally worse - on a network
+        mount, where the pages are not really local to cache. Off by
+        default for that reason.
+        """
         self._path = path
+        self._cache_mb = cache_mb
+        self._mmap_mb = mmap_mb
+        self._max_connections = max(1, int(max_connections))
         self._local = threading.local()
         self._trend_cache = {}  # type: Dict[Tuple[str, Optional[str]], Tuple[float, List[DailyResultCount]]]
         self._trend_lock = threading.Lock()
@@ -663,8 +696,43 @@ class Storage:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA foreign_keys=ON")
+            self._apply_cache_pragmas(conn)
             self._local.conn = conn
         return conn
+
+    def _apply_cache_pragmas(self, conn: sqlite3.Connection) -> None:
+        """Set the page cache and mmap size for one connection.
+
+        SQLite's default cache is 2 MB. Against a database of a few
+        hundred megabytes that means nearly every read misses and goes to
+        the filesystem — invisible on local disk, where the OS page cache
+        absorbs it, and very visible on a network mount, where each miss
+        is a round trip.
+
+        The share is per connection because the cache is: the caller's
+        budget is for the process, and there is one connection per
+        thread.
+        """
+        if self._cache_mb is not None:
+            share_kib = max(
+                _MIN_CACHE_KIB,
+                int(self._cache_mb) * 1024 // self._max_connections,
+            )
+            # Negative means KiB rather than pages, so the budget does not
+            # silently change meaning with the database's page size.
+            conn.execute("PRAGMA cache_size=-{0}".format(share_kib))
+        if self._mmap_mb is not None:
+            conn.execute("PRAGMA mmap_size={0}".format(
+                max(0, int(self._mmap_mb)) * 1024 * 1024))
+
+    def cache_bytes_per_connection(self) -> Optional[int]:
+        """The per-connection cache this Storage asks for, or None."""
+        if self._cache_mb is None:
+            return None
+        return max(
+            _MIN_CACHE_KIB,
+            int(self._cache_mb) * 1024 // self._max_connections,
+        ) * 1024
 
     def close(self) -> None:
         """Close the calling thread's connection, if it has one open."""
