@@ -295,6 +295,85 @@ class ReviewPanelTest(unittest.TestCase):
                 name + " uses the review panel but does not import it")
 
 
+class ResultEmphasisTest(unittest.TestCase):
+    """A superseded result must never outshout the current one.
+
+    Reported from real use after launch: triage rows were misleading.
+    The previous result was drawn as a full solid chip in its own
+    column, while the CURRENT result appeared only as a 3px stripe on
+    the row edge — so the loudest thing in the row was the wrong value,
+    and wrong in the misleading direction in both queues that did it. A
+    new failure's previous run is usually PASS, so a failure read as a
+    pass; a fixed test's previous run is FAIL, so a fix read as a
+    failure.
+
+    This is a defect in the visual encoding, not a preference, which is
+    why it is pinned rather than left to taste.
+    """
+
+    def test_a_superseded_result_uses_the_ghost_chip(self) -> None:
+        source = read("api.js")
+        self.assertIn("export function ghostChip", source)
+        self.assertIn("export function resultTransition", source)
+        body = _function_body(source, "export function ghostChip")
+        self.assertIn("chip-ghost", body)
+
+    def test_the_transition_puts_the_current_result_last(self) -> None:
+        """Left to right in time order: was → now.
+
+        The current result is the solid chip and it comes last, so it
+        is both the loudest thing in the cell and the thing the eye
+        finishes on.
+        """
+        body = _function_body(read("api.js"), "export function resultTransition")
+        ghost = body.index("ghostChip(previous)")
+        solid = body.index("resultChip(current)")
+        self.assertLess(
+            ghost, solid,
+            "the previous result must be rendered before the current one")
+
+    def test_the_ghost_chip_keeps_its_text_label(self) -> None:
+        """Never colour alone — the outline is an addition, not a
+        replacement for the words."""
+        body = _function_body(read("api.js"), "export function ghostChip")
+        self.assertIn("result", body)
+        self.assertIn("el(", body)
+
+    def test_neither_misleading_queue_still_uses_a_solid_prev_chip(
+        self
+    ) -> None:
+        """The specific regression: resultChip(entry.prev_result)."""
+        code = _strip_comments(read("app.js"))
+        self.assertNotIn(
+            "resultChip(entry.prev_result)", code,
+            "a previous result must use ghostChip/resultTransition, not "
+            "the solid chip that made failures look like passes")
+
+    def test_the_ghost_chip_is_styled_as_an_outline(self) -> None:
+        css = read_text("style.css")
+        self.assertIn(".chip.chip-ghost", css)
+        block = css[css.index(".chip.chip-ghost"):][:400]
+        self.assertIn("background: transparent", block)
+
+    def test_queues_with_one_invariant_result_state_it_once(self) -> None:
+        """The other half of the fix.
+
+        `still_failing` is FAIL on every row and `unexpected_passes` is
+        UNEXPECTED_PASS on every row. A per-row chip there is a column
+        of identical values — more of the noise this item is about.
+        """
+        code = _strip_comments(read("app.js"))
+        self.assertIn("QUEUE_INVARIANT_RESULT", code)
+        for queue in ("still_failing", "unexpected_passes"):
+            self.assertIn(queue, code)
+
+
+def read_text(name: str) -> str:
+    """Read any file from the static directory as text."""
+    with io.open(os.path.join(STATIC_DIR, name), "rb") as handle:
+        return handle.read().decode("utf-8")
+
+
 class PerRowFetchTest(unittest.TestCase):
     """Nothing that runs per row may reach the network.
 

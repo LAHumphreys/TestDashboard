@@ -40,6 +40,7 @@ import {
   renderUserWidget,
   requireUsername,
   resultChip,
+  resultTransition,
   resultClass,
   showError,
   testApiPath,
@@ -600,6 +601,22 @@ function renderQueueTabs() {
 }
 
 /** Column sets per queue: header + cell builder. */
+/*
+ * Queues where every row has the same current result.
+ *
+ * Repeating an identical chip down a whole page is noise, and noise is
+ * what made these tables misread. So the result is stated ONCE, above
+ * the table, and those queues get no result column at all. The two
+ * queues that DO vary (new failures, fixed) show the change per row.
+ */
+const QUEUE_INVARIANT_RESULT = {
+  still_failing: { result: "FAIL", text: "Every test here is failing now." },
+  unexpected_passes: {
+    result: "UNEXPECTED_PASS",
+    text: "Every test here passed while annotated as a known failure.",
+  },
+};
+
 function queueColumns(queueId) {
   const testCol = {
     header: "Test",
@@ -688,20 +705,25 @@ function queueColumns(queueId) {
     },
   };
 
+  // "was → now", for the two queues where the result CHANGED and the
+  // change is the reason the row is here.
+  //
+  // These two used to show the previous result as a full solid chip
+  // with the current one appearing only as a stripe on the row edge —
+  // so a new failure (previously PASS) read as a pass, and a fixed test
+  // (previously FAIL) read as a failure. Reported from real use, and
+  // wrong in the misleading direction in both queues.
+  const transitionCol = {
+    header: "Result",
+    cell: (entry) => resultTransition(
+      el("td"), entry.prev_result, entry.result),
+  };
+
   switch (queueId) {
     case "new_failures":
       return [testCol,
         when("Failed at", "start_time"),
-        { header: "Previous run",
-          cell: (entry) => {
-            const cell = el("td");
-            if (entry.prev_result) {
-              cell.appendChild(resultChip(entry.prev_result));
-            } else {
-              cell.appendChild(el("span", "muted", "first run"));
-            }
-            return cell;
-          } },
+        transitionCol,
         commentCol,
         assigneeCol];
     case "still_failing":
@@ -714,16 +736,7 @@ function queueColumns(queueId) {
       // summary reports no streak for them.
       return [testCol,
         when("Passed at", "start_time"),
-        { header: "Previously",
-          cell: (entry) => {
-            const cell = el("td");
-            if (entry.prev_result) {
-              cell.appendChild(resultChip(entry.prev_result));
-            } else {
-              cell.appendChild(el("span", "muted", "first run"));
-            }
-            return cell;
-          } },
+        transitionCol,
         commentCol,
         { header: "Assignee",
           cell: (entry) => el("td", "", entry.assignee || "—") }];
@@ -786,9 +799,18 @@ function renderQueueTable() {
   const body = document.getElementById("queue-body");
   const emptyNote = document.getElementById("queue-empty");
   const capNote = document.getElementById("queue-cap-note");
+  const resultNote = document.getElementById("queue-result-note");
 
   clearNode(headRow);
   clearNode(body);
+  clearNode(resultNote);
+
+  const invariant = QUEUE_INVARIANT_RESULT[queueId];
+  resultNote.hidden = !invariant;
+  if (invariant) {
+    resultNote.appendChild(resultChip(invariant.result));
+    resultNote.appendChild(el("span", "", invariant.text));
+  }
 
   if (queueId === "mine" && !getUsername()) {
     table.hidden = true;
@@ -796,6 +818,7 @@ function renderQueueTable() {
       "Set a username (top right) to see tests assigned to you.";
     emptyNote.hidden = false;
     capNote.hidden = true;
+    resultNote.hidden = true;
     return;
   }
   if (entries.length === 0) {
@@ -803,6 +826,7 @@ function renderQueueTable() {
     emptyNote.textContent = QUEUE_EMPTY_TEXT[queueId];
     emptyNote.hidden = false;
     capNote.hidden = true;
+    resultNote.hidden = true;
     return;
   }
 

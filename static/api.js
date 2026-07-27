@@ -383,6 +383,43 @@ export function resultChip(result) {
   return el("span", ("chip " + resultClass(result)).trim(), result);
 }
 
+/**
+ * A chip for a result that is NO LONGER true — outlined, not filled.
+ *
+ * Solid means "this is the case now"; outlined means "this was the case
+ * before". Without the distinction a triage row showed the previous
+ * result as a full saturated chip while the current one was a 3px
+ * stripe on the row edge, so a new failure (previous run: PASS) read as
+ * a pass and a fixed test (previous run: FAIL) read as a failure. The
+ * loudest thing in the row was the wrong value, in the wrong direction,
+ * both times.
+ *
+ * The text label is kept, so this is never colour-alone.
+ */
+export function ghostChip(result) {
+  return el("span", ("chip chip-ghost " + resultClass(result)).trim(), result);
+}
+
+/**
+ * "was → now" as one cell's worth of nodes, appended to `parent`.
+ *
+ * Reads left to right in time order. The arrow is muted because it is
+ * punctuation, not data.
+ */
+export function resultTransition(parent, previous, current) {
+  const wrap = el("span", "chip-transition");
+  if (previous) {
+    wrap.appendChild(ghostChip(previous));
+    wrap.appendChild(el("span", "transition-arrow", "→"));
+  }
+  wrap.appendChild(resultChip(current));
+  if (!previous) {
+    wrap.appendChild(el("span", "row-sub", "first run"));
+  }
+  parent.appendChild(wrap);
+  return parent;
+}
+
 /** "2026-07-25T02:14:07.123456" -> "2026-07-25 02:14:07" (display only). */
 export function formatTime(iso) {
   if (typeof iso !== "string" || iso.length < 19) {

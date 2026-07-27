@@ -86,6 +86,11 @@
         <span id="triage-meta" class="muted"></span>
       </div>
       <div id="queue-tabs" class="tab-row" role="tablist" aria-label="Triage queues"></div>
+      <!-- Where every row in a queue has the SAME current result, it is
+           stated once here instead of repeating a chip down the page.
+           A column of identical values is noise, and noise is what made
+           these tables misread in the first place. -->
+      <p id="queue-result-note" class="queue-result-note" hidden></p>
       <div id="all-clear" class="all-clear" hidden>
         <span class="all-clear-mark" aria-hidden="true">✓</span>
         <div>

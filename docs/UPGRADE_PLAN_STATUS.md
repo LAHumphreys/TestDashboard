@@ -33,7 +33,7 @@ these are the ones that get forgotten:
 | WP-5 | `duration_seconds` (migration 3) | **done** | migration 3, 882 tests |
 | WP-1 | Extract `review.js` | **done** | pure move, 887 tests |
 | WP-2 | Review on Open actions | pending | |
-| WP-3 | Triage result emphasis | pending | |
+| WP-3 | Triage result emphasis | **done** | 893 tests |
 | WP-7 | Sortable columns | pending | |
 | WP-6 | Time analysis tab | pending | |
 | WP-8 | Last pass + flaky signal | pending | |
@@ -229,3 +229,26 @@ Two guard tests fired and were **widened, not weakened**:
 - The new "panel reads no page state" check matched the word `state.` in
   English prose ("the row's expanded state."). It now strips comments first,
   with its own test proving the stripper removes prose and keeps code.
+
+### WP-3 — triage result emphasis — **done**
+
+Suite 887 → 893. Screenshots before/after taken against the production copy.
+
+The reported bug was real and it was a visual-encoding defect, not a preference.
+In `new_failures` and `fixed` the *previous* result was a full solid chip in its
+own column while the *current* result appeared only as a 3px stripe on the row
+edge. The loudest thing in the row was the wrong value — and wrong in the
+misleading direction in both queues, since a new failure's previous run is
+usually PASS and a fixed test's previous run is FAIL.
+
+Both queues now show one `Result` column reading `PASS → FAIL`: the superseded
+value as an outlined ghost chip, the current one solid, in time order so the eye
+finishes on what is true now. Both keep their text labels, so nothing is carried
+by colour alone.
+
+**Scoped to the two queues that actually had the bug**, per the plan's
+correction. `still_failing` is FAIL on every row and `unexpected_passes` is
+UNEXPECTED_PASS on every row; a per-row chip there is a column of identical
+values, which is more of the noise this item is about. Those state it once above
+the table (`QUEUE_INVARIANT_RESULT`) and carry no result column. `not_run`
+already had one and was left alone.
