@@ -92,7 +92,7 @@ after a merge.
 | 1 | *(deployed)* | Initial schema — **frozen** | — |
 | 2 | WP-4 | `users.deactivated_at`, `users.deactivated_by` | No |
 | 3 | WP-5 | `latest_runs.duration_seconds` | Yes — see §1.2 |
-| 4 | *reserved* | WP-8, only if the flakiness signal needs a stored column | TBD |
+| 4 | Perf pass | Sort indexes on `latest_runs` | No |
 | 5+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Claiming a version means editing this table in the same commit as the

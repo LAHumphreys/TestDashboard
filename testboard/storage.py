@@ -337,6 +337,60 @@ MIGRATIONS = [
             "python: backfill_latest_durations",
         ],
     ),
+    (
+        4,
+        [
+            # Sort indexes for the paged test list.
+            #
+            # Without a matching index SQLite orders all 12,008 rows to
+            # return 250 of them, on every page: the plan says
+            # "SCAN lr ... USE TEMP B-TREE FOR ORDER BY". With one it is
+            # "SCAN lr USING INDEX" and it stops after 250.
+            #
+            # MEASURED against the query dashboard() actually runs, on a
+            # copy of production (12,008 tests, 540,192 runs), 250 rows:
+            #
+            #                        before    after
+            #   start_time DESC      177.3ms    2.6ms
+            #   start_time ASC       177.1ms    2.9ms
+            #   duration   DESC      159.9ms    7.4ms
+            #   duration   ASC       158.1ms    8.1ms
+            #
+            # TWO indexes cover all four cases because every
+            # DASHBOARD_SORTS entry appends the full primary key and the
+            # whole ORDER BY takes ONE direction — so an all-ascending
+            # index serves the ascending pages forwards and the
+            # descending pages read backwards. An index with a DESC
+            # first column and ascending tiebreaks matches NEITHER, and
+            # is what a first attempt at this produced.
+            #
+            # THE TRADE, measured rather than assumed. Every index here
+            # is maintained on each upserted test, and a nightly import
+            # touches all 12,008:
+            #
+            #   no extra indexes      4.34s
+            #   these two            10.16s   (+130%)
+            #   four (both dirs)     13.66s   (+215%)
+            #
+            # The second pair is redundant, as above. +5.7s on an
+            # unattended nightly import buys pages that answer in
+            # single-digit milliseconds instead of ~170ms — and far
+            # worse than 170ms on the production network mount, where
+            # the temp B-tree's page reads are round trips.
+            #
+            # `result` is already served by idx_latest_runs_result and
+            # the default order is the primary key, so neither needs one.
+            """
+            CREATE INDEX idx_latest_runs_start_sort
+                ON latest_runs (start_time, environment, script, test_name)
+            """,
+            """
+            CREATE INDEX idx_latest_runs_duration_sort
+                ON latest_runs (duration_seconds, environment, script,
+                                test_name)
+            """,
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: Prefix marking a migration step that runs Python instead of SQL.

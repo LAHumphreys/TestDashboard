@@ -39,7 +39,7 @@ these are the ones that get forgotten:
 | WP-8 | Last pass + flaky signal | **done** | `with_streak=1`, 936 tests |
 | WP-9 | SQL portability groundwork | **done** | inventory + id pins, 947 tests |
 | WP-10 | MariaDB export tool | pending | |
-| — | Performance pass | pending | |
+| — | Performance pass | **done** | migration 4, 952 tests |
 
 States: `pending` → `in progress` → `done`, or `blocked` / `deferred` with a
 reason in the log below.
@@ -396,3 +396,45 @@ table where it *would* matter.
 
 Placeholders are pinned too (`?` count > 50, `%s` count 0), because a leftover
 `?` reaches MariaDB as a literal question mark rather than failing loudly.
+
+### Performance pass — **done**
+
+Profiled every endpoint warm against the production copy (12,008 tests, 540,192
+runs). Suite 947 → 952.
+
+| Endpoint | Before |
+|---|---|
+| `/api/dashboard?sort=duration&order=desc` | 204 ms |
+| `/api/dashboard?sort=start_time&order=desc` | 183 ms |
+| `/api/summary` | 197 ms |
+| `/api/dashboard` (default order) | 35 ms |
+| `/api/time` | 29 ms |
+
+The sorted pages were the outlier and are now **2.6–8.1 ms** (migration 4).
+
+**Two wrong diagnoses on the way, both caught by measuring the real query.**
+
+1. I first concluded the ORDER BY was mixed-direction (`col DESC, pk ASC`) and
+   built `DESC`-first indexes. The real ORDER BY descends on *every* column
+   together, so those indexes matched nothing and changed no plan.
+2. My benchmark query omitted the `LEFT JOIN test_retirements` the real query
+   carries. The hand-written lookalike happily used an index that the actual
+   query could not.
+
+The fix is **two plain ascending composite indexes** covering all four cases —
+ascending pages read forwards, descending pages read backwards. `_plan()` in the
+test now captures the SQL `dashboard()` actually issues via a trace callback,
+because a lookalike query would keep passing after the real one changed.
+
+**The trade is measured, not asserted.** Every index is maintained per upserted
+test and a nightly import touches all 12,008: **4.42s → 10.16s (+130%, +5.7s)**.
+A four-index version cost +215% for no further benefit. +5.7s of unattended
+batch time for ~170 ms → ~3 ms on a page people load repeatedly — and far more
+than 170 ms on the production mount, where the temp B-tree's page reads are
+round trips.
+
+**Not done, and worth knowing.** `/api/summary` is still ~197 ms, of which
+`summary_rollup` is 42 ms (a GROUP BY over all 12k rows — inherent) and most of
+the rest is the per-entry streak lookups for the `still_failing` queue. That is
+the next thing to look at, and it needs a design decision rather than an index:
+either cache the rollup or denormalise the streak.

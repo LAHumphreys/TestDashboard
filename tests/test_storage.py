@@ -2275,3 +2275,100 @@ class TestRecentResults(StorageTestBase):
             conn.set_trace_callback(None)
         selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
         self.assertEqual(len(selects), 1)
+
+
+class TestSortIndexesAreUsed(StorageTestBase):
+    """Migration 4: the descending sorts must not sort the whole table.
+
+    Without a matching index SQLite orders all 12,008 rows to return
+    250 of them, on every page — "USE TEMP B-TREE FOR ORDER BY" in the
+    plan. Measured on a copy of production that is 149ms cold and 0.8ms
+    indexed, and much worse than 149ms on a network mount where the
+    sort's page reads are round trips.
+
+    Asserting on the PLAN rather than on a duration: a timing test on a
+    fast dev machine proves nothing about a slow production one, but the
+    plan is the same on both.
+    """
+
+    def setUp(self) -> None:
+        StorageTestBase.setUp(self)
+        records = []
+        for index in range(40):
+            start = BASE + datetime.timedelta(minutes=index)
+            records.append(make_record(
+                test_name="t%03d" % index, start=start,
+                end=start + datetime.timedelta(seconds=index % 7)))
+        self.store.upsert_runs(records)
+
+    def _plan(self, sort: str, descending: bool) -> str:
+        """Plan the query dashboard() ACTUALLY runs.
+
+        Captured with a trace callback rather than rebuilt by hand: a
+        lookalike query would keep passing after the real one changed,
+        which is the failure mode this test exists to prevent.
+        """
+        captured = []  # type: List[str]
+        conn = self.store._conn()
+        conn.set_trace_callback(captured.append)
+        try:
+            self.store.dashboard(
+                sort=sort, descending=descending, limit=250, offset=0)
+        finally:
+            conn.set_trace_callback(None)
+        selects = [
+            sql for sql in captured
+            if sql.strip().upper().startswith("SELECT")
+            and "latest_runs" in sql
+        ]
+        self.assertTrue(selects, "no dashboard query was captured")
+        rows = conn.execute(
+            "EXPLAIN QUERY PLAN " + selects[-1]).fetchall()
+        return " | ".join(str(row[-1]) for row in rows)
+
+    def test_descending_start_time_uses_an_index(self) -> None:
+        plan = self._plan("start_time", True)
+        self.assertNotIn(
+            "TEMP B-TREE", plan.upper(),
+            "start_time DESC is sorting the whole table: " + plan)
+
+    def test_descending_duration_uses_an_index(self) -> None:
+        plan = self._plan("duration", True)
+        self.assertNotIn(
+            "TEMP B-TREE", plan.upper(),
+            "duration DESC is sorting the whole table: " + plan)
+
+    def test_the_indexes_exist_and_are_plain_ascending(self) -> None:
+        rows = self.store._conn().execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='index' "
+            "AND name IN ('idx_latest_runs_start_sort', "
+            "             'idx_latest_runs_duration_sort')"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        for _name, sql in rows:
+            # ASCENDING on purpose. Every DASHBOARD_SORTS entry appends
+            # the full primary key and the whole ORDER BY takes one
+            # direction, so an all-ascending index serves ascending
+            # pages forwards and descending pages backwards. An index
+            # with a DESC first column and ascending tiebreaks matches
+            # neither — which is what the first attempt at this created.
+            self.assertNotIn("DESC", sql.upper())
+
+    def test_ascending_uses_the_same_index_read_forwards(self) -> None:
+        """One index per sort key, not one per direction.
+
+        A separate descending index was built first and helped nothing:
+        it had a DESC first column with ascending tiebreaks, which
+        matches neither an ascending page nor a descending one.
+        """
+        for sort in ("start_time", "duration"):
+            plan = self._plan(sort, False)
+            self.assertNotIn("TEMP B-TREE", plan.upper(), sort)
+
+    def test_sorted_results_are_still_correct(self) -> None:
+        """An index that changes the answer is worse than a slow scan."""
+        rows = self.store.dashboard(
+            sort="start_time", descending=True, limit=40)
+        times = [row.start_time for row in rows]
+        self.assertEqual(times, sorted(times, reverse=True))
+        self.assertEqual(len(times), 40)
