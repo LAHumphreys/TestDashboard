@@ -49,7 +49,7 @@ first time here
 
       python3 run_feeder.py --init
 
-examples
+setting an import up
   Check a reader against its data. No server, no network, no config; this
   is the loop to work in while writing one:
 
@@ -66,6 +66,57 @@ examples
   does not depend on the directory it runs in:
 
       python3 run_feeder.py --config /etc/testboard/feeder.json
+
+finding out what is going on
+  Is the dashboard reachable, and is it really a testboard? Needs only
+  --url; writes nothing:
+
+      python3 run_feeder.py --test-connection --url http://dashboard-host:8000
+
+  How far have we pushed, and what would run next?
+
+      python3 run_feeder.py --config /etc/testboard/feeder.json --status
+
+  What exactly does the reader produce? Prints each record as the reader
+  yielded it and as it would be transmitted:
+
+      python3 run_feeder.py --check-reader --reader PATH.py:create_reader \\
+          --show-records 3
+
+  How many records are outstanding right now? Read everything and count
+  it without sending any of it:
+
+      python3 run_feeder.py --config /etc/testboard/feeder.json --dry-run
+
+an import failed overnight
+  Exit 1 means records were rejected or batches failed - the data that
+  did get through is safely in. The log ends with the reasons grouped by
+  rule, each with a count and one affected test to look up; only the
+  first few of each distinct problem are logged in full, so a systematic
+  fault reads as one line rather than six thousand.
+
+  Batches the server never accepted are written to
+  testboard_failed_batch_NNNN.json in --replay-dir, along with the exact
+  curl command to send one again. Nothing is discarded. If the server
+  went away mid-import the run stops after --max-consecutive-failures
+  rather than writing one file per remaining batch.
+
+  In every case the fix is the same: sort out what the log names, then
+  run the same command again. Re-running is always safe.
+
+re-importing after fixing a reader
+  Importing the same run twice never duplicates it: the server upserts on
+  (environment, script, test_name, start_time), so a corrected record
+  REPLACES the wrong one that is already stored. Repairing bad data is
+  therefore just importing it again.
+
+      python3 run_feeder.py --config ... --mode backfill \\
+          --since 2026-06-01T00:00:00        # re-do a known range
+
+      python3 run_feeder.py --config ... --forget-state   # re-do everything
+
+  --forget-state deletes the high-water mark, which is what otherwise
+  stops daily mode from looking back at runs it has already seen.
 
 timestamps are UTC
   Every time the feeder sends is UTC, written with no timezone suffix:
@@ -91,6 +142,12 @@ exit codes
      files named in the log; re-running is always safe, the server upserts
   2  the run never started: bad arguments, an unreachable dashboard, a
      reader that would not load, or an unwritable path
+
+when the reader itself breaks
+  A reader that crashes, or that returns nothing iterable, is reported
+  separately from a bad record - with how many records it had already
+  produced, which one was last, and its own traceback, printed whether or
+  not --verbose is given. That traceback names the file and line to fix.
 """
 
 #: Shown when the feeder is run with no arguments at all.
@@ -105,9 +162,15 @@ checks each answer, and writes a config file:
 
     python3 run_feeder.py --init
 
-Writing the reader for your site? Check it on its own, with no server:
+Writing the reader for your site? Check it on its own, with no server,
+and print what it actually produces:
 
-    python3 run_feeder.py --check-reader --reader PATH.py:create_reader
+    python3 run_feeder.py --check-reader --reader PATH.py:create_reader \\
+        --show-records 3
+
+Just want to know whether you can reach the dashboard?
+
+    python3 run_feeder.py --test-connection --url http://dashboard-host:8000
 
 Run 'python3 run_feeder.py --help' for every option, worked examples, and
 the rule about timestamps.
@@ -168,6 +231,62 @@ def load_config_settings(argv, parser, config_module):
     settings = config_module.load_config(known.config)
     config_module.apply_to_parser(parser, settings)
     return settings
+
+
+def report_reader_failure(exc, log):
+    # type: (Any, logging.Logger) -> None
+    """Report a broken reader: the diagnosis, then its own traceback.
+
+    The traceback is printed unconditionally rather than behind
+    --verbose. A reader that crashes is code someone has just written -
+    often generated - and the file and line it died on is the single most
+    useful fact available. Withholding it to keep the log tidy optimizes
+    for the run that works.
+    """
+    log.error("%s", exc)
+    text = getattr(exc, "traceback_text", "")
+    if text:
+        sys.stderr.write("\n" + text.rstrip() + "\n\n")
+        sys.stderr.flush()
+
+
+def forget_state(args, log, state_module):
+    # type: (argparse.Namespace, logging.Logger, Any) -> int
+    """Delete the high-water mark so the next daily run re-imports all.
+
+    This is the repair path for a reader that has been producing wrong
+    data. Re-importing does not duplicate anything - the server upserts
+    on (environment, script, test_name, start_time) - so the corrected
+    records overwrite the bad ones in place.
+    """
+    import os
+    import testboard.model
+    path = args.state_file
+    hwm = state_module.load_high_water_mark(path)
+    if not os.path.exists(path):
+        log.info(
+            "there is no state file at %s, so there is no high-water mark "
+            "to forget - the next daily run already imports everything",
+            os.path.abspath(path))
+        return 0
+    try:
+        os.remove(path)
+    except OSError as exc:
+        log.error(
+            "could not delete the state file %s (%s). Delete it by hand, "
+            "or use --mode backfill --since <date> to re-import a range "
+            "without touching it", os.path.abspath(path), exc)
+        return 2
+    if hwm is not None:
+        log.info("forgot the high-water mark of %s",
+                 testboard.model.format_iso(hwm))
+    log.info(
+        "deleted %s. The next daily run will import everything the reader "
+        "offers, and the server will UPDATE the runs it already has rather "
+        "than duplicate them - so this repairs bad data rather than "
+        "doubling it. To re-import only part of the history instead, use "
+        "--mode backfill --since <ISO>.", os.path.abspath(path))
+    return 0
 
 
 def run_preflight(args, log, preflight_module):
@@ -253,6 +372,22 @@ def build_parser():
               "minus --overlap-days. Required unless --check-reader is "
               "given"))
     parser.add_argument(
+        "--status", action="store_true",
+        help=("report how far the feed has got: the high-water mark and "
+              "its age, what the dashboard already holds, and what a run "
+              "now would cover. Sends nothing and reads no source data"))
+    parser.add_argument(
+        "--test-connection", action="store_true",
+        help=("check this machine can reach the dashboard and that it is "
+              "one: sends an empty test import that writes nothing, then "
+              "reads it back. Needs only --url"))
+    parser.add_argument(
+        "--forget-state", action="store_true",
+        help=("delete the high-water mark, so the next daily run imports "
+              "everything again. Use after fixing a reader that has been "
+              "producing wrong data - re-importing repairs the runs in "
+              "place, because the server upserts"))
+    parser.add_argument(
         "--check-reader", action="store_true",
         help=("check a reader on its own: load it, read every record, "
               "validate each one, and report what is wrong. Needs no "
@@ -286,6 +421,12 @@ def build_parser():
         "--replay-dir", default=".", metavar="DIR",
         help=("directory for testboard_failed_batch_NNNN.json replay "
               "files; must be writable (default: current directory)"))
+    parser.add_argument(
+        "--show-records", type=int, default=0, metavar="N",
+        help=("print the first N records in full - as your reader yielded "
+              "them and as they would be sent to the server - then carry "
+              "on. Use with --check-reader or --dry-run to see exactly "
+              "what the reader produces"))
     parser.add_argument(
         "--skip-preflight", action="store_true",
         help=("do not check the dashboard and the writable paths before "
@@ -335,6 +476,7 @@ def main(argv=None):
     import feeder.preflight
     import feeder.reader
     import feeder.state
+    import feeder.status
     import feeder.submitter
 
     parser = build_parser()
@@ -389,6 +531,30 @@ def main(argv=None):
     # --url/--mode are required for a real import but meaningless when
     # only checking a reader, so they are validated here rather than by
     # argparse.
+    if args.test_connection:
+        if args.url is None:
+            log.error(
+                "--test-connection needs --url: the address of the machine "
+                "running the dashboard, e.g. http://dashboard-host:8000")
+            return 2
+        lines = feeder.status.test_connection(args.url)
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        return 0 if lines[-1].startswith("OK") else 2
+
+    if args.forget_state:
+        return forget_state(args, log, feeder.state)
+
+    if args.status:
+        for line in feeder.status.describe(
+            args.url, args.state_file, args.overlap_days, args.reader,
+            args.config, args.mode,
+        ):
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        return 0
+
     if not args.check_reader:
         missing = [
             name for name, value in (("--url", args.url),
@@ -430,15 +596,11 @@ def main(argv=None):
         # Read everything, validate it the way the server would, and say
         # what is wrong.
         try:
-            report = feeder.check.check_reader(reader.read(None))
-        except Exception as exc:
-            log.error(
-                "the reader raised %s while reading: %s. read() must not "
-                "raise on a bad record — log a warning and continue "
-                "(re-run with --verbose for the full traceback)",
-                type(exc).__name__, exc)
-            if args.verbose:
-                traceback.print_exc()
+            report = feeder.check.check_reader(
+                feeder.reader.iter_records(reader, None),
+                show=args.show_records)
+        except feeder.reader.ReaderFailed as exc:
+            report_reader_failure(exc, log)
             return 2
         feeder.check.log_report(report, log)
         return 0 if report.ok else 1
@@ -465,7 +627,12 @@ def main(argv=None):
         max_consecutive_failures=args.max_consecutive_failures)
     try:
         stats = submitter.submit(
-            reader.read(since), dry_run=args.dry_run, since=since)
+            feeder.reader.iter_records(reader, since),
+            dry_run=args.dry_run, since=since,
+            show=args.show_records)
+    except feeder.reader.ReaderFailed as exc:
+        report_reader_failure(exc, log)
+        return 1
     except Exception as exc:
         log.error(
             "import aborted by an unexpected error from the reader or "

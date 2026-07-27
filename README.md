@@ -555,10 +555,11 @@ successful backfill also primes the state file, so `backfill` then `daily` is th
 standard sequence. With no state file yet, daily mode imports everything.
 
 All flags: `--init`, `--config PATH`, `--url` (required), `--mode backfill|daily`
-(required), `--since ISO` (backfill lower bound), `--reader
+(required), `--status`, `--test-connection`, `--check-reader`, `--forget-state`,
+`--since ISO` (backfill lower bound), `--reader
 jsonl|PATH.py:factory|module:factory` (default `jsonl`), `--source` (repeatable;
-files, globs or directories), `--batch-size` (default 500), `--state-file`
-(default `feeder_state.json`), `--replay-dir` (default `.`),
+files, globs or directories), `--show-records N`, `--batch-size` (default 500),
+`--state-file` (default `feeder_state.json`), `--replay-dir` (default `.`),
 `--max-consecutive-failures` (default 3), `--overlap-days` (default 1),
 `--skip-preflight`, `--dry-run`, `--allow-empty`, `--verbose`, `--version`.
 
@@ -587,6 +588,63 @@ by asking the permission bits), and that the dashboard is a dashboard — by POS
 an empty `{"runs": []}` import, which inserts nothing and whose reply identifies
 the service. A typo therefore costs a second rather than a full read of the
 estate. `--dry-run` skips the network parts; `--skip-preflight` skips all of it.
+
+### Knowing what is going on
+
+| Question | Command |
+|---|---|
+| Can this machine reach the dashboard, and is it really a testboard? | `--test-connection --url URL` |
+| How far have we pushed? What would a run now cover? | `--status --config PATH` |
+| What does the reader actually produce? | `--check-reader --show-records 3` |
+| How many records are outstanding right now? | `--dry-run` |
+
+`--test-connection` needs nothing but a URL. It posts an empty import — which
+writes nothing — then reads the result back, so it proves both directions and
+reports the endpoint posts will go to, how many tests the dashboard already
+holds, and the newest run in it. Exit 0 means the feeder can deliver.
+
+`--status` prints the high-water mark and its age, what a daily run now would
+re-read (the mark less `--overlap-days`), and what the dashboard holds. It
+deliberately does **not** read the source system — a status command that takes as
+long as the import is a status command nobody runs — so for the outstanding
+*count*, add `--dry-run` to your normal command.
+
+`--show-records N` prints the first N records twice: as the reader yielded them,
+and as they would be sent to `/api/import`. The pair is what catches a field the
+reader invented (silently dropped) or one it omitted (silently defaulted).
+
+### Fixing data that has already been pushed
+
+Nothing is stuck. A run is keyed by `(environment, script, test_name,
+start_time)` and the server **upserts**, so re-importing a corrected record
+*replaces* the wrong one rather than adding a second. After fixing a reader:
+
+```
+# re-do a range you know was wrong
+python run_feeder.py --config feeder.json --mode backfill --since 2026-06-01T00:00:00
+
+# or re-do everything
+python run_feeder.py --config feeder.json --forget-state
+python run_feeder.py --config feeder.json
+```
+
+`--forget-state` deletes the saved high-water mark, which is the only thing that
+would otherwise stop daily mode from revisiting runs it has already seen.
+
+### When the reader itself breaks
+
+A bad *record* is ordinary: it is logged with its identity and skipped. A broken
+*reader* is a different thing and is reported as one, because the site reader is
+usually the newest code in the system:
+
+- **`read()` returned nothing iterable** — named as such, with the two causes (a
+  list that is built and never returned; a `yield` in the wrong function) rather
+  than `TypeError: 'NoneType' object is not iterable`.
+- **`read()` crashed part-way through** — reported with how many records it had
+  already produced and the identity of the last good one, so the offending source
+  row is the next one along.
+- **Either way**, the reader's own traceback is printed whether or not
+  `--verbose` is given. It names the file and line, and that is the fix.
 
 ### Reliability behaviour
 
@@ -825,6 +883,9 @@ A port already in use, or a missing `static/` directory, likewise.
 | `0` | everything valid was accepted | nothing |
 | `1` | needs attention | read the grouped reasons at the end of the log |
 | `2` | the run never started | the message names the fix |
+
+A broken reader is reported separately from bad data — with how far it got, which
+record was last, and its own traceback. See *When the reader itself breaks*.
 
 Exit `1` includes three cases that would otherwise pass silently: the server
 rejected records, **nothing was read at all** (a `--source` that stopped

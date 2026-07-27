@@ -168,6 +168,45 @@ class BriefAccuracyTest(unittest.TestCase):
         for result in Result:
             self.assertIn(result.name, brief)
 
+    def test_brief_requires_a_source_locator_in_every_skip_warning(
+        self
+    ) -> None:
+        """The single most valuable habit in a generated reader.
+
+        A warning saying "skipping bad row" reports that data was lost and
+        gives no way to find it. The brief demonstrated the right pattern
+        in its worked example for a long time without ever requiring it,
+        and a reader that merely logs *something* passed every check.
+        """
+        brief = read_brief()
+        self.assertIn("source locator", brief.lower())
+        self.assertIn("line number", brief.lower())
+
+    def test_brief_forbids_print_and_swallowed_exceptions(self) -> None:
+        """Both make a scheduled failure invisible rather than diagnosable."""
+        brief = read_brief()
+        self.assertIn("never `print`", brief)
+        self.assertIn("except Exception: pass", brief)
+        self.assertIn("getLogger(__name__)", brief)
+
+    def test_brief_states_the_read_contract(self) -> None:
+        """Returning None is the commonest first-draft failure."""
+        brief = read_brief()
+        self.assertIn("generator or return an iterator", brief)
+
+    def test_brief_explains_repairing_data_already_pushed(self) -> None:
+        """Otherwise a wrong import looks permanent, and it is not."""
+        brief = read_brief()
+        self.assertIn("upsert", brief.lower())
+        self.assertIn("--forget-state", brief)
+
+    def test_brief_names_the_diagnostic_commands(self) -> None:
+        """A feature nobody is told about does not exist."""
+        brief = read_brief()
+        for flag in ("--show-records", "--test-connection", "--status",
+                     "--check-reader", "--dry-run"):
+            self.assertIn(flag, brief, "brief never mentions " + flag)
+
     def test_brief_is_self_contained_for_a_single_attachment(self) -> None:
         """It is attached alone, so it must say so and stand alone."""
         brief = read_brief()

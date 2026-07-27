@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
 from unittest import mock
 
 import run_feeder
+import feeder.check
 import feeder.state
 import feeder.submitter
 from feeder.submitter import SubmitStats
@@ -67,12 +68,14 @@ def make_fake_submitter(
 
         def submit(self, records: Iterable[Dict[str, Any]],
                    dry_run: bool = False,
-                   since: Optional[datetime.datetime] = None) -> SubmitStats:
+                   since: Optional[datetime.datetime] = None,
+                   **options: Any) -> SubmitStats:
             """Consume the record stream and return the canned stats."""
             self.submit_calls.append({
                 "records": list(records),
                 "dry_run": dry_run,
                 "since": since,
+                "options": options,
             })
             return stats
 
@@ -508,6 +511,31 @@ class FirstRunFeedbackTest(CliTestBase):
         for code in ("0", "1", "2"):
             self.assertIn("  " + code + "  ", run_feeder.EPILOG)
 
+    def test_the_help_is_organised_by_situation_not_by_flag(self) -> None:
+        """Someone reads --help with a problem, not with a flag in mind.
+
+        Every heading names a situation they might be in, so the epilog
+        can be skimmed for "the one that sounds like me" rather than read
+        as a second, wordier option list.
+        """
+        for heading in ("first time here", "setting an import up",
+                        "finding out what is going on",
+                        "an import failed overnight",
+                        "re-importing after fixing a reader",
+                        "when the reader itself breaks"):
+            self.assertIn("\n" + heading + "\n", "\n" + run_feeder.EPILOG)
+
+    def test_the_help_covers_recovering_from_a_failed_import(self) -> None:
+        """The commonest real interaction with a scheduled feeder.
+
+        At 07:00 after a red cron job nobody opens the README.
+        """
+        epilog = run_feeder.EPILOG
+        self.assertIn("testboard_failed_batch", epilog)
+        self.assertIn("--replay-dir", epilog)
+        self.assertIn("--max-consecutive-failures", epilog)
+        self.assertIn("Re-running is always safe", epilog)
+
     def test_version_is_reported(self) -> None:
         stream = io.StringIO()
         with contextlib.redirect_stdout(stream):
@@ -715,6 +743,171 @@ class ConfigFileTest(CliTestBase):
                 ["--config", os.path.join(self.tmp, "absent.json")])
         self.assertEqual(code, 2)
         self.assertIn("--init", stream.getvalue())
+
+
+class DiagnosticFlagTest(CliTestBase):
+    """The flags that exist to answer a question rather than import data."""
+
+    def stdout_of(self, argv: List[str]) -> Tuple[int, str]:
+        """Run main() with argv; return (exit code, stdout)."""
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            code = run_feeder.main(argv)
+        return code, stream.getvalue()
+
+    def test_test_connection_needs_only_a_url(self) -> None:
+        """Not --mode, not a reader, not a config: just the address."""
+        with mock.patch("feeder.status.test_connection",
+                        return_value=["OK - fine"]) as check:
+            code, out = self.stdout_of(
+                ["--test-connection", "--url", "http://dash:8000"])
+        self.assertEqual(code, 0)
+        self.assertIn("OK - fine", out)
+        self.assertEqual(check.call_args[0][0], "http://dash:8000")
+
+    def test_test_connection_without_a_url_says_what_a_url_is(self) -> None:
+        with self.capture_logs("ERROR") as caught:
+            code = run_feeder.main(["--test-connection"])
+        self.assertEqual(code, 2)
+        self.assertIn("running the dashboard", "\n".join(caught.output))
+
+    def test_a_failed_connection_exits_2(self) -> None:
+        """So it is usable as a check in a deployment script."""
+        with mock.patch("feeder.status.test_connection",
+                        return_value=["FAILED - no"]):
+            code, _ = self.stdout_of(
+                ["--test-connection", "--url", "http://dash:8000"])
+        self.assertEqual(code, 2)
+
+    def test_status_reports_without_importing_anything(self) -> None:
+        with mock.patch("feeder.submitter.Submitter") as submitter:
+            code, out = self.stdout_of(
+                ["--status", "--state-file", self.state_file,
+                 "--url", "http://127.0.0.1:9"])
+        self.assertEqual(code, 0)
+        self.assertIn("feeder status", out)
+        submitter.assert_not_called()
+
+    def test_status_needs_no_mode(self) -> None:
+        """'How far have we got' is not a kind of import."""
+        code, _ = self.stdout_of(
+            ["--status", "--state-file", self.state_file])
+        self.assertEqual(code, 0)
+
+    def test_status_reports_the_saved_mark(self) -> None:
+        feeder.state.save_high_water_mark(self.state_file, HWM)
+        code, out = self.stdout_of(
+            ["--status", "--state-file", self.state_file])
+        self.assertIn(model.format_iso(HWM), out)
+
+    def test_show_records_reaches_the_checker(self) -> None:
+        empty = feeder.check.check_reader(iter([]))
+        with mock.patch("feeder.check.check_reader",
+                        return_value=empty) as check:
+            run_feeder.main(
+                ["--check-reader", "--reader", "jsonl", "--show-records", "3"])
+        self.assertEqual(check.call_args[1]["show"], 3)
+
+    def test_show_records_reaches_the_submitter(self) -> None:
+        source = self.write_jsonl([{"environment": "e"}])
+        _, created = self.run_main_with_fake(
+            self.base_args() + ["--source", source, "--show-records", "2"],
+            make_stats(read=1, valid=1, sent=1, inserted=1))
+        self.assertEqual(
+            created[0].submit_calls[0]["options"]["show"], 2)
+
+
+class ReaderFailureTest(CliTestBase):
+    """A reader that breaks is reported as a broken reader, not a bad record."""
+
+    def write_reader(self, body: str) -> str:
+        """Write a reader module into the temp dir; return its --reader spec."""
+        path = os.path.join(self.tmp, "site_reader.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "from feeder.reader import Reader\n\n\n"
+                "class R(Reader):\n"
+                "    def read(self, since):\n" + body + "\n\n"
+                "def create_reader(sources):\n"
+                "    return R()\n")
+        return path + ":create_reader"
+
+    def run_check(self, body: str) -> Tuple[int, str, str]:
+        """--check-reader on a reader; return (code, logs, stderr)."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.capture_logs("ERROR") as caught:
+                code = run_feeder.main(
+                    ["--check-reader", "--reader", self.write_reader(body)])
+        return code, "\n".join(caught.output), stderr.getvalue()
+
+    def test_a_reader_returning_none_is_told_what_it_forgot(self) -> None:
+        code, logs, _ = self.run_check("        records = []\n")
+        self.assertEqual(code, 2)
+        self.assertIn("read() returned None", logs)
+        self.assertIn("return records", logs)
+
+    def test_a_crashing_reader_reports_its_progress(self) -> None:
+        code, logs, _ = self.run_check(
+            "        yield {'environment': 'prod', 'script': 's',\n"
+            "               'test_name': 't', 'result': 'PASS',\n"
+            "               'output': '',\n"
+            "               'start_time': '2026-07-26T03:00:00.000000',\n"
+            "               'end_time': '2026-07-26T03:00:01.000000'}\n"
+            "        raise KeyError('started')\n")
+        self.assertEqual(code, 2)
+        self.assertIn("already produced 1 record(s)", logs)
+        self.assertIn("prod / s / t", logs)
+
+    def test_the_readers_traceback_is_printed_without_verbose(self) -> None:
+        """It names the file and line; nothing else in the output does."""
+        _, _, stderr = self.run_check("        raise KeyError('started')\n")
+        self.assertIn("KeyError", stderr)
+        self.assertIn("site_reader.py", stderr)
+
+    def test_a_broken_reader_during_an_import_exits_1(self) -> None:
+        """Exit 2 is 'never started'; by here records may have been sent."""
+        spec = self.write_reader("        raise RuntimeError('db down')\n")
+        code, _ = self.run_main_with_fake(
+            self.base_args() + ["--reader", spec], make_stats())
+        self.assertEqual(code, 1)
+
+
+class ForgetStateTest(CliTestBase):
+    """Rewinding, so a fixed reader can repair what a broken one wrote."""
+
+    def test_it_deletes_the_mark_and_explains_the_consequence(self) -> None:
+        feeder.state.save_high_water_mark(self.state_file, HWM)
+        with self.capture_logs() as caught:
+            code = run_feeder.main(
+                ["--forget-state", "--state-file", self.state_file])
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(self.state_file))
+        message = "\n".join(caught.output)
+        self.assertIn(model.format_iso(HWM), message)
+        self.assertIn("UPDATE", message)
+
+    def test_it_promises_repair_rather_than_duplication(self) -> None:
+        """The reason this is safe is the only thing anyone needs to know."""
+        feeder.state.save_high_water_mark(self.state_file, HWM)
+        with self.capture_logs() as caught:
+            run_feeder.main(
+                ["--forget-state", "--state-file", self.state_file])
+        message = "\n".join(caught.output)
+        self.assertIn("rather than duplicate", message)
+        self.assertIn("--mode backfill --since", message)
+
+    def test_forgetting_nothing_is_not_an_error(self) -> None:
+        with self.capture_logs() as caught:
+            code = run_feeder.main(
+                ["--forget-state", "--state-file", self.state_file])
+        self.assertEqual(code, 0)
+        self.assertIn("no state file", "\n".join(caught.output))
+
+    def test_it_needs_no_url_or_mode(self) -> None:
+        self.assertEqual(
+            run_feeder.main(
+                ["--forget-state", "--state-file", self.state_file]), 0)
 
 
 class SourceFileHygieneTest(unittest.TestCase):

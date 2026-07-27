@@ -137,6 +137,61 @@ Notes on `read()`:
 - The generator must be robust: one unparseable record must be **skipped with a
   logged warning**, never allowed to raise and kill the whole import.
 
+## Make it debuggable — this is a requirement, not advice
+
+Whoever runs this reader in production will not be whoever wrote it, will
+not have the internal system's documentation open, and will be looking at
+a log file at 07:00 after a scheduled import reported a non-zero exit. The
+reader's job is to make that person's next step obvious. Every rule below
+is checked in the definition of done.
+
+**Log through `logging`, never `print`.** One module-level logger:
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+```
+
+`print` goes to stdout unlabelled, is invisible in a scheduled task's log,
+and cannot be turned up or down. The framework configures logging for you;
+just use the logger.
+
+**Every skipped record must name where it came from.** A warning saying
+"skipping bad row" is worthless — it says a row was lost and gives no way
+to find it. Name the *source locator*: the file and line number, the
+database row id, the URL, whatever identifies that record **in the system
+it came from**, plus the offending value:
+
+```python
+logger.warning("%s:%d: unknown outcome %r; skipping", path, line_number,
+               row.get("outcome"))          # good: findable, and says why
+
+logger.warning("bad row, skipping")          # useless: nothing to act on
+```
+
+The person reading that line must be able to open the source system and
+look at exactly that record. This single habit is worth more than every
+other debugging feature combined.
+
+**Never swallow an exception silently.** No bare `except:`, and no
+`except Exception: pass`. Catch the specific exceptions you expect from
+parsing (`KeyError`, `ValueError`, `OSError`), log them with the locator
+above, and continue. Anything you did not expect should propagate — the
+framework catches it, reports how many records you had already produced
+and which one was last, and prints your traceback with the file and line.
+Swallowing it converts a diagnosable crash into a silent hole in the data.
+
+**`read()` must be a generator or return an iterator.** Either `yield` one
+dict per record, or `return` a list/iterator of them. A `read()` that
+builds a list and forgets to return it evaluates to `None`, and the
+framework will tell you so in those words — but it is the single most
+common way a first draft fails.
+
+**Be re-runnable.** `read()` may be called more than once in a process and
+will certainly be called again tomorrow. It must not consume a queue,
+delete its input, or depend on state left by a previous run.
+
 ## The dict shape to yield (RunRecord transport schema — verbatim contract)
 
 ```json
@@ -413,6 +468,24 @@ distribution, the span of `start_time` — then either `reader OK: every record
 validates` (exit 0) or the grouped list of problems (exit 1). Iterate here until
 it is clean; it is much faster than a round trip through the server.
 
+**Add `--show-records 3` to see the records themselves.** Counts prove the reader
+is consistent; only the records prove it is *right*. Each one is printed twice —
+as your `read()` yielded it, and as it would be sent to `/api/import` — so a field
+you invented, a field you left out and the framework defaulted, or a value that
+got normalised is visible immediately:
+
+```
+python run_feeder.py --check-reader --reader internal_reader:create_reader \
+    --source ... --show-records 3
+```
+
+**If the reader crashes rather than producing bad records**, the framework says so
+in different words, and tells you three things a bare traceback cannot: whether
+`read()` returned something iterable at all, how many records it had already
+produced successfully, and the identity of the last good one — so you know exactly
+which source row it choked on. Your traceback is printed underneath, with or
+without `--verbose`.
+
 It also warns about things that are *valid but almost certainly wrong*, the most
 important being **timestamps in the future**, which is what a reader emitting
 local time instead of UTC looks like. Take those warnings seriously: they
@@ -449,9 +522,42 @@ for which tests. If a batch fails outright (server down mid-import), the exact b
 body is saved as `testboard_failed_batch_NNNN.json` for later replay — nothing is
 lost.
 
-Connection problems print an actionable message (e.g. "Cannot reach the dashboard at
-<url> (connection refused). Is the server running on that host?") — check the URL and
-that the server is up before touching the reader.
+**Before blaming the reader, check the connection.** This needs only a URL, sends
+an empty import that writes nothing, and reads the result back:
+
+```
+python run_feeder.py --test-connection --url http://HOST:8000
+```
+
+It reports the exact address posts will go to, whether the dashboard accepted the
+test import, how many tests it already holds, and the newest run it has. Exit 0
+means the feeder can deliver; anything else names what is wrong. Connection
+problems elsewhere print the same kind of actionable message (e.g. "Cannot reach
+the dashboard at <url> (connection refused). Is the server running on that
+host?").
+
+**To see how far the feed has got**, at any time:
+
+```
+python run_feeder.py --status --config <your config>
+```
+
+which prints the high-water mark and its age, what a run right now would cover,
+and what the dashboard already holds.
+
+### Got it wrong and already pushed?
+
+Nothing is stuck. A run is keyed by `(environment, script, test_name, start_time)`
+and the server **upserts**, so re-importing a corrected record *replaces* the
+wrong one rather than adding a second. Fix the reader, then:
+
+```
+python run_feeder.py --config <yours> --mode backfill --since 2026-06-01T00:00:00
+python run_feeder.py --config <yours> --forget-state    # then re-do everything
+```
+
+`--forget-state` deletes the saved high-water mark, which is the only thing that
+would otherwise stop daily mode from revisiting runs it has already seen.
 
 ## Scheduling (Windows Task Scheduler)
 
@@ -510,6 +616,13 @@ The reader is finished when all of these are true:
       you expect from the source system — a reader that maps every outcome to
       `PASS` validates perfectly and is still wrong.
 - [ ] A deliberately corrupted input row is skipped with a warning, not raised.
+- [ ] `--show-records 3` shows records that are right in *content*, not merely
+      valid — the right environment, the right script path, real output text.
+- [ ] Every skip warning names the record's location in the source system
+      (file:line, row id, URL) **and** the offending value, so it can be looked
+      up. `logging` is used throughout; there is no `print` in the file.
+- [ ] There is no bare `except:` and no `except Exception: pass` anywhere.
+- [ ] `python run_feeder.py --test-connection --url http://HOST:8000` exits 0.
 - [ ] `--dry-run` against the real server URL shows `skipped=0`.
 - [ ] No proprietary hostname, path, or field name appears in any file other
       than `internal_*.py`.

@@ -22,16 +22,28 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from typing import (
-    Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple,
+    Any, Callable, Dict, Iterable, List, NamedTuple, Optional, TextIO,
+    Tuple,
 )
 
+from feeder.identity import (
+    MAX_LOGGED_CHARS, describe, identity_of, show_record, truncate,
+)
 from testboard import model
+
+__all__ = [
+    "DEFAULT_TIMEOUT_SECONDS", "Opener", "SubmitStats", "Submitter",
+    "describe_connection_error", "group_reason", "identity_of",
+    "IMPORT_PATH", "normalize_url", "render_reasons",
+    "urllib_opener",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +54,7 @@ Opener = Callable[[str, bytes, Dict[str, str]], Tuple[int, bytes]]
 DEFAULT_TIMEOUT_SECONDS = 60.0
 
 _REPLAY_FILE_TEMPLATE = "testboard_failed_batch_{0:04d}.json"
-_IMPORT_PATH = "/api/import"
-_MAX_LOGGED_CHARS = 200
+IMPORT_PATH = "/api/import"
 
 #: How often a long-running import reports progress (seconds).
 _PROGRESS_INTERVAL_SECONDS = 30.0
@@ -175,43 +186,14 @@ def describe_connection_error(url: str, exc: BaseException) -> str:
 def normalize_url(url: str) -> str:
     """Accept a dashboard base URL or a full /api/import URL; return the latter."""
     trimmed = url.rstrip("/")
-    if not trimmed.endswith(_IMPORT_PATH):
-        trimmed += _IMPORT_PATH
+    if not trimmed.endswith(IMPORT_PATH):
+        trimmed += IMPORT_PATH
     return trimmed
 
 
-def _truncate(text: str, limit: int = _MAX_LOGGED_CHARS) -> str:
-    """Truncate ``text`` for logging, marking the cut."""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...[truncated]"
-
-
-def _truncate_bytes(data: bytes, limit: int = _MAX_LOGGED_CHARS) -> str:
+def _truncate_bytes(data: bytes, limit: int = MAX_LOGGED_CHARS) -> str:
     """Decode response bytes leniently and truncate for logging."""
-    return _truncate(data.decode("utf-8", errors="replace"), limit)
-
-
-def identity_of(raw: Any) -> str:
-    """Best-effort ``environment / script / test_name [@ start_time]`` string.
-
-    Works on raw (possibly invalid) record dicts and on server error objects;
-    missing/unusable fields become ``?`` so the line is always greppable.
-    """
-    if not isinstance(raw, dict):
-        return "<no identity: record is {0}>".format(type(raw).__name__)
-    parts = []  # type: List[str]
-    for field in ("environment", "script", "test_name"):
-        value = raw.get(field)
-        if isinstance(value, str) and value.strip():
-            parts.append(value)
-        else:
-            parts.append("?")
-    identity = " / ".join(parts)
-    start = raw.get("start_time")
-    if isinstance(start, str) and start.strip():
-        identity += " @ " + start
-    return identity
+    return truncate(data.decode("utf-8", errors="replace"), limit)
 
 
 def _reason_prefix(message: str) -> str:
@@ -230,17 +212,25 @@ def _reason_prefix(message: str) -> str:
 
 
 def group_reason(
-    reasons: "OrderedDict[str, List[Any]]", message: str, identity: str
+    reasons: "OrderedDict[str, List[Any]]", message: str, identity: str,
+    example: Optional[Any] = None,
 ) -> Tuple[str, int]:
-    """Count ``message`` under its group prefix, keeping the first identity.
+    """Count ``message`` under its group prefix, keeping the first example.
 
     Returns ``(prefix, count_so_far)`` so callers can log the first few
     occurrences of each distinct problem and stay quiet after that.
+
+    ``example`` is the offending record itself. The identity alone is not
+    always enough to act on: a record that is not a dict, or one whose
+    identity fields are the very thing that is wrong, identifies as
+    ``? / ? / ?`` and leaves nothing to look at. One truncated copy per
+    distinct problem is cheap and is usually the whole diagnosis.
     """
     prefix = _reason_prefix(message)
     entry = reasons.get(prefix)
     if entry is None:
-        reasons[prefix] = [1, identity]
+        reasons[prefix] = [
+            1, identity, describe(example) if example is not None else None]
         return prefix, 1
     entry[0] += 1
     return prefix, entry[0]
@@ -252,10 +242,13 @@ def render_reasons(reasons: "OrderedDict[str, List[Any]]") -> List[str]:
     Shared with :mod:`feeder.check` so that a reader checked offline and
     an import that rejected records report their problems identically.
     """
-    return [
-        "{0} x [{1}] first: {2}".format(entry[0], prefix, entry[1])
-        for prefix, entry in reasons.items()
-    ]
+    lines = []  # type: List[str]
+    for prefix, entry in reasons.items():
+        line = "{0} x [{1}] first: {2}".format(entry[0], prefix, entry[1])
+        if len(entry) > 2 and entry[2]:
+            line += "\n      offending record: {0}".format(entry[2])
+        lines.append(line)
+    return lines
 
 
 class Submitter:
@@ -298,7 +291,9 @@ class Submitter:
 
     def submit(self, records: Iterable[Dict[str, Any]],
                dry_run: bool = False,
-               since: Optional[datetime.datetime] = None) -> SubmitStats:
+               since: Optional[datetime.datetime] = None,
+               show: int = 0,
+               out: Optional[TextIO] = None) -> SubmitStats:
         """Validate, filter, batch and send ``records``; return the counters.
 
         Per record: :func:`testboard.model.parse_run_record`; invalid records
@@ -311,6 +306,11 @@ class Submitter:
         Ends by logging a summary line with every counter plus a breakdown of
         skip/reject reasons grouped by message prefix, each with an example
         record identity.
+
+        ``show`` prints the first N records in full to ``out`` (stdout by
+        default), as yielded and as they would be transmitted, so a
+        ``--dry-run`` can answer "what would this actually send?" and not
+        only "how many".
         """
         read = 0
         valid = 0
@@ -324,18 +324,22 @@ class Submitter:
         started = self._clock()
         last_progress = started
 
+        stream = out if out is not None else sys.stdout
         for raw in records:
             read += 1
+            if read <= show:
+                show_record(read, raw, stream)
             try:
                 record = model.parse_run_record(raw)
             except model.ValidationError as exc:
                 skipped += 1
                 identity = identity_of(raw)
-                prefix, count = group_reason(reasons, str(exc), identity)
+                prefix, count = group_reason(
+                    reasons, str(exc), identity, raw)
                 if count <= _MAX_LOGGED_PER_REASON:
                     logger.warning(
                         "skipping invalid record [%s] %s | record: %s",
-                        identity, exc, _truncate(repr(raw)),
+                        identity, exc, describe(raw),
                     )
                 elif count == _MAX_LOGGED_PER_REASON + 1:
                     _log_reason_suppressed(prefix)

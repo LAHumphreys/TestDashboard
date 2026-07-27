@@ -20,10 +20,14 @@ Python 3.6 compatible; standard library only.
 import collections
 import datetime
 import logging
+import sys
 import time
-from typing import Any, Dict, Iterator, List, NamedTuple, Optional
+from typing import (
+    Any, Dict, Iterator, List, NamedTuple, Optional, TextIO,
+)
 
-from feeder.submitter import group_reason, identity_of, render_reasons
+from feeder.identity import identity_of, show_record
+from feeder.submitter import group_reason, render_reasons
 from testboard import model
 from testboard.model import ValidationError
 
@@ -76,6 +80,8 @@ def check_reader(
     records: Iterator[Dict[str, Any]],
     now: Optional[datetime.datetime] = None,
     max_records: Optional[int] = None,
+    show: int = 0,
+    out: Optional[TextIO] = None,
 ) -> CheckReport:
     """Validate every record a reader yields and summarize the result.
 
@@ -83,6 +89,12 @@ def check_reader(
     sent anywhere. Invalid records are counted and grouped by reason
     rather than raising, exactly as an import would treat them, so one
     run of this reports every problem instead of the first.
+
+    ``show`` prints the first N records in full to ``out`` (stdout by
+    default) — as the reader yielded them and as they would be
+    transmitted. Aggregates prove a reader is *consistent*; only the
+    records themselves prove it is *right*, and "what would this actually
+    send?" is otherwise unanswerable without a server.
     """
     if now is None:
         now = model.utcnow()
@@ -99,13 +111,16 @@ def check_reader(
     ancient = 0
     zero_duration = 0
 
+    stream = out if out is not None else sys.stdout
     for raw in records:
         read += 1
+        if read <= show:
+            show_record(read, raw, stream)
         try:
             record = model.parse_run_record(raw)
         except ValidationError as exc:
             invalid += 1
-            group_reason(reasons, str(exc), identity_of(raw))
+            group_reason(reasons, str(exc), identity_of(raw), raw)
             continue
         valid += 1
         environments[record.environment] += 1

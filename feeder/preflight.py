@@ -23,12 +23,19 @@ Python 3.6 compatible; standard library only.
 import errno
 import json
 import os
+import urllib.error
 import urllib.parse
-from typing import Optional
+import urllib.request
+from typing import Any, Callable, Optional, Tuple
 
 from feeder.submitter import (
-    Opener, describe_connection_error, normalize_url, urllib_opener,
+    DEFAULT_TIMEOUT_SECONDS, IMPORT_PATH, Opener,
+    describe_connection_error, normalize_url, urllib_opener,
 )
+
+#: Read-side counterpart of :data:`feeder.submitter.Opener`:
+#: ``url -> (status, body)``. Injected by tests.
+Getter = Callable[[str], Tuple[int, bytes]]
 
 #: Written and deleted to prove a directory is writable. Includes the pid
 #: so two feeders starting at once cannot collide.
@@ -43,6 +50,49 @@ _PROBE_BODY = json.dumps({"runs": []}).encode("utf-8")
 #: Keys /api/import always returns. Their presence is what distinguishes
 #: "a testboard answered" from "something answered with a 200".
 _PROBE_KEYS = ("inserted", "updated", "rejected")
+
+
+def base_url(url: str) -> str:
+    """Return the dashboard root, whether or not ``url`` names the endpoint."""
+    trimmed = normalize_url(url)
+    return trimmed[:-len(IMPORT_PATH)] if trimmed.endswith(IMPORT_PATH) \
+        else trimmed
+
+
+def urllib_getter(url: str) -> Tuple[int, bytes]:
+    """Default :data:`Getter`: GET via urllib.request, errors as statuses."""
+    try:
+        response = urllib.request.urlopen(
+            url, timeout=DEFAULT_TIMEOUT_SECONDS)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    try:
+        return response.getcode(), response.read()
+    finally:
+        response.close()
+
+
+def fetch_json(
+    url: str, path: str, getter: Optional[Getter] = None
+) -> Optional[Any]:
+    """GET ``path`` from the dashboard and return the parsed JSON, or None.
+
+    Returns None on any failure. Callers use this to *enrich* a report —
+    what the dashboard already holds — and a report that cannot be
+    enriched should degrade quietly rather than turn into an error about
+    a secondary detail.
+    """
+    fetch = getter if getter is not None else urllib_getter
+    try:
+        status, body = fetch(base_url(url) + path)
+    except Exception:
+        return None
+    if status != 200:
+        return None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 def check_url(url: str) -> Optional[str]:

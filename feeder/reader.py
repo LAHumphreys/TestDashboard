@@ -23,7 +23,10 @@ import json
 import logging
 import os
 import sys
+import traceback
 from typing import Any, Dict, Iterator, List, Optional
+
+from feeder.identity import identity_of
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,26 @@ class ReaderLoadError(Exception):
     The message is user-facing and actionable: it names the spec that was
     tried, what went wrong, and the expected factory contract.
     """
+
+
+class ReaderFailed(Exception):
+    """The reader itself broke — as distinct from a record being bad.
+
+    A bad record is ordinary and is skipped with a warning. A reader that
+    crashes, or that never produces an iterator at all, is a bug in code
+    someone has just written (often generated), and the whole point of
+    this exception is to say *where in its own execution* it broke, not
+    merely what Python raised.
+
+    Carries ``traceback_text``: the reader's own traceback, which the CLI
+    prints unconditionally. Hiding it behind ``--verbose`` would withhold
+    the single most useful fact about the code under debugging.
+    """
+
+    def __init__(self, message: str, traceback_text: str = "") -> None:
+        """Record the diagnosis and the reader's traceback."""
+        Exception.__init__(self, message)
+        self.traceback_text = traceback_text
 
 
 class Reader(abc.ABC):
@@ -193,6 +216,99 @@ class JsonLinesReader(Reader):
                 if name.lower().endswith(_DATA_SUFFIXES):
                     found.append(os.path.join(root, name))
         return found
+
+
+def iter_records(
+    reader: Reader, since: Optional[datetime.datetime]
+) -> Iterator[Dict[str, Any]]:
+    """Yield everything ``reader`` produces, diagnosing it if it breaks.
+
+    Reading is where a newly written reader fails, and the bare exception
+    is rarely enough to find out why: ``TypeError: 'NoneType' object is
+    not iterable`` names neither the cause nor the fix, and ``KeyError:
+    'started'`` does not say whether it happened on the first row or the
+    nine-hundred-thousandth. This wrapper adds what the traceback cannot:
+    which of the three distinct failures it was, how many records had
+    already been produced, and which one was last.
+
+    Raises:
+        ReaderFailed: on any of them, carrying the reader's own traceback.
+    """
+    try:
+        produced = reader.read(since)
+    except Exception:
+        raise ReaderFailed(
+            "the reader's read() raised before it returned anything, so no "
+            "records were produced at all. The failure is in read() itself "
+            "(or in whatever it calls to open its source), not in a "
+            "record. The reader's traceback follows.",
+            traceback.format_exc(),
+        )
+    try:
+        iterator = iter(produced)
+    except TypeError:
+        raise ReaderFailed(_not_iterable_message(produced))
+
+    count = 0
+    last = None  # type: Optional[Dict[str, Any]]
+    while True:
+        try:
+            record = next(iterator)
+        except StopIteration:
+            return
+        except Exception:
+            raise ReaderFailed(
+                _crashed_message(count, last), traceback.format_exc())
+        count += 1
+        last = record
+        yield record
+
+
+def _not_iterable_message(produced: Any) -> str:
+    """Explain a read() that returned something there is nothing to read."""
+    if produced is None:
+        cause = (
+            "read() returned None. A function whose body builds a list but "
+            "never returns it evaluates to None - add 'return records' - "
+            "and so does one whose 'yield' sits inside a nested function "
+            "instead of read() itself."
+        )
+    else:
+        cause = (
+            "read() returned a {0}, which cannot be iterated over.".format(
+                type(produced).__name__)
+        )
+    return (
+        "the reader produced nothing to read: {0} read() must either be a "
+        "generator - using 'yield' once per record - or return a list or "
+        "iterator of record dicts. Note that a generator's body does not "
+        "run until the first record is asked for, so a read() that yields "
+        "correctly never reaches this message.".format(cause)
+    )
+
+
+def _crashed_message(count: int, last: Optional[Dict[str, Any]]) -> str:
+    """Explain a reader that raised part-way through producing records."""
+    if count:
+        progress = (
+            "It had already produced {0} record(s) successfully; the last "
+            "one was: {1}. Look at whatever comes immediately after that in "
+            "the source data - that is the row it could not handle.".format(
+                count, identity_of(last))
+        )
+    else:
+        progress = (
+            "It failed before producing a single record, so the problem is "
+            "in the first thing it tried to read rather than in some "
+            "unusual row further in."
+        )
+    return (
+        "the reader crashed while producing records. {0} This is a bug in "
+        "the reader rather than in the data: read() must never let one "
+        "unusable row end the import - log a warning naming the row's "
+        "location in the source system, skip it, and carry on. The "
+        "reader's traceback follows.".format(progress)
+    )
 
 
 def _looks_like_a_path(text: str) -> bool:
