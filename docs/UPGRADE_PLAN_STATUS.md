@@ -38,7 +38,7 @@ these are the ones that get forgotten:
 | WP-6 | Time analysis tab | **done** | `/api/time`, 908 tests |
 | WP-8 | Last pass + flaky signal | **done** | `with_streak=1`, 936 tests |
 | WP-9 | SQL portability groundwork | **done** | inventory + id pins, 947 tests |
-| WP-10 | MariaDB export tool | pending | |
+| WP-10 | MariaDB export tool | **done** | `tools/export_for_mariadb.py`, 980 tests |
 | — | Performance pass | **done** | migration 4, 952 tests |
 
 States: `pending` → `in progress` → `done`, or `blocked` / `deferred` with a
@@ -438,3 +438,42 @@ round trips.
 the rest is the per-entry streak lookups for the `still_failing` queue. That is
 the next thing to look at, and it needs a design decision rather than an index:
 either cache the rollup or denormalise the streak.
+
+### WP-10 — MariaDB export tool — **done**
+
+`tools/export_for_mariadb.py` + 28 tests. Suite 952 → 980.
+
+Needs **no MySQL driver**: reads SQLite read-only, writes text, and the `mysql`
+client loads it. That is what keeps the data migration inside the "nothing
+installed on the server" constraint, and it is why this half could be written
+and tested with no MariaDB anywhere near the machine.
+
+Run against the production copy: **552,200 runs exported in 13.4s**, 148 MB out
+of a 223 MB database. Parsed back and compared to the source: **0 mismatches
+across all 552,200 rows**, and 0 across 5,000 sampled blobs.
+
+Covered: escaping (tabs, newlines, backslashes, non-ASCII, empty-vs-NULL),
+hex round-trip for blobs, foreign-key load order, indexes created after the
+load, and that the verification queries run on SQLite and use nothing
+engine-specific. The DDL test asserts it carries migrations 2 and 3, because
+exporting into the launch-day schema would drop the new columns silently.
+
+**The load half is not verified and the docstring says so.** No MariaDB here or
+in CI. The runbook's dry run (§E.1) is what checks it.
+
+---
+
+## Round complete
+
+All nine requested items are implemented, plus the MariaDB groundwork. **980
+tests, green.** Every package is committed separately with its reasoning.
+
+Still open, and needing a person rather than a commit:
+
+1. `tools/diagnose_db.py --compare-local` on the production server — still never
+   run since the worker-pool fix.
+2. `/api/summary` at ~197 ms (see the performance-pass entry) — needs a design
+   decision, not an index.
+3. The MariaDB migration itself: run §C's audit on production, get §A done by
+   whoever holds root, then the dry run.
+4. Nothing has been pushed; no remote is configured.
