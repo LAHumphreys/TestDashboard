@@ -30,8 +30,8 @@ these are the ones that get forgotten:
 | WP-0 | Migration registry guard | **done** | `tests/test_migrations.py`, 19 tests |
 | WP-11 | Vendor PyMySQL | **done** | `third_party/pymysql` 1.0.2, 13 tests |
 | WP-4 | Deactivate users (migration 2) | **done** | migration 2, 869 tests |
-| WP-5 | `duration_seconds` (migration 3) | pending | |
-| WP-1 | Extract `review.js` | pending | |
+| WP-5 | `duration_seconds` (migration 3) | **done** | migration 3, 882 tests |
+| WP-1 | Extract `review.js` | **done** | pure move, 887 tests |
 | WP-2 | Review on Open actions | pending | |
 | WP-3 | Triage result emphasis | pending | |
 | WP-7 | Sortable columns | pending | |
@@ -191,3 +191,41 @@ version of the comment claimed. The `julianday` call was never the bottleneck.
 So the real justifications for this column are portability (julianday gone) and
 WP-6 (a GROUP BY over 12k rows instead of millions). **Per-direction indexes for
 every sort key is a separate piece of work — logged for the performance pass.**
+
+### WP-1 — extract the review panel — **done**
+
+`static/review.js`. Suite 882 → 887.
+
+**Kept strictly a pure move.** Three improvements got written into the new module
+while moving it — Enter-to-post a comment, refreshing after a comment, and an
+error instead of a silent return when retiring with no username set — and all
+three were reverted. A behaviour change hiding inside a 200-line move is
+invisible, and the point of a pure move is that its diff can be checked as a
+no-op. They belong in WP-2, where they are the subject rather than a passenger.
+
+Deviations from the plan, both deliberate:
+
+- The exported function is `toggleReview`, not `attachReview`. It toggles.
+- `reviewCell()` was drafted and dropped: the two call sites have different
+  button tooltips, so using it would have been a behaviour change (see above).
+
+The coupling is broken by injection. `review.js` is told a `staleBefore`
+timestamp and works out staleness itself, rather than calling back into the home
+screen's `isStale`. A test asserts the module never names `state.`,
+`refreshSummary` or `refreshQueueCounts`.
+
+Verified in a browser, not only by tests: a temporary probe page imported the
+module, called `toggleReview` against a real failing test from the production
+copy, and the panel opened, fetched the run output and rendered its actions. The
+home screen was then screenshotted intact.
+
+Two guard tests fired and were **widened, not weakened**:
+
+- `test_files_containing_a_nul_byte_are_still_read` asserted on `app.js`
+  specifically. The `\0` composite-key separator moved to `review.js` with
+  `entryKey`, so the test failed for the move rather than for the property. It
+  now asks the question it cares about — at least one scanned file contains a
+  NUL and was read anyway — and fails if none does, so it cannot go vacuous.
+- The new "panel reads no page state" check matched the word `state.` in
+  English prose ("the row's expanded state."). It now strips comments first,
+  with its own test proving the stripper removes prose and keeps code.

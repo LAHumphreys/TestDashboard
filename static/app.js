@@ -49,6 +49,10 @@ import {
   formatNight,
   stackedColumnChart,
 } from "./charts.js";
+import {
+  reopenIfOpen,
+  toggleReview,
+} from "./review.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
@@ -71,9 +75,6 @@ const state = {
   requestSeq: 0,
   browseSeq: 0,
   showRetired: false,
-  // Triage rows whose review panel is open, so an assign or a comment
-  // does not collapse what the user was reading.
-  openReviews: new Set(),
 };
 
 const envSelect = document.getElementById("filter-environment");
@@ -750,178 +751,31 @@ function queueColumns(queueId) {
   }
 }
 
-/* ---- inline review: output + assign + comment, without leaving here ---- */
+/* ---- inline review ----
+ *
+ * The panel itself lives in review.js: the open-actions page needs
+ * the same one, and a second copy would be a second set of bugs.
+ * What stays here is only what is specific to this page — the
+ * staleness cutoff, which comes from the summary, and what a change
+ * made inside the panel should refresh.
+ */
 
-
-/** True when a test has not reported inside the recency window. */
-function isStale(entry) {
-  if (!state.summary) {
-    return false;
+/** Options handed to the shared review panel from this page. */
+function reviewOptions() {
+  // The panel is told the cutoff rather than asking anyone whether a
+  // test is stale, so it stays free of this page's state.
+  let staleBefore = null;
+  if (state.summary) {
+    const cutoff = new Date(state.summary.generated_at + "Z");
+    cutoff.setTime(cutoff.getTime()
+      - state.summary.recent_hours * 3600 * 1000);
+    staleBefore = cutoff.toISOString().slice(0, -1);
   }
-  const cutoff = new Date(state.summary.generated_at + "Z");
-  cutoff.setTime(cutoff.getTime()
-    - state.summary.recent_hours * 3600 * 1000);
-  return new Date(entry.start_time + "Z") < cutoff;
-}
-
-/** Key identifying a queue entry's expanded state. */
-function entryKey(entry) {
-  return [entry.environment, entry.script, entry.test_name].join(" ");
-}
-
-function toggleReview(entry, row, button) {
-  const key = entryKey(entry);
-  const existing = row.nextSibling;
-  if (existing && existing.dataset && existing.dataset.reviewFor === key) {
-    existing.remove();
-    state.openReviews.delete(key);
-    button.setAttribute("aria-expanded", "false");
-    button.textContent = "Review";
-    return;
-  }
-  state.openReviews.add(key);
-  button.setAttribute("aria-expanded", "true");
-  button.textContent = "Close";
-  const panelRow = document.createElement("tr");
-  panelRow.className = "review-row";
-  panelRow.dataset.reviewFor = key;
-  const cell = document.createElement("td");
-  cell.colSpan = row.children.length;
-  panelRow.appendChild(cell);
-  row.parentNode.insertBefore(panelRow, row.nextSibling);
-  buildReviewPanel(entry, cell);
-}
-
-async function buildReviewPanel(entry, container) {
-  clearNode(container);
-  const panel = el("div", "review-panel");
-  container.appendChild(panel);
-
-  const head = el("div", "review-head");
-  const params = new URLSearchParams();
-  params.append("environment", entry.environment);
-  params.append("script", entry.script);
-  params.append("test_name", entry.test_name);
-  const full = document.createElement("a");
-  full.href = "test.html?" + params.toString();
-  full.textContent = "Open full test page →";
-  head.appendChild(el("span", "review-title", "Latest run output"));
-  head.appendChild(full);
-  panel.appendChild(head);
-
-  // Actions FIRST. The output block is tall, so anything below it is
-  // off-screen for a real failure — which is how "I can't comment from
-  // triage" happens even though the box was there all along.
-  panel.appendChild(buildReviewActions(entry));
-
-  const pre = el("pre", "review-output", "Loading output…");
-  panel.appendChild(pre);
-
-  try {
-    const run = await fetchJson("/api/runs/" + entry.run_id);
-    const truncated = fillOutput(pre, run.output);
-    if (truncated) {
-      pre.parentNode.insertBefore(
-        el("p", "review-note",
-          truncated + " Open the full test page for all of it."),
-        pre);
-    }
-  } catch (err) {
-    pre.textContent = "Could not load the output: " + err.message;
-  }
-}
-
-function buildReviewActions(entry) {
-  const actions = el("div", "review-actions");
-
-  /* --- assign to anyone --- */
-  const assignGroup = el("div", "review-group");
-  assignGroup.appendChild(el("label", "review-label", "Assign to"));
-  assignGroup.appendChild(
-    assigneeSelect(entry, () => refreshQueueCounts()));
-  actions.appendChild(assignGroup);
-
-  /* --- comment --- */
-  const commentGroup = el("div", "review-group review-group-wide");
-  commentGroup.appendChild(el("label", "review-label", "Add a comment"));
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "review-input";
-  input.placeholder = "What did you find?";
-  const post = el("button", "", "Post");
-  post.type = "button";
-  post.addEventListener("click", async () => {
-    const me = requireUsername();
-    if (!me) {
-      showError(
-        "Set a username first (the “Change” button, top right) "
-        + "— comments are recorded against a name.");
-      return;
-    }
-    if (!input.value.trim()) {
-      input.focus();
-      return;
-    }
-    post.disabled = true;
-    try {
-      await postJson(
-        testApiPath(entry.environment, entry.script, entry.test_name,
-          "/comments"),
-        { username: me, text: input.value.trim() });
-      input.value = "";
-      post.textContent = "Posted";
-      window.setTimeout(() => { post.textContent = "Post"; }, 1500);
-    } catch (err) {
-      showError(err.message);
-    } finally {
-      post.disabled = false;
-    }
-  });
-  commentGroup.appendChild(input);
-  commentGroup.appendChild(post);
-  actions.appendChild(commentGroup);
-
-  /* --- retire: only offered where it makes sense --- */
-  // Offered for any test that has stopped reporting, wherever it is
-  // being looked at — the triage queue or the full test list.
-  if (isStale(entry) && !entry.retired_at) {
-    const retireGroup = el("div", "review-group review-group-wide");
-    retireGroup.appendChild(el("label", "review-label",
-      "This test has stopped reporting"));
-    const why = document.createElement("input");
-    why.type = "text";
-    why.className = "review-input";
-    why.placeholder = "Why is it gone? (required — e.g. deleted in 4.2)";
-    const retire = el("button", "danger-btn",
-      "Mark as no longer in the suite");
-    retire.type = "button";
-    retire.addEventListener("click", async () => {
-      const me = requireUsername();
-      if (!me) {
-        return;
-      }
-      if (!why.value.trim()) {
-        why.focus();
-        showError("Say why the test is gone — the note is kept with it.");
-        return;
-      }
-      retire.disabled = true;
-      try {
-        await putJson(
-          testApiPath(entry.environment, entry.script, entry.test_name,
-            "/retired"),
-          { retired: true, username: me, comment: why.value.trim() });
-        await refreshSummary();
-      } catch (err) {
-        showError(err.message);
-        retire.disabled = false;
-      }
-    });
-    retireGroup.appendChild(why);
-    retireGroup.appendChild(retire);
-    actions.appendChild(retireGroup);
-  }
-  return actions;
+  return {
+    staleBefore: staleBefore,
+    onChanged: () => refreshQueueCounts(),
+    onRetired: () => refreshSummary(),
+  };
 }
 
 function renderQueueTable() {
@@ -975,16 +829,13 @@ function renderQueueTable() {
     reviewBtn.setAttribute("aria-expanded", "false");
     reviewBtn.title = "Show this run's output, and assign it";
     reviewBtn.addEventListener(
-      "click", () => toggleReview(entry, tr, reviewBtn));
+      "click", () => toggleReview(entry, tr, reviewBtn, reviewOptions()));
     actionCell.appendChild(reviewBtn);
     tr.appendChild(actionCell);
     body.appendChild(tr);
 
     // Keep panels open across the re-render that follows an action.
-    if (state.openReviews.has(entryKey(entry))) {
-      state.openReviews.delete(entryKey(entry));
-      toggleReview(entry, tr, reviewBtn);
-    }
+    reopenIfOpen(entry, tr, reviewBtn, reviewOptions());
   }
   table.hidden = false;
   emptyNote.hidden = true;
@@ -1142,7 +993,7 @@ function buildRow(row) {
   reviewBtn.setAttribute("aria-expanded", "false");
   reviewBtn.title = "Show this run's output, assign it, or comment";
   reviewBtn.addEventListener(
-    "click", () => toggleReview(row, tr, reviewBtn));
+    "click", () => toggleReview(row, tr, reviewBtn, reviewOptions()));
   actionCell.appendChild(reviewBtn);
   tr.appendChild(actionCell);
   return tr;

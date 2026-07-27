@@ -83,8 +83,30 @@ class CoverageTest(unittest.TestCase):
             self.assertGreater(len(found[name]), 1000, name)
 
     def test_files_containing_a_nul_byte_are_still_read(self) -> None:
-        """app.js joins a composite key with \\0; that is not corruption."""
-        self.assertIn("\x00", read("app.js"))
+        """A composite key is joined with \\0; that is not corruption.
+
+        The separator has to be a character that cannot occur inside an
+        environment, script or test name, or two different tests collide
+        on one key. Tools that sniff for NUL call the file binary and
+        read nothing from it, and a scan that silently matched nothing
+        would pass every test in this module forever.
+
+        It used to live in app.js and moved to review.js with
+        ``entryKey``. Asserting on a specific filename made this test
+        fail for the move rather than for the property, so it now asks
+        the question it actually cares about: at least one scanned file
+        contains a NUL, and it was read anyway.
+        """
+        with_nul = sorted(
+            name for name, source in scripts().items() if "\x00" in source
+        )
+        self.assertTrue(
+            with_nul,
+            "no scanned file contains a NUL; if the composite key "
+            "separator changed, this guard is no longer proving that "
+            "such a file can be read")
+        for name in with_nul:
+            self.assertGreater(len(scripts()[name]), 1000, name)
 
 
 class UserListTest(unittest.TestCase):
@@ -196,6 +218,83 @@ class UserListTest(unittest.TestCase):
                 "shared one from api.js")
 
 
+class ReviewPanelTest(unittest.TestCase):
+    """The review panel is defined once and imported everywhere.
+
+    Same shape as the user-list rule above, and for the same reason. The
+    panel fetches a run's output, posts comments, sets assignees and
+    retires tests; a second copy is a second set of behaviours that will
+    diverge, and the divergence shows up as "it works on the dashboard
+    but not on open actions".
+    """
+
+    #: Functions that make up the panel. Any of them appearing outside
+    #: review.js means a copy has been made.
+    _PANEL_FUNCTIONS = (
+        "function toggleReview",
+        "function buildReviewPanel",
+        "function buildReviewActions",
+    )
+
+    def test_the_panel_is_defined_in_exactly_one_file(self) -> None:
+        offenders = {}  # type: Dict[str, List[str]]
+        for name, source in scripts().items():
+            if name == "review.js":
+                continue
+            found = [fn for fn in self._PANEL_FUNCTIONS if fn in source]
+            if found:
+                offenders[name] = found
+        self.assertEqual(
+            offenders, {},
+            "the review panel must be defined only in review.js and "
+            "imported elsewhere; found " + repr(offenders))
+
+    def test_review_js_actually_defines_it(self) -> None:
+        """Otherwise the rule above is satisfied by it existing nowhere."""
+        source = read("review.js")
+        for function in self._PANEL_FUNCTIONS:
+            self.assertIn(function, source)
+        self.assertIn("export function toggleReview", source)
+
+    def test_the_panel_does_not_read_any_page_state(self) -> None:
+        """It is shared, so it cannot know whose page it is on.
+
+        The extraction exists because the panel was wired to the home
+        screen's `state` object. Everything page-specific arrives in
+        `options` — including the staleness cutoff, which is why the
+        panel is TOLD a timestamp rather than asking whether a test is
+        stale.
+        """
+        code = _strip_comments(read("review.js"))
+        for forbidden in ("state.", "refreshSummary", "refreshQueueCounts"):
+            self.assertNotIn(
+                forbidden, code,
+                "review.js must not reach into a page's state; pass it "
+                "in through options instead (found " + forbidden + ")")
+
+    def test_the_comment_stripper_does_not_hide_real_code(self) -> None:
+        """The scan above runs on stripped source, so prove the stripper
+        removes prose and keeps code — otherwise it could hide the very
+        thing it is looking for."""
+        stripped = _strip_comments(
+            "/* a row's expanded state. */\n"
+            "const a = state.summary;  // trailing state.\n"
+            "// state.thing\n"
+        )
+        self.assertIn("state.summary", stripped)
+        self.assertNotIn("expanded state.", stripped)
+        self.assertNotIn("state.thing", stripped)
+
+    def test_consumers_import_it_rather_than_redefining(self) -> None:
+        for name in ("app.js", "actions.js"):
+            source = read(name)
+            if "toggleReview" not in source:
+                continue
+            self.assertIn(
+                'from "./review.js"', source,
+                name + " uses the review panel but does not import it")
+
+
 class PerRowFetchTest(unittest.TestCase):
     """Nothing that runs per row may reach the network.
 
@@ -268,6 +367,21 @@ class SummaryRefreshTest(unittest.TestCase):
         body = _function_body(read("app.js"), "async function fetchSummary()")
         self.assertIn("while (summaryStale)", body)
         self.assertIn("summaryStale = true", body)
+
+
+def _strip_comments(source: str) -> str:
+    """Remove ``//`` and ``/* */`` comments from JavaScript source.
+
+    Naive: it does not understand strings or regex literals, so a
+    ``"//"`` inside a string literal would be treated as a comment. That
+    is acceptable here because the callers ask "does this identifier
+    appear in the CODE", and the failure mode is a false pass on a
+    contrived string — not a false failure. It exists because scanning
+    raw source for ``state.`` matches English prose ("the row's expanded
+    state.") as readily as a property access.
+    """
+    without_block = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", without_block)
 
 
 def _function_body(source: str, signature: str) -> str:
