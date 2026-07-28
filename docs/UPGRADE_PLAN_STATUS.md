@@ -46,12 +46,21 @@ these are the ones that get forgotten:
 | WP-10 | MariaDB export tool | **done** | `tools/export_for_mariadb.py`, 980 tests |
 | — | Performance pass | **done** | migration 4, 952 tests |
 | WP-12 | Cutoff from the suite's rhythm | **done (core)** | `find_passes`, 980 tests |
-| WP-13 | Declared environment expectations | **done** | `8c10de7` on branch `wp-13-environment-expectations` |
-| WP-14 | In-run progress | `pending` | depends on WP-13 |
+| WP-13 | Declared environment expectations | **done** | `8c10de7`, `0ee7c1b` on `main` |
+| — | MariaDB migration automation | **done** | `dae82c7` on `main` |
+| WP-14 | In-run progress | **done, held back** | `1102463`, `b4b1030` on branch `wp-14-in-run-progress` |
+| WP-15 | Progress pushes from a partial reader | `pending` | migration 6 claimed |
 
-**WP-13 is not on `main`.** It is the first package in this log to sit on a
-branch, so `git log --oneline` on `main` will not show it. `git log
-wp-13-environment-expectations` will.
+**WP-14 is deliberately NOT on `main`, and this is the first split in this
+log.** It is finished and green, but the progress bar it draws counts imported
+runs, and the reader that feeds production cannot push runs mid-pass — WP-15 is
+what makes it mean anything. Shipping it first would put a bar on the home
+screen that sits flat all night and then jumps to 100%, which is worse than no
+bar. It waits on the branch for WP-15.
+
+So `main` is deployable on its own: WP-13's declared expectations, the whole of
+round 1, and the MariaDB tooling, with nothing half-finished in it. `git log
+wp-14-in-run-progress` is where the progress bar lives until then.
 
 States: `pending` → `in progress` → `done`, or `blocked` / `deferred` with a
 reason in the log below.
@@ -649,3 +658,81 @@ an expected total, which is exactly a progress bar. The one design point is
 that "still running" must use a shorter idle threshold than the 6-hour pass
 boundary, or a finished 2.5-hour environment shows as in progress for another
 six.
+### WP-14 — in-run progress — **done, on `wp-14-in-run-progress`**
+
+Built, green, and deliberately **not on `main`**. Full entry lives with the
+code on that branch; whoever merges it should replace this pointer with it.
+
+The short version of why it is held back: the bar counts imported runs, and the
+reader feeding production cannot push runs mid-pass — it has identities and
+results but no per-test timings until the end. So on production today the bar
+would sit flat all night and then jump to 100%, which is worse than no bar.
+WP-15 below is what makes it mean something, and the two should land together.
+
+---
+
+## Where things stand
+
+`main` is deployable on its own and has nothing half-finished in it: all of
+round 1, WP-12's derived staleness cutoff, WP-13's declared environment
+expectations (migration 5), and the MariaDB migration tooling.
+
+Held on branches, on purpose:
+
+- `wp-14-in-run-progress` — the progress bar, waiting for WP-15.
+
+Still open, and needing a person rather than a commit:
+
+1. `tools/diagnose_db.py --compare-local` on the production server — still never
+   run since the worker-pool fix.
+2. `/api/summary` at ~197 ms — needs a design decision, not an index.
+3. The MariaDB migration itself: §A needs whoever holds root, then the dry run
+   against a copy of production. `tools/migrate_to_mariadb.py` runs everything
+   after that, but nothing in it that talks to MariaDB has been executed
+   anywhere — there is no server here or in CI.
+4. **Nothing on `main` has been clicked through in a real browser.** WP-13 was
+   driven headlessly against a live server, which catches wrong field names and
+   DOM errors but not layout, focus or keyboard behaviour.
+
+### WP-15 — progress pushes from a partial reader — **specified, not built**
+
+Raised by the user on 2026-07-28, immediately after WP-14: the in-house reader
+**cannot produce a full run record mid-pass**. During the night it has test
+identities and results but no per-test timings; it does know when the
+environment's run started, and the final push upserts everything in full.
+
+That makes WP-14 as built useless against the reader that actually exists — a
+flat bar all night, then a jump to 100%, which is the blindness it was written
+to remove. Worth knowing before anyone reads the WP-14 entry above and assumes
+it works in production.
+
+**It cannot go through `/api/import`, and not only because that contract is
+fixed.** Run identity is `(environment, script, test_name, start_time)`, so a
+record with no start time has no identity. Synthesising one means the final
+push — carrying the real per-test time — writes a SECOND row rather than
+updating the first: one duplicate per test per night, in the table whose whole
+design assumes one row per test per start.
+
+So partial records never become `runs` rows. Full specification is WP-15 in the
+plan; migration **6** is claimed there. The shape:
+
+- `run_progress`, keyed by the test triple, one row per in-flight test.
+- `POST /api/progress`, carrying `pass_started` and completed tests only —
+  confirmed with the user, so there is no "started but not finished" state and
+  the `Result` enum does not grow.
+- A real import **deletes the test's progress row in the same transaction**,
+  reusing the `_unretire_on_new_run` precedent, so a test is in exactly one
+  place and the counts cannot double.
+- A provisional result is **not** "the latest result": it stays out of
+  `latest_runs`, the queues, the staleness cutoff and WP-13's coverage
+  denominator, all of which keep reading completed, timed runs. That line is
+  what keeps the package additive.
+
+`pass_started` is incidentally the first real batch identifier this system has
+had — WP-12 and WP-13 infer pass boundaries from gaps precisely because the
+import contract has none. The inference stays: the final push still carries no
+identifier, and history still needs it.
+
+**Not started.** It shares `storage.py` and the migration registry with the
+MariaDB work in flight, so the version is claimed and the code is sequenced
+after it.

@@ -94,7 +94,8 @@ after a merge.
 | 3 | WP-5 | `latest_runs.duration_seconds` | Yes — see §1.2 |
 | 4 | Perf pass | Sort indexes on `latest_runs` | No |
 | 5 | WP-13 | `environment_expectations` table | No |
-| 6+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 6 | WP-15 | `run_progress` table | No |
+| 7+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry
@@ -803,6 +804,112 @@ WP-13 is for.
 
 ---
 
+### WP-15 — accept progress pushes from a partial reader *(migration 6)*
+
+**Why.** WP-14 counts *imported runs*, and the in-house reader cannot produce a
+full run record mid-pass: during the night it has test identities and results
+but **no per-test timings**. It does know when the environment's run started,
+and the final push upserts everything with full detail.
+
+So as built, WP-14 shows a flat bar all night and then a jump to 100% — the
+exact blindness it was written to remove. This is the package that makes it
+work against the reader that actually exists.
+
+**Already decided.**
+
+- **`/api/import` does not change.** It is a fixed contract shared with the
+  feeder (README), and it *cannot* carry these records anyway: run identity is
+  `(environment, script, test_name, start_time)`, so a record with no start
+  time has no identity. Synthesising one — the environment's start, say —
+  means the final push, carrying the real per-test time, writes a **second
+  row** rather than updating the first. One duplicate per test per night, in
+  the table whose whole design assumes one row per test per start.
+- **Partial records therefore never become `runs` rows.** New table
+  `run_progress`, keyed `(environment, script, test_name)` — one row per
+  in-flight test, because a test is only in one pass at a time:
+  `result`, `pass_started`, `reported_at`.
+- **New endpoint `POST /api/progress`:**
+  `{"environment", "pass_started", "tests": [{"script", "test_name",
+  "result"}]}`. Idempotent upsert, so snapshots and deltas both work and the
+  reader may simply resend the whole list. Same per-record tolerance as
+  `/api/import` — one bad record never aborts the batch; log, skip, count —
+  and the same response shape, so the feeder's error handling is unchanged.
+- **A progress push names only tests that have COMPLETED** (confirmed with the
+  user, 2026-07-28). There is no "started but not finished" state, so `result`
+  is a plain `Result` and the enum does not grow. Tests not yet named are
+  simply not yet reached.
+- **Reconciliation reuses the retirement precedent.** `_unretire_on_new_run`
+  already clears a retirement inside the import transaction when a test reports
+  again. Same shape: importing a real run for a test **deletes its progress
+  row in the same transaction**. A test is then in exactly one of the two
+  places, so `runs_so_far = provisional + real` cannot double-count and the
+  normal path needs no cleanup job.
+- **Abandoned passes drain themselves.** A push carrying a newer
+  `pass_started` for that environment drops that environment's older rows; a
+  push older than the newest recorded is ignored (out-of-order); anything past
+  the `_PASS_LOOKBACK_DAYS` floor is ignored. A killed run clears on the next
+  night rather than lingering for ever.
+- **A provisional result is NOT "the latest result".** It has no timings and
+  may be superseded, so it stays out of `latest_runs` and out of every estate
+  view: triage queues, failing-since, flakiness, the staleness cutoff, and
+  WP-13's coverage denominator all keep reading completed, timed runs only.
+  This is the line that keeps the package additive; crossing it would put
+  untimed, provisional data into the tables every analytic trusts.
+- **`find_passes` keeps reading `runs`.** Coverage decides the staleness
+  cutoff, which gates the offer to retire a test. It stays on completed data.
+- Two consequences in `latest_progress`, which are the actual code:
+  1. It must **synthesise an entry from `run_progress` alone.** An environment
+     whose pass is entirely provisional has nothing in `activity_buckets`, so
+     today it would produce no row at all — the bar would be missing exactly
+     when it is wanted. `pass_started` supplies the start, the row count the
+     progress, `reported_at` the freshness.
+  2. **`running` must consider `reported_at`**, not only the hour buckets over
+     `runs`. During a provisional pass `reported_at` is the only fresh signal
+     there is.
+- Retired tests are excluded from the numerator, as WP-13 excluded them from
+  the denominator. Otherwise a bar can exceed its own total.
+
+**OPEN (default given).** Show provisional failures as a count beside the bar
+("14 failing so far"). Default: **yes** — it is the thing worth knowing at 3am
+and it costs one more column in the same query. **Not** in the triage queues,
+which need timings and stability history.
+
+**Note for later, not this package.** `pass_started` is the first real batch
+identifier this system has had; WP-12 and WP-13 infer pass boundaries from gaps
+precisely because "the import contract has no session/batch id". Do **not** rip
+the inference out: the final push still carries no identifier and history still
+needs it. But for a live pass the start is now known rather than guessed.
+
+**Changes.** `testboard/storage.py` (migration 6; `upsert_progress`,
+`progress_counts`, the delete inside `_maintain_latest`),
+`testboard/analytics.py` (`latest_progress` takes provisional counts),
+`testboard/api.py` (`POST /api/progress`), `static/app.js` (the failing-so-far
+count), README (document the new endpoint beside the import contract).
+
+**Tests.** Storage: upsert idempotency; a real import clears the progress row
+in the same transaction; a newer `pass_started` drops older rows; an older one
+is ignored; retired tests excluded. Per §0.4 the progress read needs a cost
+test — it is a `GROUP BY environment` over at most one row per test, the same
+shape as `test_counts_by_environment`, and must never touch `runs`. API:
+validation, per-record tolerance matching `/api/import`, unknown result → that
+record rejected and the rest accepted. Analytics: an environment with only
+provisional data still produces a progress row; `running` driven by
+`reported_at`. **And the one that matters most:** a provisional row changes
+nothing in `/api/summary`'s queues, `stale_before`, or the WP-13 coverage
+verdict.
+
+**Risks.** The temptation will be to let provisional results feed the queues,
+because a failure known at 3am is worth seeing. Resist it in this package: those
+rows carry no timings, and `failure_streak_bounds`, the flakiness window and the
+duration sort all assume they exist. If it is wanted later it is its own
+package, with its own argument about what a run without an end time means.
+
+**Done when.** A reader that can push only identities and results mid-pass
+produces a live progress bar, the final full push supersedes every provisional
+row it covers, and nothing else in the dashboard can tell the difference.
+
+---
+
 ## 3. Execution order
 
 Three lanes. WP-0 lands before anything that touches `MIGRATIONS`.
@@ -813,8 +920,12 @@ Lane B (frontend)          WP-1 → WP-2 → WP-3 → WP-7
 Lane C (features)                         WP-6, WP-8   (start after WP-5 + WP-2)
 Lane D (independent)       WP-11 → WP-10  (touches only new files — never blocked)
 
-Round 2 (after WP-12)      WP-13 → WP-14
+Round 2 (after WP-12)      WP-13 → WP-14 → WP-15
 ```
+
+WP-15 shares `storage.py` and the migration registry with any MariaDB work in
+flight. Migration 6 is claimed above so the two cannot both write "entry 6";
+sequence the commits rather than interleaving them.
 
 WP-10 and WP-11 share no file with any other package (WP-11 touches
 `test_python36_compat.py`, which nothing else in this round does), so they can
