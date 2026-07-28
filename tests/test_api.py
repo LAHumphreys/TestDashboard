@@ -2417,9 +2417,15 @@ class TestEnvironmentUpdated(ApiCase):
             self.call("GET", "/api/summary")["environment_updated"], {})
 
     def test_it_is_not_narrowed_by_the_environment_filter(self) -> None:
-        """Scoping the page to one environment must not hide whether
-        the OTHERS have run — "has win-sim reported yet" is asked from
-        wherever you happen to be standing."""
+        """The map always carries every environment; the SCOPE is the
+        client's to apply.
+
+        The home screen shows only the selected one, so this is not
+        "the page shows them all regardless" — verified by driving the
+        filter through All -> each environment -> All. The server keeps
+        the whole map because narrowing three entries buys nothing and
+        because the scope is a presentation decision, not a data one.
+        """
         self._seed()
         updated = self.call(
             "GET", "/api/summary",
