@@ -1362,9 +1362,15 @@ button.bar-row:focus-visible {
 
 /* The declared test count is the denominator of the coverage test that
    decides whether a night counted as a pass of the suite. Narrow on
-   purpose: it holds a count, and a wide box invites a sentence. */
+   purpose: it holds a count, and a wide box invites a sentence.
+
+   Not as narrow as it looks, though. A number input renders spinner
+   arrows INSIDE the box, and they plus the padding take about 34px of
+   a nominal 98px before any text is drawn — which clipped the
+   placeholder at 7em. Widen the box when changing the placeholder,
+   or check it against the spinners rather than against the text. */
 .env-expected {
-  width: 7em;
+  width: 8.5em;
   font: inherit;
   color: inherit;
   background: var(--card);
