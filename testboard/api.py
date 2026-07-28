@@ -1425,7 +1425,7 @@ def _handle_environment_expectation(
     expected = _parse_expected_tests(obj)
     changed_by = _validate_username(obj, "changed_by")
 
-    if environment not in storage.known_environments():
+    if not storage.environment_exists(environment):
         raise _HttpError(
             404, "unknown environment: {}".format(environment)
         )

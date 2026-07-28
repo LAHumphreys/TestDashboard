@@ -13,8 +13,13 @@ these are the ones that get forgotten:
 - Production is live. `MIGRATIONS[0]` is frozen; new entries only, versions
   claimed from the plan's §1 registry.
 - Never run a migration, a tool, or the server against the repo-root
-  `testboard.db` — it holds a copy of real data. Work on copies in a temp
-  directory.
+  `testboard.db`. Work on copies in a temp directory.
+  **Corrected 2026-07-28:** it holds *generated* data on a dev machine, not a
+  copy of production. Production is ~900 MB, roughly four times its size.
+  Earlier entries here (WP-4, WP-5, the performance pass, WP-10) call it "a
+  copy of the real database" and that wording is wrong — the measurements are
+  real, the database they were taken on is not production. Say which one a
+  number came from.
 - Guard tests (`test_frontend_calls.py`, `test_server_pool.py`,
   `test_python36_compat.py`, `test_migrations.py`) encode production findings.
   Widen them; never weaken them.
@@ -41,8 +46,12 @@ these are the ones that get forgotten:
 | WP-10 | MariaDB export tool | **done** | `tools/export_for_mariadb.py`, 980 tests |
 | — | Performance pass | **done** | migration 4, 952 tests |
 | WP-12 | Cutoff from the suite's rhythm | **done (core)** | `find_passes`, 980 tests |
-| WP-13 | Declared environment expectations | **done** | migration 5, 1032 tests |
+| WP-13 | Declared environment expectations | **done** | `8c10de7` on branch `wp-13-environment-expectations` |
 | WP-14 | In-run progress | `pending` | depends on WP-13 |
+
+**WP-13 is not on `main`.** It is the first package in this log to sit on a
+branch, so `git log --oneline` on `main` will not show it. `git log
+wp-13-environment-expectations` will.
 
 States: `pending` → `in progress` → `done`, or `blocked` / `deferred` with a
 reason in the log below.
@@ -605,9 +614,10 @@ only makes it more lenient), but on a page it is a permanently red row that
 means nothing. Display only.
 
 **Migration timing.** 8 ms, on the **dev database** (218 MB, 540,192 runs,
-12,008 tests of generated data), brought to version 4 first so the number is
-entry 5 alone. Production is roughly four times that and was **not** measured
-from here — it does not need to be for this entry: `CREATE TABLE` writes one
+12,008 tests of *generated* data — not a copy of production, whatever the
+earlier entries in this file say; see the corrected ground rule at the top),
+brought to version 4 first so the number is entry 5 alone. Production is
+roughly four times that and was **not** measured from here — it does not need to be for this entry: `CREATE TABLE` writes one
 page and rewrites no existing row, so the number cannot grow with the
 database. A migration that touched existing rows would need the real thing, as
 entry 3's backfill did.
@@ -627,7 +637,7 @@ an unreachable 9,000 flips the row to `0 of 12 counted` and grows a Clear
 button, Clear restores inference, and a typed `0` is refused with a readable
 message. **Not click-verified in a browser** — that is still worth doing.
 
-Suite 980 → 1032.
+Suite 980 → 1037.
 
 A parallel session was writing `tools/migrate_to_mariadb.py` in this tree at
 the same time. Its files are untracked and are **not** in this commit; the

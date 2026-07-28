@@ -2547,3 +2547,73 @@ class TestMigrationFiveOnAnExistingDatabase(unittest.TestCase):
         self.addCleanup(store.close)
         store.set_environment_expectation("linux", 12, "amy", CREATED)
         self.assertEqual(store.declared_test_counts(), {"linux": 12})
+
+
+class TestEnvironmentListingCost(StorageTestBase):
+    """No new list query may grow with the size of the estate.
+
+    The plan's rule (0.4) arising from this round: assert the cost, not
+    just the answer. `runs` holds every run ever recorded and is three
+    orders of magnitude larger than `latest_runs`; a listing that
+    touches it is a defect even when it is fast on a small database.
+    """
+
+    def setUp(self) -> None:
+        StorageTestBase.setUp(self)
+        for env in ("linux-sim", "win-sim"):
+            for index in range(5):
+                # Several runs each, so a query that walked history
+                # rather than the derived table would show it.
+                for day in range(4):
+                    self.store.upsert_runs([make_record(
+                        environment=env, test_name="t%d" % index,
+                        start=BASE + datetime.timedelta(days=day))])
+
+    def _plan(self, sql: str, params: tuple = ()) -> str:
+        rows = self.store._conn().execute(
+            "EXPLAIN QUERY PLAN " + sql, params).fetchall()
+        return " ".join(str(row[-1]) for row in rows)
+
+    def test_the_listing_never_touches_runs(self) -> None:
+        plan = self._plan(
+            "SELECT environment FROM latest_runs "
+            "UNION SELECT environment FROM environment_expectations "
+            "ORDER BY 1")
+        self.assertNotIn(
+            "runs", plan.replace("latest_runs", ""),
+            "the environment listing must read the derived table, not "
+            "history: " + plan)
+
+    def test_the_listing_reads_an_index_not_the_table(self) -> None:
+        """It is proportional to the number of TESTS, and only to that.
+
+        The latest_runs primary key begins with `environment`, so this
+        is a covering-index scan. There is no cheaper form: SQLite here
+        cannot skip-scan to the distinct leading values, and an index on
+        `environment` alone would be maintained on every row a nightly
+        import touches.
+        """
+        plan = self._plan(
+            "SELECT environment FROM latest_runs "
+            "UNION SELECT environment FROM environment_expectations "
+            "ORDER BY 1")
+        self.assertIn("COVERING INDEX", plan.upper(), plan)
+
+    def test_checking_one_environment_is_a_seek_not_a_scan(self) -> None:
+        """Validating a single name must not cost a listing."""
+        plan = self._plan(
+            "SELECT 1 FROM latest_runs WHERE environment = ? LIMIT 1",
+            ("linux-sim",))
+        self.assertNotIn("SCAN", plan.upper(), plan)
+
+    def test_environment_exists_answers_correctly(self) -> None:
+        self.assertTrue(self.store.environment_exists("linux-sim"))
+        self.assertFalse(self.store.environment_exists("typo"))
+
+    def test_a_declaration_alone_makes_an_environment_known(self) -> None:
+        """So a renamed environment's stale declaration can be cleared."""
+        self.store.set_environment_expectation(
+            "gone-away", 5, "alice", CREATED)
+        self.store._conn().execute("DELETE FROM latest_runs")
+        self.assertTrue(self.store.environment_exists("gone-away"))
+        self.assertIn("gone-away", self.store.known_environments())

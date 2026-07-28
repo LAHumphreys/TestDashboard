@@ -1799,6 +1799,20 @@ class Storage:
         import must still be listed (otherwise it cannot be corrected),
         and an environment nobody has declared must appear so that it
         can be.
+
+        Cost: a scan of the ``latest_runs`` PRIMARY KEY, which begins
+        with ``environment``, so it reads index pages and never the
+        table — proportional to the number of TESTS (~12k, 2 ms
+        measured), never to the number of runs. The same shape as
+        :meth:`environments`, which ``/api/summary`` already calls on
+        every load. Pinned by a query-plan test, per the plan's §0.4.
+
+        There is no cheaper form available: SQLite here cannot skip-scan
+        a composite index to its distinct leading values, and an index
+        on ``environment`` alone would be maintained on every one of the
+        12,008 rows a nightly import touches — see migration 4 for what
+        that trade costs. Use :meth:`environment_exists` when the
+        question is about one name.
         """
         rows = self._conn().execute(
             "SELECT environment FROM latest_runs "
@@ -1806,6 +1820,25 @@ class Storage:
             "ORDER BY 1"
         ).fetchall()
         return [row[0] for row in rows]
+
+    def environment_exists(self, environment: str) -> bool:
+        """True if *environment* has run a test or carries a declaration.
+
+        Two index seeks, so validating one name costs nothing that grows
+        with the estate — unlike asking for the whole list and searching
+        it.
+        """
+        row = self._conn().execute(
+            "SELECT 1 FROM latest_runs WHERE environment = ? LIMIT 1",
+            (environment,),
+        ).fetchone()
+        if row is not None:
+            return True
+        row = self._conn().execute(
+            "SELECT 1 FROM environment_expectations WHERE environment = ?",
+            (environment,),
+        ).fetchone()
+        return row is not None
 
     def latest_run_time(self) -> Optional[datetime.datetime]:
         """Start time of the newest run on record, or None if empty.
