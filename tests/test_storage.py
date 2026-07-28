@@ -2617,3 +2617,68 @@ class TestEnvironmentListingCost(StorageTestBase):
         self.store._conn().execute("DELETE FROM latest_runs")
         self.assertTrue(self.store.environment_exists("gone-away"))
         self.assertIn("gone-away", self.store.known_environments())
+
+
+class TestLatestRunTimeByEnvironment(StorageTestBase):
+    """When each environment last reported.
+
+    Per environment, because they run SEQUENTIALLY and hours apart: one
+    estate-wide figure is only the newest of them, and looks healthy
+    while the environment somebody is waiting on has not started.
+    """
+
+    def _seed(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="a",
+                        start=BASE),
+            make_record(environment="linux-sim", test_name="b",
+                        start=BASE + datetime.timedelta(hours=2)),
+            make_record(environment="win-sim", test_name="c",
+                        start=BASE + datetime.timedelta(hours=5)),
+        ])
+
+    def test_each_environment_reports_its_newest_run(self) -> None:
+        self._seed()
+        self.assertEqual(
+            self.store.latest_run_time_by_environment(),
+            {"linux-sim": BASE + datetime.timedelta(hours=2),
+             "win-sim": BASE + datetime.timedelta(hours=5)})
+
+    def test_an_empty_estate_is_an_empty_map(self) -> None:
+        self.assertEqual(self.store.latest_run_time_by_environment(), {})
+
+    def test_a_re_import_of_an_older_run_does_not_move_it_back(
+        self
+    ) -> None:
+        """latest_runs holds each test's NEWEST run, so a back-filled
+        older run must not make the environment look staler than it is."""
+        self._seed()
+        self.store.upsert_runs([make_record(
+            environment="linux-sim", test_name="a",
+            start=BASE - datetime.timedelta(days=3))])
+        self.assertEqual(
+            self.store.latest_run_time_by_environment()["linux-sim"],
+            BASE + datetime.timedelta(hours=2))
+
+    def test_retired_tests_still_count(self) -> None:
+        """This is a question about the FEEDER — when did we last hear
+        from this environment — not about what is in the suite. A
+        retired test reporting still means the environment ran."""
+        self._seed()
+        self.store.set_retired(
+            "win-sim", "suite.py", "c", True, "alice", "gone", CREATED)
+        self.assertIn(
+            "win-sim", self.store.latest_run_time_by_environment())
+
+    def test_it_never_touches_the_runs_table(self) -> None:
+        """The plan's 0.4 rule. `latest_runs` is one row per TEST
+        (~12k); `runs` is every run ever recorded, and grouping that
+        would make the home screen proportional to history."""
+        self._seed()
+        plan = " ".join(str(row[-1]) for row in self.store._conn().execute(
+            "EXPLAIN QUERY PLAN SELECT environment, MAX(start_time) "
+            "FROM latest_runs GROUP BY environment"))
+        self.assertNotIn(
+            "runs", plan.replace("latest_runs", ""),
+            "must read the derived table, not history: " + plan)
+        self.assertIn("INDEX", plan.upper(), plan)

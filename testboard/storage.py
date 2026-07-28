@@ -1840,6 +1840,30 @@ class Storage:
         ).fetchone()
         return row is not None
 
+    def latest_run_time_by_environment(
+        self,
+    ) -> Dict[str, datetime.datetime]:
+        """When each environment last reported anything.
+
+        Read from ``latest_runs`` — one row per TEST — rather than from
+        ``runs``, so it costs a grouped read of ~12k rows and never
+        touches the millions of historical runs. ``latest_runs.start_time``
+        is by definition each test's newest run, so the maximum within
+        an environment is that environment's newest run.
+
+        Retired tests are included deliberately: this answers "when did
+        we last hear from this environment", which is a question about
+        the feeder, not about the suite's contents.
+        """
+        rows = self._conn().execute(
+            "SELECT environment, MAX(start_time) FROM latest_runs "
+            "GROUP BY environment"
+        ).fetchall()
+        return {
+            row[0]: model.parse_iso(row[1])
+            for row in rows if row[1] is not None
+        }
+
     def latest_run_time(self) -> Optional[datetime.datetime]:
         """Start time of the newest run on record, or None if empty.
 

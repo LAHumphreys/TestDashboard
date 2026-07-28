@@ -917,6 +917,15 @@ def _handle_summary(
                 None if latest_run is None
                 else model.format_iso(latest_run)
             ),
+            # Per environment, because they run SEQUENTIALLY and hours
+            # apart: one estate-wide "last updated" is the newest of
+            # them and says nothing about whichever one has not reported
+            # yet. That is the case people actually want to check.
+            "environment_updated": {
+                environment_name: model.format_iso(when)
+                for environment_name, when
+                in storage.latest_run_time_by_environment().items()
+            },
             "queue_cap": _SUMMARY_QUEUE_CAP,
             "status": {
                 "total_tests": status.total_tests,

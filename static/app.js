@@ -235,6 +235,7 @@ async function refreshSummary() {
   try {
     await fetchSummary();
     renderStatus();
+    renderEnvUpdated();
     renderCharts();
     renderQueues();
   } catch (err) {
@@ -254,6 +255,7 @@ function renderAll() {
   }
   renderToolbar();
   renderStatus();
+  renderEnvUpdated();
   renderCharts();
   renderQueues();
   populateScriptOptions();
@@ -326,6 +328,48 @@ function buildTile(spec) {
       el("span", "tile-delta " + spec.delta.cls, spec.delta.text));
   }
   return tile;
+}
+
+/*
+ * "Last update" per environment.
+ *
+ * The environments run one after another and hours apart, so a single
+ * estate-wide figure is only the newest of them — it looks healthy
+ * while the one you are waiting on has not started. Each is named, with
+ * its age in words, because the question is nearly always "has X run
+ * yet" rather than "what time is it in UTC".
+ */
+function ageWords(iso, nowIso) {
+  const minutes = Math.round(
+    (Date.parse(nowIso + "Z") - Date.parse(iso + "Z")) / 60000);
+  if (minutes < 0) return "just now";
+  if (minutes < 90) return minutes + "m ago";
+  const hours = Math.round(minutes / 60);
+  if (hours < 36) return hours + "h ago";
+  return Math.round(hours / 24) + "d ago";
+}
+
+function renderEnvUpdated() {
+  const summary = state.summary;
+  const container = document.getElementById("env-updated");
+  clearNode(container);
+  const updated = summary.environment_updated || {};
+  const names = Object.keys(updated).sort().filter(
+    (name) => !state.environment || name === state.environment);
+  if (names.length === 0) {
+    container.appendChild(el("span", "muted", "Nothing has reported yet."));
+    return;
+  }
+  container.appendChild(el("span", "muted", "Last update"));
+  for (const name of names) {
+    const item = el("span", "env-updated-item");
+    item.appendChild(el("span", "env-updated-name", name));
+    item.appendChild(el("span", "env-updated-when",
+      ageWords(updated[name], summary.generated_at)));
+    item.title = name + " last reported at " + formatTime(updated[name])
+      + " UTC";
+    container.appendChild(item);
+  }
 }
 
 function renderStatus() {
@@ -569,6 +613,7 @@ async function refreshQueueCounts() {
     await fetchSummary();
     renderQueueTabs();
     renderStatus();
+    renderEnvUpdated();
   } catch (err) {
     showError(err.message);
   }

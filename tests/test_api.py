@@ -2370,3 +2370,58 @@ class TestEnvironments(ApiCase):
         self.assert_405("POST", "/api/environments", "GET", body={})
         self.assert_405(
             "GET", "/api/environments/linux-sim/expectation", "PUT")
+
+
+class TestEnvironmentUpdated(ApiCase):
+    """/api/summary says when each environment last reported."""
+
+    def _seed(self) -> None:
+        self.import_runs([
+            record(environment="linux-sim", test_name="a",
+                   start_time=format_iso(
+                       NOW - datetime.timedelta(hours=7)),
+                   end_time=format_iso(
+                       NOW - datetime.timedelta(hours=7)
+                       + datetime.timedelta(seconds=1))),
+            record(environment="win-sim", script="b.py", test_name="c",
+                   start_time=format_iso(
+                       NOW - datetime.timedelta(hours=2)),
+                   end_time=format_iso(
+                       NOW - datetime.timedelta(hours=2)
+                       + datetime.timedelta(seconds=1))),
+        ])
+
+    def test_each_environment_appears_with_its_own_time(self) -> None:
+        self._seed()
+        updated = self.call("GET", "/api/summary")["environment_updated"]
+        self.assertEqual(
+            updated,
+            {"linux-sim": format_iso(NOW - datetime.timedelta(hours=7)),
+             "win-sim": format_iso(NOW - datetime.timedelta(hours=2))})
+
+    def test_the_estate_figure_is_only_the_newest_of_them(self) -> None:
+        """Which is exactly why the per-environment map exists: the
+        headline reads healthy while an environment that has not run
+        yet is invisible in it."""
+        self._seed()
+        data = self.call("GET", "/api/summary")
+        self.assertEqual(
+            data["latest_run_time"],
+            format_iso(NOW - datetime.timedelta(hours=2)))
+        self.assertNotEqual(
+            data["environment_updated"]["linux-sim"],
+            data["latest_run_time"])
+
+    def test_an_empty_estate_reports_an_empty_map(self) -> None:
+        self.assertEqual(
+            self.call("GET", "/api/summary")["environment_updated"], {})
+
+    def test_it_is_not_narrowed_by_the_environment_filter(self) -> None:
+        """Scoping the page to one environment must not hide whether
+        the OTHERS have run — "has win-sim reported yet" is asked from
+        wherever you happen to be standing."""
+        self._seed()
+        updated = self.call(
+            "GET", "/api/summary",
+            query={"environment": ["linux-sim"]})["environment_updated"]
+        self.assertEqual(sorted(updated), ["linux-sim", "win-sim"])
