@@ -203,15 +203,39 @@ class ImportCostTest(unittest.TestCase):
         self.assertIn("ok", text)
 
 
-class NotYetWiredTest(unittest.TestCase):
-    """The driver lands on its own, wired to nothing.
+#: Modules allowed to import the driver, and why each one is allowed.
+#: A migration tool is not a serving path: it runs by hand, on purpose,
+#: and reverting the driver would take it with it — which is still one
+#: commit and still no storage code.
+DRIVER_USERS = {
+    "tools/migrate_to_mariadb.py":
+        "the migration tool. It connects to MariaDB precisely so that "
+        "the migration needs nothing installed on the web server — the "
+        "property this directory exists to protect.",
+}
 
-    If it turns out to be the wrong choice, reverting must be one commit
-    that touches no storage code. That is only true while nothing
-    imports it.
+
+class NotYetWiredTest(unittest.TestCase):
+    """The serving path does not import the driver yet.
+
+    If the driver turns out to be the wrong choice, reverting must be
+    one commit that touches no storage code. Originally that was
+    enforced by allowing *nothing* to import it.
+
+    ``tools/migrate_to_mariadb.py`` is now allowed, and the reason is
+    the same one that motivated vendoring: shelling out to the ``mysql``
+    client would have made the migration depend on a client package
+    being installed on the web server, which is exactly the deployment
+    problem the vendored driver removes. It is a hand-run tool, not a
+    serving path, so the revert story is unchanged — one commit, no
+    storage code.
+
+    ``testboard/`` and ``feeder/`` are still held to the original rule:
+    the day ``storage.py`` imports it, the MariaDB backend is real, and
+    this test should be deleted with that said in the commit message.
     """
 
-    def test_no_shipped_module_imports_the_driver_yet(self) -> None:
+    def test_no_serving_module_imports_the_driver_yet(self) -> None:
         import re
 
         offenders = []
@@ -220,16 +244,26 @@ class NotYetWiredTest(unittest.TestCase):
             for name in sorted(os.listdir(directory)):
                 if not name.endswith(".py"):
                     continue
+                relative = package + "/" + name
+                if relative in DRIVER_USERS:
+                    continue
                 path = os.path.join(directory, name)
                 with io.open(path, encoding="utf-8") as handle:
                     source = handle.read()
                 if re.search(r"\bpymysql\b", source):
-                    offenders.append(package + "/" + name)
+                    offenders.append(relative)
         self.assertEqual(
             offenders, [],
-            "the vendored driver is wired in, but the MariaDB backend is "
-            "not built yet. When it is, delete this test and say so in the "
-            "commit message")
+            "the vendored driver is wired into the serving path, but the "
+            "MariaDB backend is not built yet. When it is, delete this "
+            "test and say so in the commit message")
+
+    def test_every_allowed_importer_still_exists(self) -> None:
+        """An allowlist entry for a deleted file is a hole nobody sees."""
+        for relative in DRIVER_USERS:
+            self.assertTrue(
+                os.path.isfile(os.path.join(REPO_ROOT, *relative.split("/"))),
+                relative + " is on the driver allowlist but does not exist")
 
 
 if __name__ == "__main__":

@@ -2,11 +2,12 @@
 
 **Audience.** Two people, doing different jobs:
 
-- **The DBA / whoever holds the MariaDB root password.** They run §A once, from
-  a script you hand them. They need no knowledge of testboard.
-- **You, the operator.** You run everything else with an unprivileged account.
-  **This document assumes you have never administered MariaDB.** Every command
-  says what it does and what a correct answer looks like.
+- **The administrator** — whoever has `root` on the RHEL 8 boxes and the MariaDB
+  root password. They run §A once, from a script you hand them. They need no
+  knowledge of testboard, and §A is written so it can be executed top to bottom
+  by someone who has never seen this project.
+- **You, the operator.** You run §C to §E with an unprivileged account, and
+  almost all of it is one command: `tools/migrate_to_mariadb.py`.
 
 Nothing here requires you to have, or to give anyone else, the root password.
 
@@ -22,7 +23,7 @@ share; a database that lives on a server instead of on a network mount; and
 alignment with however the rest of the estate is run. Those are good reasons and
 they are why organisations make this move.
 
-**MariaDB does not, by itself, make queries faster at this size.** 900 MB and
+**MariaDB does not, by itself, make queries faster at this size.** 950 MB and
 ~4.4M rows is small. The several-second page loads you saw were diagnosed as a
 slow network mount *plus* a page cache that never warmed, because the server
 started a thread — and therefore a fresh SQLite connection, and therefore an
@@ -34,7 +35,7 @@ you already have: keep hot pages in RAM on a machine that has plenty.
 > **Do this first — it takes one command and it informs everything below:**
 >
 > ```
-> python tools/diagnose_db.py --db /path/to/testboard.db --compare-local
+> python3 tools/diagnose_db.py --db /path/to/testboard.db --compare-local
 > ```
 >
 > Run it *on the production web server*, now that connections persist. If the
@@ -51,28 +52,111 @@ Everything below assumes the decision is made either way.
 
 | Requirement | Why |
 |---|---|
-| **MariaDB 10.6 or newer** (LTS) | Needs ≥ 10.2 for `NO PAD` collations, `DYNAMIC` row format by default and 3072-byte index keys. 10.6+ is the supported LTS line. |
-| Network route from the web server to the DB host, port 3306 | The app connects over the network now. |
-| `mysql` command-line client on the web server | Used for the load and for every verification step. No Python driver needed for the migration itself. |
-| Disk space on the web server ≈ 2.5 × the SQLite file | The export is text, and blobs are hex-encoded, which doubles them. ~2.5 GB for a 900 MB database. |
+| **MariaDB 10.2 or newer**; 10.6+ preferred | 10.2 is the correctness floor: below it there is no `NO PAD` collation and §B.3 applies. Whether you can get 10.6 on RHEL 8 depends on the module streams that host offers — §A.2 decides it with a command rather than from memory. |
+| Network route from the web server to the DB host, port 3306 | The app connects over the network now. Not needed if both live on one box. |
+| **Nothing installed on the web server** | §C–§E connect through the driver vendored in `third_party/pymysql`, which ships with the checkout. No client package, no pip, no build step — that property is the whole point, and the migration is not allowed to be the thing that breaks it. |
+| *(optional)* `mysql` command-line client | Only for the by-hand fallback in §D.3, or for poking at the server yourself. `dnf install mariadb` — §A.7. |
+| Python 3.6 on the web server | The platform Python on RHEL 8. The migration tool is stdlib-only, like everything else here. |
+| Disk space on the web server ≈ 2.5 × the SQLite file | The export is text, and blobs are hex-encoded, which doubles them. ~2.4 GB for a 950 MB database. The tool checks this before it starts. |
 | A copy of the production database for a dry run | Non-negotiable. See §E.1. |
-
-Check the version first — if it is below 10.2, stop and read §B.3, because the
-collation guidance changes and the migration becomes materially riskier:
-
-```sql
-SELECT VERSION();
-```
 
 ---
 
-## A. For whoever holds the root password
+## A. For the administrator — the whole privileged half
 
-Hand them this section. It is self-contained and it is the only thing they need
-to do. Everything is scoped to one database; nothing here grants global
-privileges.
+Hand them this section. It is self-contained. Nothing outside it needs `root`
+or the MariaDB root password, and nothing in it needs any knowledge of
+testboard.
 
-### A.1 Create the database
+It covers two machines. They may be the same box:
+
+- **A.1 – A.6** on the **database host**: install MariaDB, create the database
+  and two accounts, set the server options.
+- **A.7 – A.10** on the **web server**: the service account and group, the
+  directories, and the credentials files. Nothing gets installed here.
+- **A.11** is the hand-over checklist.
+
+Commands are `#`-prefixed where they need root. Everything is scoped to one
+database and one service account; nothing here grants a global privilege.
+
+> **§A was renumbered** when the RHEL 8 install steps were added. Anything
+> elsewhere in the repository still pointing at the old numbers maps like this:
+> **§A.1 (create the database) → §A.3**, **§A.2 (the two accounts) → §A.4**,
+> **§A.3 (server settings) → §A.5**. The header comment in a generated
+> `schema.sql` is one such pointer.
+
+### A.1 Decide where the database lives
+
+| | Same host as the dashboard | Separate database host |
+|---|---|---|
+| Grants use | `'testboard_app'@'localhost'` | `'testboard_app'@'<web server>'` |
+| Connection | Unix socket or 127.0.0.1 | TCP, port 3306 |
+| firewalld | nothing to open | §A.6 |
+| Buys you | simplicity | the operational case in "Before you start" |
+
+**This choice is the single most common source of "access denied" later.**
+MariaDB matches an account against the host it sees the connection *coming
+from*, and `'user'@'localhost'` (which means the Unix socket) is a completely
+different account from `'user'@'127.0.0.1'` (which means TCP to the same
+machine). Decide now, and use the same answer in §A.4 (the grants) and §A.9/§A.10
+(the credentials files).
+
+Write down the answer: `DBHOST` (where MariaDB runs) and `WEBHOST` (where the
+dashboard runs, as MariaDB will see it — a resolvable hostname or an IP).
+
+### A.2 Install MariaDB — on DBHOST
+
+RHEL 8 ships MariaDB as an AppStream *module*, and which versions are offered
+depends on the minor release. **Ask the box rather than trusting a version
+number from a document:**
+
+```bash
+# dnf module list mariadb
+```
+
+You get a list of streams with one marked `[d]` (default) and possibly one
+`[e]` (enabled). Choose like this:
+
+- **Pick the newest stream offered.** Anything 10.3 or newer satisfies this
+  project's correctness floor (§0), so any stream RHEL 8 offers will work.
+- A stream whose *upstream* version is past end-of-life is not automatically
+  unsupported: Red Hat maintains AppStream module streams on the RHEL
+  lifecycle, not upstream's. Check your own support position if it matters.
+- **If you need a newer MariaDB than any stream offers** — say your standard is
+  the 10.6 or 10.11 LTS line — add MariaDB's own repository for RHEL 8 instead
+  of the module. That is a supported path, and it is a decision about which
+  vendor supports your database, not a testboard requirement.
+
+Then, enabling whichever stream you chose (`10.11` here is an example, **not** a
+recommendation — use what `dnf module list` actually showed):
+
+```bash
+# dnf module enable mariadb:10.11 -y
+# dnf install mariadb-server -y
+# systemctl enable --now mariadb
+# systemctl status mariadb          # must be: active (running)
+```
+
+Set the root password and remove the defaults:
+
+```bash
+# mysql_secure_installation
+```
+
+Answer: set a root password (**yes**), remove anonymous users (**yes**),
+disallow remote root login (**yes**), remove the test database (**yes**),
+reload privileges (**yes**).
+
+Confirm the version you actually got — this is the number §0 cares about:
+
+```bash
+# mysql -u root -p -e "SELECT VERSION();"
+```
+
+If that prints anything below **10.2**, stop and read §B.3 before going on: the
+collation guidance changes and the migration becomes materially riskier.
+
+### A.3 Create the database — on DBHOST
 
 ```sql
 CREATE DATABASE testboard
@@ -87,30 +171,17 @@ user by their exact username. SQLite compares text byte-for-byte, so `Login` and
 MariaDB's *default* collations are case-insensitive and ignore trailing spaces,
 which would silently merge them — turning two tests into one and breaking
 primary keys on load. `utf8mb4_nopad_bin` restores the SQLite behaviour exactly.
-§C.2 proves it empirically rather than trusting this paragraph.
+The operator proves this empirically in §C.2 rather than trusting this
+paragraph.
 
-### A.2 Create two accounts, not one
+If `utf8mb4_nopad_bin` is rejected as unknown, the server is older than 10.2.
+See §B.3 — it has a workable but lossier fallback, and it must be an informed
+choice, not a substitution made at the prompt.
 
-Replace `WEBHOST` with the web server's hostname or IP as MariaDB sees it, and
-choose two distinct strong passwords.
+### A.4 Create two accounts, not one — on DBHOST
 
-**Create both accounts with `mysql_native_password`** — that is MariaDB's
-default, so on a stock server the plain `IDENTIFIED BY` below already does it.
-If this server has been configured to default to a sha256-based plugin, say so
-explicitly (`IDENTIFIED VIA mysql_native_password USING PASSWORD('...')`).
-
-The reason is not preference. testboard's MySQL driver is vendored into the repo
-so that nothing has to be installed on the web server, and PyMySQL needs the
-compiled `cryptography` package for the `sha256_password` and
-`caching_sha2_password` plugins. `cryptography` is deliberately **not** vendored
-— vendoring a package that needs a compiler would give up the whole "nothing to
-build on the server" property. So an account created with a sha256 plugin
-produces, at connect time:
-
-> `'cryptography' package is required for sha256_password or
-> caching_sha2_password auth methods`
-
-The fix is the auth plugin, not an install.
+Replace `WEBHOST` with the answer from §A.1 (use `localhost` if the dashboard
+runs on this same machine), and choose two distinct strong passwords.
 
 ```sql
 -- The application. Data only: it can never alter the schema.
@@ -133,7 +204,39 @@ Why two: the running dashboard has no business being able to `DROP TABLE`. It
 also means a schema change is a deliberate act by a person with a different
 credential, which is what you want once the schema is locked.
 
-### A.3 Server settings to confirm or change
+**Both accounts must use `mysql_native_password`.** That is MariaDB's default,
+so on a stock server the plain `IDENTIFIED BY` above already does it. If this
+server has been configured to default to a sha256-based plugin, say so
+explicitly:
+
+```sql
+CREATE USER 'testboard_app'@'WEBHOST'
+  IDENTIFIED VIA mysql_native_password USING PASSWORD('APP_PASSWORD_HERE');
+```
+
+Confirm what you actually created:
+
+```sql
+SELECT user, host, plugin FROM mysql.user WHERE user LIKE 'testboard%';
+```
+
+The reason is not preference. testboard's future MySQL driver is vendored into
+the repository so that nothing has to be installed on the web server, and
+PyMySQL needs the compiled `cryptography` package for the `sha256_password` and
+`caching_sha2_password` plugins. `cryptography` is deliberately **not** vendored
+— vendoring a package that needs a compiler would give up the whole "nothing to
+build on the server" property. An account created with a sha256 plugin produces,
+when the dashboard is eventually pointed at it (§F):
+
+> `'cryptography' package is required for sha256_password or
+> caching_sha2_password auth methods`
+
+The fix is the auth plugin, not an install. The operator's preflight (§C.2)
+connects with that same vendored driver, so a sha256 account fails there with a
+message naming this section — but check the `plugin` column here anyway: this is
+the only point in the procedure where somebody has the privileges to look.
+
+### A.5 Server settings — on DBHOST
 
 ```sql
 SELECT @@innodb_buffer_pool_size, @@max_allowed_packet,
@@ -142,13 +245,13 @@ SELECT @@innodb_buffer_pool_size, @@max_allowed_packet,
 
 | Setting | Required value | Why it matters |
 |---|---|---|
-| `innodb_buffer_pool_size` | As large as the host allows — at least 2 GB; ideally more than the whole database | This is the cache. The entire performance case for the move rests on it. A 900 MB database that fits in the pool is served from RAM. |
-| `max_allowed_packet` | ≥ 64 MB | Captured test output is stored as a compressed blob. A single large row must fit in one packet or the load fails partway through with a confusing error. |
+| `innodb_buffer_pool_size` | As large as the host allows — at least 2 GB; ideally more than the whole database | This is the cache. The entire performance case for the move rests on it. A 950 MB database that fits in the pool is served from RAM. |
+| `max_allowed_packet` | ≥ 64 MB (128 MB recommended) | Captured test output is stored as a compressed blob. A single large row must fit in one packet or the load fails partway through with a confusing error. |
 | `sql_mode` | must include `STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES` | **Without strict mode, a test name longer than the column silently gets truncated** — and two different tests become one, permanently, with no error. This is the most damaging thing that can go wrong in this migration. |
-| `local_infile` | `ON` (may be turned off again after the load) | Only needed if using the fast bulk load path (§D.3). |
+| `local_infile` | `ON` (may be turned off again after the load) | Needed for the bulk load path (§D.3). |
 | `innodb_default_row_format` | `dynamic` | Needed for 3072-byte index keys. Default on 10.2+. |
 
-In `/etc/my.cnf.d/testboard.cnf` (or the site equivalent):
+Write `/etc/my.cnf.d/testboard.cnf`:
 
 ```ini
 [mysqld]
@@ -160,18 +263,213 @@ character_set_server    = utf8mb4
 collation_server        = utf8mb4_nopad_bin
 ```
 
-Restart required for `innodb_buffer_pool_size`.
+```bash
+# systemctl restart mariadb
+```
 
-### A.4 Tell the operator
+`innodb_buffer_pool_size` needs the restart; do not skip it and assume the
+value took.
 
-They need: hostname, port, the two usernames and passwords, and confirmation
-that §A.3 was applied. Nothing else.
+### A.6 Network access — on DBHOST
+
+Skip this entirely if the dashboard runs on the same box (it will use the socket
+or loopback).
+
+```bash
+# firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="WEBHOST_IP" port protocol="tcp" port="3306" accept'
+# firewall-cmd --reload
+# firewall-cmd --list-rich-rules
+```
+
+(One line. A backslash-newline inside single quotes is not a continuation —
+it puts a literal backslash in the rule.)
+
+A source-scoped rich rule rather than `--add-service=mysql`: the database should
+be reachable from the web server, not from the site.
+
+By default MariaDB on RHEL 8 may listen only on localhost. If the dashboard is
+on another machine, confirm `bind-address` allows the interface it needs —
+`0.0.0.0` with the firewall rule above, or the specific address:
+
+```bash
+# grep -r bind-address /etc/my.cnf /etc/my.cnf.d/
+```
+
+SELinux does not need a boolean for MariaDB to accept connections on 3306. It
+*may* need one on the web server — see §A.8.
+
+### A.7 The service account and group — on WEBHOST
+
+This is the account the dashboard runs as. It is a system account: no login, no
+password, no home directory to speak of.
+
+```bash
+# groupadd --system testboard
+# useradd --system --gid testboard \
+          --home-dir /var/lib/testboard --create-home \
+          --shell /sbin/nologin \
+          --comment "testboard dashboard service" testboard
+```
+
+Now give the human operators access **through the group**, rather than by
+sharing the account:
+
+```bash
+# usermod -aG testboard <operator-username>        # repeat per operator
+```
+
+A group membership added with `usermod -aG` applies to *new* logins only. The
+operator must log out and back in, or start a new session with `newgrp
+testboard`, before they can read anything group-owned. Confirm with `id
+<operator-username>` — `testboard` must appear in the group list.
+
+**The migration needs nothing installed here.** It connects through the driver
+vendored in the repository (`third_party/pymysql`), which is why testboard can be
+deployed by copying a checkout. Do not install a database client on the operator's
+behalf and do not let anything in this procedure come to depend on one.
+
+Optionally, for a human to inspect the server by hand (**client only** — this box
+is not a database server):
+
+```bash
+# dnf install mariadb -y        # optional; §D.3's by-hand fallback uses it
+```
+
+### A.8 Directories — on WEBHOST
+
+```bash
+# mkdir -p /etc/testboard /var/lib/testboard /var/log/testboard
+# chown root:testboard  /etc/testboard      && chmod 0750 /etc/testboard
+# chown testboard:testboard /var/lib/testboard /var/log/testboard
+# chmod 0770 /var/lib/testboard /var/log/testboard
+```
+
+`/etc/testboard` is `root`-owned and group-readable: the service reads its
+credentials from there but must never be able to rewrite them.
+
+The migration needs a scratch directory with ~2.5 × the database in free space
+(§0). `/var/tmp` is usually right; check first, and put it somewhere else if
+not:
+
+```bash
+# df -h /var/tmp
+```
+
+**SELinux.** If the dashboard is launched as a plain systemd service it runs
+unconfined and needs nothing here. If it is served under a confined domain —
+behind `httpd`, most commonly — that domain needs permission to open a network
+connection to a database:
+
+```bash
+# getenforce                                          # Enforcing?
+# setsebool -P httpd_can_network_connect_db on        # only if under httpd
+```
+
+Do not set booleans speculatively. If §E's verification and a page load both
+work, there was nothing to fix.
+
+### A.9 The operator's migration credentials — on WEBHOST
+
+The operator runs the migration as themselves, with the `testboard_migrate`
+account. That credential is personal and short-lived; it lives in their own home
+directory, not in `/etc`:
+
+```bash
+$ umask 077
+$ cat > ~/.testboard-migrate.cnf <<'EOF'
+[client]
+host     = DBHOST
+port     = 3306
+user     = testboard_migrate
+password = MIGRATE_PASSWORD_HERE
+database = testboard
+local-infile = 1
+EOF
+$ chmod 600 ~/.testboard-migrate.cnf
+$ ls -l ~/.testboard-migrate.cnf        # must be -rw-------
+```
+
+This is an ordinary mysql option file, and it is a file rather than a command
+line for one reason: **anything on a command line is visible to every user on
+the box through `ps`.** The migration tool refuses to accept a password any
+other way.
+
+Delete this file when the migration is finished. The account it holds can drop
+every table in the database.
+
+### A.10 The application's credentials — on WEBHOST
+
+Same format, different account, and permanent:
+
+```bash
+# cat > /etc/testboard/db.cnf <<'EOF'
+[client]
+host     = DBHOST
+port     = 3306
+user     = testboard_app
+password = APP_PASSWORD_HERE
+database = testboard
+EOF
+# chown root:testboard /etc/testboard/db.cnf
+# chmod 0640 /etc/testboard/db.cnf
+# ls -l /etc/testboard/db.cnf          # must be -rw-r----- root testboard
+```
+
+`root:testboard` at `0640` means: the service account can read it, members of
+the `testboard` group can read it, nobody else can, and nothing but `root` can
+change it.
+
+> ⚠️ **The dashboard does not read this file yet.** As of today `storage.py`
+> speaks SQLite only; pointing the application at MariaDB is §F, and it is not
+> done. This file is created now because it is part of the same privileged
+> setup and because §F should find it already in place with the right
+> ownership — not because anything consumes it today. **Setting it up does not
+> migrate the dashboard.**
+
+For reference, the service unit §F will need — `/etc/systemd/system/testboard.service`:
+
+```ini
+[Unit]
+Description=testboard dashboard
+After=network-online.target
+
+[Service]
+User=testboard
+Group=testboard
+WorkingDirectory=/opt/testboard
+ExecStart=/usr/bin/python3 /opt/testboard/run_server.py --host 0.0.0.0 --port 8000 --db /var/lib/testboard/testboard.db
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+That `--db` is the SQLite path, because that is what the code takes today. §F.2
+is where it grows a URL form and starts reading `/etc/testboard/db.cnf`.
+
+### A.11 Hand over
+
+Tell the operator:
+
+- [ ] `DBHOST` and port; whether it is the same box as the dashboard
+- [ ] The two usernames, and both passwords, by whatever channel your site uses
+      for secrets — not email
+- [ ] That `~/.testboard-migrate.cnf` is in place, mode 600 (§A.9)
+- [ ] That `/etc/testboard/db.cnf` is in place, `root:testboard`, 0640 (§A.10)
+- [ ] The output of `SELECT VERSION();`
+- [ ] Confirmation that §A.5's settings were applied **and the server was
+      restarted**
+- [ ] That they are in the `testboard` group and have logged in since (§A.7)
+- [ ] Which scratch filesystem has room for the export (§A.8)
+
+Nothing else. The operator does not need root, and should not be given it.
 
 ---
 
 ## B. The schema, translated
 
-This section is reference. §D generates the actual DDL — do not hand-type it.
+This section is reference. `tools/export_for_mariadb.py` generates the actual
+DDL — do not hand-type it.
 
 ### B.1 The index key length problem *(read this one)*
 
@@ -192,12 +490,15 @@ the budget arithmetic is:
 | | | **total** | **2322** ≤ 3072 ✅ |
 
 That is the widest index in the schema (`runs`'s UNIQUE constraint). Every other
-index is smaller. There is ~750 bytes of headroom, so `script` and `test_name`
-could go to 320 each if the audit says they need to — but **run the audit in
-§C.1 before choosing.** Measured on the development database, the longest values
-are `environment` 13, `script` 28, `test_name` 26 characters, so these limits are
-roughly ten times the observed need. Production may differ; that is what the
-audit is for.
+index is smaller. The three identity columns share a budget of 761 characters
+between them and the defaults spend 574, so there is real but not unlimited
+headroom. **You do not choose these by hand:** §C.1's audit measures the longest
+value in each column and the tool sizes the columns from that, doubling for
+headroom where the budget allows and tightening — or refusing outright, with the
+query to find the culprit — where it does not. Measured on the development
+database the longest values are `environment` 13, `script` 28, `test_name` 26
+characters, roughly ten times inside the defaults. Production may differ; that
+is what the audit is for.
 
 `start_time` stays a **string**, not a `DATETIME`. The project's timestamps are
 ISO-8601 UTC strings compared lexically, everywhere, by design — storage,
@@ -214,7 +515,7 @@ breaks you will not know which change did it.
 | `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT AUTO_INCREMENT PRIMARY KEY` | `BIGINT`, not `INT`: ids are consumed by re-imports (§B.5), so they run ahead of the row count. |
 | `TEXT` (identity) | `VARCHAR(n)` per §B.1 | Bounded, or it cannot be indexed. |
 | `TEXT` (`result`) | `VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin` | Values are `PASS`, `FAIL`, `FAILED_AS_EXPECTED`, `UNEXPECTED_PASS`. Do **not** use a MariaDB `ENUM` — the Python `Result` enum is the authority and an ENUM would give you two definitions that can drift. |
-| `TEXT` (`source_link`) | `VARCHAR(1024)` | Not indexed. |
+| `TEXT` (`source_link`) | `VARCHAR(1024)` | Not indexed. The audit checks nothing exceeds it. |
 | `TEXT` (`known_failure_reason`) | `TEXT` | Nullable, not indexed. |
 | `TEXT` (comment body) | `TEXT` | API caps it at 10,000 characters; `VARCHAR(10000)` in utf8mb4 would eat the 65,535-byte row limit. |
 | `TEXT` (`username`) | `VARCHAR(100)` | Matches the API's `_MAX_USERNAME_LEN`. |
@@ -223,7 +524,7 @@ breaks you will not know which change did it.
 
 ### B.3 Collation, per column
 
-Set at the database level in §A.1, but state it explicitly on identity columns
+Set at the database level in §A.3, but stated explicitly on identity columns
 anyway — so that a future `ALTER` on a server with different defaults cannot
 quietly change comparison semantics.
 
@@ -231,13 +532,13 @@ If your server is **older than 10.2** and `utf8mb4_nopad_bin` does not exist:
 `utf8mb4_bin` gives you case sensitivity but *not* no-pad, so `"login"` and
 `"login "` compare equal. That is a real difference from SQLite. Either upgrade,
 or accept it knowingly after confirming with §C.1 that no identity value has a
-trailing space.
+trailing space — the audit reports exactly that count.
 
 ### B.4 `PRAGMA` has no equivalent, and does not need one
 
 The eight `PRAGMA` statements in `storage.py` are SQLite tuning: WAL mode, busy
 timeout, page cache, mmap. All of them are replaced by server configuration
-(§A.3) and none of them port. In particular:
+(§A.5) and none of them port. In particular:
 
 - WAL mode → InnoDB's redo log. Nothing to do.
 - `busy_timeout` → `innodb_lock_wait_timeout`.
@@ -259,7 +560,7 @@ MariaDB's `INSERT ... ON DUPLICATE KEY UPDATE` **updates the existing row in
 place**. The `id` is **unchanged**.
 
 **Checked, and the news is better than that paragraph suggests.**
-`tests/test_sql_portability.py` now pins what the code actually does:
+`tests/test_sql_portability.py` pins what the code actually does:
 
 - **`runs` never uses `INSERT OR REPLACE`.** The import path deliberately does
   SELECT-then-UPDATE-or-INSERT, so **`runs.id` is stable across re-import** —
@@ -289,19 +590,48 @@ decorative today become load-order requirements: `users` before `comments`,
 `runs` before `run_outputs` and `latest_runs`.
 
 More consequentially, **any orphan rows in the current database will refuse to
-load.** The audit in §C.1 finds them before you discover them at 2am.
+load.** The audit in §C.1 finds them before you discover them at 2am, and
+refuses to go on.
 
 ---
 
-## C. Pre-flight audit — run this on production
+## C. Pre-flight — run this on production
 
-Read-only. Run it against the live SQLite file before anything else.
+Read-only against the SQLite file, read-only-ish against the empty MariaDB
+database (it creates and drops three tiny probe tables). Nothing here changes
+production.
 
-### C.1 Sizing and integrity
+### C.1 The source audit — one command
 
-These run **on SQLite only** — they use SQLite syntax (`||`) deliberately,
-because their job is to describe the source. The cross-engine constraint in
-§E.4 does not apply here.
+```bash
+python3 tools/migrate_to_mariadb.py audit \
+    --db /path/to/testboard.db \
+    --json /var/tmp/testboard-audit.json
+```
+
+It prints one line per check, and it **exits 3 if anything blocking failed** —
+so it can be run from a wrapper without a person reading the output. What it
+checks, and why each one is where it is:
+
+| Check | Blocking? | What it means |
+|---|---|---|
+| `source_tables` | yes | Every table the exporter knows about exists. A database older than the code fails the export halfway through. |
+| `identity_lengths` | no | Measures the longest `environment`, `script` and `test_name`, and picks the `VARCHAR` sizes from them (§B.1). |
+| `source_link_length` | yes | Nothing exceeds `VARCHAR(1024)`. |
+| `timestamp_widths` | yes | Every timestamp is exactly 26 characters. If not, lexical ordering is *already* broken and the migration is not the cause. |
+| `identity_whitespace` | no | Counts leading/trailing spaces in identity values. Harmless under `utf8mb4_nopad_bin`; the measurement of the damage if §A.3 was not followed. |
+| `case_collisions` | no | How many rows differ only by case — i.e. exactly what a case-insensitive collation would merge. Non-zero makes §C.2 the only thing standing between you and data loss. |
+| `orphan_rows` | yes | Rows whose parent is missing. InnoDB will reject them (§B.6). |
+
+It also records the volumes, the largest captured output (which §C.3 checks
+against `max_allowed_packet`), and the `schema_version` — §E.4 compares that
+last one after the load.
+
+<details>
+<summary>The same checks as raw SQL, if you would rather see them yourself</summary>
+
+These use SQLite syntax (`||`) deliberately, because their job is to describe
+the source. The cross-engine constraint in §E.4 does not apply here.
 
 ```sql
 -- Longest identity values. These choose your VARCHAR(n) in §B.1.
@@ -309,8 +639,7 @@ SELECT MAX(LENGTH(environment)), MAX(LENGTH(script)),
        MAX(LENGTH(test_name)),   MAX(LENGTH(source_link))
 FROM runs;
 
--- Timestamps must ALL be exactly 26 characters, or lexical ordering is
--- already broken and the migration is not the cause.
+-- Timestamps must ALL be exactly 26 characters.
 SELECT MIN(LENGTH(start_time)), MAX(LENGTH(start_time)),
        MIN(LENGTH(end_time)),   MAX(LENGTH(end_time)) FROM runs;
 
@@ -320,9 +649,8 @@ WHERE environment <> TRIM(environment)
    OR script      <> TRIM(script)
    OR test_name   <> TRIM(test_name);
 
--- Case-collision check: values that are distinct today but would COLLIDE
--- under a case-insensitive collation. Must be 0 — if it is not, §A.1's
--- collation is not optional, it is the only thing preventing data loss.
+-- Values that are distinct today but would COLLIDE under a
+-- case-insensitive collation.
 SELECT COUNT(*) - COUNT(DISTINCT LOWER(environment) || '/' || LOWER(script)
                         || '/' || LOWER(test_name) || '/' || start_time)
 FROM runs;
@@ -341,138 +669,150 @@ SELECT COUNT(*) FROM current_assignments ca
   LEFT JOIN users u ON u.username = ca.assignee
   WHERE ca.assignee IS NOT NULL AND u.username IS NULL;
 
--- Largest single blob, against max_allowed_packet (§A.3).
+-- Largest single blob, against max_allowed_packet (§A.5).
 SELECT MAX(LENGTH(output)), SUM(LENGTH(output)) FROM run_outputs;
-
--- Volumes, for the load estimate.
-SELECT (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM run_outputs),
-       (SELECT COUNT(*) FROM latest_runs), (SELECT COUNT(*) FROM users),
-       (SELECT COUNT(*) FROM comments), (SELECT COUNT(*) FROM assignments);
 
 -- The schema version being migrated. Record it.
 SELECT version FROM schema_version;
 ```
 
-Write every answer down. §E.4 compares against them.
+</details>
 
-### C.2 Prove the collation, don't trust it
+### C.2 / C.3 / C.4 The server preflight — one command
 
-Run as `testboard_migrate`, on the empty MariaDB database, **before** loading
-anything. This is the single most valuable five seconds in the whole procedure.
-
-```sql
-CREATE TABLE _collation_probe (k VARCHAR(64) NOT NULL PRIMARY KEY);
-INSERT INTO _collation_probe (k) VALUES ('a'), ('A'), ('a ');
-SELECT COUNT(*) AS must_be_three FROM _collation_probe;
-DROP TABLE _collation_probe;
+```bash
+python3 tools/migrate_to_mariadb.py preflight \
+    --config ~/.testboard-migrate.cnf \
+    --max-blob-bytes <from the audit>
 ```
 
-- **3** → case-sensitive and no-pad. Correct. Proceed.
-- **Duplicate key error, or fewer than 3** → the collation is wrong. **Stop.**
-  Loading now would merge distinct tests into one and the damage is not
-  reversible without a reload. Return to §A.1.
+Every one of these is a **gate**: it exits 3 and the load does not run.
 
-### C.3 Prove your grants are sufficient
+| Check | What it proves |
+|---|---|
+| `server_version` | ≥ 10.2, so `NO PAD` collations exist (§B.3). |
+| `sql_mode_strict` | Truncation is an error, not a silent merge. |
+| `database_collation` | The database is binary-collated (§A.3). |
+| `max_allowed_packet` | The largest captured output fits in one packet, with margin for the hex form on the wire. |
+| `local_infile` | The bulk load path is available. |
+| `grants` | The account can create, insert and drop — i.e. you are `testboard_migrate` and not `testboard_app`. |
+| `collation_probe` | **The important one.** Stores `'a'`, `'A'` and `'a '` in a primary key and counts them. Three means case-sensitive and no-pad. Fewer — or a duplicate-key error — means loading now would merge distinct tests, permanently. |
+| `strict_probe` | Inserts a 7-character value into `VARCHAR(4)`. **It must fail.** A probe that passed by succeeding could not tell strict mode from a statement that never ran. |
+| `target_is_empty` | You are not loading on top of an earlier attempt. `--force` overrides, for scratch databases. |
 
-Cheaper to find out now than four hours into a load:
+The probe tables are created and dropped inside the check. If one is left behind
+by an interrupted run, the next `target_is_empty` check ignores it (probe names
+start with `_`) but you should drop it.
 
-```sql
-SHOW GRANTS FOR CURRENT_USER();
-SELECT @@sql_mode, @@max_allowed_packet, @@local_infile,
-       @@character_set_database, @@collation_database, VERSION();
-CREATE TABLE _grant_probe (id BIGINT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(10));
-INSERT INTO _grant_probe (v) VALUES ('ok');
-DROP TABLE _grant_probe;
-```
-
-### C.4 Prove strict mode is on
-
-Truncation is silent without it, and silent truncation merges tests (§A.3):
-
-```sql
-CREATE TABLE _strict_probe (v VARCHAR(4));
-INSERT INTO _strict_probe VALUES ('toolong');   -- MUST fail with an error
-DROP TABLE _strict_probe;
-```
-
-If that `INSERT` **succeeds**, strict mode is off. Stop, and go back to §A.3.
+This step is not run by the same tool the operator uses for everything else by
+accident: it is worth more than the rest of the procedure put together, and it
+takes about a second.
 
 ---
 
 ## D. Export and load
 
-### D.1 The tool you need
+### D.1 The two tools
 
-`tools/export_for_mariadb.py` — **does not exist yet**; specified here, listed
-as WP-10 in [`UPGRADE_PLAN.md`](UPGRADE_PLAN.md). It is stdlib-only, Python 3.6,
-opens SQLite read-only, and needs no MariaDB driver — it writes files, and the
-`mysql` client loads them. That is deliberate: it means the export half is
-fully testable tonight on a machine with no MariaDB anywhere near it.
+Both exist and both are covered by tests.
 
-It writes, into an output directory:
+| Tool | What it does | Needs a database server? |
+|---|---|---|
+| `tools/export_for_mariadb.py` | Reads SQLite read-only, writes the load files | No |
+| `tools/migrate_to_mariadb.py` | Audits, preflights, calls the exporter, creates the schema, loads, verifies | Yes, via the vendored driver — nothing installed |
+
+The exporter writes, into an output directory:
 
 | File | Contents |
 |---|---|
-| `schema.sql` | `CREATE TABLE` DDL per §B, with the `VARCHAR` sizes passed in as arguments so §C.1's audit drives them |
+| `schema.sql` | `CREATE TABLE` DDL per §B, with the `VARCHAR` sizes from the audit |
 | `<table>.tsv` | One file per table, tab-separated, `\N` for NULL, `\t`/`\n`/`\\` escaped |
 | `run_outputs.tsv` | `run_id` and the blob **hex-encoded** — this is why the export is ~2× the database size |
-| `load.sql` | Ordered `LOAD DATA` statements honouring foreign-key order (§B.6), with `UNHEX()` on the blob column |
+| `load.sql` | Ordered `LOAD DATA` statements honouring foreign-key order (§B.6), with `UNHEX()` on the blob column, and the secondary indexes created *after* the load |
 | `verify_source.txt` | Every check in §E.4, computed from SQLite |
 | `verify.sql` | The same checks, for MariaDB — **byte-identical SQL**, not a translation |
 
-`verify.sql` and the queries behind `verify_source.txt` must be generated from
-**one** list of query strings that both engines accept (§E.4). Two hand-written
-variants will drift, and a verification step that drifts is worse than none: it
-reports agreement between two different questions.
+`verify.sql` and `verify_source.txt` are generated from **one** list of query
+strings that both engines accept. Two hand-written variants would drift, and a
+verification step that drifts is worse than none: it reports agreement between
+two different questions.
 
-Required behaviours: refuse to overwrite a non-empty output directory; stream
-rather than materialise (it must not hold 900 MB in memory); print row counts
-and elapsed time per table; exit non-zero on any error.
+**Why the migration tool uses the vendored driver and never the `mysql`
+client.** Because the deployment property is the point. testboard is deployable
+by copying a checkout onto a RHEL 8 box — no pip, no build step, no virtualenv —
+and shelling out would have quietly added "a MariaDB client package must be
+installed on the web server" to that list. An RPM is a dependency in exactly the
+same way a pip install is, and it fails in the same place: on someone else's
+machine, during the cutover. `third_party/pymysql` is *present*, not installed.
 
-### D.2 Export
+Two things follow. The preflight connects with the same driver the dashboard
+will use (§F), so an auth plugin it cannot do is found in §C.2 rather than at
+first service start. And `tests/test_vendored_driver.py` now allowlists this one
+tool rather than forbidding every import — `testboard/` and `feeder/` are still
+held to "not yet", so the driver's revert story is unchanged.
+
+### D.2 The whole thing, one command
 
 ```bash
-python tools/export_for_mariadb.py \
+python3 tools/migrate_to_mariadb.py all \
+    --db     /path/to/testboard.db \
+    --out    /var/tmp/testboard-export \
+    --config ~/.testboard-migrate.cnf
+```
+
+That is: audit → preflight → export → schema → load → verify, **stopping at the
+first failed gate** with exit code 3. The server preflight deliberately comes
+*before* the export: the collation probe costs a second and the export costs
+twenty minutes and 2.4 GB, and on cutover night those twenty minutes are inside
+the freeze window. It prints the elapsed time of every phase
+at the end, which is the number §E.1 exists to obtain.
+
+Exit codes: `0` everything passed · `2` bad usage or an unexpected error ·
+`3` a check said no.
+
+The steps can also be run one at a time — `audit`, `preflight`, `export`,
+`load`, `verify` — and that is what you want when something has failed and you
+are re-running one part. `--help` on any of them.
+
+### D.3 What it does, and how to do it by hand
+
+If you need to intervene by hand, this is the same procedure through the `mysql`
+client. It is a **fallback for a human**, not a path the tooling takes — the
+client has to be installed for it, which is exactly what §D.1 explains the
+tooling avoids. The credentials file is §A.9's.
+
+```bash
+# 1. export (no database needed)
+python3 tools/export_for_mariadb.py \
     --db /path/to/testboard.db \
     --out /var/tmp/testboard-export \
     --env-len 64 --script-len 255 --test-len 255
+
+# 2. schema, then data — from inside the export directory, because
+#    load.sql names its .tsv files relatively
+cd /var/tmp/testboard-export
+mysql --defaults-file=~/.testboard-migrate.cnf < schema.sql
+mysql --defaults-file=~/.testboard-migrate.cnf --local-infile=1 < load.sql
+
+# 3. verify: compare this output against verify_source.txt
+mysql --defaults-file=~/.testboard-migrate.cnf --batch --raw \
+      --skip-column-names < verify.sql
 ```
 
-Take the lengths from §C.1 and round up generously — you have headroom (§B.1),
-and re-running the whole migration because a name was 8 characters too long is
-a bad afternoon.
-
-### D.3 Load
-
-Credentials on a command line are visible to every user on the box via `ps`.
-Use an option file instead:
-
-```ini
-# ~/.testboard-migrate.cnf   — chmod 600
-[client]
-host     = dbhost.example
-user     = testboard_migrate
-password = MIGRATE_PASSWORD_HERE
-database = testboard
-local-infile = 1
-```
-
-```bash
-chmod 600 ~/.testboard-migrate.cnf
-mysql --defaults-file=~/.testboard-migrate.cnf < /var/tmp/testboard-export/schema.sql
-mysql --defaults-file=~/.testboard-migrate.cnf < /var/tmp/testboard-export/load.sql
-```
+Take the `--env-len` etc. from §C.1 and round up generously — re-running the
+whole migration because a name was 8 characters too long is a bad afternoon. The
+`all` command does this for you from the measured maxima.
 
 If `LOAD DATA LOCAL INFILE` is refused — some builds disable it on the client
 side regardless of the server setting — the fallback is batched multi-row
-`INSERT` statements. Have `export_for_mariadb.py` emit those with
-`--format=inserts`. It is several times slower and it is a supported path, not
-a failure.
+`INSERT` statements. It is several times slower and it is a supported path, not
+a failure; it is not implemented in the exporter yet, so raise it as work if you
+hit it.
 
-**Indexes:** create the tables with their primary keys, load, then add the
-secondary indexes. Building an index once over a loaded table is much faster
-than maintaining it row by row during the load. `load.sql` must do this in that
-order.
+**Indexes:** the generated `load.sql` creates the tables with their primary
+keys, loads, and only then adds the secondary indexes. Building an index once
+over a loaded table is much faster than maintaining it row by row during the
+load. Do not reorder that.
 
 ---
 
@@ -481,32 +821,48 @@ order.
 ### E.1 Dry run first — the dry run is also your estimate
 
 Copy the production SQLite file to the web server's local disk and run §D
-against it, into a scratch database (`testboard_dryrun`, same grants). Time
-every step. **Do not estimate the downtime window; measure it here.** Then run
-§E.4's verification against the dry-run database. Only when that passes do you
-schedule the real cutover.
+against it, into a scratch database (`testboard_dryrun`, same grants). **Do not
+estimate the downtime window; measure it here** — the `all` command prints
+per-phase timings for exactly this reason. Then check §E.4's verification
+passed. Only then schedule the real cutover.
+
+A ~950 MB database is not a thing you can rehearse on a laptop: the export is
+~2.4 GB of text and the load is tens of minutes at best. Run the dry run on the
+real hardware, over the real network path.
 
 Keep the dry-run database until the real one is verified — it is a free second
 opinion if a count disagrees.
 
 ### E.2 Freeze
 
+Yours to do, not the script's: these are decisions about when users lose writes.
+
 1. **Stop the feeder** (disable the cron entry). It is the only automated
    writer.
 2. Tell the team the dashboard is read-only for the window. Comments and
    assignments made during it will be lost — this is the one irreversible part,
    so keep the window short and do it outside working hours.
-3. Note the high-water mark: `python run_feeder.py --config <cfg> --status`.
+3. Note the high-water mark: `python3 run_feeder.py --config <cfg> --status`.
    You will need it in §E.5.
 
 ### E.3 Load
 
-Run §D against the live file. Note the finish time.
+Run §D.2 against the live file. Note the finish time.
 
 ### E.4 Verify — before letting anyone in
 
-Compare `verify_source.txt` (from SQLite) against the output of `verify.sql`
-(from MariaDB). Every line must match.
+`verify` is part of `all`, but run it again on its own if you have done anything
+by hand:
+
+```bash
+python3 tools/migrate_to_mariadb.py verify \
+    --config ~/.testboard-migrate.cnf \
+    --out /var/tmp/testboard-export
+```
+
+It runs each check against MariaDB and compares it to the answer recorded from
+SQLite at export time, reporting the first row that differs rather than a wall
+of output. Exit 3 on any disagreement.
 
 | Check | Why this one |
 |---|---|
@@ -515,12 +871,12 @@ Compare `verify_source.txt` (from SQLite) against the output of `verify.sql`
 | `COUNT(*)` grouped by `SUBSTR(start_time, 1, 10), result` over `runs` | A few thousand rows; catches partial loads and timestamp mangling. |
 | `MIN(start_time)`, `MAX(start_time)` | Catches truncated or reformatted timestamps. |
 | `SUM(LENGTH(output))`, `COUNT(*)` on `run_outputs` | Catches blob corruption in the hex round-trip. **The most likely thing to go wrong** in the whole load. |
-| Distinct identity-triple count (query below) | If this is *lower* in MariaDB, the collation merged tests. Stop and reload. |
+| Distinct identity-triple count | If this is *lower* in MariaDB, the collation merged tests. Stop and reload. |
 | `schema_version` | Must equal the value recorded in §C.1. |
 
-**Every check must be written so the identical SQL runs on both engines** —
-otherwise you are comparing two different questions and calling the agreement
-meaningful. Two traps in particular:
+**Every check is written so the identical SQL runs on both engines** — otherwise
+you are comparing two different questions and calling the agreement meaningful.
+Two traps in particular:
 
 ```sql
 -- Distinct triples. COUNT(DISTINCT a, b, c) is MariaDB-only; SQLite's
@@ -550,7 +906,7 @@ Then, by hand: open the dashboard, load a test detail page, read a run's output
 
 ### E.5 Restart the feeder
 
-Point it at the new dashboard and run a catch-up. The high-water mark is in the
+Point it at the dashboard and run a catch-up. The high-water mark is in the
 feeder's own state file on the feeder host, not in the database, so it survives
 this migration untouched — the catch-up covers the freeze window automatically.
 
@@ -566,56 +922,56 @@ So: verify (§E.4) *before* announcing that the dashboard is back. That ordering
 is the whole rollback plan.
 
 Keep the SQLite file, and a copy of the export directory, for at least a month.
+Delete `~/.testboard-migrate.cnf` (§A.9) once you are sure you are done with it.
 
 ---
 
 ## F. The application code
 
 The migration above moves the *data*. Making the *dashboard* talk to MariaDB is
-separate work, and it has a blocker that is the user's decision.
+separate work, and **it is not done.** Until it is, the loaded MariaDB database
+is a copy that nothing reads.
 
-### F.1 The driver problem, stated plainly
+### F.1 The driver — decided and shipped
 
-**There is no MariaDB/MySQL driver in the Python standard library.** The project
-constraint is "standard library only, no pip installs". Those cannot both hold.
-The options:
+**There is no MariaDB/MySQL driver in the Python standard library**, and the
+project constraint is "standard library only, no pip installs". That was
+resolved by **vendoring PyMySQL 1.0.2 into `third_party/pymysql/`**: pure
+Python, no compilation, works on Python 3.6, MIT-licensed. Dropped into the tree
+it is *present*, not *installed* — nothing runs `pip` on the server and the "no
+envs to set up" property is preserved. `CLAUDE.md` records the exemption and its
+limits; `tests/test_vendored_driver.py` pins the version, proves the import
+costs nothing, and holds `testboard/` and `feeder/` to **not yet**, so that
+reverting the decision stays a single commit touching no storage code.
+`tools/migrate_to_mariadb.py` already uses it — see §D.1 for why that is the
+point rather than an exception.
 
-1. **Vendor PyMySQL into the repository** *(recommended)*. Pure Python, no
-   compilation, works on Python 3.6, MIT-licensed — compatible with this repo's
-   own MIT `LICENSE`. Dropped into `third_party/pymysql/` it is *present*, not
-   *installed*: nothing runs `pip` on the server and the "no envs to set up"
-   property is preserved. The constraint's actual purpose — never depend on the
-   deployment host having anything — is honoured. Update the constraint's
-   wording in `CLAUDE.md` to say so, rather than quietly breaking it.
-2. **`mysqlclient` / `mariadb` via pip or RPM.** Faster (C extension), and it
-   means a compiler or a system package on the server, plus a version to track.
-   If the estate already ships `python3-PyMySQL` or similar as an RPM, this is
-   more attractive than it sounds — check before dismissing it.
-3. **Shell out to the `mysql` client.** Avoids the dependency and is
-   unacceptable for a serving path: no parameter binding, so every query becomes
-   a quoting problem, which is to say an injection problem. Listed only to be
-   ruled out explicitly.
-
-**Recommendation: option 1**, unless the estate already packages a driver, in
-which case option 2.
+The alternatives, recorded so the choice can be re-examined rather than
+re-litigated: a C-extension driver (`mysqlclient`, `mariadb`) is faster but
+means a compiler or an RPM on the server — worth reconsidering only if your
+estate already ships `python3-PyMySQL`; and shelling out to the `mysql` client
+is unacceptable **everywhere**, not just in the serving path. In a serving path
+the absence of parameter binding makes every query a quoting problem, which is
+to say an injection problem. Anywhere else it silently adds a package that must
+be installed on the deployment host, which is the one thing this project's
+design exists to avoid.
 
 ### F.2 Sequencing
 
-This is the part that cannot be done unattended tonight, because there is no
-MariaDB in the dev environment and none in CI — an agent cannot verify a port
-it cannot run.
+This is the part that cannot be done unattended, because there is no MariaDB in
+the dev environment and none in CI — nobody can verify a port they cannot run.
 
-**Phase 0 — tonight, SQLite-only, fully verifiable** (plan WP-5, WP-9):
-remove the `julianday()` call by storing `duration_seconds`; funnel the three
-`INSERT OR REPLACE` sites through one method; pin the re-import id behaviour
-with a test (§B.5); add the portability inventory test so this document's
-translation tables cannot silently go stale.
+**Phase 0 — done, SQLite-only, fully verifiable** (plan WP-5, WP-9, WP-10,
+WP-11): `julianday()` removed by storing `duration_seconds`; the re-import id
+behaviour pinned by a test (§B.5); the portability inventory test that stops
+this document's translation tables silently going stale; the export tool; the
+vendored driver.
 
-**Phase 1 — after the driver decision:** a `Dialect` seam in `storage.py`
-(placeholder style, upsert form, blob type, connect/pragma behaviour) with
-SQLite as one implementation and MariaDB as the other. `--db` grows a URL form.
-The 59 execute sites do not each need porting; the ~27 dialect-specific
-constructs do.
+**Phase 1 — next:** a `Dialect` seam in `storage.py` (placeholder style, upsert
+form, blob type, connect/pragma behaviour) with SQLite as one implementation and
+MariaDB as the other. `--db` grows a URL form, or a `--db-config` pointing at
+`/etc/testboard/db.cnf` (§A.10). The 59 execute sites do not each need porting;
+the ~27 dialect-specific constructs do.
 
 **Phase 2 — CI:** add a MariaDB service container to `.github/workflows/ci.yml`
 and run the storage and API suites against **both** backends. GitHub Actions
@@ -629,13 +985,17 @@ that kind of claim testable rather than to make it confidently.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Specified key was too long; max key length is 3072 bytes` | `VARCHAR(n)` too large for an indexed column | §B.1 — recompute the budget |
-| `Duplicate entry '...' for key 'PRIMARY'` during load | Case-insensitive or PAD-SPACE collation merging distinct rows | §A.1 and §C.2. Drop the database and reload; do not "fix" the duplicates |
-| `Data too long for column 'test_name'` | `VARCHAR(n)` too small | Good news — strict mode caught it. Re-export with larger `--test-len` |
-| Load succeeds but tests are missing afterwards | Strict mode **off**, values silently truncated and merged | §C.4. Reload from scratch |
-| `MySQL server has gone away` mid-load | A row exceeded `max_allowed_packet` | §A.3, raise it; the culprit is a large `run_outputs` blob |
-| `The used command is not allowed with this MariaDB version` | `LOAD DATA LOCAL INFILE` disabled | Enable `local_infile` both sides, or use `--format=inserts` (§D.3) |
-| `Cannot add or update a child row: a foreign key constraint fails` | Orphan rows, or wrong load order | §B.6 and §C.1 |
+| `Access denied for user 'testboard_migrate'@'...'` | The grant names a different host from the one MariaDB sees you coming from | §A.1 — `localhost` (socket) and the machine's own IP (TCP) are different accounts |
+| `the vendored MySQL driver is missing` | `third_party/pymysql` is absent — an incomplete checkout, not a missing install | Restore the directory from the repository. Nothing needs installing; see `third_party/README.md` |
+| `Specified key was too long; max key length is 3072 bytes` | `VARCHAR(n)` too large for an indexed column | §B.1 — the tool sizes these from the audit; if you passed them by hand, don't |
+| `Duplicate entry '...' for key 'PRIMARY'` during load | Case-insensitive or PAD-SPACE collation merging distinct rows | §A.3 and §C.2. Drop the database and reload; do not "fix" the duplicates |
+| `Data too long for column 'test_name'` | `VARCHAR(n)` too small | Good news — strict mode caught it. Re-run the audit and re-export |
+| Load succeeds but tests are missing afterwards | Strict mode **off**, values silently truncated and merged | §C.4's probe exists to make this impossible. If you skipped it: reload from scratch |
+| `MySQL server has gone away` mid-load | A row exceeded `max_allowed_packet` | §A.5, raise it; the culprit is a large `run_outputs` blob |
+| `The used command is not allowed with this MariaDB version` | `LOAD DATA LOCAL INFILE` disabled | Enable `local_infile` on both sides (§A.5, and `local-infile = 1` in the option file) |
+| `Cannot add or update a child row: a foreign key constraint fails` | Orphan rows, or wrong load order | §B.6 and §C.1 — the audit blocks on orphans for this reason |
+| A load failed partway and the next run says the target is not empty | The wreckage of the first attempt | Drop the tables (`testboard_migrate` holds `DROP` on this database, so it can — it just cannot drop the *database*), then run the `load` step again. Do not load on top |
+| `File 'runs.tsv' not found` | The client was run from outside the export directory | §D.3 — `cd` into it first; the tool does this for you |
 | Blob comparison fails in §E.4 | Hex round-trip; usually a missing `UNHEX()` or a client charset mangling the hex text | Re-check `load.sql`; blobs must never pass through a character-set conversion |
-| Dashboard works, is slow, buffer pool is large | Pool not warm yet, or not actually applied | `SHOW ENGINE INNODB STATUS`; confirm `@@innodb_buffer_pool_size` is what §A.3 set |
-| `'cryptography' package is required for sha256_password…` at connect | The account uses a sha256 auth plugin; the vendored driver cannot do those without a compiled package | §A.2 — recreate the account with `mysql_native_password`. Do **not** install `cryptography` on the server; "nothing to build on the server" is the property this whole design protects |
+| Dashboard works, is slow, buffer pool is large | Pool not warm yet, or not actually applied | `SHOW ENGINE INNODB STATUS`; confirm `@@innodb_buffer_pool_size` is what §A.5 set — and that MariaDB was **restarted** after the config change |
+| `'cryptography' package is required for sha256_password…` at connect | The account uses a sha256 auth plugin; the vendored driver cannot do those without a compiled package | §A.4 — recreate the account with `mysql_native_password`. Do **not** install `cryptography` on the server; "nothing to build on the server" is the property this whole design protects |
