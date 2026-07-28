@@ -482,32 +482,6 @@ export function stabilitySentence(stability) {
 }
 
 /**
- * The "Last pass" table cell: the date, and what it has been doing.
- *
- * Shared by Open actions and the triage queues, and shared on purpose.
- * These two started as one cell copied into one place and a bare
- * timestamp in the other, so the same test read as "last passed on the
- * 14th" in one list and "last passed on the 14th, fails about one run
- * in three" in the other. Same question, two answers, depending which
- * page you were on.
- *
- * Takes anything carrying `last_pass_time`, `failing_since` and
- * `stability` — a /api/summary queue entry or a /api/dashboard row.
- */
-export function lastPassCell(row) {
-  const cell = el("td", "history-cell");
-  if (row.last_pass_time) {
-    cell.appendChild(document.createTextNode(formatTime(row.last_pass_time)));
-  } else if (row.failing_since) {
-    cell.appendChild(el("span", "muted", "no pass on record"));
-  } else {
-    cell.appendChild(el("span", "muted", "—"));
-  }
-  cell.appendChild(el("span", "row-sub", stabilitySentence(row.stability)));
-  return cell;
-}
-
-/**
  * A strip of the last N results, oldest to newest.
  *
  * Supports the sentence rather than replacing it: the SHAPE of a
