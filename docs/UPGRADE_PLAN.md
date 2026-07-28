@@ -93,7 +93,8 @@ after a merge.
 | 2 | WP-4 | `users.deactivated_at`, `users.deactivated_by` | No |
 | 3 | WP-5 | `latest_runs.duration_seconds` | Yes — see §1.2 |
 | 4 | Perf pass | Sort indexes on `latest_runs` | No |
-| 5+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 5 | WP-13 | `environment_expectations` table | No |
+| 6+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry
@@ -696,6 +697,112 @@ read as permission to add dependencies.
 
 ---
 
+### WP-13 — declared environment expectations *(migration 5)* *(blocks WP-14)*
+
+Arises from WP-12, which shipped its core and named this as the follow-up.
+
+**Why.** WP-12 decides "has this test gone quiet" from when the suite actually
+ran: `analytics.find_passes` calls a block of activity a *pass* only when it ran
+at least half of that environment's tests, and `recent_cutoff` takes the start of
+the previous covered pass. The denominator for that "half" is inferred —
+`COUNT(*) FROM latest_runs` per environment, which is **every test ever seen**,
+a high-water mark that only ever grows.
+
+That is the one input inference cannot get right, and getting it wrong fails
+**silently and in the destructive direction**: if the denominator is too large,
+no block reaches coverage, no pass counts as covered, and `recent_cutoff` falls
+back to the 36-hour wall clock — reinstating exactly the Monday-morning bug
+WP-12 exists to fix, complete with the review panel offering to retire thousands
+of healthy tests. Nothing in the UI says so.
+
+**Already decided.**
+
+- **A declared count overrides the inferred one, per environment. An
+  environment with no row behaves exactly as it does today.** Additive: it
+  cannot regress an environment nobody has configured.
+- **The safety clamps in `recent_cutoff` do not move.** Declared values feed the
+  *coverage denominator* only. `min(fallback)` and `max(floor)` are what keep a
+  wrong declaration a slightly-off cutoff rather than a destructive bug, and
+  they are the reason the panel stopped offering to retire healthy tests. Any
+  version of this that computes a cutoff directly from a declared value and
+  drops those clamps is the regression to watch for.
+- **Expected test count only. No cadence column.** Cadence has no consumer:
+  every boundary in `find_passes` comes from observed gaps, deliberately
+  ("nothing here knows what time the suite runs"). A declared cadence would
+  either sit unread or would have to displace the observation, which is the
+  design being defended. Add it when something needs it.
+- **Retired tests come out of the inferred denominator** in the same package.
+  They are excluded from every other estate view, and counting tests that are
+  no longer in the suite is the most common way the denominator drifts high.
+  It is the same defect as the one being fixed, so it is fixed here.
+- **`GET /api/environments`** returns, per environment: the inferred count, the
+  declared count or null, who set it and when, and the **latest pass** as
+  `find_passes` sees it (`started`, `ended`, `runs`, `covered`). The echo is the
+  point: a declaration you cannot check against reality is a form nobody knows
+  how to fill in, and `covered: false` on every recent pass is the visible
+  symptom of the silent failure above.
+- **`PUT /api/environments/{environment}/expectation`** with
+  `{"expected_tests": int|null, "changed_by": str}`; `null` clears the
+  declaration and returns to inference. Presence of the row *is* the
+  declaration, the same shape as `test_retirements` and `users.deactivated_at`.
+- **Editing surface: a second `<details>` on Open actions**, beside "Manage
+  people". Same reasoning as WP-4 — administrative, rare, and a fifth HTML page
+  is four more places to forget the nav (WP-6's risk note).
+
+**Changes.** `testboard/storage.py` (migration 5; `list_environment_expectations`,
+`set_environment_expectation`, `clear_environment_expectation`, retirement
+exclusion in `test_counts_by_environment`), `testboard/analytics.py`
+(`effective_test_counts`), `testboard/api.py` (`/api/environments`, and one place
+that computes passes), `static/actions.js`, `static/actions.html`,
+`static/style.css`.
+
+**Tests.** `tests/test_migrations.py` picks up entry 5 automatically. Storage:
+round-trip declare/clear; migration 5 against a v4 database; retired tests absent
+from the inferred count. Analytics: declared wins, including when it is larger
+than anything ever seen; an undeclared environment is untouched. API: validation
+(zero, negative, non-integer, unknown environment), and — the one that matters —
+**a declared count too high stops passes counting as covered, and the cutoff is
+still never stricter than the wall-clock fallback.**
+
+**Risks.** `environment` is a TEXT primary key and inherits WP-4's
+case-sensitivity trap: SQLite is case-sensitive, a default MariaDB collation is
+not (runbook §B.3). Note it; do not normalise. `INSERT OR REPLACE` is **not**
+available here without moving the count in `tests/test_sql_portability.py` —
+use UPDATE-then-INSERT, as the rest of the codebase does.
+
+**Done when.** An environment's expected test count can be declared and cleared
+from the UI, a declaration changes which blocks count as passes, and the page
+shows whether the latest pass actually cleared the bar.
+
+---
+
+### WP-14 — in-run progress **(depends on WP-13)**
+
+**Why.** One environment takes 2.5 hours and there is no visibility while it
+runs. `find_passes` already computes runs-so-far per environment against an
+expected total — which is exactly a progress bar, and the numbers are already
+being fetched.
+
+**Already decided.**
+
+- **No new query.** It reads the passes WP-13 already computes from
+  `activity_buckets` (hour buckets, 14-day floor). §0.4's rule is satisfied by
+  reusing a bounded query rather than justifying a new one.
+- **"Running" is a shorter idle threshold than a pass boundary.** A pass ends
+  after `_PASS_GAP_HOURS` (6h) of quiet, so treating "the latest block has not
+  closed" as "still running" would show a finished 2.5-hour environment as in
+  progress for another six. Judge it on recent activity instead, and say
+  "finished at HH:MM" once it is done.
+- Surfaced on the dashboard home, where people look in the morning, not on the
+  admin page.
+
+**Risks.** An environment with no declared expectation has an inferred
+denominator that is a high-water mark, so its bar can sit at 80% forever. Show
+the number alongside the bar, and let a declaration be the fix — that is what
+WP-13 is for.
+
+---
+
 ## 3. Execution order
 
 Three lanes. WP-0 lands before anything that touches `MIGRATIONS`.
@@ -705,6 +812,8 @@ Lane A (schema/backend)    WP-0 → WP-4 → WP-5 → WP-9
 Lane B (frontend)          WP-1 → WP-2 → WP-3 → WP-7
 Lane C (features)                         WP-6, WP-8   (start after WP-5 + WP-2)
 Lane D (independent)       WP-11 → WP-10  (touches only new files — never blocked)
+
+Round 2 (after WP-12)      WP-13 → WP-14
 ```
 
 WP-10 and WP-11 share no file with any other package (WP-11 touches

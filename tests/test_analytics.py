@@ -956,3 +956,247 @@ class TestStabilityOf(unittest.TestCase):
                 (listed.transitions, listed.classification),
                 "disagreement on pattern {0}".format(
                     [r.name for r in pattern]))
+
+
+def hourly(
+    environment: str,
+    start: datetime.datetime,
+    hours: int,
+    per_hour: int,
+) -> List[tuple]:
+    """Activity buckets for one contiguous block of running."""
+    return [
+        (environment, start + datetime.timedelta(hours=offset), per_hour)
+        for offset in range(hours)
+    ]
+
+
+class TestFindPasses(unittest.TestCase):
+    """Blocks of activity, per environment, and whether each is a pass.
+
+    Both halves come from how the suite really runs: environments go
+    SEQUENTIALLY, so they cannot share one timeline; and a failed run is
+    followed by ad-hoc re-runs, which are blocks of activity that are
+    not passes of the suite.
+    """
+
+    def _nights(self, environment: str, nights: int, per_night: int,
+                hour: int = 2) -> List[tuple]:
+        buckets = []  # type: List[tuple]
+        for night in range(nights):
+            start = (NOW - datetime.timedelta(days=nights - night)).replace(
+                hour=hour, minute=0, second=0, microsecond=0)
+            buckets.extend(hourly(environment, start, 2, per_night // 2))
+        return buckets
+
+    def test_a_quiet_gap_starts_a_new_pass(self) -> None:
+        passes = analytics.find_passes(
+            self._nights("linux", 3, 100), {"linux": 100},
+            gap_hours=6.0, coverage=0.5)
+        self.assertEqual(len(passes), 3)
+        self.assertTrue(all(entry.covered for entry in passes))
+        self.assertEqual([entry.runs for entry in passes], [100, 100, 100])
+
+    def test_a_pause_shorter_than_the_gap_stays_one_pass(self) -> None:
+        start = NOW - datetime.timedelta(hours=10)
+        buckets = [
+            ("linux", start, 50),
+            ("linux", start + datetime.timedelta(hours=5), 50),
+        ]
+        passes = analytics.find_passes(
+            buckets, {"linux": 100}, gap_hours=6.0, coverage=0.5)
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(passes[0].runs, 100)
+
+    def test_environments_are_grouped_separately(self) -> None:
+        """They run sequentially. On one shared timeline whichever ran
+        first looks stale for the rest of the morning."""
+        buckets = (
+            self._nights("linux", 2, 100, hour=1)
+            + self._nights("win", 2, 100, hour=5)
+        )
+        passes = analytics.find_passes(
+            buckets, {"linux": 100, "win": 100},
+            gap_hours=6.0, coverage=0.5)
+        self.assertEqual(
+            sorted({entry.environment for entry in passes}),
+            ["linux", "win"])
+        self.assertEqual(len(passes), 4)
+
+    def test_an_ad_hoc_re_run_is_not_a_pass(self) -> None:
+        """The failure mode that made coverage necessary: without it, a
+        twenty-test re-run after a fix drags the line to this afternoon
+        and flags the entire estate."""
+        buckets = self._nights("linux", 2, 100)
+        buckets.append(("linux", NOW - datetime.timedelta(hours=1), 20))
+        passes = analytics.find_passes(
+            buckets, {"linux": 100}, gap_hours=6.0, coverage=0.5)
+        self.assertFalse(passes[-1].covered)
+        self.assertEqual(passes[-1].runs, 20)
+
+    def test_an_environment_with_no_recorded_tests_still_needs_one_run(
+        self
+    ) -> None:
+        """max(1, ...) - a zero denominator must not make an empty block
+        a covered pass by arithmetic."""
+        passes = analytics.find_passes(
+            [("new-env", NOW - datetime.timedelta(hours=2), 1)],
+            {}, gap_hours=6.0, coverage=0.5)
+        self.assertTrue(passes[0].covered)
+
+    def test_no_activity_is_no_passes(self) -> None:
+        self.assertEqual(
+            analytics.find_passes([], {"linux": 10}, 6.0, 0.5), [])
+
+
+class TestEffectiveTestCounts(unittest.TestCase):
+    """Declared beats inferred, in both directions."""
+
+    def test_a_declaration_wins_even_when_it_is_larger(self) -> None:
+        """The case inference cannot reach: an environment that has
+        never once reported in full would otherwise be judged against
+        its own shortfall, and every partial run would be a pass."""
+        self.assertEqual(
+            analytics.effective_test_counts(
+                {"linux": 400}, {"linux": 900}),
+            {"linux": 900})
+
+    def test_a_declaration_wins_when_it_is_smaller(self) -> None:
+        self.assertEqual(
+            analytics.effective_test_counts(
+                {"linux": 400}, {"linux": 100}),
+            {"linux": 100})
+
+    def test_an_undeclared_environment_is_untouched(self) -> None:
+        """What makes this additive: it cannot change the behaviour of
+        an environment nobody has configured."""
+        self.assertEqual(
+            analytics.effective_test_counts(
+                {"linux": 400, "win": 20}, {"linux": 900}),
+            {"linux": 900, "win": 20})
+
+    def test_a_declaration_for_an_unseen_environment_is_kept(self) -> None:
+        self.assertEqual(
+            analytics.effective_test_counts({}, {"new": 5}), {"new": 5})
+
+    def test_the_inputs_are_not_mutated(self) -> None:
+        inferred = {"linux": 400}
+        analytics.effective_test_counts(inferred, {"linux": 900})
+        self.assertEqual(inferred, {"linux": 400})
+
+    def test_a_declaration_changes_which_blocks_are_passes(self) -> None:
+        """The whole point, end to end: the same activity, judged
+        against a declared denominator, stops counting as a pass."""
+        buckets = [("linux", NOW - datetime.timedelta(hours=3), 300)]
+        inferred = {"linux": 400}
+        self.assertTrue(analytics.find_passes(
+            buckets, inferred, 6.0, 0.5)[0].covered)
+        declared = analytics.effective_test_counts(inferred, {"linux": 900})
+        self.assertFalse(analytics.find_passes(
+            buckets, declared, 6.0, 0.5)[0].covered)
+
+
+class TestRecentCutoff(unittest.TestCase):
+    """The staleness line, and the two clamps that bound it.
+
+    The clamps are load-bearing. Everything feeding this is derived or
+    declared, and they are what keep a wrong derivation a slightly-off
+    cutoff rather than the review panel offering to retire thousands of
+    healthy tests.
+    """
+
+    FALLBACK = NOW - datetime.timedelta(hours=36)
+    FLOOR = NOW - datetime.timedelta(days=14)
+
+    def _pass(self, environment: str, days_ago: float,
+              covered: bool = True) -> analytics.Pass:
+        started = NOW - datetime.timedelta(days=days_ago)
+        return analytics.Pass(
+            environment=environment, started=started,
+            ended=started + datetime.timedelta(hours=2),
+            runs=100, covered=covered)
+
+    def test_it_takes_the_previous_covered_pass(self) -> None:
+        """One whole pass of grace, so a test the currently-running pass
+        has not reached yet is never called missing."""
+        passes = [self._pass("linux", 3), self._pass("linux", 2),
+                  self._pass("linux", 1)]
+        cutoff = analytics.recent_cutoff(passes, self.FALLBACK, self.FLOOR)
+        self.assertEqual(cutoff.when, passes[1].started)
+        self.assertTrue(cutoff.from_passes)
+        self.assertEqual(cutoff.environments, ["linux"])
+
+    def test_one_covered_pass_is_used_rather_than_ignored(self) -> None:
+        passes = [self._pass("linux", 5)]
+        cutoff = analytics.recent_cutoff(passes, self.FALLBACK, self.FLOOR)
+        self.assertEqual(cutoff.when, passes[0].started)
+
+    def test_the_oldest_across_environments_wins(self) -> None:
+        """Being too lenient only delays a report; being too strict
+        accuses thousands of healthy tests."""
+        passes = [
+            self._pass("linux", 4), self._pass("linux", 3),
+            self._pass("win", 3), self._pass("win", 2),
+        ]
+        cutoff = analytics.recent_cutoff(passes, self.FALLBACK, self.FLOOR)
+        # linux's previous covered pass is 4 days old, win's is 3; the
+        # older of the two serves the estate.
+        self.assertEqual(cutoff.when, NOW - datetime.timedelta(days=4))
+        self.assertEqual(cutoff.environments, ["linux", "win"])
+
+    def test_uncovered_passes_are_ignored(self) -> None:
+        passes = [self._pass("linux", 9, covered=False),
+                  self._pass("linux", 2)]
+        cutoff = analytics.recent_cutoff(passes, self.FALLBACK, self.FLOOR)
+        self.assertEqual(cutoff.when, passes[1].started)
+
+    def test_no_covered_pass_falls_back_to_the_wall_clock(self) -> None:
+        """The silent failure a too-high declaration causes. It is
+        reported rather than derived from the timestamp, because the
+        caller cannot tell these two cases apart from the value."""
+        cutoff = analytics.recent_cutoff(
+            [self._pass("linux", 3, covered=False)],
+            self.FALLBACK, self.FLOOR)
+        self.assertEqual(cutoff.when, self.FALLBACK)
+        self.assertFalse(cutoff.from_passes)
+        self.assertEqual(cutoff.environments, [])
+
+    def test_it_is_never_stricter_than_the_fallback(self) -> None:
+        """So this can only ever flag FEWER tests than the wall clock."""
+        passes = [self._pass("linux", 0.5), self._pass("linux", 0.2)]
+        cutoff = analytics.recent_cutoff(passes, self.FALLBACK, self.FLOOR)
+        self.assertEqual(cutoff.when, self.FALLBACK)
+        self.assertFalse(cutoff.from_passes)
+
+    def test_it_is_never_older_than_the_floor(self) -> None:
+        """So a stalled feeder cannot slide the line back for ever."""
+        passes = [self._pass("linux", 40), self._pass("linux", 39)]
+        cutoff = analytics.recent_cutoff(passes, self.FALLBACK, self.FLOOR)
+        self.assertEqual(cutoff.when, self.FLOOR)
+
+
+class TestCompletePasses(unittest.TestCase):
+    """Passes the lookback window cannot have cut short."""
+
+    FLOOR = NOW - datetime.timedelta(days=14)
+
+    def _pass(self, started: datetime.datetime) -> analytics.Pass:
+        return analytics.Pass(
+            environment="linux", started=started,
+            ended=started + datetime.timedelta(hours=1),
+            runs=10, covered=False)
+
+    def test_a_pass_starting_at_the_window_edge_is_dropped(self) -> None:
+        """Its run count is whatever fell inside the window, so its
+        coverage verdict means nothing - and shown on a page it is a
+        permanently red row that is an artefact of the edge."""
+        entry = self._pass(self.FLOOR + datetime.timedelta(hours=1))
+        self.assertEqual(
+            analytics.complete_passes([entry], self.FLOOR, 6.0), [])
+
+    def test_a_pass_after_a_full_quiet_gap_is_kept(self) -> None:
+        """The environment was demonstrably quiet for a whole gap, so
+        nothing outside the window could have belonged to it."""
+        entry = self._pass(self.FLOOR + datetime.timedelta(hours=7))
+        self.assertEqual(
+            analytics.complete_passes([entry], self.FLOOR, 6.0), [entry])

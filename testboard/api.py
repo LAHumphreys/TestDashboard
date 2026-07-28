@@ -530,10 +530,28 @@ _PASS_COVERAGE = 0.5
 _PASS_LOOKBACK_DAYS = 14
 
 
-def _recent_cutoff(
+class _PassView(NamedTuple):
+    """Everything derived from the suite's own rhythm, computed once.
+
+    One call path, deliberately. If the admin page worked out its passes
+    separately from the cutoff, a declared expectation could change what
+    the page shows and not what the estate is judged by — worse than not
+    having the feature, because it would look like it worked.
+    """
+
+    passes: List[analytics.Pass]
+    cutoff: analytics.Cutoff
+    inferred: Dict[str, int]
+    declared: Dict[str, int]
+    effective: Dict[str, int]
+    fallback: datetime.datetime
+    floor: datetime.datetime
+
+
+def _pass_view(
     storage: Storage, now_value: datetime.datetime
-) -> datetime.datetime:
-    """When a test's silence starts being suspicious.
+) -> _PassView:
+    """Group recent activity into passes and derive the staleness line.
 
     Derived from when the suite actually ran, not from the wall clock.
 
@@ -554,13 +572,31 @@ def _recent_cutoff(
     """
     fallback = now_value - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
     floor = now_value - datetime.timedelta(days=_PASS_LOOKBACK_DAYS)
+    inferred = storage.test_counts_by_environment()
+    declared = storage.declared_test_counts()
+    effective = analytics.effective_test_counts(inferred, declared)
     passes = analytics.find_passes(
         storage.activity_buckets(floor),
-        storage.test_counts_by_environment(),
+        effective,
         gap_hours=_PASS_GAP_HOURS,
         coverage=_PASS_COVERAGE,
     )
-    return analytics.recent_cutoff(passes, fallback, floor)
+    return _PassView(
+        passes=passes,
+        cutoff=analytics.recent_cutoff(passes, fallback, floor),
+        inferred=inferred,
+        declared=declared,
+        effective=effective,
+        fallback=fallback,
+        floor=floor,
+    )
+
+
+def _recent_cutoff(
+    storage: Storage, now_value: datetime.datetime
+) -> datetime.datetime:
+    """The staleness line alone, for the endpoints that only need it."""
+    return _pass_view(storage, now_value).cutoff.when
 
 
 def _handle_dashboard(
@@ -1266,6 +1302,159 @@ def _handle_time(
     )
 
 
+def _pass_json(entry: analytics.Pass) -> Dict[str, Any]:
+    """One inferred pass, as the environments page shows it."""
+    return {
+        "started": model.format_iso(entry.started),
+        "ended": model.format_iso(entry.ended),
+        "runs": entry.runs,
+        "covered": entry.covered,
+    }
+
+
+def _handle_environments_list(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """GET /api/environments — declared expectations, against reality.
+
+    The declaration on its own is a number in a box. What makes it
+    usable is the echo beside it: how many of the recent blocks of
+    activity actually counted as passes of the suite, and whether the
+    staleness line came from a pass at all.
+
+    That is the whole point. A declared count that is too high fails
+    SILENTLY — nothing clears the coverage bar, no pass counts, and the
+    cutoff drops back to the 36-hour wall clock, which is the
+    Monday-morning bug the derived cutoff exists to fix. ``covered: 0 of
+    14`` and ``cutoff_from_passes: false`` are what that looks like from
+    the outside, and without them nobody could tell.
+
+    Costs one hour-bucketed query over a fortnight (a few hundred rows),
+    the same one ``/api/summary`` already runs.
+    """
+    view = _pass_view(storage, now())
+    shown = analytics.complete_passes(
+        view.passes, view.floor, _PASS_GAP_HOURS
+    )
+    by_env = {}  # type: Dict[str, List[analytics.Pass]]
+    for entry in shown:
+        by_env.setdefault(entry.environment, []).append(entry)
+    declared_rows = {
+        row.environment: row
+        for row in storage.list_environment_expectations()
+    }
+
+    items = []  # type: List[Dict[str, Any]]
+    for environment in storage.known_environments():
+        found = by_env.get(environment, [])
+        row = declared_rows.get(environment)
+        items.append({
+            "environment": environment,
+            "tests_seen": view.inferred.get(environment, 0),
+            "expected_tests": None if row is None else row.expected_tests,
+            "effective_expected": view.effective.get(environment, 0),
+            "updated_at": (
+                None if row is None else model.format_iso(row.updated_at)
+            ),
+            "updated_by": None if row is None else row.updated_by,
+            "passes_total": len(found),
+            "passes_covered": len([e for e in found if e.covered]),
+            "latest_pass": _pass_json(found[-1]) if found else None,
+        })
+
+    return _json_response(
+        200,
+        {
+            "environments": items,
+            "cutoff": model.format_iso(view.cutoff.when),
+            "cutoff_from_passes": view.cutoff.from_passes,
+            "fallback": model.format_iso(view.fallback),
+            "recent_hours": _SUMMARY_RECENT_HOURS,
+            "coverage": _PASS_COVERAGE,
+            "lookback_days": _PASS_LOOKBACK_DAYS,
+        },
+    )
+
+
+def _parse_expected_tests(obj: Dict[str, Any]) -> Optional[int]:
+    """Validate ``expected_tests``; None means "clear the declaration".
+
+    ``bool`` is rejected explicitly because it is an ``int`` in Python,
+    so ``{"expected_tests": true}`` would otherwise declare that the
+    environment runs one test.
+    """
+    if "expected_tests" not in obj:
+        raise _HttpError(400, "expected_tests: required field is missing")
+    value = obj["expected_tests"]
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _HttpError(
+            400,
+            "expected_tests: must be a whole number or null, got "
+            "{}".format(type(value).__name__),
+        )
+    if value < 1:
+        raise _HttpError(
+            400,
+            "expected_tests: must be at least 1, got {} (send null to "
+            "go back to inferring it)".format(value),
+        )
+    return value
+
+
+def _handle_environment_expectation(
+    storage: Storage,
+    request: Request,
+    environment: str,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """PUT /api/environments/{environment}/expectation — declare or clear.
+
+    Body: ``{"expected_tests": int|null, "changed_by": str}``. ``null``
+    deletes the declaration and returns to the inferred count.
+
+    An environment that has never reported a run is a 404. Declaring one
+    would affect nothing and a typo would leave a row nobody can see the
+    purpose of; the listing includes declarations whose environment has
+    since disappeared precisely so a rename can be cleaned up.
+    """
+    obj = _parse_json_object(request.body)
+    expected = _parse_expected_tests(obj)
+    changed_by = _validate_username(obj, "changed_by")
+
+    if environment not in storage.known_environments():
+        raise _HttpError(
+            404, "unknown environment: {}".format(environment)
+        )
+
+    if expected is None:
+        cleared = storage.clear_environment_expectation(environment)
+        return _json_response(
+            200,
+            {
+                "environment": environment,
+                "expected_tests": None,
+                "cleared": cleared,
+            },
+        )
+    record = storage.set_environment_expectation(
+        environment, expected, changed_by, now()
+    )
+    return _json_response(
+        200,
+        {
+            "environment": record.environment,
+            "expected_tests": record.expected_tests,
+            "updated_at": model.format_iso(record.updated_at),
+            "updated_by": record.updated_by,
+            "cleared": False,
+        },
+    )
+
+
 def _handle_users_list(storage: Storage, request: Request) -> Response:
     """GET /api/users — users ordered by username.
 
@@ -1399,6 +1588,17 @@ def _route(
     if rest == ["time"]:
         _check_method(request.method, ("GET",))
         return _handle_time(storage, request, now)
+
+    if rest == ["environments"]:
+        _check_method(request.method, ("GET",))
+        return _handle_environments_list(storage, request, now)
+
+    if (len(rest) == 3 and rest[0] == "environments"
+            and rest[2] == "expectation"):
+        _check_method(request.method, ("PUT",))
+        return _handle_environment_expectation(
+            storage, request, rest[1], now
+        )
 
     if rest == ["users"]:
         _check_method(request.method, ("GET", "POST"))

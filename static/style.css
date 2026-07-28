@@ -1356,3 +1356,24 @@ button.bar-row:focus-visible {
 .run-cell.result-unexpected-pass { background: var(--c-up); }
 
 .history-cell .row-sub { display: block; }
+
+
+/* ---------- Environment expectations (WP-13) ---------- */
+
+/* The declared test count is the denominator of the coverage test that
+   decides whether a night counted as a pass of the suite. Narrow on
+   purpose: it holds a count, and a wide box invites a sentence. */
+.env-expected {
+  width: 7em;
+  font: inherit;
+  color: inherit;
+  background: var(--card);
+  border: 1px solid #c9c9c4;
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+
+/* Nothing counted. The number beside it is the actual signal — this only
+   draws the eye to a row that is worth reading, and never carries the
+   meaning on its own. */
+.env-none-counted { color: var(--c-fail); font-weight: 600; }

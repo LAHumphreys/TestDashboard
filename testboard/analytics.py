@@ -82,6 +82,9 @@ __all__ = [
     "group_executions",
     "Pass",
     "find_passes",
+    "complete_passes",
+    "effective_test_counts",
+    "Cutoff",
     "recent_cutoff",
 ]
 
@@ -560,11 +563,78 @@ def find_passes(
     return passes
 
 
+def complete_passes(
+    passes: Sequence[Pass],
+    floor: datetime.datetime,
+    gap_hours: float,
+) -> List[Pass]:
+    """Passes that the lookback window cannot have cut short.
+
+    ``find_passes`` only sees activity since *floor*, so the oldest
+    block in the window may be the tail of a pass that started before
+    it. Its run count is then whatever fell inside the window, which can
+    fail the coverage test for no reason but the window's edge.
+
+    A block is safe when it starts at least *gap_hours* after the floor:
+    the environment was demonstrably quiet for a full gap beforehand, so
+    nothing outside the window could have belonged to it.
+
+    Used for what is DISPLAYED, not for the cutoff. An edge artefact
+    marked uncovered only makes :func:`recent_cutoff` more lenient, and
+    leniency is the safe direction; shown on a page it is a permanent
+    red row that means nothing.
+    """
+    edge = floor + datetime.timedelta(hours=gap_hours)
+    return [entry for entry in passes if entry.started >= edge]
+
+
+def effective_test_counts(
+    inferred: Dict[str, int], declared: Dict[str, int]
+) -> Dict[str, int]:
+    """Merge declared expected test counts over inferred ones.
+
+    A declaration WINS, including — especially — when it is larger than
+    anything ever observed. That is the point: *inferred* is
+    ``COUNT(*)`` over one row per test ever seen, so an environment that
+    has never once reported in full would otherwise be judged against
+    its own shortfall and every partial run would look like a complete
+    pass.
+
+    An environment nobody has declared keeps its inferred count exactly,
+    which is what makes this additive: it cannot change the behaviour of
+    an environment nobody has configured.
+
+    Feeds only the coverage denominator of :func:`find_passes`. It must
+    never be allowed to set a cutoff directly — see
+    :func:`recent_cutoff`, whose two clamps are what keep a wrong
+    declaration a slightly-off cutoff rather than a destructive one.
+    """
+    counts = dict(inferred)
+    counts.update(declared)
+    return counts
+
+
+class Cutoff(NamedTuple):
+    """The staleness line, and what decided it.
+
+    ``from_passes`` is False when the wall-clock fallback won — either
+    because no block of activity cleared the coverage bar, or because
+    every pass that did is more recent than the fallback anyway. The
+    first case is a misconfiguration that is otherwise completely
+    silent, which is why this is reported rather than derived from the
+    timestamp by a caller.
+    """
+
+    when: datetime.datetime
+    from_passes: bool
+    environments: List[str]
+
+
 def recent_cutoff(
     passes: Sequence[Pass],
     fallback: datetime.datetime,
     floor: datetime.datetime,
-) -> datetime.datetime:
+) -> Cutoff:
     """When a test's silence starts being suspicious.
 
     Per environment, the start of the PREVIOUS covered pass: one whole
@@ -578,8 +648,12 @@ def recent_cutoff(
     Never stricter than *fallback* (the old wall-clock window), so this
     can only ever flag FEWER tests than before; never older than
     *floor*, so a stalled feeder cannot slide the line back for ever.
+    Both clamps are load-bearing: everything feeding this is derived or
+    declared, and they are what bound how wrong a derivation or a
+    declaration can make it.
     """
     cutoff = fallback
+    from_passes = False
     by_env = {}  # type: Dict[str, List[Pass]]
     for entry in passes:
         if entry.covered:
@@ -587,8 +661,14 @@ def recent_cutoff(
     for environment in sorted(by_env):
         covered = by_env[environment]
         chosen = covered[-2] if len(covered) >= 2 else covered[-1]
-        cutoff = min(cutoff, chosen.started)
-    return max(cutoff, floor)
+        if chosen.started < cutoff:
+            cutoff = chosen.started
+            from_passes = True
+    return Cutoff(
+        when=max(cutoff, floor),
+        from_passes=from_passes,
+        environments=sorted(by_env),
+    )
 
 
 def group_executions(

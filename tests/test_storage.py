@@ -2372,3 +2372,178 @@ class TestSortIndexesAreUsed(StorageTestBase):
         times = [row.start_time for row in rows]
         self.assertEqual(times, sorted(times, reverse=True))
         self.assertEqual(len(times), 40)
+
+
+class TestEnvironmentExpectations(StorageTestBase):
+    """Declared expected test counts (migration 5).
+
+    The declaration exists because the inferred denominator — every test
+    ever seen in an environment — is a high-water mark, and too high a
+    denominator makes real passes fail the coverage test SILENTLY.
+    """
+
+    def _declare(self, environment: str = "linux-sim",
+                 expected: int = 400) -> None:
+        self.store.set_environment_expectation(
+            environment, expected, "alice", CREATED)
+
+    def test_nothing_is_declared_to_begin_with(self) -> None:
+        self.assertEqual(self.store.declared_test_counts(), {})
+        self.assertEqual(self.store.list_environment_expectations(), [])
+
+    def test_declare_then_read_back(self) -> None:
+        self._declare()
+        self.assertEqual(
+            self.store.declared_test_counts(), {"linux-sim": 400})
+        (row,) = self.store.list_environment_expectations()
+        self.assertEqual(row.environment, "linux-sim")
+        self.assertEqual(row.expected_tests, 400)
+        self.assertEqual(row.updated_by, "alice")
+        self.assertEqual(row.updated_at, CREATED)
+
+    def test_redeclaring_replaces_rather_than_duplicates(self) -> None:
+        self._declare(expected=400)
+        later = CREATED + datetime.timedelta(days=1)
+        self.store.set_environment_expectation(
+            "linux-sim", 900, "bob", later)
+        rows = self.store.list_environment_expectations()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].expected_tests, 900)
+        self.assertEqual(rows[0].updated_by, "bob")
+        self.assertEqual(rows[0].updated_at, later)
+
+    def test_declaring_creates_the_user_that_did_it(self) -> None:
+        """Same rule as comments and assignments: a name that acted is a
+        user, so the audit trail never points at nobody."""
+        self._declare()
+        self.assertIsNotNone(self.store.get_user("alice"))
+
+    def test_clearing_returns_to_inference(self) -> None:
+        self._declare()
+        self.assertTrue(
+            self.store.clear_environment_expectation("linux-sim"))
+        self.assertEqual(self.store.declared_test_counts(), {})
+
+    def test_clearing_what_was_never_declared_is_false_not_an_error(
+        self
+    ) -> None:
+        self.assertFalse(
+            self.store.clear_environment_expectation("never-existed"))
+
+    def test_environments_are_case_sensitive(self) -> None:
+        """SQLite compares TEXT keys byte for byte; a default MariaDB
+        collation would not (runbook B.3). Pinned rather than
+        normalised, because latest_runs.environment is not normalised
+        either and folding one of the two would be worse than neither."""
+        self._declare("linux", 100)
+        self._declare("Linux", 200)
+        self.assertEqual(
+            self.store.declared_test_counts(),
+            {"linux": 100, "Linux": 200})
+
+    def test_known_environments_covers_run_and_declared_alike(
+        self
+    ) -> None:
+        """A declaration whose environment has been renamed away must
+        stay listed, or it can never be cleared."""
+        self.store.upsert_runs([make_record(environment="linux-sim")])
+        self._declare("retired-env", 10)
+        self.assertEqual(
+            self.store.known_environments(), ["linux-sim", "retired-env"])
+
+    def test_the_upsert_is_not_insert_or_replace(self) -> None:
+        """tests/test_sql_portability.py counts every OR REPLACE against
+        a committed expectation, because it deletes and re-inserts and
+        MariaDB's ON DUPLICATE KEY UPDATE does not."""
+        with open(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "testboard", "storage.py"),
+            "rb",
+        ) as handle:
+            source = handle.read().decode("utf-8")
+        self.assertNotIn(
+            "INSERT OR REPLACE INTO environment_expectations", source)
+
+
+class TestInferredTestCounts(StorageTestBase):
+    """The denominator a declaration overrides."""
+
+    def _seed(self) -> None:
+        for index in range(4):
+            self.store.upsert_runs([make_record(
+                environment="linux-sim", test_name="t%d" % index)])
+        self.store.upsert_runs([make_record(environment="win", test_name="w")])
+
+    def test_counts_are_per_environment(self) -> None:
+        self._seed()
+        self.assertEqual(
+            self.store.test_counts_by_environment(),
+            {"linux-sim": 4, "win": 1})
+
+    def test_retired_tests_do_not_inflate_the_denominator(self) -> None:
+        """A pass that does not run a retired test has missed nothing.
+
+        Counting them makes real passes fail the coverage test, and a
+        failed coverage test is invisible: the cutoff quietly drops back
+        to the wall clock.
+        """
+        self._seed()
+        self.store.set_retired(
+            "linux-sim", "suite.py", "t0", True, "alice", "gone", CREATED)
+        self.assertEqual(
+            self.store.test_counts_by_environment(),
+            {"linux-sim": 3, "win": 1})
+
+    def test_un_retiring_puts_it_back(self) -> None:
+        self._seed()
+        self.store.set_retired(
+            "linux-sim", "suite.py", "t0", True, "alice", "gone", CREATED)
+        self.store.set_retired(
+            "linux-sim", "suite.py", "t0", False, "alice", "back", CREATED)
+        self.assertEqual(
+            self.store.test_counts_by_environment()["linux-sim"], 4)
+
+
+class TestMigrationFiveOnAnExistingDatabase(unittest.TestCase):
+    """Migration 5 applied to a database built at version 4."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="testboard_migrate5_")
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.db_path = os.path.join(self.tmpdir, "v4.db")
+
+    def _build_at_version_four(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            for version, statements in storage.MIGRATIONS:
+                if version > 4:
+                    break
+                for statement in statements:
+                    storage.apply_migration_statement(conn, statement)
+            conn.execute("INSERT INTO schema_version (version) VALUES (4)")
+            conn.execute(
+                "INSERT INTO users (username, created_at) VALUES ('amy', ?)",
+                (model.format_iso(CREATED),))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_the_table_arrives_and_existing_rows_survive(self) -> None:
+        self._build_at_version_four()
+        store = Storage(self.db_path)
+        self.addCleanup(store.close)
+        self.assertEqual(store.declared_test_counts(), {})
+        self.assertIsNotNone(store.get_user("amy"))
+        version = store._conn().execute(
+            "SELECT version FROM schema_version").fetchone()[0]
+        self.assertEqual(version, 5)
+
+    def test_a_declaration_can_be_made_immediately_after(self) -> None:
+        self._build_at_version_four()
+        store = Storage(self.db_path)
+        self.addCleanup(store.close)
+        store.set_environment_expectation("linux", 12, "amy", CREATED)
+        self.assertEqual(store.declared_test_counts(), {"linux": 12})

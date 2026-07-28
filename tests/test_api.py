@@ -2161,3 +2161,212 @@ class TestDashboardStreaks(ApiCase):
         self.assertEqual(len(page["tests"]), 1)
         self.assertGreater(page["total"], 1)
         self.assertIn("stability", page["tests"][0])
+
+
+class TestEnvironments(ApiCase):
+    """GET /api/environments and PUT .../expectation.
+
+    The declared expected test count is the denominator of the coverage
+    test in analytics.find_passes. Too high a value fails SILENTLY -
+    nothing clears the bar, no pass counts, and the staleness line drops
+    back to the 36-hour wall clock, which is the Monday-morning bug the
+    derived cutoff exists to fix. The echo in the listing is how that
+    becomes visible.
+    """
+
+    def _nightly(self, environment: str, tests: int, nights: int = 4,
+                 hour: int = 2) -> None:
+        """A few nights of full passes for *environment*."""
+        rows = []
+        for night in range(1, nights + 1):
+            when = (NOW - datetime.timedelta(days=night)).replace(
+                hour=hour, minute=0, second=0, microsecond=0)
+            for index in range(tests):
+                rows.append(record(
+                    environment=environment, script="a.py",
+                    test_name="t%d" % index,
+                    start_time=format_iso(when),
+                    end_time=format_iso(
+                        when + datetime.timedelta(seconds=1))))
+        self.import_runs(rows)
+
+    def test_an_environment_with_no_declaration_reads_as_inferred(
+        self
+    ) -> None:
+        self._nightly("linux-sim", 4)
+        data = self.call("GET", "/api/environments")
+        (item,) = data["environments"]
+        self.assertEqual(item["environment"], "linux-sim")
+        self.assertEqual(item["tests_seen"], 4)
+        self.assertIsNone(item["expected_tests"])
+        self.assertEqual(item["effective_expected"], 4)
+        self.assertIsNone(item["updated_by"])
+
+    def test_the_listing_echoes_whether_passes_actually_counted(
+        self
+    ) -> None:
+        """A declaration you cannot check against reality is a form
+        nobody knows how to fill in."""
+        self._nightly("linux-sim", 4)
+        data = self.call("GET", "/api/environments")
+        (item,) = data["environments"]
+        self.assertEqual(item["passes_total"], 4)
+        self.assertEqual(item["passes_covered"], 4)
+        self.assertTrue(item["latest_pass"]["covered"])
+        self.assertEqual(item["latest_pass"]["runs"], 4)
+        self.assertTrue(data["cutoff_from_passes"])
+
+    def test_a_declaration_too_high_shows_as_nothing_counting(
+        self
+    ) -> None:
+        """The silent failure, made visible. Same activity, declared
+        against a number it cannot reach: every pass stops counting and
+        the cutoff falls back to the wall clock."""
+        self._nightly("linux-sim", 4)
+        self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": 900, "changed_by": "amy"})
+        data = self.call("GET", "/api/environments")
+        (item,) = data["environments"]
+        self.assertEqual(item["expected_tests"], 900)
+        self.assertEqual(item["effective_expected"], 900)
+        self.assertEqual(item["passes_covered"], 0)
+        self.assertGreater(item["passes_total"], 0)
+        self.assertFalse(data["cutoff_from_passes"])
+        self.assertEqual(data["cutoff"], data["fallback"])
+
+    def test_a_declaration_changes_the_estate_cutoff_not_just_the_page(
+        self
+    ) -> None:
+        """One call path. If the admin page worked out its passes
+        separately from the cutoff, a declaration could change what the
+        page shows and not what the estate is judged by."""
+        self._nightly("linux-sim", 4)
+        before = self.call("GET", "/api/summary")["stale_before"]
+        self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": 900, "changed_by": "amy"})
+        after = self.call("GET", "/api/summary")["stale_before"]
+        self.assertNotEqual(before, after)
+
+    def test_the_cutoff_is_never_stricter_than_the_wall_clock(
+        self
+    ) -> None:
+        """The clamp that bounds every way this can be got wrong -
+        including a declared count and the retired-test exclusion. It can
+        only ever flag FEWER tests than the old fixed window."""
+        self._nightly("linux-sim", 4)
+        fallback = format_iso(
+            NOW - datetime.timedelta(hours=api._SUMMARY_RECENT_HOURS))
+        for declared in (1, 4, 900):
+            self.call(
+                "PUT", "/api/environments/linux-sim/expectation",
+                body={"expected_tests": declared, "changed_by": "amy"})
+            data = self.call("GET", "/api/environments")
+            self.assertLessEqual(data["cutoff"], fallback, str(declared))
+
+    def test_declare_then_clear_returns_to_inference(self) -> None:
+        self._nightly("linux-sim", 4)
+        self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": 12, "changed_by": "amy"})
+        cleared = self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": None, "changed_by": "amy"})
+        self.assertTrue(cleared["cleared"])
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertIsNone(item["expected_tests"])
+        self.assertEqual(item["effective_expected"], 4)
+
+    def test_clearing_what_was_never_declared_is_not_an_error(
+        self
+    ) -> None:
+        self._nightly("linux-sim", 4)
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": None, "changed_by": "amy"})
+        self.assertFalse(data["cleared"])
+
+    def test_the_declaring_user_is_recorded(self) -> None:
+        self._nightly("linux-sim", 4)
+        self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": 12, "changed_by": "amy"})
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertEqual(item["updated_by"], "amy")
+        self.assertEqual(item["updated_at"], format_iso(NOW))
+        names = [u["username"]
+                 for u in self.call("GET", "/api/users")["users"]]
+        self.assertIn("amy", names)
+
+    def test_retired_tests_do_not_inflate_the_inferred_count(self) -> None:
+        """A pass that does not run a retired test has missed nothing."""
+        self._nightly("linux-sim", 4)
+        self.call(
+            "PUT", test_path("linux-sim", "a.py", "t0", "/retired"),
+            body={"retired": True, "username": "amy", "comment": "gone"})
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertEqual(item["tests_seen"], 3)
+
+    def test_an_unknown_environment_is_404(self) -> None:
+        self._nightly("linux-sim", 4)
+        data = self.call(
+            "PUT", "/api/environments/typo/expectation",
+            body={"expected_tests": 5, "changed_by": "amy"}, expect=404)
+        self.assertIn("typo", data["error"])
+
+    def test_a_declaration_survives_its_environment_disappearing(
+        self
+    ) -> None:
+        """Otherwise a renamed environment leaves a row nobody can
+        clear."""
+        self._nightly("linux-sim", 4)
+        self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": 12, "changed_by": "amy"})
+        self.storage._conn().execute("DELETE FROM latest_runs")
+        keys = [item["environment"]
+                for item in
+                self.call("GET", "/api/environments")["environments"]]
+        self.assertIn("linux-sim", keys)
+
+    def test_zero_and_negative_are_rejected(self) -> None:
+        self._nightly("linux-sim", 4)
+        for bad in (0, -1):
+            data = self.call(
+                "PUT", "/api/environments/linux-sim/expectation",
+                body={"expected_tests": bad, "changed_by": "amy"},
+                expect=400)
+            self.assertIn("expected_tests", data["error"])
+
+    def test_a_boolean_is_not_a_count(self) -> None:
+        """bool is an int in Python, so true would declare one test."""
+        self._nightly("linux-sim", 4)
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": True, "changed_by": "amy"}, expect=400)
+        self.assertIn("bool", data["error"])
+
+    def test_a_float_is_rejected(self) -> None:
+        self._nightly("linux-sim", 4)
+        self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": 4.5, "changed_by": "amy"}, expect=400)
+
+    def test_the_field_is_required(self) -> None:
+        self._nightly("linux-sim", 4)
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"changed_by": "amy"}, expect=400)
+        self.assertIn("required", data["error"])
+
+    def test_the_changer_is_required(self) -> None:
+        self._nightly("linux-sim", 4)
+        self.call(
+            "PUT", "/api/environments/linux-sim/expectation",
+            body={"expected_tests": 5}, expect=400)
+
+    def test_wrong_methods(self) -> None:
+        self.assert_405("POST", "/api/environments", "GET", body={})
+        self.assert_405(
+            "GET", "/api/environments/linux-sim/expectation", "PUT")

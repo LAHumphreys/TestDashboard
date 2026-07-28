@@ -112,6 +112,46 @@
         <p id="people-empty" class="empty-state" hidden>No people yet.</p>
       </details>
     </section>
+
+    <!-- The expected test count is the denominator of the coverage test
+         that decides whether a night's activity counted as a pass of the
+         suite — and therefore when a quiet test is called missing.
+         Inferring it from history gives a high-water mark, and too high a
+         number fails silently, so it is declarable here and echoed back
+         against what actually happened. -->
+    <section id="envs-section" aria-labelledby="envs-heading">
+      <details id="envs-details">
+        <summary id="envs-heading">Environment expectations</summary>
+        <p class="muted people-note">
+          How many tests each environment is supposed to run. testboard
+          decides whether a test has gone quiet by looking at whether the
+          suite has been round since — and a night only counts as a full
+          pass if it ran at least half of the environment. Left blank,
+          that “half” is measured against every test ever seen in the
+          environment, which only grows. Set the real number here if the
+          passes below are not counting.
+        </p>
+        <p id="envs-cutoff" class="muted"></p>
+        <div class="table-wrap">
+          <table class="data-table" id="envs-table">
+            <thead>
+              <tr>
+                <th>Environment</th>
+                <th>Tests seen</th>
+                <th>Expected</th>
+                <th>Recent passes</th>
+                <th>Latest pass</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="envs-body"></tbody>
+          </table>
+        </div>
+        <p id="envs-empty" class="empty-state" hidden>
+          No environments have reported yet.
+        </p>
+      </details>
+    </section>
   </main>
 
   <script type="module" src="actions.js"></script>

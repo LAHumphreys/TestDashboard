@@ -51,6 +51,7 @@ TABLE_ORDER = (
     "assignments",
     "current_assignments",
     "test_retirements",
+    "environment_expectations",
     "schema_version",
 )
 
@@ -70,6 +71,8 @@ VERIFY_QUERIES = (
     ("comments_total", "SELECT COUNT(*) FROM comments"),
     ("assignments_total", "SELECT COUNT(*) FROM assignments"),
     ("retirements_total", "SELECT COUNT(*) FROM test_retirements"),
+    ("expectations_total",
+     "SELECT COUNT(*) FROM environment_expectations"),
     ("schema_version", "SELECT version FROM schema_version"),
     ("run_span", "SELECT MIN(start_time), MAX(start_time) FROM runs"),
     ("output_bytes",
@@ -200,6 +203,14 @@ CREATE TABLE test_retirements (
   retired_at  {stamp} NOT NULL,
   retired_by  {user} NOT NULL,
   PRIMARY KEY (environment, script, test_name)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE environment_expectations (
+  environment    {env} NOT NULL,
+  expected_tests INT NOT NULL,
+  updated_at     {stamp} NOT NULL,
+  updated_by     {user} NOT NULL,
+  PRIMARY KEY (environment)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE schema_version (

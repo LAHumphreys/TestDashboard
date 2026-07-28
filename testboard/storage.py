@@ -68,6 +68,7 @@ __all__ = [
     "FailureStreak",
     "Comment",
     "User",
+    "EnvironmentExpectation",
     "UpsertCounts",
     "Storage",
 ]
@@ -391,6 +392,61 @@ MIGRATIONS = [
             """,
         ],
     ),
+    (
+        5,
+        [
+            # How many tests an environment is SUPPOSED to run, stated by
+            # a person instead of guessed from history.
+            #
+            # It is the denominator of the coverage test in
+            # analytics.find_passes: a block of activity counts as a pass
+            # of the suite only if it ran at least half of the
+            # environment's tests, and "one whole pass of grace" is what
+            # decides whether a quiet test is missing or merely waiting
+            # its turn.
+            #
+            # Inferring that denominator from `latest_runs` gives a
+            # HIGH-WATER MARK — every test ever seen in the environment,
+            # including ones that quietly left the suite. Too large a
+            # denominator means no block reaches coverage, no pass counts,
+            # and the cutoff falls back to the 36-hour wall clock: the
+            # exact Monday-morning bug the derived cutoff exists to fix,
+            # with no symptom anywhere to look at. That silence is why
+            # this is declarable.
+            #
+            # Presence of the row IS the declaration, the same shape as
+            # test_retirements and users.deactivated_at: clearing it
+            # returns to inference, and there is no flag that can
+            # disagree with its own value.
+            #
+            # `environment` is a TEXT primary key and therefore
+            # case-SENSITIVE here, and would not be under a default
+            # MariaDB collation — see docs/MARIADB_MIGRATION.md B.3.
+            # Deliberately not normalised: `latest_runs.environment` is
+            # not normalised either, and one of the two being folded
+            # would be worse than neither.
+            #
+            # MEASURED on the DEV database (218 MB, 540,192 runs,
+            # 12,008 tests of generated data), brought to version 4
+            # first so this is entry 5 alone: 8 ms, including opening
+            # the connection.
+            #
+            # Production is roughly four times that size and has NOT
+            # been measured from here. It does not need to be: CREATE
+            # TABLE writes one page, rewrites no existing row and reads
+            # none, so the number cannot grow with the database. A
+            # migration that touched existing rows would need the real
+            # thing — see entry 3, whose backfill does.
+            """
+            CREATE TABLE environment_expectations (
+                environment TEXT PRIMARY KEY,
+                expected_tests INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL REFERENCES users(username)
+            )
+            """,
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: Prefix marking a migration step that runs Python instead of SQL.
@@ -629,6 +685,26 @@ class User(NamedTuple):
     def active(self) -> bool:
         """True while this account is offered in assignee pickers."""
         return self.deactivated_at is None
+
+
+class EnvironmentExpectation(NamedTuple):
+    """How many tests an environment is declared to run, and who said so.
+
+    The declared alternative to a denominator inferred from history —
+    see migration 5 for why inference is not good enough, and
+    :func:`analytics.effective_test_counts` for how the two combine.
+
+    There is deliberately no cadence field. Every boundary in
+    :func:`analytics.find_passes` comes from observed gaps, so a declared
+    schedule would either sit unread or displace the observation, which
+    is the design it would be displacing. Add one when something needs
+    it.
+    """
+
+    environment: str
+    expected_tests: int
+    updated_at: datetime.datetime
+    updated_by: str
 
 
 class UpsertCounts(NamedTuple):
@@ -1605,16 +1681,131 @@ class Storage:
         ]
 
     def test_counts_by_environment(self) -> Dict[str, int]:
-        """How many tests each environment currently has.
+        """How many tests each environment currently has, INFERRED.
 
         The denominator for "did that block of activity actually cover
         this environment, or was it a handful of re-runs after a fix".
+
+        Retired tests are excluded, for the reason they are excluded from
+        every other estate view: they are not in the suite, so a pass
+        that does not run them has not missed anything. Counting them
+        inflates the denominator, which makes real passes fail the
+        coverage test — and a failed coverage test is SILENT, dropping
+        the cutoff back to the wall clock with nothing to see.
+
+        Even so this is a high-water mark: a test that quietly stopped
+        being run and was never retired stays here forever. That is what
+        :meth:`declared_test_counts` exists to override.
         """
         rows = self._conn().execute(
-            "SELECT environment, COUNT(*) FROM latest_runs "
-            "GROUP BY environment"
+            "SELECT lr.environment, COUNT(*) FROM latest_runs AS lr "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script "
+            " AND tr.test_name = lr.test_name "
+            "WHERE " + self._NOT_RETIRED + " GROUP BY lr.environment"
         ).fetchall()
         return {row[0]: int(row[1]) for row in rows}
+
+    # ------------------------------------------------------------------
+    # Declared environment expectations (migration 5)
+    # ------------------------------------------------------------------
+
+    def declared_test_counts(self) -> Dict[str, int]:
+        """Declared expected test count per environment.
+
+        Only environments somebody has declared appear. Combined with
+        the inferred counts by :func:`analytics.effective_test_counts`.
+        """
+        rows = self._conn().execute(
+            "SELECT environment, expected_tests FROM "
+            "environment_expectations"
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def list_environment_expectations(
+        self,
+    ) -> List[EnvironmentExpectation]:
+        """Every declaration, ordered by environment."""
+        rows = self._conn().execute(
+            "SELECT environment, expected_tests, updated_at, updated_by "
+            "FROM environment_expectations ORDER BY environment"
+        ).fetchall()
+        return [
+            EnvironmentExpectation(
+                environment=row[0],
+                expected_tests=int(row[1]),
+                updated_at=model.parse_iso(row[2]),
+                updated_by=row[3],
+            )
+            for row in rows
+        ]
+
+    def set_environment_expectation(
+        self,
+        environment: str,
+        expected_tests: int,
+        updated_by: str,
+        updated_at: datetime.datetime,
+    ) -> EnvironmentExpectation:
+        """Declare (or redeclare) an environment's expected test count.
+
+        UPDATE-then-INSERT rather than ``INSERT OR REPLACE``: the two are
+        indistinguishable here, but OR REPLACE deletes and re-inserts,
+        which is not what MariaDB's ``ON DUPLICATE KEY UPDATE`` does, and
+        ``tests/test_sql_portability.py`` counts every use of it against
+        a committed expectation for exactly that reason.
+        """
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.ensure_user(updated_by, updated_at)
+            stamp = model.format_iso(updated_at)
+            cursor = conn.execute(
+                "UPDATE environment_expectations SET expected_tests = ?, "
+                "updated_at = ?, updated_by = ? WHERE environment = ?",
+                (expected_tests, stamp, updated_by, environment),
+            )
+            if cursor.rowcount == 0:
+                conn.execute(
+                    "INSERT INTO environment_expectations "
+                    "(environment, expected_tests, updated_at, updated_by) "
+                    "VALUES (?, ?, ?, ?)",
+                    (environment, expected_tests, stamp, updated_by),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return EnvironmentExpectation(
+            environment=environment,
+            expected_tests=expected_tests,
+            updated_at=updated_at,
+            updated_by=updated_by,
+        )
+
+    def clear_environment_expectation(self, environment: str) -> bool:
+        """Drop a declaration, returning to inference. True if one went."""
+        cursor = self._conn().execute(
+            "DELETE FROM environment_expectations WHERE environment = ?",
+            (environment,),
+        )
+        return cursor.rowcount > 0
+
+    def known_environments(self) -> List[str]:
+        """Every environment that has run a test or carries a declaration.
+
+        Both halves matter: an environment declared before its first
+        import must still be listed (otherwise it cannot be corrected),
+        and an environment nobody has declared must appear so that it
+        can be.
+        """
+        rows = self._conn().execute(
+            "SELECT environment FROM latest_runs "
+            "UNION SELECT environment FROM environment_expectations "
+            "ORDER BY 1"
+        ).fetchall()
+        return [row[0] for row in rows]
 
     def latest_run_time(self) -> Optional[datetime.datetime]:
         """Start time of the newest run on record, or None if empty.

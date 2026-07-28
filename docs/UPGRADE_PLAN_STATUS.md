@@ -40,6 +40,9 @@ these are the ones that get forgotten:
 | WP-9 | SQL portability groundwork | **done** | inventory + id pins, 947 tests |
 | WP-10 | MariaDB export tool | **done** | `tools/export_for_mariadb.py`, 980 tests |
 | — | Performance pass | **done** | migration 4, 952 tests |
+| WP-12 | Cutoff from the suite's rhythm | **done (core)** | `find_passes`, 980 tests |
+| WP-13 | Declared environment expectations | **done** | migration 5, 1032 tests |
+| WP-14 | In-run progress | `pending` | depends on WP-13 |
 
 States: `pending` → `in progress` → `done`, or `blocked` / `deferred` with a
 reason in the log below.
@@ -527,3 +530,112 @@ The frontend no longer recomputes the cutoff — the server sends `stale_before`
    against an expected total, which is exactly a progress bar.
 
 Both want the same new table, which is why they should be designed together.
+
+### WP-13 — declared environment expectations — **done**
+
+Migration **5**: `environment_expectations`. `GET /api/environments`,
+`PUT /api/environments/{env}/expectation`, and an "Environment expectations"
+fold-out beside "Manage people" on Open actions.
+
+The first of WP-12's two named follow-ups. WP-12 decides whether a test has
+gone quiet from whether the suite has been round since, and a night only
+counts as a *pass* if it ran at least half the environment. That denominator
+was inferred as `COUNT(*) FROM latest_runs` — **every test ever seen**, a
+high-water mark that only grows.
+
+**Why that had to become declarable: it fails silently, in the destructive
+direction.** Too large a denominator means no block clears the coverage bar,
+no pass counts, and `recent_cutoff` falls back to the 36-hour wall clock —
+which is precisely the Monday-morning bug WP-12 exists to fix, review panel
+offering to retire thousands of healthy tests included. Nothing anywhere says
+so. A wrong number and a correct one look identical.
+
+So the endpoint does not just store the declaration, it **echoes it against
+what actually happened**: per environment, how many of the recent nights
+counted (`3 of 14`), and globally whether the cutoff came from a pass at all.
+A declaration you cannot check against reality is a form nobody knows how to
+fill in.
+
+Decided and worth not re-litigating:
+
+- **Declared overrides inferred, per environment; an environment with no row
+  behaves exactly as before.** Additive, so it cannot regress an environment
+  nobody has configured.
+- **The clamps in `recent_cutoff` do not move.** A declaration feeds the
+  coverage denominator only. `min(fallback)` and `max(floor)` are what keep a
+  wrong declaration a slightly-off cutoff instead of a destructive one, and
+  there is now a test asserting the cutoff stays inside the wall-clock window
+  at declared values of 1, 4 and 900.
+- **No cadence column**, despite the plan naming "cadence and expected test
+  count". Nothing consumes it: every boundary in `find_passes` comes from
+  observed gaps, deliberately. A declared schedule would either sit unread or
+  displace the observation, which is the design it would be displacing.
+- **Retired tests came out of the inferred denominator** in the same change.
+  They are excluded from every other estate view, and a pass that does not run
+  a retired test has missed nothing. This is the same defect being fixed, so
+  it is fixed here rather than left as the next surprise.
+- **404 on an environment that has never reported.** Declaring one affects
+  nothing and a typo would leave a row with no visible purpose. The listing
+  still unions declarations in, so a *renamed* environment's stale row remains
+  visible and can be cleared.
+
+**One call path, deliberately** (`api._pass_view`). If the admin page worked
+out its passes separately from the cutoff, a declaration could change what the
+page shows and not what the estate is judged by — worse than not having the
+feature, because it would look like it worked. A test asserts that declaring
+changes `/api/summary`'s `stale_before`, not just the new endpoint.
+
+**Found by running it against real-shaped data, not by testing it.** With
+`win-sim` declared at 9,000 against 1,680 tests, its own row read `0 of 12
+counted` — but the **global** `cutoff_from_passes` stayed `true`, because the
+other two environments still contributed a covered pass. So the global flag
+alone would have said everything was fine while one environment was silently
+uncounted. That is why the per-environment count is the primary signal and the
+global flag is only the headline.
+
+`analytics.recent_cutoff` now returns a `Cutoff` NamedTuple rather than a bare
+datetime. `from_passes` cannot be derived from the timestamp by a caller —
+"the fallback won because nothing counted" and "the fallback won because every
+pass is more recent than it" produce the same value and mean opposite things.
+
+`analytics.complete_passes` drops the oldest block when it starts within one
+gap of the 14-day floor. Its run count is whatever fell inside the window, so
+its coverage verdict is an artefact of the edge; harmless for the cutoff (it
+only makes it more lenient), but on a page it is a permanently red row that
+means nothing. Display only.
+
+**Migration timing.** 8 ms, on the **dev database** (218 MB, 540,192 runs,
+12,008 tests of generated data), brought to version 4 first so the number is
+entry 5 alone. Production is roughly four times that and was **not** measured
+from here — it does not need to be for this entry: `CREATE TABLE` writes one
+page and rewrites no existing row, so the number cannot grow with the
+database. A migration that touched existing rows would need the real thing, as
+entry 3's backfill did.
+
+**WP-12 had no unit tests for `find_passes` or `recent_cutoff`** — it shipped
+with API-level coverage only. Since this package changes what feeds both, they
+have them now: pass grouping, the ad-hoc re-run case that coverage exists for,
+per-environment separation, and each clamp separately.
+
+`tools/export_for_mariadb.py` needed the new table in its load order, DDL and
+verification queries — caught by its own guard test, which is what that test is
+for. Exporting into a schema missing a table drops it silently.
+
+Frontend verified by driving the real module against a live server on the dev
+database (a minimal DOM in node, not a browser): the section renders, Save with
+an unreachable 9,000 flips the row to `0 of 12 counted` and grows a Clear
+button, Clear restores inference, and a typed `0` is refused with a readable
+message. **Not click-verified in a browser** — that is still worth doing.
+
+Suite 980 → 1032.
+
+A parallel session was writing `tools/migrate_to_mariadb.py` in this tree at
+the same time. Its files are untracked and are **not** in this commit; the
+1032 above is the suite with them excluded.
+
+**WP-14 (in-run progress) is next** and is specified in the plan. It needs no
+new query: `find_passes` already computes runs-so-far per environment against
+an expected total, which is exactly a progress bar. The one design point is
+that "still running" must use a shorter idle threshold than the 6-hour pass
+boundary, or a finished 2.5-hour environment shows as in progress for another
+six.
