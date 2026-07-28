@@ -565,5 +565,82 @@ class PlantedRegressionTest(unittest.TestCase):
         self.assertIn("fetchJson(", body)
 
 
+class WindowWordingTest(unittest.TestCase):
+    """No page may name a window it is not the one being used.
+
+    The recency line stopped being a fixed 36 hours when it started
+    being derived from when the suite actually ran. The LABELS did not
+    follow, so on a Tuesday morning after a Monday-morning run the home
+    screen read:
+
+        heading   "Last night"
+        tile      "Ran last night — 100 of 100"
+        not-run   "silent for 36h+"
+
+    while the window it had actually counted was 78 hours wide, and
+    nothing had run last night at all. Every one of those was a fixed
+    string describing a value the server computes.
+
+    The rule this pins: user-facing wording about the recency window is
+    built from ``stale_before`` — the value the counting used — never
+    from ``recent_hours``, which is only the wall-clock fallback.
+    """
+
+    #: Pages that show counts bounded by the recency cutoff.
+    _PAGES = ("app.js", "time.js")
+
+    def test_no_page_labels_the_window_from_recent_hours(self) -> None:
+        offenders = {}  # type: Dict[str, List[int]]
+        for name in self._PAGES:
+            code = _strip_comments(read(name))
+            lines = [
+                number
+                for number, line in enumerate(code.splitlines(), 1)
+                if "recent_hours" in line
+            ]
+            if lines:
+                offenders[name] = lines
+        self.assertEqual(
+            offenders, {},
+            "recent_hours is the wall-clock FALLBACK, not the window "
+            "that was counted. Word it from stale_before instead; "
+            "found " + repr(offenders))
+
+    def test_the_home_screen_says_which_window_it_counted(self) -> None:
+        """Removing the wrong number is only half of it — the right one
+        has to be shown, or the tiles say nothing about their scope."""
+        code = _strip_comments(read("app.js"))
+        self.assertIn("function windowPhrase(", code)
+        self.assertIn("summary.stale_before", code)
+
+    def test_nothing_still_calls_the_window_a_night(self) -> None:
+        """A suite can run at any hour, more than once a day, or not for
+        a long weekend. "Last night" is only ever right by luck."""
+        for name in ("app.js", "time.js", "actions.js"):
+            self.assertNotIn(
+                "last night", _strip_comments(read(name)).lower(), name)
+        self.assertNotIn(
+            "last night", read_text("index.html").lower(),
+            "index.html still labels the tiles as a night")
+
+    def test_the_time_page_is_told_its_own_cutoff(self) -> None:
+        """It filters on the derived cutoff too, so its caption has the
+        same obligation as the home screen's."""
+        code = _strip_comments(read("time.js"))
+        self.assertIn("data.stale_before", code)
+
+
+class PlantedWindowRegressionTest(unittest.TestCase):
+    """Prove the detector above can fail."""
+
+    def test_a_fixed_hours_label_would_be_caught(self) -> None:
+        planted = 'sub: "silent for " + summary.recent_hours + "h+",'
+        self.assertIn("recent_hours", _strip_comments(planted))
+
+    def test_a_night_label_would_be_caught(self) -> None:
+        planted = 'label: "Pass rate last night",'
+        self.assertIn("last night", _strip_comments(planted).lower())
+
+
 if __name__ == "__main__":
     unittest.main()

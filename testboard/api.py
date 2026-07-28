@@ -1307,6 +1307,14 @@ def _handle_time(
             "excluded_tests": rollup.excluded_tests,
             "include_stale": include_stale,
             "recent_hours": _SUMMARY_RECENT_HOURS,
+            # The cutoff this page ACTUALLY filtered on. `recent_hours`
+            # is the wall-clock fallback and is usually not the answer:
+            # since WP-12 the line is derived from when the suite ran,
+            # so a caption quoting 36 hours describes a window the
+            # server stopped using.
+            "stale_before": (
+                None if cutoff is None else model.format_iso(cutoff)
+            ),
         },
     )
 

@@ -125,8 +125,8 @@ function render(data) {
     excluded.textContent = "Excludes "
       + data.excluded_tests.toLocaleString()
       + (data.excluded_tests === 1 ? " test that has" : " tests that have")
-      + " not run in the last " + data.recent_hours
-      + " hours — their last duration is on file, but counting it would"
+      + " not reported since " + formatTime(data.stale_before)
+      + " — their last duration is on file, but counting it would"
       + " claim time that was not spent.";
     excluded.hidden = false;
   } else {
@@ -140,9 +140,9 @@ function render(data) {
     // at the way to see it anyway — an all-or-nothing recency cutoff
     // otherwise blanks the page after any long weekend.
     empty.textContent = data.excluded_tests
-      ? "Nothing has run in the last " + data.recent_hours + " hours. "
-        + "Turn on “Include tests that have not run recently” to see the "
-        + "breakdown from their last run."
+      ? "Nothing has reported since " + formatTime(data.stale_before)
+        + ". Turn on “Include tests that have not run recently” to see "
+        + "the breakdown from their last run."
       : "Nothing to show here.";
     empty.hidden = false;
     renderTable();

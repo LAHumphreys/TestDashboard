@@ -3,7 +3,8 @@
  * A triage-first dashboard in four sections, all scoped by the single
  * environment filter in the toolbar:
  *
- *   1. "Last night"  — KPI tiles from /api/summary (pass-rate hero + counts).
+ *   1. "Latest results" — KPI tiles from /api/summary, counting each
+ *      test's newest run since the derived recency cutoff.
  *   2. Charts        — nightly failing-run trend, failing-by-environment,
  *                      most-failing scripts (see charts.js).
  *   3. Triage        — tabbed work queues (new failures, still failing,
@@ -308,7 +309,7 @@ function setEnvironment(environment, keepScript) {
   refreshAll();
 }
 
-/* ================= "Last night" tiles ================= */
+/* ================= "Latest results" tiles ================= */
 
 function buildTile(spec) {
   const tile = el(spec.onClick ? "button" : "div",
@@ -372,6 +373,19 @@ function renderEnvUpdated() {
   }
 }
 
+/*
+ * What the tiles are counting, said in words.
+ *
+ * They used to be headed "Last night" and subtitled "36h", both fixed
+ * strings. Neither survived WP-12: the window is now derived from when
+ * the suite actually ran, so on a Tuesday morning after a Monday-morning
+ * run it was three days wide while the page called it a night. The
+ * label has to come from the same value the counting did.
+ */
+function windowPhrase(summary) {
+  return "since " + formatTime(summary.stale_before);
+}
+
 function renderStatus() {
   const summary = state.summary;
   const status = summary.status;
@@ -384,7 +398,8 @@ function renderStatus() {
   clearNode(meta);
   meta.appendChild(document.createTextNode(
     status.total_tests.toLocaleString() + " tests tracked"
-    + (state.environment ? " in " + state.environment : "")));
+    + (state.environment ? " in " + state.environment : "")
+    + " · counting each test's latest run " + windowPhrase(summary)));
   if (status.retired > 0) {
     meta.appendChild(document.createTextNode(" · "));
     const link = el("button", "link-btn",
@@ -425,16 +440,16 @@ function renderStatus() {
 
   container.appendChild(buildTile({
     hero: true,
-    label: "Pass rate last night",
+    label: "Pass rate",
     value: rate,
     sub: ran > 0
       ? failRecent.toLocaleString() + " of "
         + ran.toLocaleString() + " runs failed"
-      : "no runs in the last " + summary.recent_hours + "h",
+      : "nothing has reported " + windowPhrase(summary),
     delta: delta,
   }));
   container.appendChild(buildTile({
-    label: "Ran last night",
+    label: "Reported",
     value: ran.toLocaleString(),
     sub: "of " + status.total_tests.toLocaleString() + " tests",
   }));
@@ -453,7 +468,7 @@ function renderStatus() {
     onClick: () => openQueue("still_failing"),
   }));
   container.appendChild(buildTile({
-    label: "Fixed last night",
+    label: "Newly fixed",
     value: status.fixed.toLocaleString(),
     accent: status.fixed > 0 ? "accent-pass" : "accent-zero",
     sub: "worth verifying",
@@ -471,7 +486,7 @@ function renderStatus() {
     label: "Not run",
     value: status.not_run.toLocaleString(),
     accent: status.not_run > 0 ? "accent-warn" : "accent-zero",
-    sub: "silent for " + summary.recent_hours + "h+",
+    sub: "no run " + windowPhrase(summary),
     onClick: () => openQueue("not_run"),
   }));
 }
@@ -564,7 +579,7 @@ function openScriptInBrowse(entry) {
 const QUEUE_TABS = [
   { id: "new_failures", label: "New failures" },
   { id: "still_failing", label: "Still failing" },
-  { id: "fixed", label: "Fixed last night" },
+  { id: "fixed", label: "Fixed" },
   { id: "unexpected_passes", label: "Stale annotations" },
   { id: "not_run", label: "Not run" },
   { id: "mine", label: "My actions" },
@@ -573,7 +588,7 @@ const QUEUE_TABS = [
 const QUEUE_EMPTY_TEXT = {
   new_failures: "No new failures — nothing broke that was passing before.",
   still_failing: "Nothing is stuck failing.",
-  fixed: "No tests went from failing to passing last night.",
+  fixed: "No tests have gone from failing to passing.",
   unexpected_passes:
     "No stale annotations — every known failure still fails.",
   not_run: "Every test reported in — nothing has gone silent.",
