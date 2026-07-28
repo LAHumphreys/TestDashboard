@@ -1570,6 +1570,65 @@ class Storage:
             params.append(environment)
         return int(self._conn().execute(sql, params).fetchone()[0])
 
+    def activity_buckets(
+        self, since: datetime.datetime
+    ) -> List[Tuple[str, datetime.datetime, int]]:
+        """(environment, hour, runs) for every active hour since *since*.
+
+        Feeds :func:`analytics.find_passes`. Bucketed to the hour and
+        grouped by environment on purpose:
+
+        - hour resolution is all this question needs, so a fortnight is
+          a few hundred rows rather than a hundred thousand runs;
+        - per environment because environments run SEQUENTIALLY. The
+          first reports in the small hours and the last hours later, so
+          on one shared timeline whichever ran first looks stale for the
+          rest of the morning.
+
+        The run count is what separates a real pass of the suite from an
+        ad-hoc re-run triggered after a fix. Both are blocks of
+        activity; only one means "everything has reported".
+
+        SUBSTR rather than a date function, so this means the same thing
+        on MariaDB (see docs/MARIADB_MIGRATION.md E.4).
+        """
+        rows = self._conn().execute(
+            "SELECT environment, SUBSTR(start_time, 1, 13), COUNT(*) "
+            "FROM runs WHERE start_time >= ? "
+            "GROUP BY environment, SUBSTR(start_time, 1, 13) "
+            "ORDER BY environment, 2",
+            (model.format_iso(since),),
+        ).fetchall()
+        return [
+            (row[0], model.parse_iso(row[1] + ":00:00.000000"), int(row[2]))
+            for row in rows
+        ]
+
+    def test_counts_by_environment(self) -> Dict[str, int]:
+        """How many tests each environment currently has.
+
+        The denominator for "did that block of activity actually cover
+        this environment, or was it a handful of re-runs after a fix".
+        """
+        rows = self._conn().execute(
+            "SELECT environment, COUNT(*) FROM latest_runs "
+            "GROUP BY environment"
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def latest_run_time(self) -> Optional[datetime.datetime]:
+        """Start time of the newest run on record, or None if empty.
+
+        The estate's own clock. Reported alongside the summary so a
+        stalled feeder is visible as a stalled feeder, rather than as
+        every test in the estate quietly going stale.
+        """
+        row = self._conn().execute(
+            "SELECT MAX(start_time) FROM runs").fetchone()
+        if row is None or row[0] is None:
+            return None
+        return model.parse_iso(row[0])
+
     def duration_rollup(
         self,
         group_by: str,

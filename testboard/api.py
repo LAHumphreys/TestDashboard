@@ -512,6 +512,57 @@ def _parse_results_param(request: Request) -> Optional[List[Result]]:
     return results
 
 
+#: How long one environment must be quiet before its next block of runs
+#: counts as a separate pass. Environments run sequentially and a whole
+#: cycle takes hours, so this has to be longer than any pause WITHIN a
+#: pass and shorter than the gap between consecutive passes. Not a time
+#: of day, and nothing here knows the schedule.
+_PASS_GAP_HOURS = 6.0
+
+#: Share of an environment's tests a block must run before it counts as
+#: a pass rather than an ad-hoc re-run after a fix.
+_PASS_COVERAGE = 0.5
+
+#: How far back to look for passes, and the oldest a derived cutoff may
+#: be. The floor matters: if the feeder stops, the newest pass stops
+#: moving, and without a floor the cutoff would slide backwards for ever
+#: and nothing would ever look stale again.
+_PASS_LOOKBACK_DAYS = 14
+
+
+def _recent_cutoff(
+    storage: Storage, now_value: datetime.datetime
+) -> datetime.datetime:
+    """When a test's silence starts being suspicious.
+
+    Derived from when the suite actually ran, not from the wall clock.
+
+    The wall-clock window this replaces was right from Tuesday to Friday
+    and wrong every Monday: with the last run on Friday night, a 36-hour
+    window makes every test in the estate look abandoned. It was also
+    wrong every morning for whichever environment runs first, because
+    environments run sequentially and the last of them reports hours
+    after the first.
+
+    Both failures had the same three consequences: a "not run" queue
+    full of healthy tests, a headline claiming nothing ran, and — worst
+    — the review panel offering to RETIRE thousands of tests that were
+    simply waiting their turn.
+
+    Falls back to the wall-clock window when there is not enough history
+    to infer anything, and can never be stricter than it.
+    """
+    fallback = now_value - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
+    floor = now_value - datetime.timedelta(days=_PASS_LOOKBACK_DAYS)
+    passes = analytics.find_passes(
+        storage.activity_buckets(floor),
+        storage.test_counts_by_environment(),
+        gap_hours=_PASS_GAP_HOURS,
+        coverage=_PASS_COVERAGE,
+    )
+    return analytics.recent_cutoff(passes, fallback, floor)
+
+
 def _handle_dashboard(
     storage: Storage,
     request: Request,
@@ -532,9 +583,7 @@ def _handle_dashboard(
 
     stale_before = None  # type: Optional[datetime.datetime]
     if _query_single(request.query, "stale") in ("1", "true"):
-        stale_before = now() - datetime.timedelta(
-            hours=_SUMMARY_RECENT_HOURS
-        )
+        stale_before = _recent_cutoff(storage, now())
     include_retired = _query_single(
         request.query, "retired") in ("1", "true")
     with_comment = _query_single(
@@ -724,9 +773,11 @@ def _handle_summary(
     )
 
     current = now()
-    recent_cutoff = current - datetime.timedelta(
-        hours=_SUMMARY_RECENT_HOURS
-    )
+    recent_cutoff = _recent_cutoff(storage, current)
+    # Reported so a stalled feeder is visible AS a stalled feeder,
+    # rather than as every test in the estate quietly going stale — the
+    # failure mode a data-derived cutoff would otherwise hide.
+    latest_run = storage.latest_run_time()
     estate = analytics.summarize_rollup(
         storage.summary_rollup(recent_cutoff, environment),
         storage.assigned_open_count(environment),
@@ -821,6 +872,15 @@ def _handle_summary(
             "scripts": storage.scripts(environment),
             "assignees": storage.assignees(),
             "recent_hours": _SUMMARY_RECENT_HOURS,
+            # The cutoff ITSELF, so the frontend stops recomputing it
+            # from a fixed number of hours. It is what gates the offer
+            # to retire a test, and that must never be based on a
+            # window the server has already stopped using.
+            "stale_before": model.format_iso(recent_cutoff),
+            "latest_run_time": (
+                None if latest_run is None
+                else model.format_iso(latest_run)
+            ),
             "queue_cap": _SUMMARY_QUEUE_CAP,
             "status": {
                 "total_tests": status.total_tests,
@@ -1176,10 +1236,7 @@ def _handle_time(
     # it can be turned off deliberately and the page says which it is.
     include_stale = _query_single(
         request.query, "include_stale") in ("1", "true")
-    cutoff = (
-        None if include_stale
-        else now() - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
-    )
+    cutoff = None if include_stale else _recent_cutoff(storage, now())
     try:
         rollup = storage.duration_rollup(
             group_by, cutoff, environment=environment, script=script

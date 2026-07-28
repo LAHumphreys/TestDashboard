@@ -1137,7 +1137,31 @@ class TestTimeEndpoint(ApiCase):
             "GET", "/api/time", query={"group_by": ["output"]}, expect=400)
         self.assertIn("group_by", data["error"])
 
+    def _nightly_history(self) -> None:
+        """A fortnight of nightly passes.
+
+        The recency cutoff is derived from when the suite ACTUALLY ran
+        (``api._recent_cutoff``), and the rule is "one whole pass of
+        grace". A fixture with only two blocks of activity therefore
+        reaches its grace all the way back to the first of them — a
+        correct answer for that fixture and nothing like production.
+        This gives the estate a realistic history, so "the previous
+        pass" means yesterday.
+        """
+        rows = []
+        for day in range(1, 15):
+            when = NOW - datetime.timedelta(days=day)
+            for index in range(3):
+                rows.append(record(
+                    environment="linux", script="a.py",
+                    test_name="hist%d" % index,
+                    start_time=format_iso(when),
+                    end_time=format_iso(
+                        when + datetime.timedelta(seconds=1))))
+        self.import_runs(rows)
+
     def test_stale_tests_are_excluded_and_reported(self) -> None:
+        self._nightly_history()
         self.import_runs([
             record(environment="linux", script="c.py", test_name="old",
                    start_time=format_iso(NOW - datetime.timedelta(days=10)),
@@ -1146,7 +1170,9 @@ class TestTimeEndpoint(ApiCase):
         ])
         data = self.call("GET", "/api/time")
         self.assertEqual(data["excluded_tests"], 1)
-        self.assertEqual(data["total_seconds"], 15.0)
+        # 15s from the three tests this class seeds, plus 1s each from
+        # the three that carry the nightly history above.
+        self.assertEqual(data["total_seconds"], 18.0)
         self.assertFalse(data["include_stale"])
 
     def test_stale_tests_can_be_included_on_request(self) -> None:

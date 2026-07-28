@@ -477,3 +477,53 @@ Still open, and needing a person rather than a commit:
 3. The MariaDB migration itself: run §C's audit on production, get §A done by
    whoever holds root, then the dry run.
 4. Nothing has been pushed; no remote is configured.
+
+### WP-12 — derive "recently run" from the suite, not the wall clock — **done (core)**
+
+`_SUMMARY_RECENT_HOURS = 36` was one wall-clock window answering a question it
+cannot answer. Suite 980, green.
+
+Two failure modes, both reported from real use:
+
+- **Monday morning.** Last run Friday night, so at 36 hours every test in the
+  estate looks abandoned.
+- **Every morning, for whichever environment runs first.** Environments run
+  **sequentially** — first reports in the small hours, last hours later — so on
+  one shared clock the early ones are stale for the rest of the morning.
+
+Consequences ranked: the review panel offered to **retire** thousands of healthy
+tests (destructive, and gated on exactly this flag); the "not run" queue filled
+with noise so real disappearances hide in it; the headline claimed nothing ran.
+
+`analytics.find_passes` groups per-environment activity hours into passes.
+`analytics.recent_cutoff` takes the start of the **previous covered pass** per
+environment, then the oldest across environments.
+
+Two properties are load-bearing and each comes from how the suite really runs:
+
+- **Per environment**, because they run sequentially.
+- **Coverage** — a block only counts as a pass if it ran ≥50% of that
+  environment's tests. Without it, the ad-hoc re-runs triggered after a fix
+  count as passes, dragging the line forward to this afternoon and flagging the
+  whole estate. That would have been worse than the bug being fixed, and it was
+  only caught because the user mentioned ad-hoc runs.
+
+Safety rails: never stricter than the old window (so it can only flag *fewer*
+tests), never older than 14 days (so a stalled feeder cannot slide the line back
+for ever), and `latest_run_time` is now reported so a stalled feeder is visible
+**as** a stalled feeder rather than as the estate quietly going stale.
+
+Nothing knows what time the suite runs; every boundary comes from observed gaps.
+The frontend no longer recomputes the cutoff — the server sends `stale_before`.
+
+**Not yet done** (agreed next steps, see the conversation):
+
+1. **Per-environment expectations, declared not inferred** — cadence and
+   expected test count, stored and editable in the UI. Would replace the
+   inferred coverage denominator and handle an environment whose rhythm the
+   inference gets wrong.
+2. **In-run progress** — one env takes 2.5 hours and there is no visibility
+   while it runs. `find_passes` already computes runs-so-far per environment
+   against an expected total, which is exactly a progress bar.
+
+Both want the same new table, which is why they should be designed together.

@@ -792,15 +792,13 @@ function queueColumns(queueId) {
 function reviewOptions() {
   // The panel is told the cutoff rather than asking anyone whether a
   // test is stale, so it stays free of this page's state.
-  let staleBefore = null;
-  if (state.summary) {
-    const cutoff = new Date(state.summary.generated_at + "Z");
-    cutoff.setTime(cutoff.getTime()
-      - state.summary.recent_hours * 3600 * 1000);
-    staleBefore = cutoff.toISOString().slice(0, -1);
-  }
+  // The SERVER decides what counts as stale — it is derived from when
+  // the suite actually ran, not from a fixed number of hours, and this
+  // value gates the offer to retire a test. Recomputing it here from
+  // recent_hours would re-introduce the bug where every test looks
+  // abandoned on a Monday.
   return {
-    staleBefore: staleBefore,
+    staleBefore: state.summary ? state.summary.stale_before : null,
     onChanged: () => refreshQueueCounts(),
     onRetired: () => refreshSummary(),
   };

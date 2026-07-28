@@ -49,7 +49,15 @@ Python 3.6 compatible; standard library only.
 import collections
 import datetime
 import statistics
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence
+from typing import (
+    Any,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from testboard.model import Result, StoredRun, duration_seconds, format_iso
 from testboard.storage import RollupCount
@@ -72,6 +80,9 @@ __all__ = [
     "summarize_rollup",
     "Execution",
     "group_executions",
+    "Pass",
+    "find_passes",
+    "recent_cutoff",
 ]
 
 #: Day labels for the day-of-week profile, Monday first (index matches
@@ -472,6 +483,112 @@ class Execution(NamedTuple):
     def duration_seconds(self) -> float:
         """Wall-clock span from the first run starting to the last ending."""
         return duration_seconds(self.started, self.ended)
+
+
+class Pass(NamedTuple):
+    """One contiguous block of activity in one environment.
+
+    Inferred from timing, like :func:`group_executions`, and for the
+    same reason: the import contract carries no batch identifier.
+
+    ``covered`` is True when the block ran enough of the environment to
+    count as a real pass of the suite rather than an ad-hoc re-run.
+    """
+
+    environment: str
+    started: datetime.datetime
+    ended: datetime.datetime
+    runs: int
+    covered: bool
+
+
+def find_passes(
+    buckets: Sequence[Tuple[str, datetime.datetime, int]],
+    test_counts: Dict[str, int],
+    gap_hours: float,
+    coverage: float,
+) -> List[Pass]:
+    """Group per-environment activity hours into passes, oldest first.
+
+    A block ends when that environment has been quiet for *gap_hours*.
+    It counts as ``covered`` when it ran at least *coverage* of that
+    environment's tests.
+
+    Both halves are load-bearing, and each is here because of a way the
+    suite actually runs:
+
+    - **Per environment**, because environments run SEQUENTIALLY: the
+      first reports in the small hours and the last hours later. Judged
+      against one shared clock, whichever ran first looks stale for the
+      remainder of the morning.
+    - **Coverage**, because a failed run is followed by ad-hoc re-runs
+      once it is fixed. Those are blocks of activity too, and treating
+      them as passes would drag the "everything has reported by now"
+      line forward to this afternoon and flag the entire estate. A
+      twenty-test re-run is not a pass of the suite.
+
+    Nothing here knows what time the suite runs. Every boundary comes
+    from observed gaps, so a schedule change needs no code change.
+    """
+    grouped = {}  # type: Dict[str, List[Tuple[datetime.datetime, int]]]
+    for environment, hour, count in buckets:
+        grouped.setdefault(environment, []).append((hour, count))
+
+    gap = datetime.timedelta(hours=gap_hours)
+    passes = []  # type: List[Pass]
+    for environment in sorted(grouped):
+        needed = max(1, int(test_counts.get(environment, 0) * coverage))
+        started = None  # type: Optional[datetime.datetime]
+        previous = None  # type: Optional[datetime.datetime]
+        runs = 0
+        for hour, count in sorted(grouped[environment]):
+            if started is None:
+                started = hour
+            elif hour - previous > gap:
+                passes.append(Pass(
+                    environment=environment, started=started,
+                    ended=previous, runs=runs, covered=runs >= needed))
+                started = hour
+                runs = 0
+            previous = hour
+            runs += count
+        if started is not None:
+            passes.append(Pass(
+                environment=environment, started=started, ended=previous,
+                runs=runs, covered=runs >= needed))
+    passes.sort(key=lambda entry: (entry.started, entry.environment))
+    return passes
+
+
+def recent_cutoff(
+    passes: Sequence[Pass],
+    fallback: datetime.datetime,
+    floor: datetime.datetime,
+) -> datetime.datetime:
+    """When a test's silence starts being suspicious.
+
+    Per environment, the start of the PREVIOUS covered pass: one whole
+    pass of grace, so a test the currently-running pass has not reached
+    yet is not called missing. Then the oldest across environments,
+    because a single cutoff has to serve the estate and the two errors
+    are not equal - being too lenient only delays a report, while being
+    too strict accuses thousands of healthy tests and offers to retire
+    them.
+
+    Never stricter than *fallback* (the old wall-clock window), so this
+    can only ever flag FEWER tests than before; never older than
+    *floor*, so a stalled feeder cannot slide the line back for ever.
+    """
+    cutoff = fallback
+    by_env = {}  # type: Dict[str, List[Pass]]
+    for entry in passes:
+        if entry.covered:
+            by_env.setdefault(entry.environment, []).append(entry)
+    for environment in sorted(by_env):
+        covered = by_env[environment]
+        chosen = covered[-2] if len(covered) >= 2 else covered[-1]
+        cutoff = min(cutoff, chosen.started)
+    return max(cutoff, floor)
 
 
 def group_executions(
