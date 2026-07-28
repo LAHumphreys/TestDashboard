@@ -372,6 +372,17 @@ pre.output {
 
 main.wide { max-width: 1340px; }
 
+/* On a wide monitor, stop capping the table pages at a width narrower
+   than the screen. Long test names do not wrap (nowrap keeps a row one
+   line), so Open actions overflowed into an internal scrollbar while
+   several hundred pixels of desktop sat empty either side — the reader
+   scrolls a table inside a page that has room for it.
+   Written as a media query rather than min(): plain CSS3, and the
+   target browsers are whatever is on the RHEL desktops. */
+@media (min-width: 1500px) {
+  main.wide { max-width: 96vw; }
+}
+
 .is-loading {
   opacity: 0.55;
   pointer-events: none;
@@ -1383,3 +1394,39 @@ button.bar-row:focus-visible {
    draws the eye to a row that is worth reading, and never carries the
    meaning on its own. */
 .env-none-counted { color: var(--c-fail); font-weight: 600; }
+
+
+/* ---------- What's new ---------- */
+
+/* Prose, so it keeps the narrow measure rather than the table pages'
+   full width — a 2000px line of text is unreadable. */
+.release {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 20px 16px;
+  margin-bottom: 18px;
+}
+
+.release h3 {
+  margin-top: 18px;
+  color: var(--ink);
+  font-size: 14px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.release p { margin: 4px 0 0; max-width: 62em; }
+
+.release code {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.release-footer {
+  margin-top: 20px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}

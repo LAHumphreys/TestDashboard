@@ -1453,6 +1453,9 @@ SUMMARY_QUEUE_ENTRY_KEYS = {
     "latest_comment",
     "failing_since",
     "last_pass_time",
+    # Only on the queues that report a streak. The others do not pay
+    # for it — see test_only_streak_queues_carry_stability.
+    "stability",
 }
 
 
@@ -2370,3 +2373,97 @@ class TestEnvironments(ApiCase):
         self.assert_405("POST", "/api/environments", "GET", body={})
         self.assert_405(
             "GET", "/api/environments/linux-sim/expectation", "PUT")
+
+
+class TestQueueStability(ApiCase):
+    """The "still failing" queue answers broken-vs-flaky, like Open
+    actions does.
+
+    Both lists show a Last pass date. Open actions said what the test
+    had been DOING alongside it; the triage queue showed the bare date.
+    Same test, same question, two different answers depending on which
+    page you were looking at — and the date alone cannot separate "broke
+    on the 14th" from "fails one night in three".
+    """
+
+    #: Flaky, and in the "still failing" queue. Both halves are needed:
+    #: the queue wants the latest TWO runs to be FAIL, and the point of
+    #: the test is that such a run of failures can still be flakiness
+    #: rather than a break — which is exactly what a last-pass date on
+    #: its own cannot tell you.
+    RESULTS = ["PASS", "FAIL", "PASS", "FAIL", "PASS", "FAIL", "FAIL"]
+
+    def seed(self) -> None:
+        base = NOW - datetime.timedelta(days=len(self.RESULTS))
+        for day, result in enumerate(self.RESULTS):
+            when = base + datetime.timedelta(days=day)
+            self.import_runs([record(
+                test_name="wobbly", result=result,
+                start_time=format_iso(when),
+                end_time=format_iso(when + datetime.timedelta(seconds=1)))])
+
+    def test_the_still_failing_queue_carries_stability(self) -> None:
+        self.seed()
+        entries = self.call("GET", "/api/summary")["queues"][
+            "still_failing"]["tests"]
+        self.assertTrue(entries)
+        stability = entries[0]["stability"]
+        self.assertEqual(stability["classification"], "flaky")
+        self.assertEqual(stability["runs"], len(self.RESULTS))
+        self.assertEqual(
+            stability["recent_results"], self.RESULTS)
+
+    def test_it_agrees_with_the_dashboard_for_the_same_test(self) -> None:
+        """The point of sharing the serializer: one test, one answer,
+        whichever list you are looking at."""
+        self.seed()
+        queue = self.call("GET", "/api/summary")["queues"][
+            "still_failing"]["tests"][0]
+        row = self.call(
+            "GET", "/api/dashboard",
+            query={"with_streak": ["1"]})["tests"][0]
+        self.assertEqual(queue["stability"], row["stability"])
+        self.assertEqual(queue["last_pass_time"], row["last_pass_time"])
+
+    def test_only_streak_queues_carry_stability(self) -> None:
+        """It costs batched queries, so the queues that show no Last
+        pass column must not pay for it."""
+        self.seed()
+        queues = self.call("GET", "/api/summary")["queues"]
+        for kind, entries in queues.items():
+            if not entries["tests"]:
+                continue
+            has = "stability" in entries["tests"][0]
+            self.assertEqual(
+                has, kind in ("still_failing", "mine"),
+                "{0} should {1}carry stability".format(
+                    kind, "" if has else "not "))
+
+    def test_history_is_batched_not_one_query_per_row(self) -> None:
+        """The bug this shape is most likely to reintroduce.
+
+        A test can sit in "still failing" and in "mine" at once, so the
+        cache must be shared across queues as well as batched within
+        one.
+        """
+        self.seed()
+        seen = []
+        conn = self.storage._conn()
+        conn.set_trace_callback(seen.append)
+        try:
+            self.call("GET", "/api/summary")
+        finally:
+            conn.set_trace_callback(None)
+        # Match recent_results specifically. "FROM runs ... start_time
+        # >=" also describes the trend counts and the activity buckets,
+        # and a detector that counted those would fail on work this
+        # test is not about.
+        history_queries = [
+            sql for sql in seen
+            if "SELECT environment, script, test_name, result, start_time"
+            in sql
+        ]
+        self.assertLessEqual(
+            len(history_queries), 2,
+            "recent_results should be batched and cached across queues; "
+            "issued {0} history queries".format(len(history_queries)))

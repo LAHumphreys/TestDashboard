@@ -34,6 +34,7 @@ import {
   fillOutput,
   formatDuration,
   formatTime,
+  lastPassCell,
   getUsername,
   postJson,
   putJson,
@@ -743,7 +744,11 @@ function queueColumns(queueId) {
         assigneeCol];
     case "still_failing":
       return [testCol, failingSinceCol,
-        when("Last pass", "last_pass_time"),
+        // The same cell Open actions uses. A bare timestamp here meant
+        // the same test read as "last passed on the 14th" in one list
+        // and "...and fails about one run in three" in the other.
+        { header: "Last pass", sortKey: "last_pass_time",
+          cell: (entry) => lastPassCell(entry) },
         commentCol,
         assigneeCol];
     case "fixed":

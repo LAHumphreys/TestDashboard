@@ -724,15 +724,26 @@ def _add_streaks(
         else:
             item["failing_since"] = None
             item["last_pass_time"] = None
-        results = history.get(key, [])
-        stability = analytics.stability_of(results)
-        item["stability"] = {
-            "classification": stability.classification,
-            "transitions": stability.transitions,
-            "score": round(stability.score, 3),
-            "runs": len(results),
-            "recent_results": [result.value for result in results],
-        }
+        item["stability"] = _stability_json(history.get(key, []))
+
+
+def _stability_json(results: Sequence[Result]) -> Dict[str, Any]:
+    """Serialize what a test has been doing lately.
+
+    One shape, because two lists show it: the Open actions page and the
+    "still failing" triage queue. They rendered the same test
+    differently for a while — a bare last-pass date in one and the date
+    plus the pattern in the other — which is the failure two
+    serializations invite.
+    """
+    stability = analytics.stability_of(results)
+    return {
+        "classification": stability.classification,
+        "transitions": stability.transitions,
+        "score": round(stability.score, 3),
+        "runs": len(results),
+        "recent_results": [result.value for result in results],
+    }
 
 
 def _result_counts_json(counts: Dict[Result, int]) -> Dict[str, int]:
@@ -853,6 +864,29 @@ def _handle_summary(
             )
         return streaks[key]
 
+    # Recent result history, for the stability sentence the streak
+    # queues show beside "Last pass". Batched by Storage.recent_results
+    # (one query per 100 identities, never one per row) and cached here
+    # because a test can sit in "still failing" and in "mine" at once.
+    # Bounded by the queue cap, not by the estate.
+    history = {}  # type: Dict[Tuple[str, str, str], List[Result]]
+    stability_since = current - datetime.timedelta(
+        days=_STABILITY_WINDOW_DAYS)
+
+    def load_history(rows: Sequence[TestStatusRow]) -> None:
+        wanted = [
+            (row.environment, row.script, row.test_name) for row in rows
+            if (row.environment, row.script, row.test_name) not in history
+        ]
+        if not wanted:
+            return
+        found = storage.recent_results(
+            wanted, stability_since, per_test_limit=_STABILITY_RUNS)
+        for triple in wanted:
+            # Record misses too, or a test with no runs in the window is
+            # re-queried by every queue it appears in.
+            history[triple] = found.get(triple, [])
+
     def queue_json(
         kind: str,
         queue_assignee: Optional[str] = None,
@@ -874,6 +908,11 @@ def _handle_summary(
             _status_row_json(row, streak_for(row) if with_streaks else None)
             for row in rows
         ]
+        if with_streaks:
+            load_history(rows)
+            for row, entry in zip(rows, entries):
+                entry["stability"] = _stability_json(history[
+                    (row.environment, row.script, row.test_name)])
         if kind == "still_failing":
             # Oldest neglected regression first — the point of the queue.
             entries.sort(key=lambda entry: entry["failing_since"] or "")
