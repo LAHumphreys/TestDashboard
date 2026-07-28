@@ -50,6 +50,7 @@ these are the ones that get forgotten:
 | — | MariaDB migration automation | **done** | `dae82c7` on `main` |
 | WP-14 | In-run progress | **done, held back** | `1102463`, `b4b1030` on branch `wp-14-in-run-progress` |
 | WP-15 | Progress pushes from a partial reader | `pending` | migration 6 claimed |
+| WP-16 | Site-specific info tab | `noted` | content not specified yet |
 
 **WP-14 is deliberately NOT on `main`, and this is the first split in this
 log.** It is finished and green, but the progress bar it draws counts imported

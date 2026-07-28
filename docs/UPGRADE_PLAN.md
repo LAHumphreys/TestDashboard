@@ -910,6 +910,36 @@ row it covers, and nothing else in the dashboard can tell the difference.
 
 ---
 
+### WP-16 — site-specific info tab *(noted, not specified)*
+
+Raised by the user on 2026-07-28 as a note for later, with no content
+defined yet. Recorded here rather than lost in a conversation; **do not
+start building it from this paragraph.**
+
+**What is known.** A tab, alongside Dashboard / Open actions / Time /
+What's new, carrying information specific to this site — the things a
+newcomer or an out-of-hours person has to ask someone for today.
+
+**What is not known, and has to be answered before any code.** What goes
+on it, and whether it is static text or reads from the database. Those
+are different pieces of work: static content is `whatsnew.html` again
+(a page, a nav entry, no API), whereas anything derived — who owns which
+environment, where the logs live, which contacts cover what — wants a
+table and an editing surface, which is WP-13's shape and considerably
+more.
+
+**The one structural thing to remember.** The nav is duplicated across
+**six** static HTML files now (`index`, `actions`, `script`, `test`,
+`time`, `whatsnew`). A new tab must be added to all six or people reach
+it once and never find it again. Grep for `site-nav`.
+
+**Default if it is never specified further:** a static page, following
+`whatsnew.html` exactly, with content the user supplies. That is an
+hour's work and can be replaced by a data-driven version later without
+anything having to be undone.
+
+---
+
 ## 3. Execution order
 
 Three lanes. WP-0 lands before anything that touches `MIGRATIONS`.
