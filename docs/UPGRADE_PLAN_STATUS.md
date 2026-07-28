@@ -673,6 +673,40 @@ WP-15 below is what makes it mean something, and the two should land together.
 
 ## Where things stand
 
+### Deploying `main` — measured 2026-07-28
+
+`origin/master` is **17 commits behind** `main`, so this is not a small
+upgrade: it carries everything from the worker-pool fix (`964e0b4`) onwards —
+all of round 1, WP-12's derived staleness cutoff, WP-13, and the MariaDB
+tooling. The running instance is at `a41cfe0`.
+
+**The database migrates on first start, from version 1 to version 5.**
+Measured on a copy of the dev database (218 MB, 540,192 runs, 12,008 tests) at
+version 1, through the real `Storage` startup path: **237 ms** for the whole
+chain, ending at version 5 with every row intact and migration 3's duration
+backfill complete.
+
+Production is ~900 MB, roughly four times that, and **the number should not be
+scaled by four.** Nothing in migrations 2–5 touches `runs`: entry 2 is two
+`ADD COLUMN`s, entry 3 backfills `latest_runs`, entry 4 indexes `latest_runs`,
+entry 5 is a `CREATE TABLE`. All of them are proportional to the number of
+TESTS — about 12,000 in both databases — and production's extra size is
+`run_outputs` blobs, which are never read. Expect well under a second.
+
+Nothing is reversible by the code: a database at version 5 is refused by
+older code, which is deliberate. **Take a copy of the SQLite file before
+starting the new build.** That is the rollback.
+
+Smoke-tested against that migrated copy through a real server: every page and
+every endpoint answers 200, the summary carries no `progress` key (WP-14 is
+not in this build), and the environment-expectations section renders, saves and
+clears against real data.
+
+To publish: the local branch is `main` and the remote branch is `master`, so
+it is `git push origin main:master` — a fast-forward, since `main` contains
+all of `origin/master`. Not done here; publishing is the user's call.
+
+
 `main` is deployable on its own and has nothing half-finished in it: all of
 round 1, WP-12's derived staleness cutoff, WP-13's declared environment
 expectations (migration 5), and the MariaDB migration tooling.
