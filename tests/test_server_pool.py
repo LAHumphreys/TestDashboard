@@ -20,7 +20,7 @@ cost a multiple of every read.
 Python 3.6 compatible; standard library only.
 """
 
-import inspect
+import http.client
 import json
 import os
 import shutil
@@ -350,45 +350,79 @@ class KeepAliveTest(ServerTestBase):
             "the second request on an idle connection was not answered, so "
             "the connection was closed when nothing was waiting for it")
 
-    def test_writing_a_response_never_consults_pool_contention(self) -> None:
-        """Ending a connection because the pool is busy was a mistake.
+    def test_a_reclaimed_connection_is_always_announced_first(self) -> None:
+        """The server must never close a connection a client thinks is open.
 
-        A version of this fix set ``close_connection`` inside
-        ``_write_response`` whenever the pool had queued work, reasoning
-        that a worker is better spent on a client that is waiting. Both
-        halves of that were wrong, and it is worth a guard because it
-        reads like an obvious improvement.
+        This is the invariant the whole keep-alive mechanism rests on, and
+        it was broken once by a change that looked like a simplification.
 
-        **Redundant.** :meth:`_wait_for_request` already gives the
-        connection up within ``_IDLE_POLL_SECONDS`` once anything queues,
-        and that poll is what fixes the starvation. The response path
-        covered only the sliver between finishing a response and starting
-        to wait.
+        Reclaiming a worker means closing a connection. The poll in
+        ``_wait_for_request`` does that when the pool is contended, which
+        is what stops idle browsers starving the pool — but a close the
+        client was not told about means its next request goes into a dead
+        socket. ``_write_response`` is the announcement half: it sets
+        ``Connection: close`` when the pool is contended, so a client that
+        is about to lose its connection learns before it uses it again.
 
-        **Harmful.** "The pool has queued work" is the normal state DURING
-        a page load: every home screen fetches ``/api/summary``, which
-        holds a worker for most of a second, so the ten static files
-        behind it were being told to close. Measured on a copy of the dev
-        database: 2 of 8 responses in one simulated page load, each
-        costing the browser a fresh connection — and one client saw its
-        socket aborted mid-body, because closing with unread bytes still
-        in flight is an RST on Windows and truncates a response the
-        browser was reading. Losing part of a response is strictly worse
-        than the reconnect it was trying to save.
+        The two halves were separated once, keeping the poll and dropping
+        the announcement. Measured with ``http.client``, which unlike a
+        browser does not retry, against a 210 MB copy of the dev data:
+        2 users lost 6 requests, 4 users lost 16, 6 users lost 27 —
+        roughly 40% of requests on reused connections — where the
+        announced version lost none at any level. A browser papers over an
+        idempotent GET by retrying it; a POST is not retried and fails in
+        front of the user.
 
-        Asserted against the source because the two mechanisms share
-        ``_pool_is_contended``: forcing contention true to test the
-        response path also makes the poll fire, so no behavioural test
-        can tell them apart. This can.
+        So: under real contention, with a client that reuses connections
+        and never retries, nothing may fail.
         """
-        source = inspect.getsource(
-            server._DashboardRequestHandler._write_response)
-        for name in ("_pool_is_contended", "has_pending"):
-            self.assertNotIn(
-                name, source,
-                "_write_response consults pool contention again. It closes "
-                "connections during ordinary page loads and can truncate a "
-                "response mid-body; the idle poll already frees the worker")
+        page = ["/api.js", "/charts.js", "/sorting.js", "/review.js",
+                "/api/environments", "/api/dashboard?limit=50"]
+        failures = []  # type: List[str]
+        announced = []  # type: List[int]
+        lock = threading.Lock()
+
+        def browse() -> None:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self.port, timeout=60)
+            try:
+                for path in page:
+                    try:
+                        conn.request("GET", path)
+                        response = conn.getresponse()
+                        response.read()
+                    except Exception as exc:
+                        with lock:
+                            failures.append("{0}: {1!r}".format(path, exc))
+                        conn.close()
+                        conn = http.client.HTTPConnection(
+                            "127.0.0.1", self.port, timeout=60)
+                        continue
+                    if (response.getheader("Connection", "").lower()
+                            == "close"):
+                        with lock:
+                            announced.append(1)
+                        # What a browser does, and the whole point of the
+                        # header: stop using this connection.
+                        conn.close()
+                        conn = http.client.HTTPConnection(
+                            "127.0.0.1", self.port, timeout=60)
+            finally:
+                conn.close()
+
+        # More clients than workers, so the pool is genuinely contended.
+        clients = [threading.Thread(target=browse)
+                   for _ in range(self.workers * 3)]
+        for client in clients:
+            client.start()
+        for client in clients:
+            client.join(timeout=120)
+
+        self.assertEqual(
+            failures, [],
+            "{0} request(s) died on a reused connection, so a close was "
+            "not announced before it happened:\n  {1}".format(
+                len(failures), "\n  ".join(failures[:8])))
 
     def test_shutdown_does_not_wait_for_an_idle_client(self) -> None:
         """A worker holding an idle connection must still be joinable.

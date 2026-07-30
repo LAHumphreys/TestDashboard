@@ -699,32 +699,43 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         got gzip, so a shared cache cannot serve one client's encoding to
         another.
         """
-        # NO adaptive keep-alive here, and that is a decision with a
-        # measurement behind it.
+        # Adaptive keep-alive: when the pool has queued work, this
+        # connection ends with this response.
         #
-        # This used to end the connection whenever the pool had queued
-        # work, on the theory that a worker is better spent on a client
-        # that is waiting than held for one that may never come back.
-        # It was redundant and it was harmful.
+        # THIS AND THE POLL IN _wait_for_request ARE ONE MECHANISM. Do
+        # not remove either alone. The poll reclaims a worker from an
+        # idle connection, and reclaiming means CLOSING a connection the
+        # client still believes is open — so the client has to be told,
+        # and the only place to tell it is a response header. That is
+        # what this is: the announcement half.
         #
-        # Redundant, because the wait for the NEXT request already gives
-        # the connection up within _IDLE_POLL_SECONDS once anything
-        # queues (see _wait_for_request). That poll is what fixes the
-        # starvation; this only covered the sliver of time between
-        # finishing a response and starting to wait.
+        # Removing it while leaving the poll was tried, on the reasoning
+        # that the poll alone fixes the starvation and this only closes
+        # connections a page load would rather keep. Both halves of that
+        # were true and the result was still much worse, because the
+        # poll then reclaimed connections SILENTLY and clients sent their
+        # next request into a socket the server had already closed.
+        # Measured with a strict client (http.client, which unlike a
+        # browser does not retry), against a 210 MB copy of the dev data:
         #
-        # Harmful, because "the pool has queued work" is the normal state
-        # DURING a page load: every home screen fetches /api/summary,
-        # which holds a worker for most of a second, so the ten static
-        # files behind it were being told to close. Measured: 2 of 8
-        # responses in one simulated page load, each costing the browser
-        # a fresh connection — and one client saw the socket aborted
-        # mid-body, because closing with unread bytes still in flight is
-        # an RST on Windows and can truncate the response.
+        #     users   announced closes / failed requests
+        #     2       16 / 0        silent: 0 / 6
+        #     4       37 / 0        silent: 0 / 16
+        #     6       60 / 0        silent: 0 / 27
         #
-        # Keep-alive is therefore unconditional. Back-pressure lives
-        # where it belongs: the bounded accept queue, and the idle
-        # timeout.
+        # Announced, nothing ever fails. Silent, 40% of requests on
+        # reused connections die. A browser retries an idempotent GET and
+        # would mostly paper over it; a POST — a comment, an assignment —
+        # is not retried and simply fails in front of the user.
+        #
+        # The cost of announcing is one TCP handshake per closed
+        # connection, which is a fraction of a millisecond on a LAN. That
+        # is the right side of this trade, and `--workers` is the knob for
+        # reducing how often it fires (24 workers took 4-user page loads
+        # from 37 closes to 8).
+        if not self.close_connection and self._pool_is_contended():
+            self.close_connection = True
+
         content_type = ""
         for name, value in headers:
             if name.lower() == "content-type":

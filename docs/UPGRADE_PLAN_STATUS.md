@@ -846,54 +846,56 @@ The fix is four interacting parts, and it took three attempts:
    already sitting in `rfile`'s buffer, and would then close the connection with
    it unanswered. `rfile.peek(1)` under a short socket timeout answers for both,
    consumes nothing, and leaves the stream untouched on timeout.
-4. **Adaptive keep-alive — built, measured, and REMOVED.** `_write_response`
-   ended the connection whenever the pool had queued work, on the theory that a
-   worker is better spent on a client that is waiting. It was redundant, because
-   the poll in (2) already releases an idle connection within 250ms; it covered
-   only the sliver between finishing a response and starting to wait.
+4. **Adaptive keep-alive.** `_write_response` sets `Connection: close` when
+   the pool has queued work, so a connection about to be reclaimed is
+   announced before the client reuses it.
 
-   And it was harmful, which only showed up when the user reported the page
-   feeling "a little laggier" after enabling `--perf-log`. **The perf log was
-   not the cause** (A/B measured below); this was. "The pool has queued work" is
-   the normal state *during a page load*: every home screen fetches
-   `/api/summary`, which holds a worker for most of a second, so the ten static
-   files behind it were being told to close. Measured on a copy of the dev
-   database, one simulated page load: **2 of 8 responses forced a close**, each
-   costing the browser a fresh connection — and one client had its socket
-   aborted mid-body, because closing with unread bytes in flight is an RST on
-   Windows and truncates a response the browser is still reading. Losing part of
-   a response is strictly worse than the reconnect it was trying to save.
+   **This and the poll in (2) are ONE mechanism, and separating them was a
+   real mistake made in this session — caught only because the user asked
+   whether `--perf-log` was the cause of a page feeling laggier.** The perf
+   log was not (measured below at +15 ms on `/api/summary`, nothing
+   elsewhere). Chasing it found that the eager close fires constantly during
+   page loads — 2 of 8 responses in a first crude probe — which looked like
+   pure waste, so it was removed on the reasoning that the poll alone fixes
+   the starvation. It was pushed as a review candidate. It was **worse**.
 
-   Removed, and guarded: `test_writing_a_response_never_consults_pool_contention`
-   asserts against the source, because both mechanisms share
-   `_pool_is_contended` and forcing contention true to test the response path
-   also makes the poll fire — no behavioural test can separate them. Verified by
-   re-planting the regression: the guard fails. After removal the same page load
-   is **10 kept alive, 0 closes, 0 aborts**, and the starvation fix still holds
-   (8 idle connections against 8 workers, ninth request answered in 0.58s).
+   Reclaiming a worker means closing a connection the client still believes
+   is open. The announcement is what makes that safe. With it gone the poll
+   reclaimed connections silently and clients sent their next request into a
+   dead socket. Measured with `http.client` — a strict client that, unlike a
+   browser, does not retry — against a 210 MB copy of the dev data, one full
+   dashboard load per simulated user:
 
-   Keep-alive is now unconditional. Back-pressure lives where it belongs: the
-   bounded accept queue, and the idle timeout.
+   | Concurrent users | Announced (deployed): closes / failed | Silent (the candidate): closes / failed |
+   |---|---|---|
+   | 2 | 16 / **0** | 0 / **6** |
+   | 4 | 37 / **0** | 0 / **16** |
+   | 6 | 60 / **0** | 0 / **27** |
 
-**The regression this caused, and how it was caught.** Yielding on contention was
-first applied to every wait, including the first request on a freshly accepted
-connection — which under load is most of them. Result: connections closed with no
-response at all. `StillAServerTest::test_more_clients_than_workers_all_complete`
-failed with 15 of 20 clients getting "remote end closed connection without
-response". A connection that has not been served is not an idle client holding a
-worker hostage; it *is* the queue. `may_yield` is now False until the connection
-has had one response.
+   About 40% of requests on reused connections died. A browser retries an
+   idempotent GET and would mostly hide it; a POST — a comment, an
+   assignment — is not retried and fails in front of the user. Reverted.
 
-Also here, because the file was open: `handle_error` no longer prints a
-traceback to stderr when a client disconnects mid-response (it looked like a
-server fault), `log_error` drops the now-normal idle-close to DEBUG, the module
-docstring stopped claiming the server is built on `ThreadingMixIn` (the class
-docstring correctly denies it), and the `socketserver` import it needed went
-with it.
+   The earlier "one client saw its socket aborted mid-body" was **also
+   wrong**, and worth recording because it nearly became a production
+   diagnosis: that probe ignored `Connection: close` and kept writing to a
+   socket the server had properly announced it was closing. A correct client
+   sees no truncation and no corruption — verified byte-for-byte against the
+   files on disk, 0 truncated and 0 corrupted at every concurrency level.
+   (A first pass reported 2 corrupted responses; that was a fresh git
+   checkout having CRLF where the working tree has LF, not the server.)
 
-Shutdown got faster as a side effect and has a test saying so: a worker blocked
-forever on an idle socket never reached its sentinel, so `server_close()`
-depended on a browser closing its connection.
+   The cost of announcing is one TCP handshake per closed connection, a
+   fraction of a millisecond on a LAN. `--workers` is the knob that reduces
+   how often it fires: on the deployed code, raising it from 8 to 24 took
+   4-user page loads from 37 closes to 8, with no code change.
+
+   Guarded by `test_a_reclaimed_connection_is_always_announced_first`, which
+   drives 12 keep-alive clients against 4 workers with a non-retrying client
+   and asserts nothing fails. Verified by re-planting the regression.
+
+   **The invariant, for whoever touches this next: the server must never
+   close a connection without having told the client in a response header.**
 
 ### Where the time goes, as a treemap — and the constraint that decided it
 
