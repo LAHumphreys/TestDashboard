@@ -699,20 +699,32 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         got gzip, so a shared cache cannot serve one client's encoding to
         another.
         """
-        # Adaptive keep-alive. A worker is bound to a CONNECTION, so
-        # holding one open for a client that may never come back is
-        # capacity taken from a client that is waiting right now. When
-        # the pool has queued work, this connection ends with this
-        # response — the decision has to be made HERE, before the
-        # headers, so `Connection: close` below tells the client the
-        # truth rather than leaving it to write into a closing socket.
+        # NO adaptive keep-alive here, and that is a decision with a
+        # measurement behind it.
         #
-        # Uncontended, keep-alive is kept: a page load fetches ~10 files
-        # and reusing the connection for them is most of why HTTP/1.1 is
-        # on. This only gives it up when someone is queueing for it.
-        if not self.close_connection and self._pool_is_contended():
-            self.close_connection = True
-
+        # This used to end the connection whenever the pool had queued
+        # work, on the theory that a worker is better spent on a client
+        # that is waiting than held for one that may never come back.
+        # It was redundant and it was harmful.
+        #
+        # Redundant, because the wait for the NEXT request already gives
+        # the connection up within _IDLE_POLL_SECONDS once anything
+        # queues (see _wait_for_request). That poll is what fixes the
+        # starvation; this only covered the sliver of time between
+        # finishing a response and starting to wait.
+        #
+        # Harmful, because "the pool has queued work" is the normal state
+        # DURING a page load: every home screen fetches /api/summary,
+        # which holds a worker for most of a second, so the ten static
+        # files behind it were being told to close. Measured: 2 of 8
+        # responses in one simulated page load, each costing the browser
+        # a fresh connection — and one client saw the socket aborted
+        # mid-body, because closing with unread bytes still in flight is
+        # an RST on Windows and can truncate the response.
+        #
+        # Keep-alive is therefore unconditional. Back-pressure lives
+        # where it belongs: the bounded accept queue, and the idle
+        # timeout.
         content_type = ""
         for name, value in headers:
             if name.lower() == "content-type":

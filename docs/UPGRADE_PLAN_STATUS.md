@@ -846,8 +846,34 @@ The fix is four interacting parts, and it took three attempts:
    already sitting in `rfile`'s buffer, and would then close the connection with
    it unanswered. `rfile.peek(1)` under a short socket timeout answers for both,
    consumes nothing, and leaves the stream untouched on timeout.
-4. **Adaptive keep-alive**, decided in `_write_response` *before* the headers so
-   `Connection: close` is honest.
+4. **Adaptive keep-alive — built, measured, and REMOVED.** `_write_response`
+   ended the connection whenever the pool had queued work, on the theory that a
+   worker is better spent on a client that is waiting. It was redundant, because
+   the poll in (2) already releases an idle connection within 250ms; it covered
+   only the sliver between finishing a response and starting to wait.
+
+   And it was harmful, which only showed up when the user reported the page
+   feeling "a little laggier" after enabling `--perf-log`. **The perf log was
+   not the cause** (A/B measured below); this was. "The pool has queued work" is
+   the normal state *during a page load*: every home screen fetches
+   `/api/summary`, which holds a worker for most of a second, so the ten static
+   files behind it were being told to close. Measured on a copy of the dev
+   database, one simulated page load: **2 of 8 responses forced a close**, each
+   costing the browser a fresh connection — and one client had its socket
+   aborted mid-body, because closing with unread bytes in flight is an RST on
+   Windows and truncates a response the browser is still reading. Losing part of
+   a response is strictly worse than the reconnect it was trying to save.
+
+   Removed, and guarded: `test_writing_a_response_never_consults_pool_contention`
+   asserts against the source, because both mechanisms share
+   `_pool_is_contended` and forcing contention true to test the response path
+   also makes the poll fire — no behavioural test can separate them. Verified by
+   re-planting the regression: the guard fails. After removal the same page load
+   is **10 kept alive, 0 closes, 0 aborts**, and the starvation fix still holds
+   (8 idle connections against 8 workers, ninth request answered in 0.58s).
+
+   Keep-alive is now unconditional. Back-pressure lives where it belongs: the
+   bounded accept queue, and the idle timeout.
 
 **The regression this caused, and how it was caught.** Yielding on contention was
 first applied to every wait, including the first request on a freshly accepted
@@ -968,6 +994,45 @@ A documentation error caught by its own test: the report first described p99 as
 "1 in 100 was at least this slow", which is wrong — with 99 samples at 1ms and
 one at 1000ms, p99 *is* 1ms. Percentiles are textbook nearest-rank now, and the
 column is described as the boundary it is, with `max` for the worst.
+
+### What `--perf-log` actually costs — measured, because it was suspected
+
+Asked directly: "Does that perf logging impose an overhead? I've enabled it and
+the page feels just a little laggier?" Worth answering with an A/B rather than a
+reassurance, and the answer turned out to be "no, but you were right that
+something was".
+
+Same code, same database (a 210 MB copy of the dev data), same request pattern,
+alternated ON/OFF/ON/OFF across two rounds so machine drift shows as spread
+rather than as a result. Twelve sequential requests per endpoint after a
+twelve-request warm-up, plus a sixteen-way concurrent burst.
+
+| | perf ON | perf OFF | overhead |
+|---|---|---|---|
+| `/api/summary` median | 728 ms | 713 ms | **+15 ms (+2.1%)** |
+| `/api/dashboard` median | 33.5 ms | 34.3 ms | −0.8 ms (−2.4%) |
+| `/api/time` median | 581 ms | 588 ms | −7.0 ms (−1.2%) |
+| 16 concurrent, wall | 3876 ms | 3883 ms | −6 ms (−0.2%) |
+
+Round-to-round spread was tight (ON 724/732 ms, OFF 715/711 ms), so the 15 ms on
+`/api/summary` is probably real and everything else is noise.
+
+**Why `/api/summary` and nothing else:** it is the only endpoint that writes a
+lot of records. One call logs **~110** — 93 of them `failure_streak_bounds`,
+which is called once per queue entry. So ~0.14 ms per record, covering
+`time.time()` twice, a lock, `json.dumps`, and a line-buffered write syscall.
+`/api/dashboard` issues a handful of storage calls and shows nothing at all.
+
+2% on the heaviest endpoint is not something a person can feel, which is what
+sent the search elsewhere and found the adaptive-keep-alive fault above. Left as
+it is: the cost is real but small, and the alternative (buffering instead of
+line-buffering) would trade it for losing the tail of the log in exactly the
+situation the log exists for — a process that has stalled and is still holding
+the file open.
+
+Worth knowing for production: the log is a write per record on the same
+filesystem as the database. On the dev machine that is an SSD and invisible. If
+the production database lives on a network mount, put the log somewhere local.
 
 ### Verification, and its limits
 

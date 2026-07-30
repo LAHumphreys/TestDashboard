@@ -20,6 +20,7 @@ cost a multiple of every read.
 Python 3.6 compatible; standard library only.
 """
 
+import inspect
 import json
 import os
 import shutil
@@ -348,6 +349,46 @@ class KeepAliveTest(ServerTestBase):
             b"200 OK", self.read_response(sock),
             "the second request on an idle connection was not answered, so "
             "the connection was closed when nothing was waiting for it")
+
+    def test_writing_a_response_never_consults_pool_contention(self) -> None:
+        """Ending a connection because the pool is busy was a mistake.
+
+        A version of this fix set ``close_connection`` inside
+        ``_write_response`` whenever the pool had queued work, reasoning
+        that a worker is better spent on a client that is waiting. Both
+        halves of that were wrong, and it is worth a guard because it
+        reads like an obvious improvement.
+
+        **Redundant.** :meth:`_wait_for_request` already gives the
+        connection up within ``_IDLE_POLL_SECONDS`` once anything queues,
+        and that poll is what fixes the starvation. The response path
+        covered only the sliver between finishing a response and starting
+        to wait.
+
+        **Harmful.** "The pool has queued work" is the normal state DURING
+        a page load: every home screen fetches ``/api/summary``, which
+        holds a worker for most of a second, so the ten static files
+        behind it were being told to close. Measured on a copy of the dev
+        database: 2 of 8 responses in one simulated page load, each
+        costing the browser a fresh connection — and one client saw its
+        socket aborted mid-body, because closing with unread bytes still
+        in flight is an RST on Windows and truncates a response the
+        browser was reading. Losing part of a response is strictly worse
+        than the reconnect it was trying to save.
+
+        Asserted against the source because the two mechanisms share
+        ``_pool_is_contended``: forcing contention true to test the
+        response path also makes the poll fire, so no behavioural test
+        can tell them apart. This can.
+        """
+        source = inspect.getsource(
+            server._DashboardRequestHandler._write_response)
+        for name in ("_pool_is_contended", "has_pending"):
+            self.assertNotIn(
+                name, source,
+                "_write_response consults pool contention again. It closes "
+                "connections during ordinary page loads and can truncate a "
+                "response mid-body; the idle poll already frees the worker")
 
     def test_shutdown_does_not_wait_for_an_idle_client(self) -> None:
         """A worker holding an idle connection must still be joinable.
