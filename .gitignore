@@ -11,3 +11,11 @@ testboard_failed_batch_*.json
 internal_*.py
 .idea/
 demo.jsonl
+# Site-specific What's new notes live BESIDE THE DATABASE, which on a
+# dev machine is this directory. They are deliberately outside version
+# control: a deployment must not be able to overwrite a site's own notes.
+site_notes.json
+site_notes.json.tmp
+# Performance logs (--perf-log), including the rolled-over predecessor.
+*-perf.log
+*-perf.log.1
