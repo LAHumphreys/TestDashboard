@@ -3,9 +3,15 @@
 Running log for [`UPGRADE_PLAN.md`](UPGRADE_PLAN.md). **Append, never rewrite.**
 
 This file exists so work can be resumed cold, by someone (or something) with no
-memory of the session that started it. If you are picking this up: read the
-plan, read this file, run `git log --oneline`, run the suite, then take the
-first package below whose state is not `done`.
+memory of the session that started it. If you are picking this up: **read
+[`SESSION_HANDOVER.md`](SESSION_HANDOVER.md) first** — it is one screen of current
+state, and it is rewritten rather than appended to, so it is not buried under
+history the way anything in this file eventually is. Then read the plan, read the
+state table below, run `git log --oneline`, run the suite, and take the first
+package whose state is not `done`.
+
+This file is the **log**: what was done, what was measured, and what was decided
+and why. Append to it; never rewrite an entry. The handover is the **snapshot**.
 
 **Ground rules that survive a restart** — the full set is §0 of the plan, but
 these are the ones that get forgotten:

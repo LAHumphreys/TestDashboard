@@ -4,12 +4,46 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project State
 
-This is a greenfield project. The only content so far is two specification briefs in `docs/`:
+**testboard is live in production and has been since 2026-07-26.** It is no longer
+greenfield: ~25k lines, 1,137 tests, schema at migration 5, deployed and in daily use
+by a small group of testers.
 
-- `docs/BRIEF_dashboard.md` — the main project: "testboard", a self-contained web dashboard for overnight test results (storage, HTTP API, analytics, web UI).
-- `docs/BRIEF_feeder_copilot.md` — a separate feeder script that pushes results into the dashboard's `/api/import` endpoint.
+**Starting a session: read [`docs/SESSION_HANDOVER.md`](docs/SESSION_HANDOVER.md) first.**
+It is one screen: what state the branches are in, what is parked where, and what the
+next piece of work is. It is rewritten each session rather than appended to, so it is
+current by construction.
 
-**Read the relevant brief in full before implementing anything.** The briefs are the source of truth for the domain model, API contract, project layout, and quality bar; this file only summarizes the non-negotiables.
+The other documents, and what each is for:
+
+| Document | What it is | How to treat it |
+|---|---|---|
+| `docs/SESSION_HANDOVER.md` | State of play, right now | **Rewrite** it when the state changes |
+| `docs/UPGRADE_PLAN.md` | Work orders, WP-0 … WP-16, plus the migration version registry | Claim a migration version here before writing one |
+| `docs/UPGRADE_PLAN_STATUS.md` | Running log: what was done, what was measured, what was decided and why | **Append only.** Never rewrite an entry |
+| `docs/MARIADB_MIGRATION.md` | Runbook for the SQLite → MariaDB move | Fix it in the same commit if you find it wrong |
+| `static/whatsnew.html` | What the testers see | Every user-visible change goes in it |
+| `docs/BRIEF_dashboard.md`, `docs/BRIEF_feeder_copilot.md` | The original briefs | **Historical.** Useful for intent; the code and the log are the source of truth now, and both have moved on |
+
+## Working practice
+
+- **Changes ship as a dated drop.** Work is batched, verified together, and deployed as
+  one group rather than trickled out. Each drop gets a dated section at the top of
+  `static/whatsnew.html` (newest first) written for a *tester* — what changed, where to
+  find it, what it means for them. Nothing user-visible ships without a line there, and
+  nothing appears there that is not in the build; a note promising a feature the drop
+  does not contain sends people hunting and then reporting its absence as a bug.
+- **One package, one commit** (or a small ordered series), on a branch named
+  `wp-<n>-<slug>`. Commit messages carry the *reasoning* and the *measurements* —
+  they are the primary record and the log summarises them.
+- **Measure, do not estimate.** Every performance or migration claim in this repo has a
+  number behind it, and says which database it was taken on. The repo-root
+  `testboard.db` is **generated dev data**, not a copy of production — production is
+  roughly four times its size. Never say "production" about a number taken here.
+- **Restarting the server is not optional after a Python change.** Static files are read
+  from disk per request, so a stale process serves new HTML/JS against old handlers. That
+  failure looks like a UI bug, not a deployment mistake, and it has cost time twice.
+- **Guard tests encode production findings.** If your change makes one fail, widen its
+  scope — never weaken its assertion — and say which you did in the commit message.
 
 ## Hard Constraints (apply to all code)
 
@@ -28,23 +62,61 @@ This is a greenfield project. The only content so far is two specification brief
 - Run all tests: `python -m unittest discover`
 - Run one test module: `python -m unittest tests.test_storage`
 - Run one test: `python -m unittest tests.test_storage.TestClass.test_method`
-- Run the server (once implemented): `python run_server.py --port <p> --db <path> --host <h>`
+- Run the server: `python run_server.py --port <p> --db <path> --host <h>`
+  (add `--workers N` / `--cache-mb MB` to tune the pool; defaults are fine)
+- **Never against the repo-root `testboard.db`** for anything that migrates or writes —
+  copy it to a temp directory first. Opening it with current code migrates it.
 
-## Architecture (dashboard, per brief)
+## Architecture (dashboard)
 
-Planned layout: `testboard/` package with `model.py` (NamedTuples, `Result` enum, ISO time parse/format), `storage.py` (all SQL, sqlite migrations), `analytics.py` (pure functions), `api.py` (framework-free routing/handlers), `server.py` (http.server glue + static files); `static/` for the UI; `tests/` for unittest suites.
+Layout as built: `testboard/` package with `model.py` (NamedTuples, `Result` enum, ISO time parse/format), `storage.py` (all SQL, sqlite migrations), `analytics.py` (pure functions), `api.py` (framework-free routing/handlers), `server.py` (http.server glue + static files); `static/` for the UI; `tests/` for unittest suites.
 
-Key design decisions mandated by the brief:
+Key design decisions. The first few came from the brief; the rest were bought
+with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
 
 - **Handlers are plain testable functions** taking (parsed request, storage) and returning `(status, headers, body)`; the `BaseHTTPRequestHandler` subclass is a thin shell. Unit-test handlers directly; a few end-to-end tests boot a real server on an ephemeral port.
-- **Test identity** is the triple `(environment, script, test_name)`; a **run** is keyed by that triple plus `start_time`. Import is an idempotent upsert on that key — use a UNIQUE constraint with `INSERT OR REPLACE` (3.6's sqlite predates `ON CONFLICT DO UPDATE`).
+- **Test identity** is the triple `(environment, script, test_name)`; a **run** is keyed
+  by that triple plus `start_time`, with a UNIQUE constraint. Import is an idempotent
+  upsert on that key, done as **SELECT-then-UPDATE-or-INSERT** — deliberately *not*
+  `INSERT OR REPLACE`, which deletes and re-inserts and would churn `runs.id` on every
+  nightly re-import, while `run_outputs.run_id` and `latest_runs.run_id` both reference
+  it. `ON CONFLICT DO UPDATE` is unavailable (3.6's bundled sqlite predates it).
+  `tests/test_sql_portability.py` pins both the id stability and the fact that the only
+  two `INSERT OR REPLACE` sites are on tables where the difference is unobservable.
 - **Timestamps** are ISO-8601 UTC strings (`YYYY-MM-DDTHH:MM:SS.ffffff`, no timezone suffix) everywhere — storage, transport, and comparisons (lexical ordering works).
 - **`result`** is an `enum.Enum`: `PASS`, `FAIL`, `FAILED_AS_EXPECTED`, `UNEXPECTED_PASS`. Analytics treat `FAILED_AS_EXPECTED` as non-failure and `UNEXPECTED_PASS` as noteworthy-but-not-failure.
 - **`output` can be large**: it lives in its own table (`run_outputs`), zlib-compressed, and is read by exactly one endpoint (`GET /api/runs/{id}`). Never join it into a list query — keeping it out of `runs` is what keeps metadata reads dense.
 - **The server serves from a fixed worker pool, never a thread per request.** Storage keeps connections in `threading.local()`, so a thread per request means a connection per request means an empty SQLite page cache on every request — measured: 20 requests, 20 connections, and no `cache_size` setting can help a cache that is discarded before it is used twice. The pool size *is* the connection count and is what a `--cache-mb` budget is divided by; `tests/test_server_pool.py` fails if the mixin comes back.
-- SQLite: WAL mode + busy timeout at connect (threaded server), versioned migration table (`schema_version`). `MIGRATIONS` currently holds ONE entry that creates the schema outright — nothing is deployed, so there is no history to preserve. The first schema change after a deployment exists adds entry 2 and never edits entry 1. A database whose version is newer than the code is refused, not used.
+- SQLite: WAL mode + busy timeout at connect (threaded server), versioned migration
+  table (`schema_version`). **`MIGRATIONS` holds five entries and entry 1 describes a
+  database that exists in production — never edit it.** Every schema change is a new
+  appended entry whose version is claimed from the registry in `docs/UPGRADE_PLAN.md`
+  §1 *in the same commit*; version 6 is already claimed by WP-15.
+  `tests/test_migrations.py` freezes entry 1 by hash and asserts the fresh-install and
+  incremental paths produce identical schemas. A migration may contain a Python step
+  (`"python: <name>"`). A database whose version exceeds the code's is refused, not
+  used — so a rollback needs a copy of the file taken beforehand.
 - **Scale is the design constraint**: ~12,000 tests a night, kept for a year (~4.4M runs). No endpoint may be proportional to the size of the estate. `latest_runs` (one row per test, carrying its latest and previous result) and `current_assignments` are derived tables maintained inside the writing transaction; estate-wide reads go through them, list endpoints are paginated in SQL, and only the returned page joins `runs`. `ORDER BY` cannot be parameterized — sort keys come from the `DASHBOARD_SORTS` whitelist.
 - **A run belongs to a test, not to a batch** — the import contract has no session/batch id. A *suite execution* is therefore inferred from run timings by `analytics.group_executions` (new execution when a run starts more than 60 min after the latest end seen). A suite can run more than once a day, so anything bucketed by calendar day (the home trend) must not be described as "per night".
+- **"Recently run" is derived from the suite, not from the wall clock.** Environments run
+  SEQUENTIALLY and hours apart, and the suite does not run every night, so a fixed window
+  was wrong every Monday and wrong every morning for whichever environment ran first —
+  and it gated the offer to RETIRE a test, so it offered to retire thousands of healthy
+  ones. `analytics.find_passes` groups per-environment activity into passes (a block only
+  counts if it ran ≥50% of that environment's tests, or ad-hoc re-runs after a fix would
+  count); `analytics.recent_cutoff` takes the start of the *previous* covered pass, then
+  the oldest across environments. Two clamps are load-bearing: never stricter than the
+  36-hour fallback, never older than 14 days. **Do not remove them** — everything feeding
+  this is derived or declared, and they are what bound how wrong it can get.
+- **Never label a window from a constant.** `_SUMMARY_RECENT_HOURS` (36) is only the
+  fallback; the window actually used is `stale_before`, which the API reports. Wording
+  built from the constant has been wrong three separate times — "Last night" over a
+  78-hour window, "silent for 36h+", "nothing in the last 36 hours" over a fortnight.
+  `tests/test_frontend_calls.py::WindowWordingTest` fails the build if it comes back.
+- **The coverage denominator is declarable** (`environment_expectations`, migration 5).
+  Inferred from `latest_runs` it is a high-water mark, and too large a denominator means
+  no pass counts, which silently drops the cutoff back to the wall clock. `/api/environments`
+  echoes how many recent passes actually counted so a wrong number is visible.
 - **Retirement** (`test_retirements`) is human-entered state marking a test as no longer in the suite: excluded from every estate view, counted only as `status.retired`, history untouched, and cleared automatically if the test reports a run again.
 - Analytics are **pure functions over lists of runs** (failing-since/regression window, flakiness score from result transitions, day-of-week profile, duration trend) over a window of last 90 days or last 200 runs, whichever is smaller.
 - The `/api/import` transport schema is a **fixed contract shared with the feeder** — keep it stable and document it in the README.
