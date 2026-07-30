@@ -1051,3 +1051,108 @@ generated, 540,192 runs) on a developer machine; production is ~900 MB and
 roughly four times that. The keep-alive figures are from the reproduction, not
 from production traffic. `tools/diagnose_db.py --compare-local` has still never
 been run on the production server.
+
+## Drop of 2026-07-31 (WP-17) — the summary at production scale, and the 10-minute re-push
+
+First production perf log (day one, user-run report): `/api/summary` mean 6 s,
+`activity_buckets` 3.5 s of it, worst response 60 s. Analysed locally, fixed on
+`wp-17-summary-perf`. Suite 1288 (from 1268). Migration 6 ships.
+
+### The finding: one query was O(total history)
+
+The staleness-cutoff bucket query — `GROUP BY environment, hour` over a
+fortnight of `runs` — was planned by SQLite as a **full covering scan of the
+runs UNIQUE index**, because the `(start_time, result)` index does not carry
+`environment` and the planner preferred scanning everything to 168k row
+lookups. Cost proportional to the whole year of history, not the window; paid
+by `/api/summary`, `/api/time`, `/api/dashboard?stale=1` and
+`/api/environments`, uncached; growing nightly. Reproduced on the dev copy at
+607 ms (70% of the 871 ms summary mean; prod 3.5 s of 6 s — same shape ×
+history size × network mount).
+
+What did NOT work, measured before choosing: `ANALYZE` (planner switched to a
+skip-scan on the same wrong index, 207 ms); an unforced covering
+`(start_time, environment)` index (planner ignored it — bound-parameter range
+selectivity is unknowable at prepare time). `INDEXED BY` worked (115 ms,
+window-proportional) but is SQLite-only syntax, leaves the query O(window),
+and the index adds ~15–20% to the file. Rejected in favour of the project's
+own pattern:
+
+**`activity_hours` (migration 6)** — third derived table, environment × UTC
+hour × result → count, maintained in the import transaction (+1 on insert,
+−1/+1 on a result flip; rows deleted at zero so it stays byte-equal to the
+GROUP BY it replaces), backfilled from full history in one aggregate pass
+(2.4 s cold on the dev copy), rebuilt by `prune_runs_before`, covered by
+`delete_environment` via `_ENVIRONMENT_TABLES`, exported by the MariaDB tool.
+`ActivityHoursTest` pins live-vs-rebuild equality both directions, with a
+planted-drift test proving the comparison can fail, and a planted-skew test
+proving the readers read the table. The trend query reads it too (the result
+dimension exists for exactly that), so the memo layer is now belt-and-braces.
+
+Measured, dev copy: buckets 607 → 2.3 ms; `/api/summary` 751 → ~190 ms;
+`/api/time` 630 → 40 ms; headline part ~100–170 ms at 14 KB.
+
+### The user's disclosure that reframed the analysis
+
+The site feeder re-pushes its whole recent window (~10k records) **every 10
+minutes**, unchanged or not, taking 1 min+. Measured cost of one unchanged
+record before: ~2.3 KB WAL (runs UPDATE + run_outputs INSERT OR REPLACE of an
+identical blob + latest_runs touch) — ~23 MB per push, ~3.3 GB/day through the
+production mount, page-cache eviction for every reader, ~20 trend-memo
+invalidations per push. And a production bug: `_unretire_on_new_run` fired on
+ANY upsert, so **every retirement was undone within 10 minutes** of being
+made. Nobody had connected the "Automatically un-retired" comments to the
+push schedule.
+
+**The skip:** a record whose metadata all matches and whose
+`runs.output_fingerprint` (SHA-1 of output text, new column, NULL for
+pre-migration rows) matches writes nothing — no UPDATE, no blob REPLACE, no
+`_maintain_latest`, no un-retire, no memo invalidation. NULL never matches, so
+the active window stamps itself in one push cycle and the first post-upgrade
+push behaves like today. Measured: 2,000 unchanged records 0.46 s / 4.6 MB WAL
+→ **0.04 s / 0 bytes**. Wire compatibility decided deliberately: response
+`updated` still counts unchanged records (deployed feeder sums and logs it);
+additive `unchanged` field refines it. `test_reimport_identical_batch...`
+re-pinned from `updated=3` to `unchanged=3` — a deliberate semantic change,
+this line is the record of it. Un-retire on a CHANGED old record is pinned as
+still happening (`test_a_changed_reimport_still_unretires`); only the
+unchanged case stopped.
+
+### The split (user chose to pull it into this drop)
+
+`/api/summary?parts=headline` (everything but queue rows, plus
+`queue_totals`), `parts=queue&queue=<kind>`; bare call unchanged-plus-totals,
+pinned to the parts by `SummaryPartsTest` (slice-vs-whole, not hand-written
+values). Home page fetches headline + active tab + browse page in parallel,
+paints each on arrival, other tabs on first click ("Loading queue…" line —
+the no-skeleton rule respected; refreshes still dim-and-hold). Action
+refreshes fetch headline + active queue only, still coalesced.
+`SummaryPartsFetchTest` pins the fetch shape the way the coalescer is pinned.
+Verified end-to-end under the node DOM shim against a live server: staged
+requests, badge paint, on-demand fetch, cached re-click.
+
+### Housekeeping with reasons
+
+- **Registry swap:** WP-17 took version 6; WP-15 (parked WIP branch) moved to
+  7 — versions must ship contiguously, so an unshipped claim cannot hold 6
+  while 7 ships. The WIP branch must renumber before merging. Registry,
+  CLAUDE.md, and the operator note all say so.
+- `TestMigrationFiveOnAnExistingDatabase` now asserts `MIGRATIONS[-1][0]`
+  rather than the literal 5 — the pin was about migration 5 arriving on a v4
+  file, not about 5 being last.
+- `test_the_trend_cache_is_invalidated` was passing vacuously: it passed `7`
+  (a days count the signature does not have) as the ENVIRONMENT filter, so
+  both sides of the assertion were always empty. Fixed and given a
+  populated-before precondition.
+- MariaDB exporter: `activity_hours` in `TABLE_ORDER` + DDL + a verify query;
+  `runs.output_fingerprint` in the DDL; the null-vs-empty test's `row[-1]`
+  made explicit (`row[8]`) — "last column" silently became a different
+  question when the column list grew. The guard tests caught all of this,
+  which is what they are for.
+
+### Verification, and its limits
+
+Same honest line as the last drop: **no browser, no production numbers.**
+Everything measured here is the 218 MB dev copy on a developer machine; the
+plan's Phase 2 (streaks, queue payloads, worker count) is parked until one
+night of production perf log after this drop re-ranks the remaining terms.

@@ -188,9 +188,10 @@ def main(argv=None):
         counts = storage.upsert_runs(demo_runs)
         print(
             "Seeded {0} simulated runs (environment '{1}', {2} inserted, "
-            "{3} updated) into {4}".format(
+            "{3} updated, {4} unchanged) into {5}".format(
                 len(demo_runs), generate_demo_data.ENVIRONMENT,
-                counts.inserted, counts.updated, args.db))
+                counts.inserted, counts.updated, counts.unchanged,
+                args.db))
 
         if args.scale_tests:
             print(
@@ -201,6 +202,7 @@ def main(argv=None):
             sys.stdout.flush()
             filler_inserted = 0
             filler_updated = 0
+            filler_unchanged = 0
             filler_kwargs = {}
             if args.days is not None:
                 filler_kwargs["days"] = args.days
@@ -212,12 +214,14 @@ def main(argv=None):
                     batch_counts = storage.upsert_runs(batch)
                     filler_inserted += batch_counts.inserted
                     filler_updated += batch_counts.updated
+                    filler_unchanged += batch_counts.unchanged
             except ValueError as exc:
                 sys.stderr.write("error: {0}\n".format(exc))
                 return 2
             print(
-                "Seeded filler estate: {0} inserted, {1} updated".format(
-                    filler_inserted, filler_updated))
+                "Seeded filler estate: {0} inserted, {1} updated, "
+                "{2} unchanged".format(
+                    filler_inserted, filler_updated, filler_unchanged))
 
         regression = None
         for rec in demo_runs:
@@ -241,9 +245,10 @@ def main(argv=None):
             print(run_self_tests.format_summary(summary))
             print(
                 "Seeded {0} self-test runs (environment '{1}', {2} "
-                "inserted, {3} updated)".format(
+                "inserted, {3} updated, {4} unchanged)".format(
                     len(self_runs), run_self_tests.ENVIRONMENT,
-                    self_counts.inserted, self_counts.updated))
+                    self_counts.inserted, self_counts.updated,
+                    self_counts.unchanged))
 
         if args.no_serve:
             print(

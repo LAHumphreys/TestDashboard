@@ -128,7 +128,10 @@ Validation rules per record:
 
 **Idempotency:** a run is uniquely keyed by
 `(environment, script, test_name, start_time)`. Re-importing the same run updates it
-in place — re-running an import is always safe and never duplicates data.
+in place — re-running an import is always safe and never duplicates data. A record
+that is **byte-identical** to what is stored (all fields, output included) writes
+nothing at all: feeders that re-push their whole recent window on a schedule cost
+the server nothing but reads.
 
 Response — `200` even when some records are rejected; one bad record never aborts the
 batch (valid records are still upserted):
@@ -137,6 +140,7 @@ batch (valid records are still upserted):
 {
   "inserted": 40,
   "updated": 2,
+  "unchanged": 1,
   "rejected": 1,
   "errors": [
     {
@@ -155,6 +159,13 @@ Each error object carries the record's identity fields when they could be extrac
 from the raw dict (null when absent), so you can grep your source data for the exact
 offending run. `400` is returned only when the envelope itself is malformed (invalid
 JSON, or `runs` missing / not a list).
+
+`updated` counts every accepted record that already existed, **including** the
+byte-identical ones — its meaning on the wire has not changed, so a feeder summing
+`inserted + updated` still accounts for every accepted record. `unchanged`
+(added 2026-07-31) refines it: the subset that required no write. A push whose
+records are all `unchanged` is the healthy steady state for a scheduled re-push,
+not a stall.
 
 ### GET /api/dashboard — latest run per test (paginated)
 
@@ -221,6 +232,20 @@ None of this is proportional to the size of the estate: the headline counts come
 from a single `GROUP BY` (a few dozen rows however many tests exist), and each
 queue is its own indexed query.
 
+**`parts` slices the payload** so a page can paint progressively instead of
+waiting for its slowest piece (this is what the home screen does):
+
+- `parts=headline` — everything below EXCEPT `queues`: the counts, trend,
+  rollups and filter lists, plus `queue_totals` (`{kind: exact_total}` for
+  every queue including `mine`) so tab badges render before any rows arrive.
+- `parts=queue&queue=<kind>` — one queue's rows:
+  `{"generated_at", "environment", "stale_before", "queue_cap",
+  "kind", "queue": {"total": n, "tests": [QueueEntry, ...]}}`.
+  `kind` is a queue name below or `mine`.
+- No `parts` — the full payload, headline plus every queue, as before the
+  split (plus `queue_totals`). `tests/test_api.py::SummaryPartsTest` pins the
+  parts to the whole, so the two cannot drift.
+
 ```json
 {
   "generated_at": "2026-07-26T06:30:00.000000",
@@ -243,6 +268,8 @@ queue is its own indexed query.
                       "new_failures": 25, "unexpected_passes": 35, "not_run": 90}],
   "top_failing_scripts": [{"environment": "linux-prod-sim",
                            "script": "regression/user_lifecycle.py", "failing": 40}],
+  "queue_totals": {"new_failures": 35, "still_failing": 385, "unexpected_passes": 50,
+                   "fixed": 28, "not_run": 160, "assigned": 210, "mine": 4},
   "queues": {
     "new_failures":      {"total": 35,  "tests": [QueueEntry, ...]},
     "still_failing":     {"total": 385, "tests": [...]},

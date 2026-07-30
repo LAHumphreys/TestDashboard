@@ -132,7 +132,10 @@ class TestMigrations(StorageTestBase):
         mem = Storage(":memory:")
         self.addCleanup(mem.close)
         counts = mem.upsert_runs([make_record()])
-        self.assertEqual(counts, storage.UpsertCounts(inserted=1, updated=0))
+        self.assertEqual(
+            counts,
+            storage.UpsertCounts(inserted=1, updated=0, unchanged=0),
+        )
         self.assertTrue(mem.test_exists("linux-sim", "suite.py", "test_a"))
 
 
@@ -146,7 +149,10 @@ class TestUpsertRuns(StorageTestBase):
                 make_record(test_name="test_b"),
             ]
         )
-        self.assertEqual(counts, storage.UpsertCounts(inserted=2, updated=0))
+        self.assertEqual(
+            counts,
+            storage.UpsertCounts(inserted=2, updated=0, unchanged=0),
+        )
 
     def test_mixed_insert_and_update_counts(self) -> None:
         self.store.upsert_runs([make_record(test_name="test_a")])
@@ -156,9 +162,21 @@ class TestUpsertRuns(StorageTestBase):
                 make_record(test_name="test_b"),
             ]
         )
-        self.assertEqual(counts, storage.UpsertCounts(inserted=1, updated=1))
+        self.assertEqual(
+            counts,
+            storage.UpsertCounts(inserted=1, updated=1, unchanged=0),
+        )
 
-    def test_reimport_identical_batch_all_updated_no_duplicates(self) -> None:
+    def test_reimport_identical_batch_is_unchanged_no_duplicates(self) -> None:
+        """A byte-identical re-import writes nothing and reports it.
+
+        This used to expect ``updated=3``: the second import rewrote
+        every row and its output blob to store what was already there.
+        The site feeder re-pushes its whole recent window every 10
+        minutes, so that churn was ~23 MB of WAL per push through the
+        production network mount — the skip is the point, and this pin
+        is what keeps it.
+        """
         batch = [
             make_record(test_name="test_a"),
             make_record(test_name="test_b"),
@@ -166,8 +184,14 @@ class TestUpsertRuns(StorageTestBase):
         ]
         first = self.store.upsert_runs(batch)
         second = self.store.upsert_runs(batch)
-        self.assertEqual(first, storage.UpsertCounts(inserted=3, updated=0))
-        self.assertEqual(second, storage.UpsertCounts(inserted=0, updated=3))
+        self.assertEqual(
+            first,
+            storage.UpsertCounts(inserted=3, updated=0, unchanged=0),
+        )
+        self.assertEqual(
+            second,
+            storage.UpsertCounts(inserted=0, updated=0, unchanged=3),
+        )
         self.assertEqual(len(self.store.dashboard()), 3)
         history = self.store.run_history("linux-sim", "suite.py", "test_a")
         self.assertEqual(len(history), 1)
@@ -184,7 +208,10 @@ class TestUpsertRuns(StorageTestBase):
             known_failure_reason="JIRA-123",
         )
         counts = self.store.upsert_runs([changed])
-        self.assertEqual(counts, storage.UpsertCounts(inserted=0, updated=1))
+        self.assertEqual(
+            counts,
+            storage.UpsertCounts(inserted=0, updated=1, unchanged=0),
+        )
         run = self.store.get_run(original.run_id)
         assert run is not None
         self.assertEqual(run.run_id, original.run_id)  # rowid preserved
@@ -203,13 +230,19 @@ class TestUpsertRuns(StorageTestBase):
                 make_record(start=BASE + datetime.timedelta(days=1)),
             ]
         )
-        self.assertEqual(counts, storage.UpsertCounts(inserted=2, updated=0))
+        self.assertEqual(
+            counts,
+            storage.UpsertCounts(inserted=2, updated=0, unchanged=0),
+        )
         history = self.store.run_history("linux-sim", "suite.py", "test_a")
         self.assertEqual(len(history), 2)
 
     def test_empty_batch(self) -> None:
         counts = self.store.upsert_runs([])
-        self.assertEqual(counts, storage.UpsertCounts(inserted=0, updated=0))
+        self.assertEqual(
+            counts,
+            storage.UpsertCounts(inserted=0, updated=0, unchanged=0),
+        )
 
 
 class TestDashboard(StorageTestBase):
@@ -1258,7 +1291,8 @@ class TestLargeBatch(StorageTestBase):
         counts = self.store.upsert_runs(records)
         elapsed = time.monotonic() - started
         self.assertEqual(
-            counts, storage.UpsertCounts(inserted=5000, updated=0)
+            counts,
+            storage.UpsertCounts(inserted=5000, updated=0, unchanged=0)
         )
         self.assertLess(
             elapsed,
@@ -2539,7 +2573,11 @@ class TestMigrationFiveOnAnExistingDatabase(unittest.TestCase):
         self.assertIsNotNone(store.get_user("amy"))
         version = store._conn().execute(
             "SELECT version FROM schema_version").fetchone()[0]
-        self.assertEqual(version, 5)
+        # Opening migrates to the NEWEST version, so this pin tracks the
+        # end of MIGRATIONS rather than naming 5: the test is about
+        # migration 5's table arriving on a v4 database, not about 5
+        # being the last migration there is.
+        self.assertEqual(version, storage.MIGRATIONS[-1][0])
 
     def test_a_declaration_can_be_made_immediately_after(self) -> None:
         self._build_at_version_four()
@@ -2813,11 +2851,183 @@ class EnvironmentDeleteTest(StorageTestBase):
             sorted(self.store.environments()), ["UNKNOWN-2", "unknown"])
 
     def test_the_trend_cache_is_invalidated(self) -> None:
-        """A memoized chart of an environment that no longer exists."""
+        """A memoized chart of an environment that no longer exists.
+
+        The second argument is the ENVIRONMENT filter; an earlier
+        version of this test passed ``7`` (a days count that the
+        signature does not have), which matched no environment and made
+        both calls empty — the assertion could never have failed.
+        """
         self.store.upsert_runs([make_record(environment="UNKNOWN")])
-        self.store.daily_result_counts(BASE, 7)          # populate the memo
+        populated = self.store.daily_result_counts(BASE)
+        self.assertGreater(
+            sum(row.count for row in populated), 0,
+            "the memo was never populated; the invalidation check below "
+            "is vacuous")
         self.store.delete_environment("UNKNOWN")
-        counts = self.store.daily_result_counts(BASE, 7)
+        counts = self.store.daily_result_counts(BASE)
         self.assertEqual(
             sum(row.count for row in counts), 0,
             "the trend still reports runs from a deleted environment")
+
+
+class ActivityHoursTest(StorageTestBase):
+    """The third derived table cannot drift from `runs` (migration 6).
+
+    The invariant is exact equality with the GROUP BY that
+    `_rebuild_activity_hours` runs; `_invariant_diff` compares in both
+    directions, and `test_the_comparison_itself_can_fail` plants a skew
+    to prove the comparison is not vacuous.
+    """
+
+    def _invariant_diff(self) -> int:
+        conn = self.store._conn()
+        forward = conn.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT environment, SUBSTR(start_time, 1, 13), result, "
+            "         COUNT(*) FROM runs GROUP BY 1, 2, 3"
+            "  EXCEPT"
+            "  SELECT environment, hour, result, count FROM activity_hours"
+            ")").fetchone()[0]
+        backward = conn.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT environment, hour, result, count FROM activity_hours"
+            "  EXCEPT"
+            "  SELECT environment, SUBSTR(start_time, 1, 13), result, "
+            "         COUNT(*) FROM runs GROUP BY 1, 2, 3"
+            ")").fetchone()[0]
+        return int(forward) + int(backward)
+
+    def test_live_maintenance_matches_a_rebuild(self) -> None:
+        """Inserts, re-imports and result flips across hours and envs."""
+        hour = datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE),
+            make_record(test_name="test_b", start=BASE,
+                        result=Result.FAIL),
+            make_record(test_name="test_a", start=BASE + hour),
+            make_record(environment="win-sim", test_name="test_a",
+                        start=BASE),
+        ])
+        # Unchanged re-import: no drift, no double counting.
+        self.store.upsert_runs([make_record(test_name="test_a", start=BASE)])
+        # Result flip: the run moves between cells of the same hour.
+        self.store.upsert_runs([
+            make_record(test_name="test_b", start=BASE,
+                        result=Result.PASS),
+        ])
+        self.assertEqual(self._invariant_diff(), 0)
+
+    def test_a_flip_that_empties_a_cell_deletes_the_row(self) -> None:
+        """GROUP BY yields no zero groups, so neither may the table."""
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        self.store.upsert_runs([make_record(result=Result.PASS)])
+        rows = self.store._conn().execute(
+            "SELECT result, count FROM activity_hours").fetchall()
+        self.assertEqual(rows, [("PASS", 1)])
+        self.assertEqual(self._invariant_diff(), 0)
+
+    def test_environment_delete_keeps_the_invariant(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="UNKNOWN"),
+            make_record(environment="linux-sim"),
+        ])
+        self.store.delete_environment("UNKNOWN")
+        self.assertEqual(self._invariant_diff(), 0)
+        rows = self.store._conn().execute(
+            "SELECT DISTINCT environment FROM activity_hours").fetchall()
+        self.assertEqual(rows, [("linux-sim",)])
+
+    def test_prune_keeps_the_invariant(self) -> None:
+        """Retention deletes history; the table must follow it."""
+        day = datetime.timedelta(days=1)
+        self.store.upsert_runs([
+            make_record(start=BASE - 400 * day),
+            make_record(start=BASE),
+        ])
+        deleted = self.store.prune_runs_before(BASE - 300 * day)
+        self.assertEqual(deleted, 1)
+        self.assertEqual(self._invariant_diff(), 0)
+
+    def test_the_comparison_itself_can_fail(self) -> None:
+        """Planted drift MUST be reported, or every pass above is noise."""
+        self.store.upsert_runs([make_record()])
+        self.store._conn().execute(
+            "UPDATE activity_hours SET count = count + 1")
+        self.assertGreater(self._invariant_diff(), 0)
+
+    def test_reads_come_from_the_derived_table_not_from_runs(self) -> None:
+        """Plant a skew in the table; the readers must report the skew.
+
+        This is the cost assertion in disguise: a reader that still
+        scanned `runs` would return the truth here and the test would
+        fail, which is exactly what stops the O(history) query coming
+        back quietly.
+        """
+        self.store.upsert_runs([make_record()])
+        conn = self.store._conn()
+        conn.execute("UPDATE activity_hours SET count = 41")
+        buckets = self.store.activity_buckets(BASE - datetime.timedelta(1))
+        self.assertEqual([b[2] for b in buckets], [41])
+        self.store._invalidate_trend_cache()  # the skew was direct SQL
+        trend = self.store.daily_result_counts(BASE)
+        self.assertEqual([row.count for row in trend], [41])
+
+
+class ReimportSkipTest(StorageTestBase):
+    """What counts as "unchanged", and what the skip must NOT skip."""
+
+    def test_output_only_change_is_an_update(self) -> None:
+        self.store.upsert_runs([make_record()])
+        counts = self.store.upsert_runs(
+            [make_record(output="the parser found more log\n")])
+        self.assertEqual(
+            counts,
+            storage.UpsertCounts(inserted=0, updated=1, unchanged=0),
+        )
+        run = self.store.latest_run("linux-sim", "suite.py", "test_a")
+        assert run is not None
+        stored = self.store.get_run(run.run_id)
+        assert stored is not None
+        self.assertEqual(stored.output, "the parser found more log\n")
+        again = self.store.upsert_runs(
+            [make_record(output="the parser found more log\n")])
+        self.assertEqual(again.unchanged, 1)
+
+    def test_a_null_fingerprint_takes_the_write_path_once(self) -> None:
+        """Every pre-migration row self-heals on its first re-import."""
+        self.store.upsert_runs([make_record()])
+        self.store._conn().execute(
+            "UPDATE runs SET output_fingerprint = NULL")
+        first = self.store.upsert_runs([make_record()])
+        self.assertEqual(first.updated, 1)  # stamps the fingerprint
+        second = self.store.upsert_runs([make_record()])
+        self.assertEqual(second.unchanged, 1)
+
+    def test_an_unchanged_reimport_does_not_unretire(self) -> None:
+        """The 10-minute re-push must not make retirement impossible.
+
+        Before the skip, ANY re-import of a triple cleared its
+        retirement — so with a feeder re-pushing its whole window every
+        10 minutes, a human's approval could not survive to the next
+        pass of the suite. An unchanged record is not the test
+        "reporting a run again"; it is the same run being repeated.
+        """
+        self.store.upsert_runs([make_record()])
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "amy",
+            "left the suite", BASE)
+        self.store.upsert_runs([make_record()])
+        self.assertTrue(
+            self.store.is_retired("linux-sim", "suite.py", "test_a"),
+            "an unchanged re-import cleared a human's retirement")
+
+    def test_a_changed_reimport_still_unretires(self) -> None:
+        """Pinned so the skip is the ONLY thing the last test proves."""
+        self.store.upsert_runs([make_record()])
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "amy",
+            "left the suite", BASE)
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        self.assertFalse(
+            self.store.is_retired("linux-sim", "suite.py", "test_a"))

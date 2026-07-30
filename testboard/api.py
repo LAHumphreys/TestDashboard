@@ -463,7 +463,15 @@ def _handle_import(storage: Storage, request: Request) -> Response:
         200,
         {
             "inserted": counts.inserted,
-            "updated": counts.updated,
+            # On the wire, "updated" keeps meaning "accepted and already
+            # known" — the sum every deployed feeder logs and reasons
+            # about. "unchanged" REFINES it: the subset that was
+            # byte-identical and wrote nothing (see UpsertCounts). The
+            # site feeder re-pushes its window every 10 minutes, so
+            # unchanged == updated is the healthy steady state, not a
+            # stall.
+            "updated": counts.updated + counts.unchanged,
+            "unchanged": counts.unchanged,
             "rejected": len(errors),
             "errors": errors,
         },
@@ -784,6 +792,101 @@ def _status_row_json(
     }
 
 
+def _summary_queue_json(
+    storage: Storage,
+    kind: str,
+    environment: Optional[str],
+    assignee: Optional[str],
+    recent_cutoff: datetime.datetime,
+    streaks: Dict[Tuple[str, str, str], FailureStreak],
+) -> Dict[str, Any]:
+    """Serialize one triage queue: exact total plus capped, enriched entries.
+
+    *kind* is any storage queue kind, or ``"mine"`` — the assignee's
+    open items, which resolves to the ``assigned`` predicate filtered to
+    *assignee* in SQL (picking a user's tests out of an already-capped
+    queue would hide their work behind other people's) and is empty
+    without an assignee.
+
+    Streak bounds cost three index seeks per row, so they are computed
+    only for the queues that report ``failing_since``/``last_pass_time``
+    (``still_failing`` and ``mine``). A test can sit in both; *streaks*
+    is the caller's cache so one request looks each test up once.
+    """
+    queue_assignee = None  # type: Optional[str]
+    storage_kind = kind
+    if kind == "mine":
+        if not assignee:
+            return {"total": 0, "tests": []}
+        storage_kind = "assigned"
+        queue_assignee = assignee
+    with_streaks = kind in _STREAK_QUEUES or kind == "mine"
+
+    def streak_for(row: TestStatusRow) -> Optional[FailureStreak]:
+        """Streak info for a FAIL row (cached); None for non-FAIL rows."""
+        if row.result is not Result.FAIL:
+            return None
+        key = (row.environment, row.script, row.test_name)
+        if key not in streaks:
+            streaks[key] = storage.failure_streak_bounds(
+                row.environment, row.script, row.test_name, row.start_time
+            )
+        return streaks[key]
+
+    rows = storage.status_queue(
+        storage_kind, environment, limit=_SUMMARY_QUEUE_CAP,
+        assignee=queue_assignee, stale_before=recent_cutoff,
+        with_latest_comment=True,
+    )
+    entries = [
+        _status_row_json(row, streak_for(row) if with_streaks else None)
+        for row in rows
+    ]
+    if kind == "still_failing":
+        # Oldest neglected regression first — the point of the queue.
+        entries.sort(key=lambda entry: entry["failing_since"] or "")
+    return {
+        "total": storage.status_queue_count(
+            storage_kind, environment, assignee=queue_assignee,
+            stale_before=recent_cutoff,
+        ),
+        "tests": entries,
+    }
+
+
+def _summary_queue_totals(
+    storage: Storage,
+    environment: Optional[str],
+    assignee: Optional[str],
+    recent_cutoff: datetime.datetime,
+) -> Dict[str, int]:
+    """Exact size of every queue, without fetching a single row.
+
+    This is what lets the headline part paint the triage tab counts
+    while the row payloads are still loading: seven indexed COUNT
+    queries over ``latest_runs``, each a few milliseconds however large
+    the estate.
+    """
+    totals = {
+        kind: storage.status_queue_count(
+            kind, environment, stale_before=recent_cutoff
+        )
+        for kind in QUEUE_KINDS
+    }
+    totals["mine"] = (
+        storage.status_queue_count(
+            "assigned", environment, assignee=assignee,
+            stale_before=recent_cutoff,
+        )
+        if assignee else 0
+    )
+    return totals
+
+
+#: Valid values of /api/summary's ``parts`` parameter.
+_SUMMARY_PARTS = ("headline", "queue")
+
+
 def _handle_summary(
     storage: Storage,
     request: Request,
@@ -794,6 +897,17 @@ def _handle_summary(
     Query parameters: ``environment`` (optional exact match) scopes
     everything; ``days`` (1..90, default 14) sets the trend window;
     ``assignee`` adds the ``mine`` queue for that user.
+
+    ``parts`` slices the payload so the home screen can paint
+    progressively instead of waiting for its slowest piece:
+
+    - absent — the full payload, exactly the pre-split shape plus
+      ``queue_totals``;
+    - ``parts=headline`` — everything EXCEPT the queue row payloads
+      (status, trend, rollups, filters, ``queue_totals`` for the tab
+      badges);
+    - ``parts=queue&queue=<kind>`` — one queue's rows. ``kind`` is a
+      :data:`testboard.storage.QUEUE_KINDS` entry or ``mine``.
 
     Nothing here is proportional to the size of the estate. The headline
     counts come from a GROUP BY (a few dozen rows however many tests
@@ -807,9 +921,42 @@ def _handle_summary(
         request, "days", _SUMMARY_DEFAULT_TREND_DAYS, 1,
         _SUMMARY_MAX_TREND_DAYS,
     )
+    part = _query_single(request.query, "parts")
+    if part is not None and part not in _SUMMARY_PARTS:
+        raise _HttpError(
+            400,
+            "parts: unknown value '{}' (expected one of {})".format(
+                part, ", ".join(_SUMMARY_PARTS)
+            ),
+        )
 
     current = now()
     recent_cutoff = _recent_cutoff(storage, current)
+
+    if part == "queue":
+        kind = _query_single(request.query, "queue")
+        valid_kinds = QUEUE_KINDS + ("mine",)
+        if kind not in valid_kinds:
+            raise _HttpError(
+                400,
+                "queue: unknown value '{}' (expected one of {})".format(
+                    kind, ", ".join(valid_kinds)
+                ),
+            )
+        return _json_response(
+            200,
+            {
+                "generated_at": model.format_iso(current),
+                "environment": environment,
+                "stale_before": model.format_iso(recent_cutoff),
+                "queue_cap": _SUMMARY_QUEUE_CAP,
+                "kind": kind,
+                "queue": _summary_queue_json(
+                    storage, kind, environment, assignee, recent_cutoff,
+                    {},
+                ),
+            },
+        )
     # Reported so a stalled feeder is visible AS a stalled feeder,
     # rather than as every test in the estate quietly going stale — the
     # failure mode a data-derived cutoff would otherwise hide.
@@ -838,70 +985,8 @@ def _handle_summary(
         night["total"] = total
         nights.append(night)
 
-    # Failure streaks, for the queue entries that will actually be shown.
-    # A test can sit in several queues; look each one up once.
-    streaks = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
-
-    def streak_for(row: TestStatusRow) -> Optional[FailureStreak]:
-        """Streak info for a FAIL row (cached); None for non-FAIL rows."""
-        if row.result is not Result.FAIL:
-            return None
-        key = (row.environment, row.script, row.test_name)
-        if key not in streaks:
-            streaks[key] = storage.failure_streak_bounds(
-                row.environment, row.script, row.test_name, row.start_time
-            )
-        return streaks[key]
-
-    def queue_json(
-        kind: str,
-        queue_assignee: Optional[str] = None,
-        with_streaks: bool = False,
-    ) -> Dict[str, Any]:
-        """Serialize one queue: exact total plus capped, enriched entries.
-
-        Streak bounds cost three index seeks per row, so *with_streaks*
-        is set only for the queues that report ``failing_since`` /
-        ``last_pass_time`` — the others would pay for values nothing
-        reads.
-        """
-        rows = storage.status_queue(
-            kind, environment, limit=_SUMMARY_QUEUE_CAP,
-            assignee=queue_assignee, stale_before=recent_cutoff,
-            with_latest_comment=True,
-        )
-        entries = [
-            _status_row_json(row, streak_for(row) if with_streaks else None)
-            for row in rows
-        ]
-        if kind == "still_failing":
-            # Oldest neglected regression first — the point of the queue.
-            entries.sort(key=lambda entry: entry["failing_since"] or "")
-        return {
-            "total": storage.status_queue_count(
-                kind, environment, assignee=queue_assignee,
-                stale_before=recent_cutoff,
-            ),
-            "tests": entries,
-        }
-
-    queues = {
-        kind: queue_json(kind, with_streaks=(kind in _STREAK_QUEUES))
-        for kind in QUEUE_KINDS
-    }
-    # "My actions" must be filtered in SQL: picking a user's tests out of
-    # a queue already capped at _SUMMARY_QUEUE_CAP would hide their work
-    # behind other people's once the estate has more open items than the
-    # cap. It reports streaks, so it goes through the same path.
-    queues["mine"] = (
-        queue_json("assigned", assignee, with_streaks=True) if assignee
-        else {"total": 0, "tests": []}
-    )
-
     status = estate.status
-    return _json_response(
-        200,
-        {
+    payload = {
             "generated_at": model.format_iso(current),
             "environment": environment,
             "environments": storage.environments(),
@@ -968,9 +1053,31 @@ def _handle_summary(
                     environment, _SUMMARY_TOP_SCRIPTS
                 )
             ],
-            "queues": queues,
-        },
+            # Every queue's exact size, row payloads not included. The
+            # headline part's reason to exist: tab badges paint from
+            # these while the rows are still being fetched.
+            "queue_totals": _summary_queue_totals(
+                storage, environment, assignee, recent_cutoff
+            ),
+        }  # type: Dict[str, Any]
+    if part == "headline":
+        return _json_response(200, payload)
+
+    # Full payload: the pre-split shape (plus queue_totals above), for
+    # callers that want one round trip — and for the contract tests,
+    # which pin it so the split cannot drift from the whole.
+    streaks = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
+    queues = {
+        kind: _summary_queue_json(
+            storage, kind, environment, None, recent_cutoff, streaks
+        )
+        for kind in QUEUE_KINDS
+    }
+    queues["mine"] = _summary_queue_json(
+        storage, "mine", environment, assignee, recent_cutoff, streaks
     )
+    payload["queues"] = queues
+    return _json_response(200, payload)
 
 
 def _handle_test_detail(

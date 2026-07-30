@@ -16,10 +16,13 @@ demo.jsonl
 # control: a deployment must not be able to overwrite a site's own notes.
 site_notes.json
 site_notes.json.tmp
-# Performance logs (--perf-log), including the rolled-over predecessor.
+# Performance logs (--perf-log), including the rolled-over predecessor
+# and any before/after copies set aside while comparing drops.
 *-perf.log
 *-perf.log.1
+*-perf-before.log
 # Local acceptance-testing scratch: a copy of the dev database served on
 # 8000 (validate.db is covered by *.db above) and its server output.
 validate-server.log
 validate-server.err
+validate-server-before.log

@@ -973,6 +973,15 @@ MariaDB as the other. `--db` grows a URL form, or a `--db-config` pointing at
 `/etc/testboard/db.cnf` (§A.10). The 59 execute sites do not each need porting;
 the ~27 dialect-specific constructs do.
 
+Two additions from migration 6 (2026-07-31) the port inherits for free but
+should not lose: `activity_hours` is maintained by the same
+SELECT-then-UPDATE-or-INSERT pattern as everything else (`ON DUPLICATE KEY
+UPDATE` reproduces it, §B.5), and its `hour` column is `SUBSTR(start_time, 1,
+13)` — string arithmetic, no date function, both engines agree. The
+byte-identical-re-import skip compares `runs.output_fingerprint` (SHA-1 hex
+computed in Python) — nothing engine-specific, but the port's upsert must keep
+the SELECT-first shape or the skip has nothing to compare against.
+
 **Phase 2 — CI:** add a MariaDB service container to `.github/workflows/ci.yml`
 and run the storage and API suites against **both** backends. GitHub Actions
 supports this directly (`services: mariadb:10.6`). Until this exists, "it works

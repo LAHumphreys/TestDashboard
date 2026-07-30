@@ -874,5 +874,51 @@ class SiteNotesFrontendTest(unittest.TestCase):
         self.assertIn("catch", code)
 
 
+
+class SummaryPartsFetchTest(unittest.TestCase):
+    """The home page must never go back to the monolithic summary.
+
+    The split exists so the tiles and charts paint without waiting for
+    the slowest queue, and so a "Take" during triage refreshes one
+    queue's rows rather than six. Both properties die silently — the
+    page still WORKS if someone reverts to the full payload; it is just
+    slow again — so they are pinned here the way the coalescer is.
+    """
+
+    def test_the_page_asks_for_the_headline_not_the_monolith(self) -> None:
+        body = _function_body(read("app.js"), "function summaryUrl()")
+        self.assertIn(
+            '"parts", "headline"', body,
+            "summaryUrl() no longer asks for parts=headline; the home "
+            "page is back to downloading every queue's rows on every "
+            "refresh")
+
+    def test_queue_rows_are_fetched_in_exactly_two_places(self) -> None:
+        """loadQueue (first paint / tab click) and the coalescer.
+
+        A third site is the per-action pile-up coming back, one queue
+        at a time.
+        """
+        source = read("app.js")
+        sites = [
+            number for number, line in enumerate(source.split("\n"), 1)
+            if "fetchJson(queueUrl(" in line
+        ]
+        self.assertEqual(
+            len(sites), 2,
+            "app.js should fetch queue rows in exactly two places "
+            "(loadQueue and fetchSummary); found lines " + repr(sites))
+
+    def test_a_tab_click_does_not_refetch_a_cached_queue(self) -> None:
+        """Clicking between tabs must cost zero requests once loaded."""
+        source = _strip_comments(read("app.js"))
+        self.assertIn("if (!state.queues[", source)
+
+    def test_an_unloaded_queue_says_it_is_loading(self) -> None:
+        """The feedback line, not a blank table, while rows are in flight."""
+        body = _function_body(read("app.js"), "function renderQueueTable()")
+        self.assertIn("allEntries === null", body)
+        self.assertIn("Loading queue", body)
+
 if __name__ == "__main__":
     unittest.main()

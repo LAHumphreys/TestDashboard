@@ -94,8 +94,17 @@ after a merge.
 | 3 | WP-5 | `latest_runs.duration_seconds` | Yes — see §1.2 |
 | 4 | Perf pass | Sort indexes on `latest_runs` | No |
 | 5 | WP-13 | `environment_expectations` table | No |
-| 6 | WP-15 | `run_progress` table | No |
-| 7+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 6 | WP-17 | `activity_hours` table, `runs.output_fingerprint` | Yes — see §1.2 |
+| 7 | WP-15 | `run_progress` table *(renumbered from 6 — see below)* | No |
+| 8+ | *unallocated* | Claim by editing this table in the same commit | — |
+
+**Why 6 and 7 swapped (2026-07-30).** Versions must ship contiguously —
+`tests/test_migrations.py` enforces it, and a database at version 7 with no 6
+behind it could never take 6 retroactively. WP-15's claim on 6 lived only on
+the parked `wp-14-in-run-progress` branch, while WP-17 had to ship first, so
+WP-17 took 6 and WP-15 moved to 7. **When the WIP branch comes back it must
+renumber its migration entry to 7 before merging** — the registry is the
+coordination point, and this note is the hand-off.
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry
@@ -804,7 +813,7 @@ WP-13 is for.
 
 ---
 
-### WP-15 — accept progress pushes from a partial reader *(migration 6)*
+### WP-15 — accept progress pushes from a partial reader *(migration 7 — renumbered, see §1)*
 
 **Why.** WP-14 counts *imported runs*, and the in-house reader cannot produce a
 full run record mid-pass: during the night it has test identities and results
@@ -940,7 +949,34 @@ anything having to be undone.
 
 ---
 
-## 3. Execution order
+### WP-17 — summary performance: `activity_hours`, the no-op re-import, and the parts split *(migration 6)*
+
+Shipped 2026-07-31; the full analysis and measurements are in
+`UPGRADE_PLAN_STATUS.md` (2026-07-30 entry) and the drop's operator note.
+Summarised here because three of its decisions constrain later work:
+
+- **`activity_hours` is the third derived table** (environment × UTC hour ×
+  result → run count), maintained inside the import transaction. It exists
+  because the staleness cutoff's bucket query was answered with a full scan
+  of the runs UNIQUE index — the only read whose cost grew with total
+  history, measured at 3.5s mean on production and 70% of `/api/summary`.
+  Reads that need a window of run activity go through it; nothing new may
+  scan a window of `runs` at request time.
+  `tests/test_storage.py::ActivityHoursTest` holds it byte-equal to the
+  GROUP BY it replaced.
+- **A byte-identical re-import writes nothing.** The site feeder re-pushes
+  its whole recent window every 10 minutes; before the skip that was ~23 MB
+  of WAL per push for zero information — and it silently un-retired tests,
+  which made retirement impossible to keep. `runs.output_fingerprint`
+  (SHA-1 of the output text, NULL = pre-migration row, self-heals in one
+  push) is what makes "identical" cheap to decide. The import response
+  gained an additive `unchanged` field; **on the wire `updated` still
+  includes unchanged records**, so deployed feeders' arithmetic holds.
+- **`/api/summary` serves parts.** `parts=headline` (everything but queue
+  rows, plus `queue_totals`), `parts=queue&queue=<kind>` (one queue's
+  rows); no parameter = the full pre-split payload, which
+  `tests/test_api.py::SummaryPartsTest` pins the parts to. The home page
+  fetches headline + active tab only; other tabs on click.
 
 Three lanes. WP-0 lands before anything that touches `MIGRATIONS`.
 
@@ -954,7 +990,8 @@ Round 2 (after WP-12)      WP-13 → WP-14 → WP-15
 ```
 
 WP-15 shares `storage.py` and the migration registry with any MariaDB work in
-flight. Migration 6 is claimed above so the two cannot both write "entry 6";
+flight. Its migration version is claimed above (7, renumbered from 6 when
+WP-17 shipped first) so two packages cannot both write the same entry;
 sequence the commits rather than interleaving them.
 
 WP-10 and WP-11 share no file with any other package (WP-11 touches
