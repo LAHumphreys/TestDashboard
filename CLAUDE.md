@@ -20,6 +20,7 @@ The other documents, and what each is for:
 | `docs/SESSION_HANDOVER.md` | State of play, right now | **Rewrite** it when the state changes |
 | `docs/UPGRADE_PLAN.md` | Work orders, WP-0 … WP-16, plus the migration version registry | Claim a migration version here before writing one |
 | `docs/UPGRADE_PLAN_STATUS.md` | Running log: what was done, what was measured, what was decided and why | **Append only.** Never rewrite an entry |
+| `docs/drops/YYYY-MM-DD.md` | **Operator note for one drop** — what changed, how to deploy it, how to roll it back, what was not verified | One per drop, written before it ships. See below |
 | `docs/MARIADB_MIGRATION.md` | Runbook for the SQLite → MariaDB move | Fix it in the same commit if you find it wrong |
 | `static/whatsnew.html` | What the testers see | Every user-visible change goes in it |
 | `docs/BRIEF_dashboard.md`, `docs/BRIEF_feeder_copilot.md` | The original briefs | **Historical.** Useful for intent; the code and the log are the source of truth now, and both have moved on |
@@ -32,6 +33,27 @@ The other documents, and what each is for:
   find it, what it means for them. Nothing user-visible ships without a line there, and
   nothing appears there that is not in the build; a note promising a feature the drop
   does not contain sends people hunting and then reporting its absence as a bug.
+  Every release section carries `data-drop-date="YYYY-MM-DD"` matching its heading —
+  three things read it and `tests/test_frontend_calls.py::DropDateTest` fails the build
+  if it is missing or disagrees.
+- **Every drop also gets an operator note**, `docs/drops/YYYY-MM-DD.md`, written for
+  whoever deploys it rather than for whoever uses it — and written *before* it ships, so
+  it is a plan and not a memoir. The two documents have different readers and neither
+  substitutes for the other: `whatsnew.html` says "the Time page works again",
+  the operator note says which flags are new, whether a migration runs, what the
+  rollback is, and what to check in the first hour. It must contain:
+
+  | Section | Why it is not optional |
+  |---|---|
+  | Suite count, schema version, whether a **migration runs** | Decides whether the rollback is `git checkout` or a database restore. Say it explicitly even when the answer is "none" |
+  | What changed, fixes first | The operator is triaging, not reading a changelog |
+  | The **exact commands**, including the stop/copy/pull/start order | "Restarting the server is not optional" is in this file and has still been forgotten twice |
+  | How to **check it came up**, and how to **roll back** | A rollback improvised during an incident is a second incident |
+  | New flags and any **decision the operator has to make** | A flag nobody was told about is a flag nobody uses |
+  | **What was not verified** | The honest one, and the one worth the most. No browser has ever rendered this project's UI before a drop; say so, every time, rather than letting green tests imply otherwise |
+
+  Keep it to one screen per section and lead with the number that changes the plan.
+  A note that has to be read twice to find out whether a migration runs is not concise.
 - **One package, one commit** (or a small ordered series), on a branch named
   `wp-<n>-<slug>`. Commit messages carry the *reasoning* and the *measurements* —
   they are the primary record and the log summarises them.
@@ -64,6 +86,16 @@ The other documents, and what each is for:
 - Run one test: `python -m unittest tests.test_storage.TestClass.test_method`
 - Run the server: `python run_server.py --port <p> --db <path> --host <h>`
   (add `--workers N` / `--cache-mb MB` to tune the pool; defaults are fine)
+- Catch a stall for later reading: `--perf-log PATH`, then
+  `python tools/perf_report.py PATH`. Off unless asked for, capped and rolled over, so
+  it is safe to leave on — and an intermittent fault cannot be caught by logging
+  started after it. The queue-wait column is what separates "slow query" from "no free
+  worker"; they are opposite diagnoses.
+- Delete a bogus environment: `python tools/drop_environment.py --db <path> -e NAME`
+  (`--dry-run` first; it cannot be undone)
+- Add a site-specific What's new note: `python tools/add_site_note.py --db <path>
+  --text "..."` (`--list` for ids, `--edit`/`--remove` to correct one — a note is live
+  the moment it is written)
 - **Never against the repo-root `testboard.db`** for anything that migrates or writes —
   copy it to a temp directory first. Opening it with current code migrates it.
 

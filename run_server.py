@@ -81,6 +81,27 @@ def build_parser():
               "on local disk; worth little or nothing on a network mount, "
               "where the pages are not local to cache. Off by default"))
     parser.add_argument(
+        "--perf-log", default=None, metavar="PATH",
+        help=("append one timing record per request and per storage call "
+              "to PATH, as newline-delimited JSON, for reading back later "
+              "with: python3 tools/perf_report.py PATH. OFF unless given, "
+              "so an intermittent stall has to be caught with this "
+              "already running. The file is capped and rolled over, so "
+              "leaving it on is safe"))
+    parser.add_argument(
+        "--perf-max-mb", type=int, default=None, metavar="MB",
+        help=("roll --perf-log over at this size (default: 128). At most "
+              "twice this is ever on disk: the live file and one "
+              "predecessor"))
+    parser.add_argument(
+        "--site-notes", default=None, metavar="PATH",
+        help=("JSON file of this SITE's own What's new notes, shown on the "
+              "What's new page beside testboard's release notes (add one "
+              "with: python3 tools/add_site_note.py). Default: "
+              "site_notes.json beside --db, which is outside the "
+              "repository so a deployment cannot overwrite it. Read per "
+              "request, so a new note needs no restart"))
+    parser.add_argument(
         "--verbose", action="store_true",
         help="DEBUG logging plus full tracebacks on fatal errors")
     return parser
@@ -137,11 +158,50 @@ def main(argv=None):
             traceback.print_exc()
         return 2
 
+    perf_log = None
+    if args.perf_log:
+        import testboard.perf
+        max_bytes = (
+            testboard.perf.DEFAULT_MAX_BYTES if args.perf_max_mb is None
+            else max(1, args.perf_max_mb) * 1024 * 1024)
+        try:
+            perf_log = testboard.perf.PerfLog(
+                args.perf_log, max_bytes=max_bytes)
+        except Exception as exc:
+            storage.close()
+            sys.stderr.write(
+                "Cannot open the performance log {0}: {1}\n".format(
+                    args.perf_log, exc))
+            if args.verbose:
+                traceback.print_exc()
+            return 2
+        wrapped = testboard.perf.instrument_storage(storage, perf_log)
+        print("performance log: {0} ({1} storage methods timed, rolling "
+              "at {2} MB)".format(
+                  os.path.abspath(args.perf_log), len(wrapped),
+                  max_bytes // (1024 * 1024)))
+
+    import testboard.site_notes
+    site_notes_path = (
+        args.site_notes if args.site_notes
+        else testboard.site_notes.default_path(args.db))
+    notes, notes_problem = testboard.site_notes.load(site_notes_path)
+    # Say the resolved path and what was found there. A notes file that is
+    # silently in the wrong place looks exactly like a site that has not
+    # written any, and someone would go looking in the code for the bug.
+    print("site notes: {0} ({1})".format(
+        os.path.abspath(site_notes_path),
+        notes_problem if notes_problem
+        else "{0} note(s)".format(len(notes))))
+
     try:
         server = testboard.server.create_server(
-            args.host, args.port, storage, args.static)
+            args.host, args.port, storage, args.static, perf=perf_log,
+            site_notes_path=site_notes_path)
     except OSError as exc:
         storage.close()
+        if perf_log is not None:
+            perf_log.close()
         # Windows reports an in-use port as WSAEADDRINUSE (10048) or —
         # when the other listener holds it exclusively — WSAEACCES
         # (10013); POSIX uses EADDRINUSE.
@@ -172,6 +232,8 @@ def main(argv=None):
     finally:
         server.server_close()
         storage.close()
+        if perf_log is not None:
+            perf_log.close()
     return 0
 
 

@@ -1462,3 +1462,175 @@ button.bar-row:focus-visible {
 .env-updated-name { font-weight: 600; }
 
 .env-updated-when { color: var(--muted); }
+
+/* ---------- Last update pills, as environment filters ---------- */
+
+/* They were <span>s and are now <button>s: the fastest way to scope the
+   page to the environment you were already looking at the clock for.
+   Everything here is either the button reset or the active state; the
+   shape above is unchanged, so a pill still looks like a pill. */
+button.env-updated-item {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+button.env-updated-item:hover {
+  border-color: var(--accent-link);
+}
+
+button.env-updated-item:focus-visible {
+  outline: 2px solid var(--accent-link);
+  outline-offset: 2px;
+}
+
+/* Filled, not just outlined. This is the only on-screen statement that
+   the whole page is scoped, so it has to survive a glance. */
+button.env-updated-item[aria-pressed="true"] {
+  background: var(--ink);
+  border-color: transparent;
+  color: #fff;
+}
+
+button.env-updated-item[aria-pressed="true"] .env-updated-when {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+/* ---------- Treemap (Time page) ---------- */
+
+/* One hue, five depths, relative to the largest box on screen (see
+   shadeFor in charts.js for why relative and not absolute). Deliberately
+   NOT the pass/fail palette: this encodes magnitude, and borrowing the
+   result colours would have people reading "red = bad" into a box that
+   only means "slow". The hue is the same #3d6b8e the bars used, so the
+   page changed shape without changing what its colour means.
+
+   Depth carries no information the area does not already carry -- it is
+   there so neighbouring boxes separate, and so the eye lands on the
+   large ones first. */
+.treemap {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 4px 0 10px;
+}
+
+.tm-shade-0 { fill: #cfdde7; }
+.tm-shade-1 { fill: #a9c3d5; }
+.tm-shade-2 { fill: #7ea5c0; }
+.tm-shade-3 { fill: #5a86a6; }
+.tm-shade-4 { fill: #3d6b8e; }
+
+.tm-label,
+.tm-value {
+  font-family: inherit;
+  pointer-events: none;         /* the hit rect above owns the pointer */
+  fill: #10222e;
+}
+
+.tm-label { font-size: 11px; font-weight: 600; }
+.tm-value { font-size: 10.5px; opacity: 0.8; }
+
+/* The two deepest shades are dark enough to need light text on them. */
+.tm-box.is-deep .tm-label,
+.tm-box.is-deep .tm-value {
+  fill: #ffffff;
+}
+
+.tm-hit {
+  fill: transparent;
+  stroke: transparent;
+  stroke-width: 1;
+}
+
+.tm-box.is-clickable .tm-hit { cursor: pointer; }
+
+.tm-box.is-hover .tm-hit,
+.tm-hit:hover {
+  stroke: #10222e;
+}
+
+/* Focus has to be visible against every one of the five shades, so it is
+   a light halo inside a dark ring rather than a single colour. */
+.tm-hit:focus-visible {
+  outline: none;
+  stroke: var(--accent-link);
+  stroke-width: 3;
+}
+
+/* The "N smaller items" box. It stands for many things rather than being
+   one of them, so it sits outside the shade scale: given a shade it reads
+   as the single biggest script on the page. Its SIZE is still the true
+   combined size of what it covers -- that is the invariant the chart
+   exists to keep (see foldTiny in charts.js). */
+.tm-rest-fill {
+  fill: #eceae4;
+  stroke: #d8d5cc;
+  stroke-width: 1;
+}
+
+.tm-box.is-rest .tm-label,
+.tm-box.is-rest .tm-value {
+  fill: #55524c;
+  font-style: italic;
+}
+
+/* ---------- What's new: nav date, unread dot, site notes ---------- */
+
+/* Release notes nobody notices are release notes nobody reads, so the
+   nav link carries the date of the latest drop and a dot until this
+   browser has opened it. Both come from whatsnew.html itself (nav.js). */
+.nav-drop-date {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.site-nav a.has-update .nav-drop-date { color: var(--accent-link); }
+
+.nav-unread-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--accent-link);
+  vertical-align: 1px;
+}
+
+/* This site's own notes, inside a dated section. Visibly separated from
+   the release notes above them: a tester who cannot tell "testboard
+   changed" from "our environment changed" cannot tell who to ask. */
+.site-notes {
+  margin: 16px 0 0;
+  padding: 10px 14px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid #7ea5c0;
+  border-radius: 6px;
+}
+
+.site-notes-head {
+  margin: 0 0 2px;
+  color: var(--ink);
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 14px;
+}
+
+.site-notes-intro { margin: 0 0 8px; font-size: 12px; }
+
+.site-notes-list { margin: 0; padding-left: 20px; }
+
+.site-notes-list li { margin-bottom: 5px; }
+
+.site-note-author {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* A date with site notes but no shipped release notes still gets a
+   section, because a note written between drops is the common case. */
+.release-site-only .section-head { margin-bottom: 4px; }

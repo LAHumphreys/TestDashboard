@@ -11,14 +11,28 @@
  * counting it would claim time was spent last night that was not — and
  * the number of exclusions is shown rather than swallowed.
  *
- * Form: horizontal bars, not a treemap. Every row is labelled and
- * readable, small values stay visible, and it degrades to the data table
- * beneath it. A treemap encodes magnitude as area — which people read
- * badly — and cannot label its small cells at all.
+ * Form: a treemap — the profiler-style box graph. This replaced
+ * horizontal bars, and the reasoning that chose bars is worth keeping
+ * because it was not wrong: area is read less precisely than length, and
+ * a treemap cannot label its small cells at all.
  *
- * Colour: ONE hue, and deliberately not the pass/fail palette. This is
- * magnitude, not status; borrowing the result colours here would have
- * people reading "red = bad" into a bar that only means "slow".
+ * What it buys instead is the question this page exists to answer. "Where
+ * is the time going" is a question about PROPORTION — how much of the
+ * night is this environment, is one script most of it — and a treemap
+ * shows the whole and the parts in one shape, at every level of the
+ * drill-down. A column of bars shows the ranking clearly and the share
+ * only by arithmetic the reader has to do.
+ *
+ * The known weakness is answered rather than ignored: labels are drawn
+ * only in boxes big enough to hold them, every box is a keyboard-focusable
+ * control with its share in its accessible name, and the full data table
+ * below the chart is sortable and lists every row. For a small slice the
+ * table is not a fallback, it is the answer.
+ *
+ * Colour: ONE hue at five depths by share, and deliberately not the
+ * pass/fail palette. This is magnitude, not status; borrowing the result
+ * colours here would have people reading "red = bad" into a box that only
+ * means "slow".
  */
 
 "use strict";
@@ -29,10 +43,11 @@ import {
   el,
   fetchJson,
   formatDuration,
+  formatTime,
   renderUserWidget,
   showError,
 } from "./api.js";
-import { barRows } from "./charts.js";
+import { treemapBoxes } from "./charts.js";
 import { attachSorting, sortRows } from "./sorting.js";
 
 const LEVELS = ["environment", "script", "test_name"];
@@ -95,6 +110,14 @@ async function load() {
   }
 }
 
+/** What the current level is a list OF, for labels and counts. */
+function unitWord() {
+  if (level() === "environment") {
+    return "environments";
+  }
+  return level() === "script" ? "scripts" : "tests";
+}
+
 function render(data) {
   renderBreadcrumb();
 
@@ -108,9 +131,7 @@ function render(data) {
     + (data.test_count === 1 ? " test" : " tests");
 
   document.getElementById("time-meta").textContent =
-    data.items.length.toLocaleString() + " "
-    + (level() === "environment" ? "environments"
-      : level() === "script" ? "scripts" : "tests");
+    data.items.length.toLocaleString() + " " + unitWord();
 
   const staleToggle = document.getElementById("stale-toggle");
   staleToggle.setAttribute(
@@ -151,7 +172,7 @@ function render(data) {
   empty.hidden = true;
 
   const canDrill = level() !== "test_name";
-  barRows(chart, state.items.map((item) => ({
+  const capped = treemapBoxes(chart, state.items.map((item) => ({
     label: item.key,
     sublabel: item.test_count.toLocaleString()
       + (item.test_count === 1 ? " test" : " tests")
@@ -159,15 +180,51 @@ function render(data) {
     value: item.total_seconds,
     valueText: formatDuration(item.total_seconds),
     onClick: canDrill ? () => drillInto(item.key) : null,
+    // The tooltip carries Share explicitly. On a treemap the share IS
+    // the encoding, so a reader estimating it from the area is exactly
+    // the reading that needs a number to check itself against.
     tooltipRows: [
-      ["Total", formatDuration(item.total_seconds)],
-      ["Tests", item.test_count.toLocaleString()],
-      ["Mean", formatDuration(item.mean)],
-      ["Share", data.total_seconds
+      { label: "total", value: formatDuration(item.total_seconds) },
+      { label: "of all time shown", value: data.total_seconds
         ? Math.round(item.total_seconds / data.total_seconds * 100) + "%"
-        : "—"],
+        : "—" },
+      { label: "tests", value: item.test_count.toLocaleString() },
+      { label: "mean each", value: formatDuration(item.mean) },
     ],
-  })), { fillClass: "fill-time" });
+  })), {
+    unitLabel: unitWord(),
+    measureLabel: "the run time shown",
+    formatValue: formatDuration,
+  });
+
+  // What the chart is not saying, said. The rectangle IS all of the time
+  // above — every box, the combined one included, is the size its share
+  // deserves — but two things still need admitting: which items got
+  // merged, and which boxes are too small to carry a name. Left unsaid,
+  // an unlabelled box invites "that big one must be the slow one" about
+  // a box that is nothing of the kind.
+  const capNote = document.getElementById("time-capped");
+  const notes = [];
+  if (capped.hiddenCount) {
+    notes.push("The smallest " + capped.hiddenCount.toLocaleString() + " "
+      + unitWord() + " are combined into one box — "
+      + formatDuration(capped.hiddenValue) + " between them, "
+      + (capped.total
+        ? Math.round((capped.hiddenValue / capped.total) * 100) : 0)
+      + "% of the time above.");
+  }
+  if (capped.unlabelled) {
+    notes.push(capped.unlabelled.toLocaleString() + " of "
+      + capped.drawn.toLocaleString()
+      + " boxes are too small to print a name in; hover one to see it.");
+  }
+  if (notes.length) {
+    capNote.textContent = notes.join(" ")
+      + " The data table below names every one.";
+    capNote.hidden = false;
+  } else {
+    capNote.hidden = true;
+  }
 
   renderTable();
 }

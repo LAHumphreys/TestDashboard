@@ -2682,3 +2682,142 @@ class TestLatestRunTimeByEnvironment(StorageTestBase):
             "runs", plan.replace("latest_runs", ""),
             "must read the derived table, not history: " + plan)
         self.assertIn("INDEX", plan.upper(), plan)
+
+
+class EnvironmentDeleteTest(StorageTestBase):
+    """Deleting an environment must leave the database consistent.
+
+    For an environment that should never have been imported — a reader
+    mis-configuration filing runs under a name like ``UNKNOWN``. Unlike
+    retirement, this removes rows, so the risk is not "the dashboard
+    shows the wrong thing" but "the dashboard cannot read itself":
+    `latest_runs` is what every estate-wide query goes through, and a
+    row there pointing at a deleted run is a broken page, not a stale
+    one.
+    """
+
+    def _seed(self) -> None:
+        for environment in ("linux-sim", "UNKNOWN"):
+            self.store.upsert_runs([
+                make_record(environment=environment, test_name="a"),
+                make_record(environment=environment, test_name="b",
+                            result=Result.FAIL,
+                            start=BASE + datetime.timedelta(hours=1)),
+            ])
+        self.store.ensure_user("alice", CREATED)
+        for environment in ("linux-sim", "UNKNOWN"):
+            self.store.add_comment(
+                environment, "suite.py", "a", "alice", "looking", CREATED)
+            self.store.set_assignee(
+                environment, "suite.py", "b", "alice", "alice", CREATED)
+            self.store.set_environment_expectation(
+                environment, 2, "alice", CREATED)
+        self.store.set_retired(
+            "UNKNOWN", "suite.py", "a", True, "alice", "bogus env", CREATED)
+
+    def _tables_with_environment(self) -> List[str]:
+        """Every table in the LIVE schema carrying an environment column."""
+        conn = self.store._conn()
+        names = [
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")
+        ]
+        found = []
+        for name in names:
+            columns = [
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info({0})".format(name))
+            ]
+            if "environment" in columns:
+                found.append(name)
+        return sorted(found)
+
+    def test_the_table_list_covers_the_whole_schema(self) -> None:
+        """A migration that adds an environment table must fail here.
+
+        The delete interpolates table names from a hand-written tuple.
+        If a later migration adds a table keyed by environment and does
+        not add it there, the rows are silently left behind and nothing
+        else in the suite notices — so this asks the schema rather than
+        trusting the tuple.
+        """
+        self.assertEqual(
+            sorted(storage._ENVIRONMENT_TABLES),
+            self._tables_with_environment(),
+            "_ENVIRONMENT_TABLES no longer matches the schema; a table "
+            "keyed by environment would keep its rows after a delete")
+
+    def test_it_removes_every_trace_of_the_environment(self) -> None:
+        self._seed()
+        self.store.delete_environment("UNKNOWN")
+        conn = self.store._conn()
+        for table in storage._ENVIRONMENT_TABLES:
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM {0} WHERE environment = ?".format(
+                    table), ("UNKNOWN",)).fetchone()[0]
+            self.assertEqual(remaining, 0, table)
+
+    def test_it_leaves_the_other_environments_alone(self) -> None:
+        self._seed()
+        before = self.store.dashboard_count(environment="linux-sim")
+        self.store.delete_environment("UNKNOWN")
+        self.assertEqual(
+            self.store.dashboard_count(environment="linux-sim"), before)
+        self.assertEqual(self.store.environments(), ["linux-sim"])
+        self.assertEqual(
+            len(self.store.list_environment_expectations()), 1)
+
+    def test_no_derived_row_is_left_pointing_at_a_deleted_run(self) -> None:
+        """The failure that would actually break the dashboard."""
+        self._seed()
+        self.store.delete_environment("UNKNOWN")
+        orphans = self.store._conn().execute(
+            "SELECT COUNT(*) FROM latest_runs lr "
+            "LEFT JOIN runs r ON r.id = lr.run_id WHERE r.id IS NULL"
+        ).fetchone()[0]
+        self.assertEqual(orphans, 0, "latest_runs references a deleted run")
+
+    def test_no_output_is_left_without_its_run(self) -> None:
+        self._seed()
+        self.store.delete_environment("UNKNOWN")
+        orphans = self.store._conn().execute(
+            "SELECT COUNT(*) FROM run_outputs o "
+            "LEFT JOIN runs r ON r.id = o.run_id WHERE r.id IS NULL"
+        ).fetchone()[0]
+        self.assertEqual(orphans, 0, "run_outputs outlived its run")
+
+    def test_the_counts_returned_match_what_the_dry_run_reported(self) -> None:
+        """The dry run has to be the same question as the delete."""
+        self._seed()
+        counted = self.store.count_environment_rows("UNKNOWN")
+        deleted = self.store.delete_environment("UNKNOWN")
+        self.assertEqual(counted, deleted)
+        self.assertGreater(sum(deleted.values()), 0)
+
+    def test_an_absent_environment_is_not_an_error(self) -> None:
+        """Re-running a job that already succeeded must be quiet."""
+        self._seed()
+        self.store.delete_environment("UNKNOWN")
+        again = self.store.delete_environment("UNKNOWN")
+        self.assertEqual(sum(again.values()), 0)
+
+    def test_the_match_is_exact_not_a_prefix_or_case_fold(self) -> None:
+        """`UNKNOWN` must not take `UNKNOWN-2` or `unknown` with it."""
+        self.store.upsert_runs([
+            make_record(environment="UNKNOWN", test_name="a"),
+            make_record(environment="UNKNOWN-2", test_name="a"),
+            make_record(environment="unknown", test_name="a"),
+        ])
+        self.store.delete_environment("UNKNOWN")
+        self.assertEqual(
+            sorted(self.store.environments()), ["UNKNOWN-2", "unknown"])
+
+    def test_the_trend_cache_is_invalidated(self) -> None:
+        """A memoized chart of an environment that no longer exists."""
+        self.store.upsert_runs([make_record(environment="UNKNOWN")])
+        self.store.daily_result_counts(BASE, 7)          # populate the memo
+        self.store.delete_environment("UNKNOWN")
+        counts = self.store.daily_result_counts(BASE, 7)
+        self.assertEqual(
+            sum(row.count for row in counts), 0,
+            "the trend still reports runs from a deleted environment")

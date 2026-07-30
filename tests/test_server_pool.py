@@ -20,8 +20,10 @@ cost a multiple of every read.
 Python 3.6 compatible; standard library only.
 """
 
+import json
 import os
 import shutil
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -224,6 +226,161 @@ class ShutdownTest(unittest.TestCase):
                                    workers=2)
         srv.server_close()
         srv.server_close()
+
+
+class KeepAliveTest(ServerTestBase):
+    """An idle client must not hold a worker out of the pool.
+
+    The second pool pathology, and the one that reached production as
+    "the page won't load". A worker serves a whole CONNECTION, the
+    server speaks HTTP/1.1, and Python's default handler timeout is
+    ``None`` — so a worker that had answered a request sat in
+    ``readline()`` on an idle socket until the browser chose to close it,
+    which could be never.
+
+    Browsers open several connections per origin and keep them long
+    after they are done. Two tabs can therefore occupy every worker in
+    the default eight-worker pool with nothing in flight at all, and the
+    next person to open the dashboard waits on a browser that is not
+    theirs. Reproduced at ``workers=2``: two idle connections, and a
+    third request that never arrived.
+
+    These tests hold connections open by hand rather than through
+    ``urllib``, because the bug is in what happens BETWEEN requests on a
+    connection and ``urlopen`` closes its connection at the end of each.
+    """
+
+    workers = 2
+
+    def raw_connection(self) -> socket.socket:
+        """A socket to the server, closed on teardown."""
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=30)
+        self.addCleanup(sock.close)
+        return sock
+
+    def read_response(self, sock: socket.socket) -> bytes:
+        """Read exactly one complete HTTP response.
+
+        Draining the body matters: a test that only recv()s once leaves
+        it on the socket, and the next recv() returns the tail of the
+        PREVIOUS response instead of the next one. That reads as a
+        keep-alive failure and is a bug in the test.
+        """
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return data
+            data += chunk
+        head, _, body = data.partition(b"\r\n\r\n")
+        length = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":", 1)[1].strip())
+        while len(body) < length:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+        return head
+
+    def hold_idle_connection(self) -> socket.socket:
+        """Answer one request on a new connection, then leave it open."""
+        sock = self.raw_connection()
+        sock.sendall(b"GET /api/environments HTTP/1.1\r\nHost: x\r\n"
+                     b"Connection: keep-alive\r\n\r\n")
+        self.assertIn(b"200 OK", self.read_response(sock))
+        return sock
+
+    def test_idle_connections_do_not_starve_the_pool(self) -> None:
+        """The reproduction. Every worker idle, and a request still served."""
+        for _ in range(self.workers):
+            self.hold_idle_connection()
+        started = time.time()
+        self.assertIn(b"status", self.get("/api/summary"))
+        elapsed = time.time() - started
+        self.assertLess(
+            elapsed, server._KEEPALIVE_IDLE_SECONDS,
+            "a queued request waited {0:.2f}s behind workers that were "
+            "doing nothing; the idle wait is not being interrupted".format(
+                elapsed))
+
+    def test_an_idle_connection_is_eventually_closed_by_the_server(
+        self
+    ) -> None:
+        """Even with nothing queued, an idle client cannot hold a worker."""
+        sock = self.hold_idle_connection()
+        sock.settimeout(server._KEEPALIVE_IDLE_SECONDS * 4)
+        # recv returns b"" when the server has closed its end.
+        self.assertEqual(
+            sock.recv(4096), b"",
+            "the server left an idle keep-alive connection open, which "
+            "means a worker is still bound to it")
+
+    def test_a_request_arriving_slowly_is_still_served(self) -> None:
+        """The other half of the split, and the reason it has to exist.
+
+        One short timeout covering both waiting and working would be a
+        simpler change and would abort a slow import: the feeder's body
+        can be large and arrive in pieces. The pause here is longer than
+        the whole idle timeout, mid-request.
+        """
+        sock = self.raw_connection()
+        sock.sendall(b"POST /api/import HTTP/1.1\r\n")
+        time.sleep(server._KEEPALIVE_IDLE_SECONDS + 1.0)
+        body = json.dumps({"runs": []}).encode("utf-8")
+        sock.sendall(b"Host: x\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: " + str(len(body)).encode("ascii")
+                     + b"\r\n\r\n" + body)
+        self.assertIn(b"200 OK", sock.recv(4096))
+
+    def test_keep_alive_is_still_used_when_nothing_is_queued(self) -> None:
+        """The fix must not degrade into close-after-every-response.
+
+        A page load fetches ten or so files. Reusing one connection for
+        them is most of the point of HTTP/1.1, so an uncontended
+        connection has to survive its first response.
+        """
+        sock = self.hold_idle_connection()
+        sock.sendall(b"GET /api/environments HTTP/1.1\r\nHost: x\r\n"
+                     b"Connection: keep-alive\r\n\r\n")
+        self.assertIn(
+            b"200 OK", self.read_response(sock),
+            "the second request on an idle connection was not answered, so "
+            "the connection was closed when nothing was waiting for it")
+
+    def test_shutdown_does_not_wait_for_an_idle_client(self) -> None:
+        """A worker holding an idle connection must still be joinable.
+
+        ``server_close`` queues a sentinel per worker and joins with a
+        10s timeout. A worker blocked forever on an idle socket never
+        reached its sentinel, so shutdown depended on a browser closing
+        its connection — the same root cause as the stall, showing up as
+        a process that would not exit.
+        """
+        self.hold_idle_connection()
+        started = time.time()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=15)
+        elapsed = time.time() - started
+        alive = [t for t in threading.enumerate()
+                 if t.name.startswith("testboard-worker")]
+        self.assertEqual(alive, [], "a worker outlived server_close()")
+        self.assertLess(elapsed, 10.0,
+                        "shutdown took {0:.1f}s waiting on an idle "
+                        "client".format(elapsed))
+
+    def test_the_two_timeouts_are_ordered(self) -> None:
+        """Waiting must be bounded well below working, or it is not a split."""
+        self.assertLess(server._IDLE_POLL_SECONDS,
+                        server._KEEPALIVE_IDLE_SECONDS)
+        self.assertLess(server._KEEPALIVE_IDLE_SECONDS,
+                        server._ACTIVE_SECONDS)
+        self.assertIsNotNone(
+            server._DashboardRequestHandler.timeout,
+            "a None handler timeout is the default, and is the bug: it "
+            "makes every socket operation unbounded")
 
 
 class DefaultsTest(unittest.TestCase):

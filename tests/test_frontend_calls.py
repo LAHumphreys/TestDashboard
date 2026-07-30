@@ -36,7 +36,7 @@ import io
 import os
 import re
 import unittest
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 STATIC_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
@@ -640,6 +640,238 @@ class PlantedWindowRegressionTest(unittest.TestCase):
     def test_a_night_label_would_be_caught(self) -> None:
         planted = 'label: "Pass rate last night",'
         self.assertIn("last night", _strip_comments(planted).lower())
+
+
+#: The frontend's own shared modules. A name one of these exports is a
+#: name every other file has to IMPORT before using — ES modules have no
+#: implicit global scope, so a missing import is a ReferenceError at the
+#: moment the line runs, not at load.
+_SHARED_MODULES = ("api.js", "charts.js", "sorting.js", "review.js")
+
+
+def _exported_names(source: str) -> List[str]:
+    """Names a module exports as functions or consts."""
+    return re.findall(
+        r"^export\s+(?:async\s+)?(?:function|const|let|class)\s+(\w+)",
+        _strip_comments(source), flags=re.M)
+
+
+def _imported_names(source: str) -> List[str]:
+    """Names a module imports, from every ``import { ... } from`` block."""
+    names = []  # type: List[str]
+    for block in re.findall(
+            r"import\s*\{([^}]*)\}\s*from", _strip_comments(source), re.S):
+        for piece in block.split(","):
+            name = piece.strip().split(" as ")[-1].strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def _defines(source: str, name: str) -> bool:
+    """True when *source* declares *name* itself rather than importing it."""
+    return re.search(
+        r"^(?:export\s+)?(?:async\s+)?(?:function|const|let|var|class)\s+"
+        + re.escape(name) + r"\b",
+        source, flags=re.M) is not None
+
+
+class SharedImportTest(unittest.TestCase):
+    """Every shared helper a page CALLS has to be in its import block.
+
+    ``time.js`` shipped calling ``formatTime()`` without importing it.
+    Nothing caught it: it parses, it loads, and the two call sites are
+    both on branches that only run when some test has stopped reporting —
+    which the generated dev database never has and production always
+    does. So it worked here and threw "formatTime is not defined" there,
+    on the one page that needed it.
+
+    This is the narrow form of the check, deliberately. "Every free
+    identifier is bound" needs a JavaScript parser, which this project
+    does not have and is not going to grow. "Every name a shared module
+    exports, if a page calls it, is imported by that page" needs a
+    regex, and catches exactly the class of bug that shipped.
+    """
+
+    def test_every_shared_helper_used_is_imported(self) -> None:
+        exports = {}  # type: Dict[str, str]
+        for module in _SHARED_MODULES:
+            for name in _exported_names(read(module)):
+                exports[name] = module
+
+        self.assertIn("formatTime", exports, sorted(exports))
+        self.assertGreater(len(exports), 20, sorted(exports))
+
+        missing = []  # type: List[str]
+        for filename, source in sorted(scripts().items()):
+            if filename in _SHARED_MODULES:
+                continue        # a shared module may define its own
+            code = _strip_comments(source)
+            imported = set(_imported_names(source))
+            for name, home in sorted(exports.items()):
+                if not re.search(r"\b" + re.escape(name) + r"\s*\(", code):
+                    continue    # not called here
+                if name in imported or _defines(code, name):
+                    continue
+                missing.append(
+                    "{0} calls {1}() from {2} without importing it".format(
+                        filename, name, home))
+        self.assertEqual(missing, [], "\n".join(missing))
+
+
+class PlantedSharedImportRegressionTest(unittest.TestCase):
+    """Prove the import check can fail — on the code that actually shipped."""
+
+    def test_the_missing_formatTime_import_would_be_caught(self) -> None:
+        planted = (
+            'import { formatDuration } from "./api.js";\n'
+            'excluded.textContent = "since " + formatTime(data.stale_before);\n'
+        )
+        code = _strip_comments(planted)
+        self.assertNotIn("formatTime", _imported_names(planted))
+        self.assertRegex(code, r"\bformatTime\s*\(")
+        self.assertFalse(_defines(code, "formatTime"))
+
+    def test_a_locally_defined_helper_is_not_flagged(self) -> None:
+        planted = (
+            "function formatTime(iso) { return iso; }\n"
+            "const label = formatTime(x);\n"
+        )
+        self.assertTrue(_defines(_strip_comments(planted), "formatTime"))
+
+    def test_a_renamed_import_counts_as_imported(self) -> None:
+        planted = 'import { formatTime as fmt } from "./api.js";\n'
+        self.assertIn("fmt", _imported_names(planted))
+
+
+#: Month names as the release headings write them.
+_MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"]
+
+
+class DropDateTest(unittest.TestCase):
+    """Every release section must carry a machine-readable date.
+
+    Three things read ``data-drop-date`` off ``whatsnew.html``: the date
+    shown on the "What's new" link, the unread marker beside it, and the
+    place this site's own notes are attached. All three fail silently on a
+    section that lacks it — the nav advertises an older drop than the one
+    that just shipped, and a site note filed against today's date grows a
+    duplicate section instead of joining the release notes.
+
+    The attribute can also be RIGHT while being wrong: a copied section
+    keeping the previous drop's date parses perfectly and misinforms
+    everyone. So this checks it against the heading a human reads, which
+    is the copy nobody forgets to update.
+    """
+
+    def sections(self) -> List[Tuple[str, str]]:
+        """(data-drop-date, heading text) for each release section.
+
+        Comments are stripped first, and not defensively: the note at the
+        top of the file explains the convention by quoting the markup,
+        so a scan of the raw text finds a ``<section class="release">``
+        and a ``data-drop-date="YYYY-MM-DD"`` inside the prose and reports
+        the documentation as a broken section.
+        """
+        html = re.sub(r"<!--.*?-->", " ", read("whatsnew.html"), flags=re.S)
+        found = []
+        for block in html.split('<section class="release"')[1:]:
+            date = re.search(r'data-drop-date="([^"]*)"', block)
+            heading = re.search(r'<h2 class="eyebrow">([^<]*)</h2>', block)
+            found.append((
+                date.group(1) if date else "",
+                heading.group(1).strip() if heading else "",
+            ))
+        return found
+
+    def test_the_scan_finds_the_release_sections(self) -> None:
+        sections = self.sections()
+        self.assertGreaterEqual(len(sections), 2, sections)
+
+    def test_every_section_has_a_drop_date(self) -> None:
+        missing = [head for date, head in self.sections() if not date]
+        self.assertEqual(
+            missing, [],
+            "release section(s) with no data-drop-date; the nav date, the "
+            "unread marker and site notes all key off it")
+
+    def test_every_drop_date_is_iso(self) -> None:
+        for date, head in self.sections():
+            self.assertRegex(date, r"^\d{4}-\d{2}-\d{2}$", head)
+
+    def test_the_drop_date_matches_the_heading(self) -> None:
+        """A copied section that kept the old date parses fine and lies."""
+        for date, heading in self.sections():
+            year, month, day = date.split("-")
+            expected = "{0} {1} {2}".format(
+                int(day), _MONTHS[int(month) - 1], year)
+            self.assertEqual(
+                heading, expected,
+                "section dated {0} is headed {1!r}; one of them is "
+                "wrong".format(date, heading))
+
+    def test_the_dates_descend(self) -> None:
+        """Newest first: the file's only ordering rule."""
+        dates = [date for date, _ in self.sections()]
+        self.assertEqual(dates, sorted(dates, reverse=True), dates)
+
+    def test_every_page_can_show_the_nav_marker(self) -> None:
+        """A page that omits nav.js silently shows a stale-looking link."""
+        for name in sorted(os.listdir(STATIC_DIR)):
+            if not name.endswith(".html"):
+                continue
+            html = read(name)
+            self.assertIn('id="nav-whatsnew"', html,
+                          name + " has no identified What's new link")
+            self.assertIn('src="nav.js"', html,
+                          name + " does not load nav.js")
+
+
+class PlantedDropDateRegressionTest(unittest.TestCase):
+    """Prove the date checks can fail."""
+
+    def test_a_copied_section_keeping_the_old_date_is_caught(self) -> None:
+        date, heading = "2026-07-28", "30 July 2026"
+        year, month, day = date.split("-")
+        rendered = "{0} {1} {2}".format(int(day), _MONTHS[int(month) - 1], year)
+        self.assertNotEqual(rendered, heading)
+
+    def test_a_missing_attribute_is_caught(self) -> None:
+        block = '<section class="release">\n<h2 class="eyebrow">1 Jan</h2>'
+        self.assertIsNone(re.search(r'data-drop-date="([^"]*)"', block))
+
+
+class SiteNotesFrontendTest(unittest.TestCase):
+    """Site notes are operator text on a page that must not break.
+
+    They are an addition to release notes that already shipped inside the
+    build, so the page has to render completely without them. And they are
+    free-form text written by a person, so they follow the same rule as
+    comments and test output: textContent, never innerHTML.
+    """
+
+    def test_notes_reach_the_dom_as_text(self) -> None:
+        code = _strip_comments(read("whatsnew.js"))
+        self.assertNotIn("innerHTML", code)
+        self.assertIn("textContent", code)
+
+    def test_the_fetch_failure_path_is_silent(self) -> None:
+        """No error banner: the real content is already on screen."""
+        code = _strip_comments(read("whatsnew.js"))
+        self.assertIn("catch", code)
+        self.assertNotIn("showError", code)
+
+    def test_it_asks_the_documented_endpoint(self) -> None:
+        self.assertEqual(
+            len(fetch_sites(read("whatsnew.js"), "/api/site-notes")), 1)
+
+    def test_the_nav_marker_never_blocks_a_page(self) -> None:
+        """nav.js runs on every page, so its failure path matters most."""
+        code = _strip_comments(read("nav.js"))
+        self.assertNotIn("innerHTML", code)
+        self.assertNotIn("showError", code)
+        self.assertIn("catch", code)
 
 
 if __name__ == "__main__":

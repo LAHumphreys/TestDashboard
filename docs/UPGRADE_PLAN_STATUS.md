@@ -777,3 +777,210 @@ identifier, and history still needs it.
 **Not started.** It shares `storage.py` and the migration registry with the
 MariaDB work in flight, so the version is claimed and the code is sequenced
 after it.
+
+---
+
+## Drop of 2026-07-30 — production fixes, treemap, operator tooling
+
+**Not a work package.** A small group of fixes requested directly, plus two
+things found while looking for them. Suite **1137 → 1268 green** (skipped 1).
+**No migration**: schema stays at 5, so this is the first drop whose rollback is
+a `git checkout` and a restart. Operator note: `docs/drops/2026-07-30.md`.
+
+### The Time page was broken in production the whole time it has existed
+
+`static/time.js` called `formatTime()` and never imported it. It parses, it
+loads, and the two call sites are both on branches that only run when some test
+has stopped reporting — which the generated dev database never has and
+production always does. So it worked here and threw
+`formatTime is not defined` there.
+
+Reported as "I assume a python 3.6.8 related error?". It is not: ES modules have
+no implicit global scope, so a missing import is a `ReferenceError` at the moment
+the line runs.
+
+The interesting part is that nothing could have caught it. There is no
+JavaScript test runner and there is not going to be. So
+`test_frontend_calls.py::SharedImportTest` now asserts the narrow form of the
+property: for every name exported by `api.js`/`charts.js`/`sorting.js`, if a page
+CALLS it, that page imports it. Regex-level, and verified against the pre-fix
+file — it fails with exactly `['formatTime']`. The general form ("every free
+identifier is bound") needs a JavaScript parser and was not attempted.
+
+Two more bugs on the same page, found while in there:
+
+- Its tooltips were passing `tooltipRows` as **arrays** where `showTooltip`
+  reads `{label, value}` objects, as every other caller passes. So the Time
+  page's tooltips rendered blank values. Fixed by the treemap work below.
+- The page never said how much it excluded. It does now.
+
+### Worker starvation from idle keep-alive connections — the "stuck page"
+
+Reported as "what looks like threading issues (I have seen at least one case of a
+developer being stuck with the page not loading)". Root-caused and reproduced.
+
+A worker serves a whole **connection**, `protocol_version = "HTTP/1.1"`, and
+Python's default handler `timeout` is `None`. So a worker that had answered a
+request sat in `readline()` on an idle socket **forever** — until the browser
+chose to close it. Browsers open up to six connections per origin and hold them
+long after they are done with them, so **two tabs could hold every worker in the
+default eight-worker pool with nothing in flight at all.** The server is idle
+and the page does not load.
+
+Reproduced at `workers=2`: two idle connections, and a third request that never
+arrived. That reproduction is now
+`test_server_pool.py::KeepAliveTest::test_idle_connections_do_not_starve_the_pool`.
+
+The fix is four interacting parts, and it took three attempts:
+
+1. **Two timeouts, not one.** `_KEEPALIVE_IDLE_SECONDS` (5s, Apache's default)
+   bounds waiting for the next request; `_ACTIVE_SECONDS` (60s) bounds a request
+   in progress. One short timeout for both aborts a slow import body; one long
+   one for both is the bug. `test_a_request_arriving_slowly_is_still_served`
+   pauses 6s mid-request and pins the split.
+2. **An interruptible wait.** The first attempt used one blocking read under the
+   idle timeout: correct, and a queued request still waited out the whole 5s
+   (**measured: 5.00s**). Now the wait polls every 250ms and gives the
+   connection up as soon as another is queued — **0.24s**.
+3. **`peek`, not `select`.** Selecting on the socket misses a pipelined request
+   already sitting in `rfile`'s buffer, and would then close the connection with
+   it unanswered. `rfile.peek(1)` under a short socket timeout answers for both,
+   consumes nothing, and leaves the stream untouched on timeout.
+4. **Adaptive keep-alive**, decided in `_write_response` *before* the headers so
+   `Connection: close` is honest.
+
+**The regression this caused, and how it was caught.** Yielding on contention was
+first applied to every wait, including the first request on a freshly accepted
+connection — which under load is most of them. Result: connections closed with no
+response at all. `StillAServerTest::test_more_clients_than_workers_all_complete`
+failed with 15 of 20 clients getting "remote end closed connection without
+response". A connection that has not been served is not an idle client holding a
+worker hostage; it *is* the queue. `may_yield` is now False until the connection
+has had one response.
+
+Also here, because the file was open: `handle_error` no longer prints a
+traceback to stderr when a client disconnects mid-response (it looked like a
+server fault), `log_error` drops the now-normal idle-close to DEBUG, the module
+docstring stopped claiming the server is built on `ThreadingMixIn` (the class
+docstring correctly denies it), and the `socketserver` import it needed went
+with it.
+
+Shutdown got faster as a side effect and has a test saying so: a worker blocked
+forever on an idle socket never reached its sentinel, so `server_close()`
+depended on a browser closing its connection.
+
+### Where the time goes, as a treemap — and the constraint that decided it
+
+Requested: "a box graph similar to you get when profiling ... you click a box you
+get a new rectangle drilling down". The drill-down already existed; only the mark
+type changed. `time.js`'s header comment argued *against* a treemap, and that
+reasoning was not wrong — area is read less precisely than length, and small
+cells cannot be labelled. The comment now records why the decision changed
+rather than contradicting the file it heads.
+
+`treemapLayout` is squarified (Bruls, Huizing & van Wijk), pure arithmetic inside
+a fixed viewBox, so it needs no measured element and was verified without a
+browser: areas proportional to values within 0.5%, full coverage, no overlap, no
+escapes, no slivers, and degenerate inputs (empty, all-zero, zero-width,
+negative) return cleanly.
+
+**Three iterations, and the third was decided by the user mid-session:**
+"make sure the treemap stays vaguely representative. Something that's 1% of total
+runtime shouldn't be 25% of the screen."
+
+- **Attempt 1 — draw everything.** Honest, unreadable. Measured on the dev
+  database: 251 scripts in one environment, median box 30x32 units, and **not one
+  of them large enough to hold its name.**
+- **Attempt 2 — top 24, rescaled to fill the rectangle.** Every box labelled and
+  the arithmetic *false*: the top 24 are 11% of the time, so rescaling inflated
+  every box on screen about ninefold. Exactly what the user then ruled out.
+- **Attempt 3 — proportional to the total, tail folded into one box.** Areas are
+  never rescaled. Items below ~220 square units combine into a single
+  "N smaller scripts" box carrying their true summed value, outside the shade
+  scale so it does not read as the biggest script. On that data it is 89% of the
+  rectangle, which is the finding: *no single script is the problem, it is spread
+  across all of them* — the thing attempt 2 hid.
+
+Verified against the rendered SVG rather than the layout function, so the gap
+inset and the aggregate box are both included: **worst drift 0.5 percentage
+points**, all of it the 2px gaps. The gap now scales with the smallest box,
+because a fixed inset takes a larger fraction of a small box than a large one
+and that is a distortion of the encoding.
+
+The page states what the chart is not saying: how many items were combined, and
+how many boxes are too small to carry a name. Shade is relative to the largest
+box on screen, not an absolute share — an absolute scale collapses to one colour
+at both ends of the range this page shows.
+
+### Smaller items
+
+**"Last update" pills are filter buttons** (`setEnvironment`, which already
+existed). All environments stay visible when one is selected, deliberately: a
+list that collapsed to the selection would remove the control you need to get
+out of it.
+
+**The What's new link carries the latest drop date** with an unread dot, from
+`data-drop-date` on each release section in `whatsnew.html` — the only copy of
+that date. `DropDateTest` asserts the attribute agrees with the heading a human
+reads, because a copied section keeping the previous date parses perfectly and
+misinforms everyone.
+
+**Site-specific What's new notes** (`testboard/site_notes.py`,
+`tools/add_site_note.py`, `GET /api/site-notes`). A JSON file outside the
+repository, so a deployment cannot overwrite it; **no migration and no table** —
+these are one site's commentary on testboard's data, not testboard's data, and
+version 6 belongs to WP-15. Read per request, so a note is live without a
+restart. Which is also why `--edit` and `--remove` exist, added on the user's
+prompt ("make sure the operator can correct / remove a note if they make a
+mistake"): a note is in front of every tester the moment it is written, so
+retraction cannot mean hand-editing JSON underneath a running server. Ids are
+stable across loads, never reused after a removal, and assigned deterministically
+even for a hand-written file that has none.
+
+**`tools/drop_environment.py`** for the `UNKNOWN` rows that appeared in
+production. Not retirement — that keeps history. One transaction over every
+table keyed by environment plus `run_outputs` via `runs.id`, ordered so no
+derived row is ever left referencing a deleted run.
+`EnvironmentDeleteTest::test_the_table_list_covers_the_whole_schema` asks the
+live schema rather than trusting the hand-written tuple, so a later migration
+adding an environment-keyed table fails the suite instead of quietly leaving its
+rows behind.
+
+**Performance logging** (`testboard/perf.py`, `tools/perf_report.py`,
+`--perf-log`). Off unless asked for; capped and rolled over so leaving it on is
+safe; a full disk degrades to "no records", never to a 500.
+
+The unit is a **storage operation, not a SQL statement**, and that is not
+convenience: `sqlite3`'s `execute()` steps a statement once, so for a SELECT most
+of the cost lands in the following `fetchall()`. Timing statements would
+systematically under-report precisely the slow reads worth finding. The
+consequence to be honest about is that a multi-statement method is one number.
+
+The field that earns it is the **queue wait**, attributed to the first request on
+a connection only — repeating it per request on a keep-alive connection would
+turn one 3-second stall into ten. Measured on a copy of the dev database, 20
+concurrent `/api/summary` against 2 workers: mean **184ms served, 615ms median
+queued, 1.23s worst**, and the report says "that is contention, not query time".
+`activity_buckets` dominated the storage section at 139ms mean / 2.92s total,
+consistent with the decomposition already recorded for `/api/summary`.
+
+A documentation error caught by its own test: the report first described p99 as
+"1 in 100 was at least this slow", which is wrong — with 99 samples at 1ms and
+one at 1000ms, p99 *is* 1ms. Percentiles are textbook nearest-rank now, and the
+column is described as the boundary it is, with `max` for the worst.
+
+### Verification, and its limits
+
+Frontend verified by driving the real ES modules against a live server under a
+minimal DOM shim in node. It earned its keep twice: it found the `formatTime`
+bug, and it found `Array.prototype.slice.call(map.keys())` in the new
+`whatsnew.js` — which returns `[]`, because a Map iterator has no `length`, so
+no site note would ever have rendered while every other part of the feature
+looked correct.
+
+**No browser has rendered any of this**, and the shim cannot catch layout,
+colour or contrast. Every number above is from the dev database (218 MB
+generated, 540,192 runs) on a developer machine; production is ~900 MB and
+roughly four times that. The keep-alive figures are from the reproduction, not
+from production traffic. `tools/diagnose_db.py --compare-local` has still never
+been run on the production server.

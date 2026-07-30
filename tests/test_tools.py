@@ -29,6 +29,7 @@ from testboard.model import (
 from testboard.storage import Storage
 from tools import (
     demo_bootstrap,
+    drop_environment,
     generate_demo_data,
     prune_runs,
     run_self_tests,
@@ -605,3 +606,98 @@ class TestPruneRunsCli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDropEnvironmentCLI(unittest.TestCase):
+    """The drop-environment CLI: it must be hard to run by accident.
+
+    The storage-level behaviour is covered by
+    ``tests/test_storage.py::EnvironmentDeleteTest``. What is worth
+    testing here is the refusals, because the whole risk of this tool is
+    someone typing the wrong environment name at a prompt that then
+    deletes a year of history with no rollback.
+    """
+
+    def setUp(self) -> None:
+        """A scratch database holding two environments."""
+        self.tmp = tempfile.mkdtemp(prefix="testboard-drop-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.db = os.path.join(self.tmp, "t.db")
+        store = Storage(self.db)
+        store.upsert_runs([
+            RunRecord(
+                environment=environment, script="suite.py",
+                test_name="test_a", result=Result.PASS,
+                start_time=NOW, end_time=NOW + datetime.timedelta(seconds=1),
+                output="out", source_link="", known_failure_reason=None)
+            for environment in ("linux-sim", "UNKNOWN")
+        ])
+        store.close()
+
+    def run_cli(self, argv: List[str], answer: str = "") -> Tuple[int, str]:
+        """Run main() with stdin scripted; return (exit code, stdout)."""
+        out = io.StringIO()
+        with mock.patch("builtins.input", side_effect=[answer]):
+            with contextlib.redirect_stdout(out):
+                rc = drop_environment.main(argv)
+        return rc, out.getvalue()
+
+    def environments(self) -> List[str]:
+        store = Storage(self.db)
+        self.addCleanup(store.close)
+        return sorted(store.environments())
+
+    def test_dry_run_changes_nothing(self) -> None:
+        rc, out = self.run_cli(
+            ["--db", self.db, "-e", "UNKNOWN", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Dry run", out)
+        self.assertEqual(self.environments(), ["UNKNOWN", "linux-sim"])
+
+    def test_a_wrong_confirmation_aborts(self) -> None:
+        """The point of the prompt. Typing anything else must not delete."""
+        rc, out = self.run_cli(
+            ["--db", self.db, "-e", "UNKNOWN"], answer="unknown")
+        self.assertEqual(rc, 1)
+        self.assertIn("Aborted", out)
+        self.assertEqual(self.environments(), ["UNKNOWN", "linux-sim"])
+
+    def test_the_exact_name_confirms(self) -> None:
+        rc, _ = self.run_cli(
+            ["--db", self.db, "-e", "UNKNOWN"], answer="UNKNOWN")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.environments(), ["linux-sim"])
+
+    def test_yes_skips_the_prompt(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = drop_environment.main(
+                ["--db", self.db, "-e", "UNKNOWN", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.environments(), ["linux-sim"])
+
+    def test_an_unknown_name_is_reported_not_deleted(self) -> None:
+        """Says what IS there, because the usual cause is a typo."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = drop_environment.main(
+                ["--db", self.db, "-e", "nope", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertIn("linux-sim", out.getvalue())
+        self.assertEqual(self.environments(), ["UNKNOWN", "linux-sim"])
+
+    def test_a_missing_database_exits_2(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = drop_environment.main(
+                ["--db", os.path.join(self.tmp, "no.db"), "-e", "x", "--yes"])
+        self.assertEqual(rc, 2)
+        self.assertIn("Database not found", err.getvalue())
+
+    def test_an_empty_environment_name_exits_2(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = drop_environment.main(
+                ["--db", self.db, "-e", "  ", "--yes"])
+        self.assertEqual(rc, 2)
+        self.assertIn("must not be empty", err.getvalue())

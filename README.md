@@ -416,6 +416,34 @@ Response: `{"retired": true, "retired_by": "luke", "comment": {...}}`.
 There is **no authentication** (see Non-goals): users self-identify by username,
 stored client-side in `localStorage`.
 
+### GET /api/site-notes — this site's own What's new notes
+
+```json
+{
+  "notes": [
+    {"id": 1, "date": "2026-07-30", "text": "Parser fixed.",
+     "author": "luke", "added_at": "2026-07-30T09:12:00.000000"}
+  ],
+  "configured": true,
+  "problem": null
+}
+```
+
+Newest `date` first. `static/whatsnew.html` carries testboard's own release
+notes and ships inside the build; these are the *site's* notes shown under the
+same dates — a reader that was fixed, a box that was rebuilt — added with
+[`tools/add_site_note.py`](#site-specific-whats-new-notes).
+
+**This endpoint never fails.** A notes file that is absent, empty, unreadable
+or malformed returns `notes: []` with `problem` set to a one-line reason, and
+`configured: false` means no path was given at all. These annotate a page whose
+real content already shipped in the build, so failing the request would take
+the release notes down with the side-car. The frontend therefore has one shape
+to handle rather than two.
+
+The file is read **per request**, so a note added by the CLI is live without
+restarting the server.
+
 ---
 
 ## Analytics definitions
@@ -948,6 +976,114 @@ the triage queues cannot be left describing a run that no longer exists. Use
 `--dry-run` to see the count first. Without `--vacuum` the freed pages stay in
 the file and are reused by later imports, which for a steady nightly load is
 usually what you want.
+
+### Deleting an environment that should never have existed
+
+A mis-configured reader can file runs under a name nothing recognises — an
+`UNKNOWN` environment, a hostname where an environment was expected. Retirement
+is the wrong tool for that: it marks a *test* as no longer in the suite and
+keeps its history. This removes the rows.
+
+```
+# always look first
+python3 tools/drop_environment.py --db testboard.db -e UNKNOWN --dry-run
+
+# then, with the server stopped and a copy of the database taken
+python3 tools/drop_environment.py --db testboard.db -e UNKNOWN
+```
+
+**It cannot be undone**, so it asks you to type the environment name back
+before doing anything (`--yes` skips that, for scripts). It covers every table
+keyed by environment plus `run_outputs` (reached through `runs.id`), in one
+transaction, ordered so no derived row is ever left pointing at a deleted run —
+a `latest_runs` row referencing a deleted `runs.id` is a broken dashboard, not
+a stale one. `tests/test_storage.py::EnvironmentDeleteTest` asserts the table
+list still matches the live schema, so a future migration that adds an
+environment-keyed table fails the suite rather than quietly leaving its rows
+behind.
+
+Match is exact and case-sensitive: `UNKNOWN` does not take `unknown` or
+`UNKNOWN-2` with it. Re-running it after it has succeeded is quiet and exits
+`0`. Stop the server first, then restart it afterwards.
+
+### Site-specific What's new notes
+
+The What's new page ships inside the build, so a deployment overwrites it. When
+something changes on the same morning that *isn't* testboard — the in-house
+reader, a rebuilt box, a renamed environment — it belongs on the same page
+under the same date, because a tester reading "what changed" does not care which
+repository it came from.
+
+```
+# today's date, credited to $USER
+python3 tools/add_site_note.py --db testboard.db \
+    --text "Fixed the parser bug that was filing runs under UNKNOWN."
+
+# against an earlier drop
+python3 tools/add_site_note.py --db testboard.db --date 2026-07-28 \
+    --text "linux-uat rebuilt overnight; the first pass was short."
+
+python3 tools/add_site_note.py --db testboard.db --list        # ids
+python3 tools/add_site_note.py --db testboard.db --edit 3 --text "Corrected: ..."
+python3 tools/add_site_note.py --db testboard.db --remove 3
+```
+
+Notes live in `site_notes.json` **beside the database** — outside the
+repository, so `git pull` cannot touch it — and the server is pointed at it with
+`--site-notes PATH` (the same default applies, so usually neither needs saying).
+No migration and no table: these are one site's commentary on testboard's data,
+not testboard's data.
+
+A note is **published the moment it is written**, because the file is read per
+request. That is why `--edit` and `--remove` exist and address notes by the id
+`--list` prints: correcting a typo that every tester can already see must not
+mean hand-editing JSON underneath a running server. A note dated where the
+build shipped no release notes gets its own section on the page, marked as
+coming from this site.
+
+A note whose date matches a release section appears inside it; every note is
+visibly attributed to the site rather than blended into testboard's own notes,
+because a tester who cannot tell "testboard changed" from "our environment
+changed" cannot tell who to ask about it.
+
+### Finding out where the time went, after the fact
+
+Stalls are intermittent, which is exactly what a live `top` never catches. The
+server can be asked to write one timing record per request and per storage call
+to disk, and a report script reads it back:
+
+```
+python3 run_server.py --db testboard.db --perf-log /var/log/testboard-perf.log
+python3 tools/perf_report.py /var/log/testboard-perf.log
+python3 tools/perf_report.py /var/log/testboard-perf.log --since 2026-07-30T09:00:00
+```
+
+**Off unless asked for**, so it costs nothing on a server nobody is
+investigating — but that also means an intermittent fault has to be caught with
+it already running. Leaving it on is safe: the file is capped
+(`--perf-max-mb`, default 128) and rolled over, so at most twice that is ever
+on disk.
+
+The report gives count, mean, median, quartiles, p1, p99, max and total per
+storage operation and per request route, plus — the field that matters most —
+**how long each connection waited for a worker**:
+
+```
+GET /api/summary   n=21  mean 184ms  p50 175ms  p99 221ms   q50 615ms  q99 1.23s
+```
+
+A slow request with a near-zero queue wait is a slow query; look for it in the
+storage section. A *fast* request with a large queue wait is not slow at all —
+the server had no free worker, and the answer is `--workers`, or whatever was
+holding them (a bulk import?), not the query. Those are opposite diagnoses and
+the request time alone cannot tell them apart.
+
+The unit is a **storage operation**, not a SQL statement, and deliberately:
+`sqlite3`'s `execute()` steps a statement once, so for a `SELECT` most of the
+cost lands in the following `fetchall()`. Timing statements would under-report
+precisely the slow reads worth finding. The consequence to know is that a method
+issuing several statements is one number — `upsert_runs` answers "how long did
+the import hold a worker", not "which statement inside it was slow".
 
 ---
 

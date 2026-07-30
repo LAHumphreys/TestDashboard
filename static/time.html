@@ -14,7 +14,7 @@
       <a href="index.html">Dashboard</a>
       <a href="actions.html">Open actions</a>
       <a href="time.html" aria-current="page">Time</a>
-      <a href="whatsnew.html">What's new</a>
+      <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
   </header>
@@ -30,8 +30,10 @@
     <!-- Says what is being measured. Without it the page invites the
          reading "total time ever", which is not what it shows. -->
     <p class="chart-caption time-scope">
-      The <strong>most recent run of each test</strong>, added up. Click a bar
-      to break it down.
+      The <strong>most recent run of each test</strong>, added up. Each box is
+      one environment, sized by its share of that time — click one to break it
+      into scripts, and a script into its tests. Small boxes are unlabelled by
+      necessity; every row is in the data table below.
     </p>
 
     <nav id="breadcrumb" class="breadcrumb" aria-label="Drill-down"></nav>
@@ -46,6 +48,7 @@
       <p id="time-total" class="time-total"></p>
       <div id="time-chart"></div>
       <p id="time-empty" class="empty-state" hidden>Nothing to show here.</p>
+      <p id="time-capped" class="muted cap-note" hidden></p>
       <p id="time-excluded" class="muted cap-note" hidden></p>
       <details>
         <summary>Data table</summary>
@@ -67,5 +70,6 @@
   </main>
 
   <script type="module" src="time.js"></script>
+  <script type="module" src="nav.js"></script>
 </body>
 </html>

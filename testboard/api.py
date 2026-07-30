@@ -44,7 +44,7 @@ from typing import (
     Tuple,
 )
 
-from testboard import analytics, model
+from testboard import analytics, model, site_notes
 from testboard.model import Result, RunRecord, StoredRun, ValidationError
 from testboard.storage import (
     DASHBOARD_SORTS,
@@ -1575,15 +1575,64 @@ def _handle_users_create(
 # ----------------------------------------------------------------------
 
 
+def _handle_site_notes(path: Optional[str]) -> Response:
+    """GET /api/site-notes — this site's own notes for the What's new page.
+
+    Not testboard's release notes: those ship inside the build, in
+    ``static/whatsnew.html``. These are the local ones a site adds beside
+    them — "the reader that was filing runs under UNKNOWN is fixed" —
+    keyed by the date of the drop they belong to.
+
+    Never an error. A file that is absent, empty or unreadable yields an
+    empty list, because these annotate a page whose real content is
+    already on screen, and failing the request would take the release
+    notes down with the side-car. A malformed file does report ``problem``
+    so somebody can see WHY it is empty rather than assuming nobody has
+    written any; the page shows that to nobody but does not swallow it
+    either — it is in the payload for whoever is debugging.
+    """
+    notes, problem = site_notes.load(path)
+    if problem is not None:
+        _LOGGER.warning("site notes: %s", problem)
+    return _json_response(
+        200,
+        {
+            "notes": [
+                {
+                    # The id is what `tools/add_site_note.py --edit/--remove`
+                    # addresses a note by; carried here so a correction can
+                    # be traced to what is on screen.
+                    "id": note.note_id,
+                    "date": note.date,
+                    "text": note.text,
+                    "author": note.author,
+                    "added_at": note.added_at or None,
+                }
+                for note in notes
+            ],
+            "configured": bool(path),
+            "problem": problem,
+        },
+    )
+
+
 def _route(
     storage: Storage,
     request: Request,
     now: Callable[[], datetime.datetime],
+    site_notes_path: Optional[str] = None,
 ) -> Response:
     """Match the decoded path segments to a handler and dispatch.
 
     Raises :class:`_HttpError` for 404 (unknown route) and 405 (known
     route, wrong method — with an Allow header).
+
+    *site_notes_path* is optional and defaults to None, which makes
+    ``/api/site-notes`` answer with an empty list rather than 404. That
+    keeps every existing caller — and every existing test — working
+    unchanged, and means the frontend has one shape to handle instead of
+    two: a deployment that has not configured notes is the same case as
+    one that has none yet.
     """
     segments = _split_path(request.path)
     if not segments or segments[0] != "api":
@@ -1609,6 +1658,10 @@ def _route(
     if rest == ["environments"]:
         _check_method(request.method, ("GET",))
         return _handle_environments_list(storage, request, now)
+
+    if rest == ["site-notes"]:
+        _check_method(request.method, ("GET",))
+        return _handle_site_notes(site_notes_path)
 
     if (len(rest) == 3 and rest[0] == "environments"
             and rest[2] == "expectation"):
@@ -1680,6 +1733,7 @@ def handle_api(
     storage: Storage,
     request: Request,
     now: Callable[[], datetime.datetime] = model.utcnow,
+    site_notes_path: Optional[str] = None,
 ) -> Response:
     """Handle one API request and ALWAYS return a JSON :class:`Response`.
 
@@ -1692,7 +1746,7 @@ def handle_api(
     and 500 for unexpected internal failures (logged with traceback).
     """
     try:
-        return _route(storage, request, now)
+        return _route(storage, request, now, site_notes_path)
     except _HttpError as exc:
         return _json_response(
             exc.status, {"error": exc.message}, exc.headers

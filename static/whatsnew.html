@@ -14,17 +14,94 @@
       <a href="index.html">Dashboard</a>
       <a href="actions.html">Open actions</a>
       <a href="time.html">Time</a>
-      <a href="whatsnew.html" aria-current="page">What's new</a>
+      <a id="nav-whatsnew" href="whatsnew.html" aria-current="page">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
   </header>
 
   <main>
-    <!-- Newest release FIRST. Append a new <section class="release">
-         above the one below it; nothing here is generated, so the only
-         rule is that the dates descend. -->
+    <!-- Newest release FIRST. Add a new <section class="release"> above
+         the one below it; nothing here is generated, so the only rule is
+         that the dates descend.
 
-    <section class="release">
+         EVERY section needs `data-drop-date="YYYY-MM-DD"`, matching its
+         heading. It is what puts the date on the "What's new" link in the
+         nav of every page, and what tells a browser whether it has read
+         this drop yet (see nav.js) — and it is where this site's own
+         notes get attached (see whatsnew.js). A section without it is
+         invisible to all three, so
+         tests/test_frontend_calls.py::DropDateTest fails the build if one
+         is missing or disagrees with the heading a human reads. -->
+
+    <section class="release" data-drop-date="2026-07-30">
+      <div class="section-head">
+        <h2 class="eyebrow">30 July 2026</h2>
+        <span class="muted">Fixes, and a new look for the Time page</span>
+      </div>
+
+      <p class="muted">
+        All of this is live now. Hard-refresh if a page looks the same as it
+        did yesterday.
+      </p>
+
+      <h3>The Time page works again</h3>
+      <ul>
+        <li><strong>It was failing to load entirely</strong> for anyone whose
+          estate had a test that had stopped reporting — which in practice
+          meant everyone, every day. It is fixed, and the page now says how
+          many tests it left out and since when.</li>
+        <li><strong>Where the time goes is now a box graph</strong>, the kind
+          you get from a profiler. The whole rectangle is the run time above
+          it; each box is one environment, sized by its share. Click a box for
+          the scripts inside it, and a script for its tests, with the trail
+          back along the top. <strong>A box's size is its share of the
+          time</strong> — so a script taking 1% of the night takes 1% of the
+          picture, and the boxes too small to label say so rather than
+          pretending.</li>
+        <li>Hovering a box shows its total, its share, and its mean per test.
+          The sortable table underneath still lists every row, including the
+          ones too small to draw a name in.</li>
+      </ul>
+
+      <h3>Dashboard</h3>
+      <ul>
+        <li><strong>The "Last update" pills are now buttons.</strong> Click the
+          environment you were checking the clock for and the whole page
+          scopes to it; click it again to go back to everything. Every
+          environment stays listed either way, with the selected one filled
+          in.</li>
+      </ul>
+
+      <h3>Pages that would not load</h3>
+      <ul>
+        <li><strong>Fixed the stall where a page hung until you gave up.</strong>
+          Browsers hold connections open after they have finished with them,
+          and the server was letting them keep a worker each — so a couple of
+          tabs left open on someone's desk could stop everyone else's pages
+          loading, with the server completely idle. It now takes those
+          connections back. Measured on the reproduction: a request that
+          waited 5 seconds behind idle browsers now waits 0.24.</li>
+      </ul>
+
+      <h3>This page</h3>
+      <ul>
+        <li><strong>The "What's new" link now carries the date of the latest
+          drop</strong>, with a dot beside it until you have read that one. It
+          stops a change landing silently and being reported as a bug a week
+          later.</li>
+        <li><strong>Local changes appear here too.</strong> Anything fixed
+          outside testboard on the same day — a reader, a rebuilt box, a
+          renamed environment — can be logged against the date and shows up
+          under it, marked as coming from this site rather than from the
+          build. Ask whoever runs the server to add one.</li>
+      </ul>
+
+      <p class="release-footer muted">
+        Anything looks wrong, say so today rather than working around it.
+      </p>
+    </section>
+
+    <section class="release" data-drop-date="2026-07-28">
       <div class="section-head">
         <h2 class="eyebrow">28 July 2026</h2>
         <span class="muted">First upgrade since launch</span>
@@ -103,5 +180,7 @@
     </section>
 
   </main>
+  <script type="module" src="whatsnew.js"></script>
+  <script type="module" src="nav.js"></script>
 </body>
 </html>

@@ -789,6 +789,28 @@ _DURATION_GROUPS = {
     "test_name": "lr.test_name",
 }  # type: Dict[str, str]
 
+#: Every table keyed by ``environment``, in an order safe to delete in:
+#: derived rows before the rows they were derived from, so no statement
+#: leaves a reference dangling even inside the transaction.
+#:
+#: Table names are interpolated into SQL, so this tuple is also the
+#: whitelist that makes that safe — nothing reaches the format string
+#: from a caller. ``run_outputs`` is absent deliberately: it has no
+#: ``environment`` column and is reached through ``runs.id``.
+#:
+#: ``tests/test_storage.py::EnvironmentDeleteTest`` asserts this covers
+#: every such table in the live schema, so a migration that adds one
+#: fails the suite instead of quietly leaving its rows behind.
+_ENVIRONMENT_TABLES = (
+    "latest_runs",
+    "current_assignments",
+    "assignments",
+    "comments",
+    "test_retirements",
+    "environment_expectations",
+    "runs",
+)  # type: Tuple[str, ...]
+
 #: Triage queue membership, as SQL predicates over ``lr`` (latest_runs)
 #: and ``ca`` (current_assignments). These are the SQL half of the same
 #: definitions :func:`testboard.analytics.summarize_rollup` applies to the
@@ -2610,6 +2632,76 @@ class Storage:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        self._invalidate_trend_cache()
+        return deleted
+
+    def count_environment_rows(self, environment: str) -> Dict[str, int]:
+        """Rows :meth:`delete_environment` would delete, per table.
+
+        The dry run for a delete that cannot be undone. Counted with the
+        same predicates the delete uses, so the report and the action
+        cannot describe different things.
+        """
+        counts = {}  # type: Dict[str, int]
+        conn = self._conn()
+        for table in _ENVIRONMENT_TABLES:
+            counts[table] = int(conn.execute(
+                "SELECT COUNT(*) FROM {0} WHERE environment = ?".format(
+                    table),
+                (environment,),
+            ).fetchone()[0])
+        counts["run_outputs"] = int(conn.execute(
+            "SELECT COUNT(*) FROM run_outputs WHERE run_id IN "
+            "(SELECT id FROM runs WHERE environment = ?)",
+            (environment,),
+        ).fetchone()[0])
+        return counts
+
+    def delete_environment(self, environment: str) -> Dict[str, int]:
+        """Delete an environment and everything belonging to it.
+
+        For an environment that should never have existed — a reader
+        mis-configuration that imported runs under a name like
+        ``UNKNOWN``. This is **not** retirement, which marks a test as no
+        longer in the suite while keeping its history. It removes the
+        rows, and nothing puts them back.
+
+        Every table carrying an ``environment`` column is covered (see
+        :data:`_ENVIRONMENT_TABLES`), plus ``run_outputs``, which is
+        reached through ``runs.id``. Ordered so that no statement leaves
+        a dangling reference even momentarily: outputs before their runs,
+        derived rows before the runs they were derived from.
+
+        One transaction. A half-deleted environment is worse than either
+        outcome — ``latest_runs`` is what every estate-wide read goes
+        through, so a row there pointing at a deleted run would be a
+        broken dashboard rather than a stale one.
+
+        Returns the per-table row counts deleted. An environment that
+        does not exist is not an error: every count is zero.
+        """
+        conn = self._conn()
+        deleted = {}  # type: Dict[str, int]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                "DELETE FROM run_outputs WHERE run_id IN "
+                "(SELECT id FROM runs WHERE environment = ?)",
+                (environment,),
+            )
+            deleted["run_outputs"] = int(cursor.rowcount)
+            for table in _ENVIRONMENT_TABLES:
+                cursor = conn.execute(
+                    "DELETE FROM {0} WHERE environment = ?".format(table),
+                    (environment,),
+                )
+                deleted[table] = int(cursor.rowcount)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        # The trend and the bucket memo are estate-wide and have just
+        # stopped being true.
         self._invalidate_trend_cache()
         return deleted
 

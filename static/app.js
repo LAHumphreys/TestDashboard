@@ -355,20 +355,34 @@ function renderEnvUpdated() {
   const container = document.getElementById("env-updated");
   clearNode(container);
   const updated = summary.environment_updated || {};
-  const names = Object.keys(updated).sort().filter(
-    (name) => !state.environment || name === state.environment);
+  // EVERY environment, including when one is selected. The pills are the
+  // fastest way to switch between environments, and a list that collapsed
+  // to the selected one would take that away at exactly the moment it is
+  // wanted — you cannot click your way out of a filter you can no longer
+  // see. The selected one is marked instead.
+  const names = Object.keys(updated).sort();
   if (names.length === 0) {
     container.appendChild(el("span", "muted", "Nothing has reported yet."));
     return;
   }
   container.appendChild(el("span", "muted", "Last update"));
   for (const name of names) {
-    const item = el("span", "env-updated-item");
+    const active = state.environment === name;
+    const item = el("button",
+      "env-updated-item" + (active ? " is-active" : ""));
+    item.type = "button";
     item.appendChild(el("span", "env-updated-name", name));
     item.appendChild(el("span", "env-updated-when",
       ageWords(updated[name], summary.generated_at)));
+    item.setAttribute("aria-pressed", active ? "true" : "false");
     item.title = name + " last reported at " + formatTime(updated[name])
-      + " UTC";
+      + " UTC · click to " + (active ? "show all environments"
+        : "show only " + name);
+    // Clicking the active pill clears the filter, so the same control
+    // that scoped the page is the one that unscopes it.
+    item.addEventListener("click", () => {
+      setEnvironment(active ? "" : name);
+    });
     container.appendChild(item);
   }
 }
