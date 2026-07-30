@@ -19,3 +19,7 @@ site_notes.json.tmp
 # Performance logs (--perf-log), including the rolled-over predecessor.
 *-perf.log
 *-perf.log.1
+# Local acceptance-testing scratch: a copy of the dev database served on
+# 8000 (validate.db is covered by *.db above) and its server output.
+validate-server.log
+validate-server.err
