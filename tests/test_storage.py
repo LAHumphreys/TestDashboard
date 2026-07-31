@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from testboard import analytics, model, storage
 from testboard.model import Result, RunRecord
