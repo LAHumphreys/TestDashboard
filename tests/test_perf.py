@@ -25,6 +25,7 @@ import shutil
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -563,6 +564,28 @@ class ServerPerfTest(unittest.TestCase):
                 out.append(copy)
         return out
 
+    def await_records(self, kind: str, count: int,
+                      timeout: float = 15.0) -> List[Dict[str, Any]]:
+        """Wait for *count* records of *kind*, then return them.
+
+        A request record is written AFTER the response has been sent —
+        the timing has to include writing it — so a client can have its
+        answer in hand before the worker has logged it. Reading the file
+        the instant the response arrives is therefore a race, and it is
+        one that only loses under load: these tests passed alone and
+        failed two-at-a-time in the full suite, reporting zero records
+        for a request that plainly happened.
+
+        Waiting for the record rather than sleeping a fixed amount keeps
+        the test fast when the machine is idle and correct when it is not.
+        """
+        deadline = time.time() + timeout
+        found = self.records(kind)
+        while len(found) < count and time.time() < deadline:
+            time.sleep(0.05)
+            found = self.records(kind)
+        return found
+
     def test_nothing_is_written_when_no_log_is_given(self) -> None:
         """Off by default has to mean off, not "on to a default path"."""
         port = self.serve(None)
@@ -578,8 +601,8 @@ class ServerPerfTest(unittest.TestCase):
         urllib.request.urlopen(
             "http://127.0.0.1:{0}/api/summary?environment=x".format(port),
             timeout=30).read()
+        requests = self.await_records("request", 1)
         log.close()
-        requests = self.records("request")
         self.assertEqual(len(requests), 1, requests)
         self.assertEqual(requests[0]["label"], "GET /api/summary")
         self.assertEqual(requests[0]["s"], 200)
@@ -595,8 +618,8 @@ class ServerPerfTest(unittest.TestCase):
                 "http://127.0.0.1:{0}/nope.js".format(port), timeout=30).read()
         except urllib.error.HTTPError:
             pass
+        statuses = [r["s"] for r in self.await_records("request", 1)]
         log.close()
-        statuses = [r["s"] for r in self.records("request")]
         self.assertIn(404, statuses)
 
     def test_the_queue_wait_belongs_to_the_first_request_only(self) -> None:
@@ -617,9 +640,8 @@ class ServerPerfTest(unittest.TestCase):
             sock.sendall(b"GET /api/environments HTTP/1.1\r\nHost: x\r\n"
                          b"Connection: keep-alive\r\n\r\n")
             self.assertIn(b"200 OK", self._read_response(sock))
+        requests = self.await_records("request", 3)
         log.close()
-
-        requests = self.records("request")
         self.assertEqual(len(requests), 3, requests)
         with_wait = [r for r in requests if "qms" in r]
         self.assertEqual(
@@ -636,6 +658,7 @@ class ServerPerfTest(unittest.TestCase):
         port = self.serve(log)
         urllib.request.urlopen(
             "http://127.0.0.1:{0}/api/summary".format(port), timeout=30).read()
+        self.await_records("request", 1)
         log.close()
         labels = {r["label"] for r in self.records("storage")}
         self.assertIn("summary_rollup", labels)

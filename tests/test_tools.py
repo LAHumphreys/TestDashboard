@@ -467,12 +467,20 @@ class TestDemoBootstrap(unittest.TestCase):
         self.assertEqual(usernames, {"alice", "bob"})
 
     def test_rerun_is_idempotent(self) -> None:
-        """A second run updates in place and duplicates nothing."""
+        """A second run duplicates nothing — and now WRITES nothing.
+
+        The seeded records are byte-identical the second time, so the
+        upsert reports them all as unchanged rather than rewriting them
+        in place (the same skip that makes the site feeder's 10-minute
+        re-push free).
+        """
         self.run_main()
         rc, out = self.run_main()
         self.assertEqual(rc, 0)
         expected_runs = 5 * len(generate_demo_data._SPECS)
-        self.assertIn("0 inserted, {} updated".format(expected_runs), out)
+        self.assertIn(
+            "0 inserted, 0 updated, {} unchanged".format(expected_runs),
+            out)
         storage = self.open_storage()
         env, script, test = self.regression_triple()
         self.assertEqual(

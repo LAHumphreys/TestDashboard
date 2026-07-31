@@ -192,7 +192,11 @@ class EndToEndTest(unittest.TestCase):
         text = self.run_tool()
         self.assertIn("journal_mode", text)
         self.assertIn("home: summary rollup", text)
-        self.assertIn("SEARCH runs USING INDEX", text)
+        # SQLite 3.36 dropped the word TABLE from query-plan lines;
+        # RHEL 8's 3.26 (the ubi8 CI leg) still prints it. The claim
+        # being tested is the same on both: the run lookup is an index
+        # SEARCH, not a scan.
+        self.assertRegex(text, r"SEARCH (TABLE )?runs USING INDEX")
 
     def test_every_dashboard_query_actually_runs(self) -> None:
         """A query in the list with a stale signature would say FAILED."""

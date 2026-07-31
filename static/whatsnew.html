@@ -33,6 +33,42 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-07-31">
+      <div class="section-head">
+        <h2 class="eyebrow">31 July 2026</h2>
+        <span class="muted">The home page got fast — and honest about loading</span>
+      </div>
+
+      <h3>The dashboard loads much faster, and in stages</h3>
+      <ul>
+        <li><strong>The numbers come up first.</strong> The tiles, the charts
+          and the counts on every triage tab paint as soon as they are ready,
+          instead of the whole page waiting for its slowest part. The rows of
+          the queue you are looking at follow a moment later; while they are
+          on their way the table says <em>"Loading queue…"</em> rather than
+          showing you nothing.</li>
+        <li><strong>The other triage tabs load when you open them.</strong>
+          The counts on the tab buttons are always live, but a tab's rows are
+          fetched the first time you click it — so the page no longer
+          downloads five tables you may never look at. Switching back to a
+          tab you have already opened is instant.</li>
+        <li>The Time page and the stale-test filter got the same speed-up
+          under the hood — the calculation that decides "recently run" is
+          hundreds of times cheaper than it was.</li>
+      </ul>
+
+      <h3>Retiring a test now sticks</h3>
+      <ul>
+        <li><strong>Retirements were being silently undone within minutes.</strong>
+          The system that pushes results re-sends recent runs on a schedule,
+          and the dashboard mistook every re-send for the test "running
+          again" — so it quietly un-retired it and left a comment saying so.
+          If you retired a test and found it back in your queues with an
+          "Automatically un-retired" comment, that was this. A test now comes
+          back only when it genuinely reports something new.</li>
+      </ul>
+    </section>
+
     <section class="release" data-drop-date="2026-07-30">
       <div class="section-head">
         <h2 class="eyebrow">30 July 2026</h2>

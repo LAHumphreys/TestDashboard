@@ -4,7 +4,8 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-07-30**, end of the day the second post-launch drop was built.
+Last rewritten: **2026-07-31, morning**, after repairing CI — all three legs
+(3.14 / 3.8 / **3.6.8 ubi8**) are green for the first time since 07-27.
 
 ---
 
@@ -12,198 +13,135 @@ Last rewritten: **2026-07-30**, end of the day the second post-launch drop was b
 
 | | |
 |---|---|
-| `origin/master` | `0d15cb2` — **this is what production is running** |
-| `main` | the 2026-07-30 drop, built and green, **not pushed** |
-| `wp-14-in-run-progress` | 4 commits past the older `main`; holds everything deferred |
+| `origin/master` | `982c28e` — **deployed**: the 2026-07-30 drop is live in production |
+| `origin/candidate-keepalive-fix` | `3ce6b93` — tests+docs only, runtime-identical to master; **not merged yet** |
+| `wp-17-summary-perf` | **the 2026-07-31 drop** — built on `3ce6b93`, so merging it also lands the candidate. Head `64a3468`: two CI-repair commits on top of the WP-17 work, test-code only |
+| `wp-14-in-run-progress` | parked WIP; see the migration renumbering warning below |
 
-Suite: **1268 green on `main`** (skipped 1), up from 1137. Schema at **migration 5,
-unchanged** — there is no migration in this drop.
+Suite: **1288 green** (skipped 1) on `wp-17-summary-perf`, up from 1268. Schema moves
+to **migration 6** — the first migration since launch, so **the rollback is the
+database copy**, not `git checkout`.
 
-Production database is ~900 MB / ~4.4M runs. The repo-root `testboard.db` is
-**generated dev data** (218 MB, 540,192 runs, 12,008 tests) — useful, and not production.
-Say which one any number came from.
+CI: **all three legs green at `64a3468`**, including the authoritative 3.6.8
+ubi8 container (skipped=5 there is expected — version-gated grammar tests).
+The 3.8/3.6 legs had been red since 07-27; all four causes were test-code
+only, and master inherits the fixes when this branch merges. Story and
+lessons: the status log's "CI repair, 2026-07-31" entry.
+
+Production database is ~900 MB / ~4.4M runs on a network mount. The repo-root
+`testboard.db` is generated dev data (218 MB, 540,192 runs); `validate.db` is the
+local acceptance copy currently served on port 8000 **by the new build** (already
+migrated to v6). Say which one any number came from.
 
 ## The immediate thing
 
-**The 2026-07-30 drop is built and awaiting acceptance testing.** Read
-[`docs/drops/2026-07-30.md`](drops/2026-07-30.md) — it is the operator note: what
-changed, the exact deploy commands, the rollback, the two new optional flags, and an
-acceptance checklist. Do not push to `master` until that checklist is signed off.
+**The 2026-07-31 drop awaits acceptance.** Read
+[`docs/drops/2026-07-31.md`](drops/2026-07-31.md) — it has the deploy commands, the
+migration expectations, the rollback, and the acceptance checklist. Headlines:
 
-Every drop gets one of those now; it is in `CLAUDE.md` under Working practice.
+1. **Production's own perf log found the fault**: the staleness-cutoff bucket query
+   was a full scan of the runs UNIQUE index — O(total history), 3.5 s mean in
+   production, 70% of `/api/summary`, growing nightly. Fixed with `activity_hours`,
+   the third derived table (migration 6). Dev-copy numbers: that query 607 ms →
+   2.3 ms; `/api/summary` 751 → ~190 ms; `/api/time` 630 → 40 ms.
+2. **The site feeder re-pushes ~10k records every 10 minutes** (user disclosure).
+   Byte-identical re-imports now write NOTHING (was ~23 MB WAL per push) — and that
+   same fix makes **retirement stick**; before it, any re-push un-retired every
+   retired test within 10 minutes. Real production bug, testers will have seen it.
+3. **`/api/summary` grew `parts=`** (headline / one queue) and the home page paints
+   progressively; other queue tabs fetch on first click.
 
-What it contains, in one line each: the Time page crash fixed (a missing JS import, not
-Python), the "stuck page" root-caused and fixed (idle browser connections were holding
-every worker), the Time page redrawn as a treemap, clickable environment pills, a dated
-"What's new" link with an unread marker, site-specific release notes, and three new
-tools — `drop_environment.py`, `perf_report.py` + `--perf-log`, `add_site_note.py`.
+**Open on that drop, for a person:** the acceptance checklist (browser pass — nothing
+has been seen by a human eye), the migration-duration probe on a prod copy (§1.2
+requires the number before shipping; the note has the one-liner), and after a night
+live, re-run `tools/perf_report.py` to re-rank what is slow NOW before doing Phase 2.
 
-**Still open from that drop, for a person:**
-
-1. A browser pass. Nothing in it has been rendered by a browser — see below.
-2. The `UNKNOWN` environment still needs dropping on the server, and the reader that
-   caused it still needs fixing. `tools/drop_environment.py` is ready and tested.
-3. Decide whether to run with `--perf-log` (recommended on, it is safe to leave) and
-   whether testers should see `--site-notes`.
+**Still open from the previous drop:** drop the `UNKNOWN` environment on the server
+(tool is ready), fix the site reader that caused it, decide `--site-notes` visibility.
 
 ## First ten minutes of a new session
 
 ```bash
 git log --oneline -5                  # where am I
 git status --short                    # should be clean
-python -m unittest discover           # expect 1268 OK (skipped=1) on main
+python -m unittest discover           # expect 1288 OK (skipped=1) on wp-17-summary-perf
 ```
 
-Then read the state table at the top of `UPGRADE_PLAN_STATUS.md` and take the first row
-that is not `done`.
-
-To look at the running dashboard:
+Local validation server: `http://127.0.0.1:8000/` is (or was) running the wp-17 build
+against `validate.db` with `--perf-log validate-perf.log`. The pre-drop logs were set
+aside as `validate-*-before.log`. If it is down:
 
 ```bash
-python run_server.py --port 8000 --db testboard.db      # migrates dev data if needed
+python run_server.py --port 8000 --db validate.db --perf-log validate-perf.log
 ```
 
-**If the UI looks wrong, check you restarted the server.** Static files are read from
-disk per request but the Python is whatever was imported at process start, so a stale
-process serves new HTML against old handlers. That has twice looked exactly like a UI
-bug.
+**If the UI looks wrong, check you restarted the server.** Static files are read per
+request; the Python is whatever was imported at process start. Twice this has looked
+exactly like a UI bug.
 
 There is no browser here. Frontend changes are verified by driving the real ES modules
-against a live server under a minimal DOM shim in node. **That method has now earned its
-keep twice in one session** — it found the `formatTime` crash and an
-`Array.prototype.slice.call(map.keys())` bug that would have rendered no site notes at
-all. It catches wrong field names, missing imports and DOM errors; **it cannot catch
-layout, colour or contrast.** Nothing on `main` has been clicked through in a real
-browser.
+against a live server under a minimal DOM shim in node (three real bugs found that way
+so far). It cannot catch layout, colour or contrast.
 
 ---
 
 ## The work waiting, in the order it wants doing
 
-### 1. Merge the deferred work back — `wp-14-in-run-progress`
+### 1. Ship the 2026-07-31 drop
 
-Three things were pulled off `main` an hour before the 2026-07-28 drop, deliberately, to
-avoid two changes to the heaviest endpoint on deployment morning. They belong together:
+Acceptance list in the operator note. Deploy merges `wp-17-summary-perf` to `master`
+(which brings the candidate-keepalive-fix commits with it — they are runtime-identical
+tests+docs).
 
-- **The in-run progress bar** (WP-14, commits `1102463`, `b4b1030`). Finished and green.
-  It counts *imported runs*, so it is useless until item 2 — against the real reader it
-  would sit flat all night and then jump to 100%.
-- **The shared last-pass field.** Open actions and the "Still failing" triage queue ask
-  the same question and answered it two different ways. One `lastPassCell()` on the
-  client, one `_stability_json()` on the server, batched-history test included.
-- **The `/api/summary` cache.** See item 3.
+### 2. Phase 2 of the performance plan — AFTER a night of production perf log
 
-**Merge `main` into the branch before doing anything on it.** It has `main` as of
-`ed4a59a` only, so it is now missing considerably more than when this was last written —
-the 2026-07-28 drop *and* the whole 2026-07-30 drop. Expect the conflicts to be larger
-than the ones described below.
+Deliberately parked, with prepared responses, until production numbers re-rank the
+remaining terms (see the 2026-07-31 status-log entry): batch `failure_streak_bounds`
+per queue the way `recent_results` chunks; audit queue payload size (6×500
+comment-joined rows); the small latest_runs scans; worker count on the mount. Do not
+build any of it from dev-copy numbers.
 
-Previously-known conflicts, all still likely:
+### 3. Merge the deferred work back — `wp-14-in-run-progress`
 
-- `UPGRADE_PLAN_STATUS.md` — the branch holds the full WP-14 log entry; `main` holds a
-  pointer that says to replace it with exactly that. Take the branch's entry.
-- `style.css` — append-only by convention, so both sides added a block at the end. Keep
-  both.
-- `app.js` — the branch re-adds the shared last-pass cell to the triage queue, while
-  `main` has since relabelled the tiles around it **and made the environment pills
-  buttons**. Read that merge rather than accepting either side wholesale.
-- **New:** `time.js` and `charts.js` have changed substantially (the treemap). If the
-  branch touches either, read it carefully.
+**It must renumber its migration from 6 to 7 before merging** — WP-17 took 6 (the
+registry in `UPGRADE_PLAN.md` §1 records the swap and why). It is also now several
+drops behind `main`-line history; expect real conflicts in `app.js` (progressive
+loading landed), `storage.py` (upsert rewritten for the no-op skip), and the status
+log. The branch's WP-14 progress bar remains useless until WP-15 lands.
 
-### 2. WP-15 — progress pushes from a partial reader *(migration 6, claimed)*
+### 4. WP-15 — progress pushes from a partial reader *(migration 7 now)*
 
-**Fully specified** in `UPGRADE_PLAN.md` §WP-15. Read it; do not re-derive it.
+Fully specified in `UPGRADE_PLAN.md` §WP-15; do not re-derive. One update to its
+spec-reading: `latest_progress` building a row "from `run_progress` alone because the
+environment has nothing in `activity_buckets`" — activity data now lives in
+`activity_hours`, same shape, same question.
 
-The short version: the in-house reader cannot produce a full run record mid-pass — it has
-identities and results but **no per-test timings** until the final push. Those records
-cannot go through `/api/import`, and not only because that contract is fixed: run identity
-includes `start_time`, so a record without one has no identity, and synthesising one makes
-the final push write a *second* row per test per night.
+### 5. WP-16 — site-specific info tab
 
-So: a `run_progress` table keyed by the test triple, a `POST /api/progress` carrying
-`pass_started` and **completed tests only** (confirmed with the user — no
-"started but not finished" state, the `Result` enum does not grow), and a delete inside
-the import transaction so a real run supersedes its provisional row. A provisional result
-is never "the latest result": it stays out of `latest_runs`, the queues, the staleness
-cutoff and the coverage denominator. **That line is what keeps the package additive.**
-
-Two things the spec calls out that are easy to miss: `latest_progress` must be able to
-build a row from `run_progress` *alone* (an environment whose pass is entirely provisional
-has nothing in `activity_buckets`, so today it would render no bar at all — precisely when
-one is wanted), and `running` must key off `reported_at`.
-
-**Migration 6 is still claimed and still unwritten.** The 2026-07-30 drop deliberately
-added no migration; `site_notes` uses a file precisely so it did not have to take a
-version out of turn.
-
-### 3. `/api/summary` — and now you can measure it in production
-
-Decomposed on the dev database (this machine, warm, 20 concurrent requests against 2
-workers, via the new `--perf-log`):
-
-| | |
-|---|---|
-| `activity_buckets` | **139 ms** mean, 2.92 s total across 21 calls |
-| `summary_rollup` | 10 ms |
-| `status_queue` | 2 ms |
-
-The earlier decomposition on the same database recorded `activity_buckets(14d)` at
-**682 ms**. Both are real; they are different machines and cache states, which is exactly
-why the numbers were never the argument. `activity_buckets` is the cost either way.
-
-**An index is not the answer, measured rather than assumed.** A covering index on
-`runs(start_time, environment)` takes the query 683 → **318 ms, but only when forced**:
-the planner keeps choosing the UNIQUE index and scanning all 540,192 entries instead of
-the 168k in the window, and `ANALYZE` does not change its mind. 2.3 s to build on dev,
-permanent cost on every import, for a gain the planner will not take.
-
-The parked fix memoises the buckets beside the existing trend cache — same lock, same
-60 s TTL, same invalidation — with the lookback floor truncated to the hour so the key
-repeats between requests. **Not yet measured:** what that does to a warm response, and
-whether the cold first-request-of-each-minute is acceptable or the query wants
-restructuring.
-
-**New:** with `--perf-log` on the production server you can now answer this from
-production rather than from here, and separate it from queue contention. Do that before
-building the cache.
-
-### 4. WP-16 — site-specific info tab
-
-**Noted, not specified.** Do not build from the paragraph in the plan. The question that
-decides its size is static text versus data-driven; see `UPGRADE_PLAN.md` §WP-16.
-
-Note that the 2026-07-30 drop has answered a nearby question in passing: site-specific
-*release notes* now exist as a JSON file plus `GET /api/site-notes`, with no migration.
-If WP-16 turns out to be mostly declared text, that is a precedent worth reusing.
+Still noted, not specified. Static-vs-data-driven is the deciding question.
 
 ---
 
 ## Needs a person, not a commit
 
-1. **Acceptance-test the 2026-07-30 drop** and work the checklist in
-   `docs/drops/2026-07-30.md`. Everything else here is behind that.
-2. `tools/diagnose_db.py --compare-local` on the production server — still never run
-   since the worker-pool fix, so every timing predating that fix describes a server that
-   discarded its page cache on every request.
-3. **The MariaDB migration.** `tools/migrate_to_mariadb.py` automates the unprivileged
-   half and stops at the first failed gate. §A of the runbook needs whoever holds root,
-   then the dry run against a copy of production. **Nothing in that tool that talks to
-   MariaDB has ever been executed** — no server here or in CI, and those paths are driven
-   by a fake client. The runbook's dry run is what proves it.
-4. A browser pass over the shipped UI, now including the treemap.
+1. **Acceptance-test and ship the 2026-07-31 drop** — everything else is behind it.
+2. The migration probe on a production copy (number goes into the operator note).
+3. Re-retire the tests the un-retire bug released (search comments for
+   "Automatically un-retired").
+4. Fix the site reader that files runs under `UNKNOWN`; then drop the environment.
+5. `tools/diagnose_db.py --compare-local` on the production server — still never run.
+6. The MariaDB migration dry run (§A of the runbook needs root).
 
 ## Shipping a drop
 
 1. Branch, build, `python -m unittest discover` green.
-2. Add a dated section at the top of `static/whatsnew.html` — for a tester, not for a
-   developer. Only what is actually in the build. It needs
-   `data-drop-date="YYYY-MM-DD"` matching its heading, or `DropDateTest` fails.
-3. **Write `docs/drops/YYYY-MM-DD.md`**, the operator note — for whoever deploys it.
-   Required contents are listed in `CLAUDE.md`; the 2026-07-30 one is the worked example.
-4. `git push origin main:master` (local branch is `main`, remote is `master`).
-5. On the box: pull, **stop the server**, copy `testboard.db` + `-wal` + `-shm`, start.
+2. Add a dated section at the top of `static/whatsnew.html` — for a tester. Only what
+   is actually in the build. `data-drop-date` must match the heading (`DropDateTest`).
+3. **Write `docs/drops/YYYY-MM-DD.md`**, the operator note — required contents are in
+   `CLAUDE.md`. If a migration runs, measure it on a prod copy first (§1.2).
+4. Push the drop branch to `master` after acceptance.
+5. On the box: stop the server, copy `testboard.db` + `-wal` + `-shm`, pull, start.
    The copy is the only rollback — a database at version N is refused by older code.
-   Do it when the feeder is not importing; a migration holds one transaction.
-6. Check the drop: each environment reads `N of N counted` under Open actions →
-   Environment expectations. If one reads `0 of N`, set its expected count before anyone
-   triages, or the cutoff silently falls back to the wall clock.
+   Do it when the feeder is not importing.
+6. Check the drop per the operator note, including `N of N counted` under Open
+   actions → Environment expectations.

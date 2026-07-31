@@ -17,10 +17,14 @@
  * are all query parameters on /api/dashboard, and only the rows on screen
  * are ever in memory.
  *
- * Data: one /api/summary call + one page of /api/dashboard per refresh,
- * in parallel. While refreshing, previous renders are held at reduced
- * opacity (no skeletons, no layout jumps). All data reaches the DOM via
- * textContent only.
+ * Data, per refresh, all in parallel: /api/summary?parts=headline (the
+ * tiles, charts, filters and every queue's COUNT — the fast part), one
+ * /api/summary?parts=queue for the active triage tab's rows, and one
+ * page of /api/dashboard. Each section paints as its data lands, so the
+ * page is readable as soon as the headline answers; the other queue
+ * tabs fetch their rows when first opened. While refreshing, previous
+ * renders are held at reduced opacity (no skeletons, no layout jumps).
+ * All data reaches the DOM via textContent only.
  */
 
 "use strict";
@@ -62,7 +66,10 @@ const CHUNK = 250;
 
 const state = {
   environment: "",        // "" = all environments
-  summary: null,          // last /api/summary payload
+  summary: null,          // last headline payload (no queue rows)
+  // Queue rows by kind, fetched per tab on demand. Absent = not landed
+  // yet for the current filters; renderQueueTable shows a loading line.
+  queues: {},
   activeQueue: "new_failures",
   // The test list: only the rows currently on screen, plus the server's
   // exact total for the active filters.
@@ -96,17 +103,33 @@ const SECTIONS = ["status-section", "charts-section", "triage-section",
 
 function summaryUrl() {
   const qs = new URLSearchParams();
+  qs.append("parts", "headline");
   if (state.environment) {
     qs.append("environment", state.environment);
   }
   // The "my actions" queue is filtered server-side: picking a user's
   // tests out of an already-capped queue would hide their own work.
+  // The headline needs the assignee too — the "mine" tab count.
   const me = getUsername();
   if (me) {
     qs.append("assignee", me);
   }
-  const query = qs.toString();
-  return query ? "/api/summary?" + query : "/api/summary";
+  return "/api/summary?" + qs.toString();
+}
+
+/** URL for one triage queue's rows. */
+function queueUrl(kind) {
+  const qs = new URLSearchParams();
+  qs.append("parts", "queue");
+  qs.append("queue", kind);
+  if (state.environment) {
+    qs.append("environment", state.environment);
+  }
+  const me = getUsername();
+  if (me) {
+    qs.append("assignee", me);
+  }
+  return "/api/summary?" + qs.toString();
 }
 
 /** URL for one page of the test list under the current filters. */
@@ -138,32 +161,89 @@ function browseUrl(offset) {
   return "/api/dashboard?" + qs.toString();
 }
 
-/** Reload the summary and the first page of tests; re-render everything. */
+/**
+ * Reload everything, painting each section as its data lands.
+ *
+ * Three requests go out together — the headline, the active queue's
+ * rows, the first browse page — and each renders its own section on
+ * arrival rather than waiting for the slowest. The tiles, charts and
+ * tab counts are a fraction of the old monolithic payload, so the page
+ * is readable at once even when a queue takes its time. A section that
+ * fails shows the error without blanking the ones that succeeded.
+ *
+ * Every block checks the sequence number before touching state: a
+ * filter change mid-flight abandons the whole generation.
+ */
 async function refreshAll() {
   const seq = ++state.requestSeq;
   state.browseSeq++;  // any in-flight page load is now stale
   clearError();
   setLoading(true);
+  state.queues = {};  // the filters may have changed; refetch per tab
+
+  const headlinePart = (async () => {
+    try {
+      const summary = await fetchJson(summaryUrl());
+      if (seq !== state.requestSeq) {
+        return;
+      }
+      state.summary = summary;
+      renderHeadline();
+      // First meaningful paint: the page is usable from here.
+      document.getElementById("loading-state").hidden = true;
+    } catch (err) {
+      if (seq === state.requestSeq) {
+        showError(err.message);
+      }
+    }
+  })();
+  const queuePart = loadQueue(state.activeQueue, seq);
+  const browsePart = (async () => {
+    try {
+      const page = await fetchJson(browseUrl(0));
+      if (seq !== state.requestSeq) {
+        return;
+      }
+      state.browseRows = page.tests;
+      state.browseTotal = page.total;
+      renderBrowse(page.tests, false);
+    } catch (err) {
+      if (seq === state.requestSeq) {
+        showError(err.message);
+      }
+    }
+  })();
+
+  await Promise.all([headlinePart, queuePart, browsePart]);
+  if (seq === state.requestSeq) {
+    setLoading(false);
+    document.getElementById("loading-state").hidden = true;
+  }
+}
+
+/**
+ * Fetch one queue's rows and render them if that tab is still active.
+ *
+ * `seq` ties the answer to the refresh generation that asked: a stale
+ * answer is dropped, never rendered. The tab badge repaints too — the
+ * queue's own total is fresher than the headline's.
+ */
+async function loadQueue(kind, seq) {
   try {
-    const [summary, page] = await Promise.all([
-      fetchJson(summaryUrl()),
-      fetchJson(browseUrl(0)),
-    ]);
+    const payload = await fetchJson(queueUrl(kind));
     if (seq !== state.requestSeq) {
       return;
     }
-    state.summary = summary;
-    state.browseRows = page.tests;
-    state.browseTotal = page.total;
-    renderAll();
+    state.queues[kind] = payload.queue;
+    if (state.summary) {
+      renderQueueTabs();
+      if (state.activeQueue === kind) {
+        renderQueueTable();
+      }
+    }
   } catch (err) {
     if (seq === state.requestSeq) {
       showError(err.message);
-    }
-  } finally {
-    if (seq === state.requestSeq) {
-      setLoading(false);
-      document.getElementById("loading-state").hidden = true;
     }
   }
 }
@@ -194,20 +274,25 @@ async function loadBrowse(append) {
 }
 
 /*
- * At most one /api/summary request in the air at a time.
+ * At most one summary refresh in the air at a time.
  *
- * /api/summary is the heaviest endpoint there is - rollups, the trend,
- * every queue, the top failing scripts - and every in-row action asks
- * for it again so the counts stay honest. Triaging a queue means
- * assigning a dozen tests in a few seconds, and each of those fired its
- * own full summary. On a large estate that is the same expensive answer
- * computed a dozen times, mostly to be thrown away by the next one.
+ * Every in-row action asks for fresh counts so the page stays honest,
+ * and triaging a queue means assigning a dozen tests in a few seconds.
+ * Before coalescing, each of those fired its own full summary — the
+ * same expensive answer computed a dozen times, mostly thrown away.
  *
  * Coalescing keeps the behaviour and drops the duplicate work: a caller
  * arriving while a request is running waits for it instead of starting
  * another, and exactly one more request follows so the final counts
  * still reflect the final action. A burst of any size costs two
  * requests rather than one per action.
+ *
+ * A refresh is now the headline plus the ACTIVE queue's rows, fetched
+ * together. The other queues' caches are dropped, not refetched: five
+ * row payloads nobody is looking at, refetched on every "Take", is the
+ * expense the parts split exists to avoid. Their tabs refetch on the
+ * next click; their badge counts come fresh with the headline either
+ * way.
  */
 let summaryInFlight = null;
 let summaryStale = false;
@@ -222,9 +307,16 @@ async function fetchSummary() {
   }
   while (summaryStale) {
     summaryStale = false;
-    summaryInFlight = fetchJson(summaryUrl());
+    const kind = state.activeQueue;
+    summaryInFlight = Promise.all([
+      fetchJson(summaryUrl()),
+      fetchJson(queueUrl(kind)),
+    ]);
     try {
-      state.summary = await summaryInFlight;
+      const results = await summaryInFlight;
+      state.summary = results[0];
+      state.queues = {};
+      state.queues[kind] = results[1].queue;
     } finally {
       summaryInFlight = null;
     }
@@ -250,7 +342,8 @@ function setLoading(loading) {
   }
 }
 
-function renderAll() {
+/** Render every section the headline payload feeds (all but browse). */
+function renderHeadline() {
   for (const id of SECTIONS) {
     document.getElementById(id).hidden = false;
   }
@@ -260,7 +353,6 @@ function renderAll() {
   renderCharts();
   renderQueues();
   populateScriptOptions();
-  renderBrowse(state.browseRows, false);
 }
 
 /* ================= toolbar ================= */
@@ -611,17 +703,29 @@ const QUEUE_EMPTY_TEXT = {
 
 function queueEntries(queueId) {
   // Every queue — "mine" included — arrives filtered, ordered and capped
-  // from the server, with its exact total alongside.
-  return state.summary.queues[queueId].tests;
+  // from the server, with its exact total alongside. Rows are fetched
+  // per tab; null means "not landed yet for the current filters".
+  const queue = state.queues[queueId];
+  return queue ? queue.tests : null;
 }
 
 function queueCount(queueId) {
-  return state.summary.queues[queueId].total;
+  // The queue's own payload carries the freshest total; before it
+  // lands, the headline's queue_totals covers the tab badge.
+  const queue = state.queues[queueId];
+  if (queue) {
+    return queue.total;
+  }
+  const totals = state.summary && state.summary.queue_totals;
+  return totals ? (totals[queueId] || 0) : 0;
 }
 
 function openQueue(queueId) {
   state.activeQueue = queueId;
   renderQueues();
+  if (!state.queues[queueId]) {
+    loadQueue(queueId, state.requestSeq);
+  }
   scrollTo("triage-section");
 }
 
@@ -649,7 +753,6 @@ async function refreshQueueCounts() {
 }
 
 function renderQueueTabs() {
-  const summary = state.summary;
   const tabs = document.getElementById("queue-tabs");
   clearNode(tabs);
   for (const tab of QUEUE_TABS) {
@@ -667,13 +770,16 @@ function renderQueueTabs() {
     btn.addEventListener("click", () => {
       state.activeQueue = tab.id;
       renderQueues();
+      if (!state.queues[tab.id]) {
+        loadQueue(tab.id, state.requestSeq);
+      }
     });
     tabs.appendChild(btn);
   }
 
-  const problems = summary.queues.new_failures.total
-    + summary.queues.still_failing.total
-    + summary.queues.unexpected_passes.total;
+  const problems = queueCount("new_failures")
+    + queueCount("still_failing")
+    + queueCount("unexpected_passes");
   document.getElementById("all-clear").hidden = problems !== 0;
   document.getElementById("triage-meta").textContent =
     problems === 0 ? "" : problems.toLocaleString() + " open items";
@@ -903,6 +1009,17 @@ function renderQueueTable() {
     table.hidden = true;
     emptyNote.textContent =
       "Set a username (top right) to see tests assigned to you.";
+    emptyNote.hidden = false;
+    capNote.hidden = true;
+    resultNote.hidden = true;
+    return;
+  }
+  if (allEntries === null) {
+    // This tab's rows have not landed yet. One quiet line rather than
+    // a skeleton — refreshes keep the previous table dimmed, so this
+    // shows only the first time a queue is opened.
+    table.hidden = true;
+    emptyNote.textContent = "Loading queue…";
     emptyNote.hidden = false;
     capNote.hidden = true;
     resultNote.hidden = true;

@@ -846,28 +846,56 @@ The fix is four interacting parts, and it took three attempts:
    already sitting in `rfile`'s buffer, and would then close the connection with
    it unanswered. `rfile.peek(1)` under a short socket timeout answers for both,
    consumes nothing, and leaves the stream untouched on timeout.
-4. **Adaptive keep-alive**, decided in `_write_response` *before* the headers so
-   `Connection: close` is honest.
+4. **Adaptive keep-alive.** `_write_response` sets `Connection: close` when
+   the pool has queued work, so a connection about to be reclaimed is
+   announced before the client reuses it.
 
-**The regression this caused, and how it was caught.** Yielding on contention was
-first applied to every wait, including the first request on a freshly accepted
-connection — which under load is most of them. Result: connections closed with no
-response at all. `StillAServerTest::test_more_clients_than_workers_all_complete`
-failed with 15 of 20 clients getting "remote end closed connection without
-response". A connection that has not been served is not an idle client holding a
-worker hostage; it *is* the queue. `may_yield` is now False until the connection
-has had one response.
+   **This and the poll in (2) are ONE mechanism, and separating them was a
+   real mistake made in this session — caught only because the user asked
+   whether `--perf-log` was the cause of a page feeling laggier.** The perf
+   log was not (measured below at +15 ms on `/api/summary`, nothing
+   elsewhere). Chasing it found that the eager close fires constantly during
+   page loads — 2 of 8 responses in a first crude probe — which looked like
+   pure waste, so it was removed on the reasoning that the poll alone fixes
+   the starvation. It was pushed as a review candidate. It was **worse**.
 
-Also here, because the file was open: `handle_error` no longer prints a
-traceback to stderr when a client disconnects mid-response (it looked like a
-server fault), `log_error` drops the now-normal idle-close to DEBUG, the module
-docstring stopped claiming the server is built on `ThreadingMixIn` (the class
-docstring correctly denies it), and the `socketserver` import it needed went
-with it.
+   Reclaiming a worker means closing a connection the client still believes
+   is open. The announcement is what makes that safe. With it gone the poll
+   reclaimed connections silently and clients sent their next request into a
+   dead socket. Measured with `http.client` — a strict client that, unlike a
+   browser, does not retry — against a 210 MB copy of the dev data, one full
+   dashboard load per simulated user:
 
-Shutdown got faster as a side effect and has a test saying so: a worker blocked
-forever on an idle socket never reached its sentinel, so `server_close()`
-depended on a browser closing its connection.
+   | Concurrent users | Announced (deployed): closes / failed | Silent (the candidate): closes / failed |
+   |---|---|---|
+   | 2 | 16 / **0** | 0 / **6** |
+   | 4 | 37 / **0** | 0 / **16** |
+   | 6 | 60 / **0** | 0 / **27** |
+
+   About 40% of requests on reused connections died. A browser retries an
+   idempotent GET and would mostly hide it; a POST — a comment, an
+   assignment — is not retried and fails in front of the user. Reverted.
+
+   The earlier "one client saw its socket aborted mid-body" was **also
+   wrong**, and worth recording because it nearly became a production
+   diagnosis: that probe ignored `Connection: close` and kept writing to a
+   socket the server had properly announced it was closing. A correct client
+   sees no truncation and no corruption — verified byte-for-byte against the
+   files on disk, 0 truncated and 0 corrupted at every concurrency level.
+   (A first pass reported 2 corrupted responses; that was a fresh git
+   checkout having CRLF where the working tree has LF, not the server.)
+
+   The cost of announcing is one TCP handshake per closed connection, a
+   fraction of a millisecond on a LAN. `--workers` is the knob that reduces
+   how often it fires: on the deployed code, raising it from 8 to 24 took
+   4-user page loads from 37 closes to 8, with no code change.
+
+   Guarded by `test_a_reclaimed_connection_is_always_announced_first`, which
+   drives 12 keep-alive clients against 4 workers with a non-retrying client
+   and asserts nothing fails. Verified by re-planting the regression.
+
+   **The invariant, for whoever touches this next: the server must never
+   close a connection without having told the client in a response header.**
 
 ### Where the time goes, as a treemap — and the constraint that decided it
 
@@ -969,6 +997,45 @@ A documentation error caught by its own test: the report first described p99 as
 one at 1000ms, p99 *is* 1ms. Percentiles are textbook nearest-rank now, and the
 column is described as the boundary it is, with `max` for the worst.
 
+### What `--perf-log` actually costs — measured, because it was suspected
+
+Asked directly: "Does that perf logging impose an overhead? I've enabled it and
+the page feels just a little laggier?" Worth answering with an A/B rather than a
+reassurance, and the answer turned out to be "no, but you were right that
+something was".
+
+Same code, same database (a 210 MB copy of the dev data), same request pattern,
+alternated ON/OFF/ON/OFF across two rounds so machine drift shows as spread
+rather than as a result. Twelve sequential requests per endpoint after a
+twelve-request warm-up, plus a sixteen-way concurrent burst.
+
+| | perf ON | perf OFF | overhead |
+|---|---|---|---|
+| `/api/summary` median | 728 ms | 713 ms | **+15 ms (+2.1%)** |
+| `/api/dashboard` median | 33.5 ms | 34.3 ms | −0.8 ms (−2.4%) |
+| `/api/time` median | 581 ms | 588 ms | −7.0 ms (−1.2%) |
+| 16 concurrent, wall | 3876 ms | 3883 ms | −6 ms (−0.2%) |
+
+Round-to-round spread was tight (ON 724/732 ms, OFF 715/711 ms), so the 15 ms on
+`/api/summary` is probably real and everything else is noise.
+
+**Why `/api/summary` and nothing else:** it is the only endpoint that writes a
+lot of records. One call logs **~110** — 93 of them `failure_streak_bounds`,
+which is called once per queue entry. So ~0.14 ms per record, covering
+`time.time()` twice, a lock, `json.dumps`, and a line-buffered write syscall.
+`/api/dashboard` issues a handful of storage calls and shows nothing at all.
+
+2% on the heaviest endpoint is not something a person can feel, which is what
+sent the search elsewhere and found the adaptive-keep-alive fault above. Left as
+it is: the cost is real but small, and the alternative (buffering instead of
+line-buffering) would trade it for losing the tail of the log in exactly the
+situation the log exists for — a process that has stalled and is still holding
+the file open.
+
+Worth knowing for production: the log is a write per record on the same
+filesystem as the database. On the dev machine that is an SSD and invisible. If
+the production database lives on a network mount, put the log somewhere local.
+
 ### Verification, and its limits
 
 Frontend verified by driving the real ES modules against a live server under a
@@ -984,3 +1051,145 @@ generated, 540,192 runs) on a developer machine; production is ~900 MB and
 roughly four times that. The keep-alive figures are from the reproduction, not
 from production traffic. `tools/diagnose_db.py --compare-local` has still never
 been run on the production server.
+
+## Drop of 2026-07-31 (WP-17) — the summary at production scale, and the 10-minute re-push
+
+First production perf log (day one, user-run report): `/api/summary` mean 6 s,
+`activity_buckets` 3.5 s of it, worst response 60 s. Analysed locally, fixed on
+`wp-17-summary-perf`. Suite 1288 (from 1268). Migration 6 ships.
+
+### The finding: one query was O(total history)
+
+The staleness-cutoff bucket query — `GROUP BY environment, hour` over a
+fortnight of `runs` — was planned by SQLite as a **full covering scan of the
+runs UNIQUE index**, because the `(start_time, result)` index does not carry
+`environment` and the planner preferred scanning everything to 168k row
+lookups. Cost proportional to the whole year of history, not the window; paid
+by `/api/summary`, `/api/time`, `/api/dashboard?stale=1` and
+`/api/environments`, uncached; growing nightly. Reproduced on the dev copy at
+607 ms (70% of the 871 ms summary mean; prod 3.5 s of 6 s — same shape ×
+history size × network mount).
+
+What did NOT work, measured before choosing: `ANALYZE` (planner switched to a
+skip-scan on the same wrong index, 207 ms); an unforced covering
+`(start_time, environment)` index (planner ignored it — bound-parameter range
+selectivity is unknowable at prepare time). `INDEXED BY` worked (115 ms,
+window-proportional) but is SQLite-only syntax, leaves the query O(window),
+and the index adds ~15–20% to the file. Rejected in favour of the project's
+own pattern:
+
+**`activity_hours` (migration 6)** — third derived table, environment × UTC
+hour × result → count, maintained in the import transaction (+1 on insert,
+−1/+1 on a result flip; rows deleted at zero so it stays byte-equal to the
+GROUP BY it replaces), backfilled from full history in one aggregate pass
+(2.4 s cold on the dev copy), rebuilt by `prune_runs_before`, covered by
+`delete_environment` via `_ENVIRONMENT_TABLES`, exported by the MariaDB tool.
+`ActivityHoursTest` pins live-vs-rebuild equality both directions, with a
+planted-drift test proving the comparison can fail, and a planted-skew test
+proving the readers read the table. The trend query reads it too (the result
+dimension exists for exactly that), so the memo layer is now belt-and-braces.
+
+Measured, dev copy: buckets 607 → 2.3 ms; `/api/summary` 751 → ~190 ms;
+`/api/time` 630 → 40 ms; headline part ~100–170 ms at 14 KB.
+
+### The user's disclosure that reframed the analysis
+
+The site feeder re-pushes its whole recent window (~10k records) **every 10
+minutes**, unchanged or not, taking 1 min+. Measured cost of one unchanged
+record before: ~2.3 KB WAL (runs UPDATE + run_outputs INSERT OR REPLACE of an
+identical blob + latest_runs touch) — ~23 MB per push, ~3.3 GB/day through the
+production mount, page-cache eviction for every reader, ~20 trend-memo
+invalidations per push. And a production bug: `_unretire_on_new_run` fired on
+ANY upsert, so **every retirement was undone within 10 minutes** of being
+made. Nobody had connected the "Automatically un-retired" comments to the
+push schedule.
+
+**The skip:** a record whose metadata all matches and whose
+`runs.output_fingerprint` (SHA-1 of output text, new column, NULL for
+pre-migration rows) matches writes nothing — no UPDATE, no blob REPLACE, no
+`_maintain_latest`, no un-retire, no memo invalidation. NULL never matches, so
+the active window stamps itself in one push cycle and the first post-upgrade
+push behaves like today. Measured: 2,000 unchanged records 0.46 s / 4.6 MB WAL
+→ **0.04 s / 0 bytes**. Wire compatibility decided deliberately: response
+`updated` still counts unchanged records (deployed feeder sums and logs it);
+additive `unchanged` field refines it. `test_reimport_identical_batch...`
+re-pinned from `updated=3` to `unchanged=3` — a deliberate semantic change,
+this line is the record of it. Un-retire on a CHANGED old record is pinned as
+still happening (`test_a_changed_reimport_still_unretires`); only the
+unchanged case stopped.
+
+### The split (user chose to pull it into this drop)
+
+`/api/summary?parts=headline` (everything but queue rows, plus
+`queue_totals`), `parts=queue&queue=<kind>`; bare call unchanged-plus-totals,
+pinned to the parts by `SummaryPartsTest` (slice-vs-whole, not hand-written
+values). Home page fetches headline + active tab + browse page in parallel,
+paints each on arrival, other tabs on first click ("Loading queue…" line —
+the no-skeleton rule respected; refreshes still dim-and-hold). Action
+refreshes fetch headline + active queue only, still coalesced.
+`SummaryPartsFetchTest` pins the fetch shape the way the coalescer is pinned.
+Verified end-to-end under the node DOM shim against a live server: staged
+requests, badge paint, on-demand fetch, cached re-click.
+
+### Housekeeping with reasons
+
+- **Registry swap:** WP-17 took version 6; WP-15 (parked WIP branch) moved to
+  7 — versions must ship contiguously, so an unshipped claim cannot hold 6
+  while 7 ships. The WIP branch must renumber before merging. Registry,
+  CLAUDE.md, and the operator note all say so.
+- `TestMigrationFiveOnAnExistingDatabase` now asserts `MIGRATIONS[-1][0]`
+  rather than the literal 5 — the pin was about migration 5 arriving on a v4
+  file, not about 5 being last.
+- `test_the_trend_cache_is_invalidated` was passing vacuously: it passed `7`
+  (a days count the signature does not have) as the ENVIRONMENT filter, so
+  both sides of the assertion were always empty. Fixed and given a
+  populated-before precondition.
+- MariaDB exporter: `activity_hours` in `TABLE_ORDER` + DDL + a verify query;
+  `runs.output_fingerprint` in the DDL; the null-vs-empty test's `row[-1]`
+  made explicit (`row[8]`) — "last column" silently became a different
+  question when the column list grew. The guard tests caught all of this,
+  which is what they are for.
+
+### Verification, and its limits
+
+Same honest line as the last drop: **no browser, no production numbers.**
+Everything measured here is the 218 MB dev copy on a developer machine; the
+plan's Phase 2 (streaks, queue payloads, worker count) is parked until one
+night of production perf log after this drop re-ranks the remaining terms.
+
+## CI repair, 2026-07-31 — the 3.8 and 3.6 legs had been red since 07-27
+
+Every leg except 3.14 was red from the moment the full local history reached
+GitHub. All four causes were in **test code**, none in shipped code, and every
+one was invisible on a modern interpreter — which is the entire reason those
+legs exist. Fixed in two commits on `wp-17-summary-perf` (`17b8b4b`,
+`64a3468`); all three legs are now green on the full 1288, including the
+authoritative ubi8/python-3.6.8 container.
+
+What each failure taught, briefly (details in the commit messages):
+
+1. `test_storage.py` used `Tuple` in an annotation without importing it —
+   latent since WP-8, silent under PEP 649's lazy annotations, an ImportError
+   on 3.6/3.8 that dropped all 209 of the module's tests from discovery.
+   **Guard widened:** the compat gate's annotation-evaluation sweep now covers
+   `tests/` too, and was proven able to catch exactly this by reverting the
+   fix and watching it fail on 3.14.
+2. `ast.parse(feature_version=(3,6))` is only *enforced* from 3.9 (PEG
+   parser); 3.8 accepts the walrus anyway. The planted regression caught it —
+   the grammar-gate tests now skip below 3.9 instead of pretending.
+3. Two copies of the storage.py literal scan matched only `ast.Constant`;
+   the 3.6 parser emits `ast.Str`, so on the deployment interpreter the scan
+   found nothing and every count "passed" over an empty list. The
+   scan-finds-something tripwires fired as designed. One copy now handles
+   both node types; the other delegates to it.
+4. Two runtime-library differences: 3.6's sqlite3 requires registered
+   callbacks to be hashable (`set_trace_callback(list.append)` is a
+   TypeError there and fine on 3.8+), and SQLite 3.36 changed query-plan
+   wording (`SEARCH TABLE runs` → `SEARCH runs`), which one diagnose_db
+   assertion had pinned to the modern spelling.
+
+The meta-lesson, worth the ink: **the gates that failed were doing their
+job.** Each red leg was a true positive, and the one gap — nothing forced
+test annotations to evaluate on a lazy interpreter — is now closed. The ubi8
+leg runs the suite with `skipped=5` (the four version-gated grammar tests
+plus the standing skip); that number is expected, not a regression.

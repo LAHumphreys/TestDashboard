@@ -27,7 +27,7 @@ import io
 import os
 import re
 import unittest
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STORAGE_PATH = os.path.join(REPO_ROOT, "testboard", "storage.py")
@@ -48,6 +48,22 @@ EXPECTED = {
     "julianday": 0,
     "strftime": 0,
 }  # type: Dict[str, int]
+
+#: The 3.6 parser emits ``ast.Str`` for string literals; 3.8+ emits
+#: ``ast.Constant``; 3.12 removed ``ast.Str``. A Constant-only scan finds
+#: NOTHING on the deployment interpreter, and every count then "passes"
+#: over an empty list — which is what test_the_scan_finds_the_sql exists
+#: to catch, and did, on the ubi8 CI leg.
+_AST_STR = getattr(ast, "Str", None)
+
+
+def _string_value(node: ast.AST) -> Optional[str]:
+    """The text of a string literal, across ast.Str and ast.Constant."""
+    if _AST_STR is not None and isinstance(node, _AST_STR):
+        return node.s
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
 
 
 def sql_literals() -> List[str]:
@@ -70,8 +86,9 @@ def sql_literals() -> List[str]:
     for node in ast.walk(tree):
         if id(node) in docstrings:
             continue
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            found.append(node.value)
+        value = _string_value(node)
+        if value is not None:
+            found.append(value)
     return found
 
 

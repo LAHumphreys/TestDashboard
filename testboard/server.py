@@ -699,17 +699,40 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         got gzip, so a shared cache cannot serve one client's encoding to
         another.
         """
-        # Adaptive keep-alive. A worker is bound to a CONNECTION, so
-        # holding one open for a client that may never come back is
-        # capacity taken from a client that is waiting right now. When
-        # the pool has queued work, this connection ends with this
-        # response — the decision has to be made HERE, before the
-        # headers, so `Connection: close` below tells the client the
-        # truth rather than leaving it to write into a closing socket.
+        # Adaptive keep-alive: when the pool has queued work, this
+        # connection ends with this response.
         #
-        # Uncontended, keep-alive is kept: a page load fetches ~10 files
-        # and reusing the connection for them is most of why HTTP/1.1 is
-        # on. This only gives it up when someone is queueing for it.
+        # THIS AND THE POLL IN _wait_for_request ARE ONE MECHANISM. Do
+        # not remove either alone. The poll reclaims a worker from an
+        # idle connection, and reclaiming means CLOSING a connection the
+        # client still believes is open — so the client has to be told,
+        # and the only place to tell it is a response header. That is
+        # what this is: the announcement half.
+        #
+        # Removing it while leaving the poll was tried, on the reasoning
+        # that the poll alone fixes the starvation and this only closes
+        # connections a page load would rather keep. Both halves of that
+        # were true and the result was still much worse, because the
+        # poll then reclaimed connections SILENTLY and clients sent their
+        # next request into a socket the server had already closed.
+        # Measured with a strict client (http.client, which unlike a
+        # browser does not retry), against a 210 MB copy of the dev data:
+        #
+        #     users   announced closes / failed requests
+        #     2       16 / 0        silent: 0 / 6
+        #     4       37 / 0        silent: 0 / 16
+        #     6       60 / 0        silent: 0 / 27
+        #
+        # Announced, nothing ever fails. Silent, 40% of requests on
+        # reused connections die. A browser retries an idempotent GET and
+        # would mostly paper over it; a POST — a comment, an assignment —
+        # is not retried and simply fails in front of the user.
+        #
+        # The cost of announcing is one TCP handshake per closed
+        # connection, which is a fraction of a millisecond on a LAN. That
+        # is the right side of this trade, and `--workers` is the knob for
+        # reducing how often it fires (24 workers took 4-user page loads
+        # from 37 closes to 8).
         if not self.close_connection and self._pool_is_contended():
             self.close_connection = True
 

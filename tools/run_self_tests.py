@@ -354,8 +354,10 @@ def main(argv=None):
         finally:
             storage.close()
         print(
-            "Seeded {0} runs into {1} ({2} inserted, {3} updated)".format(
-                len(runs), args.db, counts.inserted, counts.updated))
+            "Seeded {0} runs into {1} ({2} inserted, {3} updated, "
+            "{4} unchanged)".format(
+                len(runs), args.db, counts.inserted, counts.updated,
+                counts.unchanged))
     return 0
 
 

@@ -274,10 +274,12 @@ def future_annotations(tree: ast.AST) -> List[int]:
 def parses_as_python36(source: str, path: str) -> Optional[str]:
     """None if the 3.6 grammar accepts the source, else the error.
 
-    ``feature_version`` is 3.8+. On an older interpreter this returns
-    None rather than lying, because a 3.6/3.7 run cannot answer the
-    question — and on 3.6 itself the import simply succeeding is the
-    answer.
+    ``feature_version`` is accepted from 3.8 but only *enforced* by the
+    PEG parser, 3.9+ — 3.8's pgen parser takes the argument and then
+    accepts the walrus operator anyway (CI's 3.8 leg proved it, via
+    PlantedRegressionTest). On an interpreter that cannot answer the
+    question this returns None rather than lying; callers skip below
+    3.9. On 3.6 itself the import simply succeeding is the answer.
     """
     try:
         ast.parse(source, filename=path, feature_version=(3, 6))
@@ -330,8 +332,9 @@ class SourceCompatibilityTest(unittest.TestCase):
         ``except*`` and every other grammar change since 3.6 without this
         file having to enumerate them.
         """
-        if sys.version_info < (3, 8):
-            self.skipTest("feature_version needs Python 3.8+")
+        if sys.version_info < (3, 9):
+            self.skipTest("feature_version is only enforced by the PEG "
+                          "parser (3.9+); 3.8 accepts the walrus operator")
         bad = []  # type: List[str]
         for path, source in sorted(self.sources.items()):
             problem = parses_as_python36(source, path)
@@ -411,12 +414,19 @@ class AnnotationsEvaluateTest(unittest.TestCase):
 
     def modules(self) -> List[Tuple[str, object]]:
         """Import every shipped module, so the sweep never depends on
-        what some other test happened to load first."""
+        what some other test happened to load first.
+
+        ``tests`` is swept too, deliberately: a test module's annotation
+        that fails to evaluate is an ImportError under discovery on 3.6,
+        which silently drops every test in the module from the run —
+        exactly how test_storage.py lost its 200+ tests on the CI legs
+        for three days while the local 3.14 suite stayed green.
+        """
         import importlib
         import pkgutil
 
         names = []  # type: List[str]
-        for package in ("testboard", "feeder", "tools"):
+        for package in ("testboard", "feeder", "tools", "tests"):
             names.append(package)
             path = os.path.join(REPO_ROOT, package)
             for _finder, name, _pkg in pkgutil.iter_modules([path]):
@@ -502,8 +512,9 @@ class VendoredCodeTest(unittest.TestCase):
         "Whatever is current" is how you end up shipping a driver that
         uses the walrus operator to a RHEL 8 box.
         """
-        if sys.version_info < (3, 8):
-            self.skipTest("feature_version needs Python 3.8+")
+        if sys.version_info < (3, 9):
+            self.skipTest("feature_version is only enforced by the PEG "
+                          "parser (3.9+); 3.8 accepts the walrus operator")
         bad = []  # type: List[str]
         for path, source in sorted(self.sources.items()):
             problem = parses_as_python36(source, path)
@@ -590,8 +601,9 @@ class PlantedRegressionTest(unittest.TestCase):
         self.assertEqual(plain, [], "plain strings must not be flagged")
 
     def test_grammar_gate_rejects_post_36_syntax(self) -> None:
-        if sys.version_info < (3, 8):
-            self.skipTest("feature_version needs Python 3.8+")
+        if sys.version_info < (3, 9):
+            self.skipTest("feature_version is only enforced by the PEG "
+                          "parser (3.9+); 3.8 accepts the walrus operator")
         handle, path = tempfile.mkstemp(suffix=".py")
         os.close(handle)
         self.addCleanup(os.unlink, path)

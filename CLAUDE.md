@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project State
 
 **testboard is live in production and has been since 2026-07-26.** It is no longer
-greenfield: ~25k lines, 1,137 tests, schema at migration 5, deployed and in daily use
+greenfield: ~25k lines, 1,288 tests, schema at migration 6, deployed and in daily use
 by a small group of testers.
 
 **Starting a session: read [`docs/SESSION_HANDOVER.md`](docs/SESSION_HANDOVER.md) first.**
@@ -120,15 +120,17 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
 - **`output` can be large**: it lives in its own table (`run_outputs`), zlib-compressed, and is read by exactly one endpoint (`GET /api/runs/{id}`). Never join it into a list query — keeping it out of `runs` is what keeps metadata reads dense.
 - **The server serves from a fixed worker pool, never a thread per request.** Storage keeps connections in `threading.local()`, so a thread per request means a connection per request means an empty SQLite page cache on every request — measured: 20 requests, 20 connections, and no `cache_size` setting can help a cache that is discarded before it is used twice. The pool size *is* the connection count and is what a `--cache-mb` budget is divided by; `tests/test_server_pool.py` fails if the mixin comes back.
 - SQLite: WAL mode + busy timeout at connect (threaded server), versioned migration
-  table (`schema_version`). **`MIGRATIONS` holds five entries and entry 1 describes a
+  table (`schema_version`). **`MIGRATIONS` holds six entries and entry 1 describes a
   database that exists in production — never edit it.** Every schema change is a new
   appended entry whose version is claimed from the registry in `docs/UPGRADE_PLAN.md`
-  §1 *in the same commit*; version 6 is already claimed by WP-15.
+  §1 *in the same commit*; version 7 is claimed by WP-15 (renumbered from 6 when
+  WP-17 shipped first — the parked WIP branch must renumber before merging).
   `tests/test_migrations.py` freezes entry 1 by hash and asserts the fresh-install and
   incremental paths produce identical schemas. A migration may contain a Python step
   (`"python: <name>"`). A database whose version exceeds the code's is refused, not
   used — so a rollback needs a copy of the file taken beforehand.
-- **Scale is the design constraint**: ~12,000 tests a night, kept for a year (~4.4M runs). No endpoint may be proportional to the size of the estate. `latest_runs` (one row per test, carrying its latest and previous result) and `current_assignments` are derived tables maintained inside the writing transaction; estate-wide reads go through them, list endpoints are paginated in SQL, and only the returned page joins `runs`. `ORDER BY` cannot be parameterized — sort keys come from the `DASHBOARD_SORTS` whitelist.
+- **Scale is the design constraint**: ~12,000 tests a night, kept for a year (~4.4M runs). No endpoint may be proportional to the size of the estate — *or of its history*. Three derived tables are maintained inside the writing transaction: `latest_runs` (one row per test, carrying its latest and previous result), `current_assignments`, and `activity_hours` (run counts per environment × UTC hour × result — what the staleness cutoff and the trend read; migration 6). Estate-wide reads go through them, list endpoints are paginated in SQL, and only the returned page joins `runs`. Nothing may scan a window of `runs` at request time — the bucket query that did was 3.5s mean on production and grew every night. `ORDER BY` cannot be parameterized — sort keys come from the `DASHBOARD_SORTS` whitelist.
+- **A byte-identical re-import writes nothing.** The site feeder re-pushes its whole recent window every 10 minutes whether anything ran or not; `runs.output_fingerprint` is how an unchanged record is recognised without reading the stored blob. The skip is also what lets a retirement survive the next push — before it, ANY re-import un-retired the test. On the wire, the import response's `updated` still includes unchanged records (deployed feeders sum it); `unchanged` refines it.
 - **A run belongs to a test, not to a batch** — the import contract has no session/batch id. A *suite execution* is therefore inferred from run timings by `analytics.group_executions` (new execution when a run starts more than 60 min after the latest end seen). A suite can run more than once a day, so anything bucketed by calendar day (the home trend) must not be described as "per night".
 - **"Recently run" is derived from the suite, not from the wall clock.** Environments run
   SEQUENTIALLY and hours apart, and the suite does not run every night, so a fixed window

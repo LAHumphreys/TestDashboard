@@ -17,15 +17,18 @@ All SQL for the project lives in this module. Responsibilities:
   UPDATE`` (not available in Python 3.6's bundled sqlite).
 - The (potentially large) ``output`` column is NEVER selected by list
   queries — only :meth:`Storage.get_run` fetches it.
-- Two derived tables keep estate-wide reads proportional to the number of
-  TESTS (and the page actually returned) rather than to the number of
+- Three derived tables keep estate-wide reads proportional to the number
+  of TESTS (and the page actually returned) rather than to the number of
   runs ever recorded: ``latest_runs`` (one row per test: its newest run,
-  that run's result and the previous run's result) and
+  that run's result and the previous run's result),
   ``current_assignments`` (one row per test: who owns it now, with
-  ``assignments`` kept as the audit log). Both are maintained inside the
-  same transaction as the write that changes them — see
-  :meth:`Storage._maintain_latest` and :meth:`Storage.set_assignee` — so
-  they cannot drift from ``runs``.
+  ``assignments`` kept as the audit log) and ``activity_hours`` (run
+  counts per environment, UTC hour and result — what the staleness
+  cutoff and the trend chart read instead of scanning a window of
+  ``runs``). All are maintained inside the same transaction as the write
+  that changes them — see :meth:`Storage._maintain_latest`,
+  :meth:`Storage.set_assignee` and :meth:`Storage._apply_activity_deltas`
+  — so they cannot drift from ``runs``.
 
 Only ``str``/``int``/``float``/``None`` cross the sqlite boundary
 (``detect_types=0``); datetimes are converted with
@@ -37,6 +40,7 @@ Python 3.6 compatible; standard library only; parameterized SQL only.
 """
 
 import datetime
+import hashlib
 import os
 import sqlite3
 import threading
@@ -111,6 +115,18 @@ def _compress_output(output: str) -> bytes:
     return zlib.compress(
         output.encode("utf-8"), _OUTPUT_COMPRESS_LEVEL
     )
+
+
+def _output_fingerprint(output: str) -> str:
+    """SHA-1 hex of the output text, as stored in ``runs.output_fingerprint``.
+
+    Hashing the TEXT rather than the compressed bytes keeps the value
+    meaningful if the compression level ever changes, and lets the
+    unchanged-record check in :meth:`Storage.upsert_runs` skip the
+    compression entirely — the hash is cheaper to compute than the
+    deflate it replaces.
+    """
+    return hashlib.sha1(output.encode("utf-8")).hexdigest()
 
 
 def _decompress_output(stored: Any) -> str:
@@ -447,6 +463,82 @@ MIGRATIONS = [
             """,
         ],
     ),
+    (
+        6,
+        [
+            # Run counts per (environment, UTC hour, result), maintained
+            # inside the import transaction like latest_runs. The third
+            # derived table, and it exists because the two questions that
+            # read a window of `runs` were the only reads in the codebase
+            # whose cost grew with the SIZE OF HISTORY:
+            #
+            # - activity_buckets (the staleness cutoff, computed by
+            #   /api/summary, /api/time, /api/environments and the stale
+            #   filter): the planner answered its GROUP BY over
+            #   environment with a FULL SCAN of the runs UNIQUE index —
+            #   every row ever recorded, not the fortnight asked about.
+            #   MEASURED on the dev copy (540,192 runs): 607ms mean in
+            #   production traffic, 70% of /api/summary; the production
+            #   perf log shows the same shape at 3.5s mean over 4.4M
+            #   rows on the network mount, growing every night.
+            # - daily_result_counts (the trend chart): a covering range
+            #   scan, ~170k index entries per fortnight window.
+            #
+            # This table answers both from ~30 tiny rows per environment
+            # per day, so their cost stops depending on how much history
+            # exists. The invariant is exact equality with
+            # `SELECT environment, SUBSTR(start_time, 1, 13), result,
+            # COUNT(*) FROM runs GROUP BY 1, 2, 3` — enforced by
+            # tests/test_storage.py::ActivityHoursTest against live
+            # maintenance, environment deletion and pruning.
+            #
+            # Hours are SUBSTR(start_time, 1, 13) ("YYYY-MM-DDTHH"), the
+            # same expression the queries it replaces used, so it means
+            # the same thing on MariaDB (docs/MARIADB_MIGRATION.md E.4).
+            # No extra index: a year is under ~100k rows and every read
+            # is a range over `hour` within a table this small.
+            """
+            CREATE TABLE activity_hours (
+                environment TEXT NOT NULL,
+                hour TEXT NOT NULL,
+                result TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (environment, hour, result)
+            )
+            """,
+            # SHA-1 of the run's output TEXT, so a re-imported record can
+            # be recognised as byte-identical without reading the stored
+            # blob back. The site feeder re-pushes its whole recent
+            # window every 10 minutes; before this column each of those
+            # records rewrote its runs row AND re-REPLACEd its compressed
+            # output — MEASURED at ~2.3 KB of WAL per unchanged record,
+            # ~23 MB per 10-minute push of 10,000, all through the
+            # production network mount for zero information.
+            #
+            # NULL means "not stamped yet" (every pre-migration row):
+            # the first re-import of such a row takes the full write
+            # path once and stamps it. No backfill — reading every
+            # output blob (~most of the database) in a startup migration
+            # is exactly what §1.2 of docs/UPGRADE_PLAN.md forbids; the
+            # active window self-heals in one push cycle.
+            #
+            # O(1): ADD COLUMN with no default rewrites nothing.
+            """
+            ALTER TABLE runs ADD COLUMN output_fingerprint TEXT
+            """,
+            # Build activity_hours from the full existing history — one
+            # aggregate read pass over `runs`; the rows written are the
+            # aggregate itself (1,077 rows on the dev copy).
+            #
+            # MEASURED on the dev copy (218 MB, 540,192 runs): 2.4s as
+            # part of a cold server startup, 0.8s on a warm connection.
+            # Production is ~4.4M rows on a network mount and MUST be
+            # measured on a copy before the drop ships — the operator
+            # note (docs/drops/2026-07-31.md) records that number and
+            # what a hung-looking startup means.
+            "python: rebuild_activity_hours",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: Prefix marking a migration step that runs Python instead of SQL.
@@ -492,9 +584,39 @@ def _backfill_latest_durations(conn: sqlite3.Connection) -> None:
     )
 
 
+def _rebuild_activity_hours(conn: sqlite3.Connection) -> None:
+    """Rebuild ``activity_hours`` from ``runs``, exactly (migration 6).
+
+    DELETE-then-INSERT rather than incremental, because this is the
+    definition the incremental maintenance in :meth:`Storage.upsert_runs`
+    is held equal to — by ``tests/test_storage.py::ActivityHoursTest``
+    and by :meth:`Storage.prune_runs_before`, which calls this after
+    deleting history so the invariant survives retention.
+
+    One aggregate read pass over ``runs``; prints its elapsed time when
+    there was anything to do, per docs/UPGRADE_PLAN.md §1.2 — a silent
+    multi-second startup on the production mount should say what it is.
+    """
+    started = time.time()
+    conn.execute("DELETE FROM activity_hours")
+    cursor = conn.execute(
+        "INSERT INTO activity_hours (environment, hour, result, count) "
+        "SELECT environment, SUBSTR(start_time, 1, 13), result, COUNT(*) "
+        "FROM runs GROUP BY environment, SUBSTR(start_time, 1, 13), result"
+    )
+    if cursor.rowcount:
+        print(
+            "activity_hours: rebuilt {0} rows in {1:.1f}s".format(
+                cursor.rowcount, time.time() - started
+            ),
+            flush=True,
+        )
+
+
 #: Python migration steps, by the name used after the prefix.
 _MIGRATION_STEPS = {
     "backfill_latest_durations": _backfill_latest_durations,
+    "rebuild_activity_hours": _rebuild_activity_hours,
 }  # type: Dict[str, Any]
 
 
@@ -708,10 +830,20 @@ class EnvironmentExpectation(NamedTuple):
 
 
 class UpsertCounts(NamedTuple):
-    """Result of a batch upsert: how many rows were inserted vs updated."""
+    """Result of a batch upsert.
+
+    ``unchanged`` counts records that were byte-identical to what is
+    already stored (metadata and output fingerprint both matching) and
+    therefore wrote nothing at all. The site feeder re-pushes its whole
+    recent window every 10 minutes, so in steady state this is MOST
+    records; the split exists so that a no-op push is visible as one in
+    logs and in the import response, instead of masquerading as 10,000
+    updates.
+    """
 
     inserted: int
     updated: int
+    unchanged: int
 
 
 #: Every column of ``users``, in :class:`User` field order. One place, so
@@ -808,6 +940,7 @@ _ENVIRONMENT_TABLES = (
     "comments",
     "test_retirements",
     "environment_expectations",
+    "activity_hours",
     "runs",
 )  # type: Tuple[str, ...]
 
@@ -1199,30 +1332,69 @@ class Storage:
         """Insert or update a batch of runs in ONE transaction.
 
         A run is keyed by ``(environment, script, test_name, start_time)``.
-        For each record the existing row id is looked up (an index hit on
+        For each record the existing row is looked up (an index hit on
         the UNIQUE constraint); if found the row is UPDATEd in place
-        (preserving its rowid), otherwise a new row is INSERTed. Per-record
-        work is index hits only, so a 5000-record batch imports fast.
+        (preserving its rowid), otherwise a new row is INSERTed.
+
+        A record IDENTICAL to what is stored — every metadata field
+        equal and the output fingerprint matching — writes NOTHING: no
+        runs update, no output re-REPLACE, no ``latest_runs`` touch, no
+        un-retirement, no memo invalidation. The site feeder re-pushes
+        its whole recent window every 10 minutes whether anything ran or
+        not, and before this check each of those pushes rewrote ~10,000
+        rows plus their compressed outputs (~23 MB of WAL) through the
+        production network mount, evicting the page caches every reader
+        depends on. It also silently un-retired tests: a re-pushed OLD
+        run is not the test "reporting a run again", and treating it as
+        one made retirement impossible to keep for more than 10 minutes.
+
+        A NULL fingerprint (any row imported before migration 6) never
+        matches, so such a record takes the full write path once and is
+        stamped; the active window self-heals in one push cycle.
+
+        ``activity_hours`` is maintained here, in the same transaction:
+        +1 for each inserted run, and a paired -1/+1 when an update
+        changes a stored result. Start times are immutable (they are
+        part of the run's key), so a run can never move between hours.
         """
         conn = self._conn()
         inserted = 0
         updated = 0
+        unchanged = 0
+        # Net activity_hours changes for this batch, applied in one pass
+        # at the end: a batch of 500 typically spans a handful of
+        # (environment, hour, result) cells, not 500.
+        deltas = {}  # type: Dict[Tuple[str, str, str], int]
         conn.execute("BEGIN IMMEDIATE")
         try:
             for rec in records:
                 start = model.format_iso(rec.start_time)
                 end = model.format_iso(rec.end_time)
+                fingerprint = _output_fingerprint(rec.output)
                 row = conn.execute(
-                    "SELECT id FROM runs WHERE environment = ? AND "
+                    "SELECT id, result, end_time, source_link, "
+                    "known_failure_reason, output_fingerprint "
+                    "FROM runs WHERE environment = ? AND "
                     "script = ? AND test_name = ? AND start_time = ?",
                     (rec.environment, rec.script, rec.test_name, start),
                 ).fetchone()
+                if (
+                    row is not None
+                    and row[1] == rec.result.value
+                    and row[2] == end
+                    and row[3] == rec.source_link
+                    and row[4] == rec.known_failure_reason
+                    and row[5] == fingerprint
+                ):
+                    unchanged += 1
+                    continue
+                hour = start[:13]
                 if row is None:
                     cursor = conn.execute(
                         "INSERT INTO runs (environment, script, test_name, "
                         "result, start_time, end_time, source_link, "
-                        "known_failure_reason) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "known_failure_reason, output_fingerprint) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             rec.environment,
                             rec.script,
@@ -1232,40 +1404,102 @@ class Storage:
                             end,
                             rec.source_link,
                             rec.known_failure_reason,
+                            fingerprint,
                         ),
                     )
                     run_id = int(cursor.lastrowid)
                     inserted += 1
+                    key = (rec.environment, hour, rec.result.value)
+                    deltas[key] = deltas.get(key, 0) + 1
                 else:
                     run_id = int(row[0])
                     conn.execute(
                         "UPDATE runs SET result = ?, end_time = ?, "
-                        "source_link = ?, "
-                        "known_failure_reason = ? WHERE id = ?",
+                        "source_link = ?, known_failure_reason = ?, "
+                        "output_fingerprint = ? WHERE id = ?",
                         (
                             rec.result.value,
                             end,
                             rec.source_link,
                             rec.known_failure_reason,
+                            fingerprint,
                             run_id,
                         ),
                     )
                     updated += 1
+                    if row[1] != rec.result.value:
+                        old_key = (rec.environment, hour, row[1])
+                        new_key = (rec.environment, hour, rec.result.value)
+                        deltas[old_key] = deltas.get(old_key, 0) - 1
+                        deltas[new_key] = deltas.get(new_key, 0) + 1
                 # The payload lives in its own table, deflated;
-                # re-importing a run replaces it.
-                conn.execute(
-                    "INSERT OR REPLACE INTO run_outputs (run_id, output) "
-                    "VALUES (?, ?)",
-                    (run_id, _compress_output(rec.output)),
-                )
+                # re-importing a run replaces it — unless the
+                # fingerprint says the stored bytes are already right,
+                # which spares the largest table in the database a
+                # delete-and-reinsert of a blob it already holds.
+                if row is None or row[5] != fingerprint:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO run_outputs "
+                        "(run_id, output) VALUES (?, ?)",
+                        (run_id, _compress_output(rec.output)),
+                    )
                 self._maintain_latest(conn, rec, run_id, start)
                 self._unretire_on_new_run(conn, rec, start)
+            self._apply_activity_deltas(conn, deltas)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        self._invalidate_trend_cache()
-        return UpsertCounts(inserted=inserted, updated=updated)
+        if inserted or updated:
+            # An all-unchanged push proved the memoized trend is still
+            # true; clearing it would make the feeder's 10-minute no-op
+            # re-push defeat the memo forever.
+            self._invalidate_trend_cache()
+        return UpsertCounts(
+            inserted=inserted, updated=updated, unchanged=unchanged
+        )
+
+    @staticmethod
+    def _apply_activity_deltas(
+        conn: sqlite3.Connection,
+        deltas: Dict[Tuple[str, str, str], int],
+    ) -> None:
+        """Apply a batch's net ``activity_hours`` changes, exactly.
+
+        SELECT-then-UPDATE-or-INSERT, per this module's portability rule
+        (no ``ON CONFLICT DO UPDATE`` on 3.6's sqlite). Rows that reach
+        zero are DELETEd, not kept: the invariant is byte equality with
+        the ``GROUP BY`` over ``runs`` (see :func:`_rebuild_activity_hours`),
+        and a GROUP BY yields no zero-count groups.
+        """
+        for (environment, hour, result), delta in sorted(deltas.items()):
+            if delta == 0:
+                continue
+            row = conn.execute(
+                "SELECT count FROM activity_hours WHERE environment = ? "
+                "AND hour = ? AND result = ?",
+                (environment, hour, result),
+            ).fetchone()
+            count = (0 if row is None else int(row[0])) + delta
+            if count <= 0:
+                conn.execute(
+                    "DELETE FROM activity_hours WHERE environment = ? "
+                    "AND hour = ? AND result = ?",
+                    (environment, hour, result),
+                )
+            elif row is None:
+                conn.execute(
+                    "INSERT INTO activity_hours "
+                    "(environment, hour, result, count) "
+                    "VALUES (?, ?, ?, ?)",
+                    (environment, hour, result, count),
+                )
+            else:
+                conn.execute(
+                    "UPDATE activity_hours SET count = ? "
+                    "WHERE environment = ? AND hour = ? AND result = ?",
+                    (count, environment, hour, result),
+                )
 
     @staticmethod
     def _previous_result(
@@ -1687,15 +1921,21 @@ class Storage:
         ad-hoc re-run triggered after a fix. Both are blocks of
         activity; only one means "everything has reported".
 
-        SUBSTR rather than a date function, so this means the same thing
-        on MariaDB (see docs/MARIADB_MIGRATION.md E.4).
+        Read from ``activity_hours`` (migration 6), not from ``runs``:
+        the GROUP BY this used to run was answered with a full scan of
+        the runs UNIQUE index — the whole history, every request, on
+        every endpoint that needs the staleness cutoff. See the
+        migration 6 comment for the measurements. *since* is quantised
+        DOWN to its hour, which can only widen the window by part of one
+        hour at the 14-day edge — and :func:`analytics.recent_cutoff`
+        clamps to the floor anyway, so an extra old bucket cannot move
+        the answer.
         """
         rows = self._conn().execute(
-            "SELECT environment, SUBSTR(start_time, 1, 13), COUNT(*) "
-            "FROM runs WHERE start_time >= ? "
-            "GROUP BY environment, SUBSTR(start_time, 1, 13) "
-            "ORDER BY environment, 2",
-            (model.format_iso(since),),
+            "SELECT environment, hour, SUM(count) FROM activity_hours "
+            "WHERE hour >= ? GROUP BY environment, hour "
+            "ORDER BY environment, hour",
+            (model.format_iso(since)[:13],),
         ).fetchall()
         return [
             (row[0], model.parse_iso(row[1] + ":00:00.000000"), int(row[2]))
@@ -2254,32 +2494,33 @@ class Storage:
     ) -> List[DailyResultCount]:
         """Run counts grouped by UTC calendar day and result.
 
-        This is the one read whose cost is set by the number of RUNS
-        rather than the number of tests: a 14-night window over a
-        12,000-test estate is ~170,000 index entries, and measured on a
-        year of history (4.4M runs) that scan is ~345ms — the rest of the
-        home screen put together is under 50ms. So the result is memoized
-        per (window, environment).
+        Read from ``activity_hours`` (migration 6): summing a window of
+        hour-resolution cells gives exactly the per-day counts the old
+        ~170,000-entry index scan produced, from a few hundred rows.
+        The memo layer predates that table (it was worth ~345ms a
+        request then); it stays because it still spares a query and a
+        parse per request and its invalidation is already correct.
+
+        *since* is quantised DOWN to its hour. Every caller passes a
+        midnight, for which the quantisation changes nothing; a caller
+        passing mid-hour would see the boundary hour counted whole.
 
         The cache is cleared by every write this process makes (see
-        :meth:`upsert_runs` and :meth:`prune_runs_before`), and entries
-        expire after :data:`_TREND_CACHE_TTL_SECONDS` so a write made by
-        a DIFFERENT process — an offline prune while the server is up —
-        cannot pin a stale trend for long. Nightly data changes once a
-        day; the chart does not need to be fresher than that.
+        :meth:`upsert_runs` and :meth:`prune_runs_before`) — but NOT by
+        a re-import that changed nothing, which is what the site feeder
+        sends every 10 minutes — and entries expire after
+        :data:`_TREND_CACHE_TTL_SECONDS` so a write made by a DIFFERENT
+        process (an offline prune while the server is up) cannot pin a
+        stale trend for long.
 
-        Only runs with ``start_time >= since`` are counted — a range scan
-        over the covering ``idx_runs_start_time_result`` index, so its
-        cost tracks the width of the window, not the size of the history
-        behind it. Days with no runs simply
-        do not appear — the caller zero-fills its display range. Ordered
-        by day, then result value.
+        Days with no runs simply do not appear — the caller zero-fills
+        its display range. Ordered by day, then result value.
         """
         sql = (
-            "SELECT substr(start_time, 1, 10) AS day, result, COUNT(*) "
-            "FROM runs WHERE start_time >= ?"
+            "SELECT SUBSTR(hour, 1, 10) AS day, result, SUM(count) "
+            "FROM activity_hours WHERE hour >= ?"
         )
-        params = [model.format_iso(since)]  # type: List[Any]
+        params = [model.format_iso(since)[:13]]  # type: List[Any]
         if environment is not None:
             sql += " AND environment = ?"
             params.append(environment)
@@ -2628,6 +2869,13 @@ class Storage:
                 "    AND p.start_time < latest_runs.start_time "
                 "  ORDER BY p.start_time DESC LIMIT 1)"
             )
+            # A prune breaks the "activity_hours == GROUP BY over runs"
+            # invariant for every touched hour, and the surviving
+            # latest-run rows make the arithmetic of a partial decrement
+            # fiddly. Rebuilding is one aggregate pass over what is LEFT
+            # — this is an offline maintenance path that just deleted
+            # most of the table, not a request handler.
+            _rebuild_activity_hours(conn)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -2700,8 +2948,9 @@ class Storage:
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        # The trend and the bucket memo are estate-wide and have just
-        # stopped being true.
+        # The memoized trend is estate-wide and has just stopped being
+        # true. (activity_hours needs no special step: it is in
+        # _ENVIRONMENT_TABLES, so the environment's rows are gone.)
         self._invalidate_trend_cache()
         return deleted
 

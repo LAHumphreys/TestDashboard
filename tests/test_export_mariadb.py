@@ -200,8 +200,12 @@ class ExportTest(unittest.TestCase):
                 [exporter.unescape(f) for f in line.split("\t")]
                 for line in handle.read().split("\n") if line
             ]
+        # Column 8 = known_failure_reason. Positional on purpose (the
+        # TSV has no header), but not row[-1]: migration 6 appended
+        # output_fingerprint, and "the last column" silently became a
+        # different question.
         reasons = sorted(
-            ("<null>" if row[-1] is None else row[-1]) for row in rows)
+            ("<null>" if row[8] is None else row[8]) for row in rows)
         self.assertEqual(reasons, ["<null>", "known"])
         # And the empty source_link must NOT have become a NULL: the
         # column is NOT NULL and empty links are routine, so confusing

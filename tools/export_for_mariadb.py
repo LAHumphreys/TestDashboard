@@ -52,6 +52,7 @@ TABLE_ORDER = (
     "current_assignments",
     "test_retirements",
     "environment_expectations",
+    "activity_hours",
     "schema_version",
 )
 
@@ -73,6 +74,8 @@ VERIFY_QUERIES = (
     ("retirements_total", "SELECT COUNT(*) FROM test_retirements"),
     ("expectations_total",
      "SELECT COUNT(*) FROM environment_expectations"),
+    ("activity_total",
+     "SELECT COUNT(*), SUM(count) FROM activity_hours"),
     ("schema_version", "SELECT version FROM schema_version"),
     ("run_span", "SELECT MIN(start_time), MAX(start_time) FROM runs"),
     ("output_bytes",
@@ -144,6 +147,7 @@ CREATE TABLE runs (
   end_time             {stamp} NOT NULL,
   source_link          VARCHAR(1024) NOT NULL,
   known_failure_reason TEXT NULL,
+  output_fingerprint   VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uq_runs_identity (environment, script, test_name, start_time)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
@@ -211,6 +215,14 @@ CREATE TABLE environment_expectations (
   updated_at     {stamp} NOT NULL,
   updated_by     {user} NOT NULL,
   PRIMARY KEY (environment)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE activity_hours (
+  environment {env} NOT NULL,
+  hour        VARCHAR(13) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  result      {result} NOT NULL,
+  count       INT NOT NULL,
+  PRIMARY KEY (environment, hour, result)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE schema_version (

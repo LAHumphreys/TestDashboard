@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from testboard import api
 from testboard.model import format_iso
-from testboard.storage import DASHBOARD_SORTS, Storage
+from testboard.storage import DASHBOARD_SORTS, QUEUE_KINDS, Storage
 
 #: Fixed clock injected into handle_api for deterministic timestamps.
 NOW = datetime.datetime(2026, 7, 26, 12, 0, 0)
@@ -184,7 +184,10 @@ class TestImport(ApiCase):
         )
         self.assertEqual(
             data,
-            {"inserted": 2, "updated": 0, "rejected": 0, "errors": []},
+            {
+                "inserted": 2, "updated": 0, "unchanged": 0,
+                "rejected": 0, "errors": [],
+            },
         )
 
     def test_reimport_updates_without_duplicates(self) -> None:
@@ -192,7 +195,11 @@ class TestImport(ApiCase):
         self.import_runs(batch)
         data = self.import_runs(batch)
         self.assertEqual(data["inserted"], 0)
+        # On the wire "updated" still counts every accepted, already-known
+        # record — deployed feeders sum it — while "unchanged" refines it:
+        # both records were byte-identical, so nothing was written.
         self.assertEqual(data["updated"], 2)
+        self.assertEqual(data["unchanged"], 2)
         rows = self.call("GET", "/api/dashboard")["tests"]
         self.assertEqual(len(rows), 2)
 
@@ -200,7 +207,10 @@ class TestImport(ApiCase):
         data = self.import_runs([])
         self.assertEqual(
             data,
-            {"inserted": 0, "updated": 0, "rejected": 0, "errors": []},
+            {
+                "inserted": 0, "updated": 0, "unchanged": 0,
+                "rejected": 0, "errors": [],
+            },
         )
 
     def test_mixed_batch_partial_rejection_with_identity(self) -> None:
@@ -2431,3 +2441,96 @@ class TestEnvironmentUpdated(ApiCase):
             "GET", "/api/summary",
             query={"environment": ["linux-sim"]})["environment_updated"]
         self.assertEqual(sorted(updated), ["linux-sim", "win-sim"])
+
+
+class SummaryPartsTest(ApiCase):
+    """The parts split must be a PARTITION of the full payload.
+
+    Borrows TestSummary's seeded estate (the method, not the class —
+    subclassing would re-run every TestSummary test under this name).
+    Every assertion here compares a slice against the whole rather than
+    against hand-written values: the contract being pinned is "the
+    split cannot drift from the monolith", which hand-written
+    expectations could not express.
+    """
+
+    seed = TestSummary.seed
+
+    def _assign(self, name: str, who: str) -> None:
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", name, "/assignee"),
+            body={"username": who, "assigned_by": "bob"},
+        )
+
+    def test_headline_is_the_full_payload_minus_queue_rows(self) -> None:
+        self.seed()
+        self._assign("test_still_fail", "alice")
+        query = {"assignee": ["alice"]}
+        full = self.call("GET", "/api/summary", query=query)
+        headline = self.call(
+            "GET", "/api/summary",
+            query={"assignee": ["alice"], "parts": ["headline"]})
+        expected = {
+            key: value for key, value in full.items() if key != "queues"
+        }
+        self.assertEqual(headline, expected)
+        self.assertNotIn("queues", headline)
+
+    def test_queue_totals_agree_with_the_queues_themselves(self) -> None:
+        self.seed()
+        self._assign("test_still_fail", "alice")
+        full = self.call(
+            "GET", "/api/summary", query={"assignee": ["alice"]})
+        self.assertEqual(
+            full["queue_totals"],
+            {
+                kind: queue["total"]
+                for kind, queue in full["queues"].items()
+            },
+        )
+
+    def test_each_queue_part_matches_the_full_payload(self) -> None:
+        self.seed()
+        self._assign("test_still_fail", "alice")
+        full = self.call(
+            "GET", "/api/summary", query={"assignee": ["alice"]})
+        for kind in list(QUEUE_KINDS) + ["mine"]:
+            part = self.call(
+                "GET", "/api/summary",
+                query={
+                    "assignee": ["alice"],
+                    "parts": ["queue"],
+                    "queue": [kind],
+                })
+            self.assertEqual(part["kind"], kind)
+            self.assertEqual(part["queue"], full["queues"][kind], kind)
+            self.assertEqual(part["stale_before"], full["stale_before"])
+            self.assertEqual(part["queue_cap"], full["queue_cap"])
+
+    def test_environment_scope_applies_to_a_queue_part(self) -> None:
+        self.seed()
+        part = self.call(
+            "GET", "/api/summary",
+            query={
+                "parts": ["queue"], "queue": ["new_failures"],
+                "environment": ["env2"],
+            })
+        self.assertEqual(
+            [entry["test_name"] for entry in part["queue"]["tests"]],
+            ["test_first"],
+        )
+
+    def test_unknown_parts_or_queue_is_a_400(self) -> None:
+        self.seed()
+        error = self.call(
+            "GET", "/api/summary", query={"parts": ["everything"]},
+            expect=400)
+        self.assertIn("parts", error["error"])
+        error = self.call(
+            "GET", "/api/summary",
+            query={"parts": ["queue"], "queue": ["bogus"]}, expect=400)
+        self.assertIn("queue", error["error"])
+        error = self.call(
+            "GET", "/api/summary", query={"parts": ["queue"]}, expect=400)
+        self.assertIn("queue", error["error"])
