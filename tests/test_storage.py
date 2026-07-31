@@ -30,6 +30,19 @@ BASE = datetime.datetime(2026, 7, 1, 2, 0, 0)
 CREATED = datetime.datetime(2026, 7, 1, 9, 0, 0)
 
 
+def trace_sql_into(conn: sqlite3.Connection, into: List[str]) -> None:
+    """Register a trace callback that appends each statement to *into*.
+
+    Not ``conn.set_trace_callback(into.append)``: 3.6's sqlite3 keeps
+    registered callbacks in an internal dict, so the callable must be
+    hashable, and a bound ``list.append`` hashes via the list — a
+    TypeError on the deployment interpreter. 3.8+ stores the callback
+    as a plain attribute, so the difference is invisible on any dev
+    machine. The lambda is the fix, not decoration.
+    """
+    conn.set_trace_callback(lambda statement: into.append(statement))
+
+
 def make_record(
     environment: str = "linux-sim",
     script: str = "suite.py",
@@ -1036,7 +1049,7 @@ class TestMigrationThreeBackfill(unittest.TestCase):
         store = Storage(self.db_path)
         self.addCleanup(store.close)
         conn = store._conn()
-        conn.set_trace_callback(seen.append)
+        trace_sql_into(conn, seen)
         try:
             storage._backfill_latest_durations(conn)
         finally:
@@ -1070,30 +1083,15 @@ class TestNoSqliteDateFunctions(unittest.TestCase):
         those are what get scanned — and docstrings are excluded,
         because prose explaining why julianday was removed must not
         register as a use of it.
+
+        The scan itself is test_sql_portability's — same file, same
+        docstring exclusion, and that copy knows the 3.6 parser emits
+        ``ast.Str`` where 3.8+ emits ``ast.Constant``. A second copy
+        here had only the Constant arm and found nothing on the ubi8
+        CI leg, which is exactly the drift sharing prevents.
         """
-        import ast
-        import io
-        path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "testboard", "storage.py")
-        with io.open(path, encoding="utf-8") as handle:
-            tree = ast.parse(handle.read(), filename=path)
-
-        docstrings = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Module, ast.ClassDef,
-                                 ast.FunctionDef, ast.AsyncFunctionDef)):
-                body = getattr(node, "body", None)
-                if body and isinstance(body[0], ast.Expr):
-                    docstrings.add(id(body[0].value))
-
-        found = []  # type: List[str]
-        for node in ast.walk(tree):
-            if id(node) in docstrings:
-                continue
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                found.append(node.value)
-        return found
+        from tests.test_sql_portability import sql_literals
+        return sql_literals()
 
     def test_the_literal_scan_finds_the_sql(self) -> None:
         """A scan that matched nothing would pass forever."""
@@ -2270,7 +2268,7 @@ class TestRecentResults(StorageTestBase):
     def test_no_triples_issues_no_query_at_all(self) -> None:
         seen = []  # type: List[str]
         conn = self.store._conn()
-        conn.set_trace_callback(seen.append)
+        trace_sql_into(conn, seen)
         try:
             self.assertEqual(self.store.recent_results([], BASE), {})
         finally:
@@ -2286,7 +2284,7 @@ class TestRecentResults(StorageTestBase):
         triples = self._seed(250, 4)
         seen = []  # type: List[str]
         conn = self.store._conn()
-        conn.set_trace_callback(seen.append)
+        trace_sql_into(conn, seen)
         try:
             history = self.store.recent_results(
                 triples, BASE - datetime.timedelta(days=1))
@@ -2302,7 +2300,7 @@ class TestRecentResults(StorageTestBase):
         triples = self._seed(2, 2)
         seen = []  # type: List[str]
         conn = self.store._conn()
-        conn.set_trace_callback(seen.append)
+        trace_sql_into(conn, seen)
         try:
             self.store.recent_results(triples + triples + triples, BASE)
         finally:
@@ -2344,7 +2342,7 @@ class TestSortIndexesAreUsed(StorageTestBase):
         """
         captured = []  # type: List[str]
         conn = self.store._conn()
-        conn.set_trace_callback(captured.append)
+        trace_sql_into(conn, captured)
         try:
             self.store.dashboard(
                 sort=sort, descending=descending, limit=250, offset=0)
