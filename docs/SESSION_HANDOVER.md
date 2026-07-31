@@ -4,8 +4,8 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-07-30, late**, after building the 2026-07-31 drop overnight on
-the user's instruction ("this will be it for tomorrow's drop").
+Last rewritten: **2026-07-31, morning**, after repairing CI — all three legs
+(3.14 / 3.8 / **3.6.8 ubi8**) are green for the first time since 07-27.
 
 ---
 
@@ -15,12 +15,18 @@ the user's instruction ("this will be it for tomorrow's drop").
 |---|---|
 | `origin/master` | `982c28e` — **deployed**: the 2026-07-30 drop is live in production |
 | `origin/candidate-keepalive-fix` | `3ce6b93` — tests+docs only, runtime-identical to master; **not merged yet** |
-| `wp-17-summary-perf` | **the 2026-07-31 drop** — built on `3ce6b93`, so merging it also lands the candidate |
+| `wp-17-summary-perf` | **the 2026-07-31 drop** — built on `3ce6b93`, so merging it also lands the candidate. Head `64a3468`: two CI-repair commits on top of the WP-17 work, test-code only |
 | `wp-14-in-run-progress` | parked WIP; see the migration renumbering warning below |
 
 Suite: **1288 green** (skipped 1) on `wp-17-summary-perf`, up from 1268. Schema moves
 to **migration 6** — the first migration since launch, so **the rollback is the
 database copy**, not `git checkout`.
+
+CI: **all three legs green at `64a3468`**, including the authoritative 3.6.8
+ubi8 container (skipped=5 there is expected — version-gated grammar tests).
+The 3.8/3.6 legs had been red since 07-27; all four causes were test-code
+only, and master inherits the fixes when this branch merges. Story and
+lessons: the status log's "CI repair, 2026-07-31" entry.
 
 Production database is ~900 MB / ~4.4M runs on a network mount. The repo-root
 `testboard.db` is generated dev data (218 MB, 540,192 runs); `validate.db` is the

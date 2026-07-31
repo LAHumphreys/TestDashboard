@@ -1156,3 +1156,40 @@ Same honest line as the last drop: **no browser, no production numbers.**
 Everything measured here is the 218 MB dev copy on a developer machine; the
 plan's Phase 2 (streaks, queue payloads, worker count) is parked until one
 night of production perf log after this drop re-ranks the remaining terms.
+
+## CI repair, 2026-07-31 — the 3.8 and 3.6 legs had been red since 07-27
+
+Every leg except 3.14 was red from the moment the full local history reached
+GitHub. All four causes were in **test code**, none in shipped code, and every
+one was invisible on a modern interpreter — which is the entire reason those
+legs exist. Fixed in two commits on `wp-17-summary-perf` (`17b8b4b`,
+`64a3468`); all three legs are now green on the full 1288, including the
+authoritative ubi8/python-3.6.8 container.
+
+What each failure taught, briefly (details in the commit messages):
+
+1. `test_storage.py` used `Tuple` in an annotation without importing it —
+   latent since WP-8, silent under PEP 649's lazy annotations, an ImportError
+   on 3.6/3.8 that dropped all 209 of the module's tests from discovery.
+   **Guard widened:** the compat gate's annotation-evaluation sweep now covers
+   `tests/` too, and was proven able to catch exactly this by reverting the
+   fix and watching it fail on 3.14.
+2. `ast.parse(feature_version=(3,6))` is only *enforced* from 3.9 (PEG
+   parser); 3.8 accepts the walrus anyway. The planted regression caught it —
+   the grammar-gate tests now skip below 3.9 instead of pretending.
+3. Two copies of the storage.py literal scan matched only `ast.Constant`;
+   the 3.6 parser emits `ast.Str`, so on the deployment interpreter the scan
+   found nothing and every count "passed" over an empty list. The
+   scan-finds-something tripwires fired as designed. One copy now handles
+   both node types; the other delegates to it.
+4. Two runtime-library differences: 3.6's sqlite3 requires registered
+   callbacks to be hashable (`set_trace_callback(list.append)` is a
+   TypeError there and fine on 3.8+), and SQLite 3.36 changed query-plan
+   wording (`SEARCH TABLE runs` → `SEARCH runs`), which one diagnose_db
+   assertion had pinned to the modern spelling.
+
+The meta-lesson, worth the ink: **the gates that failed were doing their
+job.** Each red leg was a true positive, and the one gap — nothing forced
+test annotations to evaluate on a lazy interpreter — is now closed. The ubi8
+leg runs the suite with `skipped=5` (the four version-gated grammar tests
+plus the standing skip); that number is expected, not a regression.
