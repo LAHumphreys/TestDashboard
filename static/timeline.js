@@ -44,6 +44,10 @@ import {
   showError,
 } from "./api.js";
 
+/* How far back "Earlier runs…" reaches: the server's own cap, which
+ * matches retention — so it means "any recorded run", not a teaser. */
+const LONG_LOOKBACK_DAYS = 365;
+
 const state = {
   environment: null,
   blocks: [],
@@ -52,6 +56,9 @@ const state = {
    * client-side date round-trip. null means "newest block". */
   from: null,
   to: null,
+  /* null = the server's default fortnight; LONG_LOOKBACK_DAYS once
+   * somebody asks for earlier runs. */
+  days: null,
   rows: [],
   seq: 0,
 };
@@ -59,6 +66,9 @@ const state = {
 function timelineUrl() {
   const qs = new URLSearchParams();
   qs.append("environment", state.environment);
+  if (state.days !== null) {
+    qs.append("days", String(state.days));
+  }
   if (state.from !== null && state.to !== null) {
     qs.append("from", state.from);
     qs.append("to", state.to);
@@ -81,6 +91,9 @@ function syncUrl() {
   url.search = "";
   if (state.environment) {
     url.searchParams.set("environment", state.environment);
+  }
+  if (state.days !== null) {
+    url.searchParams.set("days", String(state.days));
   }
   if (state.from !== null && state.to !== null) {
     url.searchParams.set("from", state.from);
@@ -134,8 +147,15 @@ function renderBlockPicker() {
     option.value = String(index);
     select.appendChild(option);
   });
-  if (!state.blocks.length) {
-    const option = el("option", "", "no recent activity");
+  // Every recorded run is reachable, not just the recent fortnight —
+  // but the long view is fetched only when somebody asks for it.
+  if (state.days !== LONG_LOOKBACK_DAYS) {
+    const more = el("option", "", "Earlier runs… (up to a year)");
+    more.value = "__earlier__";
+    select.appendChild(more);
+  }
+  if (!state.blocks.length && state.days === LONG_LOOKBACK_DAYS) {
+    const option = el("option", "", "no recorded activity");
     option.value = "";
     select.appendChild(option);
     select.disabled = true;
@@ -144,7 +164,8 @@ function renderBlockPicker() {
   select.disabled = false;
   const chosen = state.blocks.findIndex(
     (block) => block.started === state.from && block.ended === state.to);
-  select.value = String(chosen === -1 ? 0 : chosen);
+  select.value = state.blocks.length
+    ? String(chosen === -1 ? 0 : chosen) : "__earlier__";
 }
 
 function render(data) {
@@ -230,6 +251,16 @@ function consumePendingLocate(data) {
       block.started <= pending.at
       && (pending.at <= block.ended
           || pending.at.slice(0, 13) === block.ended.slice(0, 13)));
+    if (!containing && state.days !== LONG_LOOKBACK_DAYS
+        && state.blocks.length
+        && pending.at < state.blocks[state.blocks.length - 1].started) {
+      // The run predates the default fortnight (a history-row link can
+      // point anywhere in retention): widen once and look again.
+      state.days = LONG_LOOKBACK_DAYS;
+      syncUrl();
+      load();          // still pending; next render decides
+      return;
+    }
     const shownFrom = data.window === null ? null : data.window.from;
     if (containing && containing.started !== shownFrom) {
       state.from = containing.started;
@@ -257,6 +288,10 @@ let currentMark = null;
 /* Set per render by wireFailureNav; lets a search or deep-link landing
  * re-base the stepper's position. null when there are no failures. */
 let failureNavSync = null;
+
+/* Also set per render: g / G park the cursor before the first failure
+ * or after the last, so the next n / p sweeps from that edge. */
+let failureNavReset = null;
 
 function markCurrent(tr) {
   if (currentMark) {
@@ -300,6 +335,7 @@ function wireFailureNav() {
   });
   nav.hidden = total === 0;
   failureNavSync = null;
+  failureNavReset = null;
   if (!total) {
     return;
   }
@@ -361,6 +397,17 @@ function wireFailureNav() {
     if (target >= 0) {
       jumpTo(target);
     }
+  };
+
+  /* g / G: park the cursor at an edge so the sweep restarts there.
+   * The counter goes back to the total form — no position is claimed
+   * that the stepper is not actually on. */
+  failureNavReset = (edge) => {
+    cursor = edge === "top" ? -1 : total - 0.5;
+    pos.textContent = total === 1
+      ? "1 failing test" : total + " failing tests";
+    prev.disabled = Math.ceil(cursor) - 1 < 0;
+    next.disabled = Math.floor(cursor) + 1 > total - 1;
   };
 
   /* How a search or deep-link landing re-bases the stepper. Args: the
@@ -841,6 +888,10 @@ function handleHotkey(event) {
       if (window.scrollTo) {
         window.scrollTo({ top: 0, behavior: "smooth" });
       }
+      if (failureNavReset) {
+        failureNavReset("top");    // next n sweeps from the first
+        markCurrent(null);
+      }
       break;
     case "G":
       if (window.scrollTo) {
@@ -848,6 +899,10 @@ function handleHotkey(event) {
           top: document.body ? document.body.scrollHeight : 0,
           behavior: "smooth",
         });
+      }
+      if (failureNavReset) {
+        failureNavReset("bottom"); // next p sweeps from the last
+        markCurrent(null);
       }
       break;
     case "?": {
@@ -901,6 +956,9 @@ async function init() {
     state.from = params.get("from");
     state.to = params.get("to");
   }
+  if (params.get("days")) {
+    state.days = Number(params.get("days")) || null;
+  }
   if (params.get("test") && params.get("script")) {
     pendingLocate = {
       script: params.get("script"),
@@ -927,6 +985,11 @@ async function init() {
   searchBox.addEventListener("change", (event) => {
     const value = event.target.value.trim();
     if (value) {
+      // Enter both jumps AND leaves the box — vi's exit from insert
+      // mode — so n / p step failures immediately instead of typing.
+      if (event.target.blur) {
+        event.target.blur();
+      }
       locateTest(value);
     }
   });
@@ -937,6 +1000,12 @@ async function init() {
 
   document.getElementById("timeline-block")
     .addEventListener("change", (event) => {
+      if (event.target.value === "__earlier__") {
+        state.days = LONG_LOOKBACK_DAYS;   // keep the selected window
+        syncUrl();
+        load();
+        return;
+      }
       const block = state.blocks[Number(event.target.value)];
       if (!block) {
         return;

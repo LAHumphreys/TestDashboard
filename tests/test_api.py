@@ -2691,6 +2691,25 @@ class TimelineTest(ApiCase):
             expect=400)
         self.assertIn("ISO-8601", error["error"])
 
+    def test_days_reaches_retention_and_no_further(self) -> None:
+        """The picker's "Earlier runs" promise: a year, exactly.
+
+        365 is what lets "view any recorded run's night" be a true
+        sentence, and the ceiling is what keeps the block list a read
+        of activity_hours somebody asked for rather than an unbounded
+        one.
+        """
+        self._standard_nights()
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"], "days": ["365"]})
+        self.assertEqual(data["days"], 365)
+        error = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"], "days": ["366"]},
+            expect=400)
+        self.assertIn("365", error["error"])
+
     def test_wrong_method_is_405(self) -> None:
         self.assert_405("POST", "/api/timeline", "GET")
 

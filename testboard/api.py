@@ -103,8 +103,14 @@ _EXECUTION_GAP_MINUTES = 60
 # per-execution run listing (a script execution is at most a few
 # thousand runs; the cap is a backstop against a mis-sized window, and
 # the response says when it bit).
+#
+# The max matches retention (~a year), so "view any recorded run's
+# night" is a true sentence: the picker's "Earlier runs" reaches the
+# whole file. Affordable because the block list reads activity_hours,
+# never runs — a year of buckets is ~100k tiny rows, read only when
+# somebody explicitly asks for the long view.
 _TIMELINE_DEFAULT_DAYS = 14
-_TIMELINE_MAX_DAYS = 90
+_TIMELINE_MAX_DAYS = 365
 _TIMELINE_MAX_RUNS = 5000
 
 #: Queues whose entries report failing_since / last_pass_time. Only these
