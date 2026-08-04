@@ -1269,3 +1269,39 @@ colour and contrast remain unverified by any human eye, as ever.
 exporter learned `script_hours` because its parity test failed the build
 the moment the table existed — exactly as designed. The runbook's port
 notes (§F) gained the recompute-path paragraph.
+
+## WP-18 refinements re-measured, 2026-08-04 (later the same day)
+
+After a round of UX refinements from first use (whole-row click targets,
+per-test output expansion, the failing-test stepper with search/deep-link
+re-basing, "Find test", "View in timeline" from every output view, the
+365-day "Earlier runs" lookback, vi-ish keys), the endpoint analysis was
+repeated to confirm nothing degraded. Same method: origin/master worktree
+vs the branch, interleaved runs, dev copy (218 MB, 540,192 runs — NOT
+production).
+
+**No regression.** The decisive check was a CROSS test — new code serving
+a fresh copy of the baseline's own database file, interleaved with old
+code — because the first comparison confounded code with file layout (the
+v7 file carries script_hours pages). Interleaved medians, same file:
+`/api/summary` old 61.7/59.4/62.6 ms vs new 60.9/58.0/58.9 ms;
+`parts=headline` ranges overlap entirely (33–48 old, 33–43 new), with the
+single worst rep belonging to the OLD build. This machine's own
+run-to-run band (p95 78–133 ms on an identical build) is wider than any
+before/after delta observed.
+
+**The refinements' own paths, measured** (current build, dev copy):
+default `/api/timeline` 11.6 ms median (unchanged); row expansion 1.8 ms;
+the on-demand year view (`days=365`, 45 blocks) 27.6 ms median / 43 ms
+p95 — read from the bucket tables only, fetched only when "Earlier runs"
+or an old deep link asks; the search box's debounced suggestion query
+(`/api/dashboard?q&limit=20`) 9.5 ms median.
+
+**Import path: not re-measured, by argument rather than omission** —
+`git diff` since the measured commit shows storage.py untouched (the only
+backend change is api.py's day-cap constant), so the first pass's numbers
+stand: fresh unchanged, no-op re-push still write-free, worst-case
+all-flip batch +14%.
+
+Production caveat as always: these are dev-copy constants; the mount sets
+the real ones, and the migration probe on a prod copy remains the gate.
