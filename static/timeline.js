@@ -35,10 +35,12 @@ import {
   clearNode,
   el,
   fetchJson,
+  fillOutput,
   formatDuration,
   formatTime,
   renderUserWidget,
   resultChip,
+  runApiPath,
   showError,
 } from "./api.js";
 
@@ -151,7 +153,7 @@ function render(data) {
   const rowsHost = document.getElementById("timeline-rows");
   const axis = document.getElementById("timeline-axis");
   const empty = document.getElementById("timeline-empty");
-  const jump = document.getElementById("first-failure");
+  const failureNav = document.getElementById("failure-nav");
   clearNode(rowsHost);
   clearNode(axis);
 
@@ -163,7 +165,7 @@ function render(data) {
         + " days for this environment."
       : "Nothing ran in this window.";
     empty.hidden = false;
-    jump.hidden = true;
+    failureNav.hidden = true;
     return;
   }
   empty.hidden = true;
@@ -203,14 +205,68 @@ function render(data) {
     rowsHost.appendChild(buildRow(row, domainFrom, span, dayCount > 1));
   });
 
-  const firstFailure = state.rows.findIndex((row) => row.failed > 0);
-  jump.hidden = firstFailure === -1;
-  jump.onclick = () => {
-    const target = rowsHost.children[firstFailure];
+  wireFailureNav(rowsHost);
+}
+
+/** Step between the rows that contain failures.
+ *
+ * A shortcut for the common read, and deliberately no more than that:
+ * in this system a script whose tests all PASS can still be the one
+ * that dirtied shared data, so the culprit is not guaranteed to be red.
+ * These buttons save the scrolling; the running order stays the
+ * evidence.
+ */
+function wireFailureNav(rowsHost) {
+  const nav = document.getElementById("failure-nav");
+  const prev = document.getElementById("prev-failure");
+  const next = document.getElementById("next-failure");
+  const pos = document.getElementById("failure-pos");
+
+  const failing = [];
+  state.rows.forEach((row, index) => {
+    if (row.failed > 0) {
+      failing.push(index);
+    }
+  });
+  nav.hidden = failing.length === 0;
+  if (!failing.length) {
+    return;
+  }
+
+  /* Position within `failing`, -1 before the first jump. Local to this
+   * render on purpose: new rows mean a new hunt. */
+  let cursor = -1;
+
+  const jumpTo = (position) => {
+    if (cursor >= 0) {
+      rowsHost.children[failing[cursor]].children[0]
+        .classList.remove("tl-current");
+    }
+    cursor = position;
+    const target = rowsHost.children[failing[cursor]];
+    target.children[0].classList.add("tl-current");
     target.scrollIntoView({ behavior: "smooth", block: "center" });
     const toggle = target.querySelector(".tl-expand");
     if (toggle && toggle.getAttribute("aria-expanded") === "false") {
       toggle.click();
+    }
+    pos.textContent = (cursor + 1) + " of " + failing.length;
+    prev.disabled = cursor <= 0;
+    next.disabled = cursor >= failing.length - 1;
+  };
+
+  pos.textContent = failing.length === 1
+    ? "1 row" : failing.length + " rows";
+  prev.disabled = true;
+  next.disabled = false;
+  next.onclick = () => {
+    if (cursor < failing.length - 1) {
+      jumpTo(cursor + 1);
+    }
+  };
+  prev.onclick = () => {
+    if (cursor > 0) {
+      jumpTo(cursor - 1);
     }
   };
 }
@@ -233,6 +289,21 @@ function buildRow(row, domainFrom, span, showDate) {
   toggle.setAttribute("aria-expanded", "false");
   toggle.title = "Show this run's tests, in running order";
   line.appendChild(toggle);
+
+  /* The whole row is a click target — a 22px triangle is a test of
+   * aim, not a control. The button stays: it is the keyboard-reachable,
+   * screen-reader-announced control, and the row click just drives it.
+   * Clicks on the script link (and on the button itself, which would
+   * otherwise arrive twice via bubbling) are left alone. */
+  line.classList.add("tl-clickable");
+  line.addEventListener("click", (event) => {
+    const interactive = event.target.closest
+      ? event.target.closest("a, .tl-expand") : null;
+    if (interactive) {
+      return;
+    }
+    toggle.click();
+  });
 
   /* On a window spanning more than one calendar day a bare clock time
    * is ambiguous, so the date comes back. */
@@ -322,8 +393,8 @@ function renderDetail(detail, data) {
   const table = el("table", "data-table small");
   const head = el("thead");
   const headRow = el("tr");
-  ["Started", "Test", "Result", "Duration"].forEach((label, index) => {
-    headRow.appendChild(el("th", index === 3 ? "num" : "", label));
+  ["", "Started", "Test", "Result", "Duration"].forEach((label, index) => {
+    headRow.appendChild(el("th", index === 4 ? "num" : "", label));
   });
   head.appendChild(headRow);
   table.appendChild(head);
@@ -331,7 +402,16 @@ function renderDetail(detail, data) {
   const body = el("tbody");
   let firstFailMarked = false;
   data.runs.forEach((run) => {
-    const tr = el("tr");
+    const tr = el("tr", "tl-run-row");
+
+    const runToggle = el("button", "tl-expand", "▸");
+    runToggle.type = "button";
+    runToggle.setAttribute("aria-expanded", "false");
+    runToggle.title = "Show this run's captured output";
+    const toggleCell = el("td", "tl-run-toggle");
+    toggleCell.appendChild(runToggle);
+    tr.appendChild(toggleCell);
+
     tr.appendChild(el("td", "", formatTime(run.start_time).slice(11)));
 
     const cell = el("td", "wrap");
@@ -356,6 +436,54 @@ function renderDetail(detail, data) {
     tr.appendChild(el("td", "num",
       formatDuration(run.duration_seconds)));
     body.appendChild(tr);
+
+    /* The output row is built now and hidden, so opening it is a flip
+     * plus (once) a fetch — no row insertion, no reflow surprises. The
+     * output itself is fetched on first open only: it is the one big
+     * payload in the system, and this table can hold a hundred rows. */
+    const outputRow = el("tr", "tl-output-row");
+    outputRow.hidden = true;
+    const outputCell = el("td", "");
+    outputCell.setAttribute("colspan", "5");
+    const pre = el("pre", "tl-output");
+    outputCell.appendChild(pre);
+    outputRow.appendChild(outputCell);
+    body.appendChild(outputRow);
+
+    let outputLoaded = false;
+    runToggle.addEventListener("click", async () => {
+      const open = runToggle.getAttribute("aria-expanded") === "true";
+      runToggle.setAttribute("aria-expanded", open ? "false" : "true");
+      runToggle.textContent = open ? "▸" : "▾";
+      outputRow.hidden = open;
+      if (outputLoaded || open) {
+        return;
+      }
+      outputLoaded = true;   // one fetch per run, however often it toggles
+      pre.textContent = "Loading output…";
+      try {
+        const full = await fetchJson(runApiPath(run.run_id));
+        const truncated = fillOutput(pre, full.output);
+        if (truncated) {
+          outputCell.appendChild(el("p", "muted cap-note",
+            truncated + " Open the test page for all of it."));
+        }
+      } catch (err) {
+        outputLoaded = false;  // let a retry re-fetch after a failure
+        pre.textContent = "Could not load the output: " + err.message;
+      }
+    });
+
+    /* Same convenience as the script rows: the row is the target, the
+     * button is the control. The test-name link keeps its own job. */
+    tr.addEventListener("click", (event) => {
+      const interactive = event.target.closest
+        ? event.target.closest("a, .tl-expand") : null;
+      if (interactive) {
+        return;
+      }
+      runToggle.click();
+    });
   });
   table.appendChild(body);
   wrapper.appendChild(table);

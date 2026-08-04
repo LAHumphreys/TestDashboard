@@ -45,9 +45,15 @@
       <label>Run
         <select id="timeline-block"></select>
       </label>
-      <button id="first-failure" class="toggle" type="button" hidden>
-        Jump to first failure
-      </button>
+      <!-- Steps between rows containing failures. A shortcut, not the
+           verdict: in this system even a script whose tests all pass can
+           leave shared data dirty, so the running order stays primary. -->
+      <span id="failure-nav" class="failure-nav" hidden>
+        <span class="muted">Failing rows</span>
+        <button id="prev-failure" class="toggle" type="button">‹ Prev</button>
+        <span id="failure-pos" class="muted failure-pos"></span>
+        <button id="next-failure" class="toggle" type="button">Next ›</button>
+      </span>
     </div>
 
     <div class="card timeline-card">

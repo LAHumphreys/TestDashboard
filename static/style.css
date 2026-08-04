@@ -1761,3 +1761,53 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
   .tl-track { display: none; }
   .tl-detail { padding-left: 22px; }
 }
+
+/* The whole row toggles its expansion (the triangle is the accessible
+   control, not the only target); say so on hover. */
+.tl-row.tl-clickable { cursor: pointer; }
+.tl-row.tl-clickable:hover { background: var(--surface); }
+
+.tl-run-row { cursor: pointer; }
+.tl-run-toggle { width: 22px; }
+.data-table td.tl-run-toggle { padding-right: 0; }
+
+/* A run's captured output, inline. Scrolls inside its row rather than
+   growing the page: a failing test can dump a great deal, and the point
+   of reading it HERE is keeping your place in the running order. */
+.tl-output {
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.tl-output.muted { color: var(--muted); }
+
+/* Failure stepper: prev / "2 of 5" / next. */
+.failure-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.failure-pos {
+  min-width: 52px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Where the failure stepper currently is. An outline, not a fill: it
+   marks position, it does not rank the row. */
+.tl-row.tl-current {
+  outline: 2px solid var(--accent-link);
+  outline-offset: -2px;
+  border-radius: 4px;
+}

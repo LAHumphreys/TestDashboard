@@ -49,10 +49,16 @@
           about at the top; earlier runs are in the same picker.</li>
         <li><strong>It exists for the "poisoned data" hunt.</strong> When a
           test fails because some earlier script left data in a bad state,
-          the culprit is above it in this list. <em>Jump to first
-          failure</em> takes you to the first row that went red, and
-          expanding any row lists its tests in running order — with the
-          first failure inside that run marked.</li>
+          the culprit is somewhere above it in this list. Click anywhere on
+          a row to open it — its tests appear in running order, with the
+          first failure inside that run marked — and click any test to read
+          its captured output right there, without losing your place in
+          the order.</li>
+        <li><strong>Failing rows: Prev / Next</strong> steps you between the
+          rows that contain failures, in order. A handy shortcut — but only
+          a shortcut: a script can "pass" and still leave data in a bad
+          state, so the culprit is not always a red row. Reading the
+          running order around the victim is still the real hunt.</li>
         <li><strong>Partial runs are visible as partial.</strong> A row that
           says <em>"41 of 45 known tests"</em> (in amber) means the script
           ran fewer tests than it usually reports — a cut-short or partial
