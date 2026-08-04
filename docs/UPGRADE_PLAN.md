@@ -95,16 +95,24 @@ after a merge.
 | 4 | Perf pass | Sort indexes on `latest_runs` | No |
 | 5 | WP-13 | `environment_expectations` table | No |
 | 6 | WP-17 | `activity_hours` table, `runs.output_fingerprint` | Yes — see §1.2 |
-| 7 | WP-15 | `run_progress` table *(renumbered from 6 — see below)* | No |
-| 8+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 7 | WP-18 | `script_hours` table *(took 7 from WP-15 — see below)* | Yes — see §1.2 |
+| 8 | WP-15 | `run_progress` table *(renumbered from 6, then from 7 — see below)* | No |
+| 9+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Why 6 and 7 swapped (2026-07-30).** Versions must ship contiguously —
 `tests/test_migrations.py` enforces it, and a database at version 7 with no 6
 behind it could never take 6 retroactively. WP-15's claim on 6 lived only on
 the parked `wp-14-in-run-progress` branch, while WP-17 had to ship first, so
-WP-17 took 6 and WP-15 moved to 7. **When the WIP branch comes back it must
-renumber its migration entry to 7 before merging** — the registry is the
-coordination point, and this note is the hand-off.
+WP-17 took 6 and WP-15 moved to 7.
+
+**And why 7 and 8 swapped too (2026-08-04).** The same situation a second
+time: WP-18 (Timeline) shipped while `wp-14-in-run-progress` was still
+parked, so the ship-first package took the next contiguous number and the
+parked claim moved back one. This is now the established pattern — a parked
+claim is a RESERVATION, not a number: whatever ships next takes the lowest
+unshipped version, and the reservation follows it up. **When the WIP branch
+comes back it must renumber its migration entry to 8 before merging** — the
+registry is the coordination point, and this note is the hand-off.
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry
@@ -813,7 +821,7 @@ WP-13 is for.
 
 ---
 
-### WP-15 — accept progress pushes from a partial reader *(migration 7 — renumbered, see §1)*
+### WP-15 — accept progress pushes from a partial reader *(migration 8 — renumbered twice, see §1)*
 
 **Why.** WP-14 counts *imported runs*, and the in-house reader cannot produce a
 full run record mid-pass: during the night it has test identities and results
@@ -978,6 +986,42 @@ Summarised here because three of its decisions constrain later work:
   `tests/test_api.py::SummaryPartsTest` pins the parts to. The home page
   fetches headline + active tab only; other tabs on click.
 
+### WP-18 — Timeline: script running order per environment *(migration 7)*
+
+Shipped 2026-08-04; measurements in `UPGRADE_PLAN_STATUS.md` (2026-08-04
+entry) and the drop's operator note. The problem: scripts share the system
+they test and are not run in a dependency-safe order, so a script that
+leaves static data dirty surfaces as a LATER script's test failing. Tracking
+the culprit needs the night's script running order, which no test-centric
+view can show.
+
+What was decided, because it constrains later work:
+
+- **`script_hours` is the fourth derived table** (environment × UTC hour ×
+  script × result → count, plus exact `first_start`/`last_end` per bucket),
+  maintained inside the import transaction. The span columns give sub-hour
+  ordering without touching `runs` at request time; the PK leads
+  `(environment, hour)` so a window read is a pure index range. A MIN/MAX
+  cannot be decremented, so the rare shrink paths (a re-import changing a
+  stored result or end time — the fingerprint skip makes these exceptional)
+  recompute their buckets from `runs` exactly.
+  `tests/test_storage.py::ScriptHoursTest` holds the table byte-equal to
+  its GROUP BY, including the span columns.
+- **A Timeline row is a script *execution*, not a script** — grouped by the
+  same 60-minute gap rule as `analytics.group_executions`, so re-runs are
+  separate rows and a partial run is a row whose count reads short against
+  the script's `latest_runs` test count ("41 of 45 known tests" — "known",
+  not "expected": it is a high-water mark).
+- **Endpoints**: `GET /api/timeline?environment&days[&from&to]` (blocks from
+  the same `find_passes` machinery the environments page uses — ad-hoc
+  blocks included, labelled by `covered`; rows for the selected window) and
+  `GET /api/scripts/{env}/{script}/runs?from&to` (one execution's runs, the
+  row expansion). Window edges are inclusive at hour resolution,
+  deliberately: block edges are bucket starts, and trimming against the
+  exact edge would drop whatever ran in the block's final hour.
+- The block picker and every caption are worded from actual timestamps,
+  never "last night" — `WindowWordingTest` now scans `timeline.js` too.
+
 Three lanes. WP-0 lands before anything that touches `MIGRATIONS`.
 
 ```
@@ -990,9 +1034,9 @@ Round 2 (after WP-12)      WP-13 → WP-14 → WP-15
 ```
 
 WP-15 shares `storage.py` and the migration registry with any MariaDB work in
-flight. Its migration version is claimed above (7, renumbered from 6 when
-WP-17 shipped first) so two packages cannot both write the same entry;
-sequence the commits rather than interleaving them.
+flight. Its migration version is claimed above (8 — renumbered from 6 when
+WP-17 shipped first, then from 7 when WP-18 did) so two packages cannot both
+write the same entry; sequence the commits rather than interleaving them.
 
 WP-10 and WP-11 share no file with any other package (WP-11 touches
 `test_python36_compat.py`, which nothing else in this round does), so they can

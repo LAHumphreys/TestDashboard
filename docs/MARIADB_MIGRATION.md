@@ -977,7 +977,13 @@ Two additions from migration 6 (2026-07-31) the port inherits for free but
 should not lose: `activity_hours` is maintained by the same
 SELECT-then-UPDATE-or-INSERT pattern as everything else (`ON DUPLICATE KEY
 UPDATE` reproduces it, §B.5), and its `hour` column is `SUBSTR(start_time, 1,
-13)` — string arithmetic, no date function, both engines agree. The
+13)` — string arithmetic, no date function, both engines agree. Migration 7
+(2026-08-04) adds `script_hours` in the same mould — same SUBSTR expression,
+same upsert pattern — with one extra shape: its shrink path (a re-import
+changing a stored result or end time) RECOMPUTES the affected bucket from
+`runs` rather than decrementing, because the bucket carries MIN/MAX columns.
+That recomputation is plain portable SQL (COUNT/MIN/MAX with a SUBSTR
+equality) and needs no dialect work. The
 byte-identical-re-import skip compares `runs.output_fingerprint` (SHA-1 hex
 computed in Python) — nothing engine-specific, but the port's upsert must keep
 the SELECT-first shape or the skip has nothing to compare against.

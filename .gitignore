@@ -26,3 +26,5 @@ site_notes.json.tmp
 validate-server.log
 validate-server.err
 validate-server-before.log
+# Session scratch: database copies, DOM-shim harnesses, perf notes.
+.scratch/

@@ -586,8 +586,9 @@ class WindowWordingTest(unittest.TestCase):
     from ``recent_hours``, which is only the wall-clock fallback.
     """
 
-    #: Pages that show counts bounded by the recency cutoff.
-    _PAGES = ("app.js", "time.js")
+    #: Pages that show counts bounded by the recency cutoff, or that
+    #: label a time window at all (the Timeline is nothing but one).
+    _PAGES = ("app.js", "time.js", "timeline.js")
 
     def test_no_page_labels_the_window_from_recent_hours(self) -> None:
         offenders = {}  # type: Dict[str, List[int]]
@@ -616,7 +617,7 @@ class WindowWordingTest(unittest.TestCase):
     def test_nothing_still_calls_the_window_a_night(self) -> None:
         """A suite can run at any hour, more than once a day, or not for
         a long weekend. "Last night" is only ever right by luck."""
-        for name in ("app.js", "time.js", "actions.js"):
+        for name in ("app.js", "time.js", "actions.js", "timeline.js"):
             self.assertNotIn(
                 "last night", _strip_comments(read(name)).lower(), name)
         self.assertNotIn(

@@ -18,11 +18,12 @@ from testboard.analytics import (
     analytics_to_dict,
     compute_analytics,
     group_executions,
+    group_script_executions,
     select_window,
     summarize_rollup,
 )
-from testboard.model import Result, StoredRun
-from testboard.storage import RollupCount
+from testboard.model import Result, StoredRun, format_iso
+from testboard.storage import RollupCount, ScriptHourBucket
 
 # A fixed, deterministic "now": Sunday 2026-07-26 12:00:00 UTC.
 NOW = datetime.datetime(2026, 7, 26, 12, 0, 0)
@@ -747,6 +748,108 @@ class GroupExecutionsTest(unittest.TestCase):
         executions = group_executions(self.runs([0]))
         self.assertEqual(len(executions), 1)
         self.assertEqual(executions[0].total, 1)
+
+
+class GroupScriptExecutionsTest(unittest.TestCase):
+    """The Timeline's rows: script executions from script_hours buckets."""
+
+    BASE = datetime.datetime(2026, 7, 25, 2, 0, 0)
+
+    def bucket(self, script: str, start_minutes: float,
+               end_minutes: Optional[float] = None,
+               result: Result = Result.PASS,
+               count: int = 1) -> ScriptHourBucket:
+        """One bucket; its hour is derived from its start, like the table's."""
+        start = self.BASE + datetime.timedelta(minutes=start_minutes)
+        if end_minutes is None:
+            end_minutes = start_minutes + 1
+        return ScriptHourBucket(
+            script=script,
+            hour=format_iso(start)[:13],
+            result=result,
+            count=count,
+            first_start=start,
+            last_end=self.BASE + datetime.timedelta(minutes=end_minutes),
+        )
+
+    def test_rows_come_out_in_running_order(self) -> None:
+        """The page's whole point: ordered by when each script started."""
+        executions = group_script_executions([
+            self.bucket("late.py", 30),
+            self.bucket("early.py", 0),
+            self.bucket("middle.py", 10),
+        ])
+        self.assertEqual(
+            [e.script for e in executions],
+            ["early.py", "middle.py", "late.py"])
+
+    def test_adjacent_hours_are_one_execution(self) -> None:
+        """A script spanning an hour edge is one row, not two."""
+        executions = group_script_executions([
+            self.bucket("suite.py", 50, count=3),
+            self.bucket("suite.py", 65, count=2),
+        ])
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0].total, 5)
+        self.assertEqual(executions[0].started, self.BASE
+                         + datetime.timedelta(minutes=50))
+
+    def test_a_long_quiet_period_starts_a_new_execution(self) -> None:
+        """A morning run and an evening re-run are two rows."""
+        executions = group_script_executions([
+            self.bucket("suite.py", 0, count=4),
+            self.bucket("suite.py", 720, count=4),
+        ])
+        self.assertEqual(len(executions), 2)
+        self.assertEqual([e.total for e in executions], [4, 4])
+
+    def test_the_gap_is_measured_from_the_last_end(self) -> None:
+        """A bucket whose runs are still finishing holds the row open."""
+        executions = group_script_executions([
+            self.bucket("suite.py", 0, end_minutes=120),
+            self.bucket("suite.py", 130),
+        ])
+        self.assertEqual(len(executions), 1)
+
+    def test_result_rows_of_one_hour_merge_into_the_row(self) -> None:
+        executions = group_script_executions([
+            self.bucket("suite.py", 5, result=Result.FAIL, count=2),
+            self.bucket("suite.py", 0, result=Result.PASS, count=7),
+            self.bucket("suite.py", 9, result=Result.UNEXPECTED_PASS),
+        ])
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0].total, 10)
+        self.assertEqual(executions[0].failed, 2)
+        self.assertEqual(
+            executions[0].results[Result.UNEXPECTED_PASS], 1)
+        self.assertEqual(executions[0].started, self.BASE)
+
+    def test_two_scripts_interleaved_stay_separate_rows(self) -> None:
+        """Overlap is data (the illogical-order signal), not a merge."""
+        executions = group_script_executions([
+            self.bucket("a.py", 0, end_minutes=45, count=10),
+            self.bucket("b.py", 20, end_minutes=40, count=5),
+        ])
+        self.assertEqual(len(executions), 2)
+        self.assertEqual([e.script for e in executions], ["a.py", "b.py"])
+
+    def test_span_and_duration_come_from_the_exact_timestamps(self) -> None:
+        executions = group_script_executions([
+            self.bucket("suite.py", 7, end_minutes=21),
+        ])
+        self.assertEqual(executions[0].duration_seconds, 14 * 60.0)
+
+    def test_empty_input(self) -> None:
+        self.assertEqual(group_script_executions([]), [])
+
+    def test_gap_is_configurable(self) -> None:
+        buckets = [
+            self.bucket("suite.py", 0),
+            self.bucket("suite.py", 90),
+        ]
+        self.assertEqual(len(group_script_executions(buckets)), 2)
+        self.assertEqual(
+            len(group_script_executions(buckets, gap_minutes=120)), 1)
 
     def test_no_runs(self) -> None:
         self.assertEqual(group_executions([]), [])

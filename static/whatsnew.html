@@ -14,6 +14,7 @@
       <a href="index.html">Dashboard</a>
       <a href="actions.html">Open actions</a>
       <a href="time.html">Time</a>
+      <a href="timeline.html">Timeline</a>
       <a id="nav-whatsnew" href="whatsnew.html" aria-current="page">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
@@ -32,6 +33,43 @@
          invisible to all three, so
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
+
+    <section class="release" data-drop-date="2026-08-04">
+      <div class="section-head">
+        <h2 class="eyebrow">4 August 2026</h2>
+        <span class="muted">New: the Timeline — what ran, in what order</span>
+      </div>
+
+      <h3>Fixed: a rare failed action on a busy dashboard</h3>
+      <ul>
+        <li>Very occasionally, posting a comment or assigning a test on a
+          busy dashboard failed for no visible reason and worked on the
+          second try. That was a server bug in how idle connections were
+          recycled — found by its own test — and it is fixed.</li>
+      </ul>
+
+      <h3>New page: Timeline</h3>
+      <ul>
+        <li><strong>One environment's scripts, in running order</strong> —
+          built for the poisoned-data hunt. When a test fails because an
+          earlier script left data in a bad state, the culprit is somewhere
+          above it in this list. Rows open to their tests, tests open to
+          their output, so the whole read happens in one place — and the
+          run picker replays <em>any recorded run</em>: "Earlier runs…"
+          reaches back through everything on file, not just the recent
+          fortnight.</li>
+        <li><strong>Start from the victim.</strong> "Find test" jumps to a
+          test's place in the order — or use <em>View in timeline</em>,
+          which now appears wherever a run's output does (the triage
+          panels, and each History row on a test's page — old rows land in
+          <em>that night's</em> run, not the latest).</li>
+        <li><strong>Keys, if you want them</strong> (the mouse does
+          everything): press <strong>?</strong> on the page for the list —
+          <strong>/</strong> to search, <strong>n</strong>/<strong>p</strong>
+          through failures, <strong>Ctrl-j</strong>/<strong>Ctrl-k</strong>
+          to cycle search suggestions, vim-style.</li>
+      </ul>
+    </section>
 
     <section class="release" data-drop-date="2026-07-31">
       <div class="section-head">

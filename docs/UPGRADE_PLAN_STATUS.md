@@ -1193,3 +1193,170 @@ job.** Each red leg was a true positive, and the one gap — nothing forced
 test annotations to evaluate on a lazy interpreter — is now closed. The ubi8
 leg runs the suite with `skipped=5` (the four version-gated grammar tests
 plus the standing skip); that number is expected, not a regression.
+
+## Drop of 2026-08-04 (WP-18) — the Timeline: script running order per environment
+
+**The problem, as the user stated it.** Scripts are not run in a
+dependency-safe order, and one that goes wrong tends to leave static data
+modified — the failure then surfaces in a LATER script's tests. Walking back
+from the failure to the culprit needs the night's script running order, and
+every existing view is test-centric: results, not order.
+
+**What was built.** A fifth page, Timeline: one environment, one block of
+activity, one row per script *execution* (the 60-minute-gap inference from
+`group_executions`, applied at script grain), rows in running order on a
+shared time axis. Partial runs read short against the script's known test
+count ("41 of 45 known tests"); a script that ran twice is two rows; a row
+expands in place to its tests in start order, first FAIL marked. Ad-hoc
+blocks appear in the picker labelled "partial" — a twenty-test re-run after
+a fix is often exactly the state-poisoning suspect.
+
+**Storage: `script_hours`, migration 7, the fourth derived table.** The page
+needed script × time, no table had it, and the standing rule ("nothing may
+scan a window of `runs` at request time") is why it is a derived table
+rather than a request-time GROUP BY. Design notes that will matter later:
+
+- Shape mirrors `activity_hours` plus two exact-timestamp columns
+  (`first_start`, `last_end` per bucket) — hour bucketing keeps the table
+  small (21,988 rows where `runs` holds 540,192 on the dev copy, ~4%),
+  the span columns give sub-hour ordering.
+- PK leads `(environment, hour)`: a window read is one index range,
+  pinned by a query-plan test.
+- MIN/MAX cannot be decremented, so the two shrink paths (re-import
+  changing a stored result or end time) recompute their buckets from
+  `runs` exactly, inside the same transaction. The fingerprint skip makes
+  those paths rare by construction; a bucket both grown and recomputed in
+  one batch is recomputed only (the recompute already sees the batch's
+  inserts — double-counting was designed out, and there is a test that
+  plants exactly that batch).
+- `ScriptHoursTest` holds the table byte-equal to its GROUP BY in both
+  directions, through live maintenance, environment deletion and pruning,
+  with a planted-skew test proving the comparison can fail.
+
+**Renumbering, second verse.** WP-15's parked claim moved again (7 → 8):
+versions ship contiguously, so the ship-first package takes the lowest
+unshipped number. The registry now states the pattern explicitly — a parked
+claim is a reservation, not a number.
+
+**MEASURED, all on the dev copy (218 MB, 540,192 runs) — production is ~4×
+this on a network mount and the migration MUST be re-measured there before
+the drop ships (§1.2):**
+
+- Migration 7 backfill: **3.2 s** (21,988 rows). The v5 dev copy's full
+  open-and-migrate (6 then 7, both rebuilds) was 5.95 s.
+- New endpoints: `/api/timeline` **36.8 ms** median for a full night of
+  251 script rows (comparable to `/api/time` at 37 ms); row expansion
+  **1.5 ms**.
+- No regression on existing endpoints (median, before → after):
+  `/api/summary` 177.6 → 180.9 ms, `parts=headline` 104.4 → 104.7 ms,
+  `/api/dashboard` 30.3 → 31.9 ms, `/api/time` 36.5 → 37.4 ms,
+  `/api/environments` 14.4 → 14.3 ms. All within run-to-run noise.
+- Import (2000 records, 40 scripts, temp db, median of 5): fresh
+  293 → 295 ms; **byte-identical no-op push 71 → 73 ms — the skip still
+  writes nothing**; the pathological all-2000-records-flip-result batch
+  304 → 347 ms (+14%), which is the recompute path priced at its worst
+  and a batch shape the fingerprint skip exists to prevent.
+
+**Frontend verified the established way** (no browser here): the real
+`timeline.js` driven under a node DOM shim against a live server on the
+migrated dev copy — 18 checks: initial paint, row/block counts, running
+order, bar geometry, expansion fetch-once, links, jump-to-first-failure
+visibility, block switching, URL round-trip, environment switching. Layout,
+colour and contrast remain unverified by any human eye, as ever.
+
+**Guards widened, not weakened:** `WindowWordingTest` now scans
+`timeline.js` (both the `recent_hours` ban and "last night"); the MariaDB
+exporter learned `script_hours` because its parity test failed the build
+the moment the table existed — exactly as designed. The runbook's port
+notes (§F) gained the recompute-path paragraph.
+
+## WP-18 refinements re-measured, 2026-08-04 (later the same day)
+
+After a round of UX refinements from first use (whole-row click targets,
+per-test output expansion, the failing-test stepper with search/deep-link
+re-basing, "Find test", "View in timeline" from every output view, the
+365-day "Earlier runs" lookback, vi-ish keys), the endpoint analysis was
+repeated to confirm nothing degraded. Same method: origin/master worktree
+vs the branch, interleaved runs, dev copy (218 MB, 540,192 runs — NOT
+production).
+
+**No regression.** The decisive check was a CROSS test — new code serving
+a fresh copy of the baseline's own database file, interleaved with old
+code — because the first comparison confounded code with file layout (the
+v7 file carries script_hours pages). Interleaved medians, same file:
+`/api/summary` old 61.7/59.4/62.6 ms vs new 60.9/58.0/58.9 ms;
+`parts=headline` ranges overlap entirely (33–48 old, 33–43 new), with the
+single worst rep belonging to the OLD build. This machine's own
+run-to-run band (p95 78–133 ms on an identical build) is wider than any
+before/after delta observed.
+
+**The refinements' own paths, measured** (current build, dev copy):
+default `/api/timeline` 11.6 ms median (unchanged); row expansion 1.8 ms;
+the on-demand year view (`days=365`, 45 blocks) 27.6 ms median / 43 ms
+p95 — read from the bucket tables only, fetched only when "Earlier runs"
+or an old deep link asks; the search box's debounced suggestion query
+(`/api/dashboard?q&limit=20`) 9.5 ms median.
+
+**Import path: not re-measured, by argument rather than omission** —
+`git diff` since the measured commit shows storage.py untouched (the only
+backend change is api.py's day-cap constant), so the first pass's numbers
+stand: fresh unchanged, no-op re-push still write-free, worst-case
+all-flip batch +14%.
+
+Production caveat as always: these are dev-copy constants; the mount sets
+the real ones, and the migration probe on a prod copy remains the gate.
+
+## The keep-alive flake WAS a bug — two of them (2026-08-04, evening)
+
+`KeepAliveTest::test_a_reclaimed_connection_is_always_announced_first`
+failed on a DOCS-ONLY commit's CI run. Looped locally: ~1 failure in 20
+standalone, ~1 in 14 inside the pool suite. The guard was not flaky; the
+server was, at low probability, doing exactly what the guard forbids —
+closing a connection the client believed open, losing the request in it.
+
+**Bug 1, the big one: a timed-out read poisons the reader, permanently.**
+`socket.makefile` readers set `SocketIO._timeout_occurred` the first time
+any read times out; every later read raises `OSError("cannot read from
+timed out object")` — including reads that would have found a request
+waiting. `_wait_for_request` polled by peeking WITH the poll timeout, so
+the first quiet quarter-second broke the reader. Consequences, both
+confirmed by standalone repro:
+
+- The 5-second keep-alive idle window was FICTION. Every connection died
+  at the first 0.25s poll tick, via the OSError branch. Browsers mostly
+  papered over it (idempotent GET retry), which is why nobody saw it.
+- A request arriving after one quiet tick was UNSERVABLE — the reader
+  refused to see it, the loop closed the connection, and a non-retried
+  POST died. That is the loss the flake was reporting.
+
+Fixed by never letting `rfile` experience a timed-out read: the waiting
+moved to `select.select` on the socket, and every peek is non-blocking
+(raw reads return None harmlessly in that mode; the poison flag is never
+set). EOF is distinguished by peeking after select reports readable.
+
+**Bug 2: reclaim raced an arriving request.** The loop checked contention
+BEFORE peeking, so a request landing in the same tick the pool became
+contended was closed unread. And since a response that announces
+`Connection: close` never returns to the wait loop at all, EVERY reclaim
+close is unannounced by construction — so the reclaim now (a) peeks
+first, serving anything already arrived (the response announces the
+close, because the pool is contended), and (b) gives a genuinely quiet
+connection ONE grace tick before closing, converting "close under the
+client's feet" into "serve the request that was already coming" for
+everything but the truly idle. Worst-case reclaim latency ~0.5s, same
+order as the ~0.2s previously measured and recorded.
+
+**MEASURED (this machine):** before: 1 failure in 20 standalone runs of
+the guard, 1 in 14 pool-suite runs. After: 0 in 30 standalone + 0 in 16
+suite runs + full suite green. The residual race — bytes hitting the
+socket in the microseconds between a final empty peek and the close — is
+inherent to TCP and beyond a server's power to remove.
+
+`YieldPeekTest` (4 tests) pins all of it deterministically: a buffered
+request beats the reclaim, an idle contended connection still yields
+fast, the 5-second idle window actually lasts 5 seconds, and a request
+arriving after two quiet ticks is served. The KeepAliveTest guard keeps
+its zero-loss assertion untouched.
+
+Ships in the 2026-08-04 drop (it is a `server.py` change — the restart
+the operator note already mandates covers it).

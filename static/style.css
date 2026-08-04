@@ -1634,3 +1634,218 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
 /* A date with site notes but no shipped release notes still gets a
    section, because a note written between drops is the common case. */
 .release-site-only .section-head { margin-bottom: 4px; }
+
+/* ---------- Timeline (script running order) ---------- */
+
+/* Rows on a shared time axis. The grid gives every row the same track
+   edges, which is what makes the bars comparable by eye — the whole
+   point of drawing them. Fixed-width columns for the text, one flexible
+   column for the track. */
+
+.timeline-card { padding: 14px 16px 10px; }
+
+.timeline-axis {
+  position: relative;
+  height: 18px;
+  /* Mirror .tl-row's grid so the axis spans exactly the track column:
+     toggle + time + script on the left, facts on the right. */
+  margin-left: calc(22px + 52px + 220px + 24px);
+  margin-right: 236px;
+}
+
+.tl-tick {
+  position: absolute;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: var(--axis-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.tl-row-wrap { border-top: 1px solid var(--border); }
+.tl-row-wrap:first-child { border-top: none; }
+
+.tl-row {
+  display: grid;
+  grid-template-columns: 22px 52px 220px 1fr 236px;
+  gap: 8px;
+  align-items: center;
+  padding: 5px 0;
+}
+
+.tl-expand {
+  width: 22px;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tl-expand:hover { color: var(--ink); }
+
+.tl-time {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tl-script {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tl-track {
+  position: relative;
+  height: 14px;
+  background: var(--surface);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+/* Neutral by default: the bar encodes WHEN, not how it went. Red is
+   reserved for "this run contains failures", which is a status and may
+   borrow the status colour. */
+.tl-bar {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  border-radius: 2px;
+  background: #9db3c8;
+  min-width: 3px;
+}
+
+.tl-bar.has-fail { background: var(--c-fail); }
+
+.tl-facts {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.tl-count { font-size: 12px; color: var(--ink); }
+
+/* Amber for "ran fewer tests than this script is known to have" — a
+   warning about coverage, not a failure, so not red. */
+.tl-partial {
+  color: #8a6d00;
+  font-weight: 600;
+}
+
+.tl-facts .chip { padding: 1px 8px; font-size: 11px; }
+
+.tl-duration {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 52px;
+  text-align: right;
+}
+
+.tl-detail {
+  padding: 2px 0 10px 82px;
+}
+
+.tl-detail .row-sub { margin-left: 8px; }
+
+/* On a narrow screen the bars stop earning their room: drop the track
+   and keep the ordered list, which is the primary encoding anyway. */
+@media (max-width: 900px) {
+  .timeline-axis { display: none; }
+  .tl-row { grid-template-columns: 22px 52px 1fr auto; }
+  .tl-track { display: none; }
+  .tl-detail { padding-left: 22px; }
+}
+
+/* The whole row toggles its expansion (the triangle is the accessible
+   control, not the only target); say so on hover. */
+.tl-row.tl-clickable { cursor: pointer; }
+.tl-row.tl-clickable:hover { background: var(--surface); }
+
+.tl-run-row { cursor: pointer; }
+.tl-run-toggle { width: 22px; }
+.data-table td.tl-run-toggle { padding-right: 0; }
+
+/* A run's captured output, inline. Scrolls inside its row rather than
+   growing the page: a failing test can dump a great deal, and the point
+   of reading it HERE is keeping your place in the running order. */
+.tl-output {
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.tl-output.muted { color: var(--muted); }
+
+/* Failure stepper: a pill FIXED to the viewport corner, because the
+   hunt it serves is "read a failure deep in the page, hop to the next"
+   — a control that scrolls away is a control that gets used once. */
+.failure-nav {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 40;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 8px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+}
+
+/* An author display beats the UA's [hidden] rule, so say it ourselves
+   or the pill floats over every page state forever. */
+.failure-nav[hidden] { display: none; }
+
+.failure-pos {
+  min-width: 52px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Where the stepper or a search currently is: marks position, does not
+   rank the row. On a table row a background is the reliable form. */
+.tl-run-row.tl-current td {
+  background: #e8f0fa;
+}
+
+.tl-run-row.tl-current td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent-link);
+}
+
+.search-note { font-size: 12px; }
+
+#test-search { min-width: 220px; }
+
+.hotkey-help {
+  margin: -6px 0 14px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.hotkey-help code {
+  padding: 0 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}

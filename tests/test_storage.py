@@ -2972,6 +2972,250 @@ class ActivityHoursTest(StorageTestBase):
         self.assertEqual([row.count for row in trend], [41])
 
 
+class ScriptHoursTest(StorageTestBase):
+    """The fourth derived table cannot drift from `runs` (migration 7).
+
+    Same contract as ActivityHoursTest, with the extra columns in the
+    invariant: `script_hours` also carries MIN(start_time) and
+    MAX(end_time) per bucket, and a MIN/MAX cannot be decremented — so
+    the shrink paths (an update changing a stored result or end time)
+    go through exact recomputation and are what these tests lean on.
+    """
+
+    _GROUP_BY = (
+        "SELECT environment, SUBSTR(start_time, 1, 13), script, result, "
+        "COUNT(*), MIN(start_time), MAX(end_time) "
+        "FROM runs GROUP BY 1, 2, 3, 4"
+    )
+    _TABLE = (
+        "SELECT environment, hour, script, result, count, "
+        "first_start, last_end FROM script_hours"
+    )
+
+    def _invariant_diff(self) -> int:
+        conn = self.store._conn()
+        forward = conn.execute(
+            "SELECT COUNT(*) FROM ({0} EXCEPT {1})".format(
+                self._GROUP_BY, self._TABLE)
+        ).fetchone()[0]
+        backward = conn.execute(
+            "SELECT COUNT(*) FROM ({0} EXCEPT {1})".format(
+                self._TABLE, self._GROUP_BY)
+        ).fetchone()[0]
+        return int(forward) + int(backward)
+
+    def test_live_maintenance_matches_a_rebuild(self) -> None:
+        """Inserts, re-imports and result flips across scripts and hours."""
+        hour = datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE),
+            make_record(test_name="test_b", start=BASE,
+                        result=Result.FAIL),
+            make_record(script="other.py", test_name="test_a",
+                        start=BASE + hour),
+            make_record(environment="win-sim", test_name="test_a",
+                        start=BASE),
+        ])
+        # Unchanged re-import: no drift, no double counting.
+        self.store.upsert_runs([make_record(test_name="test_a", start=BASE)])
+        # Result flip: the run moves between cells of the same bucket.
+        self.store.upsert_runs([
+            make_record(test_name="test_b", start=BASE,
+                        result=Result.PASS),
+        ])
+        self.assertEqual(self._invariant_diff(), 0)
+
+    def test_the_span_columns_are_exact_timestamps(self) -> None:
+        """Sub-hour ordering is the point; hour edges would lose it."""
+        minute = datetime.timedelta(minutes=1)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE + 7 * minute),
+            make_record(test_name="test_b", start=BASE + 21 * minute),
+        ])
+        rows = self.store._conn().execute(
+            "SELECT first_start, last_end FROM script_hours").fetchall()
+        self.assertEqual(rows, [(
+            "2026-07-01T02:07:00.000000",
+            "2026-07-01T02:21:03.000000",
+        )])
+        self.assertEqual(self._invariant_diff(), 0)
+
+    def test_an_end_time_change_that_shrinks_a_bucket(self) -> None:
+        """The MAX cannot be decremented, so this is the recompute path.
+
+        test_b's end is the bucket's last_end; a re-import (different
+        output, so not skipped) pulls it back before test_a's. A grown
+        merge could only keep the stale MAX; only exact recomputation
+        can shrink it.
+        """
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE),
+            make_record(test_name="test_b", start=BASE,
+                        end=BASE + datetime.timedelta(minutes=9)),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_b", start=BASE,
+                        end=BASE + datetime.timedelta(seconds=1),
+                        output="reparsed\n"),
+        ])
+        self.assertEqual(self._invariant_diff(), 0)
+        row = self.store._conn().execute(
+            "SELECT last_end FROM script_hours").fetchone()
+        self.assertEqual(row[0], "2026-07-01T02:00:03.000000")
+
+    def test_a_grown_bucket_recomputed_in_the_same_batch(self) -> None:
+        """Recompute must win over the merge, not double-count it.
+
+        One batch both inserts into a bucket and shrinks it: the
+        recomputation already sees the inserted row in `runs`, so
+        applying the growth as well would count it twice.
+        """
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE,
+                        end=BASE + datetime.timedelta(minutes=9)),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE,
+                        end=BASE + datetime.timedelta(seconds=1),
+                        output="reparsed\n"),
+            make_record(test_name="test_b", start=BASE),
+        ])
+        self.assertEqual(self._invariant_diff(), 0)
+        row = self.store._conn().execute(
+            "SELECT count FROM script_hours").fetchone()
+        self.assertEqual(int(row[0]), 2)
+
+    def test_a_flip_that_empties_a_cell_deletes_the_row(self) -> None:
+        """GROUP BY yields no zero groups, so neither may the table."""
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        self.store.upsert_runs([make_record(result=Result.PASS)])
+        rows = self.store._conn().execute(
+            "SELECT result, count FROM script_hours").fetchall()
+        self.assertEqual(rows, [("PASS", 1)])
+        self.assertEqual(self._invariant_diff(), 0)
+
+    def test_environment_delete_keeps_the_invariant(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="UNKNOWN"),
+            make_record(environment="linux-sim"),
+        ])
+        self.store.delete_environment("UNKNOWN")
+        self.assertEqual(self._invariant_diff(), 0)
+        rows = self.store._conn().execute(
+            "SELECT DISTINCT environment FROM script_hours").fetchall()
+        self.assertEqual(rows, [("linux-sim",)])
+
+    def test_prune_keeps_the_invariant(self) -> None:
+        """Retention deletes history; the table must follow it."""
+        day = datetime.timedelta(days=1)
+        self.store.upsert_runs([
+            make_record(start=BASE - 400 * day),
+            make_record(start=BASE),
+        ])
+        deleted = self.store.prune_runs_before(BASE - 300 * day)
+        self.assertEqual(deleted, 1)
+        self.assertEqual(self._invariant_diff(), 0)
+
+    def test_the_comparison_itself_can_fail(self) -> None:
+        """Planted drift MUST be reported, or every pass above is noise."""
+        self.store.upsert_runs([make_record()])
+        self.store._conn().execute(
+            "UPDATE script_hours SET count = count + 1")
+        self.assertGreater(self._invariant_diff(), 0)
+
+    def test_reads_come_from_the_derived_table_not_from_runs(self) -> None:
+        """Plant a skew in the table; the reader must report the skew.
+
+        The cost assertion in disguise, as in ActivityHoursTest: a
+        reader that still scanned `runs` would return the truth here
+        and the test would fail — which is what stops the O(history)
+        query coming back quietly.
+        """
+        self.store.upsert_runs([make_record()])
+        self.store._conn().execute("UPDATE script_hours SET count = 41")
+        buckets = self.store.script_activity(
+            "linux-sim", BASE - datetime.timedelta(hours=1),
+            BASE + datetime.timedelta(hours=1))
+        self.assertEqual([b.count for b in buckets], [41])
+
+    def test_the_window_read_is_an_index_range_not_a_scan(self) -> None:
+        """The PK leads (environment, hour) so one block is one seek.
+
+        Pinned because the column order is the entire reason the table
+        can be read at request time: keyed (environment, script, hour)
+        instead, the same query would walk the environment's whole
+        history and grow with it — the O(history) shape migration 6
+        was bought to end.
+        """
+        self.store.upsert_runs([make_record()])
+        plan = self.store._conn().execute(
+            "EXPLAIN QUERY PLAN SELECT script, hour, result, count, "
+            "first_start, last_end FROM script_hours "
+            "WHERE environment = ? AND hour >= ? AND hour <= ? "
+            "ORDER BY script, hour",
+            ("linux-sim", "2026-07-01T00", "2026-07-01T23"),
+        ).fetchall()
+        detail = " ".join(str(row[-1]) for row in plan)
+        self.assertIn("SEARCH", detail.upper(), detail)
+        self.assertIn("hour", detail, detail)
+
+    def test_script_activity_is_one_environment_one_window(self) -> None:
+        hour = datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(start=BASE),
+            make_record(environment="win-sim", start=BASE),
+            make_record(test_name="test_b", start=BASE + 3 * hour),
+        ])
+        buckets = self.store.script_activity(
+            "linux-sim", BASE, BASE + hour)
+        self.assertEqual(len(buckets), 1)
+        self.assertEqual(buckets[0].script, "suite.py")
+        self.assertEqual(buckets[0].result, Result.PASS)
+        self.assertEqual(buckets[0].first_start, BASE)
+
+
+class ScriptTestCountsTest(StorageTestBase):
+    """The Timeline's "of N known tests" denominator."""
+
+    def test_counts_per_script_exclude_retired(self) -> None:
+        self.store.upsert_runs([
+            make_record(test_name="test_a"),
+            make_record(test_name="test_b"),
+            make_record(script="other.py", test_name="test_c"),
+            make_record(environment="win-sim", test_name="test_d"),
+        ])
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_b", True, "amy",
+            "left the suite", CREATED)
+        self.assertEqual(
+            self.store.script_test_counts("linux-sim"),
+            {"suite.py": 1, "other.py": 1})
+
+    def test_an_unknown_environment_is_empty_not_an_error(self) -> None:
+        self.assertEqual(self.store.script_test_counts("nowhere"), {})
+
+
+class ScriptRunsUntilTest(StorageTestBase):
+    """The window ceiling the Timeline's row expansion depends on."""
+
+    def test_until_is_inclusive_and_bounds_the_window(self) -> None:
+        hour = datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(start=BASE),
+            make_record(start=BASE + hour),
+            make_record(start=BASE + 5 * hour),
+        ])
+        runs = self.store.script_runs(
+            "linux-sim", "suite.py", BASE, 100, until=BASE + hour)
+        self.assertEqual(
+            [run.start_time for run in runs], [BASE, BASE + hour])
+
+    def test_omitting_until_keeps_the_old_shape(self) -> None:
+        self.store.upsert_runs([make_record(start=BASE)])
+        runs = self.store.script_runs("linux-sim", "suite.py", BASE, 100)
+        self.assertEqual(len(runs), 1)
+
+
 class ReimportSkipTest(StorageTestBase):
     """What counts as "unchanged", and what the skip must NOT skip."""
 

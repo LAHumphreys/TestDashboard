@@ -53,6 +53,7 @@ TABLE_ORDER = (
     "test_retirements",
     "environment_expectations",
     "activity_hours",
+    "script_hours",
     "schema_version",
 )
 
@@ -76,6 +77,8 @@ VERIFY_QUERIES = (
      "SELECT COUNT(*) FROM environment_expectations"),
     ("activity_total",
      "SELECT COUNT(*), SUM(count) FROM activity_hours"),
+    ("script_activity_total",
+     "SELECT COUNT(*), SUM(count) FROM script_hours"),
     ("schema_version", "SELECT version FROM schema_version"),
     ("run_span", "SELECT MIN(start_time), MAX(start_time) FROM runs"),
     ("output_bytes",
@@ -223,6 +226,17 @@ CREATE TABLE activity_hours (
   result      {result} NOT NULL,
   count       INT NOT NULL,
   PRIMARY KEY (environment, hour, result)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE script_hours (
+  environment {env} NOT NULL,
+  hour        VARCHAR(13) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  script      {script} NOT NULL,
+  result      {result} NOT NULL,
+  count       INT NOT NULL,
+  first_start {stamp} NOT NULL,
+  last_end    {stamp} NOT NULL,
+  PRIMARY KEY (environment, hour, script, result)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE schema_version (

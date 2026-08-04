@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import queue
+import select
 import socket
 import sys
 import threading
@@ -157,6 +158,7 @@ _KEEPALIVE_IDLE_SECONDS = 5.0
 #: queued request waits for a worker that is doing nothing; four wakeups
 #: a second per idle connection costs nothing measurable.
 _IDLE_POLL_SECONDS = 0.25
+
 
 #: Socket timeout for a request already in progress — per blocking read
 #: or write, not per request. Generous on purpose: it also covers reading
@@ -402,29 +404,84 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         request queued behind it waits out the whole of it: measured at
         5.00s before this loop existed, ~0.2s after.
 
-        ``peek`` rather than ``select``: it answers "is there a request
-        to read" for bytes already sitting in ``rfile``'s buffer as well
-        as bytes still on the socket. Selecting on the socket alone would
-        miss a pipelined request that the previous ``readline`` had
-        already pulled into that buffer, and would then close the
-        connection with the request unanswered. It consumes nothing, and
-        a timed-out read leaves the stream exactly as it was.
+        ``peek`` rather than reading: it answers "is there a request to
+        read" for bytes already sitting in ``rfile``'s buffer as well as
+        bytes on the socket, and it consumes nothing. But the peek is
+        always NON-BLOCKING, and the waiting is done by ``select`` on
+        the socket — never by a read timeout — because of how
+        ``socket.makefile`` objects fail:
+
+        A TIMED-OUT READ POISONS THE READER, PERMANENTLY. SocketIO sets
+        ``_timeout_occurred`` the first time a read times out, and every
+        later read raises ``OSError("cannot read from timed out
+        object")`` — including reads that would have found a request
+        waiting. The previous version of this loop peeked WITH the poll
+        timeout, so the first quiet quarter-second broke the reader:
+        every keep-alive connection was silently closed at the first
+        poll tick (the 5-second idle window was fiction), and a request
+        arriving after that tick died on a connection nothing had
+        announced closed. Found because KeepAliveTest flaked (~1 run in
+        20, locally and on CI) — the flake was this bug, and
+        ``YieldPeekTest`` now pins both halves deterministically. In
+        non-blocking mode the raw read returns None instead of raising,
+        the flag is never set, and the reader survives any number of
+        quiet polls.
+
+        YIELDING STILL PEEKS FIRST, and that ordering is load-bearing
+        too: contention is noticed between polls, so a request can
+        arrive in the same tick the pool becomes contended, and a
+        contention check made before the peek would close the
+        connection with that request sitting unread. Serving it is
+        safe — the pool being contended makes ``_write_response``
+        announce the close on that very response, and the reclaim
+        happens one request later. The unavoidable residue is bytes
+        hitting the socket after a peek returns empty: a TCP race
+        measured in microseconds, not the quarter-second these two
+        fixes closed.
         """
         deadline = time.monotonic() + _KEEPALIVE_IDLE_SECONDS
+        # Every close this loop makes is UNANNOUNCED by construction — a
+        # response that said "Connection: close" ended its connection in
+        # handle(), so it never waits here. Hence the single tick of
+        # grace before yielding: the client was last told keep-alive,
+        # and its next request may be microseconds away on the wire. One
+        # tick converts "silently close under the client's feet" into
+        # "serve the request that was already coming, announcing the
+        # close on it" for everything but a genuinely idle client —
+        # bounded, so contention still reclaims within half a second.
+        graced = False
         while True:
+            # An instant, non-poisoning look: buffered bytes, or bytes
+            # the socket already holds. settimeout(0) is non-blocking
+            # mode, where a quiet socket reads as None, not an error.
+            self.connection.settimeout(0.0)
+            try:
+                if self.rfile.peek(1):
+                    return True
+            except OSError:
+                return False        # connection reset while idle
             if may_yield and self._pool_is_contended():
-                return False
+                if graced:
+                    return False    # given its tick; someone is queued
+                graced = True       # one tick for an in-flight request
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            self.connection.settimeout(min(_IDLE_POLL_SECONDS, remaining))
             try:
-                # b"" is EOF: the client has closed the connection.
-                return bool(self.rfile.peek(1))
-            except socket.timeout:
-                continue
+                readable = select.select(
+                    [self.connection], [], [],
+                    min(_IDLE_POLL_SECONDS, remaining))[0]
             except OSError:
                 return False        # connection reset while idle
+            if readable:
+                # Data, or EOF — the peek at the top of the loop cannot
+                # tell EOF (b"") from "nothing yet" (also b""), but
+                # after select has said readable, empty means EOF.
+                self.connection.settimeout(0.0)
+                try:
+                    return bool(self.rfile.peek(1))
+                except OSError:
+                    return False    # connection reset while idle
 
     def _record_request(self, started: float, first: bool) -> None:
         """Log how long this request took, and how long it queued.
