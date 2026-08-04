@@ -130,7 +130,22 @@ async function buildReviewPanel(entry, container, opts) {
   const full = document.createElement("a");
   full.href = "test.html?" + params.toString();
   full.textContent = "Open full test page →";
+  // The poisoned-data workflow's door: this run, in its night's running
+  // order, with everything that ran before it listed above. `at` is the
+  // run's start time, so the Timeline opens the run that CONTAINS this
+  // result rather than whatever ran most recently.
+  const timelineParams = new URLSearchParams();
+  timelineParams.append("environment", entry.environment);
+  timelineParams.append("script", entry.script);
+  timelineParams.append("test", entry.test_name);
+  timelineParams.append("at", entry.start_time);
+  const inTimeline = document.createElement("a");
+  inTimeline.href = "timeline.html?" + timelineParams.toString();
+  inTimeline.textContent = "View in timeline →";
+  inTimeline.title = "This run in its night's running order — what ran "
+    + "before it is listed above it";
   head.appendChild(el("span", "review-title", "Latest run output"));
+  head.appendChild(inTimeline);
   head.appendChild(full);
   panel.appendChild(head);
 

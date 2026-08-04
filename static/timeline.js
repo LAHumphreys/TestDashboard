@@ -156,6 +156,7 @@ function render(data) {
   const failureNav = document.getElementById("failure-nav");
   clearNode(rowsHost);
   clearNode(axis);
+  markCurrent(null);       // the marked row is being rebuilt
 
   const meta = document.getElementById("timeline-meta");
   if (!state.rows.length) {
@@ -201,66 +202,145 @@ function render(data) {
   const dayCount = new Set(
     state.rows.map((row) => row.started.slice(0, 10))).size;
 
-  state.rows.forEach((row) => {
-    rowsHost.appendChild(buildRow(row, domainFrom, span, dayCount > 1));
+  rowControllers = state.rows.map((row) => {
+    const controller = buildRow(row, domainFrom, span, dayCount > 1);
+    rowsHost.appendChild(controller.wrap);
+    return controller;
   });
 
-  wireFailureNav(rowsHost);
+  wireFailureNav();
+  consumePendingLocate(data);
 }
 
-/** Step between the rows that contain failures.
+/* A deep link ("View in timeline" on the triage panels) names a test
+ * and the start time of the run being looked at. Consumed after a
+ * render: first switch to the block CONTAINING that time — the run the
+ * panel showed, not whatever ran most recently — then place the test. */
+let pendingLocate = null;
+
+function consumePendingLocate(data) {
+  if (!pendingLocate) {
+    return;
+  }
+  const pending = pendingLocate;
+  if (pending.at) {
+    // A block "ending" at 04:00 ran tests until 04:59 — block edges
+    // are hour starts, so the final hour matches by prefix.
+    const containing = state.blocks.find((block) =>
+      block.started <= pending.at
+      && (pending.at <= block.ended
+          || pending.at.slice(0, 13) === block.ended.slice(0, 13)));
+    const shownFrom = data.window === null ? null : data.window.from;
+    if (containing && containing.started !== shownFrom) {
+      state.from = containing.started;
+      state.to = containing.ended;
+      syncUrl();
+      load();          // still pending; next render lands the test
+      return;
+    }
+  }
+  pendingLocate = null;
+  const box = document.getElementById("test-search");
+  box.value = pending.test_name;
+  placeTest([pending.script], pending.test_name, "");
+}
+
+/* One controller per rendered script row, rebuilt with them: the
+ * failure stepper and the test search drive rows open through these
+ * rather than clicking DOM they would have to go looking for. */
+let rowControllers = [];
+
+/* The row the failure stepper or a search last landed on. One marker,
+ * shared, so the two ways of moving can never leave two highlights. */
+let currentMark = null;
+
+function markCurrent(tr) {
+  if (currentMark) {
+    currentMark.classList.remove("tl-current");
+  }
+  currentMark = tr;
+  if (tr) {
+    tr.classList.add("tl-current");
+  }
+}
+
+/** Step between FAILING TESTS, across the whole window, in run order.
  *
- * A shortcut for the common read, and deliberately no more than that:
- * in this system a script whose tests all PASS can still be the one
- * that dirtied shared data, so the culprit is not guaranteed to be red.
- * These buttons save the scrolling; the running order stays the
- * evidence.
+ * Each jump opens the script row it lands in, opens the test's
+ * captured output, and scrolls there — the archaeology loop (read a
+ * failure, hop to the next) without any trip back up the page; the
+ * nav is a fixed pill at the corner of the viewport, and `n`/`p` do
+ * the same from the keyboard.
+ *
+ * A shortcut, deliberately no more: a script whose tests all PASS can
+ * still be the one that dirtied shared data, so the culprit is not
+ * guaranteed to be red. The buttons save the scrolling; the running
+ * order stays the evidence.
+ *
+ * The total comes from the rows' own failure counts, so it is known
+ * before any expansion is fetched; which TEST is the k-th failure is
+ * only knowable from a row's runs, so a jump may await that fetch.
  */
-function wireFailureNav(rowsHost) {
+function wireFailureNav() {
   const nav = document.getElementById("failure-nav");
   const prev = document.getElementById("prev-failure");
   const next = document.getElementById("next-failure");
   const pos = document.getElementById("failure-pos");
 
-  const failing = [];
-  state.rows.forEach((row, index) => {
-    if (row.failed > 0) {
-      failing.push(index);
-    }
+  /* prefix[r] = failing tests before row r; total = the lot. */
+  const prefix = [];
+  let total = 0;
+  state.rows.forEach((row) => {
+    prefix.push(total);
+    total += row.failed;
   });
-  nav.hidden = failing.length === 0;
-  if (!failing.length) {
+  nav.hidden = total === 0;
+  if (!total) {
     return;
   }
 
-  /* Position within `failing`, -1 before the first jump. Local to this
-   * render on purpose: new rows mean a new hunt. */
+  /* Position in the flat failing-test sequence, -1 before the first
+   * jump; local to this render on purpose — new rows, new hunt. */
   let cursor = -1;
+  let busy = false;
 
-  const jumpTo = (position) => {
-    if (cursor >= 0) {
-      rowsHost.children[failing[cursor]].children[0]
-        .classList.remove("tl-current");
+  const jumpTo = async (position) => {
+    if (busy) {
+      return;      // a jump is already fetching; keep clicks sane
     }
-    cursor = position;
-    const target = rowsHost.children[failing[cursor]];
-    target.children[0].classList.add("tl-current");
-    target.scrollIntoView({ behavior: "smooth", block: "center" });
-    const toggle = target.querySelector(".tl-expand");
-    if (toggle && toggle.getAttribute("aria-expanded") === "false") {
-      toggle.click();
+    busy = true;
+    try {
+      // The last row whose prefix does not pass `position` — ties
+      // resolve to the later row, which is the one with the failures.
+      let index = state.rows.length - 1;
+      while (index > 0 && prefix[index] > position) {
+        index -= 1;
+      }
+      const nth = position - prefix[index];
+      const tests = await rowControllers[index].openTests();
+      const fails = tests.filter((test) => test.result === "FAIL");
+      if (!fails.length) {
+        return;    // row data drifted under us; leave the cursor be
+      }
+      const target = fails[Math.min(nth, fails.length - 1)];
+      markCurrent(target.tr);
+      await target.showOutput();
+      target.tr.scrollIntoView({ behavior: "smooth", block: "center" });
+      cursor = position;
+      pos.textContent = (cursor + 1) + " of " + total;
+      prev.disabled = cursor <= 0;
+      next.disabled = cursor >= total - 1;
+    } finally {
+      busy = false;
     }
-    pos.textContent = (cursor + 1) + " of " + failing.length;
-    prev.disabled = cursor <= 0;
-    next.disabled = cursor >= failing.length - 1;
   };
 
-  pos.textContent = failing.length === 1
-    ? "1 row" : failing.length + " rows";
+  pos.textContent = total === 1
+    ? "1 failing test" : total + " failing tests";
   prev.disabled = true;
   next.disabled = false;
   next.onclick = () => {
-    if (cursor < failing.length - 1) {
+    if (cursor < total - 1) {
       jumpTo(cursor + 1);
     }
   };
@@ -357,30 +437,53 @@ function buildRow(row, domainFrom, span, showDate) {
   detail.hidden = true;
   wrap.appendChild(detail);
 
-  let loaded = false;
-  toggle.addEventListener("click", async () => {
-    const open = toggle.getAttribute("aria-expanded") === "true";
-    toggle.setAttribute("aria-expanded", open ? "false" : "true");
-    toggle.textContent = open ? "▸" : "▾";
-    detail.hidden = open;
-    if (loaded || open) {
-      return;
+  /* One fetch per row however often it toggles — and the same promise
+   * whether the opener was a click, the failure stepper or a search
+   * jump, so none of them can double-load or race each other. */
+  let detailPromise = null;
+  const loadDetail = () => {
+    if (detailPromise === null) {
+      detailPromise = (async () => {
+        detail.appendChild(el("p", "muted", "Loading…"));
+        try {
+          const data = await fetchJson(runsUrl(row));
+          clearNode(detail);
+          return renderDetail(detail, data);
+        } catch (err) {
+          detailPromise = null;   // let a retry re-fetch after a failure
+          clearNode(detail);
+          detail.appendChild(el("p", "muted", "Could not load this run: "
+            + err.message));
+          return [];
+        }
+      })();
     }
-    loaded = true;    // one fetch per row, however often it toggles
-    detail.appendChild(el("p", "muted", "Loading…"));
-    try {
-      const data = await fetchJson(runsUrl(row));
-      clearNode(detail);
-      renderDetail(detail, data);
-    } catch (err) {
-      loaded = false;  // let a retry re-fetch after a failure
-      clearNode(detail);
-      detail.appendChild(el("p", "muted", "Could not load this run: "
-        + err.message));
+    return detailPromise;
+  };
+
+  const setOpen = (open) => {
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    toggle.textContent = open ? "▾" : "▸";
+    detail.hidden = !open;
+  };
+
+  toggle.addEventListener("click", () => {
+    const wasOpen = toggle.getAttribute("aria-expanded") === "true";
+    setOpen(!wasOpen);
+    if (!wasOpen) {
+      loadDetail();
     }
   });
 
-  return wrap;
+  return {
+    wrap: wrap,
+    row: row,
+    /** Open the row and resolve to its test controllers. */
+    openTests: () => {
+      setOpen(true);
+      return loadDetail();
+    },
+  };
 }
 
 function renderDetail(detail, data) {
@@ -400,6 +503,7 @@ function renderDetail(detail, data) {
   table.appendChild(head);
 
   const body = el("tbody");
+  const controllers = [];
   let firstFailMarked = false;
   data.runs.forEach((run) => {
     const tr = el("tr", "tl-run-row");
@@ -450,27 +554,40 @@ function renderDetail(detail, data) {
     outputRow.appendChild(outputCell);
     body.appendChild(outputRow);
 
-    let outputLoaded = false;
-    runToggle.addEventListener("click", async () => {
-      const open = runToggle.getAttribute("aria-expanded") === "true";
-      runToggle.setAttribute("aria-expanded", open ? "false" : "true");
-      runToggle.textContent = open ? "▸" : "▾";
-      outputRow.hidden = open;
-      if (outputLoaded || open) {
-        return;
+    /* One fetch per run, shared between the click path and the
+     * stepper's jump — same shape as the row detail above. */
+    let outputPromise = null;
+    const loadOutput = () => {
+      if (outputPromise === null) {
+        outputPromise = (async () => {
+          pre.textContent = "Loading output…";
+          try {
+            const full = await fetchJson(runApiPath(run.run_id));
+            const truncated = fillOutput(pre, full.output);
+            if (truncated) {
+              outputCell.appendChild(el("p", "muted cap-note",
+                truncated + " Open the test page for all of it."));
+            }
+          } catch (err) {
+            outputPromise = null;  // let a retry re-fetch after a failure
+            pre.textContent = "Could not load the output: " + err.message;
+          }
+        })();
       }
-      outputLoaded = true;   // one fetch per run, however often it toggles
-      pre.textContent = "Loading output…";
-      try {
-        const full = await fetchJson(runApiPath(run.run_id));
-        const truncated = fillOutput(pre, full.output);
-        if (truncated) {
-          outputCell.appendChild(el("p", "muted cap-note",
-            truncated + " Open the test page for all of it."));
-        }
-      } catch (err) {
-        outputLoaded = false;  // let a retry re-fetch after a failure
-        pre.textContent = "Could not load the output: " + err.message;
+      return outputPromise;
+    };
+
+    const setOutputOpen = (open) => {
+      runToggle.setAttribute("aria-expanded", open ? "true" : "false");
+      runToggle.textContent = open ? "▾" : "▸";
+      outputRow.hidden = !open;
+    };
+
+    runToggle.addEventListener("click", () => {
+      const wasOpen = runToggle.getAttribute("aria-expanded") === "true";
+      setOutputOpen(!wasOpen);
+      if (!wasOpen) {
+        loadOutput();
       }
     });
 
@@ -484,10 +601,204 @@ function renderDetail(detail, data) {
       }
       runToggle.click();
     });
+
+    controllers.push({
+      test_name: run.test_name,
+      result: run.result,
+      tr: tr,
+      showOutput: () => {
+        setOutputOpen(true);
+        return loadOutput();
+      },
+    });
   });
   table.appendChild(body);
   wrapper.appendChild(table);
   detail.appendChild(wrapper);
+  return controllers;
+}
+
+/* ---------------- find a test in the window ----------------
+ *
+ * The victim-first entry to the whole workflow: "THIS test inherited
+ * bad data — what ran before it?". Type its name, land on its row in
+ * the running order; everything above it is the suspect list.
+ *
+ * Names come from the dashboard's existing server-side search over
+ * latest_runs (one paged query, nothing new to maintain); placing the
+ * hit uses the rows already on this page.
+ */
+
+let searchTimer = null;
+let searchSeq = 0;
+let searchMatches = [];   // last suggestions: [{script, test_name}]
+
+async function fetchSearchMatches(query) {
+  const qs = new URLSearchParams();
+  qs.append("environment", state.environment);
+  qs.append("q", query);
+  qs.append("limit", "20");
+  const data = await fetchJson("/api/dashboard?" + qs.toString());
+  return data.tests.map((test) => ({
+    script: test.script, test_name: test.test_name,
+  }));
+}
+
+function refreshSuggestions(query) {
+  if (searchTimer !== null) {
+    clearTimeout(searchTimer);
+  }
+  if (query.length < 2) {
+    return;
+  }
+  searchTimer = setTimeout(async () => {
+    const seq = ++searchSeq;
+    try {
+      const matches = await fetchSearchMatches(query);
+      if (seq !== searchSeq) {
+        return;
+      }
+      searchMatches = matches;
+      const list = document.getElementById("test-search-list");
+      clearNode(list);
+      const seen = [];
+      for (const match of matches) {
+        if (seen.indexOf(match.test_name) !== -1) {
+          continue;
+        }
+        seen.push(match.test_name);
+        const option = el("option", "");
+        option.value = match.test_name;
+        option.setAttribute("label", match.script);
+        list.appendChild(option);
+      }
+    } catch (err) {
+      /* Suggestions are decoration; the Enter path reports errors. */
+    }
+  }, 250);
+}
+
+async function locateTest(name) {
+  const note = document.getElementById("search-note");
+  note.textContent = "";
+  let candidates = searchMatches.filter(
+    (match) => match.test_name === name);
+  if (!candidates.length) {
+    try {
+      searchMatches = await fetchSearchMatches(name);
+    } catch (err) {
+      showError(err.message);
+      return;
+    }
+    candidates = searchMatches.filter(
+      (match) => match.test_name === name);
+    if (!candidates.length && searchMatches.length) {
+      candidates = [searchMatches[0]];    // nearest match, said below
+    }
+  }
+  if (!candidates.length) {
+    note.textContent = "No test matching “" + name
+      + "” in this environment.";
+    return;
+  }
+  const targetName = candidates[0].test_name;
+  await placeTest(
+    candidates.map((match) => match.script), targetName,
+    targetName === name ? "" : "Nearest match: " + targetName + ". ");
+}
+
+/** Open the row holding *targetName* (first of *scripts* that has it),
+ * mark it, scroll there. The shared tail of the search box and the
+ * "View in timeline" deep link from the triage panels. */
+async function placeTest(scripts, targetName, prefixNote) {
+  const note = document.getElementById("search-note");
+  const inWindow = rowControllers.filter(
+    (controller) => scripts.indexOf(controller.row.script) !== -1);
+  if (!inWindow.length) {
+    note.textContent = targetName + " belongs to " + scripts.join(", ")
+      + ", which has no row in the selected run — try another run in "
+      + "the picker.";
+    return;
+  }
+  for (const controller of inWindow) {
+    const tests = await controller.openTests();
+    const hit = tests.find((test) => test.test_name === targetName);
+    if (hit) {
+      markCurrent(hit.tr);
+      hit.tr.scrollIntoView({ behavior: "smooth", block: "center" });
+      note.textContent = (prefixNote || "")
+        + "Everything above its row ran before it.";
+      return;
+    }
+  }
+  note.textContent = targetName + " did not run in the selected run of "
+    + scripts.join(", ") + " — try another run in the picker.";
+}
+
+/* ---------------- hotkeys ----------------
+ *
+ * Vi-flavoured and strictly optional — every one of these has a mouse
+ * path, and none fire while a field has focus. `?` shows the list.
+ */
+
+function handleHotkey(event) {
+  const target = event.target || {};
+  const tag = target.tagName;
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
+    if (event.key === "Escape" && target.blur) {
+      target.blur();      // vi: leave insert mode
+    }
+    return;
+  }
+  if (event.ctrlKey || event.altKey || event.metaKey) {
+    return;
+  }
+  const step = (id) => {
+    const nav = document.getElementById("failure-nav");
+    const button = document.getElementById(id);
+    if (nav && !nav.hidden && button && !button.disabled) {
+      button.click();
+    }
+  };
+  switch (event.key) {
+    case "/": {
+      const box = document.getElementById("test-search");
+      if (box && box.focus) {
+        box.focus();
+        if (event.preventDefault) {
+          event.preventDefault();   // don't type the slash
+        }
+      }
+      break;
+    }
+    case "n":
+      step("next-failure");
+      break;
+    case "N":
+    case "p":
+      step("prev-failure");
+      break;
+    case "g":
+      if (window.scrollTo) {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+      break;
+    case "G":
+      if (window.scrollTo) {
+        window.scrollTo({
+          top: document.body ? document.body.scrollHeight : 0,
+          behavior: "smooth",
+        });
+      }
+      break;
+    case "?": {
+      const help = document.getElementById("hotkey-help");
+      if (help) {
+        help.hidden = !help.hidden;
+      }
+      break;
+    }
+  }
 }
 
 async function loadEnvironments() {
@@ -531,15 +842,38 @@ async function init() {
     state.from = params.get("from");
     state.to = params.get("to");
   }
+  if (params.get("test") && params.get("script")) {
+    pendingLocate = {
+      script: params.get("script"),
+      test_name: params.get("test"),
+      at: params.get("at"),
+    };
+  }
 
   document.getElementById("timeline-environment")
     .addEventListener("change", (event) => {
       state.environment = event.target.value;
       state.from = null;    // a window belongs to one environment
       state.to = null;
+      searchMatches = [];   // suggestions belonged to the old one
       syncUrl();
       load();
     });
+
+  const searchBox = document.getElementById("test-search");
+  searchBox.addEventListener("input", (event) => {
+    refreshSuggestions(event.target.value.trim());
+  });
+  searchBox.addEventListener("change", (event) => {
+    const value = event.target.value.trim();
+    if (value) {
+      locateTest(value);
+    }
+  });
+
+  if (window.addEventListener) {
+    window.addEventListener("keydown", handleHotkey);
+  }
 
   document.getElementById("timeline-block")
     .addEventListener("change", (event) => {

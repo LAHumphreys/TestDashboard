@@ -45,16 +45,40 @@
       <label>Run
         <select id="timeline-block"></select>
       </label>
-      <!-- Steps between rows containing failures. A shortcut, not the
-           verdict: in this system even a script whose tests all pass can
-           leave shared data dirty, so the running order stays primary. -->
-      <span id="failure-nav" class="failure-nav" hidden>
-        <span class="muted">Failing rows</span>
-        <button id="prev-failure" class="toggle" type="button">‹ Prev</button>
-        <span id="failure-pos" class="muted failure-pos"></span>
-        <button id="next-failure" class="toggle" type="button">Next ›</button>
-      </span>
+      <!-- The victim-first entry: name the test that inherited bad
+           data, land on its row, read upwards. -->
+      <label>Find test
+        <input id="test-search" type="search" list="test-search-list"
+               placeholder="test name… ( / )" autocomplete="off">
+      </label>
+      <datalist id="test-search-list"></datalist>
+      <span id="search-note" class="muted search-note"></span>
     </div>
+
+    <!-- Optional vi-flavoured keys; the mouse does all of it too. -->
+    <div id="hotkey-help" class="hotkey-help" hidden>
+      <strong>Keys</strong> — every one has a mouse path:
+      <code>/</code> find test ·
+      <code>n</code> next failing test ·
+      <code>N</code>/<code>p</code> previous ·
+      <code>g</code>/<code>G</code> top / bottom ·
+      <code>Esc</code> leave the search box ·
+      <code>?</code> this card
+    </div>
+
+    <!-- Steps between failing TESTS across the window. A shortcut, not
+         the verdict: in this system even a script whose tests all pass
+         can leave shared data dirty, so the running order stays primary.
+         Fixed to the corner of the viewport so a hunt never needs a trip
+         back up the page. -->
+    <span id="failure-nav" class="failure-nav" hidden>
+      <span class="muted">Failing tests</span>
+      <button id="prev-failure" class="toggle" type="button"
+              title="Previous failing test (N or p)">‹ Prev</button>
+      <span id="failure-pos" class="muted failure-pos"></span>
+      <button id="next-failure" class="toggle" type="button"
+              title="Next failing test (n)">Next ›</button>
+    </span>
 
     <div class="card timeline-card">
       <div id="timeline-axis" class="timeline-axis" aria-hidden="true"></div>

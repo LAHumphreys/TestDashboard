@@ -54,11 +54,28 @@
           first failure inside that run marked — and click any test to read
           its captured output right there, without losing your place in
           the order.</li>
-        <li><strong>Failing rows: Prev / Next</strong> steps you between the
-          rows that contain failures, in order. A handy shortcut — but only
-          a shortcut: a script can "pass" and still leave data in a bad
-          state, so the culprit is not always a red row. Reading the
-          running order around the victim is still the real hunt.</li>
+        <li><strong>Find a test by name.</strong> The "Find test" box takes
+          you straight to a test's place in the running order — the fastest
+          way in when you already know which test inherited the bad data.
+          Suggestions appear as you type; everything above the row it lands
+          on ran before it.</li>
+        <li><strong>Coming from a triage queue?</strong> The review panel
+          (the expanded section with the output) on the Dashboard and Open
+          actions pages now has a <em>View in timeline</em> link that lands
+          on that exact run, in the night it belongs to, with the running
+          order around it.</li>
+        <li><strong>Failing tests: Prev / Next</strong> — the floating
+          buttons in the corner step you through every failing test in the
+          window, opening each one's output as you arrive, without a trip
+          back up the page. A handy shortcut — but only a shortcut: a
+          script can "pass" and still leave data in a bad state, so the
+          culprit is not always a red row. Reading the running order around
+          the victim is still the real hunt.</li>
+        <li><strong>Optional keys for the flow</strong> (the mouse does
+          everything too): press <strong>?</strong> on the Timeline for the
+          list — <strong>/</strong> jumps to the search box,
+          <strong>n</strong>/<strong>p</strong> step through failing
+          tests.</li>
         <li><strong>Partial runs are visible as partial.</strong> A row that
           says <em>"41 of 45 known tests"</em> (in amber) means the script
           ran fewer tests than it usually reports — a cut-short or partial

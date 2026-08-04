@@ -1790,13 +1790,28 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
 
 .tl-output.muted { color: var(--muted); }
 
-/* Failure stepper: prev / "2 of 5" / next. */
+/* Failure stepper: a pill FIXED to the viewport corner, because the
+   hunt it serves is "read a failure deep in the page, hop to the next"
+   — a control that scrolls away is a control that gets used once. */
 .failure-nav {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 40;
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-size: 12px;
+  padding: 8px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
 }
+
+/* An author display beats the UA's [hidden] rule, so say it ourselves
+   or the pill floats over every page state forever. */
+.failure-nav[hidden] { display: none; }
 
 .failure-pos {
   min-width: 52px;
@@ -1804,10 +1819,33 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
   font-variant-numeric: tabular-nums;
 }
 
-/* Where the failure stepper currently is. An outline, not a fill: it
-   marks position, it does not rank the row. */
-.tl-row.tl-current {
-  outline: 2px solid var(--accent-link);
-  outline-offset: -2px;
-  border-radius: 4px;
+/* Where the stepper or a search currently is: marks position, does not
+   rank the row. On a table row a background is the reliable form. */
+.tl-run-row.tl-current td {
+  background: #e8f0fa;
+}
+
+.tl-run-row.tl-current td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent-link);
+}
+
+.search-note { font-size: 12px; }
+
+#test-search { min-width: 220px; }
+
+.hotkey-help {
+  margin: -6px 0 14px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.hotkey-help code {
+  padding: 0 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
 }

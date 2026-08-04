@@ -67,9 +67,10 @@ python -m unittest discover           # expect 1328 OK (skipped=1) on wp-18-time
 Local validation: `.scratch/` (gitignored) holds this session's tooling —
 `perf.db` (dev copy migrated to v7, served on 8901 during the session),
 `perf-before.db` + a `master-wt` git worktree (baseline on 8902),
-`domshim.mjs` + `drive_timeline.mjs` (the node DOM-shim harness that verified
-the Timeline page — 18 checks against a live server; reusable next session),
-and the two bench scripts behind the status-log numbers. Servers do not
+`domshim.mjs` + `drive_timeline.mjs` + `drive_deeplink.mjs` (the node
+DOM-shim harness that verified the Timeline page — 41 + 5 checks against a
+live server; reusable next session), and the two bench scripts behind the
+status-log numbers. Servers do not
 survive the session; restart with
 `python run_server.py --port 8901 --db .scratch/perf.db` if needed.
 Remove the worktree with `git worktree remove .scratch/master-wt` when done.
