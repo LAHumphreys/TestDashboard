@@ -60,7 +60,7 @@ from typing import (
 )
 
 from testboard.model import Result, StoredRun, duration_seconds, format_iso
-from testboard.storage import RollupCount
+from testboard.storage import RollupCount, ScriptHourBucket
 
 __all__ = [
     "DAY_NAMES",
@@ -80,6 +80,8 @@ __all__ = [
     "summarize_rollup",
     "Execution",
     "group_executions",
+    "ScriptExecution",
+    "group_script_executions",
     "Pass",
     "find_passes",
     "complete_passes",
@@ -724,6 +726,94 @@ def group_executions(
         if run.end_time > ended:
             ended = run.end_time
     flush()
+    return executions
+
+
+class ScriptExecution(NamedTuple):
+    """One execution of one script — a row of the Timeline page.
+
+    The script-level sibling of :class:`Execution`, inferred the same
+    way (timing gaps; the import contract has no batch id) but from
+    ``script_hours`` buckets rather than from ``runs`` — the Timeline
+    covers every script an environment ran in a night, and reading
+    every run of every one of them at request time is the O(history)
+    shape this project keeps paying to remove.
+    """
+
+    script: str
+    started: datetime.datetime
+    ended: datetime.datetime
+    total: int
+    results: Dict[Result, int]
+
+    @property
+    def failed(self) -> int:
+        """Runs that FAILED (the only result that counts as a failure)."""
+        return self.results[Result.FAIL]
+
+    @property
+    def duration_seconds(self) -> float:
+        """Wall-clock span from the first run starting to the last ending."""
+        return duration_seconds(self.started, self.ended)
+
+
+def group_script_executions(
+    buckets: Sequence[ScriptHourBucket],
+    gap_minutes: int = 60,
+) -> List[ScriptExecution]:
+    """Group one environment's script_hours buckets into executions.
+
+    The same inference as :func:`group_executions`, at bucket rather
+    than run granularity: per script, a new execution starts when a
+    bucket's ``first_start`` begins more than *gap_minutes* after the
+    latest ``last_end`` seen so far. Bucket edges cannot hide a real
+    gap or invent one at this gap size: starts inside one bucket span
+    under an hour, so a >=60-minute quiet period always crosses a
+    bucket boundary, where the exact timestamps see it.
+
+    Ordering matters and is the page's whole point: the result is
+    sorted by ``started`` (script name breaking ties), which is the
+    running order. A script that ran twice in the window comes out
+    twice, and a partial run is just a row whose ``total`` is short —
+    both are rows, not special cases.
+    """
+    gap = datetime.timedelta(minutes=gap_minutes)
+    by_script = {}  # type: Dict[str, List[ScriptHourBucket]]
+    for bucket in buckets:
+        by_script.setdefault(bucket.script, []).append(bucket)
+
+    executions = []  # type: List[ScriptExecution]
+    for script in sorted(by_script):
+        started = None  # type: Optional[datetime.datetime]
+        ended = None  # type: Optional[datetime.datetime]
+        counts = {}  # type: Dict[Result, int]
+        total = 0
+        # Result rows of one hour share the bucket; first_start orders
+        # them (and the hours) by when the activity actually began.
+        for bucket in sorted(
+            by_script[script], key=lambda entry: entry.first_start
+        ):
+            if (started is None or ended is None
+                    or bucket.first_start - ended > gap):
+                if started is not None and ended is not None:
+                    executions.append(ScriptExecution(
+                        script=script, started=started, ended=ended,
+                        total=total, results=dict(counts),
+                    ))
+                started = bucket.first_start
+                ended = bucket.last_end
+                counts = {result: 0 for result in Result}
+                total = 0
+            counts[bucket.result] += bucket.count
+            total += bucket.count
+            if bucket.last_end > ended:
+                ended = bucket.last_end
+        if started is not None and ended is not None:
+            executions.append(ScriptExecution(
+                script=script, started=started, ended=ended,
+                total=total, results=dict(counts),
+            ))
+    executions.sort(key=lambda entry: (entry.started, entry.script))
     return executions
 
 

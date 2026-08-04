@@ -14,6 +14,7 @@
       <a href="index.html">Dashboard</a>
       <a href="actions.html">Open actions</a>
       <a href="time.html">Time</a>
+      <a href="timeline.html">Timeline</a>
       <a id="nav-whatsnew" href="whatsnew.html" aria-current="page">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
@@ -32,6 +33,35 @@
          invisible to all three, so
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
+
+    <section class="release" data-drop-date="2026-08-04">
+      <div class="section-head">
+        <h2 class="eyebrow">4 August 2026</h2>
+        <span class="muted">New: the Timeline — what ran, in what order</span>
+      </div>
+
+      <h3>A new page in the nav: Timeline</h3>
+      <ul>
+        <li><strong>It shows one environment's scripts in the order they
+          ran</strong> — each row is one run of one script, with a bar on a
+          shared clock, its test count, how long it took, and a red chip if
+          anything in it failed. Pick the environment and the run you care
+          about at the top; earlier runs are in the same picker.</li>
+        <li><strong>It exists for the "poisoned data" hunt.</strong> When a
+          test fails because some earlier script left data in a bad state,
+          the culprit is above it in this list. <em>Jump to first
+          failure</em> takes you to the first row that went red, and
+          expanding any row lists its tests in running order — with the
+          first failure inside that run marked.</li>
+        <li><strong>Partial runs are visible as partial.</strong> A row that
+          says <em>"41 of 45 known tests"</em> (in amber) means the script
+          ran fewer tests than it usually reports — a cut-short or partial
+          run, worth a suspicious look on its own.</li>
+        <li>A script that ran twice in one night appears twice, in its real
+          places. Overlapping bars mean two scripts genuinely ran at the
+          same time.</li>
+      </ul>
+    </section>
 
     <section class="release" data-drop-date="2026-07-31">
       <div class="section-head">

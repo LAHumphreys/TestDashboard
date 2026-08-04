@@ -2534,3 +2534,229 @@ class SummaryPartsTest(ApiCase):
         error = self.call(
             "GET", "/api/summary", query={"parts": ["queue"]}, expect=400)
         self.assertIn("queue", error["error"])
+
+
+class TimelineTest(ApiCase):
+    """GET /api/timeline: one environment's script running order."""
+
+    def _night(
+        self,
+        days_ago: int,
+        entries: List[Any],
+        environment: str = "linux-sim",
+    ) -> None:
+        """One night's activity: (script, test, minute_offset[, result])."""
+        base = (NOW - datetime.timedelta(days=days_ago)).replace(
+            hour=2, minute=0, second=0, microsecond=0)
+        rows = []
+        for entry in entries:
+            script, test_name, offset = entry[0], entry[1], entry[2]
+            result = entry[3] if len(entry) > 3 else "PASS"
+            when = base + datetime.timedelta(minutes=offset)
+            rows.append(record(
+                environment=environment, script=script,
+                test_name=test_name, result=result,
+                start_time=format_iso(when),
+                end_time=format_iso(
+                    when + datetime.timedelta(seconds=30)),
+            ))
+        self.import_runs(rows)
+
+    def _standard_nights(self) -> None:
+        """Three identical nights: a.py (two tests), then b.py (one).
+
+        b.py starts at minute 70 — inside the block's FINAL hour
+        bucket, so it also proves the window edge is hour-inclusive
+        (trimmed against the exact bucket start, its row would vanish).
+        """
+        for day in (3, 2, 1):
+            self._night(day, [
+                ("a.py", "t0", 0),
+                ("a.py", "t1", 5, "FAIL"),
+                ("b.py", "t2", 70),
+            ])
+
+    def test_defaults_to_the_newest_block_in_running_order(self) -> None:
+        self._standard_nights()
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self.assertEqual(len(data["blocks"]), 3)
+        newest = data["blocks"][0]
+        self.assertEqual(data["window"],
+                         {"from": newest["started"],
+                          "to": newest["ended"]})
+        self.assertEqual(
+            [(row["script"], row["total"]) for row in data["rows"]],
+            [("a.py", 2), ("b.py", 1)])
+        first = data["rows"][0]
+        self.assertEqual(first["failed"], 1)
+        self.assertEqual(first["results"]["FAIL"], 1)
+        self.assertEqual(first["known_tests"], 2)
+        self.assertEqual(data["rows"][1]["known_tests"], 1)
+        self.assertEqual(data["gap_minutes"], 60)
+
+    def test_a_rerun_after_a_gap_is_its_own_row(self) -> None:
+        """A script that ran twice appears twice, in its real places."""
+        self._night(1, [
+            ("a.py", "t0", 0),
+            ("b.py", "t1", 10),
+            ("a.py", "t0", 150),
+        ])
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self.assertEqual(
+            [row["script"] for row in data["rows"]],
+            ["a.py", "b.py", "a.py"])
+
+    def test_a_partial_run_reads_short_against_known_tests(self) -> None:
+        """The row says 1 of 2 rather than pretending 1 is everything."""
+        self._night(3, [("a.py", "t0", 0), ("a.py", "t1", 1)])
+        self._night(2, [("a.py", "t0", 0), ("a.py", "t1", 1)])
+        self._night(1, [("a.py", "t0", 0)])
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        (row,) = data["rows"]
+        self.assertEqual(row["total"], 1)
+        self.assertEqual(row["known_tests"], 2)
+
+    def test_an_explicit_window_selects_an_older_block(self) -> None:
+        """The picker echoes block edges back; they must round-trip."""
+        self._standard_nights()
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        previous = data["blocks"][1]
+        chosen = self.call(
+            "GET", "/api/timeline",
+            query={
+                "environment": ["linux-sim"],
+                "from": [previous["started"]],
+                "to": [previous["ended"]],
+            })
+        self.assertEqual(
+            chosen["window"],
+            {"from": previous["started"], "to": previous["ended"]})
+        self.assertEqual(
+            [(row["script"], row["total"]) for row in chosen["rows"]],
+            [("a.py", 2), ("b.py", 1)])
+
+    def test_no_activity_means_no_window_and_no_rows(self) -> None:
+        """A long-quiet environment renders empty, not as an error."""
+        old = (NOW - datetime.timedelta(days=60)).replace(
+            hour=2, minute=0, second=0, microsecond=0)
+        self.import_runs([record(
+            environment="quiet-sim", script="a.py", test_name="t0",
+            start_time=format_iso(old),
+            end_time=format_iso(old + datetime.timedelta(seconds=1)))])
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["quiet-sim"]})
+        self.assertEqual(data["blocks"], [])
+        self.assertIsNone(data["window"])
+        self.assertEqual(data["rows"], [])
+
+    def test_environment_is_required(self) -> None:
+        error = self.call("GET", "/api/timeline", expect=400)
+        self.assertIn("environment", error["error"])
+
+    def test_an_unknown_environment_is_404(self) -> None:
+        error = self.call(
+            "GET", "/api/timeline", query={"environment": ["nowhere"]},
+            expect=404)
+        self.assertIn("nowhere", error["error"])
+
+    def test_half_a_window_is_400(self) -> None:
+        self._standard_nights()
+        error = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"],
+                   "from": ["2026-07-25T02:00:00.000000"]},
+            expect=400)
+        self.assertIn("from/to", error["error"])
+
+    def test_a_backwards_window_is_400(self) -> None:
+        self._standard_nights()
+        error = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"],
+                   "from": ["2026-07-25T02:00:00.000000"],
+                   "to": ["2026-07-24T02:00:00.000000"]},
+            expect=400)
+        self.assertIn("window ends before", error["error"])
+
+    def test_a_bad_timestamp_is_400(self) -> None:
+        self._standard_nights()
+        error = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"],
+                   "from": ["yesterday"], "to": ["today"]},
+            expect=400)
+        self.assertIn("ISO-8601", error["error"])
+
+    def test_wrong_method_is_405(self) -> None:
+        self.assert_405("POST", "/api/timeline", "GET")
+
+
+class ScriptWindowRunsTest(ApiCase):
+    """GET /api/scripts/{env}/{script}/runs: the Timeline row expansion."""
+
+    PATH = "/api/scripts/linux-sim/suite%2Falpha.py/runs"
+
+    def _seed(self) -> None:
+        base = datetime.datetime(2026, 7, 25, 2, 0, 0)
+        self.import_runs([
+            record(test_name="test_b", result="FAIL",
+                   start_time=format_iso(
+                       base + datetime.timedelta(minutes=5)),
+                   end_time=format_iso(
+                       base + datetime.timedelta(minutes=5, seconds=2))),
+            record(test_name="test_a",
+                   start_time=format_iso(base),
+                   end_time=format_iso(
+                       base + datetime.timedelta(seconds=3))),
+            record(test_name="test_a",
+                   start_time=format_iso(
+                       base + datetime.timedelta(hours=5)),
+                   end_time=format_iso(
+                       base + datetime.timedelta(hours=5, seconds=3))),
+        ])
+
+    def test_returns_the_window_oldest_first(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", self.PATH,
+            query={"from": ["2026-07-25T02:00:00.000000"],
+                   "to": ["2026-07-25T03:00:00.000000"]})
+        self.assertEqual(
+            [(run["test_name"], run["result"]) for run in data["runs"]],
+            [("test_a", "PASS"), ("test_b", "FAIL")])
+        first = data["runs"][0]
+        self.assertEqual(first["start_time"], "2026-07-25T02:00:00.000000")
+        self.assertEqual(first["duration_seconds"], 3.0)
+        self.assertIn("run_id", first)
+        self.assertFalse(data["truncated"])
+
+    def test_an_unknown_script_is_404(self) -> None:
+        self._seed()
+        error = self.call(
+            "GET", "/api/scripts/linux-sim/nope.py/runs",
+            query={"from": ["2026-07-25T02:00:00.000000"],
+                   "to": ["2026-07-25T03:00:00.000000"]},
+            expect=404)
+        self.assertIn("nope.py", error["error"])
+
+    def test_the_window_is_required(self) -> None:
+        self._seed()
+        error = self.call("GET", self.PATH, expect=400)
+        self.assertIn("from", error["error"])
+
+    def test_a_backwards_window_is_400(self) -> None:
+        self._seed()
+        error = self.call(
+            "GET", self.PATH,
+            query={"from": ["2026-07-25T03:00:00.000000"],
+                   "to": ["2026-07-25T02:00:00.000000"]},
+            expect=400)
+        self.assertIn("window ends before", error["error"])
+
+    def test_wrong_method_is_405(self) -> None:
+        self._seed()
+        self.assert_405("PUT", self.PATH, "GET")

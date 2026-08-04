@@ -99,6 +99,14 @@ _EXECUTIONS_MAX_DAYS = 90
 _EXECUTIONS_MAX_RUNS = 20000
 _EXECUTION_GAP_MINUTES = 60
 
+# /api/timeline: how far back the block picker looks, and the cap on the
+# per-execution run listing (a script execution is at most a few
+# thousand runs; the cap is a backstop against a mis-sized window, and
+# the response says when it bit).
+_TIMELINE_DEFAULT_DAYS = 14
+_TIMELINE_MAX_DAYS = 90
+_TIMELINE_MAX_RUNS = 5000
+
 #: Queues whose entries report failing_since / last_pass_time. Only these
 #: pay for the per-row streak seeks; the others describe a test whose
 #: latest run is not a failure, or show the previous result instead.
@@ -1313,6 +1321,225 @@ def _handle_script_executions(
     )
 
 
+def _parse_iso_param(request: Request, name: str) -> datetime.datetime:
+    """Parse a REQUIRED ISO-8601 query parameter, 400 when absent or bad."""
+    raw = _query_single(request.query, name)
+    if raw is None:
+        raise _HttpError(400, "{}: required parameter is missing".format(
+            name))
+    try:
+        return model.parse_iso(raw)
+    except ValueError:
+        raise _HttpError(
+            400,
+            "{}: must be an ISO-8601 UTC timestamp "
+            "(YYYY-MM-DDTHH:MM:SS.ffffff), got '{}'".format(name, raw),
+        )
+
+
+def _handle_timeline(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """GET /api/timeline — one environment's script running order.
+
+    The problem this answers: a script misbehaves, leaves shared state
+    dirty, and the visible symptom is a DIFFERENT script failing later.
+    Walking backwards from the failure needs the night's running order,
+    script by script — which the test-centric views cannot show.
+
+    Query parameters: ``environment`` (required), ``days`` (1..90,
+    default 14, how far back the block picker looks), and ``from`` /
+    ``to`` (optional ISO timestamps selecting the block of activity to
+    expand into rows; both or neither). Without ``from``/``to`` the
+    newest block is selected.
+
+    ``blocks`` are the same inferred blocks of activity the
+    environments page shows (:func:`analytics.find_passes` — ad-hoc
+    re-run blocks included, labelled by ``covered``, because a
+    twenty-test re-run after a fix is often exactly the
+    state-poisoning suspect). ``rows`` are script executions from
+    ``script_hours`` (migration 7) — never from a scan of ``runs``.
+
+    Wording note for callers: blocks are labelled by their actual
+    times, never "last night" — a suite can run twice a day or skip
+    days, and this project has been burned by window wording three
+    times (see WindowWordingTest).
+    """
+    environment = _query_single(request.query, "environment")
+    if not environment:
+        raise _HttpError(400, "environment: required parameter is missing")
+    if environment not in storage.known_environments():
+        raise _HttpError(
+            404,
+            "unknown environment: no runs recorded for {}".format(
+                environment
+            ),
+        )
+    days = _parse_int_param(
+        request, "days", _TIMELINE_DEFAULT_DAYS, 1, _TIMELINE_MAX_DAYS
+    )
+    now_value = now()
+    floor = now_value - datetime.timedelta(days=days)
+
+    # The same pass inference the environments page runs, over this
+    # page's own lookback. Coverage needs every environment's
+    # denominator, so the inputs stay estate-wide; only the blocks
+    # shown are this environment's.
+    effective = analytics.effective_test_counts(
+        storage.test_counts_by_environment(),
+        storage.declared_test_counts(),
+    )
+    passes = analytics.find_passes(
+        storage.activity_buckets(floor),
+        effective,
+        gap_hours=_PASS_GAP_HOURS,
+        coverage=_PASS_COVERAGE,
+    )
+    shown = analytics.complete_passes(passes, floor, _PASS_GAP_HOURS)
+    blocks = [
+        entry for entry in shown if entry.environment == environment
+    ]
+
+    window_from = None  # type: Optional[datetime.datetime]
+    window_to = None  # type: Optional[datetime.datetime]
+    has_from = _query_single(request.query, "from") is not None
+    has_to = _query_single(request.query, "to") is not None
+    if has_from != has_to:
+        raise _HttpError(
+            400, "from/to: provide both edges of the window, or neither"
+        )
+    if has_from:
+        window_from = _parse_iso_param(request, "from")
+        window_to = _parse_iso_param(request, "to")
+        if window_to < window_from:
+            raise _HttpError(400, "from/to: the window ends before it starts")
+    elif blocks:
+        window_from = blocks[-1].started
+        window_to = blocks[-1].ended
+
+    rows = []  # type: List[analytics.ScriptExecution]
+    known = {}  # type: Dict[str, int]
+    if window_from is not None and window_to is not None:
+        executions = analytics.group_script_executions(
+            storage.script_activity(environment, window_from, window_to),
+            gap_minutes=_EXECUTION_GAP_MINUTES,
+        )
+        # The window is INCLUSIVE AT HOUR RESOLUTION, deliberately:
+        # block edges from find_passes are bucket starts (a block
+        # "ending" at 04:00 ran tests until 04:59), so trimming
+        # against the exact edge would silently drop whatever ran in
+        # the block's final hour. Widening both edges to their hour
+        # matches what script_activity read; it cannot pull in a
+        # neighbouring block, because blocks are by construction
+        # separated by six quiet hours.
+        from_floor = window_from.replace(
+            minute=0, second=0, microsecond=0
+        )
+        to_ceiling = window_to.replace(
+            minute=0, second=0, microsecond=0
+        ) + datetime.timedelta(hours=1)
+        rows = [
+            execution for execution in executions
+            if execution.started < to_ceiling
+            and execution.ended >= from_floor
+        ]
+        known = storage.script_test_counts(environment)
+
+    return _json_response(
+        200,
+        {
+            "environment": environment,
+            "days": days,
+            "gap_minutes": _EXECUTION_GAP_MINUTES,
+            # Newest block first: that is the one being looked at.
+            "blocks": [_pass_json(entry) for entry in reversed(blocks)],
+            "window": (
+                None if window_from is None or window_to is None else {
+                    "from": model.format_iso(window_from),
+                    "to": model.format_iso(window_to),
+                }
+            ),
+            # Running order — the page renders these top to bottom.
+            "rows": [
+                {
+                    "script": execution.script,
+                    "started": model.format_iso(execution.started),
+                    "ended": model.format_iso(execution.ended),
+                    "duration_seconds": round(
+                        execution.duration_seconds, 3
+                    ),
+                    "total": execution.total,
+                    "failed": execution.failed,
+                    "results": _result_counts_json(execution.results),
+                    # High-water mark from latest_runs ("known", not
+                    # "expected"): a short total against it is what a
+                    # partial run looks like.
+                    "known_tests": known.get(execution.script, 0),
+                }
+                for execution in rows
+            ],
+        },
+    )
+
+
+def _handle_script_window_runs(
+    storage: Storage,
+    request: Request,
+    environment: str,
+    script: str,
+) -> Response:
+    """GET /api/scripts/{env}/{script}/runs — one window's runs, in order.
+
+    The Timeline row expansion: every run of one script between
+    ``from`` and ``to`` (required, inclusive), oldest first, no
+    outputs. Bounded by the script's index range and capped at
+    ``_TIMELINE_MAX_RUNS`` — the same cost profile as the executions
+    endpoint, paid one script at a time on demand.
+    """
+    if not storage.script_exists(environment, script):
+        raise _HttpError(
+            404,
+            "unknown script: no runs recorded for {} / {}".format(
+                environment, script
+            ),
+        )
+    window_from = _parse_iso_param(request, "from")
+    window_to = _parse_iso_param(request, "to")
+    if window_to < window_from:
+        raise _HttpError(400, "from/to: the window ends before it starts")
+    runs = storage.script_runs(
+        environment, script, window_from, _TIMELINE_MAX_RUNS,
+        until=window_to,
+    )
+    return _json_response(
+        200,
+        {
+            "environment": environment,
+            "script": script,
+            "from": model.format_iso(window_from),
+            "to": model.format_iso(window_to),
+            "truncated": len(runs) >= _TIMELINE_MAX_RUNS,
+            "runs": [
+                {
+                    "test_name": run.test_name,
+                    "run_id": run.run_id,
+                    "result": run.result.value,
+                    "start_time": model.format_iso(run.start_time),
+                    "end_time": model.format_iso(run.end_time),
+                    "duration_seconds": round(
+                        model.duration_seconds(
+                            run.start_time, run.end_time
+                        ), 3
+                    ),
+                }
+                for run in runs
+            ],
+        },
+    )
+
+
 def _handle_retired(
     storage: Storage,
     request: Request,
@@ -1762,6 +1989,10 @@ def _route(
         _check_method(request.method, ("GET",))
         return _handle_time(storage, request, now)
 
+    if rest == ["timeline"]:
+        _check_method(request.method, ("GET",))
+        return _handle_timeline(storage, request, now)
+
     if rest == ["environments"]:
         _check_method(request.method, ("GET",))
         return _handle_environments_list(storage, request, now)
@@ -1795,6 +2026,12 @@ def _route(
         _check_method(request.method, ("GET",))
         return _handle_script_executions(
             storage, request, rest[1], rest[2], now
+        )
+
+    if len(rest) == 4 and rest[0] == "scripts" and rest[3] == "runs":
+        _check_method(request.method, ("GET",))
+        return _handle_script_window_runs(
+            storage, request, rest[1], rest[2]
         )
 
     if len(rest) == 4 and rest[0] == "tests":

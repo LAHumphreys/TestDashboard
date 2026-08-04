@@ -17,18 +17,22 @@ All SQL for the project lives in this module. Responsibilities:
   UPDATE`` (not available in Python 3.6's bundled sqlite).
 - The (potentially large) ``output`` column is NEVER selected by list
   queries — only :meth:`Storage.get_run` fetches it.
-- Three derived tables keep estate-wide reads proportional to the number
+- Four derived tables keep estate-wide reads proportional to the number
   of TESTS (and the page actually returned) rather than to the number of
   runs ever recorded: ``latest_runs`` (one row per test: its newest run,
   that run's result and the previous run's result),
   ``current_assignments`` (one row per test: who owns it now, with
-  ``assignments`` kept as the audit log) and ``activity_hours`` (run
+  ``assignments`` kept as the audit log), ``activity_hours`` (run
   counts per environment, UTC hour and result — what the staleness
   cutoff and the trend chart read instead of scanning a window of
-  ``runs``). All are maintained inside the same transaction as the write
-  that changes them — see :meth:`Storage._maintain_latest`,
-  :meth:`Storage.set_assignee` and :meth:`Storage._apply_activity_deltas`
-  — so they cannot drift from ``runs``.
+  ``runs``) and ``script_hours`` (the same counts per script, carrying
+  the exact first start and last end in each bucket — what the Timeline
+  page reads to show a night's script running order). All are
+  maintained inside the same transaction as the write that changes them
+  — see :meth:`Storage._maintain_latest`, :meth:`Storage.set_assignee`,
+  :meth:`Storage._apply_activity_deltas` and
+  :meth:`Storage._apply_script_hour_changes` — so they cannot drift
+  from ``runs``.
 
 Only ``str``/``int``/``float``/``None`` cross the sqlite boundary
 (``detect_types=0``); datetimes are converted with
@@ -53,6 +57,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
@@ -74,6 +79,7 @@ __all__ = [
     "User",
     "EnvironmentExpectation",
     "UpsertCounts",
+    "ScriptHourBucket",
     "Storage",
 ]
 
@@ -539,6 +545,59 @@ MIGRATIONS = [
             "python: rebuild_activity_hours",
         ],
     ),
+    (
+        7,
+        [
+            # Run counts per (environment, UTC hour, script, result),
+            # plus the EXACT first start and last end inside each
+            # bucket. The fourth derived table, maintained inside the
+            # import transaction like the other three. It exists for
+            # the Timeline page (WP-18): "what order did the scripts
+            # run in last night" is a script x time question, and no
+            # existing table has that shape — activity_hours drops the
+            # script, latest_runs drops the history, and scanning a
+            # window of `runs` at request time is exactly the
+            # O(history) mistake migration 6 was bought to end.
+            #
+            # The two timestamp columns are what give SUB-HOUR ordering
+            # (scripts start minutes apart) while the hour bucketing is
+            # what keeps the table small: a script touches a handful of
+            # hours a night, so this grows like scripts x active hours,
+            # two orders of magnitude slower than `runs`.
+            #
+            # The PRIMARY KEY leads (environment, hour) — the Timeline
+            # reads one environment over one block of hours, and that
+            # column order makes the read a pure index range instead of
+            # a scan of the environment's whole history.
+            #
+            # The invariant is exact equality with `SELECT environment,
+            # SUBSTR(start_time, 1, 13), script, result, COUNT(*),
+            # MIN(start_time), MAX(end_time) FROM runs GROUP BY 1, 2,
+            # 3, 4` — enforced by tests/test_storage.py::ScriptHoursTest
+            # against live maintenance, environment deletion and
+            # pruning. SUBSTR keeps the expression portable to MariaDB
+            # for the same reason as activity_hours
+            # (docs/MARIADB_MIGRATION.md E.4).
+            """
+            CREATE TABLE script_hours (
+                environment TEXT NOT NULL,
+                hour TEXT NOT NULL,
+                script TEXT NOT NULL,
+                result TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                first_start TEXT NOT NULL,
+                last_end TEXT NOT NULL,
+                PRIMARY KEY (environment, hour, script, result)
+            )
+            """,
+            # Build script_hours from the full existing history — one
+            # aggregate read pass over `runs`, the same shape as
+            # migration 6's backfill and subject to the same rule:
+            # MEASURE it on a production copy before the drop ships and
+            # put the number in the operator note (§1.2).
+            "python: rebuild_script_hours",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: Prefix marking a migration step that runs Python instead of SQL.
@@ -613,10 +672,44 @@ def _rebuild_activity_hours(conn: sqlite3.Connection) -> None:
         )
 
 
+def _rebuild_script_hours(conn: sqlite3.Connection) -> None:
+    """Rebuild ``script_hours`` from ``runs``, exactly (migration 7).
+
+    DELETE-then-INSERT rather than incremental, for the same reason as
+    :func:`_rebuild_activity_hours`: this is the definition the
+    incremental maintenance in :meth:`Storage.upsert_runs` is held
+    equal to — by ``tests/test_storage.py::ScriptHoursTest`` and by
+    :meth:`Storage.prune_runs_before`, which calls this after deleting
+    history so the invariant survives retention.
+
+    One aggregate read pass over ``runs``; prints its elapsed time when
+    there was anything to do, per docs/UPGRADE_PLAN.md §1.2 — a silent
+    multi-second startup on the production mount should say what it is.
+    """
+    started = time.time()
+    conn.execute("DELETE FROM script_hours")
+    cursor = conn.execute(
+        "INSERT INTO script_hours "
+        "(environment, hour, script, result, count, first_start, last_end) "
+        "SELECT environment, SUBSTR(start_time, 1, 13), script, result, "
+        "COUNT(*), MIN(start_time), MAX(end_time) "
+        "FROM runs GROUP BY environment, SUBSTR(start_time, 1, 13), "
+        "script, result"
+    )
+    if cursor.rowcount:
+        print(
+            "script_hours: rebuilt {0} rows in {1:.1f}s".format(
+                cursor.rowcount, time.time() - started
+            ),
+            flush=True,
+        )
+
+
 #: Python migration steps, by the name used after the prefix.
 _MIGRATION_STEPS = {
     "backfill_latest_durations": _backfill_latest_durations,
     "rebuild_activity_hours": _rebuild_activity_hours,
+    "rebuild_script_hours": _rebuild_script_hours,
 }  # type: Dict[str, Any]
 
 
@@ -829,6 +922,23 @@ class EnvironmentExpectation(NamedTuple):
     updated_by: str
 
 
+class ScriptHourBucket(NamedTuple):
+    """One ``script_hours`` row: a script's activity inside one UTC hour.
+
+    ``first_start`` and ``last_end`` are exact run timestamps, not hour
+    edges — they are what lets the Timeline order scripts that started
+    minutes apart without ever reading ``runs``. Feeds
+    :func:`testboard.analytics.group_script_executions`.
+    """
+
+    script: str
+    hour: str
+    result: Result
+    count: int
+    first_start: datetime.datetime
+    last_end: datetime.datetime
+
+
 class UpsertCounts(NamedTuple):
     """Result of a batch upsert.
 
@@ -941,6 +1051,7 @@ _ENVIRONMENT_TABLES = (
     "test_retirements",
     "environment_expectations",
     "activity_hours",
+    "script_hours",
     "runs",
 )  # type: Tuple[str, ...]
 
@@ -1356,6 +1467,16 @@ class Storage:
         +1 for each inserted run, and a paired -1/+1 when an update
         changes a stored result. Start times are immutable (they are
         part of the run's key), so a run can never move between hours.
+
+        ``script_hours`` is maintained the same way, with one extra
+        wrinkle: its buckets carry MIN(start_time) and MAX(end_time),
+        and a MIN/MAX cannot be decremented. Inserts only ever GROW a
+        bucket, so they are applied as merged deltas like the counts;
+        an update that changes a stored result or end time could
+        SHRINK one, so those (rare — the fingerprint skip means a
+        re-push of unchanged data never gets here) mark their buckets
+        for exact recomputation from ``runs`` instead. See
+        :meth:`_apply_script_hour_changes`.
         """
         conn = self._conn()
         inserted = 0
@@ -1365,6 +1486,10 @@ class Storage:
         # at the end: a batch of 500 typically spans a handful of
         # (environment, hour, result) cells, not 500.
         deltas = {}  # type: Dict[Tuple[str, str, str], int]
+        # script_hours changes: pure growth (from inserts), merged per
+        # bucket, plus the buckets an update may have shrunk.
+        grown = {}  # type: Dict[Tuple[str, str, str, str], List[Any]]
+        recompute = set()  # type: Set[Tuple[str, str, str, str]]
         conn.execute("BEGIN IMMEDIATE")
         try:
             for rec in records:
@@ -1411,6 +1536,18 @@ class Storage:
                     inserted += 1
                     key = (rec.environment, hour, rec.result.value)
                     deltas[key] = deltas.get(key, 0) + 1
+                    script_key = (
+                        rec.environment, hour, rec.script, rec.result.value
+                    )
+                    growth = grown.get(script_key)
+                    if growth is None:
+                        grown[script_key] = [1, start, end]
+                    else:
+                        growth[0] += 1
+                        if start < growth[1]:
+                            growth[1] = start
+                        if end > growth[2]:
+                            growth[2] = end
                 else:
                     run_id = int(row[0])
                     conn.execute(
@@ -1432,6 +1569,18 @@ class Storage:
                         new_key = (rec.environment, hour, rec.result.value)
                         deltas[old_key] = deltas.get(old_key, 0) - 1
                         deltas[new_key] = deltas.get(new_key, 0) + 1
+                    if row[1] != rec.result.value or row[2] != end:
+                        # Either bucket may have shrunk; both are
+                        # recomputed from `runs` once the batch's row
+                        # writes are all in. When only the end time
+                        # changed the two keys are the same key.
+                        recompute.add(
+                            (rec.environment, hour, rec.script, row[1])
+                        )
+                        recompute.add((
+                            rec.environment, hour, rec.script,
+                            rec.result.value,
+                        ))
                 # The payload lives in its own table, deflated;
                 # re-importing a run replaces it — unless the
                 # fingerprint says the stored bytes are already right,
@@ -1446,6 +1595,7 @@ class Storage:
                 self._maintain_latest(conn, rec, run_id, start)
                 self._unretire_on_new_run(conn, rec, start)
             self._apply_activity_deltas(conn, deltas)
+            self._apply_script_hour_changes(conn, grown, recompute)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -1499,6 +1649,85 @@ class Storage:
                     "UPDATE activity_hours SET count = ? "
                     "WHERE environment = ? AND hour = ? AND result = ?",
                     (count, environment, hour, result),
+                )
+
+    @staticmethod
+    def _apply_script_hour_changes(
+        conn: sqlite3.Connection,
+        grown: Dict[Tuple[str, str, str, str], List[Any]],
+        recompute: Set[Tuple[str, str, str, str]],
+    ) -> None:
+        """Apply a batch's net ``script_hours`` changes, exactly.
+
+        Two kinds of change, because MIN/MAX cannot be decremented:
+
+        - *grown* buckets only ever got bigger (inserted runs), so the
+          stored row is merged with the batch's count/min/max — one
+          SELECT-then-UPDATE-or-INSERT per touched bucket, same
+          portability rule as :meth:`_apply_activity_deltas`.
+        - *recompute* buckets may have SHRUNK (an update changed a
+          stored result or end time), so they are re-derived from
+          ``runs`` outright. The query is bounded by one script's index
+          range and runs only when a re-import actually changed a
+          stored row, which the fingerprint skip makes rare. A bucket
+          both grown and recomputed is recomputed only — by the time
+          this runs, the batch's inserts are already in ``runs``, so
+          the recomputation already counts them.
+
+        Rows whose count reaches zero are DELETEd: the invariant is
+        equality with a GROUP BY over ``runs``, and a GROUP BY yields
+        no empty groups.
+        """
+        for key in sorted(recompute):
+            environment, hour, script, result = key
+            grown.pop(key, None)
+            row = conn.execute(
+                "SELECT COUNT(*), MIN(start_time), MAX(end_time) "
+                "FROM runs WHERE environment = ? AND script = ? "
+                "AND result = ? AND SUBSTR(start_time, 1, 13) = ?",
+                (environment, script, result, hour),
+            ).fetchone()
+            count = int(row[0])
+            conn.execute(
+                "DELETE FROM script_hours WHERE environment = ? "
+                "AND hour = ? AND script = ? AND result = ?",
+                (environment, hour, script, result),
+            )
+            if count > 0:
+                conn.execute(
+                    "INSERT INTO script_hours (environment, hour, "
+                    "script, result, count, first_start, last_end) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (environment, hour, script, result, count,
+                     row[1], row[2]),
+                )
+        for key, growth in sorted(grown.items()):
+            environment, hour, script, result = key
+            row = conn.execute(
+                "SELECT count, first_start, last_end FROM script_hours "
+                "WHERE environment = ? AND hour = ? AND script = ? "
+                "AND result = ?",
+                (environment, hour, script, result),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO script_hours (environment, hour, "
+                    "script, result, count, first_start, last_end) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (environment, hour, script, result,
+                     growth[0], growth[1], growth[2]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE script_hours SET count = ?, first_start = ?, "
+                    "last_end = ? WHERE environment = ? AND hour = ? "
+                    "AND script = ? AND result = ?",
+                    (
+                        int(row[0]) + growth[0],
+                        min(row[1], growth[1]),
+                        max(row[2], growth[2]),
+                        environment, hour, script, result,
+                    ),
                 )
 
     @staticmethod
@@ -1941,6 +2170,76 @@ class Storage:
             (row[0], model.parse_iso(row[1] + ":00:00.000000"), int(row[2]))
             for row in rows
         ]
+
+    def script_activity(
+        self,
+        environment: str,
+        since: datetime.datetime,
+        until: datetime.datetime,
+    ) -> List[ScriptHourBucket]:
+        """Every ``script_hours`` bucket for one environment's window.
+
+        Feeds :func:`analytics.group_script_executions`, which turns
+        these into the Timeline's per-script execution rows. Ordered by
+        (script, hour) — the order the grouping walks in.
+
+        Read from ``script_hours`` (migration 7), never from ``runs``:
+        the window is one block of hours for one environment, and the
+        PRIMARY KEY leads (environment, hour), so this is a pure index
+        range over a table that grows like scripts x active hours. Both
+        edges are quantised to their hour, which can only WIDEN the
+        window — the caller trims executions to the exact block, and an
+        extra boundary bucket cannot invent one (block edges are, by
+        construction, more than the execution gap apart).
+        """
+        rows = self._conn().execute(
+            "SELECT script, hour, result, count, first_start, last_end "
+            "FROM script_hours WHERE environment = ? "
+            "AND hour >= ? AND hour <= ? ORDER BY script, hour",
+            (
+                environment,
+                model.format_iso(since)[:13],
+                model.format_iso(until)[:13],
+            ),
+        ).fetchall()
+        return [
+            ScriptHourBucket(
+                script=row[0],
+                hour=row[1],
+                result=Result(row[2]),
+                count=int(row[3]),
+                first_start=model.parse_iso(row[4]),
+                last_end=model.parse_iso(row[5]),
+            )
+            for row in rows
+        ]
+
+    def script_test_counts(self, environment: str) -> Dict[str, int]:
+        """How many tests each of an environment's scripts has, INFERRED.
+
+        The "of 45" in the Timeline's "ran 41 of 45 known tests" — what
+        makes a partial run of a script visible as one. One row per
+        test via ``latest_runs`` (an index range on the PRIMARY KEY,
+        which leads with ``environment``), excluding retired tests for
+        the usual reason: they are not in the suite, so a run that
+        skips them has not missed anything.
+
+        A high-water mark, like every count inferred from
+        ``latest_runs`` — a test that quietly stopped running still
+        counts until someone retires it. The Timeline words it "known
+        tests" rather than "expected" for exactly that reason.
+        """
+        rows = self._conn().execute(
+            "SELECT lr.script, COUNT(*) FROM latest_runs AS lr "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script "
+            " AND tr.test_name = lr.test_name "
+            "WHERE lr.environment = ? AND " + self._NOT_RETIRED +
+            " GROUP BY lr.script",
+            (environment,),
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
 
     def test_counts_by_environment(self) -> Dict[str, int]:
         """How many tests each environment currently has, INFERRED.
@@ -2661,6 +2960,7 @@ class Storage:
         script: str,
         since: datetime.datetime,
         limit: int,
+        until: Optional[datetime.datetime] = None,
     ) -> List[StoredRun]:
         """Every run of one script since *since*, OLDEST FIRST, no ``output``.
 
@@ -2674,14 +2974,25 @@ class Storage:
         runs, and the caller only ever charts the recent ones. The limit
         takes the OLDEST rows in the window, so the executions returned
         are contiguous rather than a truncated middle.
+
+        *until* (inclusive, on ``start_time``) closes the window at the
+        top: the Timeline's row expansion asks for exactly one script
+        execution, and without a ceiling it would drag in every run
+        from the block to now.
         """
-        rows = self._conn().execute(
+        sql = (
             "SELECT {} FROM runs WHERE environment = ? AND script = ? "
-            "AND start_time >= ? ORDER BY start_time LIMIT ?".format(
-                _RUN_COLUMNS
-            ),
-            (environment, script, model.format_iso(since), limit),
-        ).fetchall()
+            "AND start_time >= ?".format(_RUN_COLUMNS)
+        )
+        params = [
+            environment, script, model.format_iso(since),
+        ]  # type: List[Any]
+        if until is not None:
+            sql += " AND start_time <= ?"
+            params.append(model.format_iso(until))
+        sql += " ORDER BY start_time LIMIT ?"
+        params.append(limit)
+        rows = self._conn().execute(sql, params).fetchall()
         return [_run_from_row(row, None) for row in rows]
 
     def script_exists(self, environment: str, script: str) -> bool:
@@ -2876,6 +3187,7 @@ class Storage:
             # — this is an offline maintenance path that just deleted
             # most of the table, not a request handler.
             _rebuild_activity_hours(conn)
+            _rebuild_script_hours(conn)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

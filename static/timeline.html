@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>testboard — script timeline</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="home">
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html">Dashboard</a>
+      <a href="actions.html">Open actions</a>
+      <a href="time.html">Time</a>
+      <a href="timeline.html" aria-current="page">Timeline</a>
+      <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
+    </nav>
+    <div id="user-widget" class="user-widget"></div>
+  </header>
+
+  <main class="wide">
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <section class="section-head">
+      <h2 class="eyebrow">Script timeline</h2>
+      <span id="timeline-meta" class="muted"></span>
+    </section>
+
+    <!-- Says what a row is. Scripts share state, so when one goes wrong
+         the failure often shows up in a LATER script; this page is for
+         walking backwards from that failure. -->
+    <p class="chart-caption timeline-scope">
+      The scripts one environment ran, <strong>in running order</strong>. When
+      a test fails because an earlier script left shared data in a bad state,
+      the culprit is somewhere above it in this list — expand a row to see its
+      tests in the order they ran.
+    </p>
+
+    <div class="filter-row" aria-label="Scope">
+      <label>Environment
+        <select id="timeline-environment"></select>
+      </label>
+      <label>Run
+        <select id="timeline-block"></select>
+      </label>
+      <button id="first-failure" class="toggle" type="button" hidden>
+        Jump to first failure
+      </button>
+    </div>
+
+    <div class="card timeline-card">
+      <div id="timeline-axis" class="timeline-axis" aria-hidden="true"></div>
+      <div id="timeline-rows"></div>
+      <p id="timeline-empty" class="empty-state" hidden></p>
+    </div>
+  </main>
+
+  <script type="module" src="timeline.js"></script>
+  <script type="module" src="nav.js"></script>
+</body>
+</html>
