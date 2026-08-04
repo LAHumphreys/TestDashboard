@@ -1305,3 +1305,58 @@ all-flip batch +14%.
 
 Production caveat as always: these are dev-copy constants; the mount sets
 the real ones, and the migration probe on a prod copy remains the gate.
+
+## The keep-alive flake WAS a bug — two of them (2026-08-04, evening)
+
+`KeepAliveTest::test_a_reclaimed_connection_is_always_announced_first`
+failed on a DOCS-ONLY commit's CI run. Looped locally: ~1 failure in 20
+standalone, ~1 in 14 inside the pool suite. The guard was not flaky; the
+server was, at low probability, doing exactly what the guard forbids —
+closing a connection the client believed open, losing the request in it.
+
+**Bug 1, the big one: a timed-out read poisons the reader, permanently.**
+`socket.makefile` readers set `SocketIO._timeout_occurred` the first time
+any read times out; every later read raises `OSError("cannot read from
+timed out object")` — including reads that would have found a request
+waiting. `_wait_for_request` polled by peeking WITH the poll timeout, so
+the first quiet quarter-second broke the reader. Consequences, both
+confirmed by standalone repro:
+
+- The 5-second keep-alive idle window was FICTION. Every connection died
+  at the first 0.25s poll tick, via the OSError branch. Browsers mostly
+  papered over it (idempotent GET retry), which is why nobody saw it.
+- A request arriving after one quiet tick was UNSERVABLE — the reader
+  refused to see it, the loop closed the connection, and a non-retried
+  POST died. That is the loss the flake was reporting.
+
+Fixed by never letting `rfile` experience a timed-out read: the waiting
+moved to `select.select` on the socket, and every peek is non-blocking
+(raw reads return None harmlessly in that mode; the poison flag is never
+set). EOF is distinguished by peeking after select reports readable.
+
+**Bug 2: reclaim raced an arriving request.** The loop checked contention
+BEFORE peeking, so a request landing in the same tick the pool became
+contended was closed unread. And since a response that announces
+`Connection: close` never returns to the wait loop at all, EVERY reclaim
+close is unannounced by construction — so the reclaim now (a) peeks
+first, serving anything already arrived (the response announces the
+close, because the pool is contended), and (b) gives a genuinely quiet
+connection ONE grace tick before closing, converting "close under the
+client's feet" into "serve the request that was already coming" for
+everything but the truly idle. Worst-case reclaim latency ~0.5s, same
+order as the ~0.2s previously measured and recorded.
+
+**MEASURED (this machine):** before: 1 failure in 20 standalone runs of
+the guard, 1 in 14 pool-suite runs. After: 0 in 30 standalone + 0 in 16
+suite runs + full suite green. The residual race — bytes hitting the
+socket in the microseconds between a final empty peek and the close — is
+inherent to TCP and beyond a server's power to remove.
+
+`YieldPeekTest` (4 tests) pins all of it deterministically: a buffered
+request beats the reclaim, an idle contended connection still yields
+fast, the 5-second idle window actually lasts 5 seconds, and a request
+arriving after two quiet ticks is served. The KeepAliveTest guard keeps
+its zero-loss assertion untouched.
+
+Ships in the 2026-08-04 drop (it is a `server.py` change — the restart
+the operator note already mandates covers it).

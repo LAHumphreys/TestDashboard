@@ -17,9 +17,19 @@ Last rewritten: **2026-08-04**, after building WP-18 (Timeline) as the
 | `wp-18-timeline` | **the 2026-08-04 drop** — one feature (Timeline page), migration 7, awaiting acceptance |
 | `wp-14-in-run-progress` | parked WIP; **its migration is now 8, not 7** — renumber before merging (registry §1) |
 
-Suite: **1328 green** (skipped 1) on `wp-18-timeline`, up from 1288. Schema
+Suite: **1333 green** (skipped 1) on `wp-18-timeline`, up from 1288. Schema
 moves to **migration 7** (`script_hours`), so **the rollback is the database
 copy**, not `git checkout`.
+
+**The drop also carries a real server fix found via its own CI**: the
+keep-alive guard (`KeepAliveTest`) flaked on a docs-only commit; the flake
+was two genuine bugs (a timed-out read permanently poisons a
+`socket.makefile` reader — keep-alive was living 0.25 s, not 5 s, and
+late-arriving requests died; plus a reclaim/arrival race). Fixed with a
+select-based wait, non-blocking peeks and a one-tick reclaim grace;
+`YieldPeekTest` pins it deterministically; the guard is 45-for-45 since.
+Full story: the status log's evening 2026-08-04 entry. If that guard ever
+flakes again, treat the flake as a report, not noise — it was right.
 
 The repo-root `testboard.db` is generated dev data (218 MB, 540,192 runs,
 still at schema v5 — current code migrates it on open, so COPY FIRST, always).

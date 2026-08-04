@@ -40,6 +40,14 @@
         <span class="muted">New: the Timeline — what ran, in what order</span>
       </div>
 
+      <h3>Fixed: a rare failed action on a busy dashboard</h3>
+      <ul>
+        <li>Very occasionally, posting a comment or assigning a test on a
+          busy dashboard failed for no visible reason and worked on the
+          second try. That was a server bug in how idle connections were
+          recycled — found by its own test — and it is fixed.</li>
+      </ul>
+
       <h3>New page: Timeline</h3>
       <ul>
         <li><strong>One environment's scripts, in running order</strong> —

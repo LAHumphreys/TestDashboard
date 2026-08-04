@@ -458,6 +458,111 @@ class KeepAliveTest(ServerTestBase):
             "makes every socket operation unbounded")
 
 
+class YieldPeekTest(unittest.TestCase):
+    """A request that has ALREADY ARRIVED beats a reclaim, always.
+
+    The deterministic half of what KeepAliveTest exercises under load.
+    ``_wait_for_request`` used to check contention before peeking, so a
+    request landing in the same quarter-second the pool became
+    contended was closed unread — the client had sent, nothing had
+    announced a close, its POST died. Found because the KeepAliveTest
+    guard flaked (~1 run in 20, locally and on CI's 3.8 leg): the flake
+    WAS the bug. These tests pin the ordering without needing the race
+    to be won.
+    """
+
+    def _handler(
+        self, contended: bool
+    ) -> "server._DashboardRequestHandler":
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        handler = server._DashboardRequestHandler.__new__(
+            server._DashboardRequestHandler)
+        handler.connection = ours
+        handler.rfile = ours.makefile("rb", -1)
+        self.addCleanup(handler.rfile.close)
+
+        class _FakeServer(object):
+            @staticmethod
+            def has_pending() -> bool:
+                return contended
+
+        handler.server = _FakeServer()  # type: ignore[assignment]
+        self.client = theirs
+        return handler
+
+    def test_a_buffered_request_beats_the_reclaim(self) -> None:
+        """Bytes in hand mean the client committed; serve, then close."""
+        handler = self._handler(contended=True)
+        self.client.sendall(b"GET /api/summary HTTP/1.1\r\n")
+        started = time.time()
+        self.assertTrue(
+            handler._wait_for_request(may_yield=True),
+            "a request already in the buffer was dropped for a reclaim; "
+            "nothing announced that close, so the client's request died")
+        self.assertLess(time.time() - started, 2.0)
+
+    def test_a_genuinely_idle_connection_is_still_reclaimed(self) -> None:
+        """Serving arrived requests must not turn into holding the worker."""
+        handler = self._handler(contended=True)
+        started = time.time()
+        self.assertFalse(handler._wait_for_request(may_yield=True))
+        elapsed = time.time() - started
+        self.assertLess(
+            elapsed, 1.0,
+            "reclaiming an idle contended connection took {0:.2f}s — it "
+            "is meant to be immediate".format(elapsed))
+
+    def test_an_uncontended_wait_still_times_out_idle(self) -> None:
+        """The 5-second idle window must be real, not fiction.
+
+        Before the select-based wait it WAS fiction: the first quiet
+        quarter-second poisoned the reader (SocketIO's
+        ``_timeout_occurred``) and the connection closed on the next
+        poll tick — every keep-alive connection lived ~0.25s while the
+        code, the comments and Apache's default all said 5.
+        """
+        handler = self._handler(contended=False)
+        started = time.time()
+        self.assertFalse(handler._wait_for_request(may_yield=True))
+        elapsed = time.time() - started
+        self.assertGreaterEqual(
+            elapsed, server._KEEPALIVE_IDLE_SECONDS - 0.5,
+            "the idle wait gave up after {0:.2f}s — a timed-out read "
+            "has poisoned the reader again".format(elapsed))
+
+    def test_a_request_after_quiet_polls_is_still_served(self) -> None:
+        """The poisoned-reader regression, pinned deterministically.
+
+        Two poll ticks pass with nothing to read, THEN the request
+        arrives — the pattern of a person clicking a second thing a
+        moment after a page settles. The broken reader raised
+        ``OSError("cannot read from timed out object")`` here and the
+        connection closed with the request on the wire; under load that
+        was the KeepAliveTest flake and, in production, a browser's
+        un-retried POST dying for no visible reason.
+        """
+        handler = self._handler(contended=False)
+        arrived = threading.Event()
+
+        def send_late() -> None:
+            time.sleep(server._IDLE_POLL_SECONDS * 2.5)
+            self.client.sendall(b"GET /api/summary HTTP/1.1\r\n")
+            arrived.set()
+
+        sender = threading.Thread(target=send_late)
+        sender.start()
+        try:
+            self.assertTrue(
+                handler._wait_for_request(may_yield=True),
+                "a request that arrived after two quiet polls was not "
+                "served — the timed-out reader is back")
+        finally:
+            sender.join(timeout=10)
+        self.assertTrue(arrived.is_set())
+
+
 class DefaultsTest(unittest.TestCase):
     """The two numbers that must never drift apart."""
 
