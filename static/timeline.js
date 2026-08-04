@@ -254,6 +254,10 @@ let rowControllers = [];
  * shared, so the two ways of moving can never leave two highlights. */
 let currentMark = null;
 
+/* Set per render by wireFailureNav; lets a search or deep-link landing
+ * re-base the stepper's position. null when there are no failures. */
+let failureNavSync = null;
+
 function markCurrent(tr) {
   if (currentMark) {
     currentMark.classList.remove("tl-current");
@@ -295,6 +299,7 @@ function wireFailureNav() {
     total += row.failed;
   });
   nav.hidden = total === 0;
+  failureNavSync = null;
   if (!total) {
     return;
   }
@@ -339,15 +344,36 @@ function wireFailureNav() {
     ? "1 failing test" : total + " failing tests";
   prev.disabled = true;
   next.disabled = false;
+
+  /* The cursor can sit BETWEEN failures: landing on a non-failing test
+   * via search or a deep link sets it to k - 0.5 (k failures lie
+   * before that test), so Next means "first failure after where I am"
+   * and Prev "last one before" — the stepper continues from wherever
+   * the hunt actually is, never from the top. */
   next.onclick = () => {
-    if (cursor < total - 1) {
-      jumpTo(cursor + 1);
+    const target = Math.floor(cursor) + 1;
+    if (target <= total - 1) {
+      jumpTo(target);
     }
   };
   prev.onclick = () => {
-    if (cursor > 0) {
-      jumpTo(cursor - 1);
+    const target = Math.ceil(cursor) - 1;
+    if (target >= 0) {
+      jumpTo(target);
     }
+  };
+
+  /* How a search or deep-link landing re-bases the stepper. Args: the
+   * landed row's index, how many of its failures lie at-or-before the
+   * landed test, and whether the landed test IS one of them. */
+  failureNavSync = (rowIndex, failsThroughHit, landedOnFailure) => {
+    const through = prefix[rowIndex] + failsThroughHit;
+    cursor = landedOnFailure ? through - 1 : through - 0.5;
+    pos.textContent = landedOnFailure
+      ? through + " of " + total
+      : (total === 1 ? "1 failing test" : total + " failing tests");
+    prev.disabled = Math.ceil(cursor) - 1 < 0;
+    next.disabled = Math.floor(cursor) + 1 > total - 1;
   };
 }
 
@@ -633,6 +659,15 @@ let searchTimer = null;
 let searchSeq = 0;
 let searchMatches = [];   // last suggestions: [{script, test_name}]
 
+/* Vim-style inline completion in the search box: Ctrl-j / Ctrl-k cycle
+ * the field's VALUE through the current suggestions, the way insert-
+ * mode complete replaces text. (Ctrl-n/Ctrl-p would be truer to vim,
+ * but browsers reserve Ctrl-N at a level preventDefault cannot reach.)
+ * Typing resets the cycle; programmatic value changes do not re-fetch
+ * suggestions, so the stem's list survives the walk through it. */
+let suggestionNames = [];
+let completionIndex = -1;
+
 async function fetchSearchMatches(query) {
   const qs = new URLSearchParams();
   qs.append("environment", state.environment);
@@ -672,6 +707,8 @@ function refreshSuggestions(query) {
         option.setAttribute("label", match.script);
         list.appendChild(option);
       }
+      suggestionNames = seen;
+      completionIndex = -1;
     } catch (err) {
       /* Suggestions are decoration; the Enter path reports errors. */
     }
@@ -708,31 +745,42 @@ async function locateTest(name) {
 }
 
 /** Open the row holding *targetName* (first of *scripts* that has it),
- * mark it, scroll there. The shared tail of the search box and the
- * "View in timeline" deep link from the triage panels. */
+ * open that test's OUTPUT, mark it, scroll there, and re-base the
+ * failure stepper on the landing spot. The shared tail of the search
+ * box and the "View in timeline" deep link from the triage panels. */
 async function placeTest(scripts, targetName, prefixNote) {
   const note = document.getElementById("search-note");
-  const inWindow = rowControllers.filter(
-    (controller) => scripts.indexOf(controller.row.script) !== -1);
-  if (!inWindow.length) {
-    note.textContent = targetName + " belongs to " + scripts.join(", ")
-      + ", which has no row in the selected run — try another run in "
-      + "the picker.";
+  let sawScript = false;
+  for (let index = 0; index < rowControllers.length; index++) {
+    const controller = rowControllers[index];
+    if (scripts.indexOf(controller.row.script) === -1) {
+      continue;
+    }
+    sawScript = true;
+    const tests = await controller.openTests();
+    const at = tests.findIndex((test) => test.test_name === targetName);
+    if (at === -1) {
+      continue;
+    }
+    const hit = tests[at];
+    markCurrent(hit.tr);
+    hit.showOutput();
+    hit.tr.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (failureNavSync) {
+      const failsThroughHit = tests.slice(0, at + 1).filter(
+        (test) => test.result === "FAIL").length;
+      failureNavSync(index, failsThroughHit, hit.result === "FAIL");
+    }
+    note.textContent = (prefixNote || "")
+      + "Everything above its row ran before it.";
     return;
   }
-  for (const controller of inWindow) {
-    const tests = await controller.openTests();
-    const hit = tests.find((test) => test.test_name === targetName);
-    if (hit) {
-      markCurrent(hit.tr);
-      hit.tr.scrollIntoView({ behavior: "smooth", block: "center" });
-      note.textContent = (prefixNote || "")
-        + "Everything above its row ran before it.";
-      return;
-    }
-  }
-  note.textContent = targetName + " did not run in the selected run of "
-    + scripts.join(", ") + " — try another run in the picker.";
+  note.textContent = sawScript
+    ? targetName + " did not run in the selected run of "
+      + scripts.join(", ") + " — try another run in the picker."
+    : targetName + " belongs to " + scripts.join(", ")
+      + ", which has no row in the selected run — try another run in "
+      + "the picker.";
 }
 
 /* ---------------- hotkeys ----------------
@@ -747,6 +795,17 @@ function handleHotkey(event) {
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
     if (event.key === "Escape" && target.blur) {
       target.blur();      // vi: leave insert mode
+    }
+    if (target.id === "test-search" && event.ctrlKey
+        && (event.key === "j" || event.key === "k")
+        && suggestionNames.length) {
+      const stepBy = event.key === "j" ? 1 : -1;
+      completionIndex = (completionIndex + stepBy
+        + suggestionNames.length) % suggestionNames.length;
+      target.value = suggestionNames[completionIndex];
+      if (event.preventDefault) {
+        event.preventDefault();
+      }
     }
     return;
   }
@@ -862,6 +921,7 @@ async function init() {
 
   const searchBox = document.getElementById("test-search");
   searchBox.addEventListener("input", (event) => {
+    completionIndex = -1;      // typing restarts the completion cycle
     refreshSuggestions(event.target.value.trim());
   });
   searchBox.addEventListener("change", (event) => {

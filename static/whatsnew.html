@@ -55,10 +55,12 @@
           its captured output right there, without losing your place in
           the order.</li>
         <li><strong>Find a test by name.</strong> The "Find test" box takes
-          you straight to a test's place in the running order — the fastest
-          way in when you already know which test inherited the bad data.
-          Suggestions appear as you type; everything above the row it lands
-          on ran before it.</li>
+          you straight to a test's place in the running order, with its
+          output already open — the fastest way in when you already know
+          which test inherited the bad data. Suggestions appear as you
+          type; everything above the row it lands on ran before it, and
+          Prev / Next carry on from where you landed rather than starting
+          over from the top.</li>
         <li><strong>Coming from a triage queue?</strong> The review panel
           (the expanded section with the output) on the Dashboard and Open
           actions pages now has a <em>View in timeline</em> link that lands
@@ -75,7 +77,9 @@
           everything too): press <strong>?</strong> on the Timeline for the
           list — <strong>/</strong> jumps to the search box,
           <strong>n</strong>/<strong>p</strong> step through failing
-          tests.</li>
+          tests, <strong>Ctrl-j</strong>/<strong>Ctrl-k</strong> cycle the
+          search box through its suggestions, vim-completion style. (The
+          browser keeps Ctrl-n for itself, or it would be that.)</li>
         <li><strong>Partial runs are visible as partial.</strong> A row that
           says <em>"41 of 45 known tests"</em> (in amber) means the script
           ran fewer tests than it usually reports — a cut-short or partial
