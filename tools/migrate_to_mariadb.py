@@ -57,7 +57,6 @@ import json
 import os
 import shutil
 import sqlite3
-import stat
 import sys
 import time
 from typing import (
@@ -72,6 +71,8 @@ if __name__ == "__main__" and __package__ is None:  # pragma: no cover
         0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools import export_for_mariadb as exporter  # noqa: E402
+from testboard import dbconfig  # noqa: E402
+from testboard.dbconfig import DbConfigError, Settings  # noqa: E402,F401
 
 
 #: Exit code for a failed gate — a real finding, not a crash. Separate
@@ -97,22 +98,6 @@ MIN_SIZES = {"environment": 64, "script": 255, "test_name": 255}
 #: The blob has to fit in one packet with room for protocol overhead
 #: and for the hex form the load sends.
 PACKET_SAFETY_FACTOR = 2.5
-
-
-class Settings(NamedTuple):
-    """Connection details, read from a mysql option file."""
-
-    host: str
-    port: int
-    user: str
-    password: str
-    database: str
-    unix_socket: Optional[str]
-
-    def describe(self) -> str:
-        """One line for the log. Never contains the password."""
-        where = self.unix_socket or "{0}:{1}".format(self.host, self.port)
-        return "{0}@{1}/{2}".format(self.user, where, self.database)
 
 
 class Check(NamedTuple):
@@ -152,83 +137,15 @@ class Audit(NamedTuple):
 def read_option_file(path: str) -> Settings:
     """Parse a mysql ``[client]`` option file.
 
-    Deliberately the same file format the ``mysql`` client reads
-    (runbook §A.9), so there is one credentials format in this project
-    and not two. ``configparser`` is not used: my.cnf allows bare keys
-    with no ``=`` (``local-infile``) and ``!includedir`` directives,
-    both of which it rejects outright.
-
-    The password never comes from a command line. Anything on a command
-    line is visible to every user on the box through ``ps``.
+    The parsing itself lives in :mod:`testboard.dbconfig` — the server
+    reads the same file format (``run_server.py --db-config``), and two
+    parsers would drift. This wrapper only turns the library's
+    exception into the exit code a command-line tool owes its caller.
     """
-    expanded = os.path.expanduser(path)
-    if not os.path.isfile(expanded):
-        raise SystemExit(
-            "no option file at {0}. Create one as shown in "
-            "docs/MARIADB_MIGRATION.md §A.9 and chmod it 600.".format(
-                expanded))
-    _warn_if_world_readable(expanded)
-
-    values = {}  # type: Dict[str, str]
-    section = ""
-    with io.open(expanded, encoding="utf-8") as handle:
-        for raw in handle:
-            line = raw.strip()
-            if not line or line[0] in "#;!":
-                continue
-            if line.startswith("["):
-                section = line.strip("[]").strip().lower()
-                continue
-            if section not in ("client", "mysql", "testboard"):
-                continue
-            if "=" in line:
-                key, _, value = line.partition("=")
-                values[key.strip().lower().replace("_", "-")] = _unquote(
-                    value.strip())
-            else:
-                values[line.lower().replace("_", "-")] = "1"
-
-    missing = [k for k in ("user", "password", "database")
-               if not values.get(k)]
-    if missing:
-        raise SystemExit(
-            "option file {0} is missing: {1}. It needs host, user, "
-            "password and database under a [client] section.".format(
-                expanded, ", ".join(missing)))
-
-    return Settings(
-        host=values.get("host", "127.0.0.1"),
-        port=int(values.get("port", "3306")),
-        user=values["user"],
-        password=values["password"],
-        database=values["database"],
-        unix_socket=values.get("socket") or None,
-    )
-
-
-def _unquote(value: str) -> str:
-    """Strip one layer of matching quotes, as the mysql client does."""
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
-    return value
-
-
-def _warn_if_world_readable(path: str) -> None:
-    """A credentials file readable by everyone is a finding, not style.
-
-    Not fatal — refusing to run would block a dry run for no safety
-    gain — and POSIX-only, because on Windows every file looks
-    group-readable and a warning that always fires is one nobody reads.
-    """
-    if os.name != "posix":
-        return
     try:
-        mode = os.stat(path).st_mode
-    except OSError:  # pragma: no cover - unreadable file already failed
-        return
-    if mode & (stat.S_IRGRP | stat.S_IROTH):
-        print("WARNING: {0} is readable beyond its owner. It holds a "
-              "database password: chmod 600 it.".format(path))
+        return dbconfig.read_option_file(path)
+    except DbConfigError as exc:
+        raise SystemExit(str(exc))
 
 
 # --------------------------------------------------------------------
