@@ -130,11 +130,15 @@ def _unquote(value: str) -> str:
 
 
 def _warn_if_world_readable(path: str) -> None:
-    """A credentials file readable by everyone is a finding, not style.
+    """A credentials file readable by EVERYONE is a finding, not style.
 
-    Not fatal — refusing to run would block a dry run for no safety
-    gain — and POSIX-only, because on Windows every file looks
-    group-readable and a warning that always fires is one nobody reads.
+    World-readable only, deliberately: the canonical file is
+    ``/etc/testboard/db.cnf`` at ``root:testboard`` 0640, and
+    group-readability is its design (the service account and the
+    operators read it through the group — runbook §A.9). A warning that
+    fires on the documented-correct state is one nobody reads. Not
+    fatal either way, and POSIX-only — on Windows every file looks
+    group-readable.
     """
     if os.name != "posix":
         return
@@ -142,6 +146,7 @@ def _warn_if_world_readable(path: str) -> None:
         mode = os.stat(path).st_mode
     except OSError:  # pragma: no cover - unreadable file already failed
         return
-    if mode & (stat.S_IRGRP | stat.S_IROTH):
-        print("WARNING: {0} is readable beyond its owner. It holds a "
-              "database password: chmod 600 it.".format(path))
+    if mode & stat.S_IROTH:
+        print("WARNING: {0} is readable by every user on this box. It "
+              "holds a database password: chmod 640 (root:testboard) "
+              "or 600 it.".format(path))

@@ -1506,3 +1506,70 @@ schema v7, so the MariaDB migration must run from THIS branch's checkout
 table and verify the omission as agreement). Still open: confirm the box
 runs the final drop commit 310f1c0 (What's new saying "7 August 2026" is
 the tell), push the branch to master, then §A → §C → §E.1 dry run → cutover.
+
+## Runbook simplified for the install we actually have (2026-08-07, evening)
+
+Operator decision: one box (dashboard and MariaDB on the same host, socket
+connections) and ONE database account — the app/migrate split judged
+overkill for a single-operator install. What that trades away is recorded
+in §A.4 where the decision lives: the serving app now holds DDL rights it
+never uses; accepted because the backend refuses DDL by design, everything
+is parameterized, and the split is restorable with two GRANTs and a file
+edit. One account also means ONE credentials file — /etc/testboard/db.cnf
+(root:testboard 0640, with the socket= line) now serves the migration tool,
+the dashboard and the mysql-client fallback alike; the personal
+~/.testboard-migrate.cnf lifecycle is gone.
+
+Kept deliberately: §A's section NUMBERING (A.1 became the one-box statement
+plus the localhost trap, A.6 a retirement stub) so every cross-reference in
+tool messages, tests and this log stays true; and the §A.1 socket-vs-TCP
+explanation, which is the same-box trap par excellence. The two-host,
+two-account revision lives in git history.
+
+Ripples: three tool advice strings de-two-account-ed (grant probe,
+target-not-empty, --config help; the pinned grant-probe assertion moved
+from "testboard_app" to "§A.4"); dbconfig's permissions warning narrowed to
+WORLD-readable only — the canonical file is group-readable BY DESIGN and a
+warning that fires on the documented-correct state is one nobody reads.
+
+Suite after: 1385 OK (skipped=1).
+
+## Two DB accounts restored; the runbook survives a fresh-eyes review (2026-08-07, late)
+
+The single-account simplification lasted a few hours: the operator had read
+"two accounts" as two LINUX users. There is one Linux user and there are
+two MariaDB accounts; §A.4 is back to the app/migrate split (both grants
+@'localhost' — the same-box, socket-only simplification stays) and now
+counts the accounts out loud in the preamble so the words cannot collide
+again. Tool advice strings and the pinned grant-probe assertion restored
+with it.
+
+Then a fresh-context agent read the whole runbook as its actual audience
+will — a 20-year Linux dev, not a DBA, following it exactly once — and
+found what familiarity had hidden. Two blockers, both real:
+
+- **§E never said to switch the dashboard to MariaDB.** The flip existed
+  only as a comment in §A.10's unit file. An operator could execute
+  §C-§E perfectly, verify against a still-SQLite dashboard, restart the
+  feeder into the wrong backend, and end the night having migrated
+  nothing. §E.4 now carries the service switch as an explicit step, and
+  §E.5 refuses to restart the feeder before it.
+- **The app credential was never exercised before cutover night** — a typo
+  in /etc/testboard/db.cnf surfaced only at the E.4 restart. §A.11 now
+  authenticates it as part of hand-over (the preflight failing its grants
+  check with "cannot create tables" doubles as proof the data-only account
+  is data-only).
+
+Plus eleven CONFUSING and nine NIT fixes, all applied: who runs §A.9 (the
+~ lands in /root otherwise), a separate dry-run export directory (the
+exporter refuses non-empty, and finding out mid-freeze is the wrong time),
+the C.2/C.3/C.4 numbering map, which audit figure feeds --max-blob-bytes,
+the mysql-prompt note before the first bare SQL block, the sha256 fallback
+covering both accounts, buffer-pool and unit-file placeholders marked as
+placeholders, /var/lib/mysql disk budgeted, a workable verify diff recipe,
+$HOME over tilde-after-equals, the placeholder-password trap, prompt-marker
+paste warning, and the E.2 high-water-mark note now has a purpose (E.5
+confirms the catch-up passed it).
+
+Suite: 1385 OK (skipped=1) — the account-restore touched three tool advice
+strings and one pinned assertion; the review fixes are doc-only.

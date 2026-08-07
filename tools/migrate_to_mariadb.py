@@ -671,9 +671,9 @@ def preflight(conn: Any, max_blob_bytes: int = 0,
                "of two loads that no verification can untangle. If this "
                "is the wreckage of a failed load, drop the tables and "
                "run the load again — testboard_migrate holds DROP on "
-               "this database, so it can do that itself (it cannot drop "
-               "the database, which needs whoever ran §A). Or pass "
-               "--force if you know it is a scratch database."))
+               "this database, so it can do that itself (dropping the "
+               "DATABASE needs whoever ran §A). Or pass --force if you "
+               "know it is a scratch database."))
     return checks
 
 
@@ -1318,7 +1318,7 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument(
             "--config", required=True, metavar="CNF",
             help="mysql option file with the testboard_migrate "
-                 "credentials")
+                 "credentials (runbook §A.9)")
         target.add_argument(
             "--max-blob-bytes", type=int, default=0,
             help="largest captured output, from the audit; used to "
