@@ -215,7 +215,9 @@ class ExportTest(unittest.TestCase):
 
 
 class LoadOrderTest(unittest.TestCase):
-    """InnoDB enforces the foreign keys SQLite ignores."""
+    """Parents before children — kept although the generated schema
+    declares no foreign keys (runbook §B.6): the order costs nothing,
+    and any future adoption of real constraints depends on it."""
 
     def test_parents_load_before_children(self) -> None:
         order = list(exporter.TABLE_ORDER)

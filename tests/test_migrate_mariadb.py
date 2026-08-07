@@ -288,7 +288,8 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(result.schema_version, expected)
 
     def test_an_orphan_row_stops_the_migration(self) -> None:
-        """InnoDB enforces what SQLite only decorated (runbook §B.6)."""
+        """Dangling rows are latent corruption, and the migration is the
+        one cheap moment to find them (runbook §B.6)."""
         conn = self.raw()
         conn.execute(
             "INSERT INTO run_outputs (run_id, output) VALUES (99999, ?)",
@@ -734,7 +735,8 @@ class StatementSplitTest(unittest.TestCase):
         self.assertLess(last_load, first_index)
 
     def test_parents_load_before_children(self) -> None:
-        """InnoDB enforces the references SQLite only decorated."""
+        """FK-order loading is kept even though the generated schema
+        declares no constraints (runbook §B.6)."""
         tmp = tempfile.mkdtemp(prefix="testboard_migrate_")
         self.addCleanup(shutil.rmtree, tmp, True)
         db = os.path.join(tmp, "t.db")

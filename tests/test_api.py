@@ -104,8 +104,13 @@ def test_path(
 class ApiCase(unittest.TestCase):
     """Base case: a real Storage on :memory: plus request helpers."""
 
+    def _make_storage(self) -> Storage:
+        """The backend under test. tests/test_mariadb_backend.py
+        overrides this to run the same tests against MariaDB."""
+        return Storage(":memory:")
+
     def setUp(self) -> None:
-        self.storage = Storage(":memory:")
+        self.storage = self._make_storage()
         self.addCleanup(self.storage.close)
 
     def request(

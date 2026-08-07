@@ -132,12 +132,15 @@ class InventoryTest(unittest.TestCase):
                 "semantics; compute it in Python and store it")
 
     def test_placeholders_are_qmark_everywhere(self) -> None:
-        """Recorded because it changes during the port, not before.
+        """Qmark-in-source is permanent policy, not a pre-port state.
 
-        sqlite3 is ``qmark`` (``?``); PyMySQL is ``pyformat`` (``%s``). A
-        leftover ``?`` reaches MariaDB as a literal question mark rather
-        than failing loudly, so the count is pinned here to make the
-        eventual rewrite reviewable.
+        sqlite3 is ``qmark`` (``?``); PyMySQL is ``pyformat`` (``%s``).
+        The port (WP-19) deliberately did NOT rewrite the SQL: the
+        source stays qmark-canonical and ``testboard/mariadb.py``
+        translates at execute time, doubling any literal ``%`` first.
+        So a ``%s`` appearing in storage.py is wrong on BOTH engines
+        now — SQLite would bind it as a literal, and the MariaDB
+        translation would double its ``%``.
         """
         qmark = sum(text.count("?") for text in self.literals)
         self.assertGreater(qmark, 50)
@@ -145,8 +148,9 @@ class InventoryTest(unittest.TestCase):
             len(re.findall(r"(?<!%)%s", text)) for text in self.literals)
         self.assertEqual(
             percent_s, 0,
-            "storage.py is still SQLite-only; %s placeholders arriving "
-            "before the dialect seam exists would be bound as literals")
+            "storage.py's SQL is qmark-canonical by policy; the MariaDB "
+            "backend translates at execute time. Write ? and let "
+            "testboard/mariadb.py do the spelling")
 
 
 class RewriteSemanticsTest(unittest.TestCase):

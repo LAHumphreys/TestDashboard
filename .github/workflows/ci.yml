@@ -1,11 +1,17 @@
 # CI for testboard.
 #
-# Two jobs:
-#   - modern:         proves the suite runs warning-clean on current Pythons (dev machines).
-#   - python36-rhel8: THE AUTHORITATIVE GATE. Runs inside Red Hat's ubi8/python-36
-#                     container — the exact RHEL 8 platform Python (3.6.8) the
-#                     production server uses. Dev machines run newer interpreters,
-#                     so this job is how 3.6 compatibility is really verified.
+# Three jobs:
+#   - modern:          proves the suite runs warning-clean on current Pythons (dev machines).
+#   - python36-rhel8:  THE AUTHORITATIVE GATE. Runs inside Red Hat's ubi8/python-36
+#                      container — the exact RHEL 8 platform Python (3.6.8) the
+#                      production server uses. Dev machines run newer interpreters,
+#                      so this job is how 3.6 compatibility is really verified.
+#   - python36-mariadb: the same interpreter plus a mariadb:10.3 service — the
+#                      version prod runs. TESTBOARD_TEST_DB_CNF activates the
+#                      generated dual-backend suites (tests/backends.py), so
+#                      the storage and API tests run against BOTH engines here.
+#                      SQLite is not "the CI backend" and MariaDB "the real
+#                      one" — they are equal backends and both gate the merge.
 name: CI
 
 on:
@@ -37,4 +43,45 @@ jobs:
       - name: Show interpreter version
         run: python3 --version
       - name: Run test suite
+        run: python3 -m unittest discover -v
+
+  python36-mariadb:
+    name: Python 3.6.8 + MariaDB 10.3 (dual-backend suites)
+    runs-on: ubuntu-latest
+    container: registry.access.redhat.com/ubi8/python-36
+    services:
+      mariadb:
+        # 10.3 to match production (RHEL 8's default module stream),
+        # NOT latest: the local dev server is newer, so this job is
+        # what pins the version actually deployed against.
+        image: mariadb:10.3
+        env:
+          # The 10.3-era image reads MYSQL_*; newer entrypoints prefer
+          # MARIADB_*. Setting both is harmless and survives an image
+          # refresh.
+          MYSQL_ROOT_PASSWORD: testboard-ci
+          MARIADB_ROOT_PASSWORD: testboard-ci
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=5s
+          --health-timeout=2s
+          --health-retries=12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write the test-database credentials
+        # tests/backends.py DROPs and recreates this database with the
+        # runbook's collation (utf8mb4_nopad_bin) itself — no client
+        # package, no bootstrap script, just the vendored driver.
+        run: |
+          cat > /tmp/mariadb-test.cnf <<'EOF'
+          [client]
+          host = mariadb
+          port = 3306
+          user = root
+          password = testboard-ci
+          database = testboard_test
+          EOF
+      - name: Run test suite (SQLite + MariaDB variants)
+        env:
+          TESTBOARD_TEST_DB_CNF: /tmp/mariadb-test.cnf
         run: python3 -m unittest discover -v

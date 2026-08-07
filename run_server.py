@@ -6,8 +6,14 @@ Examples::
 
     python3 run_server.py
     python3 run_server.py --port 8001 --db /var/lib/testboard/testboard.db
+    python3 run_server.py --db-config /etc/testboard/db.cnf \
+        --site-notes /var/lib/testboard/site_notes.json
 
 Serves the JSON API under /api and the static frontend from --static.
+Two equal backends, chosen at start: ``--db PATH`` is SQLite (the
+zero-setup default — nothing to install, nothing to configure) and
+``--db-config CNF`` is MariaDB via the credentials file the runbook's
+§A.10 writes. Exactly one of the two.
 Exit codes: 0 = clean shutdown (Ctrl+C); 2 = startup failure (a one-line
 actionable error is printed; re-run with --verbose for the traceback).
 
@@ -40,7 +46,9 @@ def build_parser():
         prog="run_server.py",
         description=(
             "Serve the testboard dashboard: JSON API under /api plus the "
-            "static web UI, backed by a single SQLite file."
+            "static web UI. Backed by a single SQLite file (--db, the "
+            "zero-setup default) or by MariaDB (--db-config) — one or "
+            "the other, never both."
         ),
     )
     parser.add_argument(
@@ -51,8 +59,20 @@ def build_parser():
         "--port", type=int, default=8000, metavar="N",
         help="TCP port to listen on (default: %(default)s)")
     parser.add_argument(
-        "--db", default="testboard.db", metavar="PATH",
-        help="SQLite database file (created if absent; default: %(default)s)")
+        "--db", default=None, metavar="PATH",
+        help=("SQLite database file (created if absent; default: "
+              "testboard.db). Mutually exclusive with --db-config"))
+    parser.add_argument(
+        "--db-config", default=None, metavar="CNF",
+        help=("serve from MariaDB instead of SQLite, connecting with the "
+              "credentials in CNF — a mysql option file, normally "
+              "/etc/testboard/db.cnf (docs/MARIADB_MIGRATION.md, A.10). "
+              "The schema must already have been loaded by the migration "
+              "tooling; the server verifies its version and refuses a "
+              "mismatch rather than migrating. Requires an explicit "
+              "--site-notes (there is no database file to keep it "
+              "beside). SQLite-only tuning flags (--cache-mb, --mmap-mb) "
+              "are rejected rather than ignored"))
     parser.add_argument(
         "--static", default=default_static, metavar="DIR",
         help=("directory with the frontend files "
@@ -107,6 +127,35 @@ def build_parser():
     return parser
 
 
+def backend_error(args):
+    # type: (argparse.Namespace) -> Optional[str]
+    """The reason this flag combination cannot start, or None.
+
+    Rejections, not silent choices: a --cache-mb quietly ignored under
+    --db-config would look applied, and a guessed site-notes location
+    would look empty — both are misconfigurations that should say so at
+    startup, when they cost one command to fix.
+    """
+    if not args.db_config:
+        return None
+    if args.db is not None:
+        return ("--db and --db-config choose different backends; give "
+                "exactly one. (--db PATH is SQLite; --db-config CNF is "
+                "MariaDB.)")
+    if args.site_notes is None:
+        return ("--db-config needs an explicit --site-notes PATH: the "
+                "default location is 'beside the --db file' and a MariaDB "
+                "server has no such file. Somewhere the service account "
+                "can write, e.g. /var/lib/testboard/site_notes.json.")
+    if args.cache_mb is not None or args.mmap_mb is not None:
+        return ("--cache-mb and --mmap-mb tune SQLite's per-connection "
+                "page cache and do not apply to MariaDB (the buffer pool "
+                "is server-side: innodb_buffer_pool_size, runbook A.5/"
+                "B.4). Remove the flag rather than believing it took "
+                "effect.")
+    return None
+
+
 def main(argv=None):
     # type: (Optional[List[str]]) -> int
     """Run the dashboard server; returns the process exit code (0/2)."""
@@ -145,18 +194,53 @@ def main(argv=None):
                 args.static))
         return 2
 
-    try:
-        storage = testboard.storage.Storage(
-            args.db, cache_mb=args.cache_mb, mmap_mb=args.mmap_mb,
-            max_connections=(
-                args.workers if args.workers is not None
-                else testboard.storage.DEFAULT_MAX_CONNECTIONS))
-    except Exception as exc:
-        sys.stderr.write("Cannot open the database:\n  {0}\n".format(
-            testboard.storage.describe_open_error(args.db, exc)))
-        if args.verbose:
-            traceback.print_exc()
+    problem = backend_error(args)
+    if problem is not None:
+        sys.stderr.write(problem + "\n")
         return 2
+
+    workers = (args.workers if args.workers is not None
+               else testboard.storage.DEFAULT_MAX_CONNECTIONS)
+
+    if args.db_config:
+        import testboard.dbconfig
+        import testboard.mariadb
+        try:
+            settings = testboard.dbconfig.read_option_file(args.db_config)
+        except testboard.dbconfig.DbConfigError as exc:
+            sys.stderr.write("Cannot read --db-config:\n  {0}\n".format(exc))
+            return 2
+        print("database: MariaDB, {0}".format(settings.describe()))
+        try:
+            storage = testboard.storage.Storage.mariadb(
+                settings, max_connections=workers)
+        except Exception as exc:
+            # The backend's own refusals (schema version, strict mode)
+            # are already actionable prose; only genuine connect
+            # failures get the host-matching / auth-plugin advice.
+            if isinstance(exc, RuntimeError):
+                message = str(exc)
+            else:
+                message = testboard.mariadb.describe_connect_error(
+                    settings, exc)
+            sys.stderr.write(
+                "Cannot open the database:\n  {0}\n".format(message))
+            if args.verbose:
+                traceback.print_exc()
+            return 2
+    else:
+        if args.db is None:
+            args.db = "testboard.db"
+        try:
+            storage = testboard.storage.Storage(
+                args.db, cache_mb=args.cache_mb, mmap_mb=args.mmap_mb,
+                max_connections=workers)
+        except Exception as exc:
+            sys.stderr.write("Cannot open the database:\n  {0}\n".format(
+                testboard.storage.describe_open_error(args.db, exc)))
+            if args.verbose:
+                traceback.print_exc()
+            return 2
 
     perf_log = None
     if args.perf_log:

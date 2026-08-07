@@ -214,6 +214,10 @@ CREATE USER 'testboard_app'@'WEBHOST'
   IDENTIFIED VIA mysql_native_password USING PASSWORD('APP_PASSWORD_HERE');
 ```
 
+(The `USING PASSWORD('...')` form needs MariaDB 10.4+. On a 10.3 stream,
+compute the hash first — `SELECT PASSWORD('APP_PASSWORD_HERE');` — and pass
+it as the `USING` value: `... USING '*94BDCE...'`.)
+
 Confirm what you actually created:
 
 ```sql
@@ -394,6 +398,13 @@ line for one reason: **anything on a command line is visible to every user on
 the box through `ps`.** The migration tool refuses to accept a password any
 other way.
 
+If MariaDB is on this same box and the grants were written for
+`'testboard_migrate'@'localhost'`, add one line to the `[client]` section:
+`socket = /var/lib/mysql/mysql.sock`. The vendored driver — unlike the
+`mysql` client — does **not** treat `host = localhost` as "use the socket";
+it opens TCP, which MariaDB may match against a different account (§A.1).
+With a `socket` line the tool and the client authenticate identically.
+
 Delete this file when the migration is finished. The account it holds can drop
 every table in the database.
 
@@ -419,12 +430,12 @@ EOF
 the `testboard` group can read it, nobody else can, and nothing but `root` can
 change it.
 
-> ⚠️ **The dashboard does not read this file yet.** As of today `storage.py`
-> speaks SQLite only; pointing the application at MariaDB is §F, and it is not
-> done. This file is created now because it is part of the same privileged
-> setup and because §F should find it already in place with the right
-> ownership — not because anything consumes it today. **Setting it up does not
-> migrate the dashboard.**
+> **This is the file `run_server.py --db-config` reads** (§F). Creating it is
+> part of the privileged setup; *using* it is the operator's cutover decision.
+> **Setting it up does not migrate the dashboard** — the server keeps serving
+> SQLite until it is started with `--db-config`, and SQLite remains a
+> first-class backend afterwards (a second instance can always start on
+> `--db PATH` with nothing else set up).
 
 For reference, the service unit §F will need — `/etc/systemd/system/testboard.service`:
 
@@ -524,9 +535,18 @@ breaks you will not know which change did it.
 
 ### B.3 Collation, per column
 
-Set at the database level in §A.3, but stated explicitly on identity columns
-anyway — so that a future `ALTER` on a server with different defaults cannot
-quietly change comparison semantics.
+Set at the database level in §A.3, and the identity columns (environment,
+script, test_name, username) deliberately **inherit** it — the generated DDL
+does not repeat a collation on them, so the choice lives in exactly one
+place. The machine-generated columns (timestamps, `result`, `hour`,
+`output_fingerprint`) are pinned to `ascii_bin` explicitly: exact,
+case-sensitive, and a quarter the index cost of utf8mb4. Two gates stand
+behind the inherited default: the preflight refuses a database whose default
+collation is not binary (§C.2 `database_collation`), and the collation probe
+proves the behaviour empirically before anything loads. A later
+`ALTER TABLE ... ADD COLUMN` inherits the *table's* collation, fixed at
+CREATE time from that gated default, so future columns cannot quietly
+diverge either.
 
 If your server is **older than 10.2** and `utf8mb4_nopad_bin` does not exist:
 `utf8mb4_bin` gives you case sensitivity but *not* no-pad, so `"login"` and
@@ -536,18 +556,23 @@ trailing space — the audit reports exactly that count.
 
 ### B.4 `PRAGMA` has no equivalent, and does not need one
 
-The eight `PRAGMA` statements in `storage.py` are SQLite tuning: WAL mode, busy
-timeout, page cache, mmap. All of them are replaced by server configuration
-(§A.5) and none of them port. In particular:
+The five `PRAGMA` statements in `storage.py` are SQLite tuning: WAL mode, busy
+timeout, foreign keys, page cache, mmap. All of them are replaced by server
+configuration (§A.5) or by the backend's connect settings, and none of them
+port as text. In particular:
 
 - WAL mode → InnoDB's redo log. Nothing to do.
-- `busy_timeout` → `innodb_lock_wait_timeout`.
+- `busy_timeout` → `innodb_lock_wait_timeout` (the MariaDB backend sets it
+  per session at connect).
 - `cache_size` (the `--cache-mb` flag) → `innodb_buffer_pool_size`. **The
   per-connection cache budget stops being meaningful**: InnoDB has one shared
   buffer pool for the server, not one cache per connection. The worker pool
   still matters — for connection reuse and bounded concurrency — but the
-  arithmetic in `Storage.cache_bytes_per_connection()` becomes SQLite-only.
-  Do not delete it; make it conditional on the backend.
+  arithmetic in `Storage.cache_bytes_per_connection()` is SQLite-only and
+  answers None on MariaDB (`run_server.py` rejects `--cache-mb` with
+  `--db-config` outright).
+- `foreign_keys=ON` → see §B.6; the generated schema declares no constraints,
+  so there is nothing for InnoDB to enforce.
 
 ### B.5 `INSERT OR REPLACE` is a behaviour change, not a syntax change ⚠️
 
@@ -582,16 +607,36 @@ a table where it *would* matter.
 it. It is slower and it fires `ON DELETE` behaviour, so prefer
 `ON DUPLICATE KEY UPDATE` unless a test says otherwise.
 
-### B.6 Foreign keys become real
+### B.6 Foreign keys: deliberately NOT carried over
 
-SQLite does not enforce `REFERENCES` unless `PRAGMA foreign_keys=ON`, which
-testboard does not set. InnoDB **always** enforces them. So constraints that are
-decorative today become load-order requirements: `users` before `comments`,
-`runs` before `run_outputs` and `latest_runs`.
+A correction, recorded rather than papered over: an earlier revision of this
+section claimed testboard leaves `PRAGMA foreign_keys` off. It does not —
+`storage.py` sets `foreign_keys=ON` on every connection, so SQLite HAS been
+enforcing the `REFERENCES` clauses at runtime. What is true either way: the
+serving code never *relies* on enforcement — every delete path removes child
+rows itself, in order (`prune` deletes `run_outputs` before `runs`;
+environment deletion sweeps its tables explicitly) — which is exactly why it
+runs green with enforcement on.
 
-More consequentially, **any orphan rows in the current database will refuse to
-load.** The audit in §C.1 finds them before you discover them at 2am, and
-refuses to go on.
+The generated MariaDB DDL still **declares no constraints**, and that stays
+the right call: the load is faster and simpler without them (`load.sql`'s
+FK-order and the audit's orphan gate do the same job), a bulk load under
+`FOREIGN_KEY_CHECKS=0` is never re-validated by InnoDB afterwards anyway, and
+enforcement differences between engines are one more variable the port does
+not need. The code's own delete-order discipline is what actually protects
+integrity, on both engines. Adopting declared constraints in MariaDB is
+separate, deliberate future work.
+
+Two disciplines the tooling keeps, because they cost nothing and are what
+makes that future work possible:
+
+- `load.sql` still loads parents before children: `users` before `comments`,
+  `runs` before `run_outputs` and `latest_runs`.
+- **The audit still blocks on orphan rows** (§C.1). They would load without
+  complaint into the constraint-free schema — which is precisely the problem:
+  dangling references are latent corruption, and the migration is the one
+  moment they are cheap to find. Delete them at the source rather than
+  carrying them over.
 
 ---
 
@@ -600,6 +645,20 @@ refuses to go on.
 Read-only against the SQLite file, read-only-ish against the empty MariaDB
 database (it creates and drops three tiny probe tables). Nothing here changes
 production.
+
+Two environment facts before the first command:
+
+- **Run under a UTF-8 locale** (`echo $LANG` — any `.UTF-8` value is fine).
+  Python 3.6 does not coerce the C locale the way 3.7+ does, so under
+  `LANG=C` (a stripped cron or sudo environment) the tool cannot print its
+  own output and stops at its first line with `UnicodeEncodeError`. It fails
+  before doing anything, so the fix is `export LANG=en_US.UTF-8` and re-run.
+- **The tool must match the database.** The exporter knows the schema of the
+  code it ships with. Run it from the same checkout that is *deployed* — a
+  newer tool against an older database is stopped by the `source_tables`
+  gate, but an **older tool against a newer database silently skips the
+  tables it has never heard of**, and the verification, generated by the same
+  tool, agrees with the omission.
 
 ### C.1 The source audit — one command
 
@@ -621,7 +680,7 @@ checks, and why each one is where it is:
 | `timestamp_widths` | yes | Every timestamp is exactly 26 characters. If not, lexical ordering is *already* broken and the migration is not the cause. |
 | `identity_whitespace` | no | Counts leading/trailing spaces in identity values. Harmless under `utf8mb4_nopad_bin`; the measurement of the damage if §A.3 was not followed. |
 | `case_collisions` | no | How many rows differ only by case — i.e. exactly what a case-insensitive collation would merge. Non-zero makes §C.2 the only thing standing between you and data loss. |
-| `orphan_rows` | yes | Rows whose parent is missing. InnoDB will reject them (§B.6). |
+| `orphan_rows` | yes | Rows whose parent is missing — latent corruption, blocked on principle (§B.6). |
 
 It also records the volumes, the largest captured output (which §C.3 checks
 against `max_allowed_packet`), and the `schema_version` — §E.4 compares that
@@ -767,8 +826,9 @@ twenty minutes and 2.4 GB, and on cutover night those twenty minutes are inside
 the freeze window. It prints the elapsed time of every phase
 at the end, which is the number §E.1 exists to obtain.
 
-Exit codes: `0` everything passed · `2` bad usage or an unexpected error ·
-`3` a check said no.
+Exit codes: `0` everything passed · `3` a check said no · anything else
+(`1`/`2`) is a usage or environment error — bad flags, a missing file, no
+connection. A wrapper should treat only `0` as go.
 
 The steps can also be run one at a time — `audit`, `preflight`, `export`,
 `load`, `verify` — and that is what you want when something has failed and you
@@ -821,7 +881,13 @@ load. Do not reorder that.
 ### E.1 Dry run first — the dry run is also your estimate
 
 Copy the production SQLite file to the web server's local disk and run §D
-against it, into a scratch database (`testboard_dryrun`, same grants). **Do not
+against it, into a scratch database (`testboard_dryrun`). That scratch
+database is created by whoever ran §A, exactly as §A.3 created the real one —
+**same collation**, and both §A.4 grants repeated `ON testboard_dryrun.*` —
+and the dry run needs its own copy of the §A.9 option file with
+`database = testboard_dryrun`. A scratch database created casually, without
+the collation, fails the preflight — that is the probe doing its job, not a
+fault in the rehearsal. **Do not
 estimate the downtime window; measure it here** — the `all` command prints
 per-phase timings for exactly this reason. Then check §E.4's verification
 passed. Only then schedule the real cutover.
@@ -928,9 +994,14 @@ Delete `~/.testboard-migrate.cnf` (§A.9) once you are sure you are done with it
 
 ## F. The application code
 
-The migration above moves the *data*. Making the *dashboard* talk to MariaDB is
-separate work, and **it is not done.** Until it is, the loaded MariaDB database
-is a copy that nothing reads.
+The migration above moves the *data*. Making the *dashboard* talk to MariaDB
+was separate work, and **it is done** (WP-19, drop 2026-08-07): the server
+started with `--db-config /etc/testboard/db.cnf --site-notes PATH` serves
+from MariaDB through the vendored driver. **SQLite did not become legacy** —
+`--db PATH` is unchanged, permanent, and the zero-setup way to stand up a
+second instance; both backends run the storage and API suites in CI on every
+push. What remains operator work is exactly §E: the dry run, the freeze, the
+load, the verification, and the decision to flip the flag.
 
 ### F.1 The driver — decided and shipped
 
@@ -941,10 +1012,12 @@ Python, no compilation, works on Python 3.6, MIT-licensed. Dropped into the tree
 it is *present*, not *installed* — nothing runs `pip` on the server and the "no
 envs to set up" property is preserved. `CLAUDE.md` records the exemption and its
 limits; `tests/test_vendored_driver.py` pins the version, proves the import
-costs nothing, and holds `testboard/` and `feeder/` to **not yet**, so that
-reverting the decision stays a single commit touching no storage code.
-`tools/migrate_to_mariadb.py` already uses it — see §D.1 for why that is the
-point rather than an exception.
+costs nothing, and holds the driver's serving-path blast radius to exactly
+one module (`testboard/mariadb.py` — `DriverImportAllowlistTest`), so that
+reverting the decision is still one commit: the vendored tree, the backend
+module, the migration tool, and no SQL. `feeder/` remains forbidden from
+touching it (it talks HTTP). `tools/migrate_to_mariadb.py` uses it too — see
+§D.1 for why that is the point rather than an exception.
 
 The alternatives, recorded so the choice can be re-examined rather than
 re-litigated: a C-extension driver (`mysqlclient`, `mariadb`) is faster but
@@ -956,43 +1029,57 @@ to say an injection problem. Anywhere else it silently adds a package that must
 be installed on the deployment host, which is the one thing this project's
 design exists to avoid.
 
-### F.2 Sequencing
+### F.2 How it is built — as shipped (WP-19)
 
-This is the part that cannot be done unattended, because there is no MariaDB in
-the dev environment and none in CI — nobody can verify a port they cannot run.
-
-**Phase 0 — done, SQLite-only, fully verifiable** (plan WP-5, WP-9, WP-10,
-WP-11): `julianday()` removed by storing `duration_seconds`; the re-import id
+**Phase 0 — SQLite-only groundwork** (plan WP-5, WP-9, WP-10, WP-11):
+`julianday()` removed by storing `duration_seconds`; the re-import id
 behaviour pinned by a test (§B.5); the portability inventory test that stops
 this document's translation tables silently going stale; the export tool; the
 vendored driver.
 
-**Phase 1 — next:** a `Dialect` seam in `storage.py` (placeholder style, upsert
-form, blob type, connect/pragma behaviour) with SQLite as one implementation and
-MariaDB as the other. `--db` grows a URL form, or a `--db-config` pointing at
-`/etc/testboard/db.cnf` (§A.10). The 59 execute sites do not each need porting;
-the ~27 dialect-specific constructs do.
+**Phase 1 — the backend seam, shipped.** One `Storage` class, two backend
+objects: `_SqliteBackend` in `storage.py` (byte-identical to the pre-seam
+behaviour) and `MariaDBBackend` in `testboard/mariadb.py`, reached only via
+`Storage.mariadb()` so SQLite deployments never import the driver. The SQL in
+`storage.py` stays qmark-canonical **permanently**; the MariaDB connection
+wrapper translates at execute time. The whole dialect surface, each rewrite
+pinned by a unit test:
 
-Two additions from migration 6 (2026-07-31) the port inherits for free but
-should not lose: `activity_hours` is maintained by the same
-SELECT-then-UPDATE-or-INSERT pattern as everything else (`ON DUPLICATE KEY
-UPDATE` reproduces it, §B.5), and its `hour` column is `SUBSTR(start_time, 1,
-13)` — string arithmetic, no date function, both engines agree. Migration 7
-(2026-08-04) adds `script_hours` in the same mould — same SUBSTR expression,
-same upsert pattern — with one extra shape: its shrink path (a re-import
-changing a stored result or end time) RECOMPUTES the affected bucket from
-`runs` rather than decrementing, because the bucket carries MIN/MAX columns.
-That recomputation is plain portable SQL (COUNT/MIN/MAX with a SUBSTR
-equality) and needs no dialect work. The
-byte-identical-re-import skip compares `runs.output_fingerprint` (SHA-1 hex
-computed in Python) — nothing engine-specific, but the port's upsert must keep
-the SELECT-first shape or the skip has nothing to compare against.
+- `BEGIN IMMEDIATE` → `START TRANSACTION`; `INSERT OR REPLACE` → `REPLACE`
+  (the two §B.5-safe sites); `?` → `%s` with `%` doubled first.
+- Two composed-SQL fragments chosen per backend: the search clause
+  (case-insensitive over the `_bin` columns via an explicit COLLATE, with the
+  `ESCAPE` spelling each engine's literal parsing needs) and the
+  LIMIT-with-only-an-offset idiom.
+- Connect: `CLIENT.FOUND_ROWS` (rowcount = rows *matched*, as SQLite
+  reports), `binary_prefix` (blobs are zlib bytes), autocommit plus explicit
+  transactions, `innodb_lock_wait_timeout` per session, and a strict-mode
+  assertion — the server that refuses to load non-strict also refuses to
+  *serve* non-strict.
+- Reconnect: ping-on-borrow after 60 s idle, never inside a transaction,
+  never retrying a statement.
+- **No DDL, ever.** On MariaDB the startup check verifies `schema_version`
+  equals the build's and refuses both directions; the schema only ever comes
+  from this runbook's §D.
 
-**Phase 2 — CI:** add a MariaDB service container to `.github/workflows/ci.yml`
-and run the storage and API suites against **both** backends. GitHub Actions
-supports this directly (`services: mariadb:10.6`). Until this exists, "it works
-on MariaDB" is an assertion, not a fact — and this project's habit is to make
-that kind of claim testable rather than to make it confidently.
+The 135 execute sites did not each need porting — the seam plus the rewrites
+above and the two fragments were the whole job, exactly because Phase 0 had
+already removed the date functions and kept the upsert SELECT-first (which
+the `output_fingerprint` re-import skip depends on; the port kept it).
+`activity_hours` and `script_hours` needed no dialect work at all — SUBSTR
+bucketing and plain COUNT/MIN/MAX recomputation are portable as written.
+
+**Phase 2 — CI, shipped.** `.github/workflows/ci.yml` runs a
+`python36-mariadb` job: the same ubi8/python-36 container as the
+authoritative 3.6 gate plus a **`mariadb:10.3`** service — 10.3 to match the
+production stream, not the newest. `TESTBOARD_TEST_DB_CNF` activates
+generated dual-backend suites (`tests/backends.py`): every storage and API
+test class runs a second time against a schema created from the exporter's
+own DDL, so "it works on MariaDB" is a CI fact, on the deployed version,
+against the schema the migration actually creates. A handful of tests whose
+*instrument* is SQLite (PRAGMA introspection, trace-callback query counting,
+a perf pin) are skipped there, each with its reason recorded in
+`tests/test_mariadb_backend.py`.
 
 ---
 
@@ -1008,7 +1095,7 @@ that kind of claim testable rather than to make it confidently.
 | Load succeeds but tests are missing afterwards | Strict mode **off**, values silently truncated and merged | §C.4's probe exists to make this impossible. If you skipped it: reload from scratch |
 | `MySQL server has gone away` mid-load | A row exceeded `max_allowed_packet` | §A.5, raise it; the culprit is a large `run_outputs` blob |
 | `The used command is not allowed with this MariaDB version` | `LOAD DATA LOCAL INFILE` disabled | Enable `local_infile` on both sides (§A.5, and `local-infile = 1` in the option file) |
-| `Cannot add or update a child row: a foreign key constraint fails` | Orphan rows, or wrong load order | §B.6 and §C.1 — the audit blocks on orphans for this reason |
+| `Cannot add or update a child row: a foreign key constraint fails` | Foreign key constraints were added by hand — the generated schema declares none (§B.6) | Load into the generated schema as-is; adopt constraints, if wanted, as separate later work |
 | A load failed partway and the next run says the target is not empty | The wreckage of the first attempt | Drop the tables (`testboard_migrate` holds `DROP` on this database, so it can — it just cannot drop the *database*), then run the `load` step again. Do not load on top |
 | `File 'runs.tsv' not found` | The client was run from outside the export directory | §D.3 — `cd` into it first; the tool does this for you |
 | Blob comparison fails in §E.4 | Hex round-trip; usually a missing `UNHEX()` or a client charset mangling the hex text | Re-check `load.sql`; blobs must never pass through a character-set conversion |

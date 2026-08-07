@@ -61,6 +61,7 @@ from typing import (
     Tuple,
 )
 
+from testboard import dbconfig
 from testboard import model
 from testboard.model import Result, RunRecord, StoredRun
 
@@ -1270,59 +1271,63 @@ def _summary_row_from(
     )
 
 
-class Storage:
-    """SQLite-backed storage with per-thread connections.
+class _SqliteBackend(object):
+    """The SQLite half of the storage seam.
 
-    Constructing a :class:`Storage` opens a connection for the calling
-    thread and immediately runs any pending schema migrations. Each other
-    thread that touches the instance lazily gets its own connection with
-    the same pragmas (WAL journal, 10s busy timeout, foreign keys on).
+    A backend owns HOW a connection is made and the few SQL spellings
+    that differ by engine; :class:`Storage` owns WHAT is executed — the
+    method bodies, the transactions, the SELECT-first upsert shape. The
+    MariaDB counterpart lives in ``testboard.mariadb`` and is imported
+    only by :meth:`Storage.mariadb`, so a SQLite deployment never loads
+    the vendored driver.
+
+    The engine-specific fragments are class attributes ON PURPOSE:
+    ``tests/test_sql_portability.py`` inventories THIS file's string
+    literals, and moving the SQLite spellings elsewhere would blind
+    that scan.
+
+    ``conn`` parameters across Storage stay annotated
+    ``sqlite3.Connection``: that is the shape both backends present —
+    ``execute``/``executemany`` returning a cursor with
+    ``fetchone``/``fetchall``/``rowcount``/``lastrowid`` — and the
+    MariaDB wrapper duck-types it.
     """
 
-    def __init__(self, path: str, cache_mb: Optional[int] = None,
-                 mmap_mb: Optional[int] = None,
-                 max_connections: int = DEFAULT_MAX_CONNECTIONS) -> None:
-        """Open the database at *path* and run migrations immediately.
+    #: Raised on a unique-key race; ensure_user/create_user catch it.
+    integrity_error = sqlite3.IntegrityError
 
-        ``cache_mb`` is a budget for the WHOLE process, not per
-        connection. That distinction is the entire reason this parameter
-        exists: connections are thread-local, so a value passed straight
-        to ``PRAGMA cache_size`` is multiplied by however many threads
-        the server happens to have open. Asking for 512 MB and getting
-        10 GB is a memory exhaustion bug, not a tuning win. The budget is
-        therefore divided by ``max_connections`` before it is used.
+    #: SQLite owns its schema: MIGRATIONS run at startup. The MariaDB
+    #: backend never runs DDL — its schema is created by the migration
+    #: tooling (docs/MARIADB_MIGRATION.md §D) and only VERIFIED here.
+    runs_migrations = True
 
-        ``mmap_mb`` maps the database instead of read()ing it, letting
-        the OS page cache serve pages with no copy. It is a large win on
-        local disk and worth nothing - occasionally worse - on a network
-        mount, where the pages are not really local to cache. Off by
-        default for that reason.
-        """
+    #: Substring search. SQLite's LIKE is ASCII-case-insensitive and
+    #: its string literals do not process backslashes, so the wire
+    #: carries ESCAPE '\'. MariaDB needs different spelling AND an
+    #: explicit collation to keep search case-insensitive over the
+    #: migrated _bin columns.
+    like_test_name = "lr.test_name LIKE ? ESCAPE '\\'"
+
+    #: "No limit, but an offset" — SQLite spells no-limit as -1, which
+    #: MariaDB rejects outright.
+    limit_all_offset = " LIMIT -1 OFFSET ?"
+
+    def __init__(self, path: str, cache_mb: Optional[int],
+                 mmap_mb: Optional[int], max_connections: int) -> None:
         self._path = path
         self._cache_mb = cache_mb
         self._mmap_mb = mmap_mb
-        self._max_connections = max(1, int(max_connections))
-        self._local = threading.local()
-        self._trend_cache = {}  # type: Dict[Tuple[str, Optional[str]], Tuple[float, List[DailyResultCount]]]
-        self._trend_lock = threading.Lock()
-        self._migrate()
+        self._max_connections = max_connections
 
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
-
-    def _conn(self) -> sqlite3.Connection:
-        """Return the calling thread's connection, opening it on first use."""
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = sqlite3.connect(
-                self._path, detect_types=0, isolation_level=None
-            )
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=10000")
-            conn.execute("PRAGMA foreign_keys=ON")
-            self._apply_cache_pragmas(conn)
-            self._local.conn = conn
+    def connect(self) -> sqlite3.Connection:
+        """One new connection, with the pragmas every connection gets."""
+        conn = sqlite3.connect(
+            self._path, detect_types=0, isolation_level=None
+        )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        self._apply_cache_pragmas(conn)
         return conn
 
     def _apply_cache_pragmas(self, conn: sqlite3.Connection) -> None:
@@ -1350,6 +1355,117 @@ class Storage:
             conn.execute("PRAGMA mmap_size={0}".format(
                 max(0, int(self._mmap_mb)) * 1024 * 1024))
 
+    def cache_bytes_per_connection(self) -> Optional[int]:
+        """The per-connection page cache this backend asks for, or None.
+
+        SQLite-specific arithmetic by nature: InnoDB has one shared
+        buffer pool for the whole server, not a cache per connection,
+        so the MariaDB backend answers None (runbook §B.4).
+        """
+        if self._cache_mb is None:
+            return None
+        return max(
+            _MIN_CACHE_KIB,
+            int(self._cache_mb) * 1024 // self._max_connections,
+        ) * 1024
+
+    def vacuum(self, conn: sqlite3.Connection) -> None:
+        """Rebuild the file. SQLite-shaped maintenance; see Storage.vacuum."""
+        conn.execute("VACUUM")
+
+
+class Storage:
+    """Backend-agnostic storage with per-thread connections.
+
+    ``Storage(path)`` is SQLite, exactly as it always was: constructing
+    one opens a connection for the calling thread and immediately runs
+    any pending schema migrations; each other thread lazily gets its own
+    connection with the same pragmas (WAL journal, 10s busy timeout,
+    foreign keys on). SQLite is a permanent first-class backend — the
+    zero-setup path a second instance starts on — not a legacy mode.
+
+    :meth:`Storage.mariadb` is the same object over MariaDB via the
+    vendored driver: same method bodies, same transactions, different
+    connection factory and a handful of dialect spellings
+    (see :class:`_SqliteBackend`).
+    """
+
+    def __init__(self, path: str, cache_mb: Optional[int] = None,
+                 mmap_mb: Optional[int] = None,
+                 max_connections: int = DEFAULT_MAX_CONNECTIONS) -> None:
+        """Open the SQLite database at *path* and migrate immediately.
+
+        ``cache_mb`` is a budget for the WHOLE process, not per
+        connection. That distinction is the entire reason this parameter
+        exists: connections are thread-local, so a value passed straight
+        to ``PRAGMA cache_size`` is multiplied by however many threads
+        the server happens to have open. Asking for 512 MB and getting
+        10 GB is a memory exhaustion bug, not a tuning win. The budget is
+        therefore divided by ``max_connections`` before it is used.
+
+        ``mmap_mb`` maps the database instead of read()ing it, letting
+        the OS page cache serve pages with no copy. It is a large win on
+        local disk and worth nothing - occasionally worse - on a network
+        mount, where the pages are not really local to cache. Off by
+        default for that reason.
+        """
+        connections = max(1, int(max_connections))
+        self._init_with_backend(
+            _SqliteBackend(path, cache_mb, mmap_mb, connections),
+            connections)
+
+    def _init_with_backend(self, backend: Any, max_connections: int) -> None:
+        """The shared half of construction; *backend* decides the engine.
+
+        ``backend`` is duck-typed (see :class:`_SqliteBackend` for the
+        surface) because naming the MariaDB class here would import the
+        driver into every SQLite deployment.
+        """
+        self._backend = backend
+        self._max_connections = max(1, int(max_connections))
+        self._local = threading.local()
+        self._trend_cache = {}  # type: Dict[Tuple[str, Optional[str]], Tuple[float, List[DailyResultCount]]]
+        self._trend_lock = threading.Lock()
+        self._migrate()
+
+    @classmethod
+    def mariadb(cls, settings: dbconfig.Settings,
+                max_connections: int = DEFAULT_MAX_CONNECTIONS) -> "Storage":
+        """The same Storage over MariaDB, via the vendored driver.
+
+        *settings* comes from :func:`testboard.dbconfig.read_option_file`
+        — the §A.10 credentials file. The import is inside the method so
+        that a SQLite deployment (``Storage(path)``) never loads the
+        driver: SQLite is not a fallback here, it is the other equal
+        backend.
+
+        The database must already hold the schema the migration tooling
+        creates, at exactly this build's version — this constructor
+        verifies and refuses, it never migrates (runbook §D, §F).
+        """
+        from testboard import mariadb as mariadb_backend
+        store = cls.__new__(cls)
+        store._init_with_backend(
+            mariadb_backend.MariaDBBackend(settings), max_connections)
+        return store
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def _conn(self) -> sqlite3.Connection:
+        """Return the calling thread's connection, opening it on first use.
+
+        The annotation says ``sqlite3.Connection`` because that is the
+        shape callers rely on; the MariaDB backend returns a wrapper
+        presenting the same one (execute/executemany/close).
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._backend.connect()
+            self._local.conn = conn
+        return conn
+
     @property
     def max_connections(self) -> int:
         """Connections this Storage was sized for.
@@ -1363,12 +1479,7 @@ class Storage:
 
     def cache_bytes_per_connection(self) -> Optional[int]:
         """The per-connection cache this Storage asks for, or None."""
-        if self._cache_mb is None:
-            return None
-        return max(
-            _MIN_CACHE_KIB,
-            int(self._cache_mb) * 1024 // self._max_connections,
-        ) * 1024
+        return self._backend.cache_bytes_per_connection()
 
     def close(self) -> None:
         """Close the calling thread's connection, if it has one open."""
@@ -1391,8 +1502,17 @@ class Storage:
         rather than used: its schema may have columns or tables this code
         does not know about, and writing to it with older code is how a
         database gets quietly corrupted.
+
+        Only the SQLite backend ever runs the DDL below. On MariaDB the
+        schema is created by the migration tooling (runbook §D), so the
+        backend VERIFIES the stored version matches this build exactly
+        and refuses in both directions — an app that silently ran SQLite
+        DDL against InnoDB would be worse than one that stopped.
         """
         conn = self._conn()
+        if not self._backend.runs_migrations:
+            self._backend.check_schema(conn, MIGRATIONS[-1][0])
+            return
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_version "
             "(version INTEGER NOT NULL)"
@@ -1884,8 +2004,8 @@ class Storage:
     #: Columns of a TestSummaryRow / TestStatusRow, in NamedTuple order.
     _STATUS_COLUMNS = ", ".join(_STATUS_COLUMN_NAMES)
 
-    @staticmethod
     def _dashboard_filters(
+        self,
         environment: Optional[str],
         script: Optional[str],
         result_values: Optional[List[str]],
@@ -1915,7 +2035,10 @@ class Storage:
             clauses.append("lr.result IN ({})".format(placeholders))
             params.extend(result_values)
         if q is not None:
-            clauses.append("lr.test_name LIKE ? ESCAPE '\\'")
+            # The clause text is the backend's: LIKE semantics and the
+            # ESCAPE spelling both differ by engine (_SqliteBackend
+            # documents how). The pattern built here is shared.
+            clauses.append(self._backend.like_test_name)
             params.append("%{}%".format(_escape_like(q)))
         if stale_before is not None:
             clauses.append("lr.start_time < ?")
@@ -2012,7 +2135,7 @@ class Storage:
             sql += " LIMIT ? OFFSET ?"
             params.extend([limit, offset])
         elif offset:
-            sql += " LIMIT -1 OFFSET ?"
+            sql += self._backend.limit_all_offset
             params.append(offset)
 
         rows = self._conn().execute(sql, params).fetchall()
@@ -3267,12 +3390,16 @@ class Storage:
         return deleted
 
     def vacuum(self) -> None:
-        """Rebuild the database file, returning freed pages to the disk.
+        """Compact the database, backend permitting.
 
-        Exclusive and expensive (it rewrites the whole file) — a
-        maintenance-window operation, never part of serving a request.
+        On SQLite: VACUUM — exclusive and expensive (it rewrites the
+        whole file), a maintenance-window operation, never part of
+        serving a request. On MariaDB: a logged no-op — InnoDB manages
+        its own space and the nearest equivalent (OPTIMIZE TABLE) is a
+        different decision an operator takes on the server, not one the
+        dashboard should spring on them.
         """
-        self._conn().execute("VACUUM")
+        self._backend.vacuum(self._conn())
 
     # ------------------------------------------------------------------
     # Users
@@ -3293,7 +3420,7 @@ class Storage:
                     "VALUES (?, ?)",
                     (username, model.format_iso(created_at)),
                 )
-            except sqlite3.IntegrityError:
+            except self._backend.integrity_error:
                 # Another thread created the user between our SELECT and
                 # INSERT; the user exists, which is all we need.
                 pass
@@ -3317,7 +3444,7 @@ class Storage:
                 "INSERT INTO users (username, created_at) VALUES (?, ?)",
                 (username, model.format_iso(created_at)),
             )
-        except sqlite3.IntegrityError:
+        except self._backend.integrity_error:
             # Lost a race with another thread: fetch what it created.
             row = conn.execute(
                 _USER_SELECT + " WHERE username = ?", (username,)

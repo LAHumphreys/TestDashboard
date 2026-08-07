@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project State
 
 **testboard is live in production and has been since 2026-07-26.** It is no longer
-greenfield: ~25k lines, 1,288 tests, schema at migration 6, deployed and in daily use
-by a small group of testers.
+greenfield: ~25k lines, 1,385 tests (1,749 with the MariaDB variants active),
+schema at migration 7, deployed and in daily use by a small group of testers.
 
 **Starting a session: read [`docs/SESSION_HANDOVER.md`](docs/SESSION_HANDOVER.md) first.**
 It is one screen: what state the branches are in, what is parked where, and what the
@@ -71,7 +71,7 @@ The other documents, and what each is for:
 
 1. **Python 3.6 exactly.** No 3.7+ features. Specifically forbidden: `dataclasses` (use `typing.NamedTuple` class syntax), `http.server.ThreadingHTTPServer` (hand-compose one on `http.server.HTTPServer`; note it must be a fixed worker POOL, not `socketserver.ThreadingMixIn` — see below), `datetime.fromisoformat` (write one `strptime`-based ISO-8601 parser, unit-test it, use it everywhere), `subprocess.run(capture_output=...)`, `typing.Protocol`/`Literal`, walrus operator, positional-only params, `breakpoint()`, `contextlib.nullcontext`. f-strings and `async`/`await` are fine.
 2. **Standard library only.** No pip installs, no build step, nothing to set up on the server — that property is the point, not the letter of the rule. `unittest` (not pytest), `sqlite3`, `http.server`, `json`, `urllib.request`.
-   **One narrow exemption:** pure-Python third-party source may be *vendored* under `third_party/`, where the stdlib has no equivalent and the package has no dependencies of its own. Vendored code is *present*, not *installed*, so the deployment property is preserved. It is exempt from this project's style rules (annotations, `typing.*` conventions) — holding upstream to them would mean either editing it, making it un-updatable, or accumulating excuses, making the gate meaningless — but **not** from the 3.6 parse gate, which is correctness. `tests/test_python36_compat.py::VendoredCodeTest` enforces the split. Currently: PyMySQL 1.0.2 — used by `tools/migrate_to_mariadb.py` today and by the MariaDB storage backend when §F of the runbook lands; `tests/test_vendored_driver.py` allowlists who may import it and still holds `testboard/` and `feeder/` to "not yet". Do not add anything else without the same justification.
+   **One narrow exemption:** pure-Python third-party source may be *vendored* under `third_party/`, where the stdlib has no equivalent and the package has no dependencies of its own. Vendored code is *present*, not *installed*, so the deployment property is preserved. It is exempt from this project's style rules (annotations, `typing.*` conventions) — holding upstream to them would mean either editing it, making it un-updatable, or accumulating excuses, making the gate meaningless — but **not** from the 3.6 parse gate, which is correctness. `tests/test_python36_compat.py::VendoredCodeTest` enforces the split. Currently: PyMySQL 1.0.2 — used by `tools/migrate_to_mariadb.py` and by the MariaDB storage backend (`testboard/mariadb.py`, WP-19); `tests/test_vendored_driver.py::DriverImportAllowlistTest` holds the driver's serving-path blast radius to exactly that one module — `storage.py` talks to a backend object, never to the driver, and `feeder/` may not touch it at all. Do not add anything else without the same justification.
    **Never shell out to a tool that would have to be installed.** Constraint 2 is about the *deployment host*, not about `pip` specifically: an RPM, a system binary, or a CLI on `PATH` is a dependency in exactly the same way, and it fails the same way — at deployment, on someone else's machine, at the worst moment. Vendored code exists precisely so this is never necessary. Concretely: the MariaDB work talks to the server through `third_party/pymysql`, **never** through the `mysql` client via `subprocess`. If a guard test appears to forbid using a vendored package for a legitimate purpose, amend the guard with its reasoning updated — do not route around it by adding a host dependency. `subprocess` is for things that are unambiguously part of the interpreter's own environment (`sys.executable`), not for substituting a library.
 3. **No npm, no build step, no CDN.** Frontend is static HTML + vanilla ES6 JS + CSS served by the same process; assume browsers have no internet access.
 4. **Full type annotations** on every function/method (3.6-compatible). No `Any` except at JSON boundaries, converted to typed structures immediately. Use `typing.List`/`Dict`/`Optional` — **never** PEP 585 builtin generics (`list[str]`) or PEP 604 unions (`int | None`), which are a runtime `TypeError` on 3.6 while looking perfectly fine on a modern interpreter.
@@ -85,7 +85,14 @@ The other documents, and what each is for:
 - Run one test module: `python -m unittest tests.test_storage`
 - Run one test: `python -m unittest tests.test_storage.TestClass.test_method`
 - Run the server: `python run_server.py --port <p> --db <path> --host <h>`
-  (add `--workers N` / `--cache-mb MB` to tune the pool; defaults are fine)
+  (add `--workers N` / `--cache-mb MB` to tune the pool; defaults are fine).
+  SQLite and MariaDB are **equal backends**: `--db PATH` is SQLite (zero
+  setup, permanent — never call it legacy); `--db-config CNF` serves from
+  MariaDB and requires an explicit `--site-notes`. Exactly one of the two.
+- Run the dual-backend suites: set `TESTBOARD_TEST_DB_CNF` to a mysql option
+  file naming a SACRIFICIAL database (it is dropped and recreated); unset,
+  the MariaDB test variants simply do not exist. CI's `python36-mariadb` leg
+  does this against `mariadb:10.3` — prod's stream — on every push.
 - Catch a stall for later reading: `--perf-log PATH`, then
   `python tools/perf_report.py PATH`. Off unless asked for, capped and rolled over, so
   it is safe to leave on — and an intermittent fault cannot be caught by logging
@@ -101,7 +108,7 @@ The other documents, and what each is for:
 
 ## Architecture (dashboard)
 
-Layout as built: `testboard/` package with `model.py` (NamedTuples, `Result` enum, ISO time parse/format), `storage.py` (all SQL, sqlite migrations), `analytics.py` (pure functions), `api.py` (framework-free routing/handlers), `server.py` (http.server glue + static files); `static/` for the UI; `tests/` for unittest suites.
+Layout as built: `testboard/` package with `model.py` (NamedTuples, `Result` enum, ISO time parse/format), `storage.py` (all SQL, sqlite migrations, the `_SqliteBackend` half of the backend seam), `mariadb.py` (the MariaDB backend — the ONE serving-path module that touches the vendored driver), `dbconfig.py` (mysql option-file parsing, shared with the migration tool), `analytics.py` (pure functions), `api.py` (framework-free routing/handlers), `server.py` (http.server glue + static files); `static/` for the UI; `tests/` for unittest suites. The SQL in `storage.py` is qmark-canonical permanently; the MariaDB wrapper translates at execute time, and the app NEVER runs DDL on MariaDB (schema comes from the migration tooling; `schema_version` equality is verified, both mismatch directions refuse).
 
 Key design decisions. The first few came from the brief; the rest were bought
 with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
@@ -120,11 +127,12 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
 - **`output` can be large**: it lives in its own table (`run_outputs`), zlib-compressed, and is read by exactly one endpoint (`GET /api/runs/{id}`). Never join it into a list query — keeping it out of `runs` is what keeps metadata reads dense.
 - **The server serves from a fixed worker pool, never a thread per request.** Storage keeps connections in `threading.local()`, so a thread per request means a connection per request means an empty SQLite page cache on every request — measured: 20 requests, 20 connections, and no `cache_size` setting can help a cache that is discarded before it is used twice. The pool size *is* the connection count and is what a `--cache-mb` budget is divided by; `tests/test_server_pool.py` fails if the mixin comes back.
 - SQLite: WAL mode + busy timeout at connect (threaded server), versioned migration
-  table (`schema_version`). **`MIGRATIONS` holds six entries and entry 1 describes a
+  table (`schema_version`). **`MIGRATIONS` holds seven entries and entry 1 describes a
   database that exists in production — never edit it.** Every schema change is a new
   appended entry whose version is claimed from the registry in `docs/UPGRADE_PLAN.md`
-  §1 *in the same commit*; version 7 is claimed by WP-15 (renumbered from 6 when
-  WP-17 shipped first — the parked WIP branch must renumber before merging).
+  §1 *in the same commit*; version 8 is claimed by WP-15 (renumbered from 6, then 7,
+  as WP-17 and WP-18 each shipped first — the parked WIP branch must renumber before
+  merging).
   `tests/test_migrations.py` freezes entry 1 by hash and asserts the fresh-install and
   incremental paths produce identical schemas. A migration may contain a Python step
   (`"python: <name>"`). A database whose version exceeds the code's is refused, not
