@@ -1,13 +1,19 @@
 # Migrating testboard from SQLite to MariaDB
 
-**Assumptions, simplified 2026-08-07.** The general two-host, two-account
-version of this runbook lives in git history if it is ever needed again.
-As of this revision: **the dashboard and MariaDB run on the same host**,
-everything connects over the **unix socket**, and there is **one database
-account** — used by the migration and by the running app alike. The
-dedicated app/migrate account pair was judged overkill for a
-single-operator, single-box install; §A.4 records what that trades away
-and how to restore it later.
+**Assumptions, simplified 2026-08-07.** The general two-host version of
+this runbook lives in git history if it is ever needed again. As of this
+revision: **the dashboard and MariaDB run on the same host** and everything
+connects over the **unix socket**, so both grants are `@'localhost'` and
+there is no network section.
+
+**Count your accounts before you start, because the words collide:** there
+is exactly **one Linux user** (the `testboard` service account, §A.7 — plus
+your own login) and **two MariaDB accounts** (§A.4 — a data-only one the
+app runs as, and a schema-changing one — DDL: CREATE/ALTER/DROP — the
+migration uses). The two-MariaDB-
+account split is deliberate and cheap: it is what stops the running
+dashboard from being able to drop a table. Nothing in this document creates
+a second Linux user.
 
 **Audience.** Two hats, quite possibly one head:
 
@@ -44,7 +50,8 @@ you already have: keep hot pages in RAM on a machine that has plenty.
 > ```
 >
 > Run it *on the production web server*, now that connections persist. If the
-> verdict is "the storage", MariaDB on a dedicated host addresses it directly.
+> verdict is "the storage", MariaDB on this host's local disk addresses it
+> directly — the data leaves the network mount.
 > If the verdict is "nothing here is slow", you are migrating for the
 > operational reasons above, not for speed — which is a fine reason, but you
 > should know which one you are buying.
@@ -75,16 +82,19 @@ testboard.
 
 One machine, one pass, top to bottom:
 
-- **A.2 – A.5**: install MariaDB, create the database and the account, set
-  the server options.
-- **A.7 – A.10**: the service account and group, the directories, and the
-  one credentials file.
+- **A.2 – A.5**: install MariaDB, create the database and the two database
+  accounts, set the server options.
+- **A.7 – A.10**: the (one) Linux service account and group, the
+  directories, and the two credentials files.
 - **A.11** is the hand-over checklist. (A.1 states the one-box assumption
   and its one trap; A.6 is retired — numbering is kept stable so every
   cross-reference in the tools and tests stays true.)
 
-Commands are `#`-prefixed where they need root. Everything is scoped to one
-database and one service account; nothing here grants a global privilege.
+Commands are `#`-prefixed where they need root, `$`-prefixed where they run
+as an ordinary user. **Strip the prompt marker if you paste a block** — a
+pasted `# ` comments out the first line and executes the continuation lines
+alone, which is worse than an error. Everything is scoped to one database
+and one service account; nothing here grants a global privilege.
 
 > **§A was renumbered** when the RHEL 8 install steps were added. Anything
 > elsewhere in the repository still pointing at the old numbers maps like this:
@@ -94,8 +104,8 @@ database and one service account; nothing here grants a global privilege.
 
 ### A.1 One box — and the localhost trap
 
-Everything runs on this host; the account is granted `@'localhost'` and every
-connection uses the **unix socket**. The trap worth knowing anyway, because
+Everything runs on this host; both accounts are granted `@'localhost'` and
+every connection uses the **unix socket**. The trap worth knowing anyway, because
 it is the single most common source of "access denied": MariaDB matches an
 account against the host it sees the connection *coming from*, and
 `'user'@'localhost'` (which means the Unix socket) is a completely different
@@ -149,7 +159,9 @@ Set the root password and remove the defaults:
 
 Answer: set a root password (**yes**), remove anonymous users (**yes**),
 disallow remote root login (**yes**), remove the test database (**yes**),
-reload privileges (**yes**).
+reload privileges (**yes**). (Newer streams ask one or two extra questions
+— "switch to unix_socket authentication?", "change the root password?" —
+the defaults are fine.)
 
 Confirm the version you actually got — this is the number §0 cares about:
 
@@ -161,6 +173,9 @@ If that prints anything below **10.2**, stop and read §B.3 before going on: the
 collation guidance changes and the migration becomes materially riskier.
 
 ### A.3 Create the database
+
+The SQL in §A.3–§A.5 is typed at the client prompt: `# mysql -u root -p`,
+then paste each block; `\q` to leave when §A.5 is done.
 
 ```sql
 CREATE DATABASE testboard
@@ -182,48 +197,57 @@ If `utf8mb4_nopad_bin` is rejected as unknown, the server is older than 10.2.
 See §B.3 — it has a workable but lossier fallback, and it must be an informed
 choice, not a substitution made at the prompt.
 
-### A.4 Create the account — one, deliberately
+### A.4 Create two DATABASE accounts (still only one Linux user)
 
-One account, one strong password. It runs the migration AND the app:
+Both `@'localhost'` — same box, socket connections — with two distinct
+strong passwords:
 
 ```sql
-CREATE USER 'testboard'@'localhost' IDENTIFIED BY 'PASSWORD_HERE';
+-- The application. Data only: it can never alter the schema.
+CREATE USER 'testboard_app'@'localhost' IDENTIFIED BY 'APP_PASSWORD_HERE';
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON testboard.* TO 'testboard_app'@'localhost';
+
+-- Migrations and the initial load. Used by a human, on purpose, never by
+-- the running service.
+CREATE USER 'testboard_migrate'@'localhost' IDENTIFIED BY 'MIGRATE_PASSWORD_HERE';
 GRANT SELECT, INSERT, UPDATE, DELETE,
       CREATE, ALTER, INDEX, DROP, REFERENCES,
       CREATE TEMPORARY TABLES, LOCK TABLES
-  ON testboard.* TO 'testboard'@'localhost';
+  ON testboard.* TO 'testboard_migrate'@'localhost';
 
 FLUSH PRIVILEGES;
 ```
 
-**What this trades away, on the record** (decided 2026-08-07): the earlier
-two-account design meant the *serving* app could never `DROP TABLE` — schema
-changes needed a different credential. With one account the app connection
-holds DDL rights it never uses: the dashboard runs no DDL on MariaDB by
-design (the backend refuses to, and `DriverImportAllowlistTest` plus the
-schema-version check stand behind that), every query is parameterized, and
-this is a single-operator install on one box. Judged acceptable. To restore
-the split later, create a data-only app account and swap the credentials
-file — two GRANT statements and a file edit, no code:
+**Replace both password placeholders before pasting.** The literal text
+`APP_PASSWORD_HERE` is a perfectly valid password — pasted unedited, every
+later gate passes and production runs with the placeholder, and nothing
+will ever flag it.
+
+Why two: the running dashboard has no business being able to `DROP TABLE`.
+It also means a schema change is a deliberate act by a person with a
+different credential, which is what you want once the schema is locked.
+These are rows in MariaDB's user table, not logins on the box — cheap to
+create, nothing to maintain. (An earlier revision of this document briefly
+merged them after "two accounts" was read as two *Linux* users; unmerged
+the same day. One Linux service account, §A.7, is all the OS ever sees.)
+
+**Both accounts must use `mysql_native_password`.** That is MariaDB's
+default, so on a stock server the plain `IDENTIFIED BY` above already does
+it. If this server has been configured to default to a sha256-based plugin,
+say so explicitly:
 
 ```sql
-CREATE USER 'testboard_app'@'localhost' IDENTIFIED BY '...';
-GRANT SELECT, INSERT, UPDATE, DELETE ON testboard.* TO 'testboard_app'@'localhost';
-```
-
-**The account must use `mysql_native_password`.** That is MariaDB's default,
-so on a stock server the plain `IDENTIFIED BY` above already does it. If this
-server has been configured to default to a sha256-based plugin, say so
-explicitly:
-
-```sql
-CREATE USER 'testboard'@'localhost'
-  IDENTIFIED VIA mysql_native_password USING PASSWORD('PASSWORD_HERE');
+CREATE USER 'testboard_app'@'localhost'
+  IDENTIFIED VIA mysql_native_password USING PASSWORD('APP_PASSWORD_HERE');
 ```
 
 (The `USING PASSWORD('...')` form needs MariaDB 10.4+. On a 10.3 stream,
-compute the hash first — `SELECT PASSWORD('PASSWORD_HERE');` — and pass
-it as the `USING` value: `... USING '*94BDCE...'`.)
+compute the hash first — `SELECT PASSWORD('APP_PASSWORD_HERE');` — and pass
+it as the `USING` value: `... USING '*94BDCE...'`. Repeat for
+`testboard_migrate`. If the accounts already exist from the plain block
+above, `DROP USER 'testboard_app'@'localhost';` first — and re-run that
+account's GRANT afterwards, since it dies with the user.)
 
 Confirm what you actually created:
 
@@ -260,13 +284,15 @@ SELECT @@innodb_buffer_pool_size, @@max_allowed_packet,
 | `innodb_buffer_pool_size` | As large as the host allows — at least 2 GB; ideally more than the whole database | This is the cache. The entire performance case for the move rests on it. A 950 MB database that fits in the pool is served from RAM. |
 | `max_allowed_packet` | ≥ 64 MB (128 MB recommended) | Captured test output is stored as a compressed blob. A single large row must fit in one packet or the load fails partway through with a confusing error. |
 | `sql_mode` | must include `STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES` | **Without strict mode, a test name longer than the column silently gets truncated** — and two different tests become one, permanently, with no error. This is the most damaging thing that can go wrong in this migration. |
-| `local_infile` | `ON` (may be turned off again after the load) | Needed for the bulk load path (§D.3). |
+| `local_infile` | `ON` (may be turned off again after the load) | Needed for the bulk load (§D — both the tool's own path and the by-hand fallback). |
 | `innodb_default_row_format` | `dynamic` | Needed for 3072-byte index keys. Default on 10.2+. |
 
 Write `/etc/my.cnf.d/testboard.cnf`:
 
 ```ini
 [mysqld]
+# 4G assumes the host has RAM to spare. Check free -h first: the pool must
+# leave room for the dashboard and the OS, or MariaDB OOMs at restart.
 innodb_buffer_pool_size = 4G
 max_allowed_packet      = 128M
 sql_mode                = STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION
@@ -345,7 +371,12 @@ not:
 
 ```bash
 # df -h /var/tmp
+# df -h /var/lib/mysql
 ```
+
+The second check is MariaDB's own disk: the loaded database needs roughly
+the SQLite file's size again under `/var/lib/mysql` — twice while the
+dry-run copy (§E.1) is kept alongside the real one.
 
 **SELinux.** If the dashboard is launched as a plain systemd service it runs
 unconfined and needs nothing here. If it is served under a confined domain —
@@ -360,45 +391,65 @@ connection to a database:
 Do not set booleans speculatively. If §E's verification and a page load both
 work, there was nothing to fix.
 
-### A.9 The credentials file — one file, for everything
+### A.9 The operator's migration credentials
 
-One account means one file. `/etc/testboard/db.cnf` is read by the migration
-tool (`--config`), by the running dashboard (`--db-config`, §F), and by the
-`mysql` client (`--defaults-file`, the §D.3 by-hand fallback):
+The operator runs the migration as themselves, with the `testboard_migrate`
+account. That credential is personal and short-lived; it lives in their own
+home directory, not in `/etc`.
+
+**Run this block as the operator, not as root** (`su - <operator-username>`
+first, or hand them the password and this block): the `~` below must be the
+*operator's* home, or §C's tools will look for a file that is sitting in
+`/root` where they cannot see it.
+
+```bash
+$ umask 077
+$ cat > ~/.testboard-migrate.cnf <<'EOF'
+[client]
+socket   = /var/lib/mysql/mysql.sock
+user     = testboard_migrate
+password = MIGRATE_PASSWORD_HERE
+database = testboard
+local-infile = 1
+EOF
+$ chmod 600 ~/.testboard-migrate.cnf
+$ ls -l ~/.testboard-migrate.cnf        # must be -rw-------
+```
+
+The `socket =` line is not decoration: the vendored driver — unlike the
+`mysql` client — does **not** treat `host = localhost` as "use the socket";
+it would open TCP, which MariaDB may match against a different account
+(§A.1). With the socket line, the tool and the client authenticate
+identically, as `'testboard_migrate'@'localhost'`.
+
+It is a file rather than a command line for one reason: **anything on a
+command line is visible to every user on the box through `ps`.** The
+migration tool refuses to accept a password any other way.
+
+Delete this file when the migration is finished. The account it holds can
+drop every table in the database.
+
+### A.10 The application's credentials and the service unit
+
+Same file format as §A.9, different account, permanent, and system-owned:
 
 ```bash
 # cat > /etc/testboard/db.cnf <<'EOF'
 [client]
 socket   = /var/lib/mysql/mysql.sock
-user     = testboard
-password = PASSWORD_HERE
+user     = testboard_app
+password = APP_PASSWORD_HERE
 database = testboard
-local-infile = 1
 EOF
 # chown root:testboard /etc/testboard/db.cnf
 # chmod 0640 /etc/testboard/db.cnf
 # ls -l /etc/testboard/db.cnf          # must be -rw-r----- root testboard
 ```
 
-The `socket =` line is not decoration: the vendored driver — unlike the
-`mysql` client — does **not** treat `host = localhost` as "use the socket";
-it would open TCP, which MariaDB may match against a different account
-(§A.1). With the socket line, the tool, the app and the client all
-authenticate identically, as `'testboard'@'localhost'`.
-
-It is a file rather than a command line for one reason: **anything on a
-command line is visible to every user on the box through `ps`.** The tools
-refuse to accept a password any other way.
-
 `root:testboard` at `0640` is the design, not an oversight: the service
-account and the operators (who are in the `testboard` group, §A.7) can read
-it; nobody else can; only `root` can change it. Group-readability here is
+account and the operators (in the `testboard` group, §A.7) can read it;
+nobody else can; only `root` can change it. Group-readability here is
 deliberate — the file parser warns only about *world*-readable credentials.
-
-### A.10 The service unit
-
-The credentials file is §A.9's — the app reads the same one. What the
-service needs, for the cutover day:
 
 > **`run_server.py --db-config /etc/testboard/db.cnf` is the switch** (§F).
 > Creating the file does not move anything: the server keeps serving SQLite
@@ -406,7 +457,11 @@ service needs, for the cutover day:
 > backend afterwards (a second instance can always start on `--db PATH` with
 > nothing else set up).
 
-`/etc/systemd/system/testboard.service`, both forms:
+`/etc/systemd/system/testboard.service`, both forms. **The paths below are
+the reference layout, not facts about your box**: substitute your
+checkout's location for `/opt/testboard`, and in the first `ExecStart` the
+path your dashboard *currently* uses for `--db` (if a unit already exists,
+you are editing it, not pasting this one):
 
 ```ini
 [Unit]
@@ -436,18 +491,34 @@ it there at cutover so nobody's site notes vanish.
 
 Tell the operator (or, wearing the other hat, confirm to yourself):
 
-- [ ] The `testboard` account's password, by whatever channel your site uses
-      for secrets — not email
-- [ ] That `/etc/testboard/db.cnf` is in place, `root:testboard`, 0640, with
-      the `socket =` line (§A.9)
+- [ ] The two database usernames and both passwords, by whatever channel
+      your site uses for secrets — not email
+- [ ] That `~/.testboard-migrate.cnf` is in place, mode 600, with the
+      `socket =` line (§A.9)
+- [ ] That `/etc/testboard/db.cnf` is in place, `root:testboard`, 0640,
+      with the `socket =` line (§A.10)
+- [ ] **That the app credential actually authenticates** — it is otherwise
+      never exercised until the cutover restart, which is the worst moment
+      to learn about a typo:
+      `# mysql --defaults-file=/etc/testboard/db.cnf -e 'SELECT 1;'`
+      (uses §A.7's optional client; alternatively, from a checkout,
+      `python3 tools/migrate_to_mariadb.py preflight --config
+      /etc/testboard/db.cnf` failing its `grants` check with "cannot
+      create tables" is ALSO proof — the login worked and the account is
+      correctly data-only)
+- [ ] The dry-run database: either create `testboard_dryrun` now — same
+      collation as §A.3, plus §A.4's `testboard_migrate` GRANT repeated
+      `ON testboard_dryrun.*` — or expect to be called back once at §E.1
 - [ ] The output of `SELECT VERSION();`
 - [ ] Confirmation that §A.5's settings were applied **and the server was
       restarted**
 - [ ] That the operator is in the `testboard` group and has logged in since
       (§A.7)
-- [ ] Which scratch filesystem has room for the export (§A.8)
+- [ ] Which scratch filesystem has room for the export, and that
+      `/var/lib/mysql` has room for the loaded database (§A.8)
 
-Nothing else. The operator does not need root beyond this section.
+Nothing else. The operator needs root once more at cutover — the §E.4
+service switch — and for nothing else.
 
 ---
 
@@ -713,10 +784,17 @@ SELECT version FROM schema_version;
 
 ### C.2 / C.3 / C.4 The server preflight — one command
 
+(One command, three old section numbers — kept because tool messages and
+tests still cite them: **C.2** = connection, collation and grants;
+**C.3** = `max_allowed_packet` against the largest blob; **C.4** = the
+strict-mode probe.)
+
 ```bash
 python3 tools/migrate_to_mariadb.py preflight \
-    --config /etc/testboard/db.cnf \
-    --max-blob-bytes <from the audit>
+    --config ~/.testboard-migrate.cnf \
+    --max-blob-bytes <the "largest" figure from the audit's
+                      "captured output" line — NOT the total;
+                      max_blob_bytes in the audit's --json file>
 ```
 
 Every one of these is a **gate**: it exits 3 and the load does not run.
@@ -728,7 +806,7 @@ Every one of these is a **gate**: it exits 3 and the load does not run.
 | `database_collation` | The database is binary-collated (§A.3). |
 | `max_allowed_packet` | The largest captured output fits in one packet, with margin for the hex form on the wire. |
 | `local_infile` | The bulk load path is available. |
-| `grants` | The account can create, insert and drop — i.e. §A.4's GRANT was actually applied to the account the option file names. |
+| `grants` | The account can create, insert and drop — i.e. you are `testboard_migrate` and not `testboard_app`. |
 | `collation_probe` | **The important one.** Stores `'a'`, `'A'` and `'a '` in a primary key and counts them. Three means case-sensitive and no-pad. Fewer — or a duplicate-key error — means loading now would merge distinct tests, permanently. |
 | `strict_probe` | Inserts a 7-character value into `VARCHAR(4)`. **It must fail.** A probe that passed by succeeding could not tell strict mode from a statement that never ran. |
 | `target_is_empty` | You are not loading on top of an earlier attempt. `--force` overrides, for scratch databases. |
@@ -790,7 +868,7 @@ held to "not yet", so the driver's revert story is unchanged.
 python3 tools/migrate_to_mariadb.py all \
     --db     /path/to/testboard.db \
     --out    /var/tmp/testboard-export \
-    --config /etc/testboard/db.cnf
+    --config ~/.testboard-migrate.cnf
 ```
 
 That is: audit → preflight → export → schema → load → verify, **stopping at the
@@ -823,14 +901,19 @@ python3 tools/export_for_mariadb.py \
     --env-len 64 --script-len 255 --test-len 255
 
 # 2. schema, then data — from inside the export directory, because
-#    load.sql names its .tsv files relatively
+#    load.sql names its .tsv files relatively. ($HOME, not ~: tilde
+#    after = only expands in bash, and silently not in plain sh.)
 cd /var/tmp/testboard-export
-mysql --defaults-file=/etc/testboard/db.cnf < schema.sql
-mysql --defaults-file=/etc/testboard/db.cnf --local-infile=1 < load.sql
+mysql --defaults-file=$HOME/.testboard-migrate.cnf < schema.sql
+mysql --defaults-file=$HOME/.testboard-migrate.cnf --local-infile=1 < load.sql
 
-# 3. verify: compare this output against verify_source.txt
-mysql --defaults-file=/etc/testboard/db.cnf --batch --raw \
-      --skip-column-names < verify.sql
+# 3. verify: a bare diff will NOT be clean — verify_source.txt carries a
+#    comment header and blank section separators; strip both sides:
+mysql --defaults-file=$HOME/.testboard-migrate.cnf --batch --raw \
+      --skip-column-names < verify.sql > /var/tmp/verify_mariadb.txt
+diff <(grep -v '^#' verify_source.txt | sed '/^$/d') \
+     <(sed '/^$/d' /var/tmp/verify_mariadb.txt)
+# empty output = agreement
 ```
 
 Take the `--env-len` etc. from §C.1 and round up generously — re-running the
@@ -856,20 +939,23 @@ load. Do not reorder that.
 
 Copy the production SQLite file to local disk and run §D against it, into a
 scratch database (`testboard_dryrun`). Root creates it exactly as §A.3
-created the real one — **same collation** — and repeats §A.4's GRANT
-`ON testboard_dryrun.*` for the same account. The dry run needs its own copy
-of the credentials file: `install -m 600 /etc/testboard/db.cnf
+created the real one — **same collation** — and repeats §A.4's
+`testboard_migrate` GRANT `ON testboard_dryrun.*`. The dry run needs its
+own copy of the credentials file: `install -m 600 ~/.testboard-migrate.cnf
 ~/dryrun.cnf`, then edit `database = testboard_dryrun` and pass
-`--config ~/dryrun.cnf`. A scratch database created casually, without the
-collation, fails the preflight — that is the probe doing its job, not a
-fault in the rehearsal. **Do not
+`--config ~/dryrun.cnf`. **Use a separate output directory too** —
+`--out /var/tmp/testboard-dryrun-export` — because the exporter refuses to
+write into a non-empty directory, and reusing the real path would stop the
+cutover run at its export phase, inside the freeze window. A scratch
+database created casually, without the collation, fails the preflight —
+that is the probe doing its job, not a fault in the rehearsal. **Do not
 estimate the downtime window; measure it here** — the `all` command prints
 per-phase timings for exactly this reason. Then check §E.4's verification
 passed. Only then schedule the real cutover.
 
 A ~950 MB database is not a thing you can rehearse on a laptop: the export is
-~2.4 GB of text and the load is tens of minutes at best. Run the dry run on the
-real hardware, over the real network path.
+~2.4 GB of text and the load is tens of minutes at best. Run the dry run on
+the real hardware.
 
 Keep the dry-run database until the real one is verified — it is a free second
 opinion if a count disagrees.
@@ -883,12 +969,14 @@ Yours to do, not the script's: these are decisions about when users lose writes.
 2. Tell the team the dashboard is read-only for the window. Comments and
    assignments made during it will be lost — this is the one irreversible part,
    so keep the window short and do it outside working hours.
-3. Note the high-water mark: `python3 run_feeder.py --config <cfg> --status`.
-   You will need it in §E.5.
+3. Note the high-water mark: `python3 run_feeder.py --config <cfg> --status`
+   — so that in §E.5 you can confirm the catch-up actually reached past it.
 
 ### E.3 Load
 
-Run §D.2 against the live file. Note the finish time.
+Run §D.2 against the live file. Note the finish time — it is the start of
+the window in which MariaDB is authoritative but unverified, and belongs in
+whatever log you keep of the night.
 
 ### E.4 Verify — before letting anyone in
 
@@ -897,7 +985,7 @@ by hand:
 
 ```bash
 python3 tools/migrate_to_mariadb.py verify \
-    --config /etc/testboard/db.cnf \
+    --config ~/.testboard-migrate.cnf \
     --out /var/tmp/testboard-export
 ```
 
@@ -942,14 +1030,37 @@ These are agreement checks, not cryptographic proof — but a mismatch in any on
 of them means stop, and matching all of them means the shapes agree at every
 level you can cheaply examine.
 
-Then, by hand: open the dashboard, load a test detail page, read a run's output
-(the one endpoint that reads a blob), post a comment, make an assignment.
+**Now switch the service — this is the actual cutover, and it needs root**
+(the one post-§A root moment; §A.11 warned it was coming). Only after every
+check above agrees:
+
+```bash
+# 1. edit /etc/systemd/system/testboard.service: swap ExecStart to the
+#    --db-config form (both lines are already in the unit — §A.10)
+# 2. if site_notes.json lived beside the old --db file, move it:
+#    mv /path/beside/old-db/site_notes.json /var/lib/testboard/
+systemctl daemon-reload
+systemctl restart testboard
+```
+
+Then, by hand, against the restarted dashboard: open it, load a test detail
+page, read a run's output (the one endpoint that reads a blob), post a
+comment, make an assignment. If any of that fails, the rollback (§E.6) is
+still clean: swap `ExecStart` back and restart — nothing human has been
+written to MariaDB yet.
 
 ### E.5 Restart the feeder
 
-Point it at the dashboard and run a catch-up. The high-water mark is in the
-feeder's own state file on the feeder host, not in the database, so it survives
-this migration untouched — the catch-up covers the freeze window automatically.
+**Only after §E.4's service switch** — a feeder restarted before it would
+push the freeze window's backlog into the SQLite file the dashboard no
+longer reads, and that data would be silently lost to MariaDB.
+
+Re-enable the cron entry, or run one cycle by hand
+(`python3 run_feeder.py --config <cfg>`; exit 0 means all valid records
+were accepted), then `--status` again and confirm the high-water mark moved
+past the one you noted in §E.2. The mark lives in the feeder's own state
+file on the feeder host, not in the database, so it survives the migration
+untouched — the catch-up covers the freeze window automatically.
 
 ### E.6 Rollback
 
@@ -963,8 +1074,9 @@ So: verify (§E.4) *before* announcing that the dashboard is back. That ordering
 is the whole rollback plan.
 
 Keep the SQLite file, and a copy of the export directory, for at least a
-month. The credentials file stays — it is the app's (§A.9); delete only the
-dry run's `~/dryrun.cnf` copy (§E.1) if you made one.
+month. Delete `~/.testboard-migrate.cnf` (§A.9) — and the `~/dryrun.cnf`
+copy, if you made one — once you are sure you are done: that account can
+drop every table. The app's `/etc/testboard/db.cnf` stays, of course.
 
 ---
 
@@ -1063,7 +1175,7 @@ a perf pin) are skipped there, each with its reason recorded in
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Access denied for user 'testboard'@'...'` | The grant names a different host from the one MariaDB sees you coming from | §A.1/§A.9 — `localhost` (socket) and the machine's own IP (TCP) are different accounts; the cnf's `socket =` line is what keeps everyone on the socket |
+| `Access denied for user 'testboard_migrate'@'...'` (or `testboard_app`) | The grant names a different host from the one MariaDB sees you coming from | §A.1/§A.9 — `localhost` (socket) and the machine's own IP (TCP) are different accounts; the cnf's `socket =` line is what keeps everyone on the socket |
 | `the vendored MySQL driver is missing` | `third_party/pymysql` is absent — an incomplete checkout, not a missing install | Restore the directory from the repository. Nothing needs installing; see `third_party/README.md` |
 | `Specified key was too long; max key length is 3072 bytes` | `VARCHAR(n)` too large for an indexed column | §B.1 — the tool sizes these from the audit; if you passed them by hand, don't |
 | `Duplicate entry '...' for key 'PRIMARY'` during load | Case-insensitive or PAD-SPACE collation merging distinct rows | §A.3 and §C.2. Drop the database and reload; do not "fix" the duplicates |
@@ -1072,7 +1184,7 @@ a perf pin) are skipped there, each with its reason recorded in
 | `MySQL server has gone away` mid-load | A row exceeded `max_allowed_packet` | §A.5, raise it; the culprit is a large `run_outputs` blob |
 | `The used command is not allowed with this MariaDB version` | `LOAD DATA LOCAL INFILE` disabled | Enable `local_infile` on both sides (§A.5, and `local-infile = 1` in the option file) |
 | `Cannot add or update a child row: a foreign key constraint fails` | Foreign key constraints were added by hand — the generated schema declares none (§B.6) | Load into the generated schema as-is; adopt constraints, if wanted, as separate later work |
-| A load failed partway and the next run says the target is not empty | The wreckage of the first attempt | Drop the tables (the account holds `DROP` on this database, so it can — dropping the *database* itself needs root), then run the `load` step again. Do not load on top |
+| A load failed partway and the next run says the target is not empty | The wreckage of the first attempt | Drop the tables (`testboard_migrate` holds `DROP` on this database, so it can — dropping the *database* itself needs root), then run the `load` step again. Do not load on top |
 | `File 'runs.tsv' not found` | The client was run from outside the export directory | §D.3 — `cd` into it first; the tool does this for you |
 | Blob comparison fails in §E.4 | Hex round-trip; usually a missing `UNHEX()` or a client charset mangling the hex text | Re-check `load.sql`; blobs must never pass through a character-set conversion |
 | Dashboard works, is slow, buffer pool is large | Pool not warm yet, or not actually applied | `SHOW ENGINE INNODB STATUS`; confirm `@@innodb_buffer_pool_size` is what §A.5 set — and that MariaDB was **restarted** after the config change |

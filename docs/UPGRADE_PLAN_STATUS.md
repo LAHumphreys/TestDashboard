@@ -1533,3 +1533,43 @@ WORLD-readable only — the canonical file is group-readable BY DESIGN and a
 warning that fires on the documented-correct state is one nobody reads.
 
 Suite after: 1385 OK (skipped=1).
+
+## Two DB accounts restored; the runbook survives a fresh-eyes review (2026-08-07, late)
+
+The single-account simplification lasted a few hours: the operator had read
+"two accounts" as two LINUX users. There is one Linux user and there are
+two MariaDB accounts; §A.4 is back to the app/migrate split (both grants
+@'localhost' — the same-box, socket-only simplification stays) and now
+counts the accounts out loud in the preamble so the words cannot collide
+again. Tool advice strings and the pinned grant-probe assertion restored
+with it.
+
+Then a fresh-context agent read the whole runbook as its actual audience
+will — a 20-year Linux dev, not a DBA, following it exactly once — and
+found what familiarity had hidden. Two blockers, both real:
+
+- **§E never said to switch the dashboard to MariaDB.** The flip existed
+  only as a comment in §A.10's unit file. An operator could execute
+  §C-§E perfectly, verify against a still-SQLite dashboard, restart the
+  feeder into the wrong backend, and end the night having migrated
+  nothing. §E.4 now carries the service switch as an explicit step, and
+  §E.5 refuses to restart the feeder before it.
+- **The app credential was never exercised before cutover night** — a typo
+  in /etc/testboard/db.cnf surfaced only at the E.4 restart. §A.11 now
+  authenticates it as part of hand-over (the preflight failing its grants
+  check with "cannot create tables" doubles as proof the data-only account
+  is data-only).
+
+Plus eleven CONFUSING and nine NIT fixes, all applied: who runs §A.9 (the
+~ lands in /root otherwise), a separate dry-run export directory (the
+exporter refuses non-empty, and finding out mid-freeze is the wrong time),
+the C.2/C.3/C.4 numbering map, which audit figure feeds --max-blob-bytes,
+the mysql-prompt note before the first bare SQL block, the sha256 fallback
+covering both accounts, buffer-pool and unit-file placeholders marked as
+placeholders, /var/lib/mysql disk budgeted, a workable verify diff recipe,
+$HOME over tilde-after-equals, the placeholder-password trap, prompt-marker
+paste warning, and the E.2 high-water-mark note now has a purpose (E.5
+confirms the catch-up passed it).
+
+Suite: 1385 OK (skipped=1) — the account-restore touched three tool advice
+strings and one pinned assertion; the review fixes are doc-only.
