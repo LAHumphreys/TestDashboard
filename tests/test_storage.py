@@ -75,12 +75,17 @@ def make_record(
 class StorageTestBase(unittest.TestCase):
     """Creates a Storage on a temp-file database with safe cleanup."""
 
+    def _make_storage(self) -> Storage:
+        """The backend under test. tests/test_mariadb_backend.py
+        overrides this to run the same tests against MariaDB."""
+        return Storage(self.db_path)
+
     def setUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp(prefix="testboard_storage_")
         # LIFO cleanup: connections are closed before the dir is removed.
         self.addCleanup(shutil.rmtree, self.tmpdir, True)
         self.db_path = os.path.join(self.tmpdir, "test.db")
-        self.store = Storage(self.db_path)
+        self.store = self._make_storage()
         self.addCleanup(self.store.close)
 
 
@@ -1306,14 +1311,15 @@ class TestPreviousResult(StorageTestBase):
     """latest_runs.prev_result, the pair every triage queue is built on."""
 
     def prev_result(self) -> Optional[str]:
-        """Read prev_result straight out of the table, bypassing the API."""
-        conn = sqlite3.connect(self.db_path)
-        try:
-            return conn.execute(
-                "SELECT prev_result FROM latest_runs"
-            ).fetchone()[0]
-        finally:
-            conn.close()
+        """Read prev_result straight out of the table, bypassing the API.
+
+        Through the store's own connection so the same read works on
+        either backend; "bypassing the API" means raw SQL, not a raw
+        file handle.
+        """
+        return self.store._conn().execute(
+            "SELECT prev_result FROM latest_runs"
+        ).fetchone()[0]
 
     def test_start_time_index_created(self) -> None:
         """Migrations add the covering (start_time, result) trend index."""
@@ -1425,15 +1431,11 @@ class TestLatestRunsMaintenance(StorageTestBase):
     """latest_runs stays in lockstep with upserts, including backfills."""
 
     def latest_pointer(self) -> Optional[tuple]:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            return conn.execute(
-                "SELECT run_id, start_time FROM latest_runs WHERE "
-                "environment = 'linux-sim' AND script = 'suite.py' "
-                "AND test_name = 'test_a'"
-            ).fetchone()
-        finally:
-            conn.close()
+        return self.store._conn().execute(
+            "SELECT run_id, start_time FROM latest_runs WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a'"
+        ).fetchone()
 
     def test_insert_creates_pointer(self) -> None:
         self.store.upsert_runs([make_record()])
@@ -2079,30 +2081,22 @@ class TestRunOutputs(StorageTestBase):
         self.store.upsert_runs([make_record(output="corrected\n")])
         run_id = self.store.dashboard()[0].run_id
         self.assertEqual(self.store.get_run(run_id).output, "corrected\n")
-        conn = sqlite3.connect(self.db_path)
-        try:
-            self.assertEqual(
-                conn.execute(
-                    "SELECT COUNT(*) FROM run_outputs"
-                ).fetchone()[0],
-                1,
-            )
-        finally:
-            conn.close()
+        self.assertEqual(
+            self.store._conn().execute(
+                "SELECT COUNT(*) FROM run_outputs"
+            ).fetchone()[0],
+            1,
+        )
 
     def test_output_is_stored_compressed(self) -> None:
         """Log text is ~75% of the database at scale, so it is deflated."""
         text = "2026-07-26 02:14:33 INFO harness: step done\n" * 400
         self.store.upsert_runs([make_record(output=text)])
         run_id = self.store.dashboard()[0].run_id
-        conn = sqlite3.connect(self.db_path)
-        try:
-            stored = conn.execute(
-                "SELECT output FROM run_outputs WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()[0]
-        finally:
-            conn.close()
+        stored = self.store._conn().execute(
+            "SELECT output FROM run_outputs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
         self.assertIsInstance(stored, bytes)
         self.assertLess(len(stored), len(text.encode("utf-8")) // 4)
         # ...and it comes back byte-for-byte.
@@ -2123,15 +2117,12 @@ class TestRunOutputs(StorageTestBase):
         """A row written before output was compressed must still read."""
         self.store.upsert_runs([make_record()])
         run_id = self.store.dashboard()[0].run_id
-        conn = sqlite3.connect(self.db_path)
-        try:
-            conn.execute(
-                "UPDATE run_outputs SET output = ? WHERE run_id = ?",
-                ("legacy uncompressed text\n", run_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        # The store's connection is in autocommit outside transactions
+        # on both backends, so no commit is needed.
+        self.store._conn().execute(
+            "UPDATE run_outputs SET output = ? WHERE run_id = ?",
+            ("legacy uncompressed text\n", run_id),
+        )
         self.assertEqual(
             self.store.get_run(run_id).output,
             "legacy uncompressed text\n",
@@ -2163,15 +2154,12 @@ class TestPruneRuns(StorageTestBase):
         )
         self.assertEqual(len(remaining), 5)
         self.assertTrue(all(r.start_time >= cutoff for r in remaining))
-        conn = sqlite3.connect(self.db_path)
-        try:
-            outputs = conn.execute(
-                "SELECT COUNT(*) FROM run_outputs"
-            ).fetchone()[0]
-            runs = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
-            self.assertEqual(outputs, runs)
-        finally:
-            conn.close()
+        conn = self.store._conn()
+        outputs = conn.execute(
+            "SELECT COUNT(*) FROM run_outputs"
+        ).fetchone()[0]
+        runs = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        self.assertEqual(outputs, runs)
 
     def test_never_deletes_a_tests_latest_run(self) -> None:
         """A test that stopped running must still show as "not run"."""
@@ -2191,15 +2179,11 @@ class TestPruneRuns(StorageTestBase):
             ),
         ])
         self.store.prune_runs_before(BASE + datetime.timedelta(days=1))
-        conn = sqlite3.connect(self.db_path)
-        try:
-            self.assertIsNone(
-                conn.execute(
-                    "SELECT prev_result FROM latest_runs"
-                ).fetchone()[0]
-            )
-        finally:
-            conn.close()
+        self.assertIsNone(
+            self.store._conn().execute(
+                "SELECT prev_result FROM latest_runs"
+            ).fetchone()[0]
+        )
         # The test is now a first-ever failure rather than a regression.
         self.assertEqual(
             self.store.status_queue_count("still_failing"), 0
@@ -2879,6 +2863,9 @@ class ActivityHoursTest(StorageTestBase):
     """
 
     def _invariant_diff(self) -> int:
+        # The AS t alias: SQLite tolerates an anonymous derived table,
+        # MariaDB requires the alias — same reason the exporter's
+        # distinct_tests verify query carries one (runbook §E.4).
         conn = self.store._conn()
         forward = conn.execute(
             "SELECT COUNT(*) FROM ("
@@ -2886,14 +2873,14 @@ class ActivityHoursTest(StorageTestBase):
             "         COUNT(*) FROM runs GROUP BY 1, 2, 3"
             "  EXCEPT"
             "  SELECT environment, hour, result, count FROM activity_hours"
-            ")").fetchone()[0]
+            ") AS t").fetchone()[0]
         backward = conn.execute(
             "SELECT COUNT(*) FROM ("
             "  SELECT environment, hour, result, count FROM activity_hours"
             "  EXCEPT"
             "  SELECT environment, SUBSTR(start_time, 1, 13), result, "
             "         COUNT(*) FROM runs GROUP BY 1, 2, 3"
-            ")").fetchone()[0]
+            ") AS t").fetchone()[0]
         return int(forward) + int(backward)
 
     def test_live_maintenance_matches_a_rebuild(self) -> None:
@@ -2993,13 +2980,14 @@ class ScriptHoursTest(StorageTestBase):
     )
 
     def _invariant_diff(self) -> int:
+        # AS t: MariaDB requires derived-table aliases; SQLite accepts.
         conn = self.store._conn()
         forward = conn.execute(
-            "SELECT COUNT(*) FROM ({0} EXCEPT {1})".format(
+            "SELECT COUNT(*) FROM ({0} EXCEPT {1}) AS t".format(
                 self._GROUP_BY, self._TABLE)
         ).fetchone()[0]
         backward = conn.execute(
-            "SELECT COUNT(*) FROM ({0} EXCEPT {1})".format(
+            "SELECT COUNT(*) FROM ({0} EXCEPT {1}) AS t".format(
                 self._TABLE, self._GROUP_BY)
         ).fetchone()[0]
         return int(forward) + int(backward)

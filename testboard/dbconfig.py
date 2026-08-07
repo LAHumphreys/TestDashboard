@@ -75,7 +75,11 @@ def read_option_file(path: str) -> Settings:
 
     values = {}  # type: Dict[str, str]
     section = ""
-    with io.open(expanded, encoding="utf-8") as handle:
+    # utf-8-sig, not utf-8: an option file written by a Windows editor
+    # (or PowerShell's Out-File) starts with a BOM, which would glue
+    # itself to "[client]" and silently skip every key in the file.
+    # For BOM-less files the two codecs read identically.
+    with io.open(expanded, encoding="utf-8-sig") as handle:
         for raw in handle:
             line = raw.strip()
             if not line or line[0] in "#;!":

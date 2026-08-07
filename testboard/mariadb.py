@@ -84,6 +84,43 @@ def _driver() -> Any:
     return pymysql
 
 
+class _Cursor(object):
+    """The driver's cursor, with sqlite3's return-type conventions.
+
+    One real difference is papered over here on purpose:
+    ``fetchall``/``fetchmany`` return a LIST as sqlite3's do, where
+    PyMySQL returns a tuple. Callers (including tests) compare results
+    against list literals, and "equal rows in the wrong container" is
+    not a difference worth exporting.
+    """
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+
+    def fetchone(self) -> Any:
+        return self._raw.fetchone()
+
+    def fetchall(self) -> Any:
+        return list(self._raw.fetchall())
+
+    def fetchmany(self, size: int = 1) -> Any:
+        return list(self._raw.fetchmany(size))
+
+    def close(self) -> None:
+        self._raw.close()
+
+    def __iter__(self) -> Any:
+        return iter(self._raw)
+
+    @property
+    def rowcount(self) -> int:
+        return self._raw.rowcount
+
+    @property
+    def lastrowid(self) -> Any:
+        return self._raw.lastrowid
+
+
 class _Connection(object):
     """One thread's connection: rewrite, translate, ping, delegate.
 
@@ -116,7 +153,7 @@ class _Connection(object):
 
         cursor = self._raw.cursor()
         cursor.execute(self._backend.translate(sql), tuple(params))
-        return cursor
+        return _Cursor(cursor)
 
     def executemany(self, sql: str, seq_of_params: Any) -> Any:
         """Run one statement per parameter tuple, returning the cursor."""
@@ -125,7 +162,7 @@ class _Connection(object):
         cursor.executemany(
             self._backend.translate(sql),
             [tuple(params) for params in seq_of_params])
-        return cursor
+        return _Cursor(cursor)
 
     def close(self) -> None:
         self._raw.close()
