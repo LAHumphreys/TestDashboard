@@ -1434,3 +1434,57 @@ for. There is no MariaDB in this environment or CI; the fake-server tests
 prove the tool's decisions, not the SQL. The dry run on the real hardware
 is the other half of the evidence, and it also produces the only honest
 downtime estimate.
+
+## WP-19 — the dashboard learns MariaDB (2026-08-07)
+
+§F of the runbook, built in one day as six commits, each leaving the suite
+green, folded into the 2026-08-04 drop and the whole re-dated 2026-08-07.
+No migration version consumed. The user's requirement, set before the first
+line: **SQLite stays a permanent first-class backend** — quick zero-setup
+start-up for a second instance — and MariaDB is opt-in per instance.
+
+**The measurements:**
+
+- Suite locally: 1333 → **1385 OK** (skipped=1) across the six commits; with
+  the MariaDB variants active, **1749 OK**.
+- CI: all four legs green on the first push of the new job —
+  `python36-mariadb` (ubi8 python-36 + `mariadb:10.3` service, prod's
+  stream) ran **1749 tests, OK (skipped=16)**: the 5 baseline ubi8 skips
+  plus exactly the 11 reasoned MariaDB exclusions. The port is proven on
+  prod's interpreter against prod's database version.
+- Local dev server (MariaDB 12.3.2 via winget, x86_64 under emulation,
+  functional evidence ONLY): the 364 generated dual-backend tests pass in
+  ~40 s. No performance number was taken from it and none ever will be.
+
+**Shape (details in the runbook §F.2 and the WP-19 plan section):** one
+Storage, two backend objects; qmark-canonical SQL forever with execute-time
+translation (three rewrites, two composed fragments, every one pinned);
+FOUND_ROWS/binary_prefix/strict-assertion/lock-timeout at connect;
+ping-on-borrow reconnect, never inside a transaction, never retrying a
+statement; no DDL on MariaDB ever — schema_version equality or refusal.
+
+**What the first real server contact caught** (each now pinned by a test):
+derived tables under EXCEPT need aliases; PyMySQL fetchall returns a tuple
+where sqlite3 returns a list (cursor proxy keeps sqlite3's convention); a
+BOM from a Windows editor silently emptied an option file (utf-8-sig);
+seven test helpers had sqlite3.connect plumbing where store._conn() was the
+backend-agnostic intent; eleven tests are ABOUT SQLite and skip on MariaDB
+with reasons (tests/test_mariadb_backend.py::EXCLUDED_TESTS).
+
+**Guard evolution, per the guard's own instruction:** NotYetWiredTest said
+to delete it the day storage imported the driver; it became
+DriverImportAllowlistTest instead — the rule narrowed rather than died, and
+the driver's serving-path blast radius is exactly testboard/mariadb.py.
+
+**Corrections made while documenting:** the runbook said 8 PRAGMAs (5), 59
+execute sites (135 + 1 executemany), and — twice, including in the
+2026-08-07 morning revision — that testboard does not set
+`PRAGMA foreign_keys=ON`. storage.py:~1323 sets it on every connection;
+§B.6 now records the correction rather than papering over it, and the no-FK
+MariaDB schema stays right for the reasons stated there.
+
+**Not verified, and where it is written down:** the drop note's
+NOT-verified list (docs/drops/2026-08-07.md) — no MariaDB has served this
+app outside CI's container and the local emulated install; the RHEL 8
+host's 10.3.39, socket auth, SELinux and the unit file wait for the §E.1
+dry run; MariaDB performance is unmeasured everywhere.

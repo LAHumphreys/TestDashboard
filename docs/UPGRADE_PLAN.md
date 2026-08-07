@@ -110,7 +110,10 @@ time: WP-18 (Timeline) shipped while `wp-14-in-run-progress` was still
 parked, so the ship-first package took the next contiguous number and the
 parked claim moved back one. This is now the established pattern — a parked
 claim is a RESERVATION, not a number: whatever ships next takes the lowest
-unshipped version, and the reservation follows it up. **When the WIP branch
+unshipped version, and the reservation follows it up. WP-19 (the MariaDB
+backend, 2026-08-07) deliberately consumed **no** version: the SQLite schema
+is untouched, and the MariaDB schema is only ever created by the migration
+tooling, never by the app. **When the WIP branch
 comes back it must renumber its migration entry to 8 before merging** — the
 registry is the coordination point, and this note is the hand-off.
 
@@ -1021,6 +1024,37 @@ What was decided, because it constrains later work:
   exact edge would drop whatever ran in the block's final hour.
 - The block picker and every caption are worded from actual timestamps,
   never "last night" — `WindowWordingTest` now scans `timeline.js` too.
+
+### WP-19 — the MariaDB backend (§F of the runbook) *(no migration)*
+
+Built 2026-08-07, folded into the same drop as WP-18; measurements and the
+build story in `UPGRADE_PLAN_STATUS.md` (2026-08-07 entries). Consumes **no
+migration version** — the SQLite schema is untouched and the MariaDB schema
+only ever comes from the migration tooling.
+
+What was decided, because it constrains later work:
+
+- **One `Storage`, two backend objects** (`_SqliteBackend` in `storage.py`,
+  `MariaDBBackend` in `testboard/mariadb.py`, reached only via
+  `Storage.mariadb()`); the SQL stays qmark-canonical **permanently** and
+  the MariaDB wrapper translates at execute time. The whole dialect surface
+  is three rewrites + two composed fragments; each is pinned by a unit test
+  and enumerated in the runbook's §F.2.
+- **SQLite is a permanent first-class backend**, the zero-setup default —
+  never to be described as legacy. `run_server.py --db` is unchanged;
+  `--db-config` (mysql option file, §A.10) selects MariaDB and *requires*
+  `--site-notes`; wrong flag combinations are refused with reasons.
+- **The app never runs DDL on MariaDB** — `schema_version` equality is
+  verified and both mismatch directions refuse.
+- **CI runs both backends on every push**: the `python36-mariadb` job (ubi8
+  python-36 + `mariadb:10.3`, prod's stream) activates generated
+  dual-backend suites via `TESTBOARD_TEST_DB_CNF`; the test schema is built
+  from the exporter's own DDL. SQLite-only instruments (PRAGMA, trace
+  callbacks, one perf pin) are skipped there with reasons recorded in
+  `tests/test_mariadb_backend.py`.
+- The vendored-driver guard evolved as its docstring instructed:
+  `NotYetWiredTest` → `DriverImportAllowlistTest`; the driver's
+  serving-path blast radius is exactly `testboard/mariadb.py`.
 
 Three lanes. WP-0 lands before anything that touches `MIGRATIONS`.
 
