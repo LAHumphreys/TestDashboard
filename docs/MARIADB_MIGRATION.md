@@ -1,15 +1,20 @@
 # Migrating testboard from SQLite to MariaDB
 
-**Audience.** Two people, doing different jobs:
+**Assumptions, simplified 2026-08-07.** The general two-host, two-account
+version of this runbook lives in git history if it is ever needed again.
+As of this revision: **the dashboard and MariaDB run on the same host**,
+everything connects over the **unix socket**, and there is **one database
+account** — used by the migration and by the running app alike. The
+dedicated app/migrate account pair was judged overkill for a
+single-operator, single-box install; §A.4 records what that trades away
+and how to restore it later.
 
-- **The administrator** — whoever has `root` on the RHEL 8 boxes and the MariaDB
-  root password. They run §A once, from a script you hand them. They need no
-  knowledge of testboard, and §A is written so it can be executed top to bottom
-  by someone who has never seen this project.
-- **You, the operator.** You run §C to §E with an unprivileged account, and
-  almost all of it is one command: `tools/migrate_to_mariadb.py`.
+**Audience.** Two hats, quite possibly one head:
 
-Nothing here requires you to have, or to give anyone else, the root password.
+- **The administrator** — root on the box and the MariaDB root password.
+  Runs §A once, top to bottom.
+- **The operator** — runs §C to §E, and almost all of it is one command:
+  `tools/migrate_to_mariadb.py`.
 
 ---
 
@@ -53,7 +58,7 @@ Everything below assumes the decision is made either way.
 | Requirement | Why |
 |---|---|
 | **MariaDB 10.2 or newer**; 10.6+ preferred | 10.2 is the correctness floor: below it there is no `NO PAD` collation and §B.3 applies. Whether you can get 10.6 on RHEL 8 depends on the module streams that host offers — §A.2 decides it with a command rather than from memory. |
-| Network route from the web server to the DB host, port 3306 | The app connects over the network now. Not needed if both live on one box. |
+| Nothing network | Same box: the tools and the app connect over the unix socket. No port to open, no firewall, no route. |
 | **Nothing installed on the web server** | §C–§E connect through the driver vendored in `third_party/pymysql`, which ships with the checkout. No client package, no pip, no build step — that property is the whole point, and the migration is not allowed to be the thing that breaks it. |
 | *(optional)* `mysql` command-line client | Only for the by-hand fallback in §D.3, or for poking at the server yourself. `dnf install mariadb` — §A.7. |
 | Python 3.6 on the web server | The platform Python on RHEL 8. The migration tool is stdlib-only, like everything else here. |
@@ -68,13 +73,15 @@ Hand them this section. It is self-contained. Nothing outside it needs `root`
 or the MariaDB root password, and nothing in it needs any knowledge of
 testboard.
 
-It covers two machines. They may be the same box:
+One machine, one pass, top to bottom:
 
-- **A.1 – A.6** on the **database host**: install MariaDB, create the database
-  and two accounts, set the server options.
-- **A.7 – A.10** on the **web server**: the service account and group, the
-  directories, and the credentials files. Nothing gets installed here.
-- **A.11** is the hand-over checklist.
+- **A.2 – A.5**: install MariaDB, create the database and the account, set
+  the server options.
+- **A.7 – A.10**: the service account and group, the directories, and the
+  one credentials file.
+- **A.11** is the hand-over checklist. (A.1 states the one-box assumption
+  and its one trap; A.6 is retired — numbering is kept stable so every
+  cross-reference in the tools and tests stays true.)
 
 Commands are `#`-prefixed where they need root. Everything is scoped to one
 database and one service account; nothing here grants a global privilege.
@@ -85,26 +92,23 @@ database and one service account; nothing here grants a global privilege.
 > **§A.3 (server settings) → §A.5**. The header comment in a generated
 > `schema.sql` is one such pointer.
 
-### A.1 Decide where the database lives
+### A.1 One box — and the localhost trap
 
-| | Same host as the dashboard | Separate database host |
-|---|---|---|
-| Grants use | `'testboard_app'@'localhost'` | `'testboard_app'@'<web server>'` |
-| Connection | Unix socket or 127.0.0.1 | TCP, port 3306 |
-| firewalld | nothing to open | §A.6 |
-| Buys you | simplicity | the operational case in "Before you start" |
+Everything runs on this host; the account is granted `@'localhost'` and every
+connection uses the **unix socket**. The trap worth knowing anyway, because
+it is the single most common source of "access denied": MariaDB matches an
+account against the host it sees the connection *coming from*, and
+`'user'@'localhost'` (which means the Unix socket) is a completely different
+account from `'user'@'127.0.0.1'` (which means TCP to the same machine).
+That is why the credentials file (§A.9) carries an explicit `socket =` line
+— the vendored driver, unlike the `mysql` client, does not treat
+`host = localhost` as "use the socket".
 
-**This choice is the single most common source of "access denied" later.**
-MariaDB matches an account against the host it sees the connection *coming
-from*, and `'user'@'localhost'` (which means the Unix socket) is a completely
-different account from `'user'@'127.0.0.1'` (which means TCP to the same
-machine). Decide now, and use the same answer in §A.4 (the grants) and §A.9/§A.10
-(the credentials files).
+(If the database ever moves to its own host: git history holds this
+runbook's two-host revision — grants per source host, firewalld, bind
+address, the lot.)
 
-Write down the answer: `DBHOST` (where MariaDB runs) and `WEBHOST` (where the
-dashboard runs, as MariaDB will see it — a resolvable hostname or an IP).
-
-### A.2 Install MariaDB — on DBHOST
+### A.2 Install MariaDB
 
 RHEL 8 ships MariaDB as an AppStream *module*, and which versions are offered
 depends on the minor release. **Ask the box rather than trusting a version
@@ -156,7 +160,7 @@ Confirm the version you actually got — this is the number §0 cares about:
 If that prints anything below **10.2**, stop and read §B.3 before going on: the
 collation guidance changes and the migration becomes materially riskier.
 
-### A.3 Create the database — on DBHOST
+### A.3 Create the database
 
 ```sql
 CREATE DATABASE testboard
@@ -178,44 +182,47 @@ If `utf8mb4_nopad_bin` is rejected as unknown, the server is older than 10.2.
 See §B.3 — it has a workable but lossier fallback, and it must be an informed
 choice, not a substitution made at the prompt.
 
-### A.4 Create two accounts, not one — on DBHOST
+### A.4 Create the account — one, deliberately
 
-Replace `WEBHOST` with the answer from §A.1 (use `localhost` if the dashboard
-runs on this same machine), and choose two distinct strong passwords.
+One account, one strong password. It runs the migration AND the app:
 
 ```sql
--- The application. Data only: it can never alter the schema.
-CREATE USER 'testboard_app'@'WEBHOST' IDENTIFIED BY 'APP_PASSWORD_HERE';
-GRANT SELECT, INSERT, UPDATE, DELETE
-  ON testboard.* TO 'testboard_app'@'WEBHOST';
-
--- Migrations and the initial load. Used by a human, on purpose, never by the
--- running service.
-CREATE USER 'testboard_migrate'@'WEBHOST' IDENTIFIED BY 'MIGRATE_PASSWORD_HERE';
+CREATE USER 'testboard'@'localhost' IDENTIFIED BY 'PASSWORD_HERE';
 GRANT SELECT, INSERT, UPDATE, DELETE,
       CREATE, ALTER, INDEX, DROP, REFERENCES,
       CREATE TEMPORARY TABLES, LOCK TABLES
-  ON testboard.* TO 'testboard_migrate'@'WEBHOST';
+  ON testboard.* TO 'testboard'@'localhost';
 
 FLUSH PRIVILEGES;
 ```
 
-Why two: the running dashboard has no business being able to `DROP TABLE`. It
-also means a schema change is a deliberate act by a person with a different
-credential, which is what you want once the schema is locked.
+**What this trades away, on the record** (decided 2026-08-07): the earlier
+two-account design meant the *serving* app could never `DROP TABLE` — schema
+changes needed a different credential. With one account the app connection
+holds DDL rights it never uses: the dashboard runs no DDL on MariaDB by
+design (the backend refuses to, and `DriverImportAllowlistTest` plus the
+schema-version check stand behind that), every query is parameterized, and
+this is a single-operator install on one box. Judged acceptable. To restore
+the split later, create a data-only app account and swap the credentials
+file — two GRANT statements and a file edit, no code:
 
-**Both accounts must use `mysql_native_password`.** That is MariaDB's default,
+```sql
+CREATE USER 'testboard_app'@'localhost' IDENTIFIED BY '...';
+GRANT SELECT, INSERT, UPDATE, DELETE ON testboard.* TO 'testboard_app'@'localhost';
+```
+
+**The account must use `mysql_native_password`.** That is MariaDB's default,
 so on a stock server the plain `IDENTIFIED BY` above already does it. If this
 server has been configured to default to a sha256-based plugin, say so
 explicitly:
 
 ```sql
-CREATE USER 'testboard_app'@'WEBHOST'
-  IDENTIFIED VIA mysql_native_password USING PASSWORD('APP_PASSWORD_HERE');
+CREATE USER 'testboard'@'localhost'
+  IDENTIFIED VIA mysql_native_password USING PASSWORD('PASSWORD_HERE');
 ```
 
 (The `USING PASSWORD('...')` form needs MariaDB 10.4+. On a 10.3 stream,
-compute the hash first — `SELECT PASSWORD('APP_PASSWORD_HERE');` — and pass
+compute the hash first — `SELECT PASSWORD('PASSWORD_HERE');` — and pass
 it as the `USING` value: `... USING '*94BDCE...'`.)
 
 Confirm what you actually created:
@@ -224,23 +231,24 @@ Confirm what you actually created:
 SELECT user, host, plugin FROM mysql.user WHERE user LIKE 'testboard%';
 ```
 
-The reason is not preference. testboard's future MySQL driver is vendored into
-the repository so that nothing has to be installed on the web server, and
-PyMySQL needs the compiled `cryptography` package for the `sha256_password` and
-`caching_sha2_password` plugins. `cryptography` is deliberately **not** vendored
-— vendoring a package that needs a compiler would give up the whole "nothing to
-build on the server" property. An account created with a sha256 plugin produces,
-when the dashboard is eventually pointed at it (§F):
+The reason is not preference. The MySQL driver is vendored into the
+repository so that nothing has to be installed on the server, and PyMySQL
+needs the compiled `cryptography` package for the `sha256_password` and
+`caching_sha2_password` plugins. `cryptography` is deliberately **not**
+vendored — vendoring a package that needs a compiler would give up the whole
+"nothing to build on the server" property. An account created with a sha256
+plugin produces, at preflight and at every service start:
 
 > `'cryptography' package is required for sha256_password or
 > caching_sha2_password auth methods`
 
 The fix is the auth plugin, not an install. The operator's preflight (§C.2)
-connects with that same vendored driver, so a sha256 account fails there with a
-message naming this section — but check the `plugin` column here anyway: this is
-the only point in the procedure where somebody has the privileges to look.
+connects with that same vendored driver, so a sha256 account fails there with
+a message naming this section — but check the `plugin` column here anyway:
+this is the only point in the procedure where somebody has the privileges to
+look.
 
-### A.5 Server settings — on DBHOST
+### A.5 Server settings
 
 ```sql
 SELECT @@innodb_buffer_pool_size, @@max_allowed_packet,
@@ -274,35 +282,15 @@ collation_server        = utf8mb4_nopad_bin
 `innodb_buffer_pool_size` needs the restart; do not skip it and assume the
 value took.
 
-### A.6 Network access — on DBHOST
+### A.6 Network access — retired
 
-Skip this entirely if the dashboard runs on the same box (it will use the socket
-or loopback).
+Nothing to do: same box, socket connections. Leave MariaDB listening on
+localhost only (RHEL 8's default) — a database that cannot be reached from
+the network cannot be attacked from it. If the database ever moves to its
+own host, recover this section's firewalld and bind-address guidance from
+git history. (The number is kept so §A's cross-references stay stable.)
 
-```bash
-# firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="WEBHOST_IP" port protocol="tcp" port="3306" accept'
-# firewall-cmd --reload
-# firewall-cmd --list-rich-rules
-```
-
-(One line. A backslash-newline inside single quotes is not a continuation —
-it puts a literal backslash in the rule.)
-
-A source-scoped rich rule rather than `--add-service=mysql`: the database should
-be reachable from the web server, not from the site.
-
-By default MariaDB on RHEL 8 may listen only on localhost. If the dashboard is
-on another machine, confirm `bind-address` allows the interface it needs —
-`0.0.0.0` with the firewall rule above, or the specific address:
-
-```bash
-# grep -r bind-address /etc/my.cnf /etc/my.cnf.d/
-```
-
-SELinux does not need a boolean for MariaDB to accept connections on 3306. It
-*may* need one on the web server — see §A.8.
-
-### A.7 The service account and group — on WEBHOST
+### A.7 The service account and group
 
 This is the account the dashboard runs as. It is a system account: no login, no
 password, no home directory to speak of.
@@ -339,7 +327,7 @@ is not a database server):
 # dnf install mariadb -y        # optional; §D.3's by-hand fallback uses it
 ```
 
-### A.8 Directories — on WEBHOST
+### A.8 Directories
 
 ```bash
 # mkdir -p /etc/testboard /var/lib/testboard /var/log/testboard
@@ -372,108 +360,94 @@ connection to a database:
 Do not set booleans speculatively. If §E's verification and a page load both
 work, there was nothing to fix.
 
-### A.9 The operator's migration credentials — on WEBHOST
+### A.9 The credentials file — one file, for everything
 
-The operator runs the migration as themselves, with the `testboard_migrate`
-account. That credential is personal and short-lived; it lives in their own home
-directory, not in `/etc`:
-
-```bash
-$ umask 077
-$ cat > ~/.testboard-migrate.cnf <<'EOF'
-[client]
-host     = DBHOST
-port     = 3306
-user     = testboard_migrate
-password = MIGRATE_PASSWORD_HERE
-database = testboard
-local-infile = 1
-EOF
-$ chmod 600 ~/.testboard-migrate.cnf
-$ ls -l ~/.testboard-migrate.cnf        # must be -rw-------
-```
-
-This is an ordinary mysql option file, and it is a file rather than a command
-line for one reason: **anything on a command line is visible to every user on
-the box through `ps`.** The migration tool refuses to accept a password any
-other way.
-
-If MariaDB is on this same box and the grants were written for
-`'testboard_migrate'@'localhost'`, add one line to the `[client]` section:
-`socket = /var/lib/mysql/mysql.sock`. The vendored driver — unlike the
-`mysql` client — does **not** treat `host = localhost` as "use the socket";
-it opens TCP, which MariaDB may match against a different account (§A.1).
-With a `socket` line the tool and the client authenticate identically.
-
-Delete this file when the migration is finished. The account it holds can drop
-every table in the database.
-
-### A.10 The application's credentials — on WEBHOST
-
-Same format, different account, and permanent:
+One account means one file. `/etc/testboard/db.cnf` is read by the migration
+tool (`--config`), by the running dashboard (`--db-config`, §F), and by the
+`mysql` client (`--defaults-file`, the §D.3 by-hand fallback):
 
 ```bash
 # cat > /etc/testboard/db.cnf <<'EOF'
 [client]
-host     = DBHOST
-port     = 3306
-user     = testboard_app
-password = APP_PASSWORD_HERE
+socket   = /var/lib/mysql/mysql.sock
+user     = testboard
+password = PASSWORD_HERE
 database = testboard
+local-infile = 1
 EOF
 # chown root:testboard /etc/testboard/db.cnf
 # chmod 0640 /etc/testboard/db.cnf
 # ls -l /etc/testboard/db.cnf          # must be -rw-r----- root testboard
 ```
 
-`root:testboard` at `0640` means: the service account can read it, members of
-the `testboard` group can read it, nobody else can, and nothing but `root` can
-change it.
+The `socket =` line is not decoration: the vendored driver — unlike the
+`mysql` client — does **not** treat `host = localhost` as "use the socket";
+it would open TCP, which MariaDB may match against a different account
+(§A.1). With the socket line, the tool, the app and the client all
+authenticate identically, as `'testboard'@'localhost'`.
 
-> **This is the file `run_server.py --db-config` reads** (§F). Creating it is
-> part of the privileged setup; *using* it is the operator's cutover decision.
-> **Setting it up does not migrate the dashboard** — the server keeps serving
-> SQLite until it is started with `--db-config`, and SQLite remains a
-> first-class backend afterwards (a second instance can always start on
-> `--db PATH` with nothing else set up).
+It is a file rather than a command line for one reason: **anything on a
+command line is visible to every user on the box through `ps`.** The tools
+refuse to accept a password any other way.
 
-For reference, the service unit §F will need — `/etc/systemd/system/testboard.service`:
+`root:testboard` at `0640` is the design, not an oversight: the service
+account and the operators (who are in the `testboard` group, §A.7) can read
+it; nobody else can; only `root` can change it. Group-readability here is
+deliberate — the file parser warns only about *world*-readable credentials.
+
+### A.10 The service unit
+
+The credentials file is §A.9's — the app reads the same one. What the
+service needs, for the cutover day:
+
+> **`run_server.py --db-config /etc/testboard/db.cnf` is the switch** (§F).
+> Creating the file does not move anything: the server keeps serving SQLite
+> until it is *started* with `--db-config`, and SQLite remains a first-class
+> backend afterwards (a second instance can always start on `--db PATH` with
+> nothing else set up).
+
+`/etc/systemd/system/testboard.service`, both forms:
 
 ```ini
 [Unit]
 Description=testboard dashboard
-After=network-online.target
+After=network-online.target mariadb.service
 
 [Service]
 User=testboard
 Group=testboard
 WorkingDirectory=/opt/testboard
+# Before cutover (SQLite, as today):
 ExecStart=/usr/bin/python3 /opt/testboard/run_server.py --host 0.0.0.0 --port 8000 --db /var/lib/testboard/testboard.db
+# At cutover, replace ExecStart with:
+#ExecStart=/usr/bin/python3 /opt/testboard/run_server.py --host 0.0.0.0 --port 8000 --db-config /etc/testboard/db.cnf --site-notes /var/lib/testboard/site_notes.json
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-That `--db` is the SQLite path, because that is what the code takes today. §F.2
-is where it grows a URL form and starts reading `/etc/testboard/db.cnf`.
+`--site-notes` is required with `--db-config` (there is no database file to
+keep it beside); `/var/lib/testboard/` is the right home — the service
+account owns it (§A.8). If the notes file lived beside the old `--db`, move
+it there at cutover so nobody's site notes vanish.
 
 ### A.11 Hand over
 
-Tell the operator:
+Tell the operator (or, wearing the other hat, confirm to yourself):
 
-- [ ] `DBHOST` and port; whether it is the same box as the dashboard
-- [ ] The two usernames, and both passwords, by whatever channel your site uses
+- [ ] The `testboard` account's password, by whatever channel your site uses
       for secrets — not email
-- [ ] That `~/.testboard-migrate.cnf` is in place, mode 600 (§A.9)
-- [ ] That `/etc/testboard/db.cnf` is in place, `root:testboard`, 0640 (§A.10)
+- [ ] That `/etc/testboard/db.cnf` is in place, `root:testboard`, 0640, with
+      the `socket =` line (§A.9)
 - [ ] The output of `SELECT VERSION();`
 - [ ] Confirmation that §A.5's settings were applied **and the server was
       restarted**
-- [ ] That they are in the `testboard` group and have logged in since (§A.7)
+- [ ] That the operator is in the `testboard` group and has logged in since
+      (§A.7)
 - [ ] Which scratch filesystem has room for the export (§A.8)
 
-Nothing else. The operator does not need root, and should not be given it.
+Nothing else. The operator does not need root beyond this section.
 
 ---
 
@@ -741,7 +715,7 @@ SELECT version FROM schema_version;
 
 ```bash
 python3 tools/migrate_to_mariadb.py preflight \
-    --config ~/.testboard-migrate.cnf \
+    --config /etc/testboard/db.cnf \
     --max-blob-bytes <from the audit>
 ```
 
@@ -754,7 +728,7 @@ Every one of these is a **gate**: it exits 3 and the load does not run.
 | `database_collation` | The database is binary-collated (§A.3). |
 | `max_allowed_packet` | The largest captured output fits in one packet, with margin for the hex form on the wire. |
 | `local_infile` | The bulk load path is available. |
-| `grants` | The account can create, insert and drop — i.e. you are `testboard_migrate` and not `testboard_app`. |
+| `grants` | The account can create, insert and drop — i.e. §A.4's GRANT was actually applied to the account the option file names. |
 | `collation_probe` | **The important one.** Stores `'a'`, `'A'` and `'a '` in a primary key and counts them. Three means case-sensitive and no-pad. Fewer — or a duplicate-key error — means loading now would merge distinct tests, permanently. |
 | `strict_probe` | Inserts a 7-character value into `VARCHAR(4)`. **It must fail.** A probe that passed by succeeding could not tell strict mode from a statement that never ran. |
 | `target_is_empty` | You are not loading on top of an earlier attempt. `--force` overrides, for scratch databases. |
@@ -816,7 +790,7 @@ held to "not yet", so the driver's revert story is unchanged.
 python3 tools/migrate_to_mariadb.py all \
     --db     /path/to/testboard.db \
     --out    /var/tmp/testboard-export \
-    --config ~/.testboard-migrate.cnf
+    --config /etc/testboard/db.cnf
 ```
 
 That is: audit → preflight → export → schema → load → verify, **stopping at the
@@ -851,11 +825,11 @@ python3 tools/export_for_mariadb.py \
 # 2. schema, then data — from inside the export directory, because
 #    load.sql names its .tsv files relatively
 cd /var/tmp/testboard-export
-mysql --defaults-file=~/.testboard-migrate.cnf < schema.sql
-mysql --defaults-file=~/.testboard-migrate.cnf --local-infile=1 < load.sql
+mysql --defaults-file=/etc/testboard/db.cnf < schema.sql
+mysql --defaults-file=/etc/testboard/db.cnf --local-infile=1 < load.sql
 
 # 3. verify: compare this output against verify_source.txt
-mysql --defaults-file=~/.testboard-migrate.cnf --batch --raw \
+mysql --defaults-file=/etc/testboard/db.cnf --batch --raw \
       --skip-column-names < verify.sql
 ```
 
@@ -880,13 +854,14 @@ load. Do not reorder that.
 
 ### E.1 Dry run first — the dry run is also your estimate
 
-Copy the production SQLite file to the web server's local disk and run §D
-against it, into a scratch database (`testboard_dryrun`). That scratch
-database is created by whoever ran §A, exactly as §A.3 created the real one —
-**same collation**, and both §A.4 grants repeated `ON testboard_dryrun.*` —
-and the dry run needs its own copy of the §A.9 option file with
-`database = testboard_dryrun`. A scratch database created casually, without
-the collation, fails the preflight — that is the probe doing its job, not a
+Copy the production SQLite file to local disk and run §D against it, into a
+scratch database (`testboard_dryrun`). Root creates it exactly as §A.3
+created the real one — **same collation** — and repeats §A.4's GRANT
+`ON testboard_dryrun.*` for the same account. The dry run needs its own copy
+of the credentials file: `install -m 600 /etc/testboard/db.cnf
+~/dryrun.cnf`, then edit `database = testboard_dryrun` and pass
+`--config ~/dryrun.cnf`. A scratch database created casually, without the
+collation, fails the preflight — that is the probe doing its job, not a
 fault in the rehearsal. **Do not
 estimate the downtime window; measure it here** — the `all` command prints
 per-phase timings for exactly this reason. Then check §E.4's verification
@@ -922,7 +897,7 @@ by hand:
 
 ```bash
 python3 tools/migrate_to_mariadb.py verify \
-    --config ~/.testboard-migrate.cnf \
+    --config /etc/testboard/db.cnf \
     --out /var/tmp/testboard-export
 ```
 
@@ -987,8 +962,9 @@ discards them.
 So: verify (§E.4) *before* announcing that the dashboard is back. That ordering
 is the whole rollback plan.
 
-Keep the SQLite file, and a copy of the export directory, for at least a month.
-Delete `~/.testboard-migrate.cnf` (§A.9) once you are sure you are done with it.
+Keep the SQLite file, and a copy of the export directory, for at least a
+month. The credentials file stays — it is the app's (§A.9); delete only the
+dry run's `~/dryrun.cnf` copy (§E.1) if you made one.
 
 ---
 
@@ -1087,7 +1063,7 @@ a perf pin) are skipped there, each with its reason recorded in
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Access denied for user 'testboard_migrate'@'...'` | The grant names a different host from the one MariaDB sees you coming from | §A.1 — `localhost` (socket) and the machine's own IP (TCP) are different accounts |
+| `Access denied for user 'testboard'@'...'` | The grant names a different host from the one MariaDB sees you coming from | §A.1/§A.9 — `localhost` (socket) and the machine's own IP (TCP) are different accounts; the cnf's `socket =` line is what keeps everyone on the socket |
 | `the vendored MySQL driver is missing` | `third_party/pymysql` is absent — an incomplete checkout, not a missing install | Restore the directory from the repository. Nothing needs installing; see `third_party/README.md` |
 | `Specified key was too long; max key length is 3072 bytes` | `VARCHAR(n)` too large for an indexed column | §B.1 — the tool sizes these from the audit; if you passed them by hand, don't |
 | `Duplicate entry '...' for key 'PRIMARY'` during load | Case-insensitive or PAD-SPACE collation merging distinct rows | §A.3 and §C.2. Drop the database and reload; do not "fix" the duplicates |
@@ -1096,7 +1072,7 @@ a perf pin) are skipped there, each with its reason recorded in
 | `MySQL server has gone away` mid-load | A row exceeded `max_allowed_packet` | §A.5, raise it; the culprit is a large `run_outputs` blob |
 | `The used command is not allowed with this MariaDB version` | `LOAD DATA LOCAL INFILE` disabled | Enable `local_infile` on both sides (§A.5, and `local-infile = 1` in the option file) |
 | `Cannot add or update a child row: a foreign key constraint fails` | Foreign key constraints were added by hand — the generated schema declares none (§B.6) | Load into the generated schema as-is; adopt constraints, if wanted, as separate later work |
-| A load failed partway and the next run says the target is not empty | The wreckage of the first attempt | Drop the tables (`testboard_migrate` holds `DROP` on this database, so it can — it just cannot drop the *database*), then run the `load` step again. Do not load on top |
+| A load failed partway and the next run says the target is not empty | The wreckage of the first attempt | Drop the tables (the account holds `DROP` on this database, so it can — dropping the *database* itself needs root), then run the `load` step again. Do not load on top |
 | `File 'runs.tsv' not found` | The client was run from outside the export directory | §D.3 — `cd` into it first; the tool does this for you |
 | Blob comparison fails in §E.4 | Hex round-trip; usually a missing `UNHEX()` or a client charset mangling the hex text | Re-check `load.sql`; blobs must never pass through a character-set conversion |
 | Dashboard works, is slow, buffer pool is large | Pool not warm yet, or not actually applied | `SHOW ENGINE INNODB STATUS`; confirm `@@innodb_buffer_pool_size` is what §A.5 set — and that MariaDB was **restarted** after the config change |

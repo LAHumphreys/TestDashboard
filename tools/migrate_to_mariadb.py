@@ -670,10 +670,10 @@ def preflight(conn: Any, max_blob_bytes: int = 0,
         advice="Loading on top of an existing schema produces a mixture "
                "of two loads that no verification can untangle. If this "
                "is the wreckage of a failed load, drop the tables and "
-               "run the load again — testboard_migrate holds DROP on "
-               "this database, so it can do that itself (it cannot drop "
-               "the database, which needs whoever ran §A). Or pass "
-               "--force if you know it is a scratch database."))
+               "run the load again — the migration account holds DROP "
+               "on this database, so it can do that itself (dropping "
+               "the DATABASE needs whoever ran §A). Or pass --force if "
+               "you know it is a scratch database."))
     return checks
 
 
@@ -704,9 +704,9 @@ def _grant_probe(conn: Any) -> Check:
         return Check(
             "grants", False, str(exc), blocking=True,
             advice="Cheaper to find out now than four hours into a "
-                   "load. This should be the testboard_migrate account, "
-                   "not testboard_app — the app account deliberately "
-                   "cannot create tables (runbook §A.4).")
+                   "load. The account needs CREATE, INSERT and DROP on "
+                   "this database — check that §A.4's GRANT was applied "
+                   "to the account the option file actually names.")
 
 
 def _collation_probe(conn: Any) -> Check:
@@ -1317,8 +1317,8 @@ def build_parser() -> argparse.ArgumentParser:
     def add_config(target: argparse.ArgumentParser) -> None:
         target.add_argument(
             "--config", required=True, metavar="CNF",
-            help="mysql option file with the testboard_migrate "
-                 "credentials")
+            help="mysql option file with the migration credentials "
+                 "(runbook §A.9 — normally /etc/testboard/db.cnf)")
         target.add_argument(
             "--max-blob-bytes", type=int, default=0,
             help="largest captured output, from the audit; used to "

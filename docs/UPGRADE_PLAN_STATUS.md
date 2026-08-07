@@ -1506,3 +1506,30 @@ schema v7, so the MariaDB migration must run from THIS branch's checkout
 table and verify the omission as agreement). Still open: confirm the box
 runs the final drop commit 310f1c0 (What's new saying "7 August 2026" is
 the tell), push the branch to master, then §A → §C → §E.1 dry run → cutover.
+
+## Runbook simplified for the install we actually have (2026-08-07, evening)
+
+Operator decision: one box (dashboard and MariaDB on the same host, socket
+connections) and ONE database account — the app/migrate split judged
+overkill for a single-operator install. What that trades away is recorded
+in §A.4 where the decision lives: the serving app now holds DDL rights it
+never uses; accepted because the backend refuses DDL by design, everything
+is parameterized, and the split is restorable with two GRANTs and a file
+edit. One account also means ONE credentials file — /etc/testboard/db.cnf
+(root:testboard 0640, with the socket= line) now serves the migration tool,
+the dashboard and the mysql-client fallback alike; the personal
+~/.testboard-migrate.cnf lifecycle is gone.
+
+Kept deliberately: §A's section NUMBERING (A.1 became the one-box statement
+plus the localhost trap, A.6 a retirement stub) so every cross-reference in
+tool messages, tests and this log stays true; and the §A.1 socket-vs-TCP
+explanation, which is the same-box trap par excellence. The two-host,
+two-account revision lives in git history.
+
+Ripples: three tool advice strings de-two-account-ed (grant probe,
+target-not-empty, --config help; the pinned grant-probe assertion moved
+from "testboard_app" to "§A.4"); dbconfig's permissions warning narrowed to
+WORLD-readable only — the canonical file is group-readable BY DESIGN and a
+warning that fires on the documented-correct state is one nobody reads.
+
+Suite after: 1385 OK (skipped=1).

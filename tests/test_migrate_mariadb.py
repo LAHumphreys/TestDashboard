@@ -481,9 +481,9 @@ class PreflightTest(unittest.TestCase):
             self) -> None:
         checks = self.run_preflight(
             [("CREATE TABLE _tb_grant_probe",
-              ValueError("CREATE command denied to user 'testboard_app'"))])
+              ValueError("CREATE command denied to user 'testboard'"))])
         self.assertIn("grants", self.blocking_failures(checks))
-        self.assertIn("testboard_app", checks["grants"].advice)
+        self.assertIn("§A.4", checks["grants"].advice)
 
 
 class DriverTest(unittest.TestCase):
