@@ -214,6 +214,10 @@ CREATE USER 'testboard_app'@'WEBHOST'
   IDENTIFIED VIA mysql_native_password USING PASSWORD('APP_PASSWORD_HERE');
 ```
 
+(The `USING PASSWORD('...')` form needs MariaDB 10.4+. On a 10.3 stream,
+compute the hash first — `SELECT PASSWORD('APP_PASSWORD_HERE');` — and pass
+it as the `USING` value: `... USING '*94BDCE...'`.)
+
 Confirm what you actually created:
 
 ```sql
@@ -394,6 +398,13 @@ line for one reason: **anything on a command line is visible to every user on
 the box through `ps`.** The migration tool refuses to accept a password any
 other way.
 
+If MariaDB is on this same box and the grants were written for
+`'testboard_migrate'@'localhost'`, add one line to the `[client]` section:
+`socket = /var/lib/mysql/mysql.sock`. The vendored driver — unlike the
+`mysql` client — does **not** treat `host = localhost` as "use the socket";
+it opens TCP, which MariaDB may match against a different account (§A.1).
+With a `socket` line the tool and the client authenticate identically.
+
 Delete this file when the migration is finished. The account it holds can drop
 every table in the database.
 
@@ -524,9 +535,18 @@ breaks you will not know which change did it.
 
 ### B.3 Collation, per column
 
-Set at the database level in §A.3, but stated explicitly on identity columns
-anyway — so that a future `ALTER` on a server with different defaults cannot
-quietly change comparison semantics.
+Set at the database level in §A.3, and the identity columns (environment,
+script, test_name, username) deliberately **inherit** it — the generated DDL
+does not repeat a collation on them, so the choice lives in exactly one
+place. The machine-generated columns (timestamps, `result`, `hour`,
+`output_fingerprint`) are pinned to `ascii_bin` explicitly: exact,
+case-sensitive, and a quarter the index cost of utf8mb4. Two gates stand
+behind the inherited default: the preflight refuses a database whose default
+collation is not binary (§C.2 `database_collation`), and the collation probe
+proves the behaviour empirically before anything loads. A later
+`ALTER TABLE ... ADD COLUMN` inherits the *table's* collation, fixed at
+CREATE time from that gated default, so future columns cannot quietly
+diverge either.
 
 If your server is **older than 10.2** and `utf8mb4_nopad_bin` does not exist:
 `utf8mb4_bin` gives you case sensitivity but *not* no-pad, so `"login"` and
@@ -582,16 +602,27 @@ a table where it *would* matter.
 it. It is slower and it fires `ON DELETE` behaviour, so prefer
 `ON DUPLICATE KEY UPDATE` unless a test says otherwise.
 
-### B.6 Foreign keys become real
+### B.6 Foreign keys: deliberately NOT carried over
 
 SQLite does not enforce `REFERENCES` unless `PRAGMA foreign_keys=ON`, which
-testboard does not set. InnoDB **always** enforces them. So constraints that are
-decorative today become load-order requirements: `users` before `comments`,
-`runs` before `run_outputs` and `latest_runs`.
+testboard does not set. InnoDB always enforces a *declared* constraint — so
+the generated DDL **declares none**. Carrying the `REFERENCES` clauses across
+would have turned decorative annotations into live constraints and handed §F
+a database that rejects write patterns the SQLite-tested code is proven
+against (import order, pruning, environment deletion). The migrated database
+reproduces SQLite's semantics exactly; adopting real foreign keys is
+separate, deliberate future work.
 
-More consequentially, **any orphan rows in the current database will refuse to
-load.** The audit in §C.1 finds them before you discover them at 2am, and
-refuses to go on.
+Two disciplines the tooling keeps anyway, because they cost nothing and are
+what makes that future work possible:
+
+- `load.sql` still loads parents before children: `users` before `comments`,
+  `runs` before `run_outputs` and `latest_runs`.
+- **The audit still blocks on orphan rows** (§C.1). They would load without
+  complaint into the constraint-free schema — which is precisely the problem:
+  dangling references are latent corruption, and the migration is the one
+  moment they are cheap to find. Delete them at the source rather than
+  carrying them over.
 
 ---
 
@@ -600,6 +631,20 @@ refuses to go on.
 Read-only against the SQLite file, read-only-ish against the empty MariaDB
 database (it creates and drops three tiny probe tables). Nothing here changes
 production.
+
+Two environment facts before the first command:
+
+- **Run under a UTF-8 locale** (`echo $LANG` — any `.UTF-8` value is fine).
+  Python 3.6 does not coerce the C locale the way 3.7+ does, so under
+  `LANG=C` (a stripped cron or sudo environment) the tool cannot print its
+  own output and stops at its first line with `UnicodeEncodeError`. It fails
+  before doing anything, so the fix is `export LANG=en_US.UTF-8` and re-run.
+- **The tool must match the database.** The exporter knows the schema of the
+  code it ships with. Run it from the same checkout that is *deployed* — a
+  newer tool against an older database is stopped by the `source_tables`
+  gate, but an **older tool against a newer database silently skips the
+  tables it has never heard of**, and the verification, generated by the same
+  tool, agrees with the omission.
 
 ### C.1 The source audit — one command
 
@@ -621,7 +666,7 @@ checks, and why each one is where it is:
 | `timestamp_widths` | yes | Every timestamp is exactly 26 characters. If not, lexical ordering is *already* broken and the migration is not the cause. |
 | `identity_whitespace` | no | Counts leading/trailing spaces in identity values. Harmless under `utf8mb4_nopad_bin`; the measurement of the damage if §A.3 was not followed. |
 | `case_collisions` | no | How many rows differ only by case — i.e. exactly what a case-insensitive collation would merge. Non-zero makes §C.2 the only thing standing between you and data loss. |
-| `orphan_rows` | yes | Rows whose parent is missing. InnoDB will reject them (§B.6). |
+| `orphan_rows` | yes | Rows whose parent is missing — latent corruption, blocked on principle (§B.6). |
 
 It also records the volumes, the largest captured output (which §C.3 checks
 against `max_allowed_packet`), and the `schema_version` — §E.4 compares that
@@ -767,8 +812,9 @@ twenty minutes and 2.4 GB, and on cutover night those twenty minutes are inside
 the freeze window. It prints the elapsed time of every phase
 at the end, which is the number §E.1 exists to obtain.
 
-Exit codes: `0` everything passed · `2` bad usage or an unexpected error ·
-`3` a check said no.
+Exit codes: `0` everything passed · `3` a check said no · anything else
+(`1`/`2`) is a usage or environment error — bad flags, a missing file, no
+connection. A wrapper should treat only `0` as go.
 
 The steps can also be run one at a time — `audit`, `preflight`, `export`,
 `load`, `verify` — and that is what you want when something has failed and you
@@ -821,7 +867,13 @@ load. Do not reorder that.
 ### E.1 Dry run first — the dry run is also your estimate
 
 Copy the production SQLite file to the web server's local disk and run §D
-against it, into a scratch database (`testboard_dryrun`, same grants). **Do not
+against it, into a scratch database (`testboard_dryrun`). That scratch
+database is created by whoever ran §A, exactly as §A.3 created the real one —
+**same collation**, and both §A.4 grants repeated `ON testboard_dryrun.*` —
+and the dry run needs its own copy of the §A.9 option file with
+`database = testboard_dryrun`. A scratch database created casually, without
+the collation, fails the preflight — that is the probe doing its job, not a
+fault in the rehearsal. **Do not
 estimate the downtime window; measure it here** — the `all` command prints
 per-phase timings for exactly this reason. Then check §E.4's verification
 passed. Only then schedule the real cutover.
@@ -1008,7 +1060,7 @@ that kind of claim testable rather than to make it confidently.
 | Load succeeds but tests are missing afterwards | Strict mode **off**, values silently truncated and merged | §C.4's probe exists to make this impossible. If you skipped it: reload from scratch |
 | `MySQL server has gone away` mid-load | A row exceeded `max_allowed_packet` | §A.5, raise it; the culprit is a large `run_outputs` blob |
 | `The used command is not allowed with this MariaDB version` | `LOAD DATA LOCAL INFILE` disabled | Enable `local_infile` on both sides (§A.5, and `local-infile = 1` in the option file) |
-| `Cannot add or update a child row: a foreign key constraint fails` | Orphan rows, or wrong load order | §B.6 and §C.1 — the audit blocks on orphans for this reason |
+| `Cannot add or update a child row: a foreign key constraint fails` | Foreign key constraints were added by hand — the generated schema declares none (§B.6) | Load into the generated schema as-is; adopt constraints, if wanted, as separate later work |
 | A load failed partway and the next run says the target is not empty | The wreckage of the first attempt | Drop the tables (`testboard_migrate` holds `DROP` on this database, so it can — it just cannot drop the *database*), then run the `load` step again. Do not load on top |
 | `File 'runs.tsv' not found` | The client was run from outside the export directory | §D.3 — `cd` into it first; the tool does this for you |
 | Blob comparison fails in §E.4 | Hex round-trip; usually a missing `UNHEX()` or a client charset mangling the hex text | Re-check `load.sql`; blobs must never pass through a character-set conversion |

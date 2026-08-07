@@ -380,10 +380,14 @@ def audit(db_path: str) -> Audit:
             "orphan_rows", not found,
             "; ".join(found) if found else "none",
             blocking=True,
-            advice="SQLite never enforced these references; InnoDB "
-                   "always does (runbook §B.6), so the load will fail "
-                   "partway. Delete the orphans in the source, or fix "
-                   "whatever produced them, before exporting."))
+            advice="SQLite never enforced these references, so these "
+                   "rows point at parents that do not exist. The "
+                   "generated schema does not enforce them either "
+                   "(runbook §B.6) — they would load without complaint, "
+                   "and that is the problem: a migration is the one "
+                   "moment dangling rows are cheap to find. Delete them "
+                   "in the source, or fix whatever produced them, "
+                   "before exporting."))
 
         blob = conn.execute(
             "SELECT MAX(LENGTH(output)), SUM(LENGTH(output)) "

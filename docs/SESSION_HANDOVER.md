@@ -5,7 +5,8 @@ The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
 Last rewritten: **2026-08-04**, after building WP-18 (Timeline) as the
-2026-08-04 drop.
+2026-08-04 drop. Touched 2026-08-07: MariaDB runbook reviewed and corrected
+ahead of the server-side migration (status log entry of that date).
 
 ---
 
@@ -132,7 +133,12 @@ Still noted, not specified. Static-vs-data-driven is the deciding question.
    "Automatically un-retired") — still outstanding from 07-31.
 4. `tools/diagnose_db.py --compare-local` on the production server — still
    never run.
-5. The MariaDB migration dry run (§A of the runbook needs root).
+5. The MariaDB migration dry run (§A of the runbook needs root). Runbook
+   reviewed and corrected 2026-08-07 — read §C's new preamble first. Run the
+   tooling from the checkout that matches the database's schema version
+   (master ↔ v6 production; this branch ↔ v7) and never mix. §F is still not
+   done, so after any load the dashboard keeps serving SQLite: no freeze, no
+   cutover, the SQLite file stays live and is never written by the tool.
 
 ## Shipping a drop
 

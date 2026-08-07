@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project State
 
 **testboard is live in production and has been since 2026-07-26.** It is no longer
-greenfield: ~25k lines, 1,288 tests, schema at migration 6, deployed and in daily use
+greenfield: ~25k lines, 1,333 tests, schema at migration 7, deployed and in daily use
 by a small group of testers.
 
 **Starting a session: read [`docs/SESSION_HANDOVER.md`](docs/SESSION_HANDOVER.md) first.**
@@ -120,11 +120,12 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
 - **`output` can be large**: it lives in its own table (`run_outputs`), zlib-compressed, and is read by exactly one endpoint (`GET /api/runs/{id}`). Never join it into a list query — keeping it out of `runs` is what keeps metadata reads dense.
 - **The server serves from a fixed worker pool, never a thread per request.** Storage keeps connections in `threading.local()`, so a thread per request means a connection per request means an empty SQLite page cache on every request — measured: 20 requests, 20 connections, and no `cache_size` setting can help a cache that is discarded before it is used twice. The pool size *is* the connection count and is what a `--cache-mb` budget is divided by; `tests/test_server_pool.py` fails if the mixin comes back.
 - SQLite: WAL mode + busy timeout at connect (threaded server), versioned migration
-  table (`schema_version`). **`MIGRATIONS` holds six entries and entry 1 describes a
+  table (`schema_version`). **`MIGRATIONS` holds seven entries and entry 1 describes a
   database that exists in production — never edit it.** Every schema change is a new
   appended entry whose version is claimed from the registry in `docs/UPGRADE_PLAN.md`
-  §1 *in the same commit*; version 7 is claimed by WP-15 (renumbered from 6 when
-  WP-17 shipped first — the parked WIP branch must renumber before merging).
+  §1 *in the same commit*; version 8 is claimed by WP-15 (renumbered from 6, then 7,
+  as WP-17 and WP-18 each shipped first — the parked WIP branch must renumber before
+  merging).
   `tests/test_migrations.py` freezes entry 1 by hash and asserts the fresh-install and
   incremental paths produce identical schemas. A migration may contain a Python step
   (`"python: <name>"`). A database whose version exceeds the code's is refused, not
