@@ -61,6 +61,7 @@ from typing import (
     Tuple,
 )
 
+from testboard import dbconfig
 from testboard import model
 from testboard.model import Result, RunRecord, StoredRun
 
@@ -1426,6 +1427,27 @@ class Storage:
         self._trend_cache = {}  # type: Dict[Tuple[str, Optional[str]], Tuple[float, List[DailyResultCount]]]
         self._trend_lock = threading.Lock()
         self._migrate()
+
+    @classmethod
+    def mariadb(cls, settings: dbconfig.Settings,
+                max_connections: int = DEFAULT_MAX_CONNECTIONS) -> "Storage":
+        """The same Storage over MariaDB, via the vendored driver.
+
+        *settings* comes from :func:`testboard.dbconfig.read_option_file`
+        — the §A.10 credentials file. The import is inside the method so
+        that a SQLite deployment (``Storage(path)``) never loads the
+        driver: SQLite is not a fallback here, it is the other equal
+        backend.
+
+        The database must already hold the schema the migration tooling
+        creates, at exactly this build's version — this constructor
+        verifies and refuses, it never migrates (runbook §D, §F).
+        """
+        from testboard import mariadb as mariadb_backend
+        store = cls.__new__(cls)
+        store._init_with_backend(
+            mariadb_backend.MariaDBBackend(settings), max_connections)
+        return store
 
     # ------------------------------------------------------------------
     # Connection management

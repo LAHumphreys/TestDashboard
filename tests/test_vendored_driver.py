@@ -203,39 +203,41 @@ class ImportCostTest(unittest.TestCase):
         self.assertIn("ok", text)
 
 
-#: Modules allowed to import the driver, and why each one is allowed.
-#: A migration tool is not a serving path: it runs by hand, on purpose,
-#: and reverting the driver would take it with it — which is still one
-#: commit and still no storage code.
+#: Modules allowed to import (or so much as mention) the driver, and
+#: why each one is. The scan below matches the word ``pymysql`` even in
+#: comments, deliberately: a docstring pointing at the driver from an
+#: unrelated module is how a dependency starts growing unnoticed.
 DRIVER_USERS = {
     "tools/migrate_to_mariadb.py":
         "the migration tool. It connects to MariaDB precisely so that "
         "the migration needs nothing installed on the web server — the "
         "property this directory exists to protect.",
+    "testboard/mariadb.py":
+        "the MariaDB backend (WP-19). The ONE serving-path module that "
+        "touches the driver; storage.py reaches it only through the "
+        "backend seam, and only when Storage.mariadb() is called.",
 }
 
 
-class NotYetWiredTest(unittest.TestCase):
-    """The serving path does not import the driver yet.
+class DriverImportAllowlistTest(unittest.TestCase):
+    """Exactly the allowlisted modules touch the driver, nobody else.
 
-    If the driver turns out to be the wrong choice, reverting must be
-    one commit that touches no storage code. Originally that was
-    enforced by allowing *nothing* to import it.
+    This class used to be NotYetWiredTest, which held ``testboard/``
+    and ``feeder/`` to "not yet" and instructed its own deletion the
+    day the backend became real. That day was WP-19. The rule did not
+    die with the name; it narrowed: the MariaDB backend is real and
+    lives in exactly one module, ``testboard/mariadb.py``, so the
+    driver's blast radius stays one file of serving code.
+    ``storage.py`` itself still must not mention the driver — it talks
+    to a backend object, not to PyMySQL — and ``feeder/`` still has no
+    business anywhere near it (it talks HTTP).
 
-    ``tools/migrate_to_mariadb.py`` is now allowed, and the reason is
-    the same one that motivated vendoring: shelling out to the ``mysql``
-    client would have made the migration depend on a client package
-    being installed on the web server, which is exactly the deployment
-    problem the vendored driver removes. It is a hand-run tool, not a
-    serving path, so the revert story is unchanged — one commit, no
-    storage code.
-
-    ``testboard/`` and ``feeder/`` are still held to the original rule:
-    the day ``storage.py`` imports it, the MariaDB backend is real, and
-    this test should be deleted with that said in the commit message.
+    The revert story this protects: dropping the driver is still one
+    commit — the vendored tree, the backend module, and the migration
+    tool — touching no SQL.
     """
 
-    def test_no_serving_module_imports_the_driver_yet(self) -> None:
+    def test_only_allowlisted_modules_mention_the_driver(self) -> None:
         import re
 
         offenders = []
@@ -254,9 +256,11 @@ class NotYetWiredTest(unittest.TestCase):
                     offenders.append(relative)
         self.assertEqual(
             offenders, [],
-            "the vendored driver is wired into the serving path, but the "
-            "MariaDB backend is not built yet. When it is, delete this "
-            "test and say so in the commit message")
+            "a module outside DRIVER_USERS mentions the driver. Either "
+            "route the need through testboard/mariadb.py (the backend "
+            "seam exists for exactly this), or add an allowlist entry "
+            "with its reasoning — in the same commit, with the reason "
+            "in the commit message")
 
     def test_every_allowed_importer_still_exists(self) -> None:
         """An allowlist entry for a deleted file is a hole nobody sees."""
