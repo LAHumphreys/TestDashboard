@@ -221,12 +221,15 @@ class MariaDBBackend(object):
         if ("STRICT_TRANS_TABLES" not in mode
                 and "STRICT_ALL_TABLES" not in mode):
             conn.close()
+            # ASCII only in operator-facing strings: under a non-UTF-8
+            # locale, Python 3.6 cannot print a section sign, and an
+            # error path that crashes while reporting masks the finding.
             raise RuntimeError(
                 "this MariaDB server is not running in strict mode "
                 "(sql_mode = {0!r}). The data was loaded under strict "
                 "mode and serving without it silently truncates "
                 "over-long values into collisions. Fix the server per "
-                "docs/MARIADB_MIGRATION.md §A.5 and restart "
+                "docs/MARIADB_MIGRATION.md section A.5 and restart "
                 "it.".format(mode))
 
     # ------------------------------------------------------------------
@@ -275,10 +278,10 @@ class MariaDBBackend(object):
             raise RuntimeError(
                 "this MariaDB database has no testboard schema (no "
                 "schema_version table). The schema is created by the "
-                "migration tooling, never by the dashboard — run "
+                "migration tooling, never by the dashboard - run "
                 "tools/migrate_to_mariadb.py per "
-                "docs/MARIADB_MIGRATION.md §D before pointing the "
-                "server at it.")
+                "docs/MARIADB_MIGRATION.md section D before pointing "
+                "the server at it.")
         current = 0 if row is None else int(row[0])
         if current > latest:
             raise RuntimeError(
@@ -291,9 +294,9 @@ class MariaDBBackend(object):
             raise RuntimeError(
                 "this MariaDB database is at schema version {0} but "
                 "this build expects {1}. The dashboard never migrates "
-                "MariaDB — re-run the data migration with this "
-                "checkout's tooling (docs/MARIADB_MIGRATION.md §D) so "
-                "the loaded schema matches the code.".format(
+                "MariaDB - re-run the data migration with this "
+                "checkout's tooling (docs/MARIADB_MIGRATION.md section "
+                "D) so the loaded schema matches the code.".format(
                     current, latest))
 
     def cache_bytes_per_connection(self) -> Optional[int]:
@@ -321,17 +324,17 @@ def describe_connect_error(settings: Settings, exc: BaseException) -> str:
             "could not connect as {0}: the account uses a sha256-based "
             "auth plugin, which the vendored driver cannot do without "
             "the compiled 'cryptography' package.\nDo NOT install "
-            "cryptography on the server — that gives up the 'nothing "
+            "cryptography on the server - that gives up the 'nothing "
             "to build on the server' property. Have the account "
             "recreated with mysql_native_password instead "
-            "(docs/MARIADB_MIGRATION.md §A.4).".format(
+            "(docs/MARIADB_MIGRATION.md section A.4).".format(
                 settings.describe()))
     return (
         "could not connect as {0}: {1}\nIf that says access denied: "
         "MariaDB matches an account against the host it sees the "
         "connection coming from, so 'localhost' (the socket) is a "
         "different account from the machine's own IP (TCP). The "
-        "vendored driver does NOT treat host=localhost as the socket — "
+        "vendored driver does NOT treat host=localhost as the socket - "
         "add a socket= line to the option file, or make the grant "
-        "match (docs/MARIADB_MIGRATION.md §A.1, "
-        "§A.9).".format(settings.describe(), exc))
+        "match (docs/MARIADB_MIGRATION.md sections A.1 and "
+        "A.9).".format(settings.describe(), exc))

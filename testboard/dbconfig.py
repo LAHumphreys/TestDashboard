@@ -65,10 +65,12 @@ def read_option_file(path: str) -> Settings:
     """
     expanded = os.path.expanduser(path)
     if not os.path.isfile(expanded):
+        # ASCII only: this line is printed by run_server possibly under
+        # LANG=C, where Python 3.6 cannot encode a section sign.
         raise DbConfigError(
             "no option file at {0}. Create one as shown in "
-            "docs/MARIADB_MIGRATION.md §A.9 and chmod it 600.".format(
-                expanded))
+            "docs/MARIADB_MIGRATION.md section A.9 and chmod it "
+            "600.".format(expanded))
     _warn_if_world_readable(expanded)
 
     values = {}  # type: Dict[str, str]
