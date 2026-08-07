@@ -1488,3 +1488,21 @@ NOT-verified list (docs/drops/2026-08-07.md) — no MariaDB has served this
 app outside CI's container and the local emulated install; the RHEL 8
 host's 10.3.39, socket auth, SELinux and the unit file wait for the §E.1
 dry run; MariaDB performance is unmeasured everywhere.
+
+## The 2026-08-07 drop went live the same day it was cut (2026-08-07, later)
+
+Deployed to production by the operator during the afternoon. **Migration 7
+completed on the live database** — ~4.4M runs on the network mount — in the
+**30 s–2 minutes** bracket (operator-reported, not precisely timed; recorded
+as the bracket rather than dressed up as a number). That is well above a
+linear scaling of the dev copy's 3.2 s, which is the network mount's round
+trips: future backfills of this shape should budget minutes. **The Timeline
+is accepted** — the first human eyes on it liked it. SQLite serving is
+confirmed unchanged in production, which was WP-19's first requirement.
+
+Consequences recorded in the drop note and handover: production is at
+schema v7, so the MariaDB migration must run from THIS branch's checkout
+(its exporter knows script_hours; an older tool would silently omit the
+table and verify the omission as agreement). Still open: confirm the box
+runs the final drop commit 310f1c0 (What's new saying "7 August 2026" is
+the tell), push the branch to master, then §A → §C → §E.1 dry run → cutover.

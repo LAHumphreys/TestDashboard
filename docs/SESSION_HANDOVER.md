@@ -4,8 +4,10 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-08-07**, after building WP-19 (MariaDB backend) and
-folding it with WP-18 into the re-dated **2026-08-07 drop**.
+Last rewritten: **2026-08-07**, after building WP-19 (MariaDB backend),
+folding it with WP-18 into the **2026-08-07 drop** — and after that drop
+**went live the same day**: migration 7 completed on the production database
+(30 s–2 min, operator-reported) and the Timeline is accepted.
 
 ---
 
@@ -13,8 +15,9 @@ folding it with WP-18 into the re-dated **2026-08-07 drop**.
 
 | | |
 |---|---|
-| `origin/master` | `ea15ccc` — **deployed**: the 2026-07-31 drop is live |
-| `wp-18-timeline` | **the 2026-08-07 drop** — Timeline (WP-18, migration 7) + MariaDB backend (WP-19, no migration), awaiting acceptance. Pushed; **all four CI legs green** including the new `python36-mariadb` |
+| **production** | **live on the 2026-08-07 drop** (schema v7). Confirm the box runs the FINAL drop commit `310f1c0` — What's new saying "7 August 2026" is the tell; older says 4 August |
+| `origin/master` | `ea15ccc` — **stale**: push `wp-18-timeline` to `master` so the recorded state matches the deployed one |
+| `wp-18-timeline` | the 2026-08-07 drop, deployed. **All four CI legs green** including the new `python36-mariadb` |
 | `wp-14-in-run-progress` | parked WIP; **its migration is 8** — renumber before merging (registry §1) |
 
 Suite: **1385 green** (skipped 1) locally; **1749 OK (skipped 16)** on the CI
@@ -41,22 +44,23 @@ from it.
 
 ## The immediate thing
 
-**Ship the 2026-08-07 drop, then run the MariaDB migration.** The user's
-planned order (confirmed): (1) deploy the drop to prod, still on SQLite —
-migration 7 runs at first startup; (2) §A server prep on the new account
-(target server confirmed MariaDB 10.3.39 via client banner — re-confirm
-server-side); (3) §E.1 dry run on a prod copy, **then** cutover. Read
-[`docs/drops/2026-08-07.md`](drops/2026-08-07.md) — it absorbs the
-2026-08-04 note and carries the whole procedure.
+**The MariaDB migration itself — the drop is already live.** Steps 1 of the
+plan (deploy; migration 7; Timeline acceptance) happened 2026-08-07. What
+remains: (2) §A server prep on the new account (target server confirmed
+MariaDB 10.3.39 via client banner — re-confirm server-side with
+`SELECT VERSION()`); (3) §C preflight, §E.1 **dry run on a prod copy**, then
+the §E cutover with the freeze and feeder catch-up. Read
+[`docs/drops/2026-08-07.md`](drops/2026-08-07.md) for the whole procedure
+and the two small follow-ups (confirm the box is on `310f1c0`; push the
+branch to `master`).
 
-**Open on that drop, for a person:**
-
-1. Migration-7 probe on a prod copy (blank in the drop note).
-2. Browser pass of the Timeline (unchanged from 08-04; no human eye yet).
-3. The runbook was re-reviewed and corrected 2026-08-07 (twice — see the
-   status log's two entries of that date). Read §C's preamble and §F before
-   migration day; the version-pairing rule matters (tool must match the
-   database's schema version).
+**Before migration day:** the runbook was re-reviewed and corrected
+2026-08-07 (see the status log's entries of that date). §C's preamble
+matters most — UTF-8 locale, and the tool-must-match-database-version rule.
+Production is now at **v7**, so migrate with this branch's checkout, whose
+exporter knows `script_hours`. Never with an older one: an older tool
+silently skips tables it has never heard of and its own verification agrees
+with the omission.
 
 **Still open from earlier drops:** re-retire the tests the un-retire bug
 released (search comments for "Automatically un-retired");
