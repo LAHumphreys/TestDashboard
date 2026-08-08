@@ -3231,7 +3231,13 @@ class ActivityHoursTest(StorageTestBase):
     The invariant is exact equality with the GROUP BY that
     `_rebuild_activity_hours` runs; `_invariant_diff` compares in both
     directions, and `test_the_comparison_itself_can_fail` plants a skew
-    to prove the comparison is not vacuous.
+    to prove the comparison is not vacuous. WIDENED at migration 10
+    (WP-23) to include `stream_id` in both the SELECT and the GROUP BY —
+    every test in this class still uses `make_record()` (mainline only,
+    stream_id=1), so none of their expected values change, but the
+    comparison itself now also catches a stream_id mistake, not only an
+    environment/hour/result one. Branch-specific isolation has its own
+    dedicated class (`DerivedTablePartitionIsolationTest`).
     """
 
     def _invariant_diff(self) -> int:
@@ -3241,17 +3247,19 @@ class ActivityHoursTest(StorageTestBase):
         conn = self.store._conn()
         forward = conn.execute(
             "SELECT COUNT(*) FROM ("
-            "  SELECT environment, SUBSTR(start_time, 1, 13), result, "
-            "         COUNT(*) FROM runs GROUP BY 1, 2, 3"
+            "  SELECT stream_id, environment, SUBSTR(start_time, 1, 13), "
+            "         result, COUNT(*) FROM runs GROUP BY 1, 2, 3, 4"
             "  EXCEPT"
-            "  SELECT environment, hour, result, count FROM activity_hours"
+            "  SELECT stream_id, environment, hour, result, count "
+            "         FROM activity_hours"
             ") AS t").fetchone()[0]
         backward = conn.execute(
             "SELECT COUNT(*) FROM ("
-            "  SELECT environment, hour, result, count FROM activity_hours"
+            "  SELECT stream_id, environment, hour, result, count "
+            "         FROM activity_hours"
             "  EXCEPT"
-            "  SELECT environment, SUBSTR(start_time, 1, 13), result, "
-            "         COUNT(*) FROM runs GROUP BY 1, 2, 3"
+            "  SELECT stream_id, environment, SUBSTR(start_time, 1, 13), "
+            "         result, COUNT(*) FROM runs GROUP BY 1, 2, 3, 4"
             ") AS t").fetchone()[0]
         return int(forward) + int(backward)
 
@@ -3339,15 +3347,17 @@ class ScriptHoursTest(StorageTestBase):
     MAX(end_time) per bucket, and a MIN/MAX cannot be decremented — so
     the shrink paths (an update changing a stored result or end time)
     go through exact recomputation and are what these tests lean on.
+    WIDENED at migration 10 (WP-23) to include `stream_id`, same
+    reasoning as `ActivityHoursTest`.
     """
 
     _GROUP_BY = (
-        "SELECT environment, SUBSTR(start_time, 1, 13), script, result, "
-        "COUNT(*), MIN(start_time), MAX(end_time) "
-        "FROM runs GROUP BY 1, 2, 3, 4"
+        "SELECT stream_id, environment, SUBSTR(start_time, 1, 13), "
+        "script, result, COUNT(*), MIN(start_time), MAX(end_time) "
+        "FROM runs GROUP BY 1, 2, 3, 4, 5"
     )
     _TABLE = (
-        "SELECT environment, hour, script, result, count, "
+        "SELECT stream_id, environment, hour, script, result, count, "
         "first_start, last_end FROM script_hours"
     )
 
@@ -3499,7 +3509,10 @@ class ScriptHoursTest(StorageTestBase):
         self.assertEqual([b.count for b in buckets], [41])
 
     def test_the_window_read_is_an_index_range_not_a_scan(self) -> None:
-        """The PK leads (environment, hour) so one block is one seek.
+        """The PK leads (stream_id, environment, hour) so one block is
+        one seek — widened at migration 10 (WP-23) to include stream_id,
+        which is what lets a branch's own Timeline stay an index range
+        too, not merely mainline's.
 
         Pinned because the column order is the entire reason the table
         can be read at request time: keyed (environment, script, hour)
@@ -3511,9 +3524,10 @@ class ScriptHoursTest(StorageTestBase):
         plan = self.store._conn().execute(
             "EXPLAIN QUERY PLAN SELECT script, hour, result, count, "
             "first_start, last_end FROM script_hours "
-            "WHERE environment = ? AND hour >= ? AND hour <= ? "
-            "ORDER BY script, hour",
-            ("linux-sim", "2026-07-01T00", "2026-07-01T23"),
+            "WHERE stream_id = ? AND environment = ? AND hour >= ? "
+            "AND hour <= ? ORDER BY script, hour",
+            (storage.MAINLINE_STREAM_ID, "linux-sim", "2026-07-01T00",
+             "2026-07-01T23"),
         ).fetchall()
         detail = " ".join(str(row[-1]) for row in plan)
         self.assertIn("SEARCH", detail.upper(), detail)
@@ -3838,24 +3852,43 @@ class LegacyUniqueCollisionTest(StorageTestBase):
 
 
 class DerivedTablePartitionIsolationTest(StorageTestBase):
-    """docs/STREAMS_PLAN.md §0.5/§3.1: activity_hours/script_hours are
-    mainline-only. A branch-only import must leave their row counts (and
-    contents) byte-identical — this is what keeps branch runs out of the
-    staleness cutoff, the trend and the Timeline without touching those
-    code paths at all."""
+    """docs/STREAMS_PLAN.md §5.1/§5.2 (WP-23): ``activity_hours``/
+    ``script_hours`` are maintained for EVERY stream now (the WP-21 skip
+    that kept them mainline-only is gone — see :meth:`upsert_runs`), so
+    the invariant this class pins is no longer "a branch import touches
+    neither table" — it is PARTITION ISOLATION: a write to one stream's
+    partition (``stream_id`` leads both tables' PRIMARY KEY) can never
+    change so much as one row of another stream's partition, in either
+    direction. This is the guard test named in WP-23's spec, WIDENED
+    rather than weakened per CLAUDE.md's rule — the commit message says
+    so: the old assertion ("branch import leaves the tables unchanged")
+    is now FALSE by design (a branch's own trend needs its own rows);
+    what must still hold, and what these tests now check instead, is
+    that each stream's rows are exactly what that stream's own runs
+    would produce, and never leak into another stream's rows.
+    """
 
-    def _snapshot(self) -> "Tuple[List[Tuple[Any, ...]], List[Tuple[Any, ...]]]":
-        conn = self.store._conn()
+    @staticmethod
+    def _partition(
+        conn: "sqlite3.Connection", stream_id: int
+    ) -> "Tuple[List[Tuple[Any, ...]], List[Tuple[Any, ...]]]":
         activity = conn.execute(
-            "SELECT * FROM activity_hours ORDER BY 1, 2, 3").fetchall()
+            "SELECT * FROM activity_hours WHERE stream_id = ? "
+            "ORDER BY 1, 2, 3, 4", (stream_id,)).fetchall()
         script = conn.execute(
-            "SELECT * FROM script_hours ORDER BY 1, 2, 3, 4").fetchall()
+            "SELECT * FROM script_hours WHERE stream_id = ? "
+            "ORDER BY 1, 2, 3, 4, 5", (stream_id,)).fetchall()
         return activity, script
 
-    def test_a_branch_only_import_leaves_both_tables_unchanged(
+    def test_a_branch_only_import_leaves_the_mainline_partition_untouched(
             self) -> None:
+        """Mainline seeded first; a branch-only import must not add,
+        remove or alter a single mainline row — but the branch DOES gain
+        its own rows now (the point of WP-23), so this checks the
+        mainline partition specifically, not "the tables" as a whole."""
         self.store.upsert_runs([make_record()])  # mainline seed
-        before_activity, before_script = self._snapshot()
+        conn = self.store._conn()
+        before_mainline = self._partition(conn, storage.MAINLINE_STREAM_ID)
         self.store.upsert_runs([
             make_record(test_name="test_b", branch="feat/x",
                         start=BASE + datetime.timedelta(hours=2)),
@@ -3863,21 +3896,66 @@ class DerivedTablePartitionIsolationTest(StorageTestBase):
                         result=Result.FAIL,
                         start=BASE + datetime.timedelta(hours=3)),
         ])
-        after_activity, after_script = self._snapshot()
-        self.assertEqual(before_activity, after_activity)
-        self.assertEqual(before_script, after_script)
+        after_mainline = self._partition(conn, storage.MAINLINE_STREAM_ID)
+        self.assertEqual(before_mainline, after_mainline)
+        # And the branch's own partition is NOT empty -- WP-23 deleted
+        # the skip specifically so this would be true.
+        branch_id = self.store.list_streams("")[0].stream_id
+        branch_activity, branch_script = self._partition(conn, branch_id)
+        self.assertEqual(len(branch_activity), 2)  # two hours, two runs
+        self.assertEqual(len(branch_script), 2)
 
-    def test_a_pure_branch_estate_has_empty_derived_tables(self) -> None:
-        """No mainline data at all: the tables stay at their seeded
-        (empty) state, not merely "unchanged from a snapshot"."""
+    def test_a_mainline_import_leaves_an_existing_branch_partition_untouched(
+            self) -> None:
+        """The reverse direction: seed a branch first, then import more
+        mainline data. The branch's own rows must be untouched."""
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        branch_id = self.store.list_streams("")[0].stream_id
+        conn = self.store._conn()
+        before_branch = self._partition(conn, branch_id)
+        self.store.upsert_runs([
+            make_record(test_name="test_mainline",
+                        start=BASE + datetime.timedelta(hours=5)),
+        ])
+        after_branch = self._partition(conn, branch_id)
+        self.assertEqual(before_branch, after_branch)
+
+    def test_a_pure_branch_estate_has_an_empty_mainline_partition(
+            self) -> None:
+        """No mainline data at all: stream 1's partition of both tables
+        stays at its seeded (empty) state -- not merely "unchanged from
+        a snapshot" -- even though the branch's OWN partition is not
+        empty (WP-23's whole point: the branch gets its own rows)."""
         self.store.upsert_runs([make_record(branch="feat/x")])
         conn = self.store._conn()
-        self.assertEqual(
-            conn.execute("SELECT COUNT(*) FROM activity_hours")
-            .fetchone()[0], 0)
-        self.assertEqual(
-            conn.execute("SELECT COUNT(*) FROM script_hours")
-            .fetchone()[0], 0)
+        mainline_activity, mainline_script = self._partition(
+            conn, storage.MAINLINE_STREAM_ID)
+        self.assertEqual(mainline_activity, [])
+        self.assertEqual(mainline_script, [])
+        branch_id = self.store.list_streams("")[0].stream_id
+        branch_activity, branch_script = self._partition(conn, branch_id)
+        self.assertEqual(len(branch_activity), 1)
+        self.assertEqual(len(branch_script), 1)
+
+    def test_two_branches_do_not_leak_into_each_other(self) -> None:
+        """Not just mainline vs. one branch: two SIBLING branches must
+        stay isolated from each other too -- partition isolation is a
+        property of stream_id in general, not a mainline special case."""
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        self.store.upsert_runs([
+            make_record(test_name="test_b", branch="feat/y",
+                        result=Result.FAIL,
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        conn = self.store._conn()
+        streams = {s.name: s.stream_id for s in self.store.list_streams("")}
+        x_activity, x_script = self._partition(conn, streams["feat/x"])
+        y_activity, y_script = self._partition(conn, streams["feat/y"])
+        self.assertEqual(len(x_activity), 1)
+        self.assertEqual(len(y_activity), 1)
+        self.assertNotEqual(x_activity, y_activity)
+        self.assertEqual(len(x_script), 1)
+        self.assertEqual(len(y_script), 1)
 
 
 class CompareStreamsTest(StorageTestBase):

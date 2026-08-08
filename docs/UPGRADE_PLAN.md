@@ -98,8 +98,9 @@ after a merge.
 | 7 | WP-18 | `script_hours` table *(took 7 from WP-15 — see below)* | Yes — see §1.2 |
 | 8 | WP-20 | `environment_products` table *(took 8 from WP-15 — see below)* | No |
 | 9 | WP-21 | `streams` table, `runs.stream_id`, `comments.stream_id`, `assignments.stream_id`, `current_assignments.stream_id`, `latest_runs` rebuilt with `stream_id` *(took 9 from WP-15 — see below; the two `assignments`/`current_assignments` columns were folded in after this entry first landed but before this branch shipped anywhere — see the entry's own comment in `storage.py`)* | Yes — see §1.2 (`latest_runs` rebuild; ~12k rows) |
-| 10 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8, then 9 — see below)* | No |
-| 11+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 10 | WP-23 | `activity_hours`/`script_hours` rebuilt with `stream_id` in their PRIMARY KEY *(took 10 from WP-15 — see below)* | Yes — see §1.2 (both tables rebuilt; a straight copy, not a `runs` re-aggregate — ~1k + ~22k rows on the dev copy) |
+| 11 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8, then 9, then 10 — see below)* | No |
+| 12+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Why 6 and 7 swapped (2026-07-30).** Versions must ship contiguously —
 `tests/test_migrations.py` enforces it, and a database at version 7 with no 6
@@ -133,8 +134,18 @@ order.)
 time, same day: WP-21 (streams, drop 2 of `docs/STREAMS_PLAN.md`) shipped
 while `wp-14-in-run-progress` was still parked, so the ship-first package
 took the next contiguous number (9) and the parked claim moved back one
-(10). This is the CURRENT instruction: **when the WIP branch comes back it
-must renumber its migration entry to 10 before merging.**
+(10). (This note originally said the WIP branch must renumber its migration
+entry to 10 before merging — **superseded by the next note**, which moved
+that target to 11. Left here rather than deleted so the history of the swap
+reads in order.)
+
+**And why 10 and 11 swapped too (2026-08-08).** The same situation a fifth
+time, same day: WP-23 (long-running branch streams, drop 4 of
+`docs/STREAMS_PLAN.md`) shipped while `wp-14-in-run-progress` was still
+parked, so the ship-first package took the next contiguous number (10) and
+the parked claim moved back one (11). This is the CURRENT instruction:
+**when the WIP branch comes back it must renumber its migration entry to
+11 before merging.**
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry

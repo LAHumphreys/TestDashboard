@@ -759,6 +759,50 @@ MIGRATIONS = [
             "python: rebuild_latest_runs_with_stream",
         ],
     ),
+    (
+        10,
+        [
+            # activity_hours/script_hours gain stream_id in their PRIMARY
+            # KEY (docs/STREAMS_PLAN.md §5.1, WP-23: long-running branch
+            # streams get their own trend/staleness, not just a delta
+            # view). Both are DERIVED tables, same shape as latest_runs at
+            # migration 9: SQLite cannot widen a PRIMARY KEY with ALTER,
+            # so this is CREATE new / INSERT..SELECT / DROP / RENAME.
+            #
+            # Every existing row gets stream_id = 1 (a LITERAL, not a
+            # re-aggregation from `runs`): both tables have been
+            # mainline-only since migration 6/7 (the WP-21 writer
+            # explicitly skipped maintaining them for stream_id != 1), so
+            # every row on file already IS mainline's — copying is
+            # correct and far cheaper than re-deriving from `runs`, which
+            # is why this is a straight row copy rather than the
+            # GROUP-BY-over-runs shape _rebuild_activity_hours uses.
+            #
+            # Takes 10 from WP-15's parked reservation, which moves to
+            # 11 — the fifth time this exact swap has happened (see
+            # UPGRADE_PLAN.md §1's running note); the WIP branch must
+            # renumber to 11 before it merges.
+            #
+            # MEASURED on a COPY of the dev database (220 MB, 540,192
+            # runs, 12,008 tests, brought to version 9 first so this is
+            # entry 10 alone): 0.038-0.041s across two runs, rebuilding
+            # 1,077 activity_hours rows and 21,988 script_hours rows
+            # (both a straight copy with stream_id=1, not a re-aggregate
+            # over `runs` — see above). Captured in the commit message
+            # and docs/drops/2026-08-14.md. This is DEV data, not
+            # production (roughly four times its size per CLAUDE.md) and
+            # has not been measured from here.
+            #
+            # Each step below does its own CREATE TABLE ... _new / INSERT
+            # ../SELECT / DROP / RENAME internally (see
+            # :func:`_rebuild_activity_hours_with_stream` and
+            # :func:`_rebuild_script_hours_with_stream`) — the same
+            # single-python-step shape migration 9 used for latest_runs;
+            # there is no separate literal DDL step here.
+            "python: rebuild_activity_hours_with_stream",
+            "python: rebuild_script_hours_with_stream",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: Prefix marking a migration step that runs Python instead of SQL.
@@ -950,6 +994,141 @@ def _rebuild_latest_runs_with_stream(conn: sqlite3.Connection) -> None:
         )
 
 
+def _rebuild_activity_hours_with_stream(conn: sqlite3.Connection) -> None:
+    """Rebuild ``activity_hours`` with ``stream_id`` in its key (migration 10).
+
+    Same shape as :func:`_rebuild_latest_runs_with_stream`: CREATE new /
+    INSERT..SELECT / DROP / RENAME, because SQLite cannot widen a
+    PRIMARY KEY with ALTER. Every existing row copies across with
+    ``stream_id = 1`` (a literal, not a re-aggregation from ``runs``) —
+    this table has been mainline-only since migration 6, so every row on
+    file already IS mainline's (docs/STREAMS_PLAN.md §5.1).
+
+    This function is distinct from :func:`_rebuild_activity_hours`
+    (kept unchanged: migration 6's step still runs it against the
+    pre-stream table shape on a fresh install) and from the runtime
+    rebuild :meth:`Storage.prune_runs_before` uses post-migration-10
+    (:func:`_rebuild_activity_hours_all_streams`, which re-aggregates
+    from ``runs`` because a prune can touch every stream's rows).
+    """
+    started = time.time()
+    conn.execute(
+        "CREATE TABLE activity_hours_new ("
+        "stream_id INTEGER NOT NULL DEFAULT 1 REFERENCES streams(id), "
+        "environment TEXT NOT NULL, "
+        "hour TEXT NOT NULL, "
+        "result TEXT NOT NULL, "
+        "count INTEGER NOT NULL, "
+        "PRIMARY KEY (stream_id, environment, hour, result)"
+        ")"
+    )
+    cursor = conn.execute(
+        "INSERT INTO activity_hours_new "
+        "(stream_id, environment, hour, result, count) "
+        "SELECT 1, environment, hour, result, count FROM activity_hours"
+    )
+    conn.execute("DROP TABLE activity_hours")
+    conn.execute("ALTER TABLE activity_hours_new RENAME TO activity_hours")
+    if cursor.rowcount:
+        print(
+            "activity_hours: rebuilt {0} rows with stream_id in {1:.1f}s"
+            .format(cursor.rowcount, time.time() - started),
+            flush=True,
+        )
+
+
+def _rebuild_script_hours_with_stream(conn: sqlite3.Connection) -> None:
+    """Rebuild ``script_hours`` with ``stream_id`` in its key (migration 10).
+
+    See :func:`_rebuild_activity_hours_with_stream` — same shape, same
+    reasoning, the ``script_hours`` twin.
+    """
+    started = time.time()
+    conn.execute(
+        "CREATE TABLE script_hours_new ("
+        "stream_id INTEGER NOT NULL DEFAULT 1 REFERENCES streams(id), "
+        "environment TEXT NOT NULL, "
+        "hour TEXT NOT NULL, "
+        "script TEXT NOT NULL, "
+        "result TEXT NOT NULL, "
+        "count INTEGER NOT NULL, "
+        "first_start TEXT NOT NULL, "
+        "last_end TEXT NOT NULL, "
+        "PRIMARY KEY (stream_id, environment, hour, script, result)"
+        ")"
+    )
+    cursor = conn.execute(
+        "INSERT INTO script_hours_new (stream_id, environment, hour, "
+        "script, result, count, first_start, last_end) "
+        "SELECT 1, environment, hour, script, result, count, first_start, "
+        "last_end FROM script_hours"
+    )
+    conn.execute("DROP TABLE script_hours")
+    conn.execute("ALTER TABLE script_hours_new RENAME TO script_hours")
+    if cursor.rowcount:
+        print(
+            "script_hours: rebuilt {0} rows with stream_id in {1:.1f}s"
+            .format(cursor.rowcount, time.time() - started),
+            flush=True,
+        )
+
+
+def _rebuild_activity_hours_all_streams(conn: sqlite3.Connection) -> None:
+    """Rebuild ``activity_hours`` from ``runs``, including ``stream_id``.
+
+    Used at RUNTIME by :meth:`Storage.prune_runs_before` on an
+    already-migrated (post-migration-10) database — unlike
+    :func:`_rebuild_activity_hours`, which is what migration 6's own
+    step calls against a table that does not have ``stream_id`` yet and
+    must stay untouched for that reason. A prune can delete rows
+    belonging to ANY stream, so this re-derives every stream's
+    partition in one pass rather than assuming stream 1 (WP-23,
+    docs/STREAMS_PLAN.md §5.1/§5.2). DELETE-then-INSERT, the same
+    invariant as the un-scoped rebuild: exact equality with ``SELECT
+    stream_id, environment, SUBSTR(start_time, 1, 13), result, COUNT(*)
+    FROM runs GROUP BY 1, 2, 3, 4``.
+    """
+    started = time.time()
+    conn.execute("DELETE FROM activity_hours")
+    cursor = conn.execute(
+        "INSERT INTO activity_hours "
+        "(stream_id, environment, hour, result, count) "
+        "SELECT stream_id, environment, SUBSTR(start_time, 1, 13), result, "
+        "COUNT(*) FROM runs "
+        "GROUP BY stream_id, environment, SUBSTR(start_time, 1, 13), result"
+    )
+    if cursor.rowcount:
+        print(
+            "activity_hours: rebuilt {0} rows (all streams) in {1:.1f}s"
+            .format(cursor.rowcount, time.time() - started),
+            flush=True,
+        )
+
+
+def _rebuild_script_hours_all_streams(conn: sqlite3.Connection) -> None:
+    """Rebuild ``script_hours`` from ``runs``, including ``stream_id``.
+
+    See :func:`_rebuild_activity_hours_all_streams` — same reasoning,
+    the ``script_hours`` twin, used by the same runtime caller.
+    """
+    started = time.time()
+    conn.execute("DELETE FROM script_hours")
+    cursor = conn.execute(
+        "INSERT INTO script_hours (stream_id, environment, hour, script, "
+        "result, count, first_start, last_end) "
+        "SELECT stream_id, environment, SUBSTR(start_time, 1, 13), script, "
+        "result, COUNT(*), MIN(start_time), MAX(end_time) "
+        "FROM runs GROUP BY stream_id, environment, "
+        "SUBSTR(start_time, 1, 13), script, result"
+    )
+    if cursor.rowcount:
+        print(
+            "script_hours: rebuilt {0} rows (all streams) in {1:.1f}s"
+            .format(cursor.rowcount, time.time() - started),
+            flush=True,
+        )
+
+
 #: Python migration steps, by the name used after the prefix.
 _MIGRATION_STEPS = {
     "backfill_latest_durations": _backfill_latest_durations,
@@ -957,6 +1136,8 @@ _MIGRATION_STEPS = {
     "rebuild_script_hours": _rebuild_script_hours,
     "seed_mainline_stream": _seed_mainline_stream,
     "rebuild_latest_runs_with_stream": _rebuild_latest_runs_with_stream,
+    "rebuild_activity_hours_with_stream": _rebuild_activity_hours_with_stream,
+    "rebuild_script_hours_with_stream": _rebuild_script_hours_with_stream,
 }  # type: Dict[str, Any]
 
 
@@ -1845,7 +2026,9 @@ class Storage:
         self._backend = backend
         self._max_connections = max(1, int(max_connections))
         self._local = threading.local()
-        self._trend_cache = {}  # type: Dict[Tuple[str, Optional[str], Optional[Tuple[str, ...]]], Tuple[float, List[DailyResultCount]]]
+        # WP-23: the key gained a leading stream_id (int) so a branch's
+        # trend request can never serve, or be served by, mainline's.
+        self._trend_cache = {}  # type: Dict[Tuple[int, str, Optional[str], Optional[Tuple[str, ...]]], Tuple[float, List[DailyResultCount]]]
         self._trend_lock = threading.Lock()
         self._migrate()
 
@@ -2088,11 +2271,16 @@ class Storage:
         stamped; the active window self-heals in one push cycle.
 
         ``activity_hours``/``script_hours`` are maintained here, in the
-        same transaction, and ONLY for mainline records (WP-21,
-        docs/STREAMS_PLAN.md §0.5/§3.1): +1 for each inserted mainline
-        run, and a paired -1/+1 when an update changes a stored result.
-        Start times are immutable (they are part of the run's key), so a
-        run can never move between hours.
+        same transaction, for EVERY stream (WP-23, docs/STREAMS_PLAN.md
+        §5.1/§5.2 — before this, WP-21 skipped non-mainline records
+        entirely so a branch's activity could never pollute mainline's
+        trend/staleness; the skip is gone, and stream_id now leads both
+        tables' PRIMARY KEY, so the SAME isolation holds by construction:
+        each stream's rows are a disjoint partition, and a write to one
+        can never touch another's cells): +1 for each inserted run, and
+        a paired -1/+1 when an update changes a stored result. Start
+        times are immutable (they are part of the run's key), so a run
+        can never move between hours.
 
         ``script_hours`` is maintained the same way, with one extra
         wrinkle: its buckets carry MIN(start_time) and MAX(end_time),
@@ -2111,12 +2299,12 @@ class Storage:
         rejections = []  # type: List[UpsertRejection]
         # Net activity_hours changes for this batch, applied in one pass
         # at the end: a batch of 500 typically spans a handful of
-        # (environment, hour, result) cells, not 500.
-        deltas = {}  # type: Dict[Tuple[str, str, str], int]
+        # (stream_id, environment, hour, result) cells, not 500.
+        deltas = {}  # type: Dict[Tuple[int, str, str, str], int]
         # script_hours changes: pure growth (from inserts), merged per
         # bucket, plus the buckets an update may have shrunk.
-        grown = {}  # type: Dict[Tuple[str, str, str, str], List[Any]]
-        recompute = set()  # type: Set[Tuple[str, str, str, str]]
+        grown = {}  # type: Dict[Tuple[int, str, str, str, str], List[Any]]
+        recompute = set()  # type: Set[Tuple[int, str, str, str, str]]
         # WP-21: per-batch caches so a whole batch of one branch costs
         # one product lookup and one stream find-or-create, not one per
         # record; and the observed first/last seen bounds, widened onto
@@ -2239,22 +2427,21 @@ class Storage:
                     )
                     run_id = int(cursor.lastrowid)
                     inserted += 1
-                    if stream_id == MAINLINE_STREAM_ID:
-                        key2 = (rec.environment, hour, rec.result.value)
-                        deltas[key2] = deltas.get(key2, 0) + 1
-                        script_key = (
-                            rec.environment, hour, rec.script,
-                            rec.result.value,
-                        )
-                        growth = grown.get(script_key)
-                        if growth is None:
-                            grown[script_key] = [1, start, end]
-                        else:
-                            growth[0] += 1
-                            if start < growth[1]:
-                                growth[1] = start
-                            if end > growth[2]:
-                                growth[2] = end
+                    key2 = (stream_id, rec.environment, hour, rec.result.value)
+                    deltas[key2] = deltas.get(key2, 0) + 1
+                    script_key = (
+                        stream_id, rec.environment, hour, rec.script,
+                        rec.result.value,
+                    )
+                    growth = grown.get(script_key)
+                    if growth is None:
+                        grown[script_key] = [1, start, end]
+                    else:
+                        growth[0] += 1
+                        if start < growth[1]:
+                            growth[1] = start
+                        if end > growth[2]:
+                            growth[2] = end
                 else:
                     run_id = int(row[0])
                     conn.execute(
@@ -2271,26 +2458,29 @@ class Storage:
                         ),
                     )
                     updated += 1
-                    if stream_id == MAINLINE_STREAM_ID:
-                        if row[1] != rec.result.value:
-                            old_key = (rec.environment, hour, row[1])
-                            new_key = (
-                                rec.environment, hour, rec.result.value
-                            )
-                            deltas[old_key] = deltas.get(old_key, 0) - 1
-                            deltas[new_key] = deltas.get(new_key, 0) + 1
-                        if row[1] != rec.result.value or row[2] != end:
-                            # Either bucket may have shrunk; both are
-                            # recomputed from `runs` once the batch's row
-                            # writes are all in. When only the end time
-                            # changed the two keys are the same key.
-                            recompute.add(
-                                (rec.environment, hour, rec.script, row[1])
-                            )
-                            recompute.add((
-                                rec.environment, hour, rec.script,
-                                rec.result.value,
-                            ))
+                    if row[1] != rec.result.value:
+                        old_key = (
+                            stream_id, rec.environment, hour, row[1]
+                        )
+                        new_key = (
+                            stream_id, rec.environment, hour,
+                            rec.result.value,
+                        )
+                        deltas[old_key] = deltas.get(old_key, 0) - 1
+                        deltas[new_key] = deltas.get(new_key, 0) + 1
+                    if row[1] != rec.result.value or row[2] != end:
+                        # Either bucket may have shrunk; both are
+                        # recomputed from `runs` once the batch's row
+                        # writes are all in. When only the end time
+                        # changed the two keys are the same key.
+                        recompute.add((
+                            stream_id, rec.environment, hour, rec.script,
+                            row[1],
+                        ))
+                        recompute.add((
+                            stream_id, rec.environment, hour, rec.script,
+                            rec.result.value,
+                        ))
                 # The payload lives in its own table, deflated;
                 # re-importing a run replaces it — unless the
                 # fingerprint says the stored bytes are already right,
@@ -2348,54 +2538,63 @@ class Storage:
     @staticmethod
     def _apply_activity_deltas(
         conn: sqlite3.Connection,
-        deltas: Dict[Tuple[str, str, str], int],
+        deltas: Dict[Tuple[int, str, str, str], int],
     ) -> None:
         """Apply a batch's net ``activity_hours`` changes, exactly.
 
+        Keyed by ``(stream_id, environment, hour, result)`` since
+        migration 10 (WP-23): every stream is maintained, not only
+        mainline's (the WP-21 skip is gone — see :meth:`upsert_runs`).
         SELECT-then-UPDATE-or-INSERT, per this module's portability rule
         (no ``ON CONFLICT DO UPDATE`` on 3.6's sqlite). Rows that reach
         zero are DELETEd, not kept: the invariant is byte equality with
-        the ``GROUP BY`` over ``runs`` (see :func:`_rebuild_activity_hours`),
-        and a GROUP BY yields no zero-count groups.
+        the ``GROUP BY`` over ``runs`` (see
+        :func:`_rebuild_activity_hours_all_streams`), and a GROUP BY
+        yields no zero-count groups.
         """
-        for (environment, hour, result), delta in sorted(deltas.items()):
+        for (stream_id, environment, hour, result), delta in sorted(
+                deltas.items()):
             if delta == 0:
                 continue
             row = conn.execute(
-                "SELECT count FROM activity_hours WHERE environment = ? "
-                "AND hour = ? AND result = ?",
-                (environment, hour, result),
+                "SELECT count FROM activity_hours WHERE stream_id = ? "
+                "AND environment = ? AND hour = ? AND result = ?",
+                (stream_id, environment, hour, result),
             ).fetchone()
             count = (0 if row is None else int(row[0])) + delta
             if count <= 0:
                 conn.execute(
-                    "DELETE FROM activity_hours WHERE environment = ? "
-                    "AND hour = ? AND result = ?",
-                    (environment, hour, result),
+                    "DELETE FROM activity_hours WHERE stream_id = ? "
+                    "AND environment = ? AND hour = ? AND result = ?",
+                    (stream_id, environment, hour, result),
                 )
             elif row is None:
                 conn.execute(
                     "INSERT INTO activity_hours "
-                    "(environment, hour, result, count) "
-                    "VALUES (?, ?, ?, ?)",
-                    (environment, hour, result, count),
+                    "(stream_id, environment, hour, result, count) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (stream_id, environment, hour, result, count),
                 )
             else:
                 conn.execute(
                     "UPDATE activity_hours SET count = ? "
-                    "WHERE environment = ? AND hour = ? AND result = ?",
-                    (count, environment, hour, result),
+                    "WHERE stream_id = ? AND environment = ? "
+                    "AND hour = ? AND result = ?",
+                    (count, stream_id, environment, hour, result),
                 )
 
     @staticmethod
     def _apply_script_hour_changes(
         conn: sqlite3.Connection,
-        grown: Dict[Tuple[str, str, str, str], List[Any]],
-        recompute: Set[Tuple[str, str, str, str]],
+        grown: Dict[Tuple[int, str, str, str, str], List[Any]],
+        recompute: Set[Tuple[int, str, str, str, str]],
     ) -> None:
         """Apply a batch's net ``script_hours`` changes, exactly.
 
-        Two kinds of change, because MIN/MAX cannot be decremented:
+        Keyed by ``(stream_id, environment, hour, script, result)``
+        since migration 10 (WP-23) — same widening as
+        :meth:`_apply_activity_deltas`. Two kinds of change, because
+        MIN/MAX cannot be decremented:
 
         - *grown* buckets only ever got bigger (inserted runs), so the
           stored row is merged with the batch's count/min/max — one
@@ -2403,66 +2602,70 @@ class Storage:
           portability rule as :meth:`_apply_activity_deltas`.
         - *recompute* buckets may have SHRUNK (an update changed a
           stored result or end time), so they are re-derived from
-          ``runs`` outright. The query is bounded by one script's index
-          range and runs only when a re-import actually changed a
-          stored row, which the fingerprint skip makes rare. A bucket
-          both grown and recomputed is recomputed only — by the time
-          this runs, the batch's inserts are already in ``runs``, so
-          the recomputation already counts them.
+          ``runs`` outright, filtered to THIS bucket's stream so a
+          shrink on one stream can never borrow another stream's runs.
+          The query is bounded by one script's index range and runs
+          only when a re-import actually changed a stored row, which
+          the fingerprint skip makes rare. A bucket both grown and
+          recomputed is recomputed only — by the time this runs, the
+          batch's inserts are already in ``runs``, so the recomputation
+          already counts them.
 
         Rows whose count reaches zero are DELETEd: the invariant is
         equality with a GROUP BY over ``runs``, and a GROUP BY yields
         no empty groups.
         """
         for key in sorted(recompute):
-            environment, hour, script, result = key
+            stream_id, environment, hour, script, result = key
             grown.pop(key, None)
             row = conn.execute(
                 "SELECT COUNT(*), MIN(start_time), MAX(end_time) "
                 "FROM runs WHERE environment = ? AND script = ? "
-                "AND result = ? AND SUBSTR(start_time, 1, 13) = ?",
-                (environment, script, result, hour),
+                "AND result = ? AND SUBSTR(start_time, 1, 13) = ? "
+                "AND stream_id = ?",
+                (environment, script, result, hour, stream_id),
             ).fetchone()
             count = int(row[0])
             conn.execute(
-                "DELETE FROM script_hours WHERE environment = ? "
-                "AND hour = ? AND script = ? AND result = ?",
-                (environment, hour, script, result),
+                "DELETE FROM script_hours WHERE stream_id = ? "
+                "AND environment = ? AND hour = ? AND script = ? "
+                "AND result = ?",
+                (stream_id, environment, hour, script, result),
             )
             if count > 0:
                 conn.execute(
-                    "INSERT INTO script_hours (environment, hour, "
-                    "script, result, count, first_start, last_end) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (environment, hour, script, result, count,
+                    "INSERT INTO script_hours (stream_id, environment, "
+                    "hour, script, result, count, first_start, last_end) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (stream_id, environment, hour, script, result, count,
                      row[1], row[2]),
                 )
         for key, growth in sorted(grown.items()):
-            environment, hour, script, result = key
+            stream_id, environment, hour, script, result = key
             row = conn.execute(
                 "SELECT count, first_start, last_end FROM script_hours "
-                "WHERE environment = ? AND hour = ? AND script = ? "
-                "AND result = ?",
-                (environment, hour, script, result),
+                "WHERE stream_id = ? AND environment = ? AND hour = ? "
+                "AND script = ? AND result = ?",
+                (stream_id, environment, hour, script, result),
             ).fetchone()
             if row is None:
                 conn.execute(
-                    "INSERT INTO script_hours (environment, hour, "
-                    "script, result, count, first_start, last_end) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (environment, hour, script, result,
+                    "INSERT INTO script_hours (stream_id, environment, "
+                    "hour, script, result, count, first_start, last_end) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (stream_id, environment, hour, script, result,
                      growth[0], growth[1], growth[2]),
                 )
             else:
                 conn.execute(
                     "UPDATE script_hours SET count = ?, first_start = ?, "
-                    "last_end = ? WHERE environment = ? AND hour = ? "
-                    "AND script = ? AND result = ?",
+                    "last_end = ? WHERE stream_id = ? AND environment = ? "
+                    "AND hour = ? AND script = ? AND result = ?",
                     (
                         int(row[0]) + growth[0],
                         min(row[1], growth[1]),
                         max(row[2], growth[2]),
-                        environment, hour, script, result,
+                        stream_id, environment, hour, script, result,
                     ),
                 )
 
@@ -2944,8 +3147,9 @@ class Storage:
         recent_cutoff: datetime.datetime,
         environment: Optional[str] = None,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[RollupCount]:
-        """Group the whole estate by environment, result, previous result.
+        """Group one stream's estate by environment, result, previous result.
 
         Returns a few dozen :class:`RollupCount` cells — one GROUP BY over
         ``latest_runs`` — from which
@@ -2953,9 +3157,13 @@ class Storage:
         headline number. A test counts as having run recently when its
         latest run started at or after *recent_cutoff*. *environments* is
         the WP-20 ``product=`` filter — see :meth:`_environments_clause`.
-        Mainline only (WP-21): ``/api/summary`` stays mainline-only in
-        this drop (docs/STREAMS_PLAN.md §3.5), so this is never given a
-        ``stream_id`` parameter — every caller reads stream 1.
+        *stream_id* (WP-23, default mainline): ``/api/summary`` was
+        mainline-only through WP-21/22 (docs/STREAMS_PLAN.md §3.5); WP-23
+        gives a long-running branch its OWN headline tiles by scoping
+        this the same way :meth:`dashboard` already scopes its rows —
+        ``/api/summary`` itself stays mainline by default (unchanged
+        behaviour for every existing caller), but the "own results" tab
+        reads this with the branch's stream id.
         """
         sql = (
             "SELECT lr.environment, lr.result, lr.prev_result, "
@@ -2969,7 +3177,7 @@ class Storage:
         )
         params = [model.format_iso(recent_cutoff)]  # type: List[Any]
         where = ["lr.stream_id = ?"]  # type: List[str]
-        params.append(MAINLINE_STREAM_ID)
+        params.append(stream_id)
         if environment is not None:
             where.append("lr.environment = ?")
             params.append(environment)
@@ -2999,17 +3207,23 @@ class Storage:
         self,
         environment: Optional[str] = None,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> int:
         """Count tests that have an assignee and are FAIL or UNEXPECTED_PASS.
 
-        Mainline only (WP-21) — see :meth:`summary_rollup`.
+        *stream_id* (WP-23, default mainline) — see :meth:`summary_rollup`.
+        Assignment itself is never partitioned by stream (it is an
+        annotation on the triple, docs/STREAMS_PLAN.md §0.4), so this
+        still reads the ONE current assignee; what changes is which
+        stream's ``latest_runs`` partition supplies the FAIL/
+        UNEXPECTED_PASS result the count is gated on.
         """
         sql = (
             "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN + " WHERE "
             + _QUEUE_PREDICATES["assigned"] + " AND " + self._NOT_RETIRED
             + " AND lr.stream_id = ?"
         )
-        params = [MAINLINE_STREAM_ID]  # type: List[Any]
+        params = [stream_id]  # type: List[Any]
         if environment is not None:
             sql += " AND lr.environment = ?"
             params.append(environment)
@@ -3020,7 +3234,9 @@ class Storage:
         return int(self._conn().execute(sql, params).fetchone()[0])
 
     def activity_buckets(
-        self, since: datetime.datetime
+        self,
+        since: datetime.datetime,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[Tuple[str, datetime.datetime, int]]:
         """(environment, hour, runs) for every active hour since *since*.
 
@@ -3047,12 +3263,22 @@ class Storage:
         hour at the 14-day edge — and :func:`analytics.recent_cutoff`
         clamps to the floor anyway, so an extra old bucket cannot move
         the answer.
+
+        *stream_id* (WP-23, migration 10, default mainline): every
+        estate-wide caller before this drop implicitly read mainline
+        because the table held nothing else; now that every stream is
+        maintained, an unfiltered read would silently MIX a branch's
+        activity into mainline's own pass detection the moment a branch
+        reports against the same environment. This is the fix for that
+        latent cross-stream leak (docs/STREAMS_PLAN.md §5.1/§5.2) as
+        much as it is the "own results" tab's own scoping mechanism —
+        the parameter is the same one either way.
         """
         rows = self._conn().execute(
             "SELECT environment, hour, SUM(count) FROM activity_hours "
-            "WHERE hour >= ? GROUP BY environment, hour "
-            "ORDER BY environment, hour",
-            (model.format_iso(since)[:13],),
+            "WHERE stream_id = ? AND hour >= ? "
+            "GROUP BY environment, hour ORDER BY environment, hour",
+            (stream_id, model.format_iso(since)[:13]),
         ).fetchall()
         return [
             (row[0], model.parse_iso(row[1] + ":00:00.000000"), int(row[2]))
@@ -3064,6 +3290,7 @@ class Storage:
         environment: str,
         since: datetime.datetime,
         until: datetime.datetime,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[ScriptHourBucket]:
         """Every ``script_hours`` bucket for one environment's window.
 
@@ -3073,18 +3300,23 @@ class Storage:
 
         Read from ``script_hours`` (migration 7), never from ``runs``:
         the window is one block of hours for one environment, and the
-        PRIMARY KEY leads (environment, hour), so this is a pure index
-        range over a table that grows like scripts x active hours. Both
-        edges are quantised to their hour, which can only WIDEN the
-        window — the caller trims executions to the exact block, and an
-        extra boundary bucket cannot invent one (block edges are, by
+        PRIMARY KEY leads (stream_id, environment, hour), so filtering
+        *stream_id* (WP-23, default mainline — the Timeline's own
+        ``stream=`` param) keeps this a pure index range over a table
+        that grows like streams x scripts x active hours, rather than
+        mixing a branch's script executions into mainline's Timeline the
+        moment it reports against the same environment. Both edges are
+        quantised to their hour, which can only WIDEN the window — the
+        caller trims executions to the exact block, and an extra
+        boundary bucket cannot invent one (block edges are, by
         construction, more than the execution gap apart).
         """
         rows = self._conn().execute(
             "SELECT script, hour, result, count, first_start, last_end "
-            "FROM script_hours WHERE environment = ? "
+            "FROM script_hours WHERE stream_id = ? AND environment = ? "
             "AND hour >= ? AND hour <= ? ORDER BY script, hour",
             (
+                stream_id,
                 environment,
                 model.format_iso(since)[:13],
                 model.format_iso(until)[:13],
@@ -3102,15 +3334,28 @@ class Storage:
             for row in rows
         ]
 
-    def script_test_counts(self, environment: str) -> Dict[str, int]:
+    def script_test_counts(
+        self,
+        environment: str,
+        stream_id: int = MAINLINE_STREAM_ID,
+    ) -> Dict[str, int]:
         """How many tests each of an environment's scripts has, INFERRED.
 
         The "of 45" in the Timeline's "ran 41 of 45 known tests" — what
         makes a partial run of a script visible as one. One row per
         test via ``latest_runs`` (an index range on the PRIMARY KEY,
-        which leads with ``environment``), excluding retired tests for
-        the usual reason: they are not in the suite, so a run that
-        skips them has not missed anything.
+        which leads with ``stream_id, environment``), excluding retired
+        tests for the usual reason: they are not in the suite, so a run
+        that skips them has not missed anything.
+
+        *stream_id* (WP-23, migration 10, default mainline): before this
+        parameter existed, this always read EVERY stream's rows for the
+        triple (``latest_runs`` holds one row per test PER STREAM since
+        migration 9), so a branch reporting against the same environment
+        silently inflated mainline's own "known tests" denominator —
+        found by the WP-23 sweep for cross-stream leaks
+        (docs/STREAMS_PLAN.md §5.1/§5.2), not by a plan line naming this
+        method specifically.
 
         A high-water mark, like every count inferred from
         ``latest_runs`` — a test that quietly stopped running still
@@ -3123,13 +3368,15 @@ class Storage:
             "  ON tr.environment = lr.environment "
             " AND tr.script = lr.script "
             " AND tr.test_name = lr.test_name "
-            "WHERE lr.environment = ? AND " + self._NOT_RETIRED +
-            " GROUP BY lr.script",
-            (environment,),
+            "WHERE lr.stream_id = ? AND lr.environment = ? AND "
+            + self._NOT_RETIRED + " GROUP BY lr.script",
+            (stream_id, environment),
         ).fetchall()
         return {row[0]: int(row[1]) for row in rows}
 
-    def test_counts_by_environment(self) -> Dict[str, int]:
+    def test_counts_by_environment(
+        self, stream_id: int = MAINLINE_STREAM_ID
+    ) -> Dict[str, int]:
         """How many tests each environment currently has, INFERRED.
 
         The denominator for "did that block of activity actually cover
@@ -3142,6 +3389,12 @@ class Storage:
         coverage test — and a failed coverage test is SILENT, dropping
         the cutoff back to the wall clock with nothing to see.
 
+        *stream_id* (WP-23, migration 10, default mainline) — see
+        :meth:`script_test_counts` for why this parameter exists: an
+        unfiltered read here counted every stream's copy of a test
+        towards the SAME environment's denominator, which is the same
+        latent cross-stream leak, one level up.
+
         Even so this is a high-water mark: a test that quietly stopped
         being run and was never retired stays here forever. That is what
         :meth:`declared_test_counts` exists to override.
@@ -3152,7 +3405,9 @@ class Storage:
             "  ON tr.environment = lr.environment "
             " AND tr.script = lr.script "
             " AND tr.test_name = lr.test_name "
-            "WHERE " + self._NOT_RETIRED + " GROUP BY lr.environment"
+            "WHERE lr.stream_id = ? AND " + self._NOT_RETIRED
+            + " GROUP BY lr.environment",
+            (stream_id,),
         ).fetchall()
         return {row[0]: int(row[1]) for row in rows}
 
@@ -3448,6 +3703,18 @@ class Storage:
             "SELECT COUNT(*) FROM latest_runs WHERE stream_id = ?",
             (stream_id,),
         ).fetchone()[0])
+        # WP-23, migration 10: these two are now maintained per stream
+        # too, so a stream drop must clear its own partition of them or
+        # the "derived == GROUP BY over runs" invariant rots silently
+        # the moment its runs are gone but its hour buckets are not.
+        counts["activity_hours"] = int(conn.execute(
+            "SELECT COUNT(*) FROM activity_hours WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0])
+        counts["script_hours"] = int(conn.execute(
+            "SELECT COUNT(*) FROM script_hours WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0])
         return counts
 
     def delete_stream(self, stream_id: int) -> Dict[str, int]:
@@ -3488,6 +3755,19 @@ class Storage:
                 "DELETE FROM latest_runs WHERE stream_id = ?", (stream_id,)
             )
             deleted["latest_runs"] = int(cursor.rowcount)
+            # WP-23, migration 10: this stream's own hour-table
+            # partitions, deleted before `runs` for the same "derived
+            # rows before the rows they were derived from" ordering.
+            cursor = conn.execute(
+                "DELETE FROM activity_hours WHERE stream_id = ?",
+                (stream_id,),
+            )
+            deleted["activity_hours"] = int(cursor.rowcount)
+            cursor = conn.execute(
+                "DELETE FROM script_hours WHERE stream_id = ?",
+                (stream_id,),
+            )
+            deleted["script_hours"] = int(cursor.rowcount)
             cursor = conn.execute(
                 "DELETE FROM runs WHERE stream_id = ?", (stream_id,)
             )
@@ -4269,6 +4549,7 @@ class Storage:
         assignee: Optional[str],
         stale_before: Optional[datetime.datetime] = None,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> Tuple[str, List[Any]]:
         """Build the WHERE clause for one triage queue.
 
@@ -4277,10 +4558,16 @@ class Storage:
         appearing in the work queues — and the ``not_run`` queue, where
         that approval is given, is exactly where they would otherwise
         pile up. *environments* is the WP-20 ``product=`` filter — see
-        :meth:`_environments_clause`. Mainline only (WP-21): triage
-        queues feed ``/api/summary``, mainline-only in this drop
-        (docs/STREAMS_PLAN.md §3.5) — a branch's failures must never
-        appear in the mainline triage queues (§0.4/§3.4).
+        :meth:`_environments_clause`. *stream_id* (WP-23, default
+        mainline): ``/api/summary``'s queues were mainline-only through
+        WP-21/22 (docs/STREAMS_PLAN.md §3.5) — a branch's failures must
+        never appear in the MAINLINE triage queues (§0.4/§3.4), which
+        still holds: the default is unchanged, and every existing caller
+        that never passes *stream_id* keeps reading stream 1. What is
+        new is the "own results" tab (§5.2), which reads a long-running
+        branch's OWN triage numbers by passing that branch's id here —
+        a second, independent set of queues, never merged with
+        mainline's.
         """
         try:
             predicate = _QUEUE_PREDICATES[kind]
@@ -4289,7 +4576,7 @@ class Storage:
         sql = " WHERE lr.stream_id = ? AND {} AND {}".format(
             predicate, Storage._NOT_RETIRED
         )
-        params = [MAINLINE_STREAM_ID]  # type: List[Any]
+        params = [stream_id]  # type: List[Any]
         if kind in _STALE_QUEUES:
             if stale_before is None:
                 raise ValueError(
@@ -4319,6 +4606,7 @@ class Storage:
         stale_before: Optional[datetime.datetime] = None,
         with_latest_comment: bool = False,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[TestStatusRow]:
         """Return one triage queue (see :data:`QUEUE_KINDS`), newest info first.
 
@@ -4328,6 +4616,7 @@ class Storage:
         a user's own tests behind other people's). Ordered by test
         identity; at most *limit* rows. :meth:`status_queue_count` gives
         the exact total. *environments* is the WP-20 ``product=`` filter.
+        *stream_id* (WP-23, default mainline) — see :meth:`_queue_clause`.
 
         *with_latest_comment* adds each test's newest comment — what
         somebody already worked out about this failure, which is the
@@ -4336,6 +4625,7 @@ class Storage:
         """
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
+            stream_id,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -4375,10 +4665,15 @@ class Storage:
         assignee: Optional[str] = None,
         stale_before: Optional[datetime.datetime] = None,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> int:
-        """Exact size of a triage queue, ignoring any display cap."""
+        """Exact size of a triage queue, ignoring any display cap.
+
+        *stream_id* (WP-23, default mainline) — see :meth:`_queue_clause`.
+        """
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
+            stream_id,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN + where
         return int(self._conn().execute(sql, params).fetchone()[0])
@@ -4515,6 +4810,7 @@ class Storage:
         since: datetime.datetime,
         environment: Optional[str] = None,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[DailyResultCount]:
         """Run counts grouped by UTC calendar day and result.
 
@@ -4529,10 +4825,16 @@ class Storage:
         midnight, for which the quantisation changes nothing; a caller
         passing mid-hour would see the boundary hour counted whole.
         *environments* is the WP-20 ``product=`` filter — see
-        :meth:`_environments_clause`; it is part of the cache key (as a
-        sorted tuple, so the same set in a different order is still one
-        cache entry) precisely so a scoped and an unscoped request for
-        the same window cannot serve each other's answer.
+        :meth:`_environments_clause`. *stream_id* (WP-23, migration 10,
+        default mainline): before this parameter existed the table held
+        only mainline's rows, so an unfiltered SUM was correct by
+        construction; now every stream is maintained, so this is BOTH
+        the fix for that latent cross-stream leak and the mechanism the
+        "own results" trend chart reads. Both are part of the cache key
+        (*environments* as a sorted tuple, so the same set in a
+        different order is still one cache entry) precisely so a scoped
+        and an unscoped — or a mainline and a branch — request for the
+        same window cannot serve each other's answer.
 
         The cache is cleared by every write this process makes (see
         :meth:`upsert_runs` and :meth:`prune_runs_before`) — but NOT by
@@ -4547,9 +4849,11 @@ class Storage:
         """
         sql = (
             "SELECT SUBSTR(hour, 1, 10) AS day, result, SUM(count) "
-            "FROM activity_hours WHERE hour >= ?"
+            "FROM activity_hours WHERE stream_id = ? AND hour >= ?"
         )
-        params = [model.format_iso(since)[:13]]  # type: List[Any]
+        params = [
+            stream_id, model.format_iso(since)[:13]
+        ]  # type: List[Any]
         if environment is not None:
             sql += " AND environment = ?"
             params.append(environment)
@@ -4564,7 +4868,7 @@ class Storage:
         envs_key = (
             None if environments is None else tuple(sorted(environments))
         )
-        key = (params[0], environment, envs_key)
+        key = (stream_id, params[1], environment, envs_key)
         cached = self._cached_trend(key)
         if cached is not None:
             return cached
@@ -4582,7 +4886,8 @@ class Storage:
         return counts
 
     def _cached_trend(
-        self, key: Tuple[str, Optional[str], Optional[Tuple[str, ...]]]
+        self,
+        key: Tuple[int, str, Optional[str], Optional[Tuple[str, ...]]],
     ) -> Optional[List[DailyResultCount]]:
         """Return a memoized trend for *key*, or None if absent/expired."""
         now = time.time()
@@ -4598,7 +4903,7 @@ class Storage:
 
     def _store_trend(
         self,
-        key: Tuple[str, Optional[str], Optional[Tuple[str, ...]]],
+        key: Tuple[int, str, Optional[str], Optional[Tuple[str, ...]]],
         counts: List[DailyResultCount],
     ) -> None:
         """Memoize a computed trend, bounding the cache size."""
@@ -4946,6 +5251,7 @@ class Storage:
                 "    AND p.script = latest_runs.script "
                 "    AND p.test_name = latest_runs.test_name "
                 "    AND p.start_time < latest_runs.start_time "
+                "    AND p.stream_id = latest_runs.stream_id "
                 "  ORDER BY p.start_time DESC LIMIT 1)"
             )
             # A prune breaks the "activity_hours == GROUP BY over runs"
@@ -4953,9 +5259,17 @@ class Storage:
             # latest-run rows make the arithmetic of a partial decrement
             # fiddly. Rebuilding is one aggregate pass over what is LEFT
             # — this is an offline maintenance path that just deleted
-            # most of the table, not a request handler.
-            _rebuild_activity_hours(conn)
-            _rebuild_script_hours(conn)
+            # most of the table, not a request handler. The all-streams
+            # variants (WP-23, migration 10): a prune can touch any
+            # stream's rows, not only mainline's, and unlike migration
+            # 6/7's own steps this runs against the LIVE (already
+            # stream_id-in-PK) schema, so it must re-derive every
+            # stream's partition, not assume stream 1
+            # (_rebuild_activity_hours/_rebuild_script_hours stay
+            # untouched — they are what a fresh install's migration 6/7
+            # steps run against the pre-stream table shape).
+            _rebuild_activity_hours_all_streams(conn)
+            _rebuild_script_hours_all_streams(conn)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

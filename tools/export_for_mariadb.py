@@ -250,14 +250,16 @@ CREATE TABLE environment_products (
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE activity_hours (
+  stream_id   BIGINT NOT NULL DEFAULT 1,
   environment {env} NOT NULL,
   hour        VARCHAR(13) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   result      {result} NOT NULL,
   count       INT NOT NULL,
-  PRIMARY KEY (environment, hour, result)
+  PRIMARY KEY (stream_id, environment, hour, result)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE script_hours (
+  stream_id   BIGINT NOT NULL DEFAULT 1,
   environment {env} NOT NULL,
   hour        VARCHAR(13) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   script      {script} NOT NULL,
@@ -265,7 +267,7 @@ CREATE TABLE script_hours (
   count       INT NOT NULL,
   first_start {stamp} NOT NULL,
   last_end    {stamp} NOT NULL,
-  PRIMARY KEY (environment, hour, script, result)
+  PRIMARY KEY (stream_id, environment, hour, script, result)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE schema_version (
