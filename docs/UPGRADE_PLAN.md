@@ -96,8 +96,9 @@ after a merge.
 | 5 | WP-13 | `environment_expectations` table | No |
 | 6 | WP-17 | `activity_hours` table, `runs.output_fingerprint` | Yes — see §1.2 |
 | 7 | WP-18 | `script_hours` table *(took 7 from WP-15 — see below)* | Yes — see §1.2 |
-| 8 | WP-15 | `run_progress` table *(renumbered from 6, then from 7 — see below)* | No |
-| 9+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 8 | WP-20 | `environment_products` table *(took 8 from WP-15 — see below)* | No |
+| 9 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8 — see below)* | No |
+| 10+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Why 6 and 7 swapped (2026-07-30).** Versions must ship contiguously —
 `tests/test_migrations.py` enforces it, and a database at version 7 with no 6
@@ -116,6 +117,13 @@ is untouched, and the MariaDB schema is only ever created by the migration
 tooling, never by the app. **When the WIP branch
 comes back it must renumber its migration entry to 8 before merging** — the
 registry is the coordination point, and this note is the hand-off.
+
+**And why 8 and 9 swapped too (2026-08-08).** The same situation a third
+time: WP-20 (products, drop 1 of `docs/STREAMS_PLAN.md`) shipped while
+`wp-14-in-run-progress` was still parked, so the ship-first package took the
+next contiguous number (8) and the parked claim moved back one (9). The
+hand-off updates accordingly: **when the WIP branch comes back it must
+renumber its migration entry to 9 before merging.**
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry

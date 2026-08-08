@@ -79,6 +79,7 @@ __all__ = [
     "Comment",
     "User",
     "EnvironmentExpectation",
+    "EnvironmentProduct",
     "UpsertCounts",
     "ScriptHourBucket",
     "Storage",
@@ -599,6 +600,40 @@ MIGRATIONS = [
             "python: rebuild_script_hours",
         ],
     ),
+    (
+        8,
+        [
+            # Environment -> product, declared. The same shape and
+            # lifecycle as `environment_expectations` (migration 5):
+            # presence of the row IS the declaration, `environment` is a
+            # case-sensitive TEXT PRIMARY KEY for the same reason as
+            # migration 5, and there is no backfill — an environment
+            # absent from this table belongs to the implicit product ""
+            # (see docs/STREAMS_PLAN.md §2.1).
+            #
+            # WP-20 (products) is drop 1 of the products & streams work
+            # (docs/STREAMS_PLAN.md). Products are a read-time grouping
+            # of environments, not a new component of test identity —
+            # there is deliberately no product column anywhere else, and
+            # `runs` is untouched.
+            #
+            # O(1): CREATE TABLE writes one page, rewrites no existing
+            # row and reads none, exactly like migration 5. MEASURED on
+            # a copy of the dev database (220 MB, at version 7): 26.8 ms
+            # including opening the connection. Production has not been
+            # measured from here and does not need to be, for the same
+            # reason migration 5 did not: nothing existing is read or
+            # rewritten, so the number cannot grow with the database.
+            """
+            CREATE TABLE environment_products (
+                environment TEXT PRIMARY KEY,
+                product     TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                updated_by  TEXT NOT NULL REFERENCES users(username)
+            )
+            """,
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: Prefix marking a migration step that runs Python instead of SQL.
@@ -923,6 +958,21 @@ class EnvironmentExpectation(NamedTuple):
     updated_by: str
 
 
+class EnvironmentProduct(NamedTuple):
+    """Which product an environment belongs to, and who said so.
+
+    Same shape and lifecycle as :class:`EnvironmentExpectation` (migration
+    5): presence of the row IS the declaration. An environment absent
+    from this table belongs to the implicit product ``""`` — see
+    migration 8 and docs/STREAMS_PLAN.md §2.1.
+    """
+
+    environment: str
+    product: str
+    updated_at: datetime.datetime
+    updated_by: str
+
+
 class ScriptHourBucket(NamedTuple):
     """One ``script_hours`` row: a script's activity inside one UTC hour.
 
@@ -1051,6 +1101,7 @@ _ENVIRONMENT_TABLES = (
     "comments",
     "test_retirements",
     "environment_expectations",
+    "environment_products",
     "activity_hours",
     "script_hours",
     "runs",
@@ -1424,7 +1475,7 @@ class Storage:
         self._backend = backend
         self._max_connections = max(1, int(max_connections))
         self._local = threading.local()
-        self._trend_cache = {}  # type: Dict[Tuple[str, Optional[str]], Tuple[float, List[DailyResultCount]]]
+        self._trend_cache = {}  # type: Dict[Tuple[str, Optional[str], Optional[Tuple[str, ...]]], Tuple[float, List[DailyResultCount]]]
         self._trend_lock = threading.Lock()
         self._migrate()
 
@@ -2004,6 +2055,31 @@ class Storage:
     #: Columns of a TestSummaryRow / TestStatusRow, in NamedTuple order.
     _STATUS_COLUMNS = ", ".join(_STATUS_COLUMN_NAMES)
 
+    @staticmethod
+    def _environments_clause(
+        environments: Optional[Sequence[str]], column: str = "lr.environment"
+    ) -> Tuple[Optional[str], List[Any]]:
+        """One AND-able clause for an optional environment allow-list.
+
+        Shared by every reader that WP-20's ``product=`` filter reaches
+        (the product is resolved to its environments once, at the API
+        boundary — storage never hears the word "product").
+
+        ``None`` means "no filter": the caller omits the clause
+        entirely, exactly as if this helper did not exist. An
+        explicitly EMPTY sequence means "match nothing" — a product
+        that resolved to zero environments (unknown, or declared with
+        none) — and must filter out every row, the opposite of no
+        filter. ``"1=0"`` says that without a parameter, which is what
+        keeps an empty ``IN ()`` (invalid SQL) off the wire.
+        """
+        if environments is None:
+            return None, []
+        if not environments:
+            return "1=0", []
+        placeholders = ", ".join("?" for _ in environments)
+        return "{} IN ({})".format(column, placeholders), list(environments)
+
     def _dashboard_filters(
         self,
         environment: Optional[str],
@@ -2014,6 +2090,7 @@ class Storage:
         include_retired: bool = False,
         assignees: Optional[Sequence[str]] = None,
         include_unassigned: bool = False,
+        environments: Optional[Sequence[str]] = None,
     ) -> Tuple[List[str], List[Any]]:
         """Build the shared WHERE clauses for the dashboard list and count.
 
@@ -2021,12 +2098,21 @@ class Storage:
         by default they are hidden, which is the whole point of retiring
         one. *assignees* and *include_unassigned* combine as OR — "show
         me Alice's and Bob's open items, plus anything nobody owns".
+        *environments* is the WP-20 product filter, resolved by the
+        caller to an allow-list — see :meth:`_environments_clause`. It
+        combines with *environment* by AND, which is never contradictory
+        in practice: a caller passes one or the other, never both with
+        different values.
         """
         clauses = []  # type: List[str]
         params = []  # type: List[Any]
         if environment is not None:
             clauses.append("lr.environment = ?")
             params.append(environment)
+        envs_clause, envs_params = self._environments_clause(environments)
+        if envs_clause is not None:
+            clauses.append(envs_clause)
+            params.extend(envs_params)
         if script is not None:
             clauses.append("lr.script = ?")
             params.append(script)
@@ -2091,6 +2177,7 @@ class Storage:
         descending: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
+        environments: Optional[Sequence[str]] = None,
     ) -> List[TestSummaryRow]:
         """Return ONE PAGE of the latest run per test, never with ``output``.
 
@@ -2102,9 +2189,12 @@ class Storage:
         whose latest run started before it ("not run recently"). Tests
         retired as no longer in the suite are hidden unless
         *include_retired*; *assignees*/*include_unassigned* narrow by
-        owner. With *with_latest_comment* each row carries the newest
-        comment on that test — an index seek per returned row, so it is
-        opt-in and never paid for by the home screen.
+        owner. *environments* is the WP-20 ``product=`` filter, already
+        resolved to an allow-list by the caller — see
+        :meth:`_environments_clause`. With *with_latest_comment* each row
+        carries the newest comment on that test — an index seek per
+        returned row, so it is opt-in and never paid for by the home
+        screen.
 
         *sort* is a key of :data:`DASHBOARD_SORTS`; every ordering ends
         with the full test identity, so *limit*/*offset* paging is stable
@@ -2122,7 +2212,7 @@ class Storage:
 
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
-            include_retired, assignees, include_unassigned,
+            include_retired, assignees, include_unassigned, environments,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -2154,6 +2244,7 @@ class Storage:
         include_retired: bool = False,
         assignees: Optional[Sequence[str]] = None,
         include_unassigned: bool = False,
+        environments: Optional[Sequence[str]] = None,
     ) -> int:
         """Exact number of tests matching the same filters as :meth:`dashboard`."""
         result_values = (
@@ -2163,7 +2254,7 @@ class Storage:
             return 0
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
-            include_retired, assignees, include_unassigned,
+            include_retired, assignees, include_unassigned, environments,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
         if clauses:
@@ -2201,6 +2292,7 @@ class Storage:
         self,
         recent_cutoff: datetime.datetime,
         environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
     ) -> List[RollupCount]:
         """Group the whole estate by environment, result, previous result.
 
@@ -2208,7 +2300,8 @@ class Storage:
         ``latest_runs`` — from which
         :func:`testboard.analytics.summarize_rollup` derives every
         headline number. A test counts as having run recently when its
-        latest run started at or after *recent_cutoff*.
+        latest run started at or after *recent_cutoff*. *environments* is
+        the WP-20 ``product=`` filter — see :meth:`_environments_clause`.
         """
         sql = (
             "SELECT lr.environment, lr.result, lr.prev_result, "
@@ -2221,9 +2314,16 @@ class Storage:
             " AND tr.script = lr.script AND tr.test_name = lr.test_name"
         )
         params = [model.format_iso(recent_cutoff)]  # type: List[Any]
+        where = []  # type: List[str]
         if environment is not None:
-            sql += " WHERE lr.environment = ?"
+            where.append("lr.environment = ?")
             params.append(environment)
+        envs_clause, envs_params = self._environments_clause(environments)
+        if envs_clause is not None:
+            where.append(envs_clause)
+            params.extend(envs_params)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += (
             " GROUP BY lr.environment, lr.result, lr.prev_result, recent, "
             "retired ORDER BY lr.environment, lr.result"
@@ -2241,7 +2341,9 @@ class Storage:
         ]
 
     def assigned_open_count(
-        self, environment: Optional[str] = None
+        self,
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
     ) -> int:
         """Count tests that have an assignee and are FAIL or UNEXPECTED_PASS."""
         sql = (
@@ -2252,6 +2354,10 @@ class Storage:
         if environment is not None:
             sql += " AND lr.environment = ?"
             params.append(environment)
+        envs_clause, envs_params = self._environments_clause(environments)
+        if envs_clause is not None:
+            sql += " AND " + envs_clause
+            params.extend(envs_params)
         return int(self._conn().execute(sql, params).fetchone()[0])
 
     def activity_buckets(
@@ -2476,6 +2582,130 @@ class Storage:
         )
         return cursor.rowcount > 0
 
+    # ------------------------------------------------------------------
+    # Declared environment -> product mapping (migration 8, WP-20)
+    # ------------------------------------------------------------------
+
+    def environment_products_map(self) -> Dict[str, str]:
+        """Every declared environment -> product mapping.
+
+        Environments absent here belong to the implicit product ``""``
+        — callers combine this with :meth:`known_environments` when they
+        need every environment accounted for, the same shape as
+        :meth:`declared_test_counts`.
+        """
+        rows = self._conn().execute(
+            "SELECT environment, product FROM environment_products"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def list_environment_products(self) -> List[EnvironmentProduct]:
+        """Every declaration, ordered by environment."""
+        rows = self._conn().execute(
+            "SELECT environment, product, updated_at, updated_by "
+            "FROM environment_products ORDER BY environment"
+        ).fetchall()
+        return [
+            EnvironmentProduct(
+                environment=row[0],
+                product=row[1],
+                updated_at=model.parse_iso(row[2]),
+                updated_by=row[3],
+            )
+            for row in rows
+        ]
+
+    def distinct_products(self) -> List[str]:
+        """Every distinct DECLARED product, sorted.
+
+        The implicit product ``""`` (environments nobody has mapped) is
+        never a member — it is "no product declared", not a product of
+        its own, and the frontend switcher's ``>= 2`` test reads this
+        list directly (docs/STREAMS_PLAN.md §2.3).
+        """
+        rows = self._conn().execute(
+            "SELECT DISTINCT product FROM environment_products "
+            "ORDER BY product"
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def environments_for_product(self, product: str) -> List[str]:
+        """Environments declared as belonging to *product*, sorted.
+
+        ``product == ""`` is the implicit grouping: every KNOWN
+        environment (see :meth:`known_environments`) that nobody has
+        mapped to a product. A named product with no environments
+        mapped to it (a typo, or one that has since been remapped) comes
+        back as an empty list — the API layer turns that into "empty
+        result", never a 404, because a product exists by having
+        environments (docs/STREAMS_PLAN.md §2.6).
+        """
+        if product == "":
+            mapped = set(self.environment_products_map())
+            return [
+                environment for environment in self.known_environments()
+                if environment not in mapped
+            ]
+        rows = self._conn().execute(
+            "SELECT environment FROM environment_products "
+            "WHERE product = ? ORDER BY environment",
+            (product,),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def set_environment_product(
+        self,
+        environment: str,
+        product: str,
+        updated_by: str,
+        updated_at: datetime.datetime,
+    ) -> EnvironmentProduct:
+        """Declare (or redeclare) which product an environment belongs to.
+
+        UPDATE-then-INSERT, the same shape as
+        :meth:`set_environment_expectation` and for the same reason:
+        ``INSERT OR REPLACE`` deletes and re-inserts, which
+        ``tests/test_sql_portability.py`` counts against a committed
+        expectation of exactly two acceptable sites, neither of them
+        this one.
+        """
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.ensure_user(updated_by, updated_at)
+            stamp = model.format_iso(updated_at)
+            cursor = conn.execute(
+                "UPDATE environment_products SET product = ?, "
+                "updated_at = ?, updated_by = ? WHERE environment = ?",
+                (product, stamp, updated_by, environment),
+            )
+            if cursor.rowcount == 0:
+                conn.execute(
+                    "INSERT INTO environment_products "
+                    "(environment, product, updated_at, updated_by) "
+                    "VALUES (?, ?, ?, ?)",
+                    (environment, product, stamp, updated_by),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return EnvironmentProduct(
+            environment=environment,
+            product=product,
+            updated_at=updated_at,
+            updated_by=updated_by,
+        )
+
+    def clear_environment_product(self, environment: str) -> bool:
+        """Drop a mapping, returning to the implicit product "". True if
+        one went."""
+        cursor = self._conn().execute(
+            "DELETE FROM environment_products WHERE environment = ?",
+            (environment,),
+        )
+        return cursor.rowcount > 0
+
     def known_environments(self) -> List[str]:
         """Every environment that has run a test or carries a declaration.
 
@@ -2501,6 +2731,7 @@ class Storage:
         rows = self._conn().execute(
             "SELECT environment FROM latest_runs "
             "UNION SELECT environment FROM environment_expectations "
+            "UNION SELECT environment FROM environment_products "
             "ORDER BY 1"
         ).fetchall()
         return [row[0] for row in rows]
@@ -2508,9 +2739,9 @@ class Storage:
     def environment_exists(self, environment: str) -> bool:
         """True if *environment* has run a test or carries a declaration.
 
-        Two index seeks, so validating one name costs nothing that grows
-        with the estate — unlike asking for the whole list and searching
-        it.
+        Three index seeks, so validating one name costs nothing that
+        grows with the estate — unlike asking for the whole list and
+        searching it.
         """
         row = self._conn().execute(
             "SELECT 1 FROM latest_runs WHERE environment = ? LIMIT 1",
@@ -2520,6 +2751,12 @@ class Storage:
             return True
         row = self._conn().execute(
             "SELECT 1 FROM environment_expectations WHERE environment = ?",
+            (environment,),
+        ).fetchone()
+        if row is not None:
+            return True
+        row = self._conn().execute(
+            "SELECT 1 FROM environment_products WHERE environment = ?",
             (environment,),
         ).fetchone()
         return row is not None
@@ -2567,6 +2804,7 @@ class Storage:
         recent_cutoff: Optional[datetime.datetime],
         environment: Optional[str] = None,
         script: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
     ) -> DurationRollup:
         """Where the suite's time went, grouped one level at a time.
 
@@ -2597,6 +2835,9 @@ class Storage:
         the suite has not run for a day and a half, which is a long
         weekend or one bad night. Refusing to show anything is not more
         honest than showing it clearly labelled.
+
+        *environments* is the WP-20 ``product=`` filter — see
+        :meth:`_environments_clause`.
         """
         column = _DURATION_GROUPS.get(group_by)
         if column is None:
@@ -2613,6 +2854,10 @@ class Storage:
         if environment is not None:
             where.append("lr.environment = ?")
             params.append(environment)
+        envs_clause, envs_params = self._environments_clause(environments)
+        if envs_clause is not None:
+            where.append(envs_clause)
+            params.extend(envs_params)
         if script is not None:
             where.append("lr.script = ?")
             params.append(script)
@@ -2660,9 +2905,16 @@ class Storage:
         )
 
     def top_failing_scripts(
-        self, environment: Optional[str] = None, limit: int = 10
+        self,
+        environment: Optional[str] = None,
+        limit: int = 10,
+        environments: Optional[Sequence[str]] = None,
     ) -> List[ScriptFailures]:
-        """Scripts with the most currently-failing tests, worst first."""
+        """Scripts with the most currently-failing tests, worst first.
+
+        *environments* is the WP-20 ``product=`` filter — see
+        :meth:`_environments_clause`.
+        """
         sql = (
             "SELECT lr.environment, lr.script, COUNT(*) AS failing "
             "FROM latest_runs AS lr "
@@ -2675,6 +2927,10 @@ class Storage:
         if environment is not None:
             sql += " AND lr.environment = ?"
             params.append(environment)
+        envs_clause, envs_params = self._environments_clause(environments)
+        if envs_clause is not None:
+            sql += " AND " + envs_clause
+            params.extend(envs_params)
         sql += (
             " GROUP BY lr.environment, lr.script "
             "ORDER BY failing DESC, lr.environment, lr.script LIMIT ?"
@@ -2693,6 +2949,7 @@ class Storage:
         environment: Optional[str],
         assignee: Optional[str],
         stale_before: Optional[datetime.datetime] = None,
+        environments: Optional[Sequence[str]] = None,
     ) -> Tuple[str, List[Any]]:
         """Build the WHERE clause for one triage queue.
 
@@ -2700,7 +2957,8 @@ class Storage:
         in the suite is precisely a statement that it should stop
         appearing in the work queues — and the ``not_run`` queue, where
         that approval is given, is exactly where they would otherwise
-        pile up.
+        pile up. *environments* is the WP-20 ``product=`` filter — see
+        :meth:`_environments_clause`.
         """
         try:
             predicate = _QUEUE_PREDICATES[kind]
@@ -2717,6 +2975,12 @@ class Storage:
         if environment is not None:
             sql += " AND lr.environment = ?"
             params.append(environment)
+        envs_clause, envs_params = Storage._environments_clause(
+            environments
+        )
+        if envs_clause is not None:
+            sql += " AND " + envs_clause
+            params.extend(envs_params)
         if assignee is not None:
             sql += " AND ca.assignee = ?"
             params.append(assignee)
@@ -2730,6 +2994,7 @@ class Storage:
         assignee: Optional[str] = None,
         stale_before: Optional[datetime.datetime] = None,
         with_latest_comment: bool = False,
+        environments: Optional[Sequence[str]] = None,
     ) -> List[TestStatusRow]:
         """Return one triage queue (see :data:`QUEUE_KINDS`), newest info first.
 
@@ -2738,7 +3003,7 @@ class Storage:
         filtered in SQL — filtering a capped queue client-side would hide
         a user's own tests behind other people's). Ordered by test
         identity; at most *limit* rows. :meth:`status_queue_count` gives
-        the exact total.
+        the exact total. *environments* is the WP-20 ``product=`` filter.
 
         *with_latest_comment* adds each test's newest comment — what
         somebody already worked out about this failure, which is the
@@ -2746,7 +3011,7 @@ class Storage:
         per returned row.
         """
         where, params = self._queue_clause(
-            kind, environment, assignee, stale_before
+            kind, environment, assignee, stale_before, environments,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -2785,10 +3050,11 @@ class Storage:
         environment: Optional[str] = None,
         assignee: Optional[str] = None,
         stale_before: Optional[datetime.datetime] = None,
+        environments: Optional[Sequence[str]] = None,
     ) -> int:
         """Exact size of a triage queue, ignoring any display cap."""
         where, params = self._queue_clause(
-            kind, environment, assignee, stale_before
+            kind, environment, assignee, stale_before, environments,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN + where
         return int(self._conn().execute(sql, params).fetchone()[0])
@@ -2913,6 +3179,7 @@ class Storage:
         self,
         since: datetime.datetime,
         environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
     ) -> List[DailyResultCount]:
         """Run counts grouped by UTC calendar day and result.
 
@@ -2926,6 +3193,11 @@ class Storage:
         *since* is quantised DOWN to its hour. Every caller passes a
         midnight, for which the quantisation changes nothing; a caller
         passing mid-hour would see the boundary hour counted whole.
+        *environments* is the WP-20 ``product=`` filter — see
+        :meth:`_environments_clause`; it is part of the cache key (as a
+        sorted tuple, so the same set in a different order is still one
+        cache entry) precisely so a scoped and an unscoped request for
+        the same window cannot serve each other's answer.
 
         The cache is cleared by every write this process makes (see
         :meth:`upsert_runs` and :meth:`prune_runs_before`) — but NOT by
@@ -2946,9 +3218,18 @@ class Storage:
         if environment is not None:
             sql += " AND environment = ?"
             params.append(environment)
+        envs_clause, envs_params = self._environments_clause(
+            environments, column="environment"
+        )
+        if envs_clause is not None:
+            sql += " AND " + envs_clause
+            params.extend(envs_params)
         sql += " GROUP BY day, result ORDER BY day, result"
 
-        key = (params[0], environment)
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = (params[0], environment, envs_key)
         cached = self._cached_trend(key)
         if cached is not None:
             return cached
@@ -2966,7 +3247,7 @@ class Storage:
         return counts
 
     def _cached_trend(
-        self, key: Tuple[str, Optional[str]]
+        self, key: Tuple[str, Optional[str], Optional[Tuple[str, ...]]]
     ) -> Optional[List[DailyResultCount]]:
         """Return a memoized trend for *key*, or None if absent/expired."""
         now = time.time()
@@ -2981,7 +3262,8 @@ class Storage:
             return counts
 
     def _store_trend(
-        self, key: Tuple[str, Optional[str]],
+        self,
+        key: Tuple[str, Optional[str], Optional[Tuple[str, ...]]],
         counts: List[DailyResultCount],
     ) -> None:
         """Memoize a computed trend, bounding the cache size."""

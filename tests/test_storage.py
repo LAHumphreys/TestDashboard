@@ -315,6 +315,27 @@ class TestDashboard(StorageTestBase):
         self.assertEqual([r.test_name for r in rows], ["test_c"])
         self.assertEqual(self.store.dashboard(environment="nope"), [])
 
+    def test_filter_environments_list_is_an_or(self) -> None:
+        """The WP-20 product filter: an allow-list of environments,
+        resolved by the caller from ``environment_products``."""
+        rows = self.store.dashboard(environments=["linux-sim", "win-uat"])
+        self.assertEqual(
+            sorted(r.test_name for r in rows),
+            ["test_a", "test_b", "test_c"])
+        rows = self.store.dashboard(environments=["win-uat"])
+        self.assertEqual([r.test_name for r in rows], ["test_c"])
+
+    def test_filter_environments_empty_list_matches_nothing(self) -> None:
+        """A product that resolved to zero environments (unknown, or
+        declared with none) must filter out everything, not act as if
+        no filter were given."""
+        self.assertEqual(self.store.dashboard(environments=[]), [])
+        self.assertEqual(
+            self.store.dashboard_count(environments=[]), 0)
+
+    def test_filter_environments_none_means_unfiltered(self) -> None:
+        self.assertEqual(len(self.store.dashboard(environments=None)), 3)
+
     def test_filter_script(self) -> None:
         rows = self.store.dashboard(script="other.py")
         self.assertEqual([r.test_name for r in rows], ["test_c"])
@@ -912,6 +933,22 @@ class TestDurationRollup(StorageTestBase):
         rollup = self.store.duration_rollup("environment", None)
         self.assertEqual(rollup.total_seconds, 37.0)
         self.assertEqual(rollup.excluded_tests, 0)
+
+    def test_environments_list_filter(self) -> None:
+        """The WP-20 product filter: an allow-list rather than one exact
+        match, so a multi-environment product scopes the same way."""
+        rollup = self.store.duration_rollup(
+            "environment", self.cutoff, environments=["linux", "win"])
+        self.assertEqual(rollup.total_seconds, 37.0)
+        rollup = self.store.duration_rollup(
+            "environment", self.cutoff, environments=["win"])
+        self.assertEqual(
+            [(s.key, s.total_seconds) for s in rollup.slices],
+            [("win", 2.0)])
+        rollup = self.store.duration_rollup(
+            "environment", self.cutoff, environments=[])
+        self.assertEqual(rollup.slices, [])
+        self.assertEqual(rollup.test_count, 0)
 
     def test_an_unknown_group_by_is_refused(self) -> None:
         """GROUP BY cannot be parameterised, so the whitelist IS the
@@ -1516,6 +1553,47 @@ class TestDailyResultCounts(StorageTestBase):
         self.assertEqual([(c.day, c.count) for c in counts],
                          [(BASE.date(), 1)])
 
+    def test_environments_list_filter(self) -> None:
+        """The WP-20 product filter: an allow-list of environments."""
+        self.store.upsert_runs([
+            make_record(environment="env-a", start=BASE),
+            make_record(environment="env-b", start=BASE),
+            make_record(environment="env-c", start=BASE),
+        ])
+        counts = self.store.daily_result_counts(
+            BASE - datetime.timedelta(days=1),
+            environments=["env-a", "env-b"],
+        )
+        self.assertEqual([(c.day, c.count) for c in counts],
+                         [(BASE.date(), 2)])
+
+    def test_environments_list_is_a_distinct_cache_key(self) -> None:
+        """A scoped and an unscoped request for the same window must not
+        serve each other's memoized answer — the bug this guards is
+        silent, not an exception."""
+        self.store.upsert_runs([
+            make_record(environment="env-a", start=BASE),
+            make_record(environment="env-b", start=BASE),
+        ])
+        since = BASE - datetime.timedelta(days=1)
+        unscoped = self.store.daily_result_counts(since)
+        scoped = self.store.daily_result_counts(
+            since, environments=["env-a"])
+        self.assertEqual([(c.day, c.count) for c in unscoped],
+                         [(BASE.date(), 2)])
+        self.assertEqual([(c.day, c.count) for c in scoped],
+                         [(BASE.date(), 1)])
+        # Ask again, in reverse order, to prove neither call is serving
+        # the other's cached entry now that both are warm.
+        self.assertEqual(
+            [(c.day, c.count)
+             for c in self.store.daily_result_counts(
+                 since, environments=["env-a"])],
+            [(BASE.date(), 1)])
+        self.assertEqual(
+            [(c.day, c.count) for c in self.store.daily_result_counts(since)],
+            [(BASE.date(), 2)])
+
 
 class TestDescribeOpenError(unittest.TestCase):
     """A failure to open the database must name the cause AND the fix.
@@ -1814,6 +1892,29 @@ class TestStatusQueues(EstateTestBase):
             ["test_win_fail"],
         )
 
+    def test_environments_list_scoping(self) -> None:
+        """The WP-20 product filter: an allow-list, not an exact match."""
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        self.assertEqual(
+            self.queue_names(
+                "new_failures", environments=["linux-sim", "win-sim"]),
+            sorted(["test_first_fail", "test_new_fail", "test_win_fail"]),
+        )
+        self.assertEqual(
+            self.store.status_queue_count(
+                "new_failures", environments=["win-sim"]),
+            1,
+        )
+        self.assertEqual(
+            self.store.status_queue_count(
+                "new_failures", environments=[]),
+            0,
+            "an empty allow-list (an unknown product) must match nothing",
+        )
+
     def test_limit_caps_rows_but_not_the_count(self) -> None:
         self.assertEqual(
             len(self.store.status_queue("new_failures", limit=1)), 1
@@ -1915,6 +2016,44 @@ class TestStatusQueues(EstateTestBase):
             [("suite.py", 3), ("other.py", 1)],
         )
         self.assertEqual(len(self.store.top_failing_scripts(limit=1)), 1)
+
+    def test_summary_rollup_environments_filter(self) -> None:
+        """The WP-20 product filter, on the query the estate headline
+        and the products[] breakdown are both built from."""
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        scoped = {
+            c.environment
+            for c in self.store.summary_rollup(
+                self.NIGHT_1, environments=["linux-sim"])
+        }
+        self.assertEqual(scoped, {"linux-sim"})
+        self.assertEqual(
+            self.store.summary_rollup(self.NIGHT_1, environments=[]), [])
+
+    def test_assigned_open_count_environments_filter(self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        self.store.set_assignee(
+            "win-sim", "suite.py", "test_win_fail", "alice", "bob", CREATED,
+        )
+        self.assertEqual(
+            self.store.assigned_open_count(environments=["win-sim"]), 1)
+        self.assertEqual(
+            self.store.assigned_open_count(environments=["linux-sim"]), 0)
+
+    def test_top_failing_scripts_environments_filter(self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="win-sim", script="other.py", test_name="test_o",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        top = self.store.top_failing_scripts(environments=["win-sim"])
+        self.assertEqual([(s.script, s.failing) for s in top],
+                          [("other.py", 1)])
 
 
 class TestFailureStreakBounds(StorageTestBase):
@@ -2480,6 +2619,147 @@ class TestEnvironmentExpectations(StorageTestBase):
             source = handle.read().decode("utf-8")
         self.assertNotIn(
             "INSERT OR REPLACE INTO environment_expectations", source)
+
+
+class TestEnvironmentProducts(StorageTestBase):
+    """Declared environment -> product mapping (migration 8, WP-20).
+
+    An environment absent from this table belongs to the implicit
+    product ``""`` — this is the read-time grouping the products
+    feature is built on, and it exists so a second product's
+    environments can be kept out of every estate view without touching
+    test identity.
+    """
+
+    def _declare(self, environment: str = "linux-sim",
+                 product: str = "Atlas") -> None:
+        self.store.set_environment_product(
+            environment, product, "alice", CREATED)
+
+    def test_nothing_is_declared_to_begin_with(self) -> None:
+        self.assertEqual(self.store.environment_products_map(), {})
+        self.assertEqual(self.store.list_environment_products(), [])
+        self.assertEqual(self.store.distinct_products(), [])
+
+    def test_declare_then_read_back(self) -> None:
+        self._declare()
+        self.assertEqual(
+            self.store.environment_products_map(), {"linux-sim": "Atlas"})
+        (row,) = self.store.list_environment_products()
+        self.assertEqual(row.environment, "linux-sim")
+        self.assertEqual(row.product, "Atlas")
+        self.assertEqual(row.updated_by, "alice")
+        self.assertEqual(row.updated_at, CREATED)
+
+    def test_redeclaring_replaces_rather_than_duplicates(self) -> None:
+        self._declare(product="Atlas")
+        later = CREATED + datetime.timedelta(days=1)
+        self.store.set_environment_product(
+            "linux-sim", "Borealis", "bob", later)
+        rows = self.store.list_environment_products()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].product, "Borealis")
+        self.assertEqual(rows[0].updated_by, "bob")
+        self.assertEqual(rows[0].updated_at, later)
+
+    def test_declaring_creates_the_user_that_did_it(self) -> None:
+        self._declare()
+        self.assertIsNotNone(self.store.get_user("alice"))
+
+    def test_clearing_returns_to_the_implicit_product(self) -> None:
+        self._declare()
+        self.assertTrue(self.store.clear_environment_product("linux-sim"))
+        self.assertEqual(self.store.environment_products_map(), {})
+
+    def test_clearing_what_was_never_declared_is_false_not_an_error(
+        self
+    ) -> None:
+        self.assertFalse(
+            self.store.clear_environment_product("never-existed"))
+
+    def test_environments_are_case_sensitive(self) -> None:
+        """Same reasoning, and the same test, as
+        TestEnvironmentExpectations.test_environments_are_case_sensitive:
+        a default MariaDB collation would fold these two together
+        (runbook B.3); this project's does not."""
+        self._declare("linux", "Atlas")
+        self._declare("Linux", "Borealis")
+        self.assertEqual(
+            self.store.environment_products_map(),
+            {"linux": "Atlas", "Linux": "Borealis"})
+
+    def test_known_environments_covers_run_and_declared_alike(
+        self
+    ) -> None:
+        """A product declared before the environment's first import, or
+        after it stopped reporting, must still be listed — the same
+        rule migration 5 established, so it can always be corrected."""
+        self.store.upsert_runs([make_record(environment="linux-sim")])
+        self._declare("retired-env", "Atlas")
+        self.assertEqual(
+            self.store.known_environments(), ["linux-sim", "retired-env"])
+
+    def test_environment_exists_is_true_once_a_product_is_declared(
+        self
+    ) -> None:
+        self.assertFalse(self.store.environment_exists("brand-new"))
+        self._declare("brand-new", "Atlas")
+        self.assertTrue(self.store.environment_exists("brand-new"))
+
+    def test_the_upsert_is_not_insert_or_replace(self) -> None:
+        """tests/test_sql_portability.py counts every OR REPLACE against
+        a committed expectation, because it deletes and re-inserts and
+        MariaDB's ON DUPLICATE KEY UPDATE does not."""
+        with open(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "testboard", "storage.py"),
+            "rb",
+        ) as handle:
+            source = handle.read().decode("utf-8")
+        self.assertNotIn(
+            "INSERT OR REPLACE INTO environment_products", source)
+
+
+class TestEnvironmentsForProduct(StorageTestBase):
+    """Resolving a product name to its member environments.
+
+    The read the WP-20 ``product=`` API filter is built on: it turns a
+    declared name into an allow-list of environments, which every
+    scoped endpoint then filters ``environment IN (...)`` on.
+    """
+
+    def test_the_implicit_product_is_every_unmapped_known_environment(
+        self
+    ) -> None:
+        self.store.upsert_runs([make_record(environment="linux-sim")])
+        self.store.upsert_runs([make_record(environment="win")])
+        self.store.set_environment_product(
+            "win", "Atlas", "alice", CREATED)
+        self.assertEqual(
+            self.store.environments_for_product(""), ["linux-sim"])
+
+    def test_a_named_product_returns_its_mapped_environments_sorted(
+        self
+    ) -> None:
+        self.store.set_environment_product(
+            "win", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "mac", "Borealis", "alice", CREATED)
+        self.assertEqual(
+            self.store.environments_for_product("Atlas"),
+            ["linux-sim", "win"])
+
+    def test_an_unknown_product_is_an_empty_list_not_an_error(self) -> None:
+        self.assertEqual(self.store.environments_for_product("Nope"), [])
+
+    def test_distinct_products_excludes_the_implicit_one(self) -> None:
+        self.store.set_environment_product(
+            "win", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([make_record(environment="linux-sim")])
+        self.assertEqual(self.store.distinct_products(), ["Atlas"])
 
 
 class TestInferredTestCounts(StorageTestBase):
