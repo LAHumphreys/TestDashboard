@@ -39,6 +39,15 @@
     <section id="test-header">
       <h1 id="test-title">Test detail</h1>
       <p id="test-identity" class="muted identity-line"></p>
+      <!-- WP-22 (docs/STREAMS_PLAN.md §4.1, explicitly asked for during
+           first human use of WP-21): jump to this triple's result on any
+           OTHER stream that has one. Hidden when there is nothing to
+           switch to (mainline-only, no branch/build has ever run this
+           test) — a one-option "switcher" is not one. -->
+      <p id="stream-switcher-field" class="muted" hidden>
+        <label for="stream-switcher-select">Viewing on</label>
+        <select id="stream-switcher-select" aria-label="Switch to another stream's result for this test"></select>
+      </p>
       <p id="source-line" hidden>Source: <a id="source-link" rel="noopener" hidden></a><span id="source-text" hidden></span></p>
       <div class="assignee-box">
         <label for="assignee-select">Assignee</label>
@@ -118,6 +127,29 @@
               </table>
             </details>
           </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- WP-22 (docs/STREAMS_PLAN.md §4.1): this triple's latest result
+         on every stream of its product, newest first. Collapsed by
+         default, the same "dig deeper" treatment as the charts above —
+         and, on a page with no non-mainline streams, this whole section
+         stays hidden rather than opening onto a one-row table. -->
+    <section id="every-build-section" hidden>
+      <details id="every-build-details" class="charts-details">
+        <summary class="charts-summary">Every build — this test's latest result on each stream</summary>
+        <div class="table-wrap">
+          <table class="data-table small">
+            <thead>
+              <tr>
+                <th>Stream</th>
+                <th>Result</th>
+                <th>When</th>
+              </tr>
+            </thead>
+            <tbody id="every-build-body"></tbody>
+          </table>
         </div>
       </details>
     </section>

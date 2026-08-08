@@ -1507,6 +1507,14 @@ def _handle_test_streams(
     dropdown next to it, which wants exactly this list and nothing more
     — a dropdown entry with no result to show is not useful.
 
+    ``product`` (WP-22) is the ENVIRONMENT's own declared product — not
+    necessarily any entry in ``results``, since a triple with no
+    non-mainline runs yet has only a mainline row, and the mainline
+    stream's own ``product`` is always ``""`` regardless of what this
+    environment is actually mapped to. Without this field the "Every
+    build" table would have no way to ask ``GET /api/streams?product=``
+    for the union it needs.
+
     404 if the triple has never run ANYWHERE — the same rule
     :func:`_handle_history` already follows, so a typo'd triple reads
     as "no such test" rather than "ran nowhere".
@@ -1521,6 +1529,7 @@ def _handle_test_streams(
             "environment": environment,
             "script": script,
             "test_name": test_name,
+            "product": storage.product_for_environment(environment),
             "results": [
                 {
                     "stream": _stream_json(entry.stream),

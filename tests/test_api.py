@@ -815,11 +815,28 @@ class TestStreamResults(ApiCase):
         self.assertEqual(data["environment"], self.ENV)
         self.assertEqual(data["script"], self.SCRIPT)
         self.assertEqual(data["test_name"], self.NAME)
+        self.assertEqual(data["product"], "Atlas")
         kinds = [row["stream"]["kind"] for row in data["results"]]
         self.assertEqual(kinds, ["branch", "build", "mainline"])
         self.assertEqual(data["results"][0]["result"], "FAIL")
         self.assertIn("run_id", data["results"][0])
         self.assertIn("start_time", data["results"][0])
+
+    def test_product_is_empty_string_when_undeclared(self) -> None:
+        """The mainline row's own `stream.product` is always "" (it is
+        universal), which must never be mistaken for THIS environment's
+        declared product -- exercised on an environment nobody has
+        mapped, where both happen to agree by coincidence, and again
+        implicitly by test_newest_first_and_identity_shape above where
+        they must NOT agree."""
+        self.import_runs([
+            record(environment="unmapped-env", test_name="lonely",
+                   result="PASS"),
+        ])
+        data = self.call(
+            "GET",
+            test_path("unmapped-env", self.SCRIPT, "lonely", "/streams"))
+        self.assertEqual(data["product"], "")
 
     def test_a_stream_that_never_ran_this_test_is_absent(self) -> None:
         data = self.call("GET", self.path)

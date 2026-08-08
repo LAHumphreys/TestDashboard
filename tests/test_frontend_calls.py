@@ -1414,6 +1414,77 @@ class TestPageBranchBandTest(unittest.TestCase):
         self.assertIn("backLink.href", body)
 
 
+class EveryBuildAndStreamSwitcherTest(unittest.TestCase):
+    """test.js's WP-22 additions (docs/STREAMS_PLAN.md §4.1): the
+    per-stream result dropdown near the top of the page, and the "Every
+    build" disclosure table below the analytics section."""
+
+    def test_the_switcher_markup_ships_hidden(self) -> None:
+        html = read_text("test.html")
+        field_at = html.index('id="stream-switcher-field"')
+        self.assertIn("hidden", html[field_at:field_at + 60])
+        self.assertIn('id="stream-switcher-select"', html)
+
+    def test_the_every_build_section_ships_hidden(self) -> None:
+        html = read_text("test.html")
+        section_at = html.index('id="every-build-section"')
+        self.assertIn("hidden", html[section_at:section_at + 60])
+        self.assertIn('id="every-build-body"', html)
+
+    def test_the_switcher_hides_with_fewer_than_two_options(self) -> None:
+        """A one-entry "switcher" is not one -- this is only useful once
+        there is somewhere else to switch TO."""
+        body = _function_body(
+            read("test.js"), "function renderStreamSwitcher(")
+        self.assertIn("results.length < 2", body)
+        self.assertIn("field.hidden = true", body)
+
+    def test_switching_never_changes_which_test_is_shown(self) -> None:
+        body = _function_body(read("test.js"), "function testPageUrl(")
+        self.assertIn('params.append("environment"', body)
+        self.assertIn('params.append("script"', body)
+        self.assertIn('params.append("test_name"', body)
+
+    def test_the_dropdown_only_lists_results_never_widened(self) -> None:
+        """docs/STREAMS_PLAN.md §4.1: the dropdown wants exactly the
+        per-triple results list -- widening it with NO RESULT entries
+        (the "Every build" table's job) would offer a destination with
+        nothing to switch to."""
+        body = _function_body(
+            read("test.js"), "function renderStreamSwitcher(")
+        self.assertNotIn("productStreams", body)
+        self.assertNotIn("withoutResult", body)
+
+    def test_no_result_is_never_a_chip_in_the_every_build_table(
+            self) -> None:
+        """The same defect ResultEmphasisTest/compare.js's
+        noResultCell() pin elsewhere: an absent result must never render
+        as a coloured chip variant."""
+        body = _function_body(
+            read("test.js"), "function buildEveryBuildRow(")
+        self.assertIn('"no result"', body)
+        self.assertNotIn("ghostChip(", body)
+
+    def test_the_union_keeps_the_per_triple_results_intact(self) -> None:
+        """docs/STREAMS_PLAN.md §4.1's absence rule + the general "union
+        by id, do not rebuild from the picker list" reasoning: the
+        results the per-triple endpoint returned must never be dropped
+        just because a stream is absent from /api/streams (e.g. after a
+        product remap) -- only ADDED to, for the streams present there
+        that have no result."""
+        body = _function_body(read("test.js"), "async function loadEveryBuild(")
+        self.assertIn("data.results.slice()", body)
+        self.assertIn("resultKeys", body)
+
+    def test_a_single_row_disclosure_stays_hidden(self) -> None:
+        body = _function_body(read("test.js"), "async function loadEveryBuild(")
+        self.assertIn("rows.length < 2", body)
+
+    def test_init_calls_load_every_build(self) -> None:
+        body = _function_body(read("test.js"), "async function init(")
+        self.assertIn("loadEveryBuild()", body)
+
+
 class CommentStreamTagTest(unittest.TestCase):
     """The "posted from" tag on each comment (WP-21 §3.6) — every
     comment shows in full regardless of the page's current scope, tagged

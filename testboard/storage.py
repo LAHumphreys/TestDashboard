@@ -3245,6 +3245,20 @@ class Storage:
     # Declared environment -> product mapping (migration 8, WP-20)
     # ------------------------------------------------------------------
 
+    def product_for_environment(self, environment: str) -> str:
+        """One environment's declared product, or ``""`` if unmapped
+        (the implicit grouping — same reading as everywhere else in
+        this feature). A single-row lookup for callers that need
+        exactly one environment's product (WP-22's per-triple streams
+        endpoint) rather than the whole map :meth:`environment_products_map`
+        returns for callers that need every environment's.
+        """
+        row = self._conn().execute(
+            "SELECT product FROM environment_products WHERE environment = ?",
+            (environment,),
+        ).fetchone()
+        return "" if row is None else row[0]
+
     def environment_products_map(self) -> Dict[str, str]:
         """Every declared environment -> product mapping.
 

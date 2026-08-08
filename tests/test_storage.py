@@ -2760,6 +2760,15 @@ class TestEnvironmentProducts(StorageTestBase):
         self.assertFalse(
             self.store.clear_environment_product("never-existed"))
 
+    def test_product_for_environment_single_row_lookup(self) -> None:
+        """WP-22's single-environment lookup (used by the per-triple
+        streams endpoint) must agree with the whole-map read."""
+        self._declare("linux-sim", "Atlas")
+        self.assertEqual(
+            self.store.product_for_environment("linux-sim"), "Atlas")
+        self.assertEqual(
+            self.store.product_for_environment("never-declared"), "")
+
     def test_environments_are_case_sensitive(self) -> None:
         """Same reasoning, and the same test, as
         TestEnvironmentExpectations.test_environments_are_case_sensitive:
