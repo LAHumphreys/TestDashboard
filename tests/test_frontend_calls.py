@@ -1189,6 +1189,22 @@ class DeltaViewTest(unittest.TestCase):
     def test_no_innerHTML(self) -> None:
         self.assertNotIn("innerHTML", read("compare.js"))
 
+    def test_delta_rows_carry_the_stream_into_the_test_link(self) -> None:
+        """A delta row's link must include ?stream=, or the branch-scoped
+        test page (history, analytics, output — all built for exactly
+        this drill-down) is unreachable by clicking: the reader lands on
+        the MAINLINE view of a test they opened FROM a branch, which
+        reads as "the branch has no detail pages". Found by the first
+        human to use the branch dashboard, 2026-08-08 — the DOM-shim
+        checks rendered rows, not where their links lead."""
+        body = _function_body(read("compare.js"), "function buildDeltaRow(")
+        self.assertIn("getSelectedStreamId()", body)
+        stream_at = body.index("getSelectedStreamId()")
+        self.assertIn('params.append("stream"', body[stream_at:])
+        self.assertLess(stream_at, body.index('"test.html?"'),
+                        "the stream param must be appended BEFORE the "
+                        "href is built from params")
+
 
 class CompareStripTest(unittest.TestCase):
     """test.js's compare strip (WP-21 §3.6): mainline's result beside a

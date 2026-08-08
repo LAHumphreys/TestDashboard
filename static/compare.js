@@ -175,6 +175,15 @@ function buildDeltaRow(row) {
   params.append("environment", row.environment);
   params.append("script", row.script);
   params.append("test_name", row.test_name);
+  // Carry the page's stream scope into the link: the whole point of
+  // clicking a delta row is reading THIS branch's history/output of the
+  // test, and test.html only shows that when ?stream= arrives with it.
+  // Without this line the stream-scoped test page is unreachable by
+  // clicking — found by the first human to use the branch dashboard.
+  const streamId = getSelectedStreamId();
+  if (streamId !== null) {
+    params.append("stream", String(streamId));
+  }
   link.href = "test.html?" + params.toString();
   link.textContent = row.test_name;
   testCell.appendChild(link);
