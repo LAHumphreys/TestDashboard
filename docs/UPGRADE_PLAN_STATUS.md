@@ -1845,3 +1845,148 @@ class's five assertions touch `<select>` mechanics.
 
 Suite: 1739 OK (skipped=1) SQLite-only; 2307 OK (skipped=18) dual-backend
 — both re-run after every fix in this entry.
+
+## WP-23 — long-running branch streams (2026-08-09, `wp-23-longrunning`)
+
+Drop 4 of `docs/STREAMS_PLAN.md`, built on `wp-22-builds`'s tip. A
+months-long feature branch with its own nightly CI is a second mainline
+in all but name; this gives it its own trend/staleness/triage instead of
+only the WP-21/22 delta view. Full account of decisions made during
+implementation is `docs/STREAMS_PLAN.md` §5.4 ("as built") — this entry
+is the chronological record, that one is the reference.
+
+**Migration 10** claims the version WP-15's parked reservation was
+sitting on (moves to 11 — fifth such swap, see `UPGRADE_PLAN.md` §1).
+`activity_hours`/`script_hours` rebuilt with `stream_id` in their PRIMARY
+KEY, the migration-9 `latest_runs` precedent exactly (existing rows
+copied with a literal `stream_id = 1`, not re-aggregated from `runs` —
+both tables had been mainline-only since migrations 6/7). MEASURED on a
+copy of the dev database (220 MB, 540,192 runs, 12,008 tests) THIS
+session: entry 10 alone **0.038–0.041s** (from v9); entries 8+9+10
+combined from v7 (production's current version) **~0.17–0.18s** — both
+numbers reproduced across repeated runs. This differs from the
+2026-08-14 note's earlier v7→v9 figure (0.806s) recorded in the WP-21
+session; no attempt was made to reconcile the two beyond noting the
+difference here, per CLAUDE.md's "measure, do not estimate" — what is
+reported is what was actually measured this session, on this machine, at
+this time.
+
+**The writer's WP-21 skip is deleted.** `activity_hours`/`script_hours`
+are now maintained for every stream inside the import transaction, keyed
+by its own `stream_id` — `_apply_activity_deltas`/
+`_apply_script_hour_changes`'s dict keys gained a leading `stream_id`,
+and the two `if stream_id == MAINLINE_STREAM_ID` guards in
+`upsert_runs` are gone. The guard test this touches
+(`DerivedTablePartitionIsolationTest`, "branch import leaves the tables
+unchanged") is WIDENED, not weakened, per CLAUDE.md's rule — its old
+assertion is now false BY DESIGN (a branch gains its own rows; that is
+the entire point of this drop), so it now asserts PARTITION ISOLATION
+instead, checked in both directions (branch-after-mainline,
+mainline-after-branch) plus sibling branches against each other.
+`ActivityHoursTest`/`ScriptHoursTest`'s own invariant comparisons were
+separately widened to include `stream_id` in their GROUP BY, so a
+stream_id bug would fail those too, not only the dedicated isolation
+class.
+
+**A sweep for WP-21-era cross-stream leaks**, prompted by an advisor
+review before writing production code (write the failing guard first,
+watch it fail, then sweep every unfiltered `FROM latest_runs`/
+`FROM activity_hours`/`FROM script_hours`): `test_counts_by_environment`,
+`script_test_counts`, `daily_result_counts` (plus its trend-memo cache
+key), and `prune_runs_before`'s `prev_result` recomputation all read
+without a stream filter. Each was correct before this drop only because
+the tables held nothing but mainline's rows; once every stream is
+maintained, an unfiltered read silently mixes a branch's numbers into
+mainline's own coverage denominator, trend, or `prev_result` the moment
+a branch reports into the SAME environment mainline uses. All four
+closed in the migration-10 commit, plus `summary_rollup`/
+`assigned_open_count`/`status_queue`/`status_queue_count`/
+`duration_rollup`/`latest_run_time`/`latest_run_time_by_environment`/
+`top_failing_scripts` gained a `stream_id` parameter (default mainline,
+so no existing caller's behaviour changes) as the mechanism the "own
+results" tab reads.
+
+**Per-stream pass detection needed no change to `analytics.find_passes`/
+`recent_cutoff`** — both are pure functions over whatever buckets/test
+counts they are handed; scoping to a stream is the exact mechanism
+`_pass_view`'s own docstring already documented for WP-20's `product=`
+filter (restrict the inputs). The two clamps (36h fallback floor,
+14-day ceiling) are therefore unchanged code, applying per stream
+automatically — pinned by a test that a branch too sparse to have one
+covered pass falls back to the same 36h window mainline would use in
+the same spot. `/api/summary`, `/api/time`, `/api/timeline` all gained
+an optional `stream=` (default mainline); guard tests import a branch
+into a shared environment and assert the UNSCOPED response is
+byte-identical before/after, closing the exact scenario the sweep
+above found.
+
+**The branch dashboard's two-tab header** (`static/app.js`): `init()` no
+longer calls `initDeltaView()` directly — it calls
+`initBranchDashboard(streamId)`, which shows a `#branch-tabs` header for
+`kind='branch'` streams only (builds keep the unchanged WP-21/22
+delta-only view). "Its own results" re-enters the mainline dashboard
+body scoped via a new `appendStream()` helper (mirrors `appendProduct`,
+threaded into `summaryUrl`/`queueUrl`/`browseUrl`); one-time listener
+wiring was factored out of `init()` into `wireMainlineControls()`,
+guarded by a module flag, so switching tabs repeatedly never stacks
+duplicate listeners. Default tab: `/api/summary` gained `covered_passes`
+(the count `_pass_view` already computes); `>=2` shows "Its own results"
+first, and the caption states the actual count AND the threshold in its
+own sentence, never a hidden constant. The frontend guard test
+`DeltaViewTest::test_a_mainline_page_load_never_reaches_the_delta_view`
+was WIDENED (not weakened, per CLAUDE.md) to check the new two-hop call
+chain (`init()` → `initBranchDashboard()` → `activateDiffTab()` →
+`initDeltaView()`) instead of the old direct call.
+
+**Drift framing**: one new line in the delta view — "of N failing here,
+M fail on `<baseline>` too" (N = `new_failures + both_failing`, both
+guaranteed FAIL on the stream by `CompareCounts`' own definition; M =
+`both_failing`). "Behind by N commits" stays void — not knowable, not
+built, confirmed again rather than silently reconsidered.
+
+**The Watchlist `s:` card decision**: kept as the vs-mainline verdict
+only, per §5.2's own escape hatch, for two reasons recorded in
+`static/watch.js`'s comment — the card is already full, and
+`/api/watch` is architecturally O(cards) in Python but O(1) in queries
+(`compare_counts_many` batches every requested stream's comparison in
+one query, pinned flat by a dedicated test); a per-branch own-results
+number needs its own per-stream pass-detection cutoff with no batched
+multi-stream form here, and adding it would make N branch cards cost N
+times that work.
+
+**Live verification, this session** (third time this project has driven
+real frontend JS against a real running server): a scratch database
+(`.scratch/wp23verify.db`, gitignored) seeded with two products, a
+short-lived one-off branch (1 covered pass) and a long-running branch (8
+nightly covered passes over 8 nights: a standing regression on the
+branch alone, plus one failure that also hits mainline from night 7),
+served by `run_server.py`, driven by the node DOM-shim harness
+(`.scratch/drive_branch_tabs.mjs`, gitignored) with real `click()`
+dispatches on both tab buttons. Confirmed: band text, tab visibility,
+caption wording (the exact covered-pass count and the "2 or more"
+threshold, both literally in the sentence), the default tab selection
+for BOTH branches (own for the regular one, diff for the sparse one),
+the branch's own FAIL count (2) differing correctly from mainline's
+whole-estate count, both tab-switch directions toggling the right
+sections, the drift line's exact wording ("Of 2 tests failing here, 1
+also fails on mainline too" — matching `/api/compare`'s own
+`new_failures=1, both_failing=1` for that stream), and a genuine
+zero-`stream=`-param mainline load touching none of the new elements —
+seeded with the shim's `hidden` state matching the real shipped markup
+first (the shim builds bare `<div>`s with `hidden=false` by default; it
+does not parse index.html), a setup detail worth recording since it
+produced four false failures before being caught.
+
+**Not run this session**: CI's own `python36-mariadb` leg (mariadb:10.3,
+production's stream) — only the dual-backend suite against this dev
+machine's local MariaDB (12.3.2, functional evidence only, never a perf
+number). Production-scale migration timing (dev copy only, ~4x smaller
+than production per CLAUDE.md). No human has looked at the two-tab
+header, the drift line, or the caption's wording in a real browser —
+the DOM-shim harness proves wiring and DOM shape, not legibility,
+layout, or whether two tabs plus a caption plus the existing toolbar is
+too much for one screen.
+
+Suite: 1750 OK (skipped=1) SQLite-only; 2329 OK (skipped=18) dual-backend
+(this dev machine's local MariaDB) — both on the final tree, after every
+commit in this entry.

@@ -38,7 +38,7 @@
     <section class="release" data-drop-date="2026-08-14">
       <div class="section-head">
         <h2 class="eyebrow">14 August 2026</h2>
-        <span class="muted">New: branches and release builds beside mainline, compare any two, plus the Watch page</span>
+        <span class="muted">New: branches and release builds beside mainline, compare any two, a long-running branch gets its own dashboard, plus the Watch page</span>
       </div>
 
       <h3>New: branches and builds, compared to mainline</h3>
@@ -117,6 +117,35 @@
           products is refused with a clear message naming both — there is
           nothing to compare across products, since they don't share
           environments.</li>
+      </ul>
+
+      <h3>New: a long-running branch gets its own dashboard</h3>
+      <ul>
+        <li><strong>A branch that runs nightly for weeks now reads like a
+          second small testboard, not just a diff against mainline.</strong>
+          Open a branch with enough history and you'll see two tabs at the
+          top: <strong>Its own results</strong> (the same tiles, trend
+          chart and triage queues you already know from the home screen —
+          scoped to that branch alone) and <strong>Difference from
+          mainline</strong> (the comparison view from the August drop
+          above, unchanged). Both tabs are always there for a branch;
+          which one opens first depends on how much history the branch
+          has, and a line under the tabs says exactly why in plain
+          words — "this branch has completed 8 passes in the last 14
+          days" or similar, never a silent guess.</li>
+        <li>The Time and Timeline pages can now be scoped to a branch too
+          (via the same picker, from a branch's own dashboard) — so "where
+          did the suite's time go last night" and "what order did scripts
+          run in" both work for a branch's own nightly run, not only for
+          mainline.</li>
+        <li>The comparison view now says, in one line, how much of what's
+          failing on a branch is really <em>new</em> there versus already
+          broken on mainline too — "Of 4 tests failing here, 1 also fails
+          on mainline too" — so a branch's own regressions don't get lost
+          in mainline's existing noise.</li>
+        <li>Mainline is completely unaffected either way — a branch's own
+          nightly history has never counted toward mainline's trend,
+          staleness, or triage queues, and this drop keeps it that way.</li>
       </ul>
 
       <h3>New page: Watch</h3>

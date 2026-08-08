@@ -196,11 +196,17 @@ lifetime even if the mapping changes later. There is no registry to maintain: th
 first record naming a stream creates it, inside the same transaction as the
 import, the same way an unrecognised `environment` has always worked.
 
-**Mainline is provably unaffected.** `activity_hours`/`script_hours` (the trend,
-the staleness cutoff) are maintained only for mainline; a stream's un-retirement
-never fires (a branch run reporting against a mainline-retired test does not
-un-retire it — the branch may predate the decision); `/api/summary`, `/api/time`
-and the Timeline read mainline only, unconditionally, in this drop.
+**Mainline is provably unaffected.** A stream's un-retirement never fires (a
+branch run reporting against a mainline-retired test does not un-retire it —
+the branch may predate the decision). `activity_hours`/`script_hours` (the
+trend, the staleness cutoff, the Timeline's running order) are maintained
+for EVERY stream (WP-23) — each stream's rows are a disjoint partition
+(`stream_id` leads both tables' PRIMARY KEY), so a branch's own activity can
+never change a byte of mainline's. `/api/summary`, `/api/time` and
+`/api/timeline` all accept an optional `stream=<id>` (default: mainline —
+every caller from before WP-23 sees no change); a long-running branch's
+"own results" dashboard tab reads its own status/trend/triage/running-order
+through the exact same endpoints, scoped.
 
 **The one collision case.** Run identity is `(stream, environment, script,
 test_name, start_time)`, but the underlying `runs` table's UNIQUE constraint
@@ -326,13 +332,24 @@ neither repeat nor skip a row.
 Everything the triage home screen needs in one request. Query parameters (all
 optional): `environment` (exact match; scopes every number below), `days`
 (integer 1..90, default 14; the trend window — invalid values → 400), `assignee`
-(adds the `mine` queue for that user).
+(adds the `mine` queue for that user), `stream=<id>` (WP-23, default: mainline
+— scopes `status`, `trend`, every queue, `queue_totals`, `top_failing_scripts`
+and `covered_passes` to one stream's own partition; `products`/`environments`/
+`scripts`/`assignees`/`assignment_streams` stay estate-wide regardless, since
+they answer "what exists" rather than one stream's results).
 
 `assignment_streams` (WP-21) lists every non-mainline stream currently
 annotating an assignment, resolved to its identity — Open actions' origin
 filter reads this the same way it reads `assignees`: the available values,
 and (empty list) the signal that no assignment carries a stream anywhere in
 the estate, so the filter does not render at all.
+
+`covered_passes` (WP-23) is the count of COVERED passes (a block of activity
+that ran at least half the stream's own tests — the same inference the
+staleness cutoff is derived from) the requested stream completed in its own
+14-day lookback — the number the branch dashboard's two-tab header reads to
+decide whether "Its own results" or "Difference from mainline" opens by
+default, stated alongside the threshold in the caption rather than hidden.
 
 None of this is proportional to the size of the estate: the headline counts come
 from a single `GROUP BY` (a few dozen rows however many tests exist), and each

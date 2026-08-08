@@ -655,6 +655,122 @@ clamps; migration rebuild equivalence + measured timings.
 delta view separates "drift" from "mine," and mainline's numbers are provably
 identical with and without the branch importing nightly.
 
+### 5.4 As built (2026-08-09, `wp-23-longrunning`)
+
+Matches the plan above with these decisions made during implementation,
+recorded here rather than left implicit:
+
+- **Migration 10 claims the version** (registry: WP-15's parked
+  reservation moves to 11, the fifth such swap — see `UPGRADE_PLAN.md`
+  §1's running note). `activity_hours`/`script_hours` rebuilt with
+  `stream_id` in their PRIMARY KEY, existing rows copied with a literal
+  `stream_id = 1` (both tables had been mainline-only since migrations
+  6/7, so every row on file already IS mainline's) — the migration-9
+  `latest_runs` precedent exactly, not a re-aggregate over `runs`.
+  MEASURED on a copy of the dev database (220 MB, 540,192 runs, 12,008
+  tests): **0.038–0.041s** for entry 10 alone (brought to v9 first),
+  **~0.17–0.18s** for entries 8+9+10 combined from v7 (production's
+  current version) — both consistently reproduced across repeated runs
+  this session. Differs noticeably from the 2026-08-14 note's earlier
+  v7→v9 number (0.806s, migration 9 alone 0.883s); the two sessions ran
+  on the same machine at different times, and no attempt was made to
+  reconcile the difference beyond noting it — see CLAUDE.md's "measure,
+  do not estimate" rule: this entry reports what was actually measured
+  this session, not a reconciled or averaged figure.
+- **`find_passes`/`recent_cutoff` needed NO signature change.** Both are
+  pure functions over whatever activity buckets/test counts they are
+  handed; scoping to one stream is the same mechanism `_pass_view`'s
+  own docstring already documented for WP-20's `product=` filter —
+  restrict the *inputs* (`Storage.activity_buckets`/
+  `test_counts_by_environment`, both gained a `stream_id` parameter,
+  default mainline). The two clamps inside `recent_cutoff` (36h
+  fallback floor, 14-day ceiling) are therefore unchanged code and
+  apply per stream automatically — pinned by a test that a branch too
+  sparse to have a single covered pass falls back to the exact same
+  36-hour window mainline would use in the same spot.
+- **A pre-existing WP-21-era class of bug, found by the sweep this
+  package's own guard-test discipline demanded**: several reads of
+  `latest_runs`/`activity_hours` had no stream filter at all —
+  `Storage.test_counts_by_environment`, `script_test_counts`,
+  `daily_result_counts` (plus its trend-memo cache key),
+  `prune_runs_before`'s `prev_result` recomputation. Each was correct
+  *before* migration 10 only because the tables in question held
+  nothing but mainline's rows; once every stream is maintained
+  (this drop), an unfiltered read silently mixes a branch's numbers
+  into mainline's own coverage denominator, trend, or `prev_result` the
+  moment a branch reports into the SAME environment mainline uses —
+  exactly the scenario `docs/STREAMS_PLAN.md` §5's "mainline
+  behaviour byte-identical" requirement is about. All closed in the
+  migration-10 commit, each with a guard test that imports a branch
+  into a shared environment and asserts the unscoped response/table is
+  untouched.
+- **The "own results" tab is real second dashboard, not a filtered
+  view of mainline's**: `/api/summary`, `/api/time` and `/api/timeline`
+  all gained an optional `stream=` (default mainline, so every existing
+  caller is unaffected) that scopes status, trend, every triage queue,
+  `queue_totals`, `top_failing_scripts`, duration rollups and the
+  Timeline's blocks/rows to the requested stream's own partition.
+  Catalog fields (`products`, `environments`, `scripts`, `assignees`,
+  `assignment_streams`) stay estate-wide regardless — they answer "what
+  exists", not "what this stream's results are".
+- **Default-tab heuristic, stated exactly**: `/api/summary` gained
+  `covered_passes` (the count of COVERED passes `_pass_view` already
+  computes for the requested stream, in its own 14-day lookback). The
+  branch dashboard's two-tab header (`static/app.js`,
+  `initBranchDashboard`) defaults to "Its own results" when
+  `covered_passes >= 2`, else "Difference from mainline" — both the
+  count and the threshold appear literally in the caption's own
+  sentence ("this branch has completed N passes in the last 14 days (2
+  or more shows its own dashboard first)"), the `WindowWordingTest`
+  discipline applied to a new kind of default rather than a recency
+  window. **Both tabs always exist** for a `kind='branch'` stream;
+  release builds (`kind='build'`) and anything else keep the exact
+  WP-21/22 delta-only behaviour with no tab header at all — §5.2 frames
+  the two-tab header as a branch concept, and an RC is not a second
+  mainline with its own nightly cadence.
+- **Drift framing landed as one line**, not a redesign of the delta
+  view: baseline freshness and "this stream's window" already existed
+  (WP-21's `delta-baseline` line); what was missing was "of N failing
+  here, M fail on `<baseline>` too" (N = `new_failures + both_failing`,
+  both guaranteed FAIL on the stream by `CompareCounts`' own
+  definition; M = `both_failing`, the subset also failing on the
+  baseline). "Behind by N commits" stays void, confirmed again: not
+  knowable without VCS integration, not built.
+- **The Watchlist `s:` card decision: vs-mainline verdict only, not
+  widened.** §5.2 explicitly permits this ("if this makes the card
+  crowded, prefer the vs-mainline verdict and note the decision") and
+  it is the decision taken, for two reasons recorded in
+  `static/watch.js`'s own comment: the card is already five stats, a
+  headline and two freshness lines; and more concretely, `/api/watch`
+  is architecturally O(cards) in Python but O(1) in QUERIES
+  (`Storage.compare_counts_many` batches every requested stream's
+  comparison in one query, pinned flat by a dedicated test) — a
+  per-branch "own new failures" number needs its own per-stream
+  pass-detection cutoff, which this endpoint has no batched
+  multi-stream form of, and adding it would make N branch cards cost N
+  times the pass-detection work. Click through to the branch's own
+  dashboard tab instead.
+- **Assignment origin extends to the own-results tab.** WP-21 already
+  tagged an assignment made from a branch's delta table with
+  `stream_id` (an annotation, never a partition — §0.4). This drop
+  extends the same tagging to rows fetched while on a branch's "Its
+  own results" tab (`tagStream()` in `static/app.js`), so Open Actions'
+  existing branch-origin tag/filter (WP-21) is complete for both
+  branch-scoped surfaces, not only the delta table.
+- **Live-verified against a real server**, the same method WP-21/22
+  established: a scratch database seeded with two products, a
+  short-lived one-off branch (1 covered pass) and a long-running branch
+  (8 nightly covered passes over 8 nights, its own standing regression
+  plus one failure that also hits mainline from night 7), driven
+  through the node DOM-shim harness with real `click()` dispatches on
+  the two tab buttons — band text, tab visibility, caption wording
+  (including the exact count/threshold), the default selection for
+  both branches, the branch's own FAIL count differing correctly from
+  mainline's, tab-switching both directions, the drift line's exact
+  wording, and a genuine zero-stream-param mainline load touching none
+  of the new elements at all. See `docs/drops/2026-08-14.md` for the
+  full account.
+
 ---
 
 ## 6. Cross-cutting notes
