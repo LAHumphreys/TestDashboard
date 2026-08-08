@@ -4347,7 +4347,7 @@ class Storage:
         return row is not None
 
     def latest_run_time_by_environment(
-        self,
+        self, stream_id: int = MAINLINE_STREAM_ID,
     ) -> Dict[str, datetime.datetime]:
         """When each environment last reported anything.
 
@@ -4361,32 +4361,38 @@ class Storage:
         we last hear from this environment", which is a question about
         the feeder, not about the suite's contents.
 
-        Mainline only (WP-21): fed to the environment pill and Watchlist
-        environment cards, both mainline concepts in this drop — a
-        branch import must not make an environment's mainline "last
-        reported" line look fresher than mainline actually is.
+        *stream_id* (WP-23, default mainline): fed to the environment
+        pill and Watchlist environment cards, both mainline concepts in
+        every existing caller — a branch import must not make an
+        environment's MAINLINE "last reported" line look fresher than
+        mainline actually is. The default preserves that; the "own
+        results" tab passes its own stream's id to get the branch's own
+        clock instead.
         """
         rows = self._conn().execute(
             "SELECT environment, MAX(start_time) FROM latest_runs "
             "WHERE stream_id = ? GROUP BY environment",
-            (MAINLINE_STREAM_ID,),
+            (stream_id,),
         ).fetchall()
         return {
             row[0]: model.parse_iso(row[1])
             for row in rows if row[1] is not None
         }
 
-    def latest_run_time(self) -> Optional[datetime.datetime]:
+    def latest_run_time(
+        self, stream_id: int = MAINLINE_STREAM_ID
+    ) -> Optional[datetime.datetime]:
         """Start time of the newest run on record, or None if empty.
 
         The estate's own clock. Reported alongside the summary so a
         stalled feeder is visible as a stalled feeder, rather than as
-        every test in the estate quietly going stale. Mainline only
-        (WP-21) — see :meth:`latest_run_time_by_environment`.
+        every test in the estate quietly going stale. *stream_id*
+        (WP-23, default mainline) — see
+        :meth:`latest_run_time_by_environment`.
         """
         row = self._conn().execute(
             "SELECT MAX(start_time) FROM runs WHERE stream_id = ?",
-            (MAINLINE_STREAM_ID,),
+            (stream_id,),
         ).fetchone()
         if row is None or row[0] is None:
             return None
@@ -4399,6 +4405,7 @@ class Storage:
         environment: Optional[str] = None,
         script: Optional[str] = None,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> DurationRollup:
         """Where the suite's time went, grouped one level at a time.
 
@@ -4431,9 +4438,12 @@ class Storage:
         honest than showing it clearly labelled.
 
         *environments* is the WP-20 ``product=`` filter — see
-        :meth:`_environments_clause`. Mainline only (WP-21): the Time
-        page stays mainline-only in this drop (docs/STREAMS_PLAN.md
-        §3.5/§3.10).
+        :meth:`_environments_clause`. *stream_id* (WP-23, default
+        mainline): the Time page stayed mainline-only through WP-21/22
+        (docs/STREAMS_PLAN.md §3.5/§3.10); WP-23 lets a long-running
+        branch's "own results" tab read WHERE ITS OWN suite spent its
+        time, the same way the mainline page always has — the default
+        keeps every existing caller unscoped exactly as before.
         """
         column = _DURATION_GROUPS.get(group_by)
         if column is None:
@@ -4447,7 +4457,7 @@ class Storage:
             "tr.environment IS NULL",
             "lr.stream_id = ?",
         ]
-        params = [MAINLINE_STREAM_ID]  # type: List[Any]
+        params = [stream_id]  # type: List[Any]
         if environment is not None:
             where.append("lr.environment = ?")
             params.append(environment)
@@ -4506,12 +4516,13 @@ class Storage:
         environment: Optional[str] = None,
         limit: int = 10,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[ScriptFailures]:
         """Scripts with the most currently-failing tests, worst first.
 
         *environments* is the WP-20 ``product=`` filter — see
-        :meth:`_environments_clause`. Mainline only (WP-21) — see
-        :meth:`duration_rollup`.
+        :meth:`_environments_clause`. *stream_id* (WP-23, default
+        mainline) — see :meth:`duration_rollup`.
         """
         sql = (
             "SELECT lr.environment, lr.script, COUNT(*) AS failing "
@@ -4522,7 +4533,7 @@ class Storage:
             "WHERE lr.result = ? AND " + self._NOT_RETIRED
             + " AND lr.stream_id = ?"
         )
-        params = [Result.FAIL.value, MAINLINE_STREAM_ID]  # type: List[Any]
+        params = [Result.FAIL.value, stream_id]  # type: List[Any]
         if environment is not None:
             sql += " AND lr.environment = ?"
             params.append(environment)

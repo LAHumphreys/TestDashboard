@@ -1491,6 +1491,49 @@ class TestTimeEndpoint(ApiCase):
         self.assert_405("POST", "/api/time", "GET", body={})
 
 
+class TimeStreamScopingTest(ApiCase):
+    """WP-23 (docs/STREAMS_PLAN.md §5.2): ``/api/time`` accepts
+    ``stream=`` (default mainline) so a branch's "own results" tab can
+    read WHERE ITS OWN suite spent its time."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux", script="a.py", test_name="one",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=10))),
+        ])
+
+    def test_a_branch_import_leaves_mainline_unaffected(self) -> None:
+        before = self.call("GET", "/api/time")
+        self.import_runs([
+            record(environment="linux", script="a.py",
+                   test_name="branch_only", branch="feat/x",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=99))),
+        ])
+        after = self.call("GET", "/api/time")
+        self.assertEqual(before, after)
+
+    def test_stream_param_reads_the_branch_own_time(self) -> None:
+        self.import_runs([
+            record(environment="linux", script="a.py",
+                   test_name="branch_only", branch="feat/x",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=99))),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        data = self.call(
+            "GET", "/api/time", query={"stream": [str(stream_id)]})
+        self.assertEqual(data["stream"], stream_id)
+        self.assertEqual(data["test_count"], 1)
+        self.assertEqual(data["total_seconds"], 99.0)
+
+
 class TestUsers(ApiCase):
     """GET/POST /api/users: listing, idempotent creation, validation."""
 
@@ -3505,6 +3548,113 @@ class SummaryPartsTest(ApiCase):
         self.assertIn("queue", error["error"])
 
 
+class SummaryStreamScopingTest(ApiCase):
+    """WP-23 (docs/STREAMS_PLAN.md §5.2): ``/api/summary`` accepts an
+    optional ``stream=`` so a long-running branch's "own results" tab
+    reads its own headline/trend/queues from this same endpoint.
+
+    The load-bearing guard here is the one the advisor flagged: a branch
+    reporting into the SAME environment as mainline must leave every
+    field of a MAINLINE (unscoped) ``/api/summary`` response
+    byte-identical. This was NOT true of the code as found —
+    ``test_counts_by_environment``/``daily_result_counts`` read
+    ``latest_runs``/``activity_hours`` with no stream filter, so a
+    branch import into ``linux-sim`` silently changed mainline's own
+    coverage denominator and trend sums. Closed in the migration-10
+    commit; this test is the record of it, written to fail against the
+    pre-fix code (moving it here, after the fix already landed, still
+    proves the invariant going forward).
+    """
+
+    seed = TestSummary.seed
+
+    def test_a_branch_import_into_the_same_environment_leaves_mainline_unchanged(
+            self) -> None:
+        self.seed()
+        before = self.call("GET", "/api/summary")
+        self.import_runs([
+            record(test_name="test_new_fail", branch="feat/x",
+                   result="FAIL",
+                   start_time="2026-07-26T04:00:00.000000",
+                   end_time="2026-07-26T04:00:03.000000"),
+            record(test_name="test_branch_only", branch="feat/x",
+                   result="PASS",
+                   start_time="2026-07-26T04:01:00.000000",
+                   end_time="2026-07-26T04:01:03.000000"),
+        ])
+        after = self.call("GET", "/api/summary")
+        self.assertEqual(before, after)
+
+    def test_a_branch_import_leaves_the_mainline_trend_unchanged(
+            self) -> None:
+        self.seed()
+        before = self.call(
+            "GET", "/api/summary", query={"days": ["7"]})["trend"]
+        self.import_runs([
+            record(test_name="test_trend_branch", branch="feat/y",
+                   result="FAIL",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T05:00:03.000000"),
+        ])
+        after = self.call(
+            "GET", "/api/summary", query={"days": ["7"]})["trend"]
+        self.assertEqual(before, after)
+
+    def test_stream_param_scopes_status_to_the_branch_own_results(
+            self) -> None:
+        """The other half of the guarantee: the branch's OWN request
+        (stream=<id>) reads ITS OWN numbers, not mainline's — this is
+        what makes "own results" a real second dashboard rather than a
+        copy of mainline's."""
+        self.seed()
+        self.import_runs([
+            record(test_name="test_branch_only", branch="feat/x",
+                   result="FAIL",
+                   start_time="2026-07-26T04:00:00.000000",
+                   end_time="2026-07-26T04:00:03.000000"),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        scoped = self.call(
+            "GET", "/api/summary", query={"stream": [str(stream_id)]})
+        self.assertEqual(scoped["stream"], stream_id)
+        self.assertEqual(scoped["status"]["total_tests"], 1)
+        self.assertEqual(scoped["status"]["results"]["FAIL"], 1)
+        # Mainline's own count is untouched and different from the
+        # branch's -- proof the two are not secretly sharing a query.
+        mainline = self.call("GET", "/api/summary")
+        self.assertEqual(mainline["status"]["total_tests"], 6)
+
+    def test_the_36h_fallback_clamp_applies_to_a_sparse_branch_too(
+            self) -> None:
+        """The two clamps inside analytics.recent_cutoff (36h fallback
+        floor, 14-day ceiling) are UNCHANGED -- CLAUDE.md is explicit
+        that they must not be removed or loosened. A branch too sparse
+        to have a single COVERED pass must fall back to the exact same
+        36-hour wall-clock window mainline would use in the same spot,
+        never something looser."""
+        self.seed()
+        self.import_runs([
+            record(test_name="test_branch_only", branch="feat/z",
+                   result="PASS",
+                   start_time="2026-07-26T04:00:00.000000",
+                   end_time="2026-07-26T04:00:03.000000"),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = [s["id"] for s in streams["streams"]
+                     if s["name"] == "feat/z"][0]
+        scoped = self.call(
+            "GET", "/api/summary", query={"stream": [str(stream_id)]})
+        expected = format_iso(NOW - datetime.timedelta(hours=36))
+        self.assertEqual(scoped["stale_before"], expected)
+
+    def test_unknown_stream_is_a_404(self) -> None:
+        self.seed()
+        error = self.call(
+            "GET", "/api/summary", query={"stream": ["9999"]}, expect=404)
+        self.assertIn("stream", error["error"])
+
+
 class TimelineTest(ApiCase):
     """GET /api/timeline: one environment's script running order."""
 
@@ -3681,6 +3831,56 @@ class TimelineTest(ApiCase):
 
     def test_wrong_method_is_405(self) -> None:
         self.assert_405("POST", "/api/timeline", "GET")
+
+
+class TimelineStreamScopingTest(ApiCase):
+    """WP-23 (docs/STREAMS_PLAN.md §5.2): ``/api/timeline`` accepts
+    ``stream=`` (default mainline) so a long-running branch's running
+    order reads from its OWN ``script_hours`` partition."""
+
+    def _night(
+        self, days_ago: int, environment: str = "linux-sim",
+        branch: Optional[str] = None,
+    ) -> None:
+        base = (NOW - datetime.timedelta(days=days_ago)).replace(
+            hour=2, minute=0, second=0, microsecond=0)
+        rec = record(
+            environment=environment, script="a.py", test_name="t0",
+            start_time=format_iso(base),
+            end_time=format_iso(base + datetime.timedelta(seconds=30)),
+        )
+        if branch:
+            rec["branch"] = branch
+        self.import_runs([rec])
+
+    def test_a_branch_import_leaves_the_mainline_timeline_unaffected(
+            self) -> None:
+        self._night(1)
+        before = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self._night(1, branch="feat/x")
+        after = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self.assertEqual(before, after)
+
+    def test_stream_param_reads_the_branch_own_running_order(self) -> None:
+        self._night(1, branch="feat/x")
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"],
+                   "stream": [str(stream_id)]})
+        self.assertEqual(data["stream"], stream_id)
+        self.assertEqual(len(data["rows"]), 1)
+        self.assertEqual(data["rows"][0]["script"], "a.py")
+        # And the UNSCOPED (mainline) request sees no blocks at all --
+        # proof the branch's activity never reached mainline's own
+        # activity_hours/script_hours partition.
+        mainline = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self.assertEqual(mainline["blocks"], [])
+        self.assertEqual(mainline["rows"], [])
 
 
 class ScriptWindowRunsTest(ApiCase):

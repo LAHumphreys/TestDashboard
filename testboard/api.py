@@ -669,6 +669,7 @@ def _pass_view(
     storage: Storage,
     now_value: datetime.datetime,
     environments: Optional[Sequence[str]] = None,
+    stream_id: int = MAINLINE_STREAM_ID,
 ) -> _PassView:
     """Group recent activity into passes and derive the staleness line.
 
@@ -696,13 +697,29 @@ def _pass_view(
     so restricting the input passes is the whole mechanism: no change to
     that pure function, and a product's ``stale_before`` is provably its
     own rather than the whole estate's (docs/STREAMS_PLAN.md §2.3).
+
+    *stream_id* (WP-23, migration 10, default mainline) scopes the SAME
+    way: :func:`analytics.find_passes`/:func:`analytics.recent_cutoff`
+    need no change at all — they are pure functions over whatever
+    buckets and test counts they are handed, and restricting those
+    inputs to one stream's own ``activity_hours``/``script_hours``
+    partition (:meth:`Storage.activity_buckets`,
+    :meth:`Storage.test_counts_by_environment`) is the entire mechanism,
+    exactly as *environments* already demonstrates for products. This is
+    what gives a long-running branch its OWN passes, its OWN cutoff, and
+    (via the two clamps inside :func:`analytics.recent_cutoff`, both
+    UNCHANGED) the same 36-hour floor and 14-day ceiling mainline has —
+    per-stream, not shared, so a stream with sparse history cannot make
+    another stream's cutoff stricter or looser.
     """
     fallback = now_value - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
     floor = now_value - datetime.timedelta(days=_PASS_LOOKBACK_DAYS)
-    inferred = storage.test_counts_by_environment()
+    inferred = storage.test_counts_by_environment(stream_id)
     declared = storage.declared_test_counts()
     effective = analytics.effective_test_counts(inferred, declared)
-    buckets = _filter_buckets(storage.activity_buckets(floor), environments)
+    buckets = _filter_buckets(
+        storage.activity_buckets(floor, stream_id), environments
+    )
     passes = analytics.find_passes(
         buckets,
         effective,
@@ -724,9 +741,10 @@ def _recent_cutoff(
     storage: Storage,
     now_value: datetime.datetime,
     environments: Optional[Sequence[str]] = None,
+    stream_id: int = MAINLINE_STREAM_ID,
 ) -> datetime.datetime:
     """The staleness line alone, for the endpoints that only need it."""
-    return _pass_view(storage, now_value, environments).cutoff.when
+    return _pass_view(storage, now_value, environments, stream_id).cutoff.when
 
 
 def _resolve_product_environments(
@@ -1051,6 +1069,7 @@ def _summary_queue_json(
     streaks: Dict[Tuple[str, str, str], FailureStreak],
     environments: Optional[Sequence[str]] = None,
     env_to_product: Optional[Dict[str, str]] = None,
+    stream_id: int = MAINLINE_STREAM_ID,
 ) -> Dict[str, Any]:
     """Serialize one triage queue: exact total plus capped, enriched entries.
 
@@ -1068,6 +1087,12 @@ def _summary_queue_json(
     *env_to_product* — the caller's own :meth:`Storage.environment_products_map`
     call, threaded through rather than re-fetched per queue (there are up
     to seven of these in one ``/api/summary`` response).
+
+    *stream_id* (WP-23, default mainline): a long-running branch's "own
+    results" tab reads its OWN triage queues by passing its stream id —
+    never merged with mainline's (docs/STREAMS_PLAN.md §5.2). Streak
+    bounds are scoped the same way, so a branch's failing-since is never
+    inherited from mainline's history of the same triple.
     """
     products = env_to_product or {}
     queue_assignee = None  # type: Optional[str]
@@ -1086,7 +1111,8 @@ def _summary_queue_json(
         key = (row.environment, row.script, row.test_name)
         if key not in streaks:
             streaks[key] = storage.failure_streak_bounds(
-                row.environment, row.script, row.test_name, row.start_time
+                row.environment, row.script, row.test_name, row.start_time,
+                stream_id,
             )
         return streaks[key]
 
@@ -1094,6 +1120,7 @@ def _summary_queue_json(
         storage_kind, environment, limit=_SUMMARY_QUEUE_CAP,
         assignee=queue_assignee, stale_before=recent_cutoff,
         with_latest_comment=True, environments=environments,
+        stream_id=stream_id,
     )
     entries = [
         _status_row_json(
@@ -1109,6 +1136,7 @@ def _summary_queue_json(
         "total": storage.status_queue_count(
             storage_kind, environment, assignee=queue_assignee,
             stale_before=recent_cutoff, environments=environments,
+            stream_id=stream_id,
         ),
         "tests": entries,
     }
@@ -1120,18 +1148,20 @@ def _summary_queue_totals(
     assignee: Optional[str],
     recent_cutoff: datetime.datetime,
     environments: Optional[Sequence[str]] = None,
+    stream_id: int = MAINLINE_STREAM_ID,
 ) -> Dict[str, int]:
     """Exact size of every queue, without fetching a single row.
 
     This is what lets the headline part paint the triage tab counts
     while the row payloads are still loading: seven indexed COUNT
     queries over ``latest_runs``, each a few milliseconds however large
-    the estate.
+    the estate. *stream_id* (WP-23, default mainline) — see
+    :func:`_summary_queue_json`.
     """
     totals = {
         kind: storage.status_queue_count(
             kind, environment, stale_before=recent_cutoff,
-            environments=environments,
+            environments=environments, stream_id=stream_id,
         )
         for kind in QUEUE_KINDS
     }
@@ -1139,6 +1169,7 @@ def _summary_queue_totals(
         storage.status_queue_count(
             "assigned", environment, assignee=assignee,
             stale_before=recent_cutoff, environments=environments,
+            stream_id=stream_id,
         )
         if assignee else 0
     )
@@ -1200,7 +1231,16 @@ def _handle_summary(
 
     Query parameters: ``environment`` (optional exact match) scopes
     everything; ``days`` (1..90, default 14) sets the trend window;
-    ``assignee`` adds the ``mine`` queue for that user.
+    ``assignee`` adds the ``mine`` queue for that user. ``stream=`` (an
+    id, WP-23, default mainline) scopes ``status``/``trend``/every
+    queue/``queue_totals``/``top_failing_scripts``/
+    ``environment_updated``/``latest_run_time`` to one stream's OWN
+    partition — the "own results" tab of a long-running branch stream's
+    dashboard (docs/STREAMS_PLAN.md §5.2) is this same endpoint with
+    ``stream=<its id>``. ``products``/``environments``/``scripts``/
+    ``assignees``/``assignment_streams`` stay ALWAYS estate-wide
+    regardless — they are catalog data, not one stream's results.
+    Absent, every deployed caller from before this drop sees no change.
 
     ``parts`` slices the payload so the home screen can paint
     progressively instead of waiting for its slowest piece:
@@ -1235,6 +1275,10 @@ def _handle_summary(
         )
     product = _query_single(request.query, "product")
     environments = _resolve_product_environments(storage, product)
+    # WP-23: a long-running branch's "own results" tab is this same
+    # endpoint, scoped — absent, the default (mainline) means every
+    # deployed caller from before this drop sees no change at all.
+    stream_id = _resolve_stream_id(storage, request)
     # One lookup, threaded through every queue below rather than
     # re-fetched per queue (see _summary_queue_json's docstring).
     env_to_product = storage.environment_products_map()
@@ -1243,8 +1287,12 @@ def _handle_summary(
     # A product's own window, never the whole estate's: `environments`
     # scopes which passes count, so a scoped request's stale_before is
     # provably that product's own (docs/STREAMS_PLAN.md §2.3 — "never
-    # one wall-clock phrase across products").
-    recent_cutoff = _recent_cutoff(storage, current, environments)
+    # one wall-clock phrase across products"). *stream_id* scopes the
+    # same way, one level further: a branch's stale_before is provably
+    # its OWN, never mainline's or another branch's (§5.2) — the two
+    # clamps inside analytics.recent_cutoff (36h floor, 14-day ceiling)
+    # apply to this stream's own passes, unchanged.
+    recent_cutoff = _recent_cutoff(storage, current, environments, stream_id)
 
     if part == "queue":
         kind = _query_single(request.query, "queue")
@@ -1262,24 +1310,29 @@ def _handle_summary(
                 "generated_at": model.format_iso(current),
                 "environment": environment,
                 "product": product,
+                "stream": stream_id,
                 "stale_before": model.format_iso(recent_cutoff),
                 "queue_cap": _SUMMARY_QUEUE_CAP,
                 "kind": kind,
                 "queue": _summary_queue_json(
                     storage, kind, environment, assignee, recent_cutoff,
                     {}, environments=environments,
-                    env_to_product=env_to_product,
+                    env_to_product=env_to_product, stream_id=stream_id,
                 ),
             },
         )
     # Reported so a stalled feeder is visible AS a stalled feeder,
     # rather than as every test in the estate quietly going stale — the
     # failure mode a data-derived cutoff would otherwise hide.
-    latest_run = storage.latest_run_time()
+    latest_run = storage.latest_run_time(stream_id)
     estate = analytics.summarize_rollup(
         storage.summary_rollup(
-            recent_cutoff, environment, environments=environments),
-        storage.assigned_open_count(environment, environments=environments),
+            recent_cutoff, environment, environments=environments,
+            stream_id=stream_id,
+        ),
+        storage.assigned_open_count(
+            environment, environments=environments, stream_id=stream_id,
+        ),
     )
 
     # Trend: per-night result counts, zero-filled over the window so the
@@ -1288,7 +1341,7 @@ def _handle_summary(
     since = datetime.datetime.combine(first_day, datetime.time())
     counts = {}  # type: Dict[Tuple[datetime.date, Result], int]
     for entry in storage.daily_result_counts(
-        since, environment, environments=environments
+        since, environment, environments=environments, stream_id=stream_id,
     ):
         counts[(entry.day, entry.result)] = entry.count
     nights = []  # type: List[Dict[str, Any]]
@@ -1322,6 +1375,14 @@ def _handle_summary(
             "generated_at": model.format_iso(current),
             "environment": environment,
             "product": product,
+            # WP-23: absent (mainline) for every deployed client. The
+            # "own results" tab's own request carries its stream's id
+            # and reads EVERY field below (status/trend/queues) scoped
+            # to it; the cross-stream/catalog fields just below
+            # (products, environments, scripts, assignees,
+            # assignment_streams) are ALWAYS estate-wide regardless —
+            # see their own comments.
+            "stream": stream_id,
             # ALWAYS estate-wide (see _products_summary) — this is what
             # lets a request scoped to one product still offer the
             # switcher's way back to "All products". Empty list = no
@@ -1355,7 +1416,8 @@ def _handle_summary(
             "environment_updated": {
                 environment_name: model.format_iso(when)
                 for environment_name, when
-                in storage.latest_run_time_by_environment().items()
+                in storage.latest_run_time_by_environment(
+                    stream_id).items()
             },
             "queue_cap": _SUMMARY_QUEUE_CAP,
             "status": {
@@ -1397,7 +1459,7 @@ def _handle_summary(
                 }
                 for entry in storage.top_failing_scripts(
                     environment, _SUMMARY_TOP_SCRIPTS,
-                    environments=environments,
+                    environments=environments, stream_id=stream_id,
                 )
             ],
             # Every queue's exact size, row payloads not included. The
@@ -1405,7 +1467,7 @@ def _handle_summary(
             # these while the rows are still being fetched.
             "queue_totals": _summary_queue_totals(
                 storage, environment, assignee, recent_cutoff,
-                environments=environments,
+                environments=environments, stream_id=stream_id,
             ),
         }  # type: Dict[str, Any]
     if part == "headline":
@@ -1419,12 +1481,14 @@ def _handle_summary(
         kind: _summary_queue_json(
             storage, kind, environment, None, recent_cutoff, streaks,
             environments=environments, env_to_product=env_to_product,
+            stream_id=stream_id,
         )
         for kind in QUEUE_KINDS
     }
     queues["mine"] = _summary_queue_json(
         storage, "mine", environment, assignee, recent_cutoff, streaks,
         environments=environments, env_to_product=env_to_product,
+        stream_id=stream_id,
     )
     payload["queues"] = queues
     return _json_response(200, payload)
@@ -1841,6 +1905,12 @@ def _handle_timeline(
     times, never "last night" — a suite can run twice a day or skip
     days, and this project has been burned by window wording three
     times (see WindowWordingTest).
+
+    ``stream=`` (an id, WP-23, default mainline): the branch/build hour
+    tables are now maintained for every stream (migration 10), so this
+    page reads a long-running branch's OWN running order the same way
+    it reads mainline's — zero visible change when the param is absent
+    (docs/STREAMS_PLAN.md §5.2).
     """
     environment = _query_single(request.query, "environment")
     product = _query_single(request.query, "product")
@@ -1857,6 +1927,7 @@ def _handle_timeline(
                 environment
             ),
         )
+    stream_id = _resolve_stream_id(storage, request)
     days = _parse_int_param(
         request, "days", _TIMELINE_DEFAULT_DAYS, 1, _TIMELINE_MAX_DAYS
     )
@@ -1864,15 +1935,16 @@ def _handle_timeline(
     floor = now_value - datetime.timedelta(days=days)
 
     # The same pass inference the environments page runs, over this
-    # page's own lookback. Coverage needs every environment's
-    # denominator, so the inputs stay estate-wide; only the blocks
+    # page's own lookback, scoped to *stream_id*. Coverage needs every
+    # environment's denominator ON THAT STREAM, so the inputs are
+    # stream-wide (not estate-wide across streams); only the blocks
     # shown are this environment's.
     effective = analytics.effective_test_counts(
-        storage.test_counts_by_environment(),
+        storage.test_counts_by_environment(stream_id),
         storage.declared_test_counts(),
     )
     passes = analytics.find_passes(
-        storage.activity_buckets(floor),
+        storage.activity_buckets(floor, stream_id),
         effective,
         gap_hours=_PASS_GAP_HOURS,
         coverage=_PASS_COVERAGE,
@@ -1903,7 +1975,9 @@ def _handle_timeline(
     known = {}  # type: Dict[str, int]
     if window_from is not None and window_to is not None:
         executions = analytics.group_script_executions(
-            storage.script_activity(environment, window_from, window_to),
+            storage.script_activity(
+                environment, window_from, window_to, stream_id,
+            ),
             gap_minutes=_EXECUTION_GAP_MINUTES,
         )
         # The window is INCLUSIVE AT HOUR RESOLUTION, deliberately:
@@ -1925,13 +1999,14 @@ def _handle_timeline(
             if execution.started < to_ceiling
             and execution.ended >= from_floor
         ]
-        known = storage.script_test_counts(environment)
+        known = storage.script_test_counts(environment, stream_id)
 
     return _json_response(
         200,
         {
             "environment": environment,
             "product": product,
+            "stream": stream_id,
             "days": days,
             "gap_minutes": _EXECUTION_GAP_MINUTES,
             # Newest block first: that is the one being looked at.
@@ -2082,6 +2157,9 @@ def _handle_time(
     ``script`` to scope a drill-down, and ``product`` (WP-20) to scope
     to a declared product's environments — resolved server-side to
     ``environment IN (...)``, same as every other filter here.
+    ``stream=`` (an id, WP-23, default mainline) scopes to one stream's
+    own latest-run durations — zero visible change when absent
+    (docs/STREAMS_PLAN.md §5.2).
 
     Aggregates the newest run of each test, so it answers "where did the
     last run of the suite spend its time" — not a historical window.
@@ -2094,6 +2172,7 @@ def _handle_time(
     script = _query_single(request.query, "script")
     product = _query_single(request.query, "product")
     environments = _resolve_product_environments(storage, product)
+    stream_id = _resolve_stream_id(storage, request)
     # Off by default: counting a test that last ran three weeks ago as
     # part of "where the time went" claims time that was not spent. But
     # an all-or-nothing cutoff empties the page after any quiet day, so
@@ -2102,12 +2181,12 @@ def _handle_time(
         request.query, "include_stale") in ("1", "true")
     cutoff = (
         None if include_stale
-        else _recent_cutoff(storage, now(), environments)
+        else _recent_cutoff(storage, now(), environments, stream_id)
     )
     try:
         rollup = storage.duration_rollup(
             group_by, cutoff, environment=environment, script=script,
-            environments=environments,
+            environments=environments, stream_id=stream_id,
         )
     except ValueError as exc:
         raise _HttpError(400, "group_by: {}".format(exc))
@@ -2118,6 +2197,7 @@ def _handle_time(
             "environment": environment,
             "script": script,
             "product": product,
+            "stream": stream_id,
             "items": [
                 {
                     "key": item.key,
