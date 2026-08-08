@@ -771,6 +771,74 @@ class TestHistory(ApiCase):
         self.assert_405("POST", self.path, "GET")
 
 
+class TestBuildRebuildHistory(ApiCase):
+    """WP-22 (docs/STREAMS_PLAN.md §4.1): a rebuild is just a second
+    import under the same `build` name -- verifies that the WP-21
+    history table (unchanged code) already reads a build's rebuild
+    correctly rather than assuming it without checking (item 7 of the
+    WP-22 work order)."""
+
+    ENV = "linux-sim"
+    SCRIPT = "suite/alpha.py"
+    NAME = "test_flow"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="FAIL", build="1.0",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        # The rebuild: same build name, a LATER run of the same test.
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="PASS", build="1.0",
+                   start_time="2026-07-25T05:00:00.000000",
+                   end_time="2026-07-25T05:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def test_the_rebuild_creates_no_second_stream(self) -> None:
+        """Re-importing under the SAME name is the same stream, not a
+        new one -- docs/STREAMS_PLAN.md §3.3's find-or-create rule."""
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0]["name"], "1.0")
+
+    def test_the_newer_run_wins_as_latest(self) -> None:
+        data = self.call(
+            "GET", test_path(self.ENV, self.SCRIPT, self.NAME),
+            query={"stream": [str(self.stream_id)]})
+        self.assertEqual(data["latest"]["result"], "PASS")
+        self.assertEqual(
+            data["latest"]["start_time"], "2026-07-25T05:00:00.000000")
+
+    def test_history_still_shows_both_runs_newest_first(self) -> None:
+        """The older (superseded) run is not lost -- it is a real row
+        in `runs`, just no longer the one `latest_runs` points to."""
+        data = self.call(
+            "GET",
+            test_path(self.ENV, self.SCRIPT, self.NAME, "/history"),
+            query={"stream": [str(self.stream_id)]})
+        results = [run["result"] for run in data["runs"]]
+        starts = [run["start_time"] for run in data["runs"]]
+        self.assertEqual(results, ["PASS", "FAIL"])
+        self.assertEqual(starts, sorted(starts, reverse=True))
+
+    def test_the_every_build_endpoint_also_reflects_the_newer_run(
+            self) -> None:
+        data = self.call(
+            "GET",
+            test_path(self.ENV, self.SCRIPT, self.NAME, "/streams"))
+        (row,) = data["results"]
+        self.assertEqual(row["result"], "PASS")
+        self.assertEqual(row["start_time"], "2026-07-25T05:00:00.000000")
+
+
 class TestStreamResults(ApiCase):
     """GET .../streams (WP-22, docs/STREAMS_PLAN.md §4.1): a triple's
     latest result on every stream that HAS one, newest first -- the test
