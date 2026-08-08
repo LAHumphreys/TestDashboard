@@ -591,20 +591,19 @@ identical with and without the branch importing nightly.
   constant; text always carries meaning beside colour; solid = now,
   outlined = before; product/stream columns appear only when the page spans
   them.
-- **Open questions parked (decide when their drop is specced, with the
-  user):**
-  1. Declared lifecycle (`merged`/`abandoned`/`Released`) — wanted at all?
-     (Stale-by-age may be enough; it has been enough for environments.)
-  2. Branch-run retention policy — measure growth before inventing one.
-  3. Whether `/api/summary` should ever aggregate across streams (currently
-     never — mainline only by definition).
-  4. A pushed morning digest (email/webhook rendering of a Watchlist URL) —
-     out of scope for all four drops. The Watchlist deliberately converts
-     the 20-emails problem from push to pull first; only add push back if
-     pull proves insufficient in practice, and note it would be the first
-     outbound network dependency this project has.
-  5. Watchlist URLs name things (`p:`/`e:` by display name) — renames break
-     shared URLs. Accepted: the error card makes the break visible and
-     self-explanatory, and names-in-URLs keeps them human-readable and
-     hand-editable, which is worth more. Revisit only if renames turn out
-     to be common.
+- **Formerly-open questions — decided with the user, 2026-08-08:**
+  1. **No declared lifecycle states, in any drop.** Stale-by-age only: the
+     picker folds streams with old `last_seen` under a stale group;
+     `drop_stream` deletes dead ones. Same model environments have always
+     used. (WP-22's "optional declared RC/Released label" paragraph is
+     void — do not build it.)
+  2. **No retention policy yet — measure first.** `drop_stream` is the
+     manual pressure valve; revisit with real growth numbers once WP-21
+     has production history. No automatic pruning.
+  3. `/api/summary` never aggregates across streams. Confirmed.
+  4. Pushed digest (email/webhook) confirmed out of scope for all four
+     drops; the Watchlist converts the problem to pull first. Revisit only
+     if pull proves insufficient — it would be the project's first
+     outbound network dependency.
+  5. Watchlist URLs keep human-readable names; renames surface as error
+     cards. Confirmed.
