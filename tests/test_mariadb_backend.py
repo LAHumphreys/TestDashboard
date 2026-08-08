@@ -90,6 +90,11 @@ EXCLUDED_TESTS = {
         "counts queries via sqlite3's set_trace_callback.",
     "StreamIdentitiesTest.test_query_count_is_one_regardless_of_id_count":
         "counts queries via sqlite3's set_trace_callback.",
+    "CompareCountsManyBaselinesTest."
+    "test_query_count_does_not_grow_with_a_baseline_override":
+        "counts queries via sqlite3's set_trace_callback.",
+    "PreviousBuildsTest.test_query_count_is_one_regardless_of_build_count":
+        "counts queries via sqlite3's set_trace_callback.",
     "ScriptHoursTest.test_the_window_read_is_an_index_range_not_a_scan":
         "asserts the SQLite query plan; MariaDB's planner is a "
         "different instrument for a different day.",
