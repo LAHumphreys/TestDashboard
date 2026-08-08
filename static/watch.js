@@ -178,6 +178,31 @@ function baselineLabel(card) {
  * baseline_kind`/`baseline_name` name whatever it actually was, so
  * nothing here assumes "mainline" the way the WP-21 version of this
  * card did.
+ *
+ * WP-23 DECISION (docs/STREAMS_PLAN.md §5.2's own escape hatch —
+ * "keep the card honest and small; if this makes the card crowded,
+ * prefer the vs-mainline verdict and note the decision"): this card
+ * stays the vs-mainline verdict ONLY, even for a long-running branch
+ * with its own triage numbers now available via the two-tab dashboard.
+ * Two reasons, not one: the card is already five stats plus a
+ * headline plus two freshness lines — a sixth number earns its keep
+ * less than the branch's own dashboard does, where it has room to be
+ * explained; and more concretely, `/api/watch` is architecturally
+ * O(cards) IN PYTHON, never O(cards) in QUERIES (`Storage.
+ * compare_counts_many` batches every requested stream's comparison in
+ * ONE query, pinned flat by
+ * tests/test_api.py::TestWatchStreamCards::
+ * test_query_count_does_not_grow_with_s_card_count) — a per-branch
+ * "own new failures" number needs its own pass-detection cutoff
+ * (Storage.activity_buckets + analytics.find_passes, PER STREAM,
+ * since each branch's cadence is its own), which this endpoint has no
+ * batched multi-stream form of. Adding it here would mean N branch
+ * cards costing N times the passes/cutoff work — the exact shape
+ * CLAUDE.md's "no endpoint may be proportional to card count" rule
+ * exists to keep out of the Watchlist. Click through to the branch's
+ * own dashboard for its own numbers instead — a real second click,
+ * but an honest one over a query-count regression on a page whose
+ * whole point is O(1) per card.
  */
 function buildStreamCard(card, index, total) {
   const div = el("div", "card watch-card");
