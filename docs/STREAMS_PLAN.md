@@ -391,7 +391,48 @@ loudly instead of corrupting quietly.
 - Test detail: `stream=` param scopes the history table and analytics
   (computed from that stream's runs of the triple — the existing endpoints
   filtered by stream); a compare strip (mainline chip → branch chip) when
-  scoped; comments always shown in full with their "posted from" tag.
+  scoped; comments always shown in full with their "posted from" tag; the
+  **same branch band as the dashboard** (shared `renderBranchBand`, not a
+  second implementation) — found missing in first human use of the branch
+  dashboard: a reader who clicked through to a test's own page from the
+  delta table lost every indication they were scoped to a branch at all.
+  "Back to mainline" is the CURRENT URL with only `stream` removed, never a
+  fixed target — the dashboard's link strips to `index.html`, the test
+  page's preserves `environment`/`script`/`test_name`, from one shared
+  function.
+- **Triage still works from a branch** (§0.4): the delta table's rows carry
+  the same assignee select and inline Review expander (output, "View in
+  timeline", comment) as every other list in the app — assigning from a
+  branch row assigns the SAME test everyone else sees, never a
+  per-stream partition of ownership. Retirement is refused on a branch row
+  by construction (the shared review panel is simply never told a
+  `staleBefore`, so its own gate never opens) — retirement stays a mainline
+  decision (§3.4). The compare row payload carries the branch's own
+  `stream_run_id`/`stream_start_time` (null exactly when there is no run on
+  that side to review) and the triple's current, UNPARTITIONED `assignee` —
+  no new query shape, both already live on `latest_runs`/`current_assignments`.
+- **Assignment origin is an annotation, not a partition** (mirrors
+  comments.stream_id exactly): `assignments`/`current_assignments` both
+  gained a nullable `stream_id` — WHERE the assignment was MADE from, never
+  which test it targets. `PUT .../assignee` accepts it optionally; the
+  frontend sends the page's own scope when set, omits it on every mainline
+  page (unchanged behaviour for every client that predates this). Folded
+  into migration 9 itself (still unshipped when found) rather than spent on
+  a migration 10 — see the entry's own comment in `storage.py`.
+- **Open Actions shows the origin**: a row whose current assignment carries
+  a non-mainline `stream_id` gets a small "branch feat/x" tag (names
+  resolved via the same batch `streams` map pattern the comments endpoint
+  established — `/api/dashboard`'s response carries one for whatever
+  distinct streams are on the returned page), and a binary
+  branch-vs-mainline filter chip pair (`origin=branch`/`origin=mainline` on
+  `/api/dashboard`, server-side — the SAME rule the existing owner filter
+  already follows, for the same reason: a client-side filter over one paged
+  fetch turns "every branch-originated item" into "the ones that happen to
+  be on this page"). The filter is entirely absent — not merely
+  empty-valued — on any estate where no current assignment carries a
+  stream (`/api/summary`'s `assignment_streams`, empty list is the signal),
+  the same "zero visible change" rule every other WP-21/WP-20 addition
+  follows.
 - All new DOM via `textContent`/`createElement` — the mockup's
   innerHTML/template idiom does not port, per the frontend security rule.
 - Mainline pages: **zero visible change when no non-mainline stream
@@ -485,6 +526,10 @@ same name.
   result on each stream of its product, newest first — reads the
   `(environment, script, test_name)` index added in WP-21; row count is the
   stream count, bounded and small. NO RESULT rows say NO RESULT.
+  **User has explicitly asked for this** (found missing during first human
+  use of WP-21's branch dashboard, 2026-08-08 — a per-stream result
+  switcher/dropdown on the test page was the specific request) — do not
+  drop it from scope when this drop is planned.
 - **Watchlist `s:` cards work for build streams** (same card machinery;
   the verdict line is "failing in <name>" plus its vs-previous-build delta
   when a predecessor exists). A release manager's URL is a row of RC cards

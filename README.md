@@ -219,10 +219,22 @@ kind, name, first_seen, last_seen, a current failing count) — `product` defaul
 to `""`, the implicit grouping for environments with no declared product; an
 unknown product is an empty list, never 404. `GET /api/compare?stream=<id>` (with
 an optional `category=` for one paginated slice, `limit`/`offset`) returns the
-five-way classification of that stream's tests against mainline
-(`new_failures`/`new_passes`/`both_failing`/`new_tests`/`no_result`) plus both
-sides' identity and `last_seen`; `baseline=` may currently only be the mainline
-stream's id (comparing against any other stream arrives in WP-22).
+SIX-way classification of that stream's tests against mainline
+(`new_failures`/`new_passes`/`both_failing`/`new_tests`/`no_result`, plus
+`agree` — both sides have a result and it is not FAIL on either — a real
+field rather than something the caller re-derives, since it is what the "N
+tests agree and are not listed" and coverage lines on the dashboard need)
+plus both sides' identity and `last_seen`; `baseline=` may currently only be
+the mainline stream's id (comparing against any other stream arrives in
+WP-22). Each row of a `category=` page is
+`{environment, script, test_name, stream_result, baseline_result,
+stream_run_id, stream_start_time, assignee}` — `stream_run_id`/
+`stream_start_time` (WP-21) are the STREAM's own run (never the baseline's),
+both `null` exactly when `stream_result` is (nothing to review on that side);
+`assignee` is the triple's current, UNPARTITIONED assignee (the same value a
+mainline view of the same test would show — assigning is never scoped to a
+stream, only annotated with where it was made, see the assignee endpoint
+below).
 `GET /api/dashboard`, test detail and test history all accept an optional
 `stream=<id>` (default: mainline).
 
@@ -246,11 +258,13 @@ Query parameters (all optional):
 | `retired` | `1`/`true` — include tests retired as no longer in the suite (hidden by default) |
 | `assignee` | repeatable — only tests owned by these people |
 | `unassigned` | `1`/`true` — include tests nobody owns (ORed with `assignee`) |
+| `origin` | `branch` or `mainline` (WP-21) — only tests whose CURRENT assignment was made from a non-mainline stream, or made from mainline/never assigned, respectively; anything else → 400 |
 | `with_comment` | `1`/`true` — add `latest_comment` to each row (one index seek per returned row, so it is opt-in) |
 | `sort` | one of `environment` (default), `script`, `test_name`, `result`, `start_time`, `duration`, `assignee`; anything else → 400 |
 | `order` | `asc` (default) or `desc`; anything else → 400 |
 | `limit` | 1..1000, default 250 |
 | `offset` | ≥ 0, default 0 |
+| `stream` | stream id (WP-21) — which partition of `latest_runs` the row's own result comes from; default mainline |
 
 Response:
 
@@ -262,16 +276,25 @@ Response:
       "run_id": 7, "result": "FAIL",
       "start_time": "...", "end_time": "...", "duration_seconds": 1.234,
       "known_failure_reason": null, "source_link": "...", "assignee": null,
+      "assignment_stream_id": null,
       "retired_at": null, "retired_by": null
     }
   ],
-  "total": 12376, "limit": 250, "offset": 0
+  "total": 12376, "limit": 250, "offset": 0,
+  "streams": {}
 }
 ```
 
 With `with_comment=1` each row also carries
 `"latest_comment": {"author": "...", "created_at": "...", "text": "..."}`
 (absent when the test has no comments).
+
+`assignment_stream_id` (WP-21) is WHERE the row's current assignment was made
+from — `null` for mainline, unassigned, or a pre-WP-21 assignment. `streams`
+batch-resolves every DISTINCT non-null `assignment_stream_id` on the RETURNED
+PAGE to its identity (same shape as the comments endpoint's `streams` map,
+same reason: a "branch feat/x" tag needs a name, not just an id, and a lookup
+per row does not scale).
 
 `total` counts every test matching the filters, not the rows returned. Every
 ordering ends with the full test identity, so paging with `limit`/`offset` can
@@ -286,6 +309,12 @@ Everything the triage home screen needs in one request. Query parameters (all
 optional): `environment` (exact match; scopes every number below), `days`
 (integer 1..90, default 14; the trend window — invalid values → 400), `assignee`
 (adds the `mine` queue for that user).
+
+`assignment_streams` (WP-21) lists every non-mainline stream currently
+annotating an assignment, resolved to its identity — Open actions' origin
+filter reads this the same way it reads `assignees`: the available values,
+and (empty list) the signal that no assignment carries a stream anywhere in
+the estate, so the filter does not render at all.
 
 None of this is proportional to the size of the estate: the headline counts come
 from a single `GROUP BY` (a few dozen rows however many tests exist), and each
@@ -312,6 +341,9 @@ waiting for its slowest piece (this is what the home screen does):
   "environments": ["linux-prod-sim", "linux-uat-sim"],
   "scripts": ["regression/user_lifecycle.py", "smoke/login.py"],
   "assignees": ["alice", "luke"],
+  "assignment_streams": [{"id": 2, "product": "", "kind": "branch",
+                          "name": "feat/x", "first_seen": "...",
+                          "last_seen": "...", "failing": 0}],
   "recent_hours": 36,
   "queue_cap": 500,
   "status": {
@@ -500,11 +532,20 @@ newest comment is shown in the triage queues and the open-actions view.
 
 ### PUT /api/tests/{env}/{script}/{test}/assignee
 
-Body `{"username": "bob-or-null", "assigned_by": "alice"}`. The `"username"` key is
-**required**; pass `null` to clear the assignment. `assigned_by` must be a non-empty
-string. Both users are created implicitly if unknown. Assignment history is kept for
-audit; the current assignee is the most recent entry. Returns `200`
+Body `{"username": "bob-or-null", "assigned_by": "alice", "stream_id": 2}`. The
+`"username"` key is **required**; pass `null` to clear the assignment. `assigned_by`
+must be a non-empty string. Both users are created implicitly if unknown. Assignment
+history is kept for audit; the current assignee is the most recent entry. Returns `200`
 `{"assignee": "bob"}` (or null).
+
+`stream_id` (WP-21) is optional and is an **annotation**, not a scope: it records
+WHERE the assignment was made from, never who or what it targets — the assignee
+itself is the same value seen from mainline or from any branch's view of the same
+test. Omitted or `null` means mainline, or a client that predates this field —
+every assignment ever made before WP-21. When given it must reference an existing
+stream (`404` otherwise). Both `GET /api/dashboard` rows and `GET /api/compare`'s
+paginated rows echo the current assignee; dashboard rows additionally carry
+`"assignment_stream_id"`.
 
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 

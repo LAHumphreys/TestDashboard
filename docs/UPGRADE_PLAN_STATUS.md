@@ -1573,3 +1573,114 @@ confirms the catch-up passed it).
 
 Suite: 1385 OK (skipped=1) — the account-restore touched three tool advice
 strings and one pinned assertion; the review fixes are doc-only.
+
+## WP-21 — branches and builds beside mainline (2026-08-08)
+
+Built on `wp-21-streams`, cut from `wp-20-products`: the whole of
+`docs/STREAMS_PLAN.md` §3, migration 9. Streams (`(product, kind, name)`,
+mainline the un-droppable id 1) resolved lazily inside the import
+transaction; `runs.stream_id`/`comments.stream_id` added, `latest_runs`
+rebuilt with `stream_id` leading its key (SQLite cannot widen a PRIMARY KEY
+in place — CREATE new / INSERT..SELECT / DROP / RENAME, five indexes
+recreated); the legacy `(environment, script, test_name, start_time)`
+UNIQUE on `runs` predates streams and cannot hold two streams' runs at the
+identical instant, so that collision is a per-record REJECTION, never a
+silent overwrite or misfile. Mainline provably unaffected:
+`activity_hours`/`script_hours` and un-retirement both mainline-only by
+construction, every estate-wide read hardcoded to mainline with no override
+parameter. `streams_seen` in the import response — its ABSENCE (not `[]`)
+is how a new feeder detects a server that has never heard of streams and
+aborts loudly rather than filing everything into mainline silently.
+Frontend: the Build picker, the branch band, the delta view (five tiles,
+tabbed paginated tables, an agree/coverage line pair, both sides'
+freshness), the test-detail compare strip, comment "posted from" tags, and
+a Watchlist `s:` verdict card — all through a shared `compare.js`, all
+zero-visible-change on a mainline page (a single guarded, early-returning
+branch in `app.js`'s `init()`; nothing below it runs when unscoped).
+`tools/drop_stream.py` is the `drop_environment.py` analogue, refusing
+mainline unconditionally. Migration 9 measured on the 220 MB dev copy
+(NOT production): 0.883 s alone (v8→v9), 0.6 s of it the `latest_runs`
+rebuild (12,008 rows); combined with WP-20's migration 8, v7→v9 (the actual
+production upgrade path) measured at 0.806 s.
+
+Two real defects were caught only by driving the actual frontend JS
+against a live server through the project's node DOM-shim harness (not by
+unit tests, which all declare a product before touching a stream — exactly
+the case that was broken): a comment's "posted from" tag was never wired
+into `test.js` despite the backend already returning the data; and the
+Watchlist's `s:` card was silently all-zero for any stream whose product
+is `""` (the common case on a site that has never declared a product) —
+`_handle_watch` resolved environment scope through a dict that is ALWAYS
+empty for `""`, fixed to special-case it the way
+`Storage.environments_for_product("")` already did on the single-stream
+path.
+
+Suite: 1645 OK (skipped=1) SQLite-only; 2152 OK (skipped=16) dual-backend
+(this dev machine's local MariaDB, `.scratch/mariadb-test.cnf`) — both
+re-run after every backend change and after the two fixes above.
+
+## First human use of the branch dashboard finds four gaps (2026-08-08, later)
+
+Found on the same day the branch dashboard was first opened in a real
+browser (still the only page of this project ever to receive that):
+clicking a delta-table row landed on the MAINLINE test page (`eb05c7a`,
+one line — `buildDeltaRow()` built its link without the page's own stream
+id, fixed and guard-tested). Then, working with the user, four more:
+
+1. **The branch band was dashboard-only.** A reader who followed a delta
+   row to a test's own page lost every indication they were scoped to a
+   branch — the compare strip alone was not loud enough. `renderBranchBand`
+   is now exported and shared between `index.html` and `test.html`, and
+   "Back to mainline" generalised to "the current URL with only `stream`
+   removed" (preserves `environment`/`script`/`test_name` on the test page,
+   where a fixed `index.html` target would have landed on the wrong page).
+2. **Triage from a branch didn't actually work.** The delta table shipped
+   chips-only. Added the same assignee select and inline Review expander
+   (output, "View in timeline", a comment box) every other list in the app
+   already has — assigning from a branch row assigns the SAME
+   (environment, script, test_name), never a stream-scoped copy of
+   ownership. Retirement is refused by construction (the shared panel is
+   simply never given a staleness cutoff on a branch row, so its own gate
+   never opens) — retirement stays mainline-only per §3.4.
+   `/api/compare`'s paginated rows gained `stream_run_id`/
+   `stream_start_time` (the branch's own run, null exactly when there is
+   nothing to review) and the triple's current, unpartitioned `assignee` —
+   both already live on `latest_runs`/`current_assignments`, no new query
+   shape.
+3. **Assignment origin folded into migration 9**, still unshipped when
+   found, rather than spent on a migration 10: `assignments`/
+   `current_assignments` both gained a nullable `stream_id`, the exact
+   shape `comments.stream_id` already established — an annotation of WHERE
+   an assignment was made, never a partition of WHO it targets. `PUT
+   .../assignee` accepts it optionally; every existing caller that never
+   sends it is unaffected.
+4. **Open actions shows the origin**: a "branch feat/x" tag (batch-resolved
+   per page, the comments-endpoint pattern) and a server-side
+   `origin=branch`/`origin=mainline` filter next to the existing owner
+   chips — the same "server-side, not a client reshuffle" rule the
+   existing owner filter already follows, and the same "absent, not just
+   empty, when nothing needs it" rule every WP-20/WP-21 addition follows
+   (`/api/summary`'s `assignment_streams`, empty list is the signal).
+
+Verified beyond the source-level guard tests by driving all four against a
+live scratch server through the DOM-shim harness — extended further this
+pass (`insertBefore`/`nextSibling`/`remove()`, `document
+.createDocumentFragment()`, a `find()` guard against text-node leaves;
+`actions.js` had never been driven through row-rendering before, only
+checked for its product-switcher mount). Confirmed the assignee select
+showed a REAL pre-existing value rather than defaulting to "Unassigned"
+(the specific wrong-payload failure the coordinator's own review flagged
+as the likeliest bug), the Review panel opened onto the branch's own
+captured output, no retire control appeared anywhere, both branch bands
+and their back-links were correct, and the Open actions filter/tag
+round-tripped a real assignment including the server-side re-fetch on a
+filter click.
+
+`docs/STREAMS_PLAN.md` §3.6 updated to record all four as part of WP-21's
+actual shipped scope (found in first use, not deferred); §4 gained an
+explicit note that the user has asked for the test-page per-stream
+("Every build") dropdown, so WP-22 planning does not drop it.
+
+Suite: 1688 OK (skipped=1) SQLite-only. Dual-backend re-run on the final
+tree; see `docs/drops/2026-08-14.md` for the count captured there rather
+than duplicated here.
