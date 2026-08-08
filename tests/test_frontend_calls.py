@@ -1039,6 +1039,29 @@ class ProductSwitcherHostManagedTest(unittest.TestCase):
         for html, _ in self._HOST_MANAGED:
             self.assertIn('src="products.js"', read_text(html), html)
 
+    def test_host_pages_guard_the_mount_before_calling_renderSwitcher(
+        self
+    ) -> None:
+        """renderSwitcher() opens with clearNode(container); calling it
+        with a null container throws, and on these two pages that throw
+        would happen mid-render — inside renderHeadline()/refresh(),
+        after the tiles/charts/queues (app.js) or the owner filters
+        (actions.js) render but before the function returns, taking the
+        whole first paint down with it. products.js's own init() guards
+        the same lookup; these call sites must too."""
+        for _, js in self._HOST_MANAGED:
+            code = _strip_comments(read(js))
+            call_at = code.index("renderSwitcher(")
+            before = code[:call_at]
+            self.assertIn(
+                "getElementById(\"product-switcher\")", before, js)
+            # The most recent conditional before the call must guard it.
+            guard_at = before.rindex("if (")
+            guarded = code[guard_at:call_at]
+            self.assertNotIn("}", guarded,
+                js + " calls renderSwitcher() outside the nearest "
+                "preceding if-guard")
+
 
 class ProductColumnTest(unittest.TestCase):
     """The Product column on the browse/triage tables (WP-20 §2.3).

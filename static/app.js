@@ -372,8 +372,10 @@ function renderHeadline() {
   renderQueues();
   populateScriptOptions();
   updateProductColumn();
-  renderSwitcher(document.getElementById("product-switcher"),
-    state.summary.products || []);
+  const switcherMount = document.getElementById("product-switcher");
+  if (switcherMount) {
+    renderSwitcher(switcherMount, state.summary.products || []);
+  }
 }
 
 /* ================= toolbar ================= */
