@@ -20,6 +20,7 @@ from testboard.analytics import (
     group_executions,
     group_script_executions,
     select_window,
+    summarize_by_product,
     summarize_rollup,
 )
 from testboard.model import Result, StoredRun, format_iso
@@ -981,6 +982,69 @@ class SummarizeRollupTest(unittest.TestCase):
         self.assertEqual(summary.status.results[Result.FAIL], 0)
         self.assertEqual(summary.status.assigned_open, 0)
         self.assertEqual(summary.by_environment, [])
+
+
+class SummarizeByProductTest(unittest.TestCase):
+    """WP-20's products[] breakdown: rollup cells grouped by declared
+    product rather than by environment."""
+
+    MAPPING = {"linux-sim": "Atlas", "win-sim": "Atlas", "mac-sim": "Borealis"}
+
+    def test_environments_group_into_their_declared_product(self) -> None:
+        rows = summarize_by_product([
+            cell(Result.FAIL, Result.PASS, environment="linux-sim"),
+            cell(Result.FAIL, Result.FAIL, environment="win-sim"),
+            cell(Result.PASS, Result.PASS, environment="mac-sim"),
+        ], self.MAPPING)
+        self.assertEqual([r.product for r in rows], ["Atlas", "Borealis"])
+        atlas = rows[0]
+        self.assertEqual(atlas.failing, 2)
+        self.assertEqual(atlas.new_failures, 1)
+        self.assertEqual(atlas.fixed, 0)
+        self.assertEqual(atlas.unexpected_passes, 0)
+
+    def test_fixed_counts_any_non_fail_result(self) -> None:
+        rows = summarize_by_product([
+            cell(Result.PASS, Result.FAIL, environment="linux-sim"),
+            cell(Result.UNEXPECTED_PASS, Result.FAIL, environment="linux-sim"),
+        ], self.MAPPING)
+        self.assertEqual(rows[0].fixed, 2)
+
+    def test_unmapped_environments_contribute_no_row(self) -> None:
+        """The implicit product "" is not a row here -- this is a
+        breakdown of DECLARED products, not an everything-else total."""
+        rows = summarize_by_product([
+            cell(Result.FAIL, Result.PASS, environment="unmapped-env"),
+        ], self.MAPPING)
+        self.assertEqual(rows, [])
+
+    def test_retired_tests_are_excluded(self) -> None:
+        rows = summarize_by_product([
+            cell(Result.FAIL, Result.PASS, environment="linux-sim",
+                 retired=True),
+        ], self.MAPPING)
+        self.assertEqual(rows, [])
+
+    def test_not_recency_gated(self) -> None:
+        """None of the four counts depends on `recent` -- there is no
+        single truthful window across products, so none is implied."""
+        rows = summarize_by_product([
+            cell(Result.FAIL, Result.PASS, environment="linux-sim",
+                 recent=False),
+        ], self.MAPPING)
+        self.assertEqual(rows[0].failing, 1)
+
+    def test_counts_add_the_whole_cell(self) -> None:
+        rows = summarize_by_product([
+            cell(Result.FAIL, Result.PASS, environment="linux-sim",
+                 count=40),
+        ], self.MAPPING)
+        self.assertEqual(rows[0].new_failures, 40)
+
+    def test_no_declared_products_is_an_empty_list(self) -> None:
+        rows = summarize_by_product(
+            [cell(Result.FAIL, Result.PASS, environment="linux-sim")], {})
+        self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":

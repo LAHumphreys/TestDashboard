@@ -570,8 +570,32 @@ class _PassView(NamedTuple):
     floor: datetime.datetime
 
 
+def _filter_buckets(
+    buckets: List[Tuple[str, datetime.datetime, int]],
+    environments: Optional[Sequence[str]],
+) -> List[Tuple[str, datetime.datetime, int]]:
+    """Keep only the WP-20 ``product=`` scope's environments, in Python.
+
+    ``storage.activity_buckets`` is deliberately NOT given a SQL filter
+    for this: its whole result is a few hundred rows for a fortnight
+    (see its docstring), so fetching it once and slicing the Python list
+    is cheaper than adding another IN-clause plumbing path to a query
+    every summary/dashboard/timeline request already runs unscoped.
+    This is also what makes ``/api/watch`` affordable — one fetch, N
+    cards each filtering their own slice (see :func:`_handle_watch`).
+
+    ``None`` means "no filter", matching :meth:`Storage._environments_clause`.
+    """
+    if environments is None:
+        return list(buckets)
+    allowed = set(environments)
+    return [bucket for bucket in buckets if bucket[0] in allowed]
+
+
 def _pass_view(
-    storage: Storage, now_value: datetime.datetime
+    storage: Storage,
+    now_value: datetime.datetime,
+    environments: Optional[Sequence[str]] = None,
 ) -> _PassView:
     """Group recent activity into passes and derive the staleness line.
 
@@ -591,14 +615,23 @@ def _pass_view(
 
     Falls back to the wall-clock window when there is not enough history
     to infer anything, and can never be stricter than it.
+
+    *environments*, the WP-20 ``product=`` filter, scopes the passes
+    (and therefore the cutoff) to one product's own environments — see
+    :func:`_filter_buckets`. ``analytics.recent_cutoff`` already takes
+    "the oldest across environments" from whatever passes it is given,
+    so restricting the input passes is the whole mechanism: no change to
+    that pure function, and a product's ``stale_before`` is provably its
+    own rather than the whole estate's (docs/STREAMS_PLAN.md §2.3).
     """
     fallback = now_value - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
     floor = now_value - datetime.timedelta(days=_PASS_LOOKBACK_DAYS)
     inferred = storage.test_counts_by_environment()
     declared = storage.declared_test_counts()
     effective = analytics.effective_test_counts(inferred, declared)
+    buckets = _filter_buckets(storage.activity_buckets(floor), environments)
     passes = analytics.find_passes(
-        storage.activity_buckets(floor),
+        buckets,
         effective,
         gap_hours=_PASS_GAP_HOURS,
         coverage=_PASS_COVERAGE,
@@ -615,10 +648,31 @@ def _pass_view(
 
 
 def _recent_cutoff(
-    storage: Storage, now_value: datetime.datetime
+    storage: Storage,
+    now_value: datetime.datetime,
+    environments: Optional[Sequence[str]] = None,
 ) -> datetime.datetime:
     """The staleness line alone, for the endpoints that only need it."""
-    return _pass_view(storage, now_value).cutoff.when
+    return _pass_view(storage, now_value, environments).cutoff.when
+
+
+def _resolve_product_environments(
+    storage: Storage, product: Optional[str]
+) -> Optional[List[str]]:
+    """Turn a ``product=`` query parameter into an environment allow-list.
+
+    ``None`` (no ``product=`` given) means "no filter" and is passed
+    straight through as ``environments=None`` — every reader this
+    touches treats that as "unscoped", the same as before WP-20. A given
+    product resolves via :meth:`Storage.environments_for_product`,
+    which is ``[]`` for an unknown product — and per
+    docs/STREAMS_PLAN.md §2.6 that must read as an EMPTY RESULT, never a
+    404: a product exists by having environments, the same rule
+    :meth:`Storage.environment_exists` already applies.
+    """
+    if product is None:
+        return None
+    return storage.environments_for_product(product)
 
 
 def _handle_dashboard(
@@ -638,10 +692,12 @@ def _handle_dashboard(
     script = _query_single(request.query, "script")
     q = _query_single(request.query, "q")
     results = _parse_results_param(request)
+    product = _query_single(request.query, "product")
+    environments = _resolve_product_environments(storage, product)
 
     stale_before = None  # type: Optional[datetime.datetime]
     if _query_single(request.query, "stale") in ("1", "true"):
-        stale_before = _recent_cutoff(storage, now())
+        stale_before = _recent_cutoff(storage, now(), environments)
     include_retired = _query_single(
         request.query, "retired") in ("1", "true")
     with_comment = _query_single(
@@ -684,6 +740,7 @@ def _handle_dashboard(
         "include_retired": include_retired,
         "assignees": assignees,
         "include_unassigned": include_unassigned,
+        "environments": environments,
     }  # type: Dict[str, Any]
     rows = storage.dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,
@@ -700,6 +757,7 @@ def _handle_dashboard(
             "limit": limit,
             "offset": offset,
             "with_streak": with_streak,
+            "product": product,
         },
     )
 
@@ -813,6 +871,7 @@ def _summary_queue_json(
     assignee: Optional[str],
     recent_cutoff: datetime.datetime,
     streaks: Dict[Tuple[str, str, str], FailureStreak],
+    environments: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Serialize one triage queue: exact total plus capped, enriched entries.
 
@@ -850,7 +909,7 @@ def _summary_queue_json(
     rows = storage.status_queue(
         storage_kind, environment, limit=_SUMMARY_QUEUE_CAP,
         assignee=queue_assignee, stale_before=recent_cutoff,
-        with_latest_comment=True,
+        with_latest_comment=True, environments=environments,
     )
     entries = [
         _status_row_json(row, streak_for(row) if with_streaks else None)
@@ -862,7 +921,7 @@ def _summary_queue_json(
     return {
         "total": storage.status_queue_count(
             storage_kind, environment, assignee=queue_assignee,
-            stale_before=recent_cutoff,
+            stale_before=recent_cutoff, environments=environments,
         ),
         "tests": entries,
     }
@@ -873,6 +932,7 @@ def _summary_queue_totals(
     environment: Optional[str],
     assignee: Optional[str],
     recent_cutoff: datetime.datetime,
+    environments: Optional[Sequence[str]] = None,
 ) -> Dict[str, int]:
     """Exact size of every queue, without fetching a single row.
 
@@ -883,14 +943,15 @@ def _summary_queue_totals(
     """
     totals = {
         kind: storage.status_queue_count(
-            kind, environment, stale_before=recent_cutoff
+            kind, environment, stale_before=recent_cutoff,
+            environments=environments,
         )
         for kind in QUEUE_KINDS
     }
     totals["mine"] = (
         storage.status_queue_count(
             "assigned", environment, assignee=assignee,
-            stale_before=recent_cutoff,
+            stale_before=recent_cutoff, environments=environments,
         )
         if assignee else 0
     )
@@ -899,6 +960,48 @@ def _summary_queue_totals(
 
 #: Valid values of /api/summary's ``parts`` parameter.
 _SUMMARY_PARTS = ("headline", "queue")
+
+
+def _products_summary(
+    storage: Storage, recent_cutoff: datetime.datetime
+) -> List[Dict[str, Any]]:
+    """The ``products[]`` breakdown of ``/api/summary`` (WP-20 §2.2).
+
+    ALWAYS estate-wide, regardless of the request's own ``product=``/
+    ``environment=`` scope: a request scoped to product A must still be
+    told product B exists, or the switcher has no way back to "All
+    products" (the frontend's ``>= 2`` visibility test reads this list).
+    Empty when nobody has declared a product — the frontend's key for
+    "do not show any of this" (docs/STREAMS_PLAN.md §2.2).
+
+    *recent_cutoff* only affects a column :func:`analytics.summarize_by_product`
+    ignores (none of its four counts is recency-gated), so the caller's
+    own cutoff is fine to reuse here — no second cutoff computation.
+    """
+    products = storage.distinct_products()
+    if not products:
+        return []
+    by_product = {
+        row.product: row
+        for row in analytics.summarize_by_product(
+            storage.summary_rollup(recent_cutoff),
+            storage.environment_products_map(),
+        )
+    }
+    zero = analytics.ProductRollup(
+        product="", failing=0, new_failures=0, fixed=0, unexpected_passes=0
+    )
+    return [
+        {
+            "product": product,
+            "failing": by_product.get(product, zero).failing,
+            "new_failures": by_product.get(product, zero).new_failures,
+            "fixed": by_product.get(product, zero).fixed,
+            "unexpected_passes": by_product.get(
+                product, zero).unexpected_passes,
+        }
+        for product in products
+    ]
 
 
 def _handle_summary(
@@ -943,9 +1046,15 @@ def _handle_summary(
                 part, ", ".join(_SUMMARY_PARTS)
             ),
         )
+    product = _query_single(request.query, "product")
+    environments = _resolve_product_environments(storage, product)
 
     current = now()
-    recent_cutoff = _recent_cutoff(storage, current)
+    # A product's own window, never the whole estate's: `environments`
+    # scopes which passes count, so a scoped request's stale_before is
+    # provably that product's own (docs/STREAMS_PLAN.md §2.3 — "never
+    # one wall-clock phrase across products").
+    recent_cutoff = _recent_cutoff(storage, current, environments)
 
     if part == "queue":
         kind = _query_single(request.query, "queue")
@@ -962,12 +1071,13 @@ def _handle_summary(
             {
                 "generated_at": model.format_iso(current),
                 "environment": environment,
+                "product": product,
                 "stale_before": model.format_iso(recent_cutoff),
                 "queue_cap": _SUMMARY_QUEUE_CAP,
                 "kind": kind,
                 "queue": _summary_queue_json(
                     storage, kind, environment, assignee, recent_cutoff,
-                    {},
+                    {}, environments=environments,
                 ),
             },
         )
@@ -976,8 +1086,9 @@ def _handle_summary(
     # failure mode a data-derived cutoff would otherwise hide.
     latest_run = storage.latest_run_time()
     estate = analytics.summarize_rollup(
-        storage.summary_rollup(recent_cutoff, environment),
-        storage.assigned_open_count(environment),
+        storage.summary_rollup(
+            recent_cutoff, environment, environments=environments),
+        storage.assigned_open_count(environment, environments=environments),
     )
 
     # Trend: per-night result counts, zero-filled over the window so the
@@ -985,7 +1096,9 @@ def _handle_summary(
     first_day = current.date() - datetime.timedelta(days=days - 1)
     since = datetime.datetime.combine(first_day, datetime.time())
     counts = {}  # type: Dict[Tuple[datetime.date, Result], int]
-    for entry in storage.daily_result_counts(since, environment):
+    for entry in storage.daily_result_counts(
+        since, environment, environments=environments
+    ):
         counts[(entry.day, entry.result)] = entry.count
     nights = []  # type: List[Dict[str, Any]]
     for offset in range(days):
@@ -1003,6 +1116,13 @@ def _handle_summary(
     payload = {
             "generated_at": model.format_iso(current),
             "environment": environment,
+            "product": product,
+            # ALWAYS estate-wide (see _products_summary) — this is what
+            # lets a request scoped to one product still offer the
+            # switcher's way back to "All products". Empty list = no
+            # products declared, the frontend's signal to show nothing
+            # product-shaped at all.
+            "products": _products_summary(storage, recent_cutoff),
             "environments": storage.environments(),
             "scripts": storage.scripts(environment),
             "assignees": storage.assignees(),
@@ -1064,14 +1184,16 @@ def _handle_summary(
                     "failing": entry.failing,
                 }
                 for entry in storage.top_failing_scripts(
-                    environment, _SUMMARY_TOP_SCRIPTS
+                    environment, _SUMMARY_TOP_SCRIPTS,
+                    environments=environments,
                 )
             ],
             # Every queue's exact size, row payloads not included. The
             # headline part's reason to exist: tab badges paint from
             # these while the rows are still being fetched.
             "queue_totals": _summary_queue_totals(
-                storage, environment, assignee, recent_cutoff
+                storage, environment, assignee, recent_cutoff,
+                environments=environments,
             ),
         }  # type: Dict[str, Any]
     if part == "headline":
@@ -1083,12 +1205,14 @@ def _handle_summary(
     streaks = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
     queues = {
         kind: _summary_queue_json(
-            storage, kind, environment, None, recent_cutoff, streaks
+            storage, kind, environment, None, recent_cutoff, streaks,
+            environments=environments,
         )
         for kind in QUEUE_KINDS
     }
     queues["mine"] = _summary_queue_json(
-        storage, "mine", environment, assignee, recent_cutoff, streaks
+        storage, "mine", environment, assignee, recent_cutoff, streaks,
+        environments=environments,
     )
     payload["queues"] = queues
     return _json_response(200, payload)
@@ -1355,11 +1479,22 @@ def _handle_timeline(
     Walking backwards from the failure needs the night's running order,
     script by script — which the test-centric views cannot show.
 
-    Query parameters: ``environment`` (required), ``days`` (1..90,
+    Query parameters: ``environment`` (required, UNLESS ``product``
+    resolves to exactly one environment — see below), ``days`` (1..90,
     default 14, how far back the block picker looks), and ``from`` /
     ``to`` (optional ISO timestamps selecting the block of activity to
     expand into rows; both or neither). Without ``from``/``to`` the
     newest block is selected.
+
+    ``product`` (WP-20) exists here only through the existing
+    ``environment`` semantics, per docs/STREAMS_PLAN.md §2.3: this page
+    shows ONE environment's running order, so a product with several
+    environments still needs one picked. When ``environment`` is absent
+    and ``product`` resolves to exactly one environment, that one is
+    used; otherwise the ordinary "environment: required" 400 stands —
+    there is no 400 for "environment does not belong to product": an
+    explicit ``environment`` always wins, matching how the switcher and
+    the environment filter already coexist everywhere else.
 
     ``blocks`` are the same inferred blocks of activity the
     environments page shows (:func:`analytics.find_passes` — ad-hoc
@@ -1374,6 +1509,11 @@ def _handle_timeline(
     times (see WindowWordingTest).
     """
     environment = _query_single(request.query, "environment")
+    product = _query_single(request.query, "product")
+    if not environment and product is not None:
+        product_environments = storage.environments_for_product(product)
+        if len(product_environments) == 1:
+            environment = product_environments[0]
     if not environment:
         raise _HttpError(400, "environment: required parameter is missing")
     if environment not in storage.known_environments():
@@ -1457,6 +1597,7 @@ def _handle_timeline(
         200,
         {
             "environment": environment,
+            "product": product,
             "days": days,
             "gap_minutes": _EXECUTION_GAP_MINUTES,
             # Newest block first: that is the one being looked at.
@@ -1604,7 +1745,9 @@ def _handle_time(
 
     Query parameters: ``group_by`` (``environment`` | ``script`` |
     ``test_name``, default ``environment``), plus ``environment`` and
-    ``script`` to scope a drill-down.
+    ``script`` to scope a drill-down, and ``product`` (WP-20) to scope
+    to a declared product's environments — resolved server-side to
+    ``environment IN (...)``, same as every other filter here.
 
     Aggregates the newest run of each test, so it answers "where did the
     last run of the suite spend its time" — not a historical window.
@@ -1615,16 +1758,22 @@ def _handle_time(
     group_by = _query_single(request.query, "group_by") or "environment"
     environment = _query_single(request.query, "environment")
     script = _query_single(request.query, "script")
+    product = _query_single(request.query, "product")
+    environments = _resolve_product_environments(storage, product)
     # Off by default: counting a test that last ran three weeks ago as
     # part of "where the time went" claims time that was not spent. But
     # an all-or-nothing cutoff empties the page after any quiet day, so
     # it can be turned off deliberately and the page says which it is.
     include_stale = _query_single(
         request.query, "include_stale") in ("1", "true")
-    cutoff = None if include_stale else _recent_cutoff(storage, now())
+    cutoff = (
+        None if include_stale
+        else _recent_cutoff(storage, now(), environments)
+    )
     try:
         rollup = storage.duration_rollup(
-            group_by, cutoff, environment=environment, script=script
+            group_by, cutoff, environment=environment, script=script,
+            environments=environments,
         )
     except ValueError as exc:
         raise _HttpError(400, "group_by: {}".format(exc))
@@ -1634,6 +1783,7 @@ def _handle_time(
             "group_by": group_by,
             "environment": environment,
             "script": script,
+            "product": product,
             "items": [
                 {
                     "key": item.key,
@@ -1702,6 +1852,11 @@ def _handle_environments_list(
         row.environment: row
         for row in storage.list_environment_expectations()
     }
+    # WP-20: which product each environment belongs to, "" (the implicit
+    # product) when nobody has declared one. Cheap (a handful of rows,
+    # same shape as declared_rows above) and read on every load of this
+    # page regardless of whether products are in use.
+    products = storage.environment_products_map()
 
     items = []  # type: List[Dict[str, Any]]
     for environment in storage.known_environments():
@@ -1709,6 +1864,7 @@ def _handle_environments_list(
         row = declared_rows.get(environment)
         items.append({
             "environment": environment,
+            "product": products.get(environment, ""),
             "tests_seen": view.inferred.get(environment, 0),
             "expected_tests": None if row is None else row.expected_tests,
             "effective_expected": view.effective.get(environment, 0),
@@ -1809,6 +1965,280 @@ def _handle_environment_expectation(
             "updated_by": record.updated_by,
             "cleared": False,
         },
+    )
+
+
+#: Generous but bounded — a product is a display name, not free text; see
+#: docs/STREAMS_PLAN.md §2.1.
+_MAX_PRODUCT_LEN = 200
+
+
+def _parse_product(obj: Dict[str, Any]) -> str:
+    """Validate the ``product`` field of a PUT .../product body.
+
+    Required, must be a string. Trimmed of leading/trailing whitespace;
+    an empty result is not an error — it CLEARS the mapping, because
+    ``""`` is the implicit product's own name (docs/STREAMS_PLAN.md
+    §2.1), not a third state alongside a declared name and absence.
+    """
+    if "product" not in obj:
+        raise _HttpError(400, "product: required field is missing")
+    value = obj["product"]
+    if not isinstance(value, str):
+        raise _HttpError(
+            400,
+            "product: must be a string, got {}".format(
+                type(value).__name__
+            ),
+        )
+    stripped = value.strip()
+    if len(stripped) > _MAX_PRODUCT_LEN:
+        raise _HttpError(
+            400,
+            "product: must be at most {} characters (got {})".format(
+                _MAX_PRODUCT_LEN, len(stripped)
+            ),
+        )
+    return stripped
+
+
+def _handle_environment_product(
+    storage: Storage,
+    request: Request,
+    environment: str,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """PUT /api/environments/{environment}/product — declare or clear.
+
+    Body: ``{"product": str, "username": str}``. Mirrors
+    :func:`_handle_environment_expectation`'s shape (one endpoint,
+    declare or clear), but the clear signal is an EMPTY STRING rather
+    than ``null``: ``""`` already means "the implicit product" everywhere
+    else in this feature (docs/STREAMS_PLAN.md §2.1), so a third
+    "no field" case would just be a second spelling of the same thing.
+
+    An environment that has never reported a run and carries no other
+    declaration is a 404 — same reasoning as the expectation endpoint:
+    declaring one would affect nothing visible and a typo would leave a
+    row nobody can see the purpose of.
+    """
+    obj = _parse_json_object(request.body)
+    product = _parse_product(obj)
+    username = _validate_username(obj, "username")
+
+    if not storage.environment_exists(environment):
+        raise _HttpError(
+            404, "unknown environment: {}".format(environment)
+        )
+
+    if product == "":
+        cleared = storage.clear_environment_product(environment)
+        return _json_response(
+            200,
+            {"environment": environment, "product": "", "cleared": cleared},
+        )
+    record = storage.set_environment_product(
+        environment, product, username, now()
+    )
+    return _json_response(
+        200,
+        {
+            "environment": record.environment,
+            "product": record.product,
+            "updated_at": model.format_iso(record.updated_at),
+            "updated_by": record.updated_by,
+            "cleared": False,
+        },
+    )
+
+
+#: Cards per /api/watch request. A URL this long is a mistake, not a use
+#: case (docs/STREAMS_PLAN.md §2.4) — stated in the refusal and the README.
+_WATCH_MAX_CARDS = 50
+
+
+def _parse_watch_spec(spec: str) -> Tuple[str, str]:
+    """Split one ``c=`` value into ``(kind, name)`` at the FIRST colon.
+
+    docs/STREAMS_PLAN.md §2.4: "a one-letter kind, a colon, then the
+    name". *spec* has already been through the query-string decoder
+    (``urllib.parse.parse_qs``) by the time it reaches here, so no
+    further unquoting happens — doing it twice would corrupt a name
+    that itself contains a ``%`` sequence. A spec with no colon at all
+    has no valid kind and is handled the same as any other unrecognised
+    kind — an ``ok: false`` card, not a parse error, because a
+    stale or hand-edited URL should degrade to "this one card is
+    wrong", never to a broken page.
+    """
+    if ":" not in spec:
+        return spec, ""
+    kind, name = spec.split(":", 1)
+    return kind, name
+
+
+def _watch_card_error(
+    spec: str, kind: str, name: str, message: str
+) -> Dict[str, Any]:
+    """One ``ok: false`` card — the page still answers 200 around it."""
+    return {
+        "spec": spec, "kind": kind, "name": name, "ok": False,
+        "error": message,
+    }
+
+
+def _handle_watch(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """GET /api/watch?c=…&c=… — the whole Watchlist page in one request.
+
+    docs/STREAMS_PLAN.md §2.4. ``c`` is repeated, ORDER PRESERVED — the
+    URL is the entire configuration, there is no server-side saved view,
+    so the response's card order is exactly the request's. Each value is
+    ``kind:name`` (see :func:`_parse_watch_spec`).
+
+    ``p`` (product) and ``e`` (environment) resolve to verdict cards.
+    ``s`` (stream) is part of the URL grammar from day one so it never
+    has to change when WP-21 adds streams, but streams do not exist
+    yet — so ANY ``s:`` spec in the request 400s the WHOLE request with
+    a clear message, checked before any card is built. There is no
+    partial page for a request that names a feature that is not there.
+
+    An unrecognised kind, or a ``p``/``e`` name that resolves to
+    nothing, is instead an ``ok: false`` CARD — the page still answers
+    200, because a shared URL outlives renames and deletions and a
+    missing scope must say so plainly rather than silently vanish
+    (docs/STREAMS_PLAN.md's "silently missing data is worse than an
+    unexpected row" rule, restated for this page as "a missing scope is
+    an explicit error card, not a gap").
+
+    Fetches every derived table EXACTLY ONCE regardless of how many
+    cards are requested — ``activity_buckets``, the pass list,
+    ``summary_rollup`` and ``environment_products_map`` are each one
+    query; every card after that is a pure-Python slice of that one
+    fetch (see :func:`analytics.summarize_by_product`, reused here with
+    an identity mapping to group by ENVIRONMENT the same way it groups
+    by product). This is what keeps the endpoint O(cards in Python)
+    rather than O(cards) round trips — ``tests/test_api.py`` pins the
+    query count as flat from 1 card to the 50-card cap.
+    """
+    specs = request.query.get("c") or []
+    if len(specs) > _WATCH_MAX_CARDS:
+        raise _HttpError(
+            413,
+            "too many cards: {} requested, {} is the limit for one "
+            "watch request".format(len(specs), _WATCH_MAX_CARDS),
+        )
+    parsed = [
+        (spec,) + _parse_watch_spec(spec) for spec in specs
+    ]  # type: List[Tuple[str, str, str]]
+    for spec, kind, _name in parsed:
+        if kind == "s":
+            raise _HttpError(
+                400,
+                "streams arrive in a later drop (spec {!r})".format(spec),
+            )
+
+    now_value = now()
+    fallback = now_value - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
+    floor = now_value - datetime.timedelta(days=_PASS_LOOKBACK_DAYS)
+    inferred = storage.test_counts_by_environment()
+    declared = storage.declared_test_counts()
+    effective = analytics.effective_test_counts(inferred, declared)
+    all_passes = analytics.find_passes(
+        storage.activity_buckets(floor), effective,
+        gap_hours=_PASS_GAP_HOURS, coverage=_PASS_COVERAGE,
+    )
+    known_environments = set(storage.known_environments())
+    env_to_product = storage.environment_products_map()
+    product_to_envs = {}  # type: Dict[str, List[str]]
+    for environment, product in env_to_product.items():
+        product_to_envs.setdefault(product, []).append(environment)
+    declared_products = set(product_to_envs)
+    latest_by_env = storage.latest_run_time_by_environment()
+    # ONE estate-wide rollup. The recent_cutoff argument only feeds a
+    # column the verdict below never reads — none of failing/
+    # new_failures/fixed/unexpected_passes is recency-gated (see
+    # analytics.summarize_by_product) — so any value works and no
+    # per-card (or per-scope) query is needed for it.
+    rollup_counts = storage.summary_rollup(now_value)
+    by_environment = {
+        row.product: row
+        for row in analytics.summarize_by_product(
+            rollup_counts, {e: e for e in known_environments}
+        )
+    }
+    by_product = {
+        row.product: row
+        for row in analytics.summarize_by_product(
+            rollup_counts, env_to_product
+        )
+    }
+    zero = analytics.ProductRollup(
+        product="", failing=0, new_failures=0, fixed=0, unexpected_passes=0
+    )
+
+    def card_cutoff(card_environments: Sequence[str]) -> datetime.datetime:
+        """This card's OWN staleness line — never the whole estate's."""
+        scoped = [
+            entry for entry in all_passes
+            if entry.environment in card_environments
+        ]
+        return analytics.recent_cutoff(scoped, fallback, floor).when
+
+    cards = []  # type: List[Dict[str, Any]]
+    for spec, kind, name in parsed:
+        if kind == "e":
+            if name not in known_environments:
+                cards.append(_watch_card_error(
+                    spec, kind, name,
+                    "nothing under this name — removed or renamed?"))
+                continue
+            verdict = by_environment.get(name, zero)
+            cards.append({
+                "spec": spec, "kind": "environment", "name": name,
+                "ok": True,
+                "failing": verdict.failing,
+                "new_failures": verdict.new_failures,
+                "fixed": verdict.fixed,
+                "unexpected_passes": verdict.unexpected_passes,
+                "stale_before": model.format_iso(card_cutoff([name])),
+                "last_reported": (
+                    None if name not in latest_by_env
+                    else model.format_iso(latest_by_env[name])
+                ),
+            })
+        elif kind == "p":
+            if name not in declared_products:
+                cards.append(_watch_card_error(
+                    spec, kind, name,
+                    "nothing under this name — removed or renamed?"))
+                continue
+            verdict = by_product.get(name, zero)
+            cards.append({
+                "spec": spec, "kind": "product", "name": name,
+                "ok": True,
+                "failing": verdict.failing,
+                "new_failures": verdict.new_failures,
+                "fixed": verdict.fixed,
+                "unexpected_passes": verdict.unexpected_passes,
+                "stale_before": model.format_iso(
+                    card_cutoff(product_to_envs.get(name, []))),
+                # No single "last reported" for a multi-environment
+                # product — env_updated already answers that per
+                # environment, and this page must never invent one
+                # truthful-looking timestamp out of several.
+                "last_reported": None,
+            })
+        else:
+            cards.append(_watch_card_error(
+                spec, kind, name,
+                "unknown card kind {!r} (expected 'p' or 'e')".format(kind),
+            ))
+
+    return _json_response(
+        200, {"cards": cards, "cap": _WATCH_MAX_CARDS}
     )
 
 
@@ -2013,6 +2443,17 @@ def _route(
         return _handle_environment_expectation(
             storage, request, rest[1], now
         )
+
+    if (len(rest) == 3 and rest[0] == "environments"
+            and rest[2] == "product"):
+        _check_method(request.method, ("PUT",))
+        return _handle_environment_product(
+            storage, request, rest[1], now
+        )
+
+    if rest == ["watch"]:
+        _check_method(request.method, ("GET",))
+        return _handle_watch(storage, request, now)
 
     if rest == ["users"]:
         _check_method(request.method, ("GET", "POST"))

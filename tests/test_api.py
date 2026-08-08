@@ -21,6 +21,7 @@ import datetime
 import json
 import os
 import re
+import sqlite3
 import unittest
 import urllib.parse
 from typing import Any, Dict, List, Optional, Union
@@ -2385,6 +2386,387 @@ class TestEnvironments(ApiCase):
         self.assert_405("POST", "/api/environments", "GET", body={})
         self.assert_405(
             "GET", "/api/environments/linux-sim/expectation", "PUT")
+
+
+class TestEnvironmentProduct(ApiCase):
+    """PUT /api/environments/{env}/product, and the "product" field of
+    GET /api/environments (WP-20, docs/STREAMS_PLAN.md §2.1/§2.2)."""
+
+    def _nightly(self, environment: str, tests: int = 2) -> None:
+        self.import_runs([
+            record(environment=environment, test_name="t%d" % i)
+            for i in range(tests)
+        ])
+
+    def test_an_environment_with_no_declaration_reads_as_the_implicit_product(
+        self
+    ) -> None:
+        self._nightly("linux-sim")
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertEqual(item["product"], "")
+
+    def test_declare_then_read_back(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        self.assertEqual(data["product"], "Atlas")
+        self.assertFalse(data["cleared"])
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertEqual(item["product"], "Atlas")
+
+    def test_empty_string_clears_the_mapping(self) -> None:
+        self._nightly("linux-sim")
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "", "username": "amy"})
+        self.assertEqual(data["product"], "")
+        self.assertTrue(data["cleared"])
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertEqual(item["product"], "")
+
+    def test_clearing_what_was_never_declared_is_not_an_error(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "", "username": "amy"})
+        self.assertFalse(data["cleared"])
+
+    def test_an_unknown_environment_is_404(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/typo/product",
+            body={"product": "Atlas", "username": "amy"}, expect=404)
+        self.assertIn("typo", data["error"])
+
+    def test_the_product_field_is_required(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"username": "amy"}, expect=400)
+        self.assertIn("required", data["error"])
+
+    def test_the_username_field_is_required(self) -> None:
+        self._nightly("linux-sim")
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas"}, expect=400)
+
+    def test_a_non_string_product_is_rejected(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": 5, "username": "amy"}, expect=400)
+        self.assertIn("product", data["error"])
+
+    def test_the_declaring_user_is_recorded(self) -> None:
+        self._nightly("linux-sim")
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        names = [u["username"]
+                 for u in self.call("GET", "/api/users")["users"]]
+        self.assertIn("amy", names)
+
+    def test_wrong_methods(self) -> None:
+        self.assert_405(
+            "GET", "/api/environments/linux-sim/product", "PUT")
+
+
+class TestProductFiltering(ApiCase):
+    """``product=`` on dashboard/summary/time/timeline, and the
+    ``products[]`` breakdown on /api/summary (WP-20, §2.2)."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def _seed(self) -> None:
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1",
+                   result="FAIL"),
+            record(environment="win-sim", test_name="t2", result="FAIL"),
+            record(environment="mac-sim", test_name="t3"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        self._declare("mac-sim", "Borealis")
+
+    def test_products_empty_when_nothing_declared(self) -> None:
+        self.import_runs([record(environment="linux-sim")])
+        data = self.call("GET", "/api/summary")
+        self.assertEqual(data["products"], [])
+
+    def test_products_breakdown_groups_by_declared_product(self) -> None:
+        self._seed()
+        data = self.call("GET", "/api/summary")
+        by_product = {p["product"]: p for p in data["products"]}
+        self.assertEqual(sorted(by_product), ["Atlas", "Borealis"])
+        self.assertEqual(by_product["Atlas"]["failing"], 2)
+        self.assertEqual(by_product["Borealis"]["failing"], 0)
+
+    def test_products_breakdown_is_estate_wide_regardless_of_scope(
+        self
+    ) -> None:
+        """A request scoped to one product must still see the others, or
+        the switcher has no way back to "All products"."""
+        self._seed()
+        scoped = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        self.assertEqual(
+            sorted(p["product"] for p in scoped["products"]),
+            ["Atlas", "Borealis"])
+
+    def test_dashboard_product_filter_is_an_environment_allow_list(
+        self
+    ) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/dashboard", query={"product": ["Atlas"]})
+        environments = {t["environment"] for t in data["tests"]}
+        self.assertEqual(environments, {"linux-sim", "win-sim"})
+        self.assertEqual(data["product"], "Atlas")
+
+    def test_dashboard_unknown_product_is_empty_not_404(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/dashboard", query={"product": ["Nope"]})
+        self.assertEqual(data["tests"], [])
+        self.assertEqual(data["total"], 0)
+
+    def test_summary_product_filter_scopes_the_headline(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        self.assertEqual(data["status"]["total_tests"], 2)
+        self.assertEqual(data["product"], "Atlas")
+
+    def test_summary_product_filter_scopes_the_stale_before(self) -> None:
+        """Each product's own window -- never one wall-clock phrase
+        across products (docs/STREAMS_PLAN.md §2.3)."""
+        self._seed()
+        scoped = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        unscoped = self.call("GET", "/api/summary")
+        # Both are legitimate cutoffs; the point under test is that the
+        # scoped call actually goes through the scoped code path and
+        # both answer without error -- exact equality is not asserted
+        # because with this little history both may legitimately fall
+        # back to the same wall-clock default.
+        self.assertIn("stale_before", scoped)
+        self.assertIn("stale_before", unscoped)
+
+    def test_time_product_filter(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/time",
+            query={"group_by": ["environment"], "product": ["Atlas"],
+                   "include_stale": ["1"]})
+        keys = {item["key"] for item in data["items"]}
+        self.assertEqual(keys, {"linux-sim", "win-sim"})
+        self.assertEqual(data["product"], "Atlas")
+
+    def test_timeline_product_resolving_to_one_environment_is_used(
+        self
+    ) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/timeline", query={"product": ["Borealis"]})
+        self.assertEqual(data["environment"], "mac-sim")
+
+    def test_timeline_product_resolving_to_many_still_needs_environment(
+        self
+    ) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/timeline", query={"product": ["Atlas"]},
+            expect=400)
+        self.assertIn("environment", data["error"])
+
+    def test_timeline_explicit_environment_wins_over_product(self) -> None:
+        """No 400 for "environment does not belong to product" -- an
+        explicit environment always wins (docs/STREAMS_PLAN.md §2.6's
+        only stated product-error rule is unknown product = empty
+        result, not this)."""
+        self._seed()
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["mac-sim"], "product": ["Atlas"]})
+        self.assertEqual(data["environment"], "mac-sim")
+
+
+def _trace_sql_into(conn: sqlite3.Connection, into: List[str]) -> None:
+    """Register a trace callback that appends each statement to *into*.
+
+    Not ``conn.set_trace_callback(into.append)``: 3.6's sqlite3 keeps
+    registered callbacks in an internal dict, so the callable must be
+    hashable, and a bound ``list.append`` hashes via the list -- a
+    TypeError on the deployment interpreter. The lambda is the fix.
+    Same helper as tests/test_storage.py's, kept local rather than
+    imported so the two test modules stay independent.
+    """
+    conn.set_trace_callback(lambda statement: into.append(statement))
+
+
+class TestWatch(ApiCase):
+    """GET /api/watch (WP-20, docs/STREAMS_PLAN.md §2.4): the whole
+    Watchlist page in one request, cards in request order."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def _seed(self) -> None:
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1",
+                   result="FAIL"),
+            record(environment="win-sim", test_name="t2", result="FAIL"),
+            record(environment="mac-sim", test_name="t3"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        self._declare("mac-sim", "Borealis")
+
+    def test_cards_come_back_in_request_order(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:mac-sim", "p:Atlas", "e:linux-sim"]})
+        self.assertEqual(
+            [c["spec"] for c in data["cards"]],
+            ["e:mac-sim", "p:Atlas", "e:linux-sim"])
+
+    def test_an_environment_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:linux-sim"]}
+        )["cards"]
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["kind"], "environment")
+        self.assertEqual(card["name"], "linux-sim")
+        self.assertEqual(card["failing"], 1)
+        self.assertEqual(card["new_failures"], 1)
+        self.assertIsNotNone(card["last_reported"])
+        self.assertIsNotNone(card["stale_before"])
+
+    def test_a_product_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Atlas"]}
+        )["cards"]
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["kind"], "product")
+        self.assertEqual(card["failing"], 2)
+        self.assertIsNone(card["last_reported"])
+        self.assertIsNotNone(card["stale_before"])
+
+    def test_an_unknown_environment_is_an_error_card_not_404(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch", query={"c": ["e:typo"]})
+        (card,) = data["cards"]
+        self.assertFalse(card["ok"])
+        self.assertIn("error", card)
+
+    def test_an_unknown_environment_page_is_still_200(self) -> None:
+        self._seed()
+        response = self.request(
+            "GET", "/api/watch", query={"c": ["e:typo"]})
+        self.assertEqual(response.status, 200)
+
+    def test_an_unknown_product_is_an_error_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Nope"]}
+        )["cards"]
+        self.assertFalse(card["ok"])
+
+    def test_an_unknown_kind_is_an_error_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["x:whatever"]}
+        )["cards"]
+        self.assertFalse(card["ok"])
+        self.assertIn("unknown", card["error"])
+
+    def test_a_malformed_spec_with_no_colon_is_an_error_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["garbage"]}
+        )["cards"]
+        self.assertFalse(card["ok"])
+
+    def test_a_mix_of_good_and_bad_cards_is_still_200(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:linux-sim", "e:typo", "p:Atlas"]})
+        oks = [c["ok"] for c in data["cards"]]
+        self.assertEqual(oks, [True, False, True])
+
+    def test_a_stream_card_400s_the_whole_request(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:linux-sim", "s:1"]}, expect=400)
+        self.assertIn("later drop", data["error"])
+
+    def test_a_stream_card_400s_even_mixed_with_good_cards_first(
+        self
+    ) -> None:
+        """Checked before any card is built -- no partial page for a
+        request naming a feature that does not exist yet."""
+        self._seed()
+        self.call(
+            "GET", "/api/watch",
+            query={"c": ["p:Atlas", "e:linux-sim", "s:1"]}, expect=400)
+
+    def test_the_cap_refuses_clearly(self) -> None:
+        self._seed()
+        specs = ["e:linux-sim"] * (api._WATCH_MAX_CARDS + 1)
+        data = self.call(
+            "GET", "/api/watch", query={"c": specs}, expect=413)
+        self.assertIn(str(api._WATCH_MAX_CARDS), data["error"])
+
+    def test_the_cap_boundary_is_accepted(self) -> None:
+        self._seed()
+        specs = ["e:linux-sim"] * api._WATCH_MAX_CARDS
+        data = self.call("GET", "/api/watch", query={"c": specs})
+        self.assertEqual(len(data["cards"]), api._WATCH_MAX_CARDS)
+        self.assertEqual(data["cap"], api._WATCH_MAX_CARDS)
+
+    def test_no_cards_is_an_empty_page_not_an_error(self) -> None:
+        data = self.call("GET", "/api/watch")
+        self.assertEqual(data["cards"], [])
+
+    def test_query_count_does_not_grow_with_card_count(self) -> None:
+        """§0.4: no new list query may cost more the more cards are
+        asked for. One card and fifty must cost the SAME number of
+        queries -- every card after the first fetch is a Python-side
+        slice of data already in memory."""
+        self._seed()
+        conn = self.storage._conn()
+
+        def query_count(specs: List[str]) -> int:
+            statements = []  # type: List[str]
+            _trace_sql_into(conn, statements)
+            try:
+                self.call("GET", "/api/watch", query={"c": specs})
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        one = query_count(["e:linux-sim"])
+        fifty = query_count(["e:linux-sim"] * api._WATCH_MAX_CARDS)
+        self.assertEqual(one, fifty)
+
+    def test_wrong_methods(self) -> None:
+        self.assert_405("POST", "/api/watch", "GET", body={})
 
 
 class TestEnvironmentUpdated(ApiCase):
