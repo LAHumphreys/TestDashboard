@@ -1990,3 +1990,26 @@ too much for one screen.
 Suite: 1750 OK (skipped=1) SQLite-only; 2329 OK (skipped=18) dual-backend
 (this dev machine's local MariaDB) — both on the final tree, after every
 commit in this entry.
+
+## 2026-08-09 — overnight perf pass over the streams work (dev copy, 220MB)
+
+Method: EXPLAIN QUERY PLAN audit of every new read path (32 distinct
+SELECTs), a request storm through --perf-log/perf_report.py, and import
+re-push timing. All numbers DEV data (~1/4 production size).
+
+- Zero request-time scans of `runs` anywhere. One bounded scan
+  (`assignment_stream_ids` over current_assignments — O(currently
+  assigned), acceptable and noted).
+- THE finding: /api/compare at 490ms-1.5s — the pairs SQL joined two
+  MATERIALIZED partition subqueries, un-indexable, nested-loop
+  ~2k x 2k. Reshaped to a latest_runs self-join on the PRIMARY KEY
+  (commit 3ebd5f7): full compare page 1942.5ms -> 12.2ms at the storage
+  layer, 15ms end-to-end. ComparePairsQueryPlanTest pins the plan shape
+  (proved by reversion); MariaDB confirmed eq_ref by hand.
+- Byte-identical re-push of 26,320 records across four streams: all
+  recognised unchanged, ~2.4s wall including client fetches — the
+  10-minute feeder path is unharmed by stream resolution.
+- Queue waits across 385 connections: median 0.03ms, worst 0.98ms — no
+  pool pressure; every cost above was SQL, not starvation.
+- Remaining dev-only numbers needing production confirmation are listed
+  in docs/drops/2026-08-14.md's not-verified section.
