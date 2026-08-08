@@ -560,6 +560,41 @@ superseded runs.
 same name, judged against its predecessor and against mainline, and a test's
 page answers "which builds fail this?" in one disclosure.
 
+### 4.4 As built (2026-08-08, `wp-22-builds`)
+
+Matches the plan above with these decisions made during implementation,
+recorded here rather than left implicit:
+
+- **Cross-product refusal rule, precisely:** allowed when either side is
+  `kind='mainline'`, or when both sides' `product` match; refused
+  otherwise, 400 naming both products. Mainline is exempt on EITHER side
+  (`stream=` or `baseline=`), not only as a baseline — the SQL is
+  symmetric and there is no reason the exemption should not be.
+- **"Searchable" (§4.1) was NOT built as a second datalist combo for the
+  Build picker itself** — that treatment went to the NEW "Compare to"
+  control only (§4.1's own explicit instruction), which needed it to let
+  a release manager type or pick a build/branch name. The picker stays
+  the WP-21 `<select>` with the new Builds/Branches `<optgroup>` split,
+  relying on native browser type-ahead. Revisit if a real deployment's
+  stream count makes this feel slow — the risk note in §4.3 already
+  expected this to need revisiting "if in doubt."
+- **The per-triple endpoint is `GET /api/tests/{env}/{script}/{test}/streams`**,
+  an extension of the test-detail SHAPE (a sibling sub-resource, not a
+  field folded into the existing detail payload) — chosen because it is
+  fetched independently and lazily (the "Every build" disclosure is
+  collapsed by default) and because the SAME payload also drives the
+  stream switcher, which needs to render before the disclosure is ever
+  opened.
+- **"Superseded runs render as ghosts"** (§4, opening paragraph) is
+  **not implemented** — verified, not merely left alone: the history
+  table draws every row solid. Newer-wins-as-latest and the older run
+  remaining visible in history both hold; there is no solid/outline
+  visual distinction between them. Out of scope for this drop per its
+  own "nothing new to build if... already renders older runs" escape
+  valve — flagged here so it is not silently assumed to exist.
+- **The "optional declared RC/Released label" paragraph stays void**, per
+  §0's closing decision — not built, not reconsidered.
+
 ---
 
 ## 5. WP-23 — Long-running branch streams *(drop 4; one migration)*

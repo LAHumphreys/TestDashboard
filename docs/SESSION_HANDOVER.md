@@ -4,12 +4,13 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-08-08**, after WP-21 (branches/builds beside mainline,
-migration 9) was built on `wp-21-streams`, then — the same day — put in
-front of a real browser for the first time. Four gaps found in that first
-use are now fixed on the same branch, in the same still-unshipped drop.
-**Built and green on both backends, not yet accepted, not yet deployed** —
-the 2026-08-07 drop is still the one running in production.
+Last rewritten: **2026-08-08**, after WP-22 (release builds + compare-any-two,
+`docs/STREAMS_PLAN.md` §4, **no migration**) was built on `wp-22-builds`, cut
+from `wp-21-streams`'s tip. **Built and green on both backends, not yet
+accepted, not yet deployed** — the 2026-08-07 drop is still the one running
+in production. WP-20+21+22 now ship as ONE combined drop; there is nothing
+left in the streams/products design (`docs/STREAMS_PLAN.md` §§0–4) unbuilt
+except WP-23 (long-running branch streams — deliberately last, see below).
 
 ---
 
@@ -17,80 +18,39 @@ the 2026-08-07 drop is still the one running in production.
 
 | | |
 |---|---|
-| **production** | **live on the 2026-08-07 drop** (schema v7). Confirm the box runs the FINAL drop commit `310f1c0` — What's new saying "7 August 2026" is the tell. Neither WP-20 nor WP-21 below has been deployed |
+| **production** | **live on the 2026-08-07 drop** (schema v7). Confirm the box runs the FINAL drop commit `310f1c0` — What's new saying "7 August 2026" is the tell. Nothing below has been deployed |
 | `origin/master` | `ea15ccc` — **stale**: push `wp-18-timeline` to `master` so the recorded state matches the deployed one |
 | `wp-18-timeline` | the 2026-08-07 drop, deployed. All four CI legs green |
-| `wp-20-products` | WP-20 (products + Watchlist), migration 8. **Superseded as a ship candidate by `wp-21-streams` below**, which contains it — ship the combined drop, not this branch alone, unless WP-21 is deliberately deferred |
-| `wp-21-streams` | WP-21 (branches/builds beside mainline), migration 9, built on top of WP-20, then extended with four fixes found in first human use (branch band on the test page, triage-from-a-branch, assignment origin annotation, Open actions' origin filter/tag — see below). Suite green on BOTH backends. Operator note is `docs/drops/2026-08-14.md` — **date provisional**, re-date before pushing if it ships on a different day. Acceptance list is at the bottom of that note, and is now longer than any previous drop's |
+| `wp-20-products` | WP-20 (products + Watchlist), migration 8. **Superseded as a ship candidate by `wp-22-builds` below**, which contains it |
+| `wp-21-streams` | WP-21 (branches/builds beside mainline), migration 9. **Superseded as a ship candidate by `wp-22-builds` below**, which contains it |
+| `wp-22-builds` | **WP-22 (release builds + compare-any-two), no migration — the current ship candidate, contains WP-20+21+22 in full.** `/api/compare?baseline=` now accepts any same-product stream, not only mainline; the Build picker gains a Builds group; the build-scoped dashboard gains a "Compare to" box defaulting to the predecessor build; the test page gains the "Every build" table + stream switcher explicitly requested after WP-21's first human use; the Watchlist's `s:` card works for builds. Suite green on BOTH backends. Operator note is `docs/drops/2026-08-14.md` — **date provisional**, re-date before pushing if it ships on a different day |
 | `wp-14-in-run-progress` | parked WIP; its migration is now **10** (WP-20 took 8, WP-21 took 9 — the registry note in `UPGRADE_PLAN.md` §1 tracks this renumbering) — renumber before merging |
 
-Suite on `wp-21-streams`: **1688 green** (skipped 1) SQLite-only; **2228
-green** (skipped 16) with `TESTBOARD_TEST_DB_CNF` set against this dev
+Suite on `wp-22-builds`: **1736 green** (skipped 1) SQLite-only; **2303
+green** (skipped 18) with `TESTBOARD_TEST_DB_CNF` set against this dev
 machine's local `mariadbd` (port 3307, `.scratch/mariadb-test.cnf`) — both
 on the FINAL tree, re-run after every change this session. **CI's own
 `python36-mariadb` leg (mariadb:10.3, prod's actual stream) has not been
 observed against this branch** — the local server is a newer MariaDB,
 functional evidence only, never a perf number.
 
-**This is now the first branch in this project's history to have been
-opened in a real browser** — still the only page ever to receive that, and
-it found real bugs immediately: `eb05c7a` (a delta-table row's link forgot
-its own stream id and landed on the mainline test page — one line, now
-guard-tested). Working through it with the user surfaced four more, all
-fixed on this same branch, same drop:
-
-1. **The branch band was dashboard-only.** `test.html` had the full
-   `?stream=` scoping (history, analytics, the compare strip) but nothing
-   loud saying so. `renderBranchBand` is now exported from `compare.js` and
-   shared by both pages; "Back to mainline" generalised to "the current URL
-   with only `stream` removed" (preserves the test page's own
-   environment/script/test_name instead of bouncing to a fixed
-   `index.html`).
-2. **Triage didn't actually work from a branch.** The delta table was
-   chips-only. It now carries the same assignee select and inline Review
-   expander every other list in the app has — assigning from a branch row
-   assigns the SAME test everyone sees, retirement is refused by
-   construction (the shared panel is simply never given a staleness cutoff
-   there). `/api/compare` rows gained `stream_run_id`/`stream_start_time`
-   (the branch's own run) and the triple's current, unpartitioned
-   `assignee` — no new query shape, both already live on `latest_runs`/
-   `current_assignments`.
-3. **Assignment origin folded into migration 9** (still unshipped when
-   found, so no database anywhere has the narrower shape) —
-   `assignments`/`current_assignments` gained a nullable `stream_id`, the
-   exact shape `comments.stream_id` already established. `PUT
-   .../assignee` accepts it optionally.
-4. **Open actions shows the origin**: a "branch feat/x" tag per row and a
-   server-side `origin=branch`/`origin=mainline` filter — absent entirely
-   (not just empty) when no assignment anywhere carries a stream.
-
-All four were driven against a real scratch server through the project's
-node DOM-shim harness, not just source-scanned — the harness itself grew
-(`insertBefore`/`nextSibling`/`remove()`, `document.createDocumentFragment
-()`, a `find()` guard against text-node leaves; `actions.js` had never been
-driven through row-rendering before). It confirmed the assignee select
-showed a REAL pre-existing value rather than defaulting to "Unassigned"
-(the specific wrong-payload failure that was flagged as the likeliest risk
-before it was checked), the Review panel opened onto the branch's own
-captured output, no retire control appeared anywhere, both bands and their
-back-links were correct, and the Open actions filter/tag round-tripped a
-real assignment end to end. **Still true: no browser has rendered the
-delta view's layout, contrast, or whether five tiles plus a tabbed table is
-too much page for one screen** — the shim proves wiring and data flow, not
-appearance. Full account, per finding, is in `docs/drops/2026-08-14.md`.
-
-**Migration timings, measured on the 220 MB / 540,192-run dev copy (NOT
-production — production is ~4x this size), brought to v7 first (production's
-current version) so the number is what the box will actually see:**
-migration 8 alone 26.8 ms (O(1)); migration 9 alone (v8→v9) 0.883 s total,
-of which 0.6 s is the `latest_runs` rebuild (12,008 rows — the one part of
-either migration that scales with estate size); **combined v7→v9, 0.806 s**
-— the number that matters for the actual upgrade. These numbers predate
-this session's four fixes but are unaffected by them: none touches
-`latest_runs`'s shape, only `assignments`/`current_assignments` (small
-tables, O(1) ALTERs). Full detail and the measurement method (a read-only
-`git archive` of `wp-18-timeline`'s `storage.py`, bringing a scratch copy to
-exactly v7 without touching any branch) is in the drop note.
+**WP-22 got the same real-server-plus-DOM-shim treatment WP-21's first
+human use established**, this session: a scratch server seeded with two
+products, one feature branch, and TWO builds of the same product (older +
+newer, an overlapping-but-changed test set) so previous-build defaulting
+was actually exercised — not merely asserted by a unit test. **It caught
+one real defect**: a JSDoc comment in `compare.js` contained a literal
+`*/` mid-sentence ("built from *streamMeta*/*baselineMeta*'s own..."),
+which closed the block comment early and turned the rest of it into a
+syntax error. `node --check` on the same file did NOT catch this —
+only the DOM shim's real dynamic `import()`, which parses the actual
+module graph the way a browser would, did. This would have broken
+`index.html` AND `test.html` outright (both import `compare.js`) had it
+shipped; no unit test in this project (all static-analysis, no JS
+runtime) could have found it. Fixed same-session, before the rest of the
+verification pass ran. Full account is in `docs/drops/2026-08-14.md`'s
+"What was NOT verified" section (which also says, plainly, what the pass
+still does not prove: layout, contrast, real screen widths).
 
 **SQLite is a permanent first-class backend** (user requirement, 2026-08-07):
 `--db PATH` unchanged forever, zero-setup second instances, both backends
@@ -113,27 +73,29 @@ from it.
 
 **Two independent threads are both live right now — do not conflate them.**
 
-**Thread A — accept and ship the combined WP-20+WP-21 drop
-(`wp-21-streams`).** Suite-green on both backends, not deployed, not
+**Thread A — accept and ship the combined WP-20+WP-21+WP-22 drop
+(`wp-22-builds`).** Suite-green on both backends, not deployed, not
 reviewed. Before it ships:
 
-1. Read `docs/drops/2026-08-14.md`'s acceptance list in full — it is the
-   longest of any drop so far, because this is the first WP-21 surface a
-   human has actually used, and the four fixes above are new ground:
-   assign/review from a branch row, the origin tag/filter on Open actions,
-   the test-page band.
+1. Read `docs/drops/2026-08-14.md`'s acceptance list in full — WP-22 added
+   its own items (the Builds group, the "Compare to" default, the
+   build-framing line, the "Every build" table + stream switcher, the
+   build-kind Watchlist card's wording) on top of WP-21's already-long
+   list.
 2. Re-date the drop note and `whatsnew.html` if the ship day is not the
    14th (`DropDateTest` catches a mismatch between the two, not a date
    that is wrong in the same way in both places).
-3. Feed a real branch or build's results in against a scratch copy and
-   walk the acceptance checklist before it goes anywhere near production —
-   this session's own driver scripts are a starting point, not a
-   substitute; they proved data flow, not appearance.
+3. Feed real branch AND build results in against a scratch copy —
+   including a SECOND build under a different name, so the rebuild and
+   previous-build-defaulting paths both get exercised by a human — and
+   walk the acceptance checklist before it goes anywhere near production.
 4. Run the migration-8+9 probe against a copy of **production** (not just
    the dev copy measured so far) and record the number in the drop note
-   before shipping.
-5. Push `wp-21-streams` to `master` and follow the drop note's upgrade
-   procedure (two migrations run in one restart).
+   before shipping. (WP-22 itself claims no migration, so this number is
+   unchanged from the WP-20/21 measurement.)
+5. Push `wp-22-builds` to `master` and follow the drop note's upgrade
+   procedure (two migrations run in one restart, same as before — WP-22
+   adds none).
 
 `wp-14-in-run-progress` must renumber its migration to **10** before it can
 merge, now that WP-20 has taken 8 and WP-21 has taken 9.
@@ -165,41 +127,41 @@ collision path (docs/STREAMS_PLAN.md §3.2 — a branch and mainline reporting
 the identical test at the identical microsecond) is unit-tested on both
 backends but has never been provoked against a real feed.
 
-**Explicitly requested, deferred to WP-22:** a per-stream result switcher
-("Every build") on the test-detail page — the user asked for it directly
-during this session's review; it is recorded in `docs/STREAMS_PLAN.md` §4.1
-so it is not dropped when that drop is planned.
+**WP-23 (long-running branch streams, its own migration) is next after this
+ships**, and deliberately last — it should be justified by real WP-21/22
+usage first, per `docs/STREAMS_PLAN.md` §5's own reasoning.
 
 ## First ten minutes of a new session
 
 ```bash
 git log --oneline -5                  # where am I
 git status --short                    # should be clean
-python -m unittest discover           # expect 1688 OK (skipped=1) on wp-21-streams
+python -m unittest discover           # expect 1736 OK (skipped=1) on wp-22-builds
 ```
 
 **If the UI looks wrong, check you restarted the server.** Static files are
 read per request; the Python is whatever was imported at process start.
 
-There is no browser here, except that this drop has now had one used
-against it once, by a person, outside this environment — the fixes above
-are what came back from that. Frontend changes are otherwise verified by
+There is no browser here. Frontend changes are verified by
 `tests/test_frontend_calls.py` (static analysis of the actual `.js` source)
 and, for pieces that carry real risk, by driving the actual JS through the
-node DOM-shim harness in `.scratch/` against a real running server. Neither
-proves layout, colour, contrast, or whether a page is too much for one
-screen — only a real browser does, and this drop has had exactly one look.
+node DOM-shim harness in `.scratch/` against a real running server via a
+real dynamic `import()` — the WP-22 pass this session is the second time
+this method has been used, and it found a real bug the first static check
+missed (see above). Neither proves layout, colour, contrast, or whether a
+page is too much for one screen — only a real browser does, and no drop so
+far has had one.
 
 ---
 
 ## The work waiting, in the order it wants doing
 
-### 1. Accept and ship the combined WP-20+WP-21 drop
+### 1. Accept and ship the combined WP-20+WP-21+WP-22 drop
 
 See Thread A above. This is now the single largest piece of unshipped,
-unreviewed work in the repo — two work packages, one drop, two schema
-migrations, a whole new comparison-and-triage surface, and the first real
-human feedback this project has had on any of it.
+unreviewed work in the repo — three work packages, one drop, two schema
+migrations, a whole new comparison-and-triage surface, and compare-any-two
+on top of it.
 
 ### 2. Ship the 2026-08-07 drop's remaining MariaDB cutover steps
 
@@ -208,10 +170,10 @@ See Thread B above — independent of Thread A, and can proceed in parallel.
 ### 3. Merge the deferred work back — `wp-14-in-run-progress`
 
 **Migration renumbers to 10 before merging** (registry §1, third
-renumbering). Now further behind two whole work packages: expect conflicts
-in `app.js`, `storage.py` (the backend seam, the upsert maintaining
-`activity_hours`/`script_hours`, and now the stream partition), and the
-status log.
+renumbering). Now further behind three whole work packages: expect
+conflicts in `app.js`, `storage.py` (the backend seam, the upsert
+maintaining `activity_hours`/`script_hours`, and now the stream
+partition), and the status log.
 
 ### 4. WP-15 — progress pushes from a partial reader *(migration 10)*
 
@@ -224,16 +186,15 @@ hand-applied DDL via `testboard_migrate`) — decide when it lands.
 
 Still noted, not specified.
 
-### 6. WP-22 — cross-branch baselines, release builds
+### 6. WP-23 — long-running branch streams *(own migration, deliberately last)*
 
-Deliberately deferred out of WP-21: `/api/compare?baseline=` refuses
-anything but mainline in this drop with an explicit 400 naming WP-22. Now
-also carries the explicit "Every build" dropdown request noted above — see
-`docs/STREAMS_PLAN.md` §4 for the rest of what is already specified there.
+`docs/STREAMS_PLAN.md` §5. Gives a long-running branch its own triage/trend/
+staleness instead of only a delta view. Should wait for real usage data from
+WP-21/22 first — the plan's own reasoning for putting it last.
 
 ## Needs a person, not a commit
 
-1. **Acceptance-test and ship the combined WP-20+WP-21 drop** — the
+1. **Acceptance-test and ship the combined WP-20+WP-21+WP-22 drop** — the
    longest list of any drop so far; see `docs/drops/2026-08-14.md`.
 2. Migration-8+9 probe on a prod copy (number into the drop note).
 3. §A on the MariaDB server (root), §E.1 dry run, cutover decision.

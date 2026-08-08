@@ -1684,3 +1684,111 @@ explicit note that the user has asked for the test-page per-stream
 Suite: 1688 OK (skipped=1) SQLite-only. Dual-backend re-run on the final
 tree; see `docs/drops/2026-08-14.md` for the count captured there rather
 than duplicated here.
+
+## WP-22 — release builds + compare-any-two (2026-08-08, same day, `wp-22-builds`)
+
+Cut from `wp-21-streams`'s tip. `docs/STREAMS_PLAN.md` §4. **No migration**
+— every piece reads WP-21's `streams` table and the
+`(environment, script, test_name)` index migration 9 already created.
+
+**Backend.** `/api/compare?baseline=` loses the "must be mainline"
+restriction: any stream of the SAME product as `stream=` is now accepted
+(mainline stays the one universal exception on either side, since its
+`product` is `''` by construction). A cross-product pairing 400s naming
+both products — the environments filter both sides of the SQL join share
+is resolved from `stream='s` own product alone, so an unchecked mismatch
+would not have errored, it would have silently compared against the wrong
+(empty) environments on the baseline side. `Storage.compare_counts_many`
+gained an optional per-stream `baselines` argument so a build-kind
+Watchlist card can default to its predecessor build without paying one
+query per card — every distinct baseline id folds into the SAME
+`IN`-clause query the method already ran, keeping
+`test_query_count_does_not_grow_with_s_card_count` green for a real reason.
+`Storage.previous_builds` resolves "the nearest earlier same-product build
+by `last_seen`" in ONE query bounded to the distinct products among the
+requested builds. New `Storage.stream_results_for_triple` +
+`GET /api/tests/{env}/{script}/{test}/streams` (plus a small
+`Storage.product_for_environment` single-row lookup so the frontend can
+resolve which product's FULL stream list to union against): a triple's
+latest result on every stream that has one, newest first — deliberately
+NOT product-filtered at the query level, since the triple's `environment`
+is already the discriminator and filtering again by the CURRENT
+`environment_products` mapping would silently drop a row after a remap.
+Widened the WP-21 guard test that pinned "non-mainline baseline is
+refused" into same-product-allowed / cross-product-refused /
+mainline-always-exempt cases — that restriction was WP-21's own stated
+scope boundary, not a production finding, and lifting it was WP-22's job.
+
+**Frontend.** Every place that built its wording from the literal word
+"mainline" — the delta view's heading, column headers, freshness lines,
+the branch band, the Watchlist's stream card — now reads it from the
+baseline's own identity (new `compare.js` export `streamLabel()`), because
+a build's baseline is routinely a PREDECESSOR BUILD once this ships, not
+mainline. The build-scoped dashboard gained a "Compare to" box (a plain
+datalist combo, visible only for a `kind='build'` stream — a branch
+dashboard's cost and appearance stay exactly what WP-21 shipped) defaulting
+to the previous build by `last_seen` where one exists, else mainline, plus
+a build-only framing line ("Built … — nothing has run since." / "…last
+ran …"). The Build picker gained a Builds `<optgroup>`, newest first by
+`last_seen` (branches keep their own group, unchanged order) — "searchable"
+was judged satisfied by native `<select>` type-ahead at realistic stream
+counts rather than converting the picker to a second datalist combo, to
+avoid churn against `StreamPickerTest` for a nice-to-have. The test page
+gained the "Every build" disclosure (this triple's latest result on every
+stream of its product, newest first, unioned by stream id against the full
+`/api/streams` list so absent streams render NO RESULT rather than being
+silently dropped or omitted) and the stream switcher near the top of the
+page — the SPECIFIC thing the user asked for after WP-21's first human use,
+recorded in `docs/STREAMS_PLAN.md` §4.1 so it would not be dropped when
+this drop was planned. Watchlist `s:` cards gained a "N tests failing in
+`<name>`" headline (§4.1's literal wording) ahead of the existing five-tile
+stat grid.
+
+**Item 7 (superseded-run ghosting) was verification, not new code**: a
+build rebuild (second import under the same `build` name) was checked end
+to end — same stream, no duplicate, newer run wins as `latest`, older run
+still shows in history. Correction to the plan's own wording, found by
+checking rather than assuming: "superseded runs render as ghosts" is not
+literally true — the history table draws every row solid, with no
+ghost/outline distinction. Said plainly in the operator note rather than
+left for someone to discover later.
+
+**Live verification, this session** (the second time this project has
+driven real frontend JS against a real running server, after WP-21's first
+human use): a scratch server seeded with two products, one feature branch,
+and TWO builds of the same product (older + newer, an
+overlapping-but-changed test set) so previous-build defaulting was actually
+exercised. Confirmed via the node DOM-shim harness (`.scratch/`,
+gitignored): the Builds group and its ordering; the newer build's delta
+view defaulting to the older build (band text, heading, column header, the
+Compare-to box's preset value, and the tile counts all checked against the
+real numbers); the older build (no predecessor) falling back to mainline;
+a branch-scoped dashboard showing ZERO of the WP-22 additions; the
+Watchlist `s:` card's wording naming the real predecessor, never falling
+back to "mainline"; the test page's "Every build" table (4 rows, newest
+first, current scope marked "you are here") and stream switcher; and the
+cross-product refusal, live, both directions via `curl`.
+
+**This caught one real defect before it shipped**: a JSDoc comment in
+`compare.js` read "built from `*streamMeta*/*baselineMeta*'s` own
+kind/name" — the literal `*/` mid-sentence closed the block comment early,
+turning the rest of it into code and producing a syntax error. `node
+--check` on the same file, run earlier in the same session, did NOT catch
+it (it does not fully parse the module the way a real ES module loader
+does); only the DOM shim's actual dynamic `import()` — which loads the
+real module graph, the way `<script type="module">` does in a browser —
+failed on it. This would have broken `index.html` AND `test.html` outright
+(both import `compare.js`), and no unit test in this project (all
+static-analysis, no JS runtime) could have caught it. Fixed same-session,
+before the rest of the verification pass ran; the checks above are
+POST-fix. This is now the concrete case for why this project's frontend
+verification method insists on a real dynamic import over a syntax-only
+pass, beside the two defects WP-21's first human use already found.
+
+Suite: 1736 OK (skipped=1) SQLite-only; 2303 OK (skipped=18) dual-backend
+(this dev machine's local MariaDB, `.scratch/mariadb-test.cnf` — two new
+query-count tests needed the same `EXCLUDED_TESTS` treatment every other
+`sqlite3.set_trace_callback`-based test already gets). CI's own
+`python36-mariadb` leg has not been observed against this branch.
+`docs/drops/2026-08-14.md` rewritten to cover WP-20+21+22 as one coherent
+combined drop, per house rule.

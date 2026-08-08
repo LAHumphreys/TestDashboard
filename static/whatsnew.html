@@ -38,7 +38,7 @@
     <section class="release" data-drop-date="2026-08-14">
       <div class="section-head">
         <h2 class="eyebrow">14 August 2026</h2>
-        <span class="muted">New: branches and builds beside mainline, plus the Watch page</span>
+        <span class="muted">New: branches and release builds beside mainline, compare any two, plus the Watch page</span>
       </div>
 
       <h3>New: branches and builds, compared to mainline</h3>
@@ -48,15 +48,16 @@
           stays exactly what it always was, and nothing about this is
           visible until your team actually feeds in a branch or a build.
           Once one exists, a <strong>Build</strong> picker appears next to
-          the Environment filter on the dashboard; pick one to see it
-          compared against mainline.</li>
+          the Environment filter on the dashboard, grouped into
+          <strong>Branches</strong> and <strong>Builds</strong> (newest
+          build first); pick one to see it compared against mainline.</li>
         <li>The comparison page shows what's new: failing, passing, still
           failing on both, brand-new tests, and tests with no result on one
           side — each a tab with its own table, plus how many tests
           <em>agree</em> and are not worth listing, and how much of the
           estate has a result on this branch at all. Both sides' "last ran"
-          times are shown, and a warning appears if mainline itself hasn't
-          run recently enough to trust the comparison.</li>
+          times are shown, and a warning appears if the comparison's other
+          side hasn't run recently enough to trust it.</li>
         <li><strong>Triage works from a branch too</strong> — every row in
           the comparison table can be assigned (or taken) right there, and
           "Review" opens the same output/comment panel you already know
@@ -65,10 +66,11 @@
           otherwise it is the same triage you already do, one click closer.
           A sticky band across the top of the page (and the test's own page,
           if you follow a row there) always says which branch or build
-          you're looking at, so it's never a mystery how you got there.</li>
-        <li>Open a test from a branch's table and its page now shows
-          mainline's result right beside the branch's, and any comment on
-          that test says which build or branch it was posted from.</li>
+          you're looking at, and what it's being compared against, so it's
+          never a mystery how you got there.</li>
+        <li>Open a test from a branch's or build's table and its page now
+          shows the comparison result right beside its own, and any comment
+          on that test says which build or branch it was posted from.</li>
         <li><strong>Open actions shows where an assignment came from.</strong>
           If a test was assigned while looking at a branch or build, its row
           carries a small tag saying which one — and once at least one
@@ -77,11 +79,44 @@
           mainline's own.</li>
         <li>The Watchlist (below) can carry a branch/build card too — add
           one from the "Branch/build" option in the card picker to keep an
-          eye on a branch's health alongside your usual environments and
-          products.</li>
+          eye on a branch's or build's health alongside your usual
+          environments and products.</li>
         <li>If your site's feeder script submits branch or build results,
           see the README's "Feeding a branch or build" section for the new
           <code>--branch</code>/<code>--build</code> flags.</li>
+      </ul>
+
+      <h3>New: release builds — compare against any earlier build, not just mainline</h3>
+      <ul>
+        <li><strong>A build can now be judged against the build before
+          it, not only against mainline.</strong> Open a build's comparison
+          page and a new <strong>Compare to</strong> box appears above the
+          numbers — it defaults to the build's own predecessor when one
+          exists (the last time this same build name was cut, this box
+          shows which one it picked), and falls back to mainline when there
+          isn't one yet. Type or pick any other build or branch of the same
+          product to compare against that instead — nothing is parsed out
+          of the version string; builds are always ordered by when they
+          actually ran, never by name.</li>
+        <li>A build's page now says when it was built and whether anything
+          has run since — "Built 2 days ago — nothing has run since" if it
+          hasn't been re-cut, or its last run time if it has.</li>
+        <li><strong>A test's own page can now show its result on every
+          build and branch of its product at once.</strong> Open the new
+          "Every build" section below Analytics: one row per stream that
+          has ever run this test, newest first, with the ones that never
+          ran it plainly marked <em>no result</em> rather than left off the
+          table or guessed at. There's also a quick switcher near the top
+          of the page — pick any stream from the list and jump straight to
+          this same test's result there.</li>
+        <li>A Watchlist card for a build now says how many tests are
+          failing in it by name, and compares it against its predecessor
+          build when one exists — the same default the comparison page
+          uses — falling back to mainline otherwise.</li>
+        <li>Comparing two builds (or a build and a branch) from different
+          products is refused with a clear message naming both — there is
+          nothing to compare across products, since they don't share
+          environments.</li>
       </ul>
 
       <h3>New page: Watch</h3>

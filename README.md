@@ -224,9 +224,16 @@ SIX-way classification of that stream's tests against mainline
 `agree` — both sides have a result and it is not FAIL on either — a real
 field rather than something the caller re-derives, since it is what the "N
 tests agree and are not listed" and coverage lines on the dashboard need)
-plus both sides' identity and `last_seen`; `baseline=` may currently only be
-the mainline stream's id (comparing against any other stream arrives in
-WP-22). Each row of a `category=` page is
+plus both sides' identity and `last_seen`; `baseline=` (WP-22) accepts any
+stream id of the SAME product as `stream=`, not only mainline — a build
+judged against the build before it, or one branch against another — and
+defaults to mainline when omitted. Mainline is the one universal exception
+to the product check on either side (its own `product` is `""` by
+construction, shared by every product). A baseline naming a DIFFERENT
+product than `stream=` is refused with `400`, naming both products — the
+comparison's environments are resolved from `stream='s` own product, so a
+mismatched baseline would otherwise silently compare against the wrong
+environments instead of erroring. Each row of a `category=` page is
 `{environment, script, test_name, stream_result, baseline_result,
 stream_run_id, stream_start_time, assignee}` — `stream_run_id`/
 `stream_start_time` (WP-21) are the STREAM's own run (never the baseline's),
@@ -237,6 +244,17 @@ stream, only annotated with where it was made, see the assignee endpoint
 below).
 `GET /api/dashboard`, test detail and test history all accept an optional
 `stream=<id>` (default: mainline).
+
+`GET /api/tests/{env}/{script}/{test}/streams` (WP-22) returns this triple's
+latest result on every stream that HAS one, newest first by that stream's
+own run: `{environment, script, test_name, product, results: [{stream,
+result, run_id, start_time}, ...]}`. `product` is the ENVIRONMENT's own
+declared product (not necessarily any entry in `results` — the mainline
+stream's own `product` is always `""`, which would otherwise give the
+frontend no way to ask `GET /api/streams?product=` for the full stream list
+it needs to render NO RESULT rows for streams absent here). A stream with
+no result for the triple is simply absent from `results` — never
+fabricated. `404` if the triple has never run anywhere.
 
 ### GET /api/dashboard — latest run per test (paginated)
 
@@ -418,13 +436,19 @@ unexpected_passes, stale_before, last_reported}` (product cards carry
 card spanning several environments). `s` cards come back as `{spec,
 kind: "stream", name, ok, id, stream_kind, product, new_failures,
 new_passes, both_failing, new_tests, no_result, last_seen,
-baseline_last_seen}` — the same five-way classification as
-`GET /api/compare` for that stream against mainline, plus both sides'
-freshness so the card can show its own staleness warning. A name/id that
-resolves to nothing (including `s:1`, the mainline stream — it is never a
-Watchlist entry, the same rule `GET /api/streams` applies) is instead
-`{spec, kind, name, ok: false, error}`. The page still answers 200 around
-a mix of good and bad cards.
+baseline_kind, baseline_name, baseline_last_seen}` — the same five-way
+classification as `GET /api/compare` for that stream against its baseline,
+plus both sides' identity and freshness so the card can name what it was
+actually compared against and show its own staleness warning.
+`baseline_kind`/`baseline_name` (WP-22) are `"mainline"`/`""` for a branch
+(branches have no predecessor concept), or the nearest earlier same-product
+build by `last_seen` for a build that has one — the same default the
+build-scoped dashboard's "Compare to" control opens on
+(`Storage.previous_builds`) — falling back to mainline otherwise. A
+name/id that resolves to nothing (including `s:1`, the mainline stream —
+it is never a Watchlist entry, the same rule `GET /api/streams` applies)
+is instead `{spec, kind, name, ok: false, error}`. The page still answers
+200 around a mix of good and bad cards.
 
 **Cards per request are capped at 50.** A request naming more answers 413
 with the count and the limit in the message; a URL that long is treated as
