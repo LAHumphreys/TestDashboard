@@ -45,6 +45,7 @@ RUN_OUT_KEYS = {
 }
 DASHBOARD_ROW_KEYS = {
     "environment",
+    "product",
     "script",
     "test_name",
     "run_id",
@@ -1457,6 +1458,7 @@ class TestRoutingAndEncoding(ApiCase):
 
 SUMMARY_QUEUE_ENTRY_KEYS = {
     "environment",
+    "product",
     "script",
     "test_name",
     "run_id",
@@ -2530,6 +2532,34 @@ class TestProductFiltering(ApiCase):
         environments = {t["environment"] for t in data["tests"]}
         self.assertEqual(environments, {"linux-sim", "win-sim"})
         self.assertEqual(data["product"], "Atlas")
+
+    def test_dashboard_rows_carry_their_own_product(self) -> None:
+        """A cheap per-row join, so the Product column can render without
+        a second request for the environment -> product mapping."""
+        self._seed()
+        data = self.call("GET", "/api/dashboard")
+        by_env = {t["environment"]: t["product"] for t in data["tests"]}
+        self.assertEqual(by_env["linux-sim"], "Atlas")
+        self.assertEqual(by_env["win-sim"], "Atlas")
+        self.assertEqual(by_env["mac-sim"], "Borealis")
+
+    def test_dashboard_unmapped_environment_has_the_implicit_product(
+        self
+    ) -> None:
+        self.import_runs([record(environment="unmapped")])
+        (row,) = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(row["product"], "")
+
+    def test_summary_queue_rows_carry_their_own_product(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/summary",
+            query={"parts": ["queue"], "queue": ["new_failures"]})
+        by_env = {
+            t["environment"]: t["product"] for t in data["queue"]["tests"]
+        }
+        self.assertEqual(by_env["linux-sim"], "Atlas")
+        self.assertEqual(by_env["win-sim"], "Atlas")
 
     def test_dashboard_unknown_product_is_empty_not_404(self) -> None:
         self._seed()

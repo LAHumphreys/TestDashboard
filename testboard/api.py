@@ -365,10 +365,21 @@ def _run_json(run: StoredRun) -> Dict[str, Any]:
     }
 
 
-def _summary_row_json(row: TestSummaryRow) -> Dict[str, Any]:
-    """Serialize one dashboard row to its JSON shape."""
+def _summary_row_json(
+    row: TestSummaryRow, product: str = ""
+) -> Dict[str, Any]:
+    """Serialize one dashboard row to its JSON shape.
+
+    *product* (WP-20) is the row's environment joined against
+    ``environment_products`` by the caller — ``""`` for the implicit
+    product. It is NOT a column on ``runs`` or ``latest_runs``
+    (docs/STREAMS_PLAN.md §1 keeps product a read-time grouping of
+    environments); this is a cheap dict lookup the caller does once per
+    page, not a new join per row.
+    """
     payload = {
         "environment": row.environment,
+        "product": product,
         "script": row.script,
         "test_name": row.test_name,
         "run_id": row.run_id,
@@ -746,7 +757,13 @@ def _handle_dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,
         offset=offset, with_latest_comment=with_comment, **filters
     )
-    payload = [_summary_row_json(row) for row in rows]
+    # One tiny lookup, not a join per row: the same map every OTHER
+    # product-aware endpoint reads from environment_products.
+    env_to_product = storage.environment_products_map()
+    payload = [
+        _summary_row_json(row, env_to_product.get(row.environment, ""))
+        for row in rows
+    ]
     if with_streak:
         _add_streaks(storage, rows, payload, now())
     return _json_response(
@@ -821,9 +838,14 @@ def _result_counts_json(counts: Dict[Result, int]) -> Dict[str, int]:
 
 
 def _status_row_json(
-    row: TestStatusRow, streak: Optional[FailureStreak]
+    row: TestStatusRow,
+    streak: Optional[FailureStreak],
+    product: str = "",
 ) -> Dict[str, Any]:
-    """Serialize one queue entry (a status row plus optional streak info)."""
+    """Serialize one queue entry (a status row plus optional streak info).
+
+    *product* — see :func:`_summary_row_json`.
+    """
     failing_since = None  # type: Optional[datetime.datetime]
     last_pass = None  # type: Optional[datetime.datetime]
     if streak is not None:
@@ -831,6 +853,7 @@ def _status_row_json(
         last_pass = streak.last_pass_before
     return {
         "environment": row.environment,
+        "product": product,
         "script": row.script,
         "test_name": row.test_name,
         "run_id": row.run_id,
@@ -872,6 +895,7 @@ def _summary_queue_json(
     recent_cutoff: datetime.datetime,
     streaks: Dict[Tuple[str, str, str], FailureStreak],
     environments: Optional[Sequence[str]] = None,
+    env_to_product: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Serialize one triage queue: exact total plus capped, enriched entries.
 
@@ -885,7 +909,12 @@ def _summary_queue_json(
     only for the queues that report ``failing_since``/``last_pass_time``
     (``still_failing`` and ``mine``). A test can sit in both; *streaks*
     is the caller's cache so one request looks each test up once.
+
+    *env_to_product* — the caller's own :meth:`Storage.environment_products_map`
+    call, threaded through rather than re-fetched per queue (there are up
+    to seven of these in one ``/api/summary`` response).
     """
+    products = env_to_product or {}
     queue_assignee = None  # type: Optional[str]
     storage_kind = kind
     if kind == "mine":
@@ -912,7 +941,10 @@ def _summary_queue_json(
         with_latest_comment=True, environments=environments,
     )
     entries = [
-        _status_row_json(row, streak_for(row) if with_streaks else None)
+        _status_row_json(
+            row, streak_for(row) if with_streaks else None,
+            products.get(row.environment, ""),
+        )
         for row in rows
     ]
     if kind == "still_failing":
@@ -1048,6 +1080,9 @@ def _handle_summary(
         )
     product = _query_single(request.query, "product")
     environments = _resolve_product_environments(storage, product)
+    # One lookup, threaded through every queue below rather than
+    # re-fetched per queue (see _summary_queue_json's docstring).
+    env_to_product = storage.environment_products_map()
 
     current = now()
     # A product's own window, never the whole estate's: `environments`
@@ -1078,6 +1113,7 @@ def _handle_summary(
                 "queue": _summary_queue_json(
                     storage, kind, environment, assignee, recent_cutoff,
                     {}, environments=environments,
+                    env_to_product=env_to_product,
                 ),
             },
         )
@@ -1206,13 +1242,13 @@ def _handle_summary(
     queues = {
         kind: _summary_queue_json(
             storage, kind, environment, None, recent_cutoff, streaks,
-            environments=environments,
+            environments=environments, env_to_product=env_to_product,
         )
         for kind in QUEUE_KINDS
     }
     queues["mine"] = _summary_queue_json(
         storage, "mine", environment, assignee, recent_cutoff, streaks,
-        environments=environments,
+        environments=environments, env_to_product=env_to_product,
     )
     payload["queues"] = queues
     return _json_response(200, payload)
