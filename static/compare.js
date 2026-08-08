@@ -365,7 +365,7 @@ function renderTabs() {
 }
 
 /**
- * All wording here is built from *streamMeta*/*baselineMeta*'s own
+ * All wording here is built from streamMeta's / baselineMeta's own
  * kind/name — never the literal word "mainline" or "branch" (WP-22,
  * docs/STREAMS_PLAN.md §4.1: a build's baseline is routinely another
  * build, not mainline, since it defaults to its predecessor). The
