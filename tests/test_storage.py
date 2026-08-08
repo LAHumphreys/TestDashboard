@@ -3584,6 +3584,26 @@ class TestStreams(StorageTestBase):
             "SELECT stream_id FROM runs").fetchone()
         self.assertEqual(row[0], storage.MAINLINE_STREAM_ID)
 
+    def test_mainlines_own_last_seen_advances_too(self) -> None:
+        """Row 1 is not just a seeded constant: a mainline import widens
+        its own first_seen/last_seen the same way a branch import widens
+        its stream's -- otherwise "baseline last_seen" (the compare
+        endpoint, the Watchlist's s: cards) would read the migration
+        timestamp forever.
+
+        The record's start_time is set safely in the future (well past
+        the migration's real seed timestamp, whatever "now" happens to
+        be when this test runs) so widening it can only be an increase.
+        """
+        before = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        assert before is not None
+        later = datetime.datetime(2099, 1, 1)
+        self.store.upsert_runs([make_record(start=later)])
+        after = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        assert after is not None
+        self.assertEqual(after.last_seen, later)
+        self.assertGreater(after.last_seen, before.last_seen)
+
     def test_a_branch_record_creates_a_stream(self) -> None:
         self.store.upsert_runs([make_record(branch="feat/x")])
         streams = self.store.list_streams("Atlas")
@@ -3807,6 +3827,7 @@ class CompareStreamsTest(StorageTestBase):
             both_failing=1,   # test_e: FAIL on both
             new_tests=1,      # test_d: only on the branch
             no_result=1,      # test_c: only on mainline
+            agree=0,          # no pair is a non-FAIL match on both sides
         ))
 
     def test_new_failures_direction(self) -> None:
@@ -3864,8 +3885,147 @@ class CompareStreamsTest(StorageTestBase):
         counts = self.store.compare_counts(self.stream_id)
         self.assertEqual(counts, storage.CompareCounts(
             new_failures=1, new_passes=1, both_failing=1, new_tests=1,
-            no_result=1,
+            no_result=1, agree=0,
         ))
+
+
+class CompareCountsManyTest(StorageTestBase):
+    """compare_counts_many: the Watchlist s: cards' batched path.
+
+    Cross-checks against compare_counts (the single-stream SQL path) so
+    the Python classification here cannot silently drift from it.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "win-sim", "Borealis", "alice", CREATED)
+        branch_start = BASE + datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="test_a",
+                        result=Result.PASS),
+            make_record(environment="linux-sim", test_name="test_b",
+                        result=Result.FAIL),
+            make_record(environment="win-sim", test_name="test_x",
+                        result=Result.PASS),
+        ])
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="test_a",
+                        result=Result.FAIL, branch="feat/x",
+                        start=branch_start),
+            make_record(environment="linux-sim", test_name="test_c",
+                        result=Result.PASS, branch="feat/x",
+                        start=branch_start),
+        ])
+        self.store.upsert_runs([
+            make_record(environment="win-sim", test_name="test_x",
+                        result=Result.FAIL, branch="feat/y",
+                        start=branch_start),
+        ])
+        self.stream_x = self.store.list_streams("Atlas")[0].stream_id
+        self.stream_y = self.store.list_streams("Borealis")[0].stream_id
+
+    def test_agrees_with_compare_counts_for_each_stream(self) -> None:
+        many = self.store.compare_counts_many({
+            self.stream_x: self.store.environments_for_product("Atlas"),
+            self.stream_y: self.store.environments_for_product("Borealis"),
+        })
+        self.assertEqual(
+            many[self.stream_x], self.store.compare_counts(self.stream_x))
+        self.assertEqual(
+            many[self.stream_y], self.store.compare_counts(self.stream_y))
+
+    def test_a_stream_from_a_different_product_does_not_leak_environments(
+            self) -> None:
+        """test_x (win-sim) must never appear as no_result under
+        stream_x (Atlas, linux-sim only), and vice versa."""
+        many = self.store.compare_counts_many({
+            self.stream_x: self.store.environments_for_product("Atlas"),
+        })
+        # Atlas has 2 mainline tests (test_a, test_b) and the branch has
+        # 2 (test_a changed, test_c new): no_result=1 (test_b),
+        # new_tests=1 (test_c), new_failures=1 (test_a) -- never touches
+        # win-sim's test_x.
+        self.assertEqual(many[self.stream_x].no_result, 1)
+        self.assertEqual(many[self.stream_x].new_tests, 1)
+
+    def test_empty_input_returns_empty_dict(self) -> None:
+        self.assertEqual(self.store.compare_counts_many({}), {})
+
+    def test_a_stream_with_no_declared_product_environments_is_all_zero(
+            self) -> None:
+        many = self.store.compare_counts_many({self.stream_x: []})
+        self.assertEqual(
+            many[self.stream_x],
+            storage.CompareCounts(0, 0, 0, 0, 0, 0),
+        )
+
+    def test_query_count_does_not_grow_with_the_number_of_streams(
+            self) -> None:
+        conn = self.store._conn()
+
+        def query_count(stream_environments: Any) -> int:
+            statements = []  # type: List[str]
+            trace_sql_into(conn, statements)
+            try:
+                self.store.compare_counts_many(stream_environments)
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        one = query_count({
+            self.stream_x: self.store.environments_for_product("Atlas"),
+        })
+        both = query_count({
+            self.stream_x: self.store.environments_for_product("Atlas"),
+            self.stream_y: self.store.environments_for_product("Borealis"),
+        })
+        self.assertEqual(one, both)
+
+
+class StreamIdentitiesTest(StorageTestBase):
+    """Batch stream metadata lookup for the Watchlist's s: cards."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_returns_the_requested_streams(self) -> None:
+        result = self.store.stream_identities([self.stream_id])
+        self.assertEqual(set(result), {self.stream_id})
+        self.assertEqual(result[self.stream_id].kind, "branch")
+        self.assertEqual(result[self.stream_id].name, "feat/x")
+
+    def test_unknown_ids_are_simply_absent(self) -> None:
+        result = self.store.stream_identities([self.stream_id, 999999])
+        self.assertEqual(set(result), {self.stream_id})
+
+    def test_empty_input_returns_empty_dict(self) -> None:
+        self.assertEqual(self.store.stream_identities([]), {})
+
+    def test_query_count_is_one_regardless_of_id_count(self) -> None:
+        second_id = self.store._find_or_create_stream(
+            self.store._conn(), "Atlas", "build", "rc1",
+            "2026-07-01T00:00:00.000000")
+        conn = self.store._conn()
+
+        def query_count(ids: List[int]) -> int:
+            statements = []  # type: List[str]
+            trace_sql_into(conn, statements)
+            try:
+                self.store.stream_identities(ids)
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        self.assertEqual(
+            query_count([self.stream_id]),
+            query_count([self.stream_id, second_id]))
 
 
 class DropStreamTest(StorageTestBase):

@@ -1176,7 +1176,7 @@ class Stream(NamedTuple):
 
 
 class CompareCounts(NamedTuple):
-    """The five headline counts of :meth:`Storage.compare_streams`.
+    """The six headline counts of :meth:`Storage.compare_streams`.
 
     Each test of the *stream*'s product is classified by its latest
     result on *stream* against its latest result on *baseline* — see
@@ -1184,6 +1184,14 @@ class CompareCounts(NamedTuple):
     (removed, or never run there — the dashboard cannot tell which) is
     ``no_result``, never rendered as a pass, a fail, or an implied
     anything (§0.6).
+
+    ``agree`` is the implicit sixth bucket (both sides have a result and
+    it is not FAIL on either side) — carried as a real field, not left
+    for the caller to infer by subtracting the other five from a total
+    it does not have, because neither ``compare_counts`` nor
+    ``compare_counts_many`` otherwise exposes the comparison universe
+    size the frontend's "N tests agree and are not listed" line and the
+    coverage line (§3.6) both need.
     """
 
     new_failures: int
@@ -1191,6 +1199,7 @@ class CompareCounts(NamedTuple):
     both_failing: int
     new_tests: int
     no_result: int
+    agree: int
 
 
 class CompareRow(NamedTuple):
@@ -2028,9 +2037,16 @@ class Storage:
         # one product lookup and one stream find-or-create, not one per
         # record; and the observed first/last seen bounds, widened onto
         # `streams` in a single pass per touched stream at the end.
+        # Keyed by stream_id directly (not by (product, kind, name)):
+        # mainline's own bound is tracked here too — every record widens
+        # ITS OWN stream's first_seen/last_seen, mainline included, so
+        # streams.last_seen for row 1 is a true "mainline's own clock"
+        # rather than frozen at whatever migration 9 seeded it to. This
+        # is what a mainline card's "baseline last_seen" (WP-21 §3.5/
+        # §3.6, the compare endpoint and the Watchlist's s: cards) reads.
         stream_cache = {}  # type: Dict[Tuple[str, str, str], int]
         env_product_cache = {}  # type: Dict[str, str]
-        stream_bounds = {}  # type: Dict[Tuple[str, str, str], List[str]]
+        stream_bounds = {}  # type: Dict[int, List[str]]
         conn.execute("BEGIN IMMEDIATE")
         try:
             for index, rec in enumerate(records):
@@ -2059,13 +2075,11 @@ class Storage:
                             conn, product, kind, name, start
                         )
                         stream_cache[cache_key] = stream_id
-                    bounds = stream_bounds.setdefault(
-                        cache_key, [start, start]
-                    )
-                    if start < bounds[0]:
-                        bounds[0] = start
-                    if start > bounds[1]:
-                        bounds[1] = start
+                bounds = stream_bounds.setdefault(stream_id, [start, start])
+                if start < bounds[0]:
+                    bounds[0] = start
+                if start > bounds[1]:
+                    bounds[1] = start
 
                 row = conn.execute(
                     "SELECT id, result, end_time, source_link, "
@@ -2220,8 +2234,7 @@ class Storage:
             # same shape as :meth:`_apply_activity_deltas`, not a third
             # SQL dialect fork). Comparison is lexical on ISO-8601
             # strings, which sorts chronologically.
-            for cache_key, (first, last) in sorted(stream_bounds.items()):
-                stream_id = stream_cache[cache_key]
+            for stream_id, (first, last) in sorted(stream_bounds.items()):
                 row = conn.execute(
                     "SELECT first_seen, last_seen FROM streams "
                     "WHERE id = ?", (stream_id,),
@@ -3467,6 +3480,7 @@ class Storage:
             both_failing=counts.get("both_failing", 0),
             new_tests=counts.get("new_tests", 0),
             no_result=counts.get("no_result", 0),
+            agree=counts.get("agree", 0),
         )
 
     def compare_category(
@@ -3549,6 +3563,152 @@ class Storage:
             sql, params + [category]
         ).fetchone()
         return int(row[0])
+
+    def compare_counts_many(
+        self, stream_environments: Dict[int, Sequence[str]],
+    ) -> Dict[int, "CompareCounts"]:
+        """Compare N streams against mainline, in ONE query total.
+
+        For the Watchlist's ``s:`` cards (docs/STREAMS_PLAN.md §3.6):
+        ``/api/watch`` already fetches every OTHER card's data in O(1)
+        queries regardless of card count (``tests/test_api.py::TestWatch
+        ::test_query_count_does_not_grow_with_card_count``), and this is
+        what keeps stream cards honouring the same property instead of
+        costing one :meth:`compare_counts` call per card.
+
+        *stream_environments* is ``{stream_id: [environments of that
+        stream's own product]}``, precomputed by the CALLER from data it
+        already holds (``environment_products_map()``, one query
+        ``/api/watch`` already makes) — this method makes no further
+        query to resolve it, which is what keeps the total flat.
+        Streams that resolved to no environments (an undeclared product)
+        get an all-zero :class:`CompareCounts`.
+
+        Unlike :meth:`compare_counts`, classification happens in PYTHON
+        rather than as a SQL CASE: each requested stream can scope to a
+        DIFFERENT set of environments (a different product), so a single
+        SQL FULL OUTER JOIN emulation would need one subquery pair per
+        distinct product anyway. At Watchlist-card counts (dozens, not
+        thousands of tests) fetching the raw rows once and grouping in
+        memory is simpler and no more expensive.
+        ``tests/test_storage.py::CompareCountsManyTest`` cross-checks
+        this against :meth:`compare_counts` for the same stream, so the
+        two classifications cannot silently drift apart.
+        """
+        if not stream_environments:
+            return {}
+        conn = self._conn()
+        stream_ids = sorted(stream_environments)
+        all_envs = sorted({
+            env for envs in stream_environments.values() for env in envs
+        })
+        id_placeholders = ", ".join("?" for _ in stream_ids)
+        clauses = ["lr.stream_id IN ({0})".format(id_placeholders)]
+        params = list(stream_ids)  # type: List[Any]
+        if all_envs:
+            env_placeholders = ", ".join("?" for _ in all_envs)
+            clauses.append(
+                "(lr.stream_id = ? AND lr.environment IN ({0}))".format(
+                    env_placeholders
+                )
+            )
+            params.append(MAINLINE_STREAM_ID)
+            params.extend(all_envs)
+        rows = conn.execute(
+            "SELECT lr.stream_id, lr.environment, lr.script, "
+            "lr.test_name, lr.result FROM latest_runs lr "
+            "LEFT JOIN test_retirements tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE (" + " OR ".join(clauses) + ") AND tr.retired_at IS NULL",
+            params,
+        ).fetchall()
+
+        mainline = {}  # type: Dict[Tuple[str, str, str], str]
+        partitions = {}  # type: Dict[int, Dict[Tuple[str, str, str], str]]
+        for row in rows:
+            sid, environment, script, test_name = (
+                int(row[0]), row[1], row[2], row[3]
+            )
+            triple = (environment, script, test_name)
+            if sid == MAINLINE_STREAM_ID:
+                mainline[triple] = row[4]
+            else:
+                partitions.setdefault(sid, {})[triple] = row[4]
+
+        fail = Result.FAIL.value
+        results = {}  # type: Dict[int, CompareCounts]
+        for stream_id, envs in stream_environments.items():
+            env_set = set(envs)
+            baseline = {
+                triple: result for triple, result in mainline.items()
+                if triple[0] in env_set
+            }
+            # Match compare_counts' SQL path (_compare_partition_sql
+            # applies the SAME environment scope to both sides): a
+            # stream's own runs are, by construction, always from its
+            # own product's environments already, so this filter is a
+            # no-op in the ordinary case and only bites the edge case of
+            # an undeclared/misconfigured product (empty scope).
+            mine = {
+                triple: result
+                for triple, result in partitions.get(stream_id, {}).items()
+                if triple[0] in env_set
+            }
+            counts = {
+                "new_failures": 0, "new_passes": 0, "both_failing": 0,
+                "new_tests": 0, "no_result": 0, "agree": 0,
+            }  # type: Dict[str, int]
+            for triple in set(baseline) | set(mine):
+                a = mine.get(triple)
+                b = baseline.get(triple)
+                if a is None:
+                    counts["no_result"] += 1
+                elif b is None:
+                    counts["new_tests"] += 1
+                elif a == fail and b == fail:
+                    counts["both_failing"] += 1
+                elif a == fail:
+                    counts["new_failures"] += 1
+                elif b == fail:
+                    counts["new_passes"] += 1
+                else:
+                    # Both sides have a result and it is not FAIL on
+                    # either side -- the same "agree" bucket
+                    # compare_counts' SQL CASE ends on.
+                    counts["agree"] += 1
+            results[stream_id] = CompareCounts(**counts)
+        return results
+
+    def stream_identities(self, ids: Sequence[int]) -> Dict[int, "Stream"]:
+        """Batch stream metadata (id, product, kind, name, first_seen,
+        last_seen) for exactly *ids*, in ONE query.
+
+        For the Watchlist's ``s:`` cards (docs/STREAMS_PLAN.md §3.6),
+        which need every requested stream's identity and freshness but
+        NOT a failing count — the verdict comes from
+        :meth:`compare_counts_many` instead. ``failing`` on the returned
+        :class:`Stream` objects is always 0: meaningless here, kept only
+        so the same NamedTuple shape can be reused rather than adding a
+        second one. Ids that do not exist are simply absent from the
+        result — the caller renders those as error cards.
+        """
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        rows = self._conn().execute(
+            "SELECT id, product, kind, name, first_seen, last_seen "
+            "FROM streams WHERE id IN ({0})".format(placeholders),
+            list(ids),
+        ).fetchall()
+        return {
+            int(row[0]): Stream(
+                stream_id=int(row[0]), product=row[1], kind=row[2],
+                name=row[3], first_seen=model.parse_iso(row[4]),
+                last_seen=model.parse_iso(row[5]), failing=0,
+            )
+            for row in rows
+        }
 
     def known_environments(self) -> List[str]:
         """Every environment that has run a test or carries a declaration.

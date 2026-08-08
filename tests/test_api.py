@@ -28,7 +28,9 @@ from typing import Any, Dict, List, Optional, Union
 
 from testboard import api
 from testboard.model import format_iso
-from testboard.storage import DASHBOARD_SORTS, QUEUE_KINDS, Storage
+from testboard.storage import (
+    DASHBOARD_SORTS, MAINLINE_STREAM_ID, QUEUE_KINDS, Storage,
+)
 
 #: Fixed clock injected into handle_api for deterministic timestamps.
 NOW = datetime.datetime(2026, 7, 26, 12, 0, 0)
@@ -550,6 +552,7 @@ class TestDetail(ApiCase):
                 "latest",
                 "analytics",
                 "stream",
+                "stream_identity",
             },
         )
         self.assertEqual(data["environment"], self.ENV)
@@ -762,7 +765,7 @@ class TestComments(ApiCase):
 
     def test_empty_thread(self) -> None:
         data = self.call("GET", self.path)
-        self.assertEqual(data, {"comments": []})
+        self.assertEqual(data, {"comments": [], "streams": {}})
 
     def test_post_and_get_oldest_first(self) -> None:
         first = self.call(
@@ -2768,22 +2771,24 @@ class TestWatch(ApiCase):
         oks = [c["ok"] for c in data["cards"]]
         self.assertEqual(oks, [True, False, True])
 
-    def test_a_stream_card_400s_the_whole_request(self) -> None:
+    def test_the_mainline_stream_id_is_never_a_valid_s_card(self) -> None:
+        """Mainline is not a Build picker entry (list_streams excludes
+        it too) -- a card comparing it to itself would be trivially
+        all-zero, not a useful verdict."""
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["s:1"]})["cards"]
+        self.assertFalse(card["ok"])
+
+    def test_an_s_card_mixed_with_good_cards_all_render(self) -> None:
+        """Streams work like every other card kind -- a mix of good and
+        (here, deliberately bad) cards is still one 200 page."""
         self._seed()
         data = self.call(
             "GET", "/api/watch",
-            query={"c": ["e:linux-sim", "s:1"]}, expect=400)
-        self.assertIn("later drop", data["error"])
-
-    def test_a_stream_card_400s_even_mixed_with_good_cards_first(
-        self
-    ) -> None:
-        """Checked before any card is built -- no partial page for a
-        request naming a feature that does not exist yet."""
-        self._seed()
-        self.call(
-            "GET", "/api/watch",
-            query={"c": ["p:Atlas", "e:linux-sim", "s:1"]}, expect=400)
+            query={"c": ["p:Atlas", "e:linux-sim", "s:1"]})
+        oks = [c["ok"] for c in data["cards"]]
+        self.assertEqual(oks, [True, True, False])
 
     def test_the_cap_refuses_clearly(self) -> None:
         self._seed()
@@ -2826,6 +2831,142 @@ class TestWatch(ApiCase):
 
     def test_wrong_methods(self) -> None:
         self.assert_405("POST", "/api/watch", "GET", body={})
+
+
+class TestWatchStreamCards(ApiCase):
+    """s: cards (WP-21, docs/STREAMS_PLAN.md §3.6): branch/build verdicts
+    on the Watchlist, resolved through the same storage reads as
+    /api/compare, still O(1) queries regardless of card count."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="PASS"),
+            record(environment="linux-sim", test_name="test_b",
+                   result="FAIL"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="FAIL", branch="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": ["Atlas"]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def test_an_ok_stream_card(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.stream_id)]})["cards"]
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["kind"], "stream")
+        self.assertEqual(card["name"], "feat/x")
+        self.assertEqual(card["stream_kind"], "branch")
+        self.assertEqual(card["product"], "Atlas")
+        self.assertEqual(card["new_failures"], 1)   # test_a
+        self.assertEqual(card["no_result"], 1)      # test_b
+        self.assertEqual(card["agree"], 0)
+        self.assertIsNotNone(card["last_seen"])
+        self.assertIsNotNone(card["baseline_last_seen"])
+
+    def test_an_unknown_stream_id_is_an_error_card(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["s:999999"]})["cards"]
+        self.assertFalse(card["ok"])
+        self.assertEqual(card["kind"], "stream")
+
+    def test_a_non_integer_s_value_is_an_error_card(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["s:not-a-number"]})["cards"]
+        self.assertFalse(card["ok"])
+
+    def test_the_click_through_id_is_present(self) -> None:
+        """The frontend opens the branch-scoped dashboard from this."""
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.stream_id)]})["cards"]
+        self.assertEqual(card["id"], self.stream_id)
+
+    def test_query_count_does_not_grow_with_s_card_count(self) -> None:
+        """The same §0.4 flat-cost property TestWatch pins for e:/p:
+        cards, extended here to s: cards -- a SEPARATE assertion rather
+        than editing TestWatch's, since that one is specifically about
+        the pre-existing card kinds and must keep passing unchanged."""
+        conn = self.storage._conn()
+
+        def query_count(specs: List[str]) -> int:
+            statements = []  # type: List[str]
+            _trace_sql_into(conn, statements)
+            try:
+                self.call("GET", "/api/watch", query={"c": specs})
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        spec = "s:{}".format(self.stream_id)
+        one = query_count([spec])
+        many = query_count([spec] * api._WATCH_MAX_CARDS)
+        self.assertEqual(one, many)
+
+
+class TestWatchStreamCardImplicitProduct(ApiCase):
+    """A stream whose product is "" (WP-21) -- the common case on a
+    deployment that has never declared any products (WP-20's default).
+
+    Regression: found by driving /api/watch against a real server with
+    NO declared products at all (never exercised by TestWatchStreamCards
+    above, which always calls `set_environment_product` first). Every
+    s: card came back all-zero, silently wrong -- `_handle_watch` built
+    the stream's environment scope from `product_to_envs.get("", [])`,
+    which is ALWAYS empty (`environment_products_map()` only ever
+    contains environments that HAVE a declared product), instead of
+    resolving "" the way `Storage.environments_for_product("")` does
+    (every KNOWN environment nobody has mapped). Fixed by special-casing
+    "" in `_handle_watch` to that same set, computed once, still O(1).
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="PASS"),
+            record(environment="linux-sim", test_name="test_b",
+                   result="FAIL"),
+        ])
+        # Deliberately NO set_environment_product call -- linux-sim stays
+        # in the implicit "" product, same as a fresh install.
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="FAIL", branch="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def test_the_card_is_not_all_zero(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.stream_id)]})["cards"]
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["product"], "")
+        self.assertEqual(card["new_failures"], 1)   # test_a
+        self.assertEqual(card["no_result"], 1)      # test_b
+        self.assertEqual(
+            card["new_failures"], self.call(
+                "GET", "/api/compare",
+                query={"stream": [str(self.stream_id)]}
+            )["counts"]["new_failures"],
+            "the card must agree with /api/compare for the same stream")
 
 
 class TestEnvironmentUpdated(ApiCase):
@@ -3368,7 +3509,7 @@ class TestStreamsEndpoint(ApiCase):
 
 
 class TestCompareEndpoint(ApiCase):
-    """GET /api/compare — the five counts plus one paginated category."""
+    """GET /api/compare — the six counts plus one paginated category."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -3405,7 +3546,7 @@ class TestCompareEndpoint(ApiCase):
             expect=400)
         self.assertIn("WP-22", error["error"])
 
-    def test_the_five_counts_and_both_sides_identity(self) -> None:
+    def test_the_six_counts_and_both_sides_identity(self) -> None:
         data = self.call(
             "GET", "/api/compare", query={"stream": [str(self.stream_id)]})
         self.assertEqual(
@@ -3416,6 +3557,7 @@ class TestCompareEndpoint(ApiCase):
                 "both_failing": 0,
                 "new_tests": 1,      # test_c
                 "no_result": 1,      # test_b
+                "agree": 0,          # no pair matches, not-FAIL, both sides
             },
         )
         self.assertEqual(data["stream"]["id"], self.stream_id)
@@ -3508,12 +3650,15 @@ class TestDetailAndHistoryStreamParam(ApiCase):
         data = self.call("GET", self.path)
         self.assertEqual(data["latest"]["result"], "PASS")
         self.assertEqual(data["stream"], 1)
+        self.assertIsNone(data["stream_identity"])
 
     def test_detail_scoped_to_a_branch(self) -> None:
         data = self.call(
             "GET", self.path, query={"stream": [str(self.stream_id)]})
         self.assertEqual(data["latest"]["result"], "FAIL")
         self.assertEqual(data["stream"], self.stream_id)
+        self.assertEqual(data["stream_identity"]["kind"], "branch")
+        self.assertEqual(data["stream_identity"]["name"], "feat/x")
 
     def test_history_default_is_mainline(self) -> None:
         data = self.call("GET", self.path + "/history")
@@ -3558,6 +3703,31 @@ class TestCommentStreamId(ApiCase):
         [comment] = self.call(
             "GET", self.path + "/comments")["comments"]
         self.assertEqual(comment["stream_id"], self.stream_id)
+
+    def test_the_list_resolves_referenced_streams(self) -> None:
+        """The "posted from" tag needs a name, not just an id — the list
+        endpoint batch-resolves every distinct stream_id on the thread,
+        mainline included, in the SAME response (no per-comment fetch)."""
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "from mainline",
+                  "stream_id": MAINLINE_STREAM_ID}, expect=201)
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "from ci",
+                  "stream_id": self.stream_id}, expect=201)
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "no context at all"},
+            expect=201)
+        data = self.call("GET", self.path + "/comments")
+        streams = data["streams"]
+        self.assertEqual(
+            sorted(streams), sorted([str(MAINLINE_STREAM_ID),
+                                      str(self.stream_id)]))
+        self.assertEqual(streams[str(MAINLINE_STREAM_ID)]["kind"], "mainline")
+        self.assertEqual(streams[str(self.stream_id)]["kind"], "branch")
+        self.assertEqual(streams[str(self.stream_id)]["name"], "feat/x")
 
     def test_unknown_stream_id_is_404(self) -> None:
         self.call(

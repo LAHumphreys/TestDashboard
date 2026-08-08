@@ -83,6 +83,13 @@ EXCLUDED_TESTS = {
     "TestWatch.test_query_count_does_not_grow_with_card_count":
         "counts queries via sqlite3's set_trace_callback, and reaches "
         "into self.storage._conn() directly to register it.",
+    "TestWatchStreamCards.test_query_count_does_not_grow_with_s_card_count":
+        "counts queries via sqlite3's set_trace_callback.",
+    "CompareCountsManyTest."
+    "test_query_count_does_not_grow_with_the_number_of_streams":
+        "counts queries via sqlite3's set_trace_callback.",
+    "StreamIdentitiesTest.test_query_count_is_one_regardless_of_id_count":
+        "counts queries via sqlite3's set_trace_callback.",
     "ScriptHoursTest.test_the_window_read_is_an_index_range_not_a_scan":
         "asserts the SQLite query plan; MariaDB's planner is a "
         "different instrument for a different day.",

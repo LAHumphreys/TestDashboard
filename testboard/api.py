@@ -1366,6 +1366,14 @@ def _handle_test_detail(
     (docs/STREAMS_PLAN.md §3.5).
     """
     stream_id = _resolve_stream_id(storage, request)
+    # Only fetched when scoped away from mainline: the compare strip
+    # needs a stream's kind/name to LABEL itself, and mainline's own
+    # detail view never draws one — so the hot, unscoped path (every
+    # test-detail visit that never touches WP-21) costs no extra query.
+    stream = (
+        None if stream_id == MAINLINE_STREAM_ID
+        else storage.get_stream(stream_id)
+    )
     latest = storage.latest_run(
         environment, script, test_name, stream_id=stream_id)
     if latest is None:
@@ -1397,6 +1405,8 @@ def _handle_test_detail(
                 summary, max_runs=_ANALYTICS_MAX_RUNS
             ),
             "stream": stream_id,
+            "stream_identity": None if stream is None else _stream_json(
+                stream),
         },
     )
 
@@ -1474,11 +1484,37 @@ def _handle_run(storage: Storage, run_id_segment: str) -> Response:
 def _handle_comments_list(
     storage: Storage, environment: str, script: str, test_name: str
 ) -> Response:
-    """GET .../comments — the test's comment thread, oldest first."""
+    """GET .../comments — the test's comment thread, oldest first.
+
+    Comments are never filtered by the page's current ``stream=`` scope
+    (docs/STREAMS_PLAN.md §3.6: "comments always shown in full with
+    their posted-from tag") — a thread is one conversation regardless of
+    which stream someone was looking at when they wrote a line of it.
+    ``streams`` resolves every DISTINCT non-null ``comment.stream_id``
+    on the thread to its identity in ONE extra query
+    (:meth:`Storage.stream_identities`, the same batched read the
+    Watchlist's ``s:`` cards use) — the "posted from mainline" tag needs
+    a stream's kind/name, not just its id, and a per-comment lookup
+    would cost one query per comment on a thread with mixed history.
+    Absent from the map: a comment with ``stream_id: null`` (posted
+    before WP-21, or with no declared context) — the frontend renders
+    no tag at all for those, never a fabricated "mainline".
+    """
     _require_test(storage, environment, script, test_name)
     comments = storage.comments(environment, script, test_name)
+    stream_ids = sorted({
+        c.stream_id for c in comments if c.stream_id is not None
+    })
+    streams = storage.stream_identities(stream_ids) if stream_ids else {}
     return _json_response(
-        200, {"comments": [_comment_json(c) for c in comments]}
+        200,
+        {
+            "comments": [_comment_json(c) for c in comments],
+            "streams": {
+                str(sid): _stream_json(stream)
+                for sid, stream in streams.items()
+            },
+        },
     )
 
 
@@ -2364,6 +2400,7 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
                 "both_failing": counts.both_failing,
                 "new_tests": counts.new_tests,
                 "no_result": counts.no_result,
+                "agree": counts.agree,
             },
             "category": category,
             "tests": tests,
@@ -2421,29 +2458,34 @@ def _handle_watch(
     ``kind:name`` (see :func:`_parse_watch_spec`).
 
     ``p`` (product) and ``e`` (environment) resolve to verdict cards.
-    ``s`` (stream) is part of the URL grammar from day one so it never
-    has to change when WP-21 adds streams, but streams do not exist
-    yet — so ANY ``s:`` spec in the request 400s the WHOLE request with
-    a clear message, checked before any card is built. There is no
-    partial page for a request that names a feature that is not there.
+    ``s`` (stream, WP-21) resolves to a branch/build VERDICT card — the
+    compare-vs-mainline headline, both sides' freshness — built from the
+    same :meth:`Storage.compare_counts_many` reads
+    :func:`_handle_compare` uses for one stream, batched here across
+    every ``s:`` card in the request so the O(cards)-in-Python property
+    below still holds (docs/STREAMS_PLAN.md §3.6).
 
-    An unrecognised kind, or a ``p``/``e`` name that resolves to
-    nothing, is instead an ``ok: false`` CARD — the page still answers
-    200, because a shared URL outlives renames and deletions and a
-    missing scope must say so plainly rather than silently vanish
+    An unrecognised kind, or a ``p``/``e``/``s`` name that resolves to
+    nothing, is an ``ok: false`` CARD — the page still answers 200,
+    because a shared URL outlives renames and deletions and a missing
+    scope must say so plainly rather than silently vanish
     (docs/STREAMS_PLAN.md's "silently missing data is worse than an
     unexpected row" rule, restated for this page as "a missing scope is
-    an explicit error card, not a gap").
+    an explicit error card, not a gap"). An ``s:`` value that is not an
+    integer is the same case — a stream id is opaque, not a name, so a
+    non-integer cannot be a stream that once existed.
 
     Fetches every derived table EXACTLY ONCE regardless of how many
     cards are requested — ``activity_buckets``, the pass list,
-    ``summary_rollup`` and ``environment_products_map`` are each one
-    query; every card after that is a pure-Python slice of that one
-    fetch (see :func:`analytics.summarize_by_product`, reused here with
-    an identity mapping to group by ENVIRONMENT the same way it groups
-    by product). This is what keeps the endpoint O(cards in Python)
-    rather than O(cards) round trips — ``tests/test_api.py`` pins the
-    query count as flat from 1 card to the 50-card cap.
+    ``summary_rollup``, ``environment_products_map``,
+    :meth:`Storage.stream_identities` and
+    :meth:`Storage.compare_counts_many` are each one query; every card
+    after that is a pure-Python slice of those fetches (see
+    :func:`analytics.summarize_by_product`, reused here with an identity
+    mapping to group by ENVIRONMENT the same way it groups by product).
+    This is what keeps the endpoint O(cards in Python) rather than
+    O(cards) round trips — ``tests/test_api.py`` pins the query count as
+    flat from 1 card to the 50-card cap, for every mix of kinds.
     """
     specs = request.query.get("c") or []
     if len(specs) > _WATCH_MAX_CARDS:
@@ -2455,12 +2497,22 @@ def _handle_watch(
     parsed = [
         (spec,) + _parse_watch_spec(spec) for spec in specs
     ]  # type: List[Tuple[str, str, str]]
-    for spec, kind, _name in parsed:
-        if kind == "s":
-            raise _HttpError(
-                400,
-                "streams arrive in a later drop (spec {!r})".format(spec),
-            )
+
+    # WP-21: every s: card's stream id, valid-integer ones only (a
+    # non-integer becomes an error card in the main loop below, same as
+    # any other unresolved name) - resolved and compared in bulk, BEFORE
+    # the per-card loop, so this stays O(1) queries regardless of how
+    # many s: cards the request names.
+    requested_stream_ids = set()  # type: Set[int]
+    for _spec, kind, name in parsed:
+        if kind != "s":
+            continue
+        try:
+            stream_id_candidate = int(name)
+        except ValueError:
+            continue
+        if stream_id_candidate != MAINLINE_STREAM_ID:
+            requested_stream_ids.add(stream_id_candidate)
 
     now_value = now()
     fallback = now_value - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
@@ -2479,6 +2531,40 @@ def _handle_watch(
         product_to_envs.setdefault(product, []).append(environment)
     declared_products = set(product_to_envs)
     latest_by_env = storage.latest_run_time_by_environment()
+
+    # WP-21: identities + compare counts for every requested s: card, in
+    # three queries total (mainline's own clock included) regardless of
+    # how many s: cards were named — and none at all when there are none.
+    #
+    # A stream's product can be "" (the implicit grouping: environments
+    # nobody has mapped to a product — the common case on a deployment
+    # that has never declared any, per WP-20). `product_to_envs` above
+    # is built from `environment_products_map()` alone, so it NEVER
+    # contains an "" entry — that is correct for "p:" cards (there is no
+    # such thing as a product card for "no product"), but wrong here: a
+    # stream literally does carry product "". Resolving it the same way
+    # `Storage.environments_for_product("")` does (every known
+    # environment nobody has mapped) rather than through
+    # `product_to_envs.get("", [])`, which is always empty, is what fixed
+    # a real bug caught only by driving this endpoint against a database
+    # with no declared products at all — every s: card silently came
+    # back all-zero, "wrong and looks right" in exactly the way this
+    # project's own house rules warn about.
+    mapped_environments = set(env_to_product)
+    implicit_environments = [
+        e for e in known_environments if e not in mapped_environments
+    ]
+    stream_identities = storage.stream_identities(requested_stream_ids)
+    stream_counts = storage.compare_counts_many({
+        stream_id: (
+            implicit_environments if stream.product == ""
+            else product_to_envs.get(stream.product, [])
+        )
+        for stream_id, stream in stream_identities.items()
+    })
+    mainline_last_seen = (
+        storage.latest_run_time() if requested_stream_ids else None
+    )
     # ONE estate-wide rollup. The recent_cutoff argument only feeds a
     # column the verdict below never reads — none of failing/
     # new_failures/fixed/unexpected_passes is recency-gated (see
@@ -2553,10 +2639,56 @@ def _handle_watch(
                 # truthful-looking timestamp out of several.
                 "last_reported": None,
             })
+        elif kind == "s":
+            try:
+                stream_id = int(name)
+            except ValueError:
+                cards.append(_watch_card_error(
+                    spec, "stream", name,
+                    "not a stream id (expected an integer)"))
+                continue
+            if stream_id == MAINLINE_STREAM_ID:
+                # Mainline is never a Build picker entry (list_streams
+                # excludes it for the same reason); a card comparing it
+                # to itself would be a trivially-all-zero verdict, not a
+                # useful one, so this reads as "no such stream" too.
+                cards.append(_watch_card_error(
+                    spec, "stream", name,
+                    "nothing under this id — removed or never existed?"))
+                continue
+            stream = stream_identities.get(stream_id)
+            if stream is None:
+                cards.append(_watch_card_error(
+                    spec, "stream", name,
+                    "nothing under this id — removed or never existed?"))
+                continue
+            counts = stream_counts.get(stream_id, CompareCounts(
+                new_failures=0, new_passes=0, both_failing=0,
+                new_tests=0, no_result=0, agree=0,
+            ))
+            cards.append({
+                "spec": spec, "kind": "stream", "name": stream.name,
+                "ok": True,
+                "id": stream.stream_id,
+                "stream_kind": stream.kind,
+                "product": stream.product,
+                "new_failures": counts.new_failures,
+                "new_passes": counts.new_passes,
+                "both_failing": counts.both_failing,
+                "new_tests": counts.new_tests,
+                "no_result": counts.no_result,
+                "agree": counts.agree,
+                "last_seen": model.format_iso(stream.last_seen),
+                "baseline_last_seen": (
+                    None if mainline_last_seen is None
+                    else model.format_iso(mainline_last_seen)
+                ),
+            })
         else:
             cards.append(_watch_card_error(
                 spec, kind, name,
-                "unknown card kind {!r} (expected 'p' or 'e')".format(kind),
+                "unknown card kind {!r} (expected 'p', 'e' or "
+                "'s')".format(kind),
             ))
 
     return _json_response(

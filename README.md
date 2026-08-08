@@ -479,11 +479,24 @@ useful as recording why it fails. The full thread is on the test page; the
 newest comment is shown in the triage queues and the open-actions view.
 
 - `GET /api/tests/{env}/{script}/{test}/comments` — 404 unknown triple. Response:
-  `{"comments": [{"id": 1, "author": "alice", "created_at": "...", "text": "..."}]}`
-  oldest first.
-- `POST` same path — body `{"username": "...", "text": "..."}`. `username` non-empty,
-  max 100 chars (stripped); `text` non-empty, max 10000 chars. The user is created
-  implicitly if unknown. Returns `201` with `{"comment": {...}}`.
+  `{"comments": [{"id": 1, "author": "alice", "created_at": "...", "text": "...",
+  "stream_id": 1}], "streams": {"1": {"id": 1, "kind": "mainline", "name": "", ...}}}`
+  oldest first. The thread is **never filtered by the page's current `stream=`
+  scope** (WP-21) — one conversation, regardless of which stream someone was
+  looking at when they wrote a line of it. `streams` batch-resolves every
+  *distinct* non-null `stream_id` on the thread to its identity, in one extra
+  query — this is what lets the UI show a "posted from mainline" / "posted
+  from branch feat/x" tag on each comment without a lookup per comment. A
+  comment with `stream_id: null` (posted before WP-21, or with no declared
+  context) has no entry in `streams` and the UI shows it with no tag at all.
+- `POST` same path — body `{"username": "...", "text": "...", "stream_id":
+  1}`. `username` non-empty, max 100 chars (stripped); `text` non-empty, max
+  10000 chars. The user is created implicitly if unknown. `stream_id`
+  (WP-21) is optional — omitted or `null` means no declared context, the
+  same as every comment posted before this feature; when given it must
+  reference an existing stream (`404` otherwise) and is stored as the
+  comment's "posted from", not part of its identity. Returns `201` with
+  `{"comment": {...}}`.
 
 ### PUT /api/tests/{env}/{script}/{test}/assignee
 
