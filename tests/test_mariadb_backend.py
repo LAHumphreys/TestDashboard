@@ -160,7 +160,7 @@ if backends.MARIADB_AVAILABLE:
                 start_time=start,
                 end_time=start + datetime.timedelta(seconds=3),
                 output="line one\ncafé 🙂", source_link="",
-                known_failure_reason=None)
+                known_failure_reason=None, branch=None, build=None)
 
         def test_reimport_updates_in_place_and_keeps_the_id(self) -> None:
             from testboard.model import Result
@@ -215,7 +215,8 @@ if backends.MARIADB_AVAILABLE:
                 environment="e", script="s", test_name="t",
                 result=Result.PASS, start_time=start,
                 end_time=start + datetime.timedelta(seconds=1),
-                output=text, source_link="", known_failure_reason=None)])
+                output=text, source_link="", known_failure_reason=None,
+                branch=None, build=None)])
             run_id = self.raw("SELECT id FROM runs")[0][0]
             stored = self.store.get_run(int(run_id))
             self.assertIsNotNone(stored)
@@ -233,7 +234,7 @@ if backends.MARIADB_AVAILABLE:
                           result=Result.PASS, start_time=start,
                           end_time=start + datetime.timedelta(seconds=1),
                           output="", source_link="",
-                          known_failure_reason=None)
+                          known_failure_reason=None, branch=None, build=None)
                 for name in names])
 
         def names_for(self, q: str) -> List[str]:
@@ -274,7 +275,7 @@ if backends.MARIADB_AVAILABLE:
                           result=Result.PASS, start_time=start,
                           end_time=start + datetime.timedelta(seconds=1),
                           output="", source_link="",
-                          known_failure_reason=None)
+                          known_failure_reason=None, branch=None, build=None)
                 for index in range(5)])
 
     class SchemaGuardMariaDBTest(unittest.TestCase):

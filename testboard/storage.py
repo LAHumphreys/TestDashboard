@@ -70,6 +70,7 @@ __all__ = [
     "describe_open_error",
     "DASHBOARD_SORTS",
     "QUEUE_KINDS",
+    "COMPARE_CATEGORIES",
     "TestSummaryRow",
     "TestStatusRow",
     "DailyResultCount",
@@ -80,10 +81,21 @@ __all__ = [
     "User",
     "EnvironmentExpectation",
     "EnvironmentProduct",
+    "Stream",
+    "CompareCounts",
+    "CompareRow",
     "UpsertCounts",
+    "UpsertRejection",
     "ScriptHourBucket",
+    "MAINLINE_STREAM_ID",
     "Storage",
 ]
+
+#: ``streams.id`` of the mainline stream, seeded by migration 9. Runs
+#: never carrying ``branch``/``build`` resolve here without a lookup —
+#: see :func:`Storage._stream_key_for`. "Estate views pin stream_id = 1"
+#: (docs/STREAMS_PLAN.md §1) reads this constant, not a magic number.
+MAINLINE_STREAM_ID = 1
 
 
 #: How long a memoized nightly trend may be reused. Bounds how stale the
@@ -634,6 +646,79 @@ MIGRATIONS = [
             """,
         ],
     ),
+    (
+        9,
+        [
+            # Streams: branch/build runs beside the mainline nightlies
+            # (docs/STREAMS_PLAN.md, WP-21, drop 2 of the products &
+            # streams work). OBSERVED, not registered: a stream row is
+            # created lazily inside the import transaction the first
+            # time an import record names a branch/build
+            # (Storage._find_or_create_stream) — there is no admin UI
+            # that creates one. Row 1 is THE mainline stream and is
+            # seeded by the python step below; every run recorded
+            # before this migration is, and remains, on it.
+            """
+            CREATE TABLE streams (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                UNIQUE (product, kind, name)
+            )
+            """,
+            "python: seed_mainline_stream",
+            # ALTER TABLE ... ADD COLUMN with a NOT NULL DEFAULT cannot
+            # ALSO carry an inline REFERENCES while
+            # `PRAGMA foreign_keys=ON` (every connection this module
+            # opens): SQLite refuses with "Cannot add a REFERENCES
+            # column with non-NULL default value" — measured directly
+            # against a copy of this migration before it shipped (it is
+            # not documented anywhere in SQLite's own ALTER TABLE page
+            # in a way that would have been found without trying it).
+            # `latest_runs`, rebuilt below via CREATE TABLE rather than
+            # ALTER, keeps the real FK on its stream_id; `runs` already
+            # carries no FK to anything (not even to itself for the
+            # UNIQUE it relies on), so dropping this one is a narrowing
+            # of an already-absent guarantee, not a new gap.
+            "ALTER TABLE runs ADD COLUMN stream_id INTEGER NOT NULL "
+            "DEFAULT 1",
+            # Nullable, so the restriction above does not apply (also
+            # verified directly): a comment is an annotation on the
+            # (environment, script, test_name) triple, stream-agnostic
+            # by design (docs/STREAMS_PLAN.md §0.4), so NULL means
+            # "posted before this migration — there was only one stream,
+            # nothing to record" and every comment from here on carries
+            # the stream it was posted from. ON DELETE SET NULL: deleting
+            # a stream (tools/drop_stream.py) must not take its comments
+            # with it — the annotation still belongs to the triple.
+            "ALTER TABLE comments ADD COLUMN stream_id INTEGER "
+            "REFERENCES streams(id) ON DELETE SET NULL",
+            # latest_runs is DERIVED (~12k rows: one per test, on
+            # mainline alone — see migration 5's comment for the
+            # precedent). It is rebuilt with the stream in the key
+            # rather than migrated in place because SQLite cannot widen
+            # a PRIMARY KEY with ALTER TABLE: CREATE new / INSERT..
+            # SELECT (stream_id 1 for every existing row — every run on
+            # file predates streams) / DROP / RENAME, then recreate its
+            # five indexes (four carried over from migrations 1 and 4,
+            # now leading with stream_id so a stream-scoped read is
+            # still a pure index range and not a table-wide filter; one
+            # new index on the bare triple for "this test on every
+            # stream", which WP-22's every-build view reads).
+            #
+            # MEASURED on a COPY of the dev database (220 MB, 12,008
+            # tests / 540,192 runs, brought to version 8 first so this
+            # is entry 9 alone): see the print the python step emits,
+            # captured in the commit message and docs/drops/2026-08-14.md
+            # — this is DEV data, not production, which is roughly four
+            # times its size (per CLAUDE.md) and has not been measured
+            # from here.
+            "python: rebuild_latest_runs_with_stream",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: Prefix marking a migration step that runs Python instead of SQL.
@@ -741,11 +826,97 @@ def _rebuild_script_hours(conn: sqlite3.Connection) -> None:
         )
 
 
+def _seed_mainline_stream(conn: sqlite3.Connection) -> None:
+    """Insert THE mainline stream row (id 1) for migration 9.
+
+    Every run recorded before this migration is a mainline run, and
+    ``runs.stream_id DEFAULT 1`` (the next step) is what makes that true
+    without touching a single existing row. ``product`` and ``name`` are
+    both ``""`` — mainline is not scoped to a product and has no name to
+    show (docs/STREAMS_PLAN.md §1).
+    """
+    now = model.format_iso(model.utcnow())
+    conn.execute(
+        "INSERT INTO streams (id, product, kind, name, first_seen, "
+        "last_seen) VALUES (1, '', 'mainline', '', ?, ?)",
+        (now, now),
+    )
+
+
+def _rebuild_latest_runs_with_stream(conn: sqlite3.Connection) -> None:
+    """Rebuild ``latest_runs`` with ``stream_id`` in its key (migration 9).
+
+    SQLite cannot widen a PRIMARY KEY with ALTER TABLE, so this is
+    CREATE new / INSERT..SELECT / DROP / RENAME — the same shape as
+    every other derived-table rebuild in this module, and the migration
+    comment on entry 9 has the measured timing. Every existing row gets
+    ``stream_id = 1``: it predates streams, so it IS a mainline row.
+
+    Recreates all five indexes: the four inherited from migrations 1
+    and 4 (now leading with ``stream_id``, so a stream-scoped read stays
+    a pure index range) plus one new index on the bare triple — "this
+    test on every stream" (WP-22's every-build view; cheap to add now
+    while the table is still ~12k rows, per docs/STREAMS_PLAN.md §3.1).
+    """
+    started = time.time()
+    conn.execute(
+        "CREATE TABLE latest_runs_new ("
+        "stream_id INTEGER NOT NULL DEFAULT 1 REFERENCES streams(id), "
+        "environment TEXT NOT NULL, "
+        "script TEXT NOT NULL, "
+        "test_name TEXT NOT NULL, "
+        "run_id INTEGER NOT NULL REFERENCES runs(id), "
+        "start_time TEXT NOT NULL, "
+        "result TEXT NOT NULL, "
+        "prev_result TEXT, "
+        "duration_seconds REAL NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (stream_id, environment, script, test_name)"
+        ")"
+    )
+    cursor = conn.execute(
+        "INSERT INTO latest_runs_new (stream_id, environment, script, "
+        "test_name, run_id, start_time, result, prev_result, "
+        "duration_seconds) "
+        "SELECT 1, environment, script, test_name, run_id, start_time, "
+        "result, prev_result, duration_seconds FROM latest_runs"
+    )
+    conn.execute("DROP TABLE latest_runs")
+    conn.execute("ALTER TABLE latest_runs_new RENAME TO latest_runs")
+    conn.execute(
+        "CREATE INDEX idx_latest_runs_result ON latest_runs "
+        "(stream_id, result, environment, script, test_name)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_latest_runs_start_time "
+        "ON latest_runs (stream_id, start_time)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_latest_runs_start_sort ON latest_runs "
+        "(stream_id, start_time, environment, script, test_name)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_latest_runs_duration_sort ON latest_runs "
+        "(stream_id, duration_seconds, environment, script, test_name)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_latest_runs_triple "
+        "ON latest_runs (environment, script, test_name)"
+    )
+    if cursor.rowcount:
+        print(
+            "latest_runs: rebuilt {0} rows with stream_id in {1:.1f}s"
+            .format(cursor.rowcount, time.time() - started),
+            flush=True,
+        )
+
+
 #: Python migration steps, by the name used after the prefix.
 _MIGRATION_STEPS = {
     "backfill_latest_durations": _backfill_latest_durations,
     "rebuild_activity_hours": _rebuild_activity_hours,
     "rebuild_script_hours": _rebuild_script_hours,
+    "seed_mainline_stream": _seed_mainline_stream,
+    "rebuild_latest_runs_with_stream": _rebuild_latest_runs_with_stream,
 }  # type: Dict[str, Any]
 
 
@@ -905,7 +1076,14 @@ class FailureStreak(NamedTuple):
 
 
 class Comment(NamedTuple):
-    """A comment attached to a test (the triple, not a single run)."""
+    """A comment attached to a test (the triple, not a single run).
+
+    ``stream_id`` (WP-21, migration 9) is "posted from" — an annotation
+    only, never part of the comment's identity: the comment lives on the
+    triple, stream-agnostic, so it is visible from every stream's test
+    detail page (docs/STREAMS_PLAN.md §1/§3.4). ``None`` means posted
+    before this migration, when there was only one stream to be from.
+    """
 
     comment_id: int
     environment: str
@@ -914,6 +1092,7 @@ class Comment(NamedTuple):
     author: str
     created_at: datetime.datetime
     text: str
+    stream_id: Optional[int]
 
 
 class User(NamedTuple):
@@ -973,6 +1152,63 @@ class EnvironmentProduct(NamedTuple):
     updated_by: str
 
 
+class Stream(NamedTuple):
+    """One observed branch/build/mainline stream (migration 9, WP-21).
+
+    OBSERVED, not registered: created lazily inside the import
+    transaction the first time a record names a branch/build (see
+    :meth:`Storage._find_or_create_stream`); there is no admin UI that
+    creates one. Row 1 is THE mainline stream (``product=''``,
+    ``kind='mainline'``, ``name=''``), seeded by migration 9.
+    ``failing`` is the stream's own current failing count, from its
+    partition of ``latest_runs`` — populated by :meth:`Storage.list_streams`
+    only (no hidden staleness constant: the caller judges freshness from
+    ``last_seen`` itself, per docs/STREAMS_PLAN.md §3.5).
+    """
+
+    stream_id: int
+    product: str
+    kind: str
+    name: str
+    first_seen: datetime.datetime
+    last_seen: datetime.datetime
+    failing: int
+
+
+class CompareCounts(NamedTuple):
+    """The five headline counts of :meth:`Storage.compare_streams`.
+
+    Each test of the *stream*'s product is classified by its latest
+    result on *stream* against its latest result on *baseline* — see
+    docs/STREAMS_PLAN.md §3.5. A test with no result on either side
+    (removed, or never run there — the dashboard cannot tell which) is
+    ``no_result``, never rendered as a pass, a fail, or an implied
+    anything (§0.6).
+    """
+
+    new_failures: int
+    new_passes: int
+    both_failing: int
+    new_tests: int
+    no_result: int
+
+
+class CompareRow(NamedTuple):
+    """One test in a :meth:`Storage.compare_category` page.
+
+    ``stream_result``/``baseline_result`` are ``None`` when that side has
+    no result for the triple (a category-consistent fact — a row is
+    only ever in the ``new_tests``/``no_result`` categories because one
+    side is None).
+    """
+
+    environment: str
+    script: str
+    test_name: str
+    stream_result: Optional[Result]
+    baseline_result: Optional[Result]
+
+
 class ScriptHourBucket(NamedTuple):
     """One ``script_hours`` row: a script's activity inside one UTC hour.
 
@@ -990,6 +1226,27 @@ class ScriptHourBucket(NamedTuple):
     last_end: datetime.datetime
 
 
+class UpsertRejection(NamedTuple):
+    """One record :meth:`Storage.upsert_runs` refused to store.
+
+    WP-21's only storage-level rejection: the legacy-UNIQUE collision
+    of docs/STREAMS_PLAN.md §3.2 (a different stream already holds this
+    exact ``(environment, script, test_name, start_time)``). Everything
+    else that can go wrong with a record is caught by
+    :func:`model.parse_run_record` before storage ever sees it.
+    ``index`` is the record's position in the sequence passed to
+    :meth:`~Storage.upsert_runs` — the caller (``api._handle_import``)
+    maps it back to the original request index.
+    """
+
+    index: int
+    message: str
+    environment: str
+    script: str
+    test_name: str
+    start_time: datetime.datetime
+
+
 class UpsertCounts(NamedTuple):
     """Result of a batch upsert.
 
@@ -1000,11 +1257,16 @@ class UpsertCounts(NamedTuple):
     records; the split exists so that a no-op push is visible as one in
     logs and in the import response, instead of masquerading as 10,000
     updates.
+
+    ``rejections`` (WP-21) lists every record refused at the storage
+    layer — see :class:`UpsertRejection`. Empty for every batch that
+    carries no branch/build collision, which in practice is every batch.
     """
 
     inserted: int
     updated: int
     unchanged: int
+    rejections: List[UpsertRejection]
 
 
 #: Every column of ``users``, in :class:`User` field order. One place, so
@@ -1118,6 +1380,21 @@ QUEUE_KINDS = (
     "unexpected_passes",
     "not_run",
     "assigned",
+)
+
+#: The five categories a stream-vs-baseline comparison classifies every
+#: test into (docs/STREAMS_PLAN.md §3.5), plus the implicit "agree"
+#: bucket (both sides share the same non-FAIL verdict) that the UI's
+#: "N tests agree and are not listed" line derives by subtraction
+#: rather than an endpoint returning it directly. Public — the API
+#: layer validates its ``category=`` query param against this, the
+#: same shape as :data:`QUEUE_KINDS`.
+COMPARE_CATEGORIES = (
+    "new_failures",
+    "new_passes",
+    "both_failing",
+    "new_tests",
+    "no_result",
 )
 
 #: Queues whose predicate needs the recency cutoff bound to it.
@@ -1610,13 +1887,93 @@ class Storage:
     # Runs
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _stream_key_for(rec: RunRecord) -> Optional[Tuple[str, str]]:
+        """``(kind, name)`` for a non-mainline record, or None for mainline.
+
+        ``branch``/``build`` are already mutually exclusive by the time a
+        record reaches here — :func:`model.parse_run_record` rejects a
+        record carrying both, per-record, before it is ever batched.
+        """
+        if rec.branch:
+            return ("branch", rec.branch)
+        if rec.build:
+            return ("build", rec.build)
+        return None
+
+    @staticmethod
+    def _find_or_create_stream(
+        conn: sqlite3.Connection, product: str, kind: str, name: str,
+        seen_at: str,
+    ) -> int:
+        """Find or create the ``(product, kind, name)`` stream row.
+
+        Product is resolved by the caller from the record's environment
+        at the moment a NEW stream is created, and is then fixed — an
+        existing stream's product is never touched here, matching
+        docs/STREAMS_PLAN.md §3.3 ("resolved ... at creation time, then
+        fixed"). ``first_seen``/``last_seen`` both start at *seen_at*;
+        :meth:`upsert_runs` widens them for the rest of the batch in one
+        pass at the end (see ``stream_bounds``), the same batching shape
+        as :meth:`_apply_activity_deltas`.
+        """
+        row = conn.execute(
+            "SELECT id FROM streams WHERE product = ? AND kind = ? "
+            "AND name = ?",
+            (product, kind, name),
+        ).fetchone()
+        if row is not None:
+            return int(row[0])
+        cursor = conn.execute(
+            "INSERT INTO streams (product, kind, name, first_seen, "
+            "last_seen) VALUES (?, ?, ?, ?, ?)",
+            (product, kind, name, seen_at, seen_at),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _stream_label(conn: sqlite3.Connection, stream_id: int) -> str:
+        """``"mainline"`` or ``"{kind}:{name}"`` for an error message."""
+        if stream_id == MAINLINE_STREAM_ID:
+            return "mainline"
+        row = conn.execute(
+            "SELECT kind, name FROM streams WHERE id = ?", (stream_id,)
+        ).fetchone()
+        if row is None:
+            return "stream {0}".format(stream_id)
+        return "{0}:{1}".format(row[0], row[1])
+
     def upsert_runs(self, records: Sequence[RunRecord]) -> UpsertCounts:
         """Insert or update a batch of runs in ONE transaction.
 
-        A run is keyed by ``(environment, script, test_name, start_time)``.
-        For each record the existing row is looked up (an index hit on
-        the UNIQUE constraint); if found the row is UPDATEd in place
-        (preserving its rowid), otherwise a new row is INSERTed.
+        A run is keyed by ``(stream_id, environment, script, test_name,
+        start_time)`` — see docs/STREAMS_PLAN.md §3.2 for how that
+        coexists with the table-level UNIQUE on ``(environment, script,
+        test_name, start_time)`` alone (frozen since migration 1, and
+        never widened: rebuilding ``runs`` — 4.4M rows, a network mount —
+        is not a startup-migration operation). For each record the
+        existing row is looked up FIRST BY THE FULL KEY (an index hit on
+        the UNIQUE constraint, filtered to this record's stream in
+        Python — cheap, the constraint has no stream column to seek on);
+        if found the row is UPDATEd in place (preserving its rowid),
+        otherwise a SECOND lookup checks whether the legacy key
+        (``environment``, ``script``, ``test_name``, ``start_time``
+        alone) is already claimed by a DIFFERENT stream. If so the
+        record is REJECTED — naming both streams — rather than either
+        silently overwriting the other stream's row or letting the
+        INSERT hit the UNIQUE constraint and roll back the whole batch
+        (violating the one-bad-record rule). This is believed to be
+        near-impossible in practice (a branch run microsecond-identical
+        to a mainline run of the same triple) and the second SELECT
+        costs nothing that grows with the estate — one index seek, only
+        on the insert path.
+
+        Non-mainline records resolve their stream INSIDE this
+        transaction via :meth:`_find_or_create_stream`: product from the
+        record's environment (:meth:`environment_products_map`,
+        cached once per batch since environments repeat), fixed at
+        creation. ``streams.first_seen``/``last_seen`` are widened in
+        one pass at the end of the batch, not per record.
 
         A record IDENTICAL to what is stored — every metadata field
         equal and the output fingerprint matching — writes NOTHING: no
@@ -1629,15 +1986,20 @@ class Storage:
         depends on. It also silently un-retired tests: a re-pushed OLD
         run is not the test "reporting a run again", and treating it as
         one made retirement impossible to keep for more than 10 minutes.
+        **Un-retirement is mainline-only** (WP-21, docs/STREAMS_PLAN.md
+        §3.4): a branch run may predate a retirement decided on
+        mainline, and must not silently reverse it.
 
         A NULL fingerprint (any row imported before migration 6) never
         matches, so such a record takes the full write path once and is
         stamped; the active window self-heals in one push cycle.
 
-        ``activity_hours`` is maintained here, in the same transaction:
-        +1 for each inserted run, and a paired -1/+1 when an update
-        changes a stored result. Start times are immutable (they are
-        part of the run's key), so a run can never move between hours.
+        ``activity_hours``/``script_hours`` are maintained here, in the
+        same transaction, and ONLY for mainline records (WP-21,
+        docs/STREAMS_PLAN.md §0.5/§3.1): +1 for each inserted mainline
+        run, and a paired -1/+1 when an update changes a stored result.
+        Start times are immutable (they are part of the run's key), so a
+        run can never move between hours.
 
         ``script_hours`` is maintained the same way, with one extra
         wrinkle: its buckets carry MIN(start_time) and MAX(end_time),
@@ -1653,6 +2015,7 @@ class Storage:
         inserted = 0
         updated = 0
         unchanged = 0
+        rejections = []  # type: List[UpsertRejection]
         # Net activity_hours changes for this batch, applied in one pass
         # at the end: a batch of 500 typically spans a handful of
         # (environment, hour, result) cells, not 500.
@@ -1661,18 +2024,59 @@ class Storage:
         # bucket, plus the buckets an update may have shrunk.
         grown = {}  # type: Dict[Tuple[str, str, str, str], List[Any]]
         recompute = set()  # type: Set[Tuple[str, str, str, str]]
+        # WP-21: per-batch caches so a whole batch of one branch costs
+        # one product lookup and one stream find-or-create, not one per
+        # record; and the observed first/last seen bounds, widened onto
+        # `streams` in a single pass per touched stream at the end.
+        stream_cache = {}  # type: Dict[Tuple[str, str, str], int]
+        env_product_cache = {}  # type: Dict[str, str]
+        stream_bounds = {}  # type: Dict[Tuple[str, str, str], List[str]]
         conn.execute("BEGIN IMMEDIATE")
         try:
-            for rec in records:
+            for index, rec in enumerate(records):
                 start = model.format_iso(rec.start_time)
                 end = model.format_iso(rec.end_time)
                 fingerprint = _output_fingerprint(rec.output)
+
+                key = self._stream_key_for(rec)
+                if key is None:
+                    stream_id = MAINLINE_STREAM_ID
+                else:
+                    kind, name = key
+                    product = env_product_cache.get(rec.environment)
+                    if product is None:
+                        prow = conn.execute(
+                            "SELECT product FROM environment_products "
+                            "WHERE environment = ?",
+                            (rec.environment,),
+                        ).fetchone()
+                        product = prow[0] if prow is not None else ""
+                        env_product_cache[rec.environment] = product
+                    cache_key = (product, kind, name)
+                    stream_id = stream_cache.get(cache_key)
+                    if stream_id is None:
+                        stream_id = self._find_or_create_stream(
+                            conn, product, kind, name, start
+                        )
+                        stream_cache[cache_key] = stream_id
+                    bounds = stream_bounds.setdefault(
+                        cache_key, [start, start]
+                    )
+                    if start < bounds[0]:
+                        bounds[0] = start
+                    if start > bounds[1]:
+                        bounds[1] = start
+
                 row = conn.execute(
                     "SELECT id, result, end_time, source_link, "
                     "known_failure_reason, output_fingerprint "
                     "FROM runs WHERE environment = ? AND "
-                    "script = ? AND test_name = ? AND start_time = ?",
-                    (rec.environment, rec.script, rec.test_name, start),
+                    "script = ? AND test_name = ? AND start_time = ? "
+                    "AND stream_id = ?",
+                    (
+                        rec.environment, rec.script, rec.test_name, start,
+                        stream_id,
+                    ),
                 ).fetchone()
                 if (
                     row is not None
@@ -1686,11 +2090,42 @@ class Storage:
                     continue
                 hour = start[:13]
                 if row is None:
+                    collision = conn.execute(
+                        "SELECT stream_id FROM runs WHERE environment = ? "
+                        "AND script = ? AND test_name = ? "
+                        "AND start_time = ?",
+                        (rec.environment, rec.script, rec.test_name, start),
+                    ).fetchone()
+                    if collision is not None:
+                        other = self._stream_label(
+                            conn, int(collision[0])
+                        )
+                        mine = self._stream_label(conn, stream_id)
+                        rejections.append(UpsertRejection(
+                            index=index,
+                            message=(
+                                "environment/script/test_name/start_time "
+                                "already recorded on stream {0!r}; this "
+                                "record targets stream {1!r}, and the "
+                                "runs table's UNIQUE (environment, "
+                                "script, test_name, start_time) is frozen "
+                                "since migration 1 and cannot hold both "
+                                "(docs/STREAMS_PLAN.md §3.2)".format(
+                                    other, mine
+                                )
+                            ),
+                            environment=rec.environment,
+                            script=rec.script,
+                            test_name=rec.test_name,
+                            start_time=rec.start_time,
+                        ))
+                        continue
                     cursor = conn.execute(
                         "INSERT INTO runs (environment, script, test_name, "
                         "result, start_time, end_time, source_link, "
-                        "known_failure_reason, output_fingerprint) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "known_failure_reason, output_fingerprint, "
+                        "stream_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             rec.environment,
                             rec.script,
@@ -1701,24 +2136,27 @@ class Storage:
                             rec.source_link,
                             rec.known_failure_reason,
                             fingerprint,
+                            stream_id,
                         ),
                     )
                     run_id = int(cursor.lastrowid)
                     inserted += 1
-                    key = (rec.environment, hour, rec.result.value)
-                    deltas[key] = deltas.get(key, 0) + 1
-                    script_key = (
-                        rec.environment, hour, rec.script, rec.result.value
-                    )
-                    growth = grown.get(script_key)
-                    if growth is None:
-                        grown[script_key] = [1, start, end]
-                    else:
-                        growth[0] += 1
-                        if start < growth[1]:
-                            growth[1] = start
-                        if end > growth[2]:
-                            growth[2] = end
+                    if stream_id == MAINLINE_STREAM_ID:
+                        key2 = (rec.environment, hour, rec.result.value)
+                        deltas[key2] = deltas.get(key2, 0) + 1
+                        script_key = (
+                            rec.environment, hour, rec.script,
+                            rec.result.value,
+                        )
+                        growth = grown.get(script_key)
+                        if growth is None:
+                            grown[script_key] = [1, start, end]
+                        else:
+                            growth[0] += 1
+                            if start < growth[1]:
+                                growth[1] = start
+                            if end > growth[2]:
+                                growth[2] = end
                 else:
                     run_id = int(row[0])
                     conn.execute(
@@ -1735,23 +2173,26 @@ class Storage:
                         ),
                     )
                     updated += 1
-                    if row[1] != rec.result.value:
-                        old_key = (rec.environment, hour, row[1])
-                        new_key = (rec.environment, hour, rec.result.value)
-                        deltas[old_key] = deltas.get(old_key, 0) - 1
-                        deltas[new_key] = deltas.get(new_key, 0) + 1
-                    if row[1] != rec.result.value or row[2] != end:
-                        # Either bucket may have shrunk; both are
-                        # recomputed from `runs` once the batch's row
-                        # writes are all in. When only the end time
-                        # changed the two keys are the same key.
-                        recompute.add(
-                            (rec.environment, hour, rec.script, row[1])
-                        )
-                        recompute.add((
-                            rec.environment, hour, rec.script,
-                            rec.result.value,
-                        ))
+                    if stream_id == MAINLINE_STREAM_ID:
+                        if row[1] != rec.result.value:
+                            old_key = (rec.environment, hour, row[1])
+                            new_key = (
+                                rec.environment, hour, rec.result.value
+                            )
+                            deltas[old_key] = deltas.get(old_key, 0) - 1
+                            deltas[new_key] = deltas.get(new_key, 0) + 1
+                        if row[1] != rec.result.value or row[2] != end:
+                            # Either bucket may have shrunk; both are
+                            # recomputed from `runs` once the batch's row
+                            # writes are all in. When only the end time
+                            # changed the two keys are the same key.
+                            recompute.add(
+                                (rec.environment, hour, rec.script, row[1])
+                            )
+                            recompute.add((
+                                rec.environment, hour, rec.script,
+                                rec.result.value,
+                            ))
                 # The payload lives in its own table, deflated;
                 # re-importing a run replaces it — unless the
                 # fingerprint says the stored bytes are already right,
@@ -1763,10 +2204,36 @@ class Storage:
                         "(run_id, output) VALUES (?, ?)",
                         (run_id, _compress_output(rec.output)),
                     )
-                self._maintain_latest(conn, rec, run_id, start)
-                self._unretire_on_new_run(conn, rec, start)
+                self._maintain_latest(conn, rec, run_id, start, stream_id)
+                if stream_id == MAINLINE_STREAM_ID:
+                    self._unretire_on_new_run(conn, rec, start)
             self._apply_activity_deltas(conn, deltas)
             self._apply_script_hour_changes(conn, grown, recompute)
+            # Widen streams.first_seen/last_seen once per touched stream,
+            # not once per record. SELECT-then-UPDATE, not SQL MIN()/MAX()
+            # with two arguments: that spelling is SQLite's own scalar
+            # MIN/MAX (2+ args picks the smaller/larger of its arguments)
+            # — MariaDB's MIN()/MAX() are aggregates-only and reject it
+            # with a syntax error (LEAST()/GREATEST() is the MariaDB
+            # spelling, and would be the wrong direction to unify on:
+            # this module's portability rule is SELECT-then-UPDATE, the
+            # same shape as :meth:`_apply_activity_deltas`, not a third
+            # SQL dialect fork). Comparison is lexical on ISO-8601
+            # strings, which sorts chronologically.
+            for cache_key, (first, last) in sorted(stream_bounds.items()):
+                stream_id = stream_cache[cache_key]
+                row = conn.execute(
+                    "SELECT first_seen, last_seen FROM streams "
+                    "WHERE id = ?", (stream_id,),
+                ).fetchone()
+                new_first = first if first < row[0] else row[0]
+                new_last = last if last > row[1] else row[1]
+                if new_first != row[0] or new_last != row[1]:
+                    conn.execute(
+                        "UPDATE streams SET first_seen = ?, "
+                        "last_seen = ? WHERE id = ?",
+                        (new_first, new_last, stream_id),
+                    )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -1777,7 +2244,8 @@ class Storage:
             # re-push defeat the memo forever.
             self._invalidate_trend_cache()
         return UpsertCounts(
-            inserted=inserted, updated=updated, unchanged=unchanged
+            inserted=inserted, updated=updated, unchanged=unchanged,
+            rejections=rejections,
         )
 
     @staticmethod
@@ -1908,17 +2376,24 @@ class Storage:
         script: str,
         test_name: str,
         before: str,
+        stream_id: int,
     ) -> Optional[str]:
         """Result of the newest run of the triple older than *before*.
 
-        One seek on the UNIQUE ``(environment, script, test_name,
-        start_time)`` index; None when the run is the test's first.
+        Scoped to *stream_id* (WP-21): a branch's ``prev_result`` must
+        derive from that branch's own history of the triple, never
+        mainline's, or the delta view would inherit drift that never
+        happened on the branch. One seek — the runs table's UNIQUE index
+        has no stream column to lead with, but ``(environment, script,
+        test_name, start_time)`` already narrows to a handful of rows at
+        most, so filtering ``stream_id`` in the WHERE clause costs
+        nothing that grows with the estate.
         """
         row = conn.execute(
             "SELECT result FROM runs WHERE environment = ? AND script = ? "
-            "AND test_name = ? AND start_time < ? "
+            "AND test_name = ? AND start_time < ? AND stream_id = ? "
             "ORDER BY start_time DESC LIMIT 1",
-            (environment, script, test_name, before),
+            (environment, script, test_name, before, stream_id),
         ).fetchone()
         return None if row is None else row[0]
 
@@ -1928,16 +2403,21 @@ class Storage:
         rec: RunRecord,
         run_id: int,
         start: str,
+        stream_id: int,
     ) -> None:
         """Keep ``latest_runs`` describing the test's newest run.
 
-        Called inside the upsert transaction for every record. The row
-        carries the newest run's ``result`` and the result of the run
-        before it, both of which every estate-wide read depends on, so
-        all four orderings a record can arrive in are handled explicitly:
+        Called inside the upsert transaction for every record, against
+        *stream_id*'s partition of ``latest_runs`` (WP-21, migration 9:
+        the PRIMARY KEY is ``(stream_id, environment, script,
+        test_name)``). The row carries the newest run's ``result`` and
+        the result of the run before it, both of which every estate-wide
+        read depends on, so all four orderings a record can arrive in
+        are handled explicitly:
 
-        - first sighting of the triple — insert, deriving ``prev_result``
-          from ``runs`` (older runs may already exist);
+        - first sighting of the triple ON THIS STREAM — insert, deriving
+          ``prev_result`` from that stream's own runs (older runs on the
+          SAME stream may already exist);
         - newer than the current latest (the nightly case) — the run the
           row pointed at becomes the previous one, no query needed;
         - the same run re-imported — its result may have changed, its
@@ -1951,18 +2431,21 @@ class Storage:
         """
         row = conn.execute(
             "SELECT start_time, result FROM latest_runs "
-            "WHERE environment = ? AND script = ? AND test_name = ?",
-            (rec.environment, rec.script, rec.test_name),
+            "WHERE stream_id = ? AND environment = ? AND script = ? "
+            "AND test_name = ?",
+            (stream_id, rec.environment, rec.script, rec.test_name),
         ).fetchone()
         # Computed with the same function the API serialises with, so a
         # stored duration and a displayed one cannot disagree.
         duration = model.duration_seconds(rec.start_time, rec.end_time)
         if row is None:
             conn.execute(
-                "INSERT INTO latest_runs (environment, script, test_name, "
-                "run_id, start_time, result, prev_result, duration_seconds) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO latest_runs (stream_id, environment, script, "
+                "test_name, run_id, start_time, result, prev_result, "
+                "duration_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    stream_id,
                     rec.environment,
                     rec.script,
                     rec.test_name,
@@ -1971,7 +2454,7 @@ class Storage:
                     rec.result.value,
                     Storage._previous_result(
                         conn, rec.environment, rec.script, rec.test_name,
-                        start,
+                        start, stream_id,
                     ),
                     duration,
                 ),
@@ -1979,12 +2462,16 @@ class Storage:
             return
 
         latest_start, latest_result = row[0], row[1]
-        key = (rec.environment, rec.script, rec.test_name)
+        key = (stream_id, rec.environment, rec.script, rec.test_name)
+        where = (
+            "WHERE stream_id = ? AND environment = ? AND script = ? "
+            "AND test_name = ?"
+        )
         if start > latest_start:
             conn.execute(
                 "UPDATE latest_runs SET run_id = ?, start_time = ?, "
                 "result = ?, prev_result = ?, duration_seconds = ? "
-                "WHERE environment = ? AND script = ? AND test_name = ?",
+                + where,
                 (run_id, start, rec.result.value, latest_result, duration)
                 + key,
             )
@@ -1995,18 +2482,16 @@ class Storage:
             # survive the repair.
             conn.execute(
                 "UPDATE latest_runs SET run_id = ?, result = ?, "
-                "duration_seconds = ? "
-                "WHERE environment = ? AND script = ? AND test_name = ?",
+                "duration_seconds = ? " + where,
                 (run_id, rec.result.value, duration) + key,
             )
         else:
             conn.execute(
-                "UPDATE latest_runs SET prev_result = ? "
-                "WHERE environment = ? AND script = ? AND test_name = ?",
+                "UPDATE latest_runs SET prev_result = ? " + where,
                 (
                     Storage._previous_result(
                         conn, rec.environment, rec.script, rec.test_name,
-                        latest_start,
+                        latest_start, stream_id,
                     ),
                 ) + key,
             )
@@ -2091,6 +2576,7 @@ class Storage:
         assignees: Optional[Sequence[str]] = None,
         include_unassigned: bool = False,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> Tuple[List[str], List[Any]]:
         """Build the shared WHERE clauses for the dashboard list and count.
 
@@ -2102,10 +2588,15 @@ class Storage:
         caller to an allow-list — see :meth:`_environments_clause`. It
         combines with *environment* by AND, which is never contradictory
         in practice: a caller passes one or the other, never both with
-        different values.
+        different values. *stream_id* (WP-21, default mainline) is
+        ALWAYS bound: every dashboard read is scoped to exactly one
+        stream's partition of ``latest_runs`` — the leading column of
+        every WP-21 index (see migration 9), so this equality predicate
+        is what keeps the sort indexes usable rather than forcing a
+        TEMP B-TREE.
         """
-        clauses = []  # type: List[str]
-        params = []  # type: List[Any]
+        clauses = ["lr.stream_id = ?"]  # type: List[str]
+        params = [stream_id]  # type: List[Any]
         if environment is not None:
             clauses.append("lr.environment = ?")
             params.append(environment)
@@ -2178,6 +2669,7 @@ class Storage:
         limit: Optional[int] = None,
         offset: int = 0,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[TestSummaryRow]:
         """Return ONE PAGE of the latest run per test, never with ``output``.
 
@@ -2194,7 +2686,9 @@ class Storage:
         :meth:`_environments_clause`. With *with_latest_comment* each row
         carries the newest comment on that test — an index seek per
         returned row, so it is opt-in and never paid for by the home
-        screen.
+        screen. *stream_id* (WP-21, default mainline) selects one
+        partition of ``latest_runs`` — the ``/api/dashboard`` ``stream=``
+        param, resolved by the caller.
 
         *sort* is a key of :data:`DASHBOARD_SORTS`; every ordering ends
         with the full test identity, so *limit*/*offset* paging is stable
@@ -2213,6 +2707,7 @@ class Storage:
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
+            stream_id,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -2245,6 +2740,7 @@ class Storage:
         assignees: Optional[Sequence[str]] = None,
         include_unassigned: bool = False,
         environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> int:
         """Exact number of tests matching the same filters as :meth:`dashboard`."""
         result_values = (
@@ -2255,6 +2751,7 @@ class Storage:
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
+            stream_id,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
         if clauses:
@@ -2263,19 +2760,31 @@ class Storage:
         return int(row[0])
 
     def environments(self) -> List[str]:
-        """Return every distinct environment with a recorded test, sorted."""
+        """Return every distinct environment with a recorded test, sorted.
+
+        Mainline only (WP-21): this feeds the estate-wide environment
+        picker, and a branch importing a brand-new environment name must
+        not make it appear estate-wide before mainline has ever reported
+        it — the same reasoning as :meth:`summary_rollup` and every
+        other estate view (docs/STREAMS_PLAN.md §1, "estate views read
+        stream_id = 1").
+        """
         rows = self._conn().execute(
             "SELECT DISTINCT environment FROM latest_runs "
-            "ORDER BY environment"
+            "WHERE stream_id = ? ORDER BY environment",
+            (MAINLINE_STREAM_ID,),
         ).fetchall()
         return [row[0] for row in rows]
 
     def scripts(self, environment: Optional[str] = None) -> List[str]:
-        """Return every distinct script name (optionally in one env), sorted."""
-        sql = "SELECT DISTINCT script FROM latest_runs"
-        params = []  # type: List[Any]
+        """Return every distinct script name (optionally in one env), sorted.
+
+        Mainline only (WP-21) — see :meth:`environments`.
+        """
+        sql = "SELECT DISTINCT script FROM latest_runs WHERE stream_id = ?"
+        params = [MAINLINE_STREAM_ID]  # type: List[Any]
         if environment is not None:
-            sql += " WHERE environment = ?"
+            sql += " AND environment = ?"
             params.append(environment)
         sql += " ORDER BY script"
         return [row[0] for row in self._conn().execute(sql, params)]
@@ -2302,6 +2811,9 @@ class Storage:
         headline number. A test counts as having run recently when its
         latest run started at or after *recent_cutoff*. *environments* is
         the WP-20 ``product=`` filter — see :meth:`_environments_clause`.
+        Mainline only (WP-21): ``/api/summary`` stays mainline-only in
+        this drop (docs/STREAMS_PLAN.md §3.5), so this is never given a
+        ``stream_id`` parameter — every caller reads stream 1.
         """
         sql = (
             "SELECT lr.environment, lr.result, lr.prev_result, "
@@ -2314,7 +2826,8 @@ class Storage:
             " AND tr.script = lr.script AND tr.test_name = lr.test_name"
         )
         params = [model.format_iso(recent_cutoff)]  # type: List[Any]
-        where = []  # type: List[str]
+        where = ["lr.stream_id = ?"]  # type: List[str]
+        params.append(MAINLINE_STREAM_ID)
         if environment is not None:
             where.append("lr.environment = ?")
             params.append(environment)
@@ -2345,12 +2858,16 @@ class Storage:
         environment: Optional[str] = None,
         environments: Optional[Sequence[str]] = None,
     ) -> int:
-        """Count tests that have an assignee and are FAIL or UNEXPECTED_PASS."""
+        """Count tests that have an assignee and are FAIL or UNEXPECTED_PASS.
+
+        Mainline only (WP-21) — see :meth:`summary_rollup`.
+        """
         sql = (
             "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN + " WHERE "
             + _QUEUE_PREDICATES["assigned"] + " AND " + self._NOT_RETIRED
+            + " AND lr.stream_id = ?"
         )
-        params = []  # type: List[Any]
+        params = [MAINLINE_STREAM_ID]  # type: List[Any]
         if environment is not None:
             sql += " AND lr.environment = ?"
             params.append(environment)
@@ -2706,6 +3223,333 @@ class Storage:
         )
         return cursor.rowcount > 0
 
+    # ------------------------------------------------------------------
+    # Streams (migration 9, WP-21) — observed branch/build/mainline runs
+    # ------------------------------------------------------------------
+
+    def _stream_from_row(self, row: Sequence[Any]) -> "Stream":
+        """Build a :class:`Stream` from a ``streams`` row plus its own
+        failing count (one small indexed query)."""
+        stream_id = int(row[0])
+        failing_row = self._conn().execute(
+            "SELECT COUNT(*) FROM latest_runs AS lr "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE lr.stream_id = ? AND lr.result = ? AND " + self._NOT_RETIRED,
+            (stream_id, Result.FAIL.value),
+        ).fetchone()
+        return Stream(
+            stream_id=stream_id,
+            product=row[1],
+            kind=row[2],
+            name=row[3],
+            first_seen=model.parse_iso(row[4]),
+            last_seen=model.parse_iso(row[5]),
+            failing=int(failing_row[0]),
+        )
+
+    def get_stream(self, stream_id: int) -> Optional["Stream"]:
+        """One stream by id, or None. See :class:`Stream`."""
+        row = self._conn().execute(
+            "SELECT id, product, kind, name, first_seen, last_seen "
+            "FROM streams WHERE id = ?",
+            (stream_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._stream_from_row(row)
+
+    def list_streams(self, product: str) -> List["Stream"]:
+        """Every non-mainline stream of *product*, id ascending.
+
+        The Build picker's data (``GET /api/streams?product=``,
+        docs/STREAMS_PLAN.md §3.5): id, kind, name, first_seen, last_seen
+        and a cheap latest verdict (failing count) — no hidden staleness
+        constant, the picker folds by age FROM the reported ``last_seen``.
+        Mainline (id 1) is never listed here; it is not a "build" a
+        tester picks, it is the default.
+        """
+        rows = self._conn().execute(
+            "SELECT id, product, kind, name, first_seen, last_seen "
+            "FROM streams WHERE product = ? AND id != ? ORDER BY id",
+            (product, MAINLINE_STREAM_ID),
+        ).fetchall()
+        return [self._stream_from_row(row) for row in rows]
+
+    def count_stream_rows(self, stream_id: int) -> Dict[str, int]:
+        """Rows :meth:`delete_stream` would delete, per table (dry run)."""
+        conn = self._conn()
+        counts = {}  # type: Dict[str, int]
+        counts["runs"] = int(conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE stream_id = ?", (stream_id,)
+        ).fetchone()[0])
+        counts["run_outputs"] = int(conn.execute(
+            "SELECT COUNT(*) FROM run_outputs WHERE run_id IN "
+            "(SELECT id FROM runs WHERE stream_id = ?)", (stream_id,)
+        ).fetchone()[0])
+        counts["latest_runs"] = int(conn.execute(
+            "SELECT COUNT(*) FROM latest_runs WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0])
+        return counts
+
+    def delete_stream(self, stream_id: int) -> Dict[str, int]:
+        """Delete a stream and everything belonging to it. Cannot be undone.
+
+        Refuses stream 1 (mainline) — the caller (``tools/drop_stream.py``)
+        must never be able to remove it. Comments posted from this stream
+        are NOT deleted: they annotate the (environment, script,
+        test_name) triple, not the stream. ``comments.stream_id`` is
+        cleared with an explicit UPDATE, in the same transaction, rather
+        than relied on SQLite's ``ON DELETE SET NULL``: the MariaDB
+        schema declares no foreign keys at all (runbook §B.6), so an FK
+        action would be silently a no-op there and the two backends
+        would disagree about a comment's tag after a delete — the
+        explicit UPDATE is identical on both (docs/STREAMS_PLAN.md
+        §3.8).
+
+        One transaction: outputs before their runs, ``latest_runs``
+        before ``runs`` (derived rows before the rows they were derived
+        from — the same ordering :meth:`delete_environment` uses).
+        """
+        if stream_id == MAINLINE_STREAM_ID:
+            raise ValueError("refusing to delete the mainline stream")
+        conn = self._conn()
+        deleted = {}  # type: Dict[str, int]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE comments SET stream_id = NULL WHERE stream_id = ?",
+                (stream_id,),
+            )
+            cursor = conn.execute(
+                "DELETE FROM run_outputs WHERE run_id IN "
+                "(SELECT id FROM runs WHERE stream_id = ?)", (stream_id,)
+            )
+            deleted["run_outputs"] = int(cursor.rowcount)
+            cursor = conn.execute(
+                "DELETE FROM latest_runs WHERE stream_id = ?", (stream_id,)
+            )
+            deleted["latest_runs"] = int(cursor.rowcount)
+            cursor = conn.execute(
+                "DELETE FROM runs WHERE stream_id = ?", (stream_id,)
+            )
+            deleted["runs"] = int(cursor.rowcount)
+            cursor = conn.execute(
+                "DELETE FROM streams WHERE id = ?", (stream_id,)
+            )
+            deleted["streams"] = int(cursor.rowcount)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        self._invalidate_trend_cache()
+        return deleted
+
+    #: Categories a comparison classifies every test into — the "five
+    #: See module-level :data:`COMPARE_CATEGORIES`.
+    _COMPARE_CATEGORIES = COMPARE_CATEGORIES
+
+    @staticmethod
+    def _compare_partition_sql(
+        environments: Sequence[str],
+    ) -> Tuple[str, List[Any]]:
+        """One stream's non-retired ``latest_runs`` rows, product-scoped.
+
+        *environments* narrows the comparison to the STREAM's OWN
+        product (resolved by the caller via
+        :meth:`environments_for_product`) — comparing against mainline's
+        whole ``latest_runs`` unfiltered would pull in every other
+        product's environments as spurious ``no_result``/``new_tests``
+        rows. Takes a ``?`` for ``stream_id``, bound by the caller.
+        """
+        envs_clause, envs_params = Storage._environments_clause(
+            environments, column="lr.environment"
+        )
+        sql = (
+            "SELECT lr.environment, lr.script, lr.test_name, lr.result "
+            "FROM latest_runs lr LEFT JOIN test_retirements tr "
+            "  ON tr.environment = lr.environment AND tr.script = lr.script "
+            " AND tr.test_name = lr.test_name "
+            "WHERE lr.stream_id = ? AND tr.retired_at IS NULL"
+        )
+        if envs_clause is not None:
+            sql += " AND " + envs_clause
+        return sql, envs_params
+
+    @classmethod
+    def _compare_pairs_sql(
+        cls, stream_id: int, baseline_id: int, environments: Sequence[str],
+    ) -> Tuple[str, List[Any]]:
+        """Full outer join of two ``latest_runs`` partitions on the triple.
+
+        SQLite has no ``FULL OUTER JOIN``: this is the standard
+        emulation — a LEFT JOIN stream->baseline (every triple on the
+        stream, with the baseline's result or NULL), UNION ALL a LEFT
+        JOIN baseline->stream restricted to the ANTI-JOIN complement
+        (triples on the baseline the stream has nothing for, which the
+        first half already excluded from double-counting). Columns are
+        named consistently across both halves — ``stream_result``,
+        ``baseline_result`` — never swapped, so the caller's CASE
+        expression means the same thing for every row.
+        """
+        part_sql, envs_params = cls._compare_partition_sql(environments)
+        pairs_sql = (
+            "SELECT s.environment AS environment, s.script AS script, "
+            "s.test_name AS test_name, s.result AS stream_result, "
+            "m.result AS baseline_result "
+            "FROM ({part}) s LEFT JOIN ({part}) m "
+            "  ON m.environment = s.environment AND m.script = s.script "
+            " AND m.test_name = s.test_name "
+            "UNION ALL "
+            "SELECT m2.environment AS environment, m2.script AS script, "
+            "m2.test_name AS test_name, s2.result AS stream_result, "
+            "m2.result AS baseline_result "
+            "FROM ({part}) m2 LEFT JOIN ({part}) s2 "
+            "  ON s2.environment = m2.environment AND s2.script = m2.script "
+            " AND s2.test_name = m2.test_name "
+            "WHERE s2.result IS NULL"
+        ).format(part=part_sql)
+        params = (
+            [stream_id] + envs_params
+            + [baseline_id] + envs_params
+            + [baseline_id] + envs_params
+            + [stream_id] + envs_params
+        )
+        return pairs_sql, params
+
+    #: The classification every comparison row falls into. ``{fail}`` is
+    #: substituted once at import time, the same pattern as
+    #: :data:`_QUEUE_PREDICATES` — bound to the enum, not a hand-written
+    #: literal, so a renamed Result member cannot silently match nothing.
+    _COMPARE_CASE = (
+        "CASE "
+        "WHEN stream_result IS NULL THEN 'no_result' "
+        "WHEN baseline_result IS NULL THEN 'new_tests' "
+        "WHEN stream_result = '{fail}' AND baseline_result = '{fail}' "
+        "  THEN 'both_failing' "
+        "WHEN stream_result = '{fail}' THEN 'new_failures' "
+        "WHEN baseline_result = '{fail}' THEN 'new_passes' "
+        "ELSE 'agree' END"
+    ).format(fail=Result.FAIL.value)
+
+    def compare_counts(
+        self, stream_id: int, baseline_id: int = MAINLINE_STREAM_ID,
+    ) -> "CompareCounts":
+        """The five headline counts of a stream-vs-baseline comparison.
+
+        Raises :class:`KeyError` if *stream_id* does not exist. Two
+        joins of two ``latest_runs`` partitions (see
+        :meth:`_compare_pairs_sql`) — never a scan of ``runs``, and
+        bounded by the stream's own product's test count (a few
+        thousand to ~12k), not by history.
+        """
+        stream = self.get_stream(stream_id)
+        if stream is None:
+            raise KeyError(stream_id)
+        environments = self.environments_for_product(stream.product)
+        pairs_sql, params = self._compare_pairs_sql(
+            stream_id, baseline_id, environments
+        )
+        # The derived-table alias ("pairs") is required by MariaDB
+        # ("Every derived table must have its own alias") though SQLite
+        # does not need one; harmless there.
+        sql = (
+            "SELECT {0} AS category, COUNT(*) FROM ({1}) pairs "
+            "GROUP BY category"
+        ).format(self._COMPARE_CASE, pairs_sql)
+        rows = self._conn().execute(sql, params).fetchall()
+        counts = {row[0]: int(row[1]) for row in rows}
+        return CompareCounts(
+            new_failures=counts.get("new_failures", 0),
+            new_passes=counts.get("new_passes", 0),
+            both_failing=counts.get("both_failing", 0),
+            new_tests=counts.get("new_tests", 0),
+            no_result=counts.get("no_result", 0),
+        )
+
+    def compare_category(
+        self,
+        stream_id: int,
+        category: str,
+        baseline_id: int = MAINLINE_STREAM_ID,
+        limit: int = 250,
+        offset: int = 0,
+    ) -> List["CompareRow"]:
+        """ONE PAGE of one comparison category, paginated in SQL.
+
+        *category* must be one of :data:`_COMPARE_CATEGORIES` — like
+        :data:`DASHBOARD_SORTS`, callers choose from a whitelist and
+        anything else is refused before it reaches the database (a
+        GROUP BY/CASE label cannot be a bound parameter safely combined
+        with pagination logic here, and there is no reason to allow
+        one that means nothing).
+        """
+        if category not in self._COMPARE_CATEGORIES:
+            raise ValueError(
+                "category must be one of {0}, got {1!r}".format(
+                    self._COMPARE_CATEGORIES, category
+                )
+            )
+        stream = self.get_stream(stream_id)
+        if stream is None:
+            raise KeyError(stream_id)
+        environments = self.environments_for_product(stream.product)
+        pairs_sql, params = self._compare_pairs_sql(
+            stream_id, baseline_id, environments
+        )
+        sql = (
+            "SELECT environment, script, test_name, stream_result, "
+            "baseline_result FROM (SELECT environment, script, test_name, "
+            "stream_result, baseline_result, {0} AS category "
+            "FROM ({1}) pairs) categorized "
+            "WHERE category = ? ORDER BY environment, script, test_name "
+            "LIMIT ? OFFSET ?"
+        ).format(self._COMPARE_CASE, pairs_sql)
+        rows = self._conn().execute(
+            sql, params + [category, limit, offset]
+        ).fetchall()
+        return [
+            CompareRow(
+                environment=row[0],
+                script=row[1],
+                test_name=row[2],
+                stream_result=None if row[3] is None else Result(row[3]),
+                baseline_result=None if row[4] is None else Result(row[4]),
+            )
+            for row in rows
+        ]
+
+    def compare_category_count(
+        self,
+        stream_id: int,
+        category: str,
+        baseline_id: int = MAINLINE_STREAM_ID,
+    ) -> int:
+        """Exact size of one comparison category, ignoring any display cap."""
+        if category not in self._COMPARE_CATEGORIES:
+            raise ValueError(
+                "category must be one of {0}, got {1!r}".format(
+                    self._COMPARE_CATEGORIES, category
+                )
+            )
+        stream = self.get_stream(stream_id)
+        if stream is None:
+            raise KeyError(stream_id)
+        environments = self.environments_for_product(stream.product)
+        pairs_sql, params = self._compare_pairs_sql(
+            stream_id, baseline_id, environments
+        )
+        sql = (
+            "SELECT COUNT(*) FROM (SELECT {0} AS category FROM ({1}) "
+            "pairs) categorized WHERE category = ?"
+        ).format(self._COMPARE_CASE, pairs_sql)
+        row = self._conn().execute(
+            sql, params + [category]
+        ).fetchone()
+        return int(row[0])
+
     def known_environments(self) -> List[str]:
         """Every environment that has run a test or carries a declaration.
 
@@ -2775,10 +3619,16 @@ class Storage:
         Retired tests are included deliberately: this answers "when did
         we last hear from this environment", which is a question about
         the feeder, not about the suite's contents.
+
+        Mainline only (WP-21): fed to the environment pill and Watchlist
+        environment cards, both mainline concepts in this drop — a
+        branch import must not make an environment's mainline "last
+        reported" line look fresher than mainline actually is.
         """
         rows = self._conn().execute(
             "SELECT environment, MAX(start_time) FROM latest_runs "
-            "GROUP BY environment"
+            "WHERE stream_id = ? GROUP BY environment",
+            (MAINLINE_STREAM_ID,),
         ).fetchall()
         return {
             row[0]: model.parse_iso(row[1])
@@ -2790,10 +3640,13 @@ class Storage:
 
         The estate's own clock. Reported alongside the summary so a
         stalled feeder is visible as a stalled feeder, rather than as
-        every test in the estate quietly going stale.
+        every test in the estate quietly going stale. Mainline only
+        (WP-21) — see :meth:`latest_run_time_by_environment`.
         """
         row = self._conn().execute(
-            "SELECT MAX(start_time) FROM runs").fetchone()
+            "SELECT MAX(start_time) FROM runs WHERE stream_id = ?",
+            (MAINLINE_STREAM_ID,),
+        ).fetchone()
         if row is None or row[0] is None:
             return None
         return model.parse_iso(row[0])
@@ -2837,7 +3690,9 @@ class Storage:
         honest than showing it clearly labelled.
 
         *environments* is the WP-20 ``product=`` filter — see
-        :meth:`_environments_clause`.
+        :meth:`_environments_clause`. Mainline only (WP-21): the Time
+        page stays mainline-only in this drop (docs/STREAMS_PLAN.md
+        §3.5/§3.10).
         """
         column = _DURATION_GROUPS.get(group_by)
         if column is None:
@@ -2849,8 +3704,9 @@ class Storage:
         conn = self._conn()
         where = [
             "tr.environment IS NULL",
+            "lr.stream_id = ?",
         ]
-        params = []  # type: List[Any]
+        params = [MAINLINE_STREAM_ID]  # type: List[Any]
         if environment is not None:
             where.append("lr.environment = ?")
             params.append(environment)
@@ -2913,7 +3769,8 @@ class Storage:
         """Scripts with the most currently-failing tests, worst first.
 
         *environments* is the WP-20 ``product=`` filter — see
-        :meth:`_environments_clause`.
+        :meth:`_environments_clause`. Mainline only (WP-21) — see
+        :meth:`duration_rollup`.
         """
         sql = (
             "SELECT lr.environment, lr.script, COUNT(*) AS failing "
@@ -2922,8 +3779,9 @@ class Storage:
             "  ON tr.environment = lr.environment "
             " AND tr.script = lr.script AND tr.test_name = lr.test_name "
             "WHERE lr.result = ? AND " + self._NOT_RETIRED
+            + " AND lr.stream_id = ?"
         )
-        params = [Result.FAIL.value]  # type: List[Any]
+        params = [Result.FAIL.value, MAINLINE_STREAM_ID]  # type: List[Any]
         if environment is not None:
             sql += " AND lr.environment = ?"
             params.append(environment)
@@ -2958,14 +3816,19 @@ class Storage:
         appearing in the work queues — and the ``not_run`` queue, where
         that approval is given, is exactly where they would otherwise
         pile up. *environments* is the WP-20 ``product=`` filter — see
-        :meth:`_environments_clause`.
+        :meth:`_environments_clause`. Mainline only (WP-21): triage
+        queues feed ``/api/summary``, mainline-only in this drop
+        (docs/STREAMS_PLAN.md §3.5) — a branch's failures must never
+        appear in the mainline triage queues (§0.4/§3.4).
         """
         try:
             predicate = _QUEUE_PREDICATES[kind]
         except KeyError:
             raise ValueError("unknown queue kind: {!r}".format(kind))
-        sql = " WHERE {} AND {}".format(predicate, Storage._NOT_RETIRED)
-        params = []  # type: List[Any]
+        sql = " WHERE lr.stream_id = ? AND {} AND {}".format(
+            predicate, Storage._NOT_RETIRED
+        )
+        params = [MAINLINE_STREAM_ID]  # type: List[Any]
         if kind in _STALE_QUEUES:
             if stale_before is None:
                 raise ValueError(
@@ -3064,11 +3927,15 @@ class Storage:
         triples: Sequence[Tuple[str, str, str]],
         since: datetime.datetime,
         per_test_limit: int = 20,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> Dict[Tuple[str, str, str], List[Result]]:
         """The last few results of each of a PAGE of tests.
 
         Returns ``{triple: [oldest, ..., newest]}``, at most
-        *per_test_limit* entries each, for runs at or after *since*.
+        *per_test_limit* entries each, for runs at or after *since*, on
+        *stream_id* (WP-21, default mainline) — the caller's own stream,
+        so a branch's stability history is never the mainline history of
+        the same triple.
 
         The point of this method is what it refuses to be: a query per
         row. A page of a hundred tests asking "how has this one been
@@ -3098,10 +3965,12 @@ class Storage:
             params = []  # type: List[Any]
             for triple in chunk:
                 params.extend(triple)
+            params.append(stream_id)
             params.append(cutoff)
             rows = conn.execute(
                 "SELECT environment, script, test_name, result, start_time "
-                "FROM runs WHERE ({0}) AND start_time >= ? "
+                "FROM runs WHERE ({0}) AND stream_id = ? "
+                "AND start_time >= ? "
                 "ORDER BY environment, script, test_name, start_time".format(
                     clause),
                 tuple(params),
@@ -3122,6 +3991,7 @@ class Storage:
         script: str,
         test_name: str,
         latest_start: datetime.datetime,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> FailureStreak:
         """When the test's current FAIL streak began, and its last pass before.
 
@@ -3132,7 +4002,8 @@ class Storage:
         (every run in between is a FAIL by construction), then find the
         newest PASS older than the streak. ``FAILED_AS_EXPECTED`` and
         ``UNEXPECTED_PASS`` bound a streak but are not passes, so the
-        last-pass seek is separate.
+        last-pass seek is separate. *stream_id* (WP-21, default
+        mainline) scopes every seek to the caller's own stream.
         """
         conn = self._conn()
         triple = (environment, script, test_name)
@@ -3141,22 +4012,24 @@ class Storage:
         bound_row = conn.execute(
             "SELECT start_time FROM runs WHERE environment = ? "
             "AND script = ? AND test_name = ? AND start_time < ? "
-            "AND result <> ? ORDER BY start_time DESC LIMIT 1",
-            triple + (start, Result.FAIL.value),
+            "AND result <> ? AND stream_id = ? "
+            "ORDER BY start_time DESC LIMIT 1",
+            triple + (start, Result.FAIL.value, stream_id),
         ).fetchone()
 
         if bound_row is None:
             since_row = conn.execute(
                 "SELECT MIN(start_time) FROM runs WHERE environment = ? "
-                "AND script = ? AND test_name = ? AND start_time <= ?",
-                triple + (start,),
+                "AND script = ? AND test_name = ? AND start_time <= ? "
+                "AND stream_id = ?",
+                triple + (start, stream_id),
             ).fetchone()
         else:
             since_row = conn.execute(
                 "SELECT MIN(start_time) FROM runs WHERE environment = ? "
                 "AND script = ? AND test_name = ? AND start_time > ? "
-                "AND start_time <= ?",
-                triple + (bound_row[0], start),
+                "AND start_time <= ? AND stream_id = ?",
+                triple + (bound_row[0], start, stream_id),
             ).fetchone()
         if since_row is None or since_row[0] is None:
             return FailureStreak(failing_since=None, last_pass_before=None)
@@ -3165,8 +4038,9 @@ class Storage:
         pass_row = conn.execute(
             "SELECT start_time FROM runs WHERE environment = ? "
             "AND script = ? AND test_name = ? AND start_time < ? "
-            "AND result = ? ORDER BY start_time DESC LIMIT 1",
-            triple + (failing_since, Result.PASS.value),
+            "AND result = ? AND stream_id = ? "
+            "ORDER BY start_time DESC LIMIT 1",
+            triple + (failing_since, Result.PASS.value, stream_id),
         ).fetchone()
         return FailureStreak(
             failing_since=model.parse_iso(failing_since),
@@ -3291,15 +4165,21 @@ class Storage:
         return row is not None
 
     def latest_run(
-        self, environment: str, script: str, test_name: str
+        self, environment: str, script: str, test_name: str,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> Optional[StoredRun]:
-        """Return the newest run for the triple (``output=None``), or None."""
+        """Return the newest run for the triple (``output=None``), or None.
+
+        *stream_id* (WP-21, default mainline) — the test detail page's
+        ``stream=`` param.
+        """
         row = self._conn().execute(
             "SELECT {} FROM runs WHERE environment = ? AND script = ? "
-            "AND test_name = ? ORDER BY start_time DESC LIMIT 1".format(
+            "AND test_name = ? AND stream_id = ? "
+            "ORDER BY start_time DESC LIMIT 1".format(
                 _RUN_COLUMNS
             ),
-            (environment, script, test_name),
+            (environment, script, test_name, stream_id),
         ).fetchone()
         if row is None:
             return None
@@ -3312,18 +4192,23 @@ class Storage:
         test_name: str,
         limit: int = 50,
         before: Optional[datetime.datetime] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[StoredRun]:
         """Return runs for the triple, newest first, ``output=None``.
 
         When *before* is given only runs with ``start_time`` strictly
         earlier than it are returned (pagination cursor). At most *limit*
-        runs are returned.
+        runs are returned. *stream_id* (WP-21, default mainline) — the
+        test detail page's ``stream=`` param; the history table is one
+        stream's runs of the triple, never a mix.
         """
         sql = (
             "SELECT {} FROM runs WHERE environment = ? AND script = ? "
-            "AND test_name = ?".format(_RUN_COLUMNS)
+            "AND test_name = ? AND stream_id = ?".format(_RUN_COLUMNS)
         )
-        params = [environment, script, test_name]  # type: List[Any]
+        params = [
+            environment, script, test_name, stream_id,
+        ]  # type: List[Any]
         if before is not None:
             sql += " AND start_time < ?"
             params.append(model.format_iso(before))
@@ -3339,21 +4224,25 @@ class Storage:
         test_name: str,
         since: datetime.datetime,
         limit: int,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[StoredRun]:
         """Return runs with ``start_time >= since``, newest first.
 
         Capped at *limit* rows; ``output=None``. This is the analytics
-        window query.
+        window query, scoped to *stream_id* (WP-21, default mainline) —
+        analytics computed for a branch-scoped test detail page must be
+        that branch's own runs, never mainline's.
         """
         rows = self._conn().execute(
             "SELECT {} FROM runs WHERE environment = ? AND script = ? "
-            "AND test_name = ? AND start_time >= ? "
+            "AND test_name = ? AND start_time >= ? AND stream_id = ? "
             "ORDER BY start_time DESC LIMIT ?".format(_RUN_COLUMNS),
             (
                 environment,
                 script,
                 test_name,
                 model.format_iso(since),
+                stream_id,
                 limit,
             ),
         ).fetchall()
@@ -3384,13 +4273,17 @@ class Storage:
         top: the Timeline's row expansion asks for exactly one script
         execution, and without a ceiling it would drag in every run
         from the block to now.
+
+        Mainline only (WP-21): the Timeline stays mainline-only in this
+        drop (docs/STREAMS_PLAN.md §3.10).
         """
         sql = (
             "SELECT {} FROM runs WHERE environment = ? AND script = ? "
-            "AND start_time >= ?".format(_RUN_COLUMNS)
+            "AND start_time >= ? AND stream_id = ?".format(_RUN_COLUMNS)
         )
         params = [
             environment, script, model.format_iso(since),
+            MAINLINE_STREAM_ID,
         ]  # type: List[Any]
         if until is not None:
             sql += " AND start_time <= ?"
@@ -3485,6 +4378,7 @@ class Storage:
             author=username,
             created_at=now,
             text=comment,
+            stream_id=None,
         )
 
     def is_retired(
@@ -3508,6 +4402,13 @@ class Storage:
         leaving it hidden would be the worse failure — silently MISSING
         data is worse than an unexpected row. The comment thread records
         why the approval lapsed, so the story reads in order.
+
+        **Mainline only** (WP-21, docs/STREAMS_PLAN.md §3.4): the caller
+        (:meth:`upsert_runs`) only reaches this for
+        ``stream_id == MAINLINE_STREAM_ID`` — a branch run may predate a
+        retirement decided on mainline and must not silently reverse it.
+        The recorded comment is stamped ``stream_id=MAINLINE_STREAM_ID``
+        for the same reason it is only ever called for one.
         """
         triple = (rec.environment, rec.script, rec.test_name)
         row = conn.execute(
@@ -3527,6 +4428,7 @@ class Storage:
             "Automatically un-retired: this test reported a run at {0}, "
             "so it is in the suite again.".format(start),
             model.parse_iso(start),
+            MAINLINE_STREAM_ID,
         )
 
     # ------------------------------------------------------------------
@@ -3861,15 +4763,23 @@ class Storage:
         author: str,
         text: str,
         created_at: datetime.datetime,
+        stream_id: Optional[int] = None,
     ) -> Comment:
-        """Add a comment to a test triple, implicitly creating *author*."""
+        """Add a comment to a test triple, implicitly creating *author*.
+
+        *stream_id* (WP-21) records which stream the comment was posted
+        FROM — an annotation, not part of the comment's identity; the
+        comment is still visible from every stream's test detail page.
+        ``None`` (the default) is a plain "no stream context" comment,
+        same as every comment posted before this migration.
+        """
         conn = self._conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
             self.ensure_user(author, created_at)
             comment_id = self._insert_comment(
                 conn, (environment, script, test_name), author, text,
-                created_at,
+                created_at, stream_id,
             )
             conn.execute("COMMIT")
         except Exception:
@@ -3883,6 +4793,7 @@ class Storage:
             author=author,
             created_at=created_at,
             text=text,
+            stream_id=stream_id,
         )
 
     @staticmethod
@@ -3892,17 +4803,22 @@ class Storage:
         author: str,
         text: str,
         created_at: datetime.datetime,
+        stream_id: Optional[int] = None,
     ) -> int:
         """Append one comment inside the caller's transaction; return its id.
 
         Shared by the comment endpoint, retirement (which records the
-        human's reason) and un-retirement (which records the machine's),
-        so every one of them lands in the same thread.
+        human's reason, ``stream_id=None`` — retiring is a triage
+        decision, not something posted from a stream) and un-retirement
+        (which records the machine's, ``stream_id=MAINLINE_STREAM_ID``
+        since un-retirement only ever fires on a mainline import), so
+        every one of them lands in the same thread.
         """
         cursor = conn.execute(
             "INSERT INTO comments (environment, script, test_name, "
-            "author, created_at, text) VALUES (?, ?, ?, ?, ?, ?)",
-            triple + (author, model.format_iso(created_at), text),
+            "author, created_at, text, stream_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            triple + (author, model.format_iso(created_at), text, stream_id),
         )
         return int(cursor.lastrowid)
 
@@ -3912,8 +4828,9 @@ class Storage:
         """Return all comments for the triple, oldest first."""
         rows = self._conn().execute(
             "SELECT id, environment, script, test_name, author, "
-            "created_at, text FROM comments WHERE environment = ? "
-            "AND script = ? AND test_name = ? ORDER BY id",
+            "created_at, text, stream_id FROM comments WHERE "
+            "environment = ? AND script = ? AND test_name = ? "
+            "ORDER BY id",
             (environment, script, test_name),
         ).fetchall()
         return [
@@ -3925,6 +4842,7 @@ class Storage:
                 author=row[4],
                 created_at=model.parse_iso(row[5]),
                 text=row[6],
+                stream_id=(None if row[7] is None else int(row[7])),
             )
             for row in rows
         ]

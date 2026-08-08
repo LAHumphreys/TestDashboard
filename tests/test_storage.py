@@ -53,6 +53,8 @@ def make_record(
     output: str = "all good\n",
     source_link: str = "https://example.com/suite.py#L1",
     known_failure_reason: Optional[str] = None,
+    branch: Optional[str] = None,
+    build: Optional[str] = None,
 ) -> RunRecord:
     """Build a RunRecord with sensible defaults for tests."""
     if start is None:
@@ -69,6 +71,8 @@ def make_record(
         output=output,
         source_link=source_link,
         known_failure_reason=known_failure_reason,
+        branch=branch,
+        build=build,
     )
 
 
@@ -152,7 +156,7 @@ class TestMigrations(StorageTestBase):
         counts = mem.upsert_runs([make_record()])
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=1, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=1, updated=0, unchanged=0, rejections=[]),
         )
         self.assertTrue(mem.test_exists("linux-sim", "suite.py", "test_a"))
 
@@ -169,7 +173,7 @@ class TestUpsertRuns(StorageTestBase):
         )
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=2, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=2, updated=0, unchanged=0, rejections=[]),
         )
 
     def test_mixed_insert_and_update_counts(self) -> None:
@@ -182,7 +186,7 @@ class TestUpsertRuns(StorageTestBase):
         )
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=1, updated=1, unchanged=0),
+            storage.UpsertCounts(inserted=1, updated=1, unchanged=0, rejections=[]),
         )
 
     def test_reimport_identical_batch_is_unchanged_no_duplicates(self) -> None:
@@ -204,11 +208,11 @@ class TestUpsertRuns(StorageTestBase):
         second = self.store.upsert_runs(batch)
         self.assertEqual(
             first,
-            storage.UpsertCounts(inserted=3, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=3, updated=0, unchanged=0, rejections=[]),
         )
         self.assertEqual(
             second,
-            storage.UpsertCounts(inserted=0, updated=0, unchanged=3),
+            storage.UpsertCounts(inserted=0, updated=0, unchanged=3, rejections=[]),
         )
         self.assertEqual(len(self.store.dashboard()), 3)
         history = self.store.run_history("linux-sim", "suite.py", "test_a")
@@ -228,7 +232,7 @@ class TestUpsertRuns(StorageTestBase):
         counts = self.store.upsert_runs([changed])
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=0, updated=1, unchanged=0),
+            storage.UpsertCounts(inserted=0, updated=1, unchanged=0, rejections=[]),
         )
         run = self.store.get_run(original.run_id)
         assert run is not None
@@ -250,7 +254,7 @@ class TestUpsertRuns(StorageTestBase):
         )
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=2, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=2, updated=0, unchanged=0, rejections=[]),
         )
         history = self.store.run_history("linux-sim", "suite.py", "test_a")
         self.assertEqual(len(history), 2)
@@ -259,7 +263,7 @@ class TestUpsertRuns(StorageTestBase):
         counts = self.store.upsert_runs([])
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=0, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=0, updated=0, unchanged=0, rejections=[]),
         )
 
 
@@ -1332,7 +1336,7 @@ class TestLargeBatch(StorageTestBase):
         elapsed = time.monotonic() - started
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=5000, updated=0, unchanged=0)
+            storage.UpsertCounts(inserted=5000, updated=0, unchanged=0, rejections=[])
         )
         self.assertLess(
             elapsed,
@@ -3493,7 +3497,7 @@ class ReimportSkipTest(StorageTestBase):
             [make_record(output="the parser found more log\n")])
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=0, updated=1, unchanged=0),
+            storage.UpsertCounts(inserted=0, updated=1, unchanged=0, rejections=[]),
         )
         run = self.store.latest_run("linux-sim", "suite.py", "test_a")
         assert run is not None
@@ -3533,11 +3537,443 @@ class ReimportSkipTest(StorageTestBase):
             "an unchanged re-import cleared a human's retirement")
 
     def test_a_changed_reimport_still_unretires(self) -> None:
-        """Pinned so the skip is the ONLY thing the last test proves."""
+        """Pinned so the skip is the ONLY thing the last test proves.
+
+        WIDENED for WP-21 (docs/STREAMS_PLAN.md §3.4): un-retirement is
+        mainline-only, so this now also pins the branch case in the same
+        test — a branch run reporting against a mainline-retired test
+        must NOT clear the retirement, because the branch run may predate
+        the decision to retire it. Never weakened: the original mainline
+        assertion is untouched below.
+        """
         self.store.upsert_runs([make_record()])
         self.store.set_retired(
             "linux-sim", "suite.py", "test_a", True, "amy",
             "left the suite", BASE)
+        self.store.upsert_runs([
+            make_record(
+                result=Result.FAIL, branch="feat/x",
+                start=BASE + datetime.timedelta(hours=1),
+            )
+        ])
+        self.assertTrue(
+            self.store.is_retired("linux-sim", "suite.py", "test_a"),
+            "a branch import must never un-retire a mainline test")
         self.store.upsert_runs([make_record(result=Result.FAIL)])
         self.assertFalse(
             self.store.is_retired("linux-sim", "suite.py", "test_a"))
+
+
+class TestStreams(StorageTestBase):
+    """WP-21: stream find-or-create, upsert scoping, migration 9 basics."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+
+    def test_mainline_row_is_seeded_by_migration(self) -> None:
+        stream = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        assert stream is not None
+        self.assertEqual((stream.product, stream.kind, stream.name),
+                          ("", "mainline", ""))
+
+    def test_mainline_records_default_to_stream_one(self) -> None:
+        self.store.upsert_runs([make_record()])
+        row = self.store._conn().execute(
+            "SELECT stream_id FROM runs").fetchone()
+        self.assertEqual(row[0], storage.MAINLINE_STREAM_ID)
+
+    def test_a_branch_record_creates_a_stream(self) -> None:
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        streams = self.store.list_streams("Atlas")
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(
+            (streams[0].kind, streams[0].name), ("branch", "feat/x"))
+
+    def test_a_build_record_creates_a_stream_of_kind_build(self) -> None:
+        self.store.upsert_runs([make_record(build="2026.9.1")])
+        streams = self.store.list_streams("Atlas")
+        self.assertEqual(
+            (streams[0].kind, streams[0].name), ("build", "2026.9.1"))
+
+    def test_reimporting_the_same_branch_reuses_the_stream(self) -> None:
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        self.store.upsert_runs([make_record(
+            test_name="test_b", branch="feat/x",
+            start=BASE + datetime.timedelta(hours=1))])
+        streams = self.store.list_streams("Atlas")
+        self.assertEqual(len(streams), 1, "a second push must not create "
+                          "a second stream for the same name")
+
+    def test_branch_and_build_with_the_same_name_are_distinct_streams(
+            self) -> None:
+        self.store.upsert_runs([make_record(branch="rc1")])
+        self.store.upsert_runs([make_record(
+            test_name="test_b", build="rc1",
+            start=BASE + datetime.timedelta(hours=1))])
+        streams = self.store.list_streams("Atlas")
+        self.assertEqual(len(streams), 2)
+        self.assertEqual(
+            sorted((s.kind, s.name) for s in streams),
+            [("branch", "rc1"), ("build", "rc1")])
+
+    def test_different_products_get_distinct_streams_of_the_same_name(
+            self) -> None:
+        self.store.set_environment_product(
+            "other-env", "Zephyr", "alice", CREATED)
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", branch="feat/x"),
+            make_record(environment="other-env", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        self.assertEqual(len(self.store.list_streams("Atlas")), 1)
+        self.assertEqual(len(self.store.list_streams("Zephyr")), 1)
+
+    def test_stream_product_is_fixed_at_creation(self) -> None:
+        """Re-declaring the environment's product later must not move
+        an already-created stream — resolved at creation, then fixed
+        (docs/STREAMS_PLAN.md §3.3)."""
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        stream = self.store.list_streams("Atlas")[0]
+        self.store.set_environment_product(
+            "linux-sim", "Renamed", "alice", CREATED)
+        still_there = self.store.get_stream(stream.stream_id)
+        assert still_there is not None
+        self.assertEqual(still_there.product, "Atlas")
+        self.assertEqual(self.store.list_streams("Renamed"), [])
+
+    def test_an_environment_with_no_declared_product_uses_empty_string(
+            self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="undeclared-env", branch="feat/x")])
+        streams = self.store.list_streams("")
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0].product, "")
+
+    def test_last_seen_widens_across_a_batch(self) -> None:
+        self.store.upsert_runs([
+            make_record(branch="feat/x", start=BASE),
+            make_record(test_name="test_b", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=3)),
+        ])
+        stream = self.store.list_streams("Atlas")[0]
+        self.assertEqual(stream.first_seen, BASE)
+        self.assertEqual(
+            stream.last_seen, BASE + datetime.timedelta(hours=3))
+
+    def test_last_seen_widens_on_a_later_push(self) -> None:
+        self.store.upsert_runs([make_record(branch="feat/x", start=BASE)])
+        first = self.store.list_streams("Atlas")[0]
+        later = BASE + datetime.timedelta(days=1)
+        self.store.upsert_runs([make_record(
+            test_name="test_b", branch="feat/x", start=later)])
+        second = self.store.list_streams("Atlas")[0]
+        self.assertEqual(second.stream_id, first.stream_id)
+        self.assertEqual(second.first_seen, BASE)
+        self.assertEqual(second.last_seen, later)
+
+
+class LegacyUniqueCollisionTest(StorageTestBase):
+    """docs/STREAMS_PLAN.md §3.2: the frozen v1 UNIQUE on ``runs``.
+
+    A branch run whose (environment, script, test_name, start_time) is
+    IDENTICAL to a run already stored on a DIFFERENT stream cannot be
+    stored (the table-level UNIQUE has no stream column). It must be
+    REJECTED, naming both streams, with the rest of the batch unaffected
+    — never a silent wrong-stream overwrite, never an aborted batch.
+    """
+
+    def test_a_same_instant_branch_run_is_rejected_not_overwritten(
+            self) -> None:
+        self.store.upsert_runs([make_record()])
+        counts = self.store.upsert_runs(
+            [make_record(branch="feat/x")])  # identical start_time
+        self.assertEqual(counts.inserted, 0)
+        self.assertEqual(len(counts.rejections), 1)
+        rejection = counts.rejections[0]
+        self.assertEqual(rejection.index, 0)
+        self.assertIn("mainline", rejection.message)
+        self.assertIn("branch:feat/x", rejection.message)
+        self.assertEqual(rejection.environment, "linux-sim")
+        self.assertEqual(rejection.test_name, "test_a")
+        # The original mainline row must be untouched.
+        row = self.store._conn().execute(
+            "SELECT stream_id FROM runs").fetchone()
+        self.assertEqual(row[0], storage.MAINLINE_STREAM_ID)
+
+    def test_the_rest_of_the_batch_still_imports(self) -> None:
+        """One bad record must never abort the batch (project-wide rule)."""
+        self.store.upsert_runs([make_record()])
+        counts = self.store.upsert_runs([
+            make_record(branch="feat/x"),          # collides, rejected
+            make_record(test_name="test_b", branch="feat/x"),  # fine
+        ])
+        self.assertEqual(len(counts.rejections), 1)
+        self.assertEqual(counts.inserted, 1)
+        streams = self.store.list_streams("")
+        # test_b's stream was created even though test_a's record in the
+        # same batch collided.
+        self.assertEqual(len(streams), 1)
+
+    def test_the_message_is_identical_regardless_of_which_side_is_mainline(
+            self) -> None:
+        """A collision between two NON-mainline streams also rejects and
+        names both — the rule is about the legacy key, not about
+        mainline specifically."""
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        counts = self.store.upsert_runs([make_record(branch="feat/y")])
+        self.assertEqual(len(counts.rejections), 1)
+        message = counts.rejections[0].message
+        self.assertIn("branch:feat/x", message)
+        self.assertIn("branch:feat/y", message)
+
+
+class DerivedTablePartitionIsolationTest(StorageTestBase):
+    """docs/STREAMS_PLAN.md §0.5/§3.1: activity_hours/script_hours are
+    mainline-only. A branch-only import must leave their row counts (and
+    contents) byte-identical — this is what keeps branch runs out of the
+    staleness cutoff, the trend and the Timeline without touching those
+    code paths at all."""
+
+    def _snapshot(self) -> "Tuple[List[Tuple[Any, ...]], List[Tuple[Any, ...]]]":
+        conn = self.store._conn()
+        activity = conn.execute(
+            "SELECT * FROM activity_hours ORDER BY 1, 2, 3").fetchall()
+        script = conn.execute(
+            "SELECT * FROM script_hours ORDER BY 1, 2, 3, 4").fetchall()
+        return activity, script
+
+    def test_a_branch_only_import_leaves_both_tables_unchanged(
+            self) -> None:
+        self.store.upsert_runs([make_record()])  # mainline seed
+        before_activity, before_script = self._snapshot()
+        self.store.upsert_runs([
+            make_record(test_name="test_b", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=2)),
+            make_record(test_name="test_c", branch="feat/x",
+                        result=Result.FAIL,
+                        start=BASE + datetime.timedelta(hours=3)),
+        ])
+        after_activity, after_script = self._snapshot()
+        self.assertEqual(before_activity, after_activity)
+        self.assertEqual(before_script, after_script)
+
+    def test_a_pure_branch_estate_has_empty_derived_tables(self) -> None:
+        """No mainline data at all: the tables stay at their seeded
+        (empty) state, not merely "unchanged from a snapshot"."""
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        conn = self.store._conn()
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM activity_hours")
+            .fetchone()[0], 0)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM script_hours")
+            .fetchone()[0], 0)
+
+
+class CompareStreamsTest(StorageTestBase):
+    """docs/STREAMS_PLAN.md §3.5: the five counts, and the paginated
+    per-category listing, of a stream-vs-mainline comparison."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        branch_start = BASE + datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.PASS),
+            make_record(test_name="test_b", result=Result.FAIL),
+            make_record(test_name="test_c", result=Result.PASS),
+            make_record(test_name="test_e", result=Result.FAIL),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        branch="feat/x", start=branch_start),
+            make_record(test_name="test_b", result=Result.PASS,
+                        branch="feat/x", start=branch_start),
+            make_record(test_name="test_d", result=Result.PASS,
+                        branch="feat/x", start=branch_start),
+            make_record(test_name="test_e", result=Result.FAIL,
+                        branch="feat/x", start=branch_start),
+        ])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_the_five_counts(self) -> None:
+        counts = self.store.compare_counts(self.stream_id)
+        self.assertEqual(counts, storage.CompareCounts(
+            new_failures=1,   # test_a: PASS on mainline, FAIL on branch
+            new_passes=1,     # test_b: FAIL on mainline, PASS on branch
+            both_failing=1,   # test_e: FAIL on both
+            new_tests=1,      # test_d: only on the branch
+            no_result=1,      # test_c: only on mainline
+        ))
+
+    def test_new_failures_direction(self) -> None:
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].test_name, "test_a")
+        self.assertEqual(rows[0].stream_result, Result.FAIL)
+        self.assertEqual(rows[0].baseline_result, Result.PASS)
+
+    def test_new_tests_direction_is_present_on_stream_absent_on_baseline(
+            self) -> None:
+        rows = self.store.compare_category(self.stream_id, "new_tests")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].test_name, "test_d")
+        self.assertEqual(rows[0].stream_result, Result.PASS)
+        self.assertIsNone(rows[0].baseline_result)
+
+    def test_no_result_direction_is_absent_on_stream_present_on_baseline(
+            self) -> None:
+        rows = self.store.compare_category(self.stream_id, "no_result")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].test_name, "test_c")
+        self.assertIsNone(rows[0].stream_result)
+        self.assertEqual(rows[0].baseline_result, Result.PASS)
+
+    def test_pagination_is_exact(self) -> None:
+        total = self.store.compare_category_count(
+            self.stream_id, "new_failures")
+        self.assertEqual(total, 1)
+        page = self.store.compare_category(
+            self.stream_id, "new_failures", limit=0, offset=0)
+        self.assertEqual(page, [])
+
+    def test_a_retired_test_is_excluded_from_every_category(self) -> None:
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "amy", "gone", BASE)
+        counts = self.store.compare_counts(self.stream_id)
+        self.assertEqual(counts.new_failures, 0)
+
+    def test_an_unknown_stream_raises_key_error(self) -> None:
+        with self.assertRaises(KeyError):
+            self.store.compare_counts(999999)
+
+    def test_an_unknown_category_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.compare_category(self.stream_id, "not_a_category")
+
+    def test_comparison_is_scoped_to_the_streams_own_product(self) -> None:
+        """An environment of a DIFFERENT product must never show up as a
+        spurious no_result/new_tests row."""
+        self.store.set_environment_product(
+            "other-product-env", "Zephyr", "alice", CREATED)
+        self.store.upsert_runs([make_record(
+            environment="other-product-env", test_name="unrelated")])
+        counts = self.store.compare_counts(self.stream_id)
+        self.assertEqual(counts, storage.CompareCounts(
+            new_failures=1, new_passes=1, both_failing=1, new_tests=1,
+            no_result=1,
+        ))
+
+
+class DropStreamTest(StorageTestBase):
+    """count_stream_rows / delete_stream — the storage half of
+    tools/drop_stream.py."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_refuses_to_delete_mainline(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.delete_stream(storage.MAINLINE_STREAM_ID)
+
+    def test_count_matches_delete(self) -> None:
+        counts = self.store.count_stream_rows(self.stream_id)
+        deleted = self.store.delete_stream(self.stream_id)
+        self.assertEqual(counts["runs"], deleted["runs"])
+        self.assertEqual(counts["latest_runs"], deleted["latest_runs"])
+        self.assertEqual(counts["run_outputs"], deleted["run_outputs"])
+
+    def test_deletes_runs_outputs_and_the_latest_runs_partition(
+            self) -> None:
+        self.store.delete_stream(self.stream_id)
+        conn = self.store._conn()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE stream_id = ?",
+            (self.stream_id,)).fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM latest_runs WHERE stream_id = ?",
+            (self.stream_id,)).fetchone()[0], 0)
+        self.assertIsNone(self.store.get_stream(self.stream_id))
+        # Mainline is untouched.
+        self.assertIsNotNone(
+            self.store.latest_run("linux-sim", "suite.py", "test_a"))
+
+    def test_a_comment_posted_from_the_stream_survives_with_its_tag_cleared(
+            self) -> None:
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_b", "amy", "looks fine", BASE,
+            stream_id=self.stream_id)
+        self.store.delete_stream(self.stream_id)
+        comments = self.store.comments("linux-sim", "suite.py", "test_b")
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].text, "looks fine")
+        self.assertIsNone(comments[0].stream_id)
+
+
+class CommentStreamTagTest(StorageTestBase):
+    """comments.stream_id — "posted from" (docs/STREAMS_PLAN.md §1)."""
+
+    def test_defaults_to_none(self) -> None:
+        self.store.upsert_runs([make_record()])
+        comment = self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "hi", BASE)
+        self.assertIsNone(comment.stream_id)
+        [stored] = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertIsNone(stored.stream_id)
+
+    def test_round_trips_when_given(self) -> None:
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        stream_id = self.store.list_streams("")[0].stream_id
+        comment = self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "from ci", BASE,
+            stream_id=stream_id)
+        self.assertEqual(comment.stream_id, stream_id)
+        [stored] = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertEqual(stored.stream_id, stream_id)
+
+
+class DashboardStreamScopingTest(StorageTestBase):
+    """dashboard()/dashboard_count() default to mainline and can be
+    scoped to any stream — mainline must be provably unaffected by a
+    branch import (docs/STREAMS_PLAN.md §3.5)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([make_record()])
+        self.store.upsert_runs([make_record(
+            test_name="test_b", branch="feat/x",
+            start=BASE + datetime.timedelta(hours=1))])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_default_dashboard_is_mainline_only(self) -> None:
+        rows = self.store.dashboard()
+        self.assertEqual([r.test_name for r in rows], ["test_a"])
+        self.assertEqual(self.store.dashboard_count(), 1)
+
+    def test_scoped_dashboard_sees_only_that_stream(self) -> None:
+        rows = self.store.dashboard(stream_id=self.stream_id)
+        self.assertEqual([r.test_name for r in rows], ["test_b"])
+        self.assertEqual(
+            self.store.dashboard_count(stream_id=self.stream_id), 1)
+
+    def test_a_branch_import_does_not_change_the_mainline_count(
+            self) -> None:
+        before = self.store.dashboard_count()
+        self.store.upsert_runs([make_record(
+            test_name="test_c", branch="feat/x",
+            start=BASE + datetime.timedelta(hours=2))])
+        after = self.store.dashboard_count()
+        self.assertEqual(before, after)

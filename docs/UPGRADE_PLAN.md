@@ -97,8 +97,9 @@ after a merge.
 | 6 | WP-17 | `activity_hours` table, `runs.output_fingerprint` | Yes — see §1.2 |
 | 7 | WP-18 | `script_hours` table *(took 7 from WP-15 — see below)* | Yes — see §1.2 |
 | 8 | WP-20 | `environment_products` table *(took 8 from WP-15 — see below)* | No |
-| 9 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8 — see below)* | No |
-| 10+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 9 | WP-21 | `streams` table, `runs.stream_id`, `comments.stream_id`, `latest_runs` rebuilt with `stream_id` *(took 9 from WP-15 — see below)* | Yes — see §1.2 (`latest_runs` rebuild; ~12k rows) |
+| 10 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8, then 9 — see below)* | No |
+| 11+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Why 6 and 7 swapped (2026-07-30).** Versions must ship contiguously —
 `tests/test_migrations.py` enforces it, and a database at version 7 with no 6
@@ -122,10 +123,18 @@ history of the swap reads in order.)
 **And why 8 and 9 swapped too (2026-08-08).** The same situation a third
 time: WP-20 (products, drop 1 of `docs/STREAMS_PLAN.md`) shipped while
 `wp-14-in-run-progress` was still parked, so the ship-first package took the
-next contiguous number (8) and the parked claim moved back one (9). The
-hand-off updates accordingly — this is the CURRENT instruction: **when the
-WIP branch comes back it must renumber its migration entry to 9 before
-merging.**
+next contiguous number (8) and the parked claim moved back one (9). (This
+note originally said the WIP branch must renumber its migration entry to 9
+before merging — **superseded by the next note**, which moved that target
+to 10. Left here rather than deleted so the history of the swap reads in
+order.)
+
+**And why 9 and 10 swapped too (2026-08-08).** The same situation a fourth
+time, same day: WP-21 (streams, drop 2 of `docs/STREAMS_PLAN.md`) shipped
+while `wp-14-in-run-progress` was still parked, so the ship-first package
+took the next contiguous number (9) and the parked claim moved back one
+(10). This is the CURRENT instruction: **when the WIP branch comes back it
+must renumber its migration entry to 10 before merging.**
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry

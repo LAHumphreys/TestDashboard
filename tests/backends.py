@@ -29,8 +29,8 @@ Python 3.6 compatible; standard library plus the vendored driver.
 import os
 from typing import Any, List, Optional
 
-from testboard import dbconfig
-from testboard.storage import MIGRATIONS, Storage
+from testboard import dbconfig, model
+from testboard.storage import MAINLINE_STREAM_ID, MIGRATIONS, Storage
 
 MARIADB_CNF = os.environ.get("TESTBOARD_TEST_DB_CNF", "")
 MARIADB_AVAILABLE = bool(MARIADB_CNF)
@@ -104,17 +104,32 @@ def ensure_schema() -> None:
 
 
 def reset_database() -> None:
-    """Empty every table and restore the schema_version row.
+    """Empty every table and restore the schema_version and mainline-
+    stream rows.
 
     TRUNCATE rather than DELETE: it also resets AUTO_INCREMENT, so the
     id-stability tests see the same fresh-database numbering a new
     SQLite file gives them.
+
+    ``streams`` row 1 (WP-21, migration 9): on SQLite this is seeded by
+    a migration Python step, but this backend never runs migrations —
+    its schema comes straight from ``exporter.ddl()`` (no data) — so
+    the harness seeds it here, the same way it already seeds
+    ``schema_version``. In production the row exists because the
+    SQLite source database was migrated (and therefore seeded) BEFORE
+    export; this harness has no source database to export from.
     """
     ensure_schema()
     for table in _TABLES:
         _run("TRUNCATE TABLE `{0}`".format(table))
     _run("INSERT INTO schema_version (version) VALUES ({0})".format(
         MIGRATIONS[-1][0]))
+    now = model.format_iso(model.utcnow())
+    _run(
+        "INSERT INTO streams (id, product, kind, name, first_seen, "
+        "last_seen) VALUES ({0}, '', 'mainline', '', '{1}', "
+        "'{1}')".format(MAINLINE_STREAM_ID, now)
+    )
 
 
 def mariadb_storage(max_connections: Optional[int] = None) -> Storage:

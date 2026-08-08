@@ -315,6 +315,65 @@ class ApplicationTest(TempDirTest):
         self.assertEqual(version_of(path), MIGRATIONS[-1][0])
 
 
+class Migration9IndexesTest(TempDirTest):
+    """The ``latest_runs`` rebuild (migration 9, WP-21) must carry every
+    index migrations 1 and 4 built, not just the new ones.
+
+    ``test_stepwise_and_fresh_schemas_are_identical`` (above) already
+    proves the two construction paths agree with each other, but it
+    would agree just as happily if migration 9 silently DROPPED an
+    index on both paths — both would be equally, identically wrong, and
+    that is exactly what would quietly undo migration 4's measured
+    177ms -> 2.6ms win (docs/STREAMS_PLAN.md §3.1). This test pins the
+    index NAMES directly instead.
+    """
+
+    #: The index set on ``latest_runs`` before migration 9 (one from
+    #: entry 1, two from entry 4 — ``idx_latest_runs_result`` covers the
+    #: "failures only" default order via its own PRIMARY KEY prefix and
+    #: needs no partner).
+    _PRE_9 = frozenset((
+        "idx_latest_runs_result",
+        "idx_latest_runs_start_time",
+        "idx_latest_runs_start_sort",
+        "idx_latest_runs_duration_sort",
+    ))
+
+    def _index_names(self, path: str) -> "frozenset":
+        conn = sqlite3.connect(path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'latest_runs' "
+                "AND name NOT LIKE 'sqlite_autoindex_%'"
+            ).fetchall()
+        finally:
+            conn.close()
+        return frozenset(row[0] for row in rows)
+
+    def test_pre_9_indexes_all_survive_the_rebuild(self) -> None:
+        path = self.path("post9.db")
+        storage = Storage(path)
+        self.addCleanup(storage.close)
+        after = self._index_names(path)
+        missing = self._PRE_9 - after
+        self.assertEqual(
+            missing, frozenset(),
+            "the latest_runs rebuild dropped an index that existed "
+            "before migration 9: {0}".format(sorted(missing)))
+
+    def test_exactly_one_new_index_was_added(self) -> None:
+        path = self.path("post9_new.db")
+        storage = Storage(path)
+        self.addCleanup(storage.close)
+        after = self._index_names(path)
+        added = after - self._PRE_9
+        self.assertEqual(
+            added, frozenset(("idx_latest_runs_triple",)),
+            "expected exactly one new index (idx_latest_runs_triple), "
+            "got {0}".format(sorted(added)))
+
+
 class DataSurvivesTest(TempDirTest):
     """Migrations run against databases that already hold data.
 
