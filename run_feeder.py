@@ -23,6 +23,8 @@ SyntaxError. Do not add f-strings or inline annotations to this file.
 import argparse
 import datetime
 import logging
+import os
+import re
 import sys
 import traceback
 
@@ -248,6 +250,64 @@ def compute_since(mode, hwm, since_arg, overlap_days):
     if hwm is None:
         return None
     return hwm - datetime.timedelta(days=overlap_days)
+
+
+def stream_state_path(base_path, branch, build):
+    # type: (str, Optional[str], Optional[str]) -> str
+    """The high-water-mark file for one invocation (WP-21, docs/STREAMS_PLAN.md
+    section 3.7).
+
+    Mainline (neither --branch nor --build given) uses ``base_path``
+    unchanged - every existing deployment keeps its current state file.
+    A --branch/--build invocation gets its OWN file, derived from
+    ``base_path``: without this, a branch catchup run would read and
+    advance the SAME high-water mark as the mainline nightly, either
+    fast-forwarding mainline past runs it has never actually seen or
+    making the branch skip runs mainline already claimed.
+
+    Naming: ``<base>.<kind>.<sanitized-name><ext>``, e.g.
+    ``feeder_state.json`` + ``--branch feature/foo`` becomes
+    ``feeder_state.branch.feature-foo.json``. The name is sanitized to
+    filesystem-safe characters (``[A-Za-z0-9_.-]``, everything else
+    collapsed to ``-``) because branch names commonly contain ``/``.
+    """
+    if branch is None and build is None:
+        return base_path
+    kind = "branch" if branch is not None else "build"
+    name = branch if branch is not None else build
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-") or "unnamed"
+    root, ext = os.path.splitext(base_path)
+    return "{0}.{1}.{2}{3}".format(root, kind, safe, ext or ".json")
+
+
+def stamped(records, branch, build):
+    # type: (Any, Optional[str], Optional[str]) -> Any
+    """Wrap a raw-record stream, stamping ``branch``/``build`` onto each one.
+
+    WP-21: the reader is site-specific and knows nothing about CLI
+    flags, so the stamp is applied here, between the reader and the
+    submitter, on the raw dict (before ``model.parse_run_record`` ever
+    sees it) — the same "wrap the stream" shape as :func:`limited`.
+    Records that are not dicts pass through untouched; validation
+    (which will reject them anyway) is the submitter's job, not this
+    function's.
+    """
+    if branch is None and build is None:
+        return records
+    return _stamp(records, branch, build)
+
+
+def _stamp(records, branch, build):
+    # type: (Any, Optional[str], Optional[str]) -> Any
+    """Generator behind stamped(); see there."""
+    for raw in records:
+        if isinstance(raw, dict):
+            raw = dict(raw)
+            if branch is not None:
+                raw["branch"] = branch
+            else:
+                raw["build"] = build
+        yield raw
 
 
 def feeder_version():
@@ -516,6 +576,25 @@ def build_parser():
               "large estate is brought in one manageable chunk at a time. "
               "Ignored in catchup mode"))
     parser.add_argument(
+        "--branch", default=None, metavar="NAME",
+        help=("stamp every record of this run as belonging to branch "
+              "stream NAME instead of mainline (WP-21). Mutually "
+              "exclusive with --build. REQUIRES the dashboard server to "
+              "understand streams_seen in its /api/import response - an "
+              "older server's silence is treated as a fatal error, "
+              "before any high-water mark is saved, because it means "
+              "these runs would otherwise land silently in mainline. "
+              "Also keys a SEPARATE high-water-mark state file, so a "
+              "branch catchup run never shares mainline's progress "
+              "(see --state-file)"))
+    parser.add_argument(
+        "--build", default=None, metavar="NAME",
+        help=("stamp every record of this run as belonging to build "
+              "stream NAME instead of mainline (WP-21) - for RC/release "
+              "builds, re-cut under the same name. Mutually exclusive "
+              "with --branch; see it for the streams_seen requirement "
+              "and the per-stream state file"))
+    parser.add_argument(
         "--limit", type=int, default=None, metavar="N",
         help=("stop after reading N records. For sizing up a reader "
               "against a large source without waiting for all of it; use "
@@ -549,7 +628,10 @@ def build_parser():
         help=("daily-mode high-water-mark file; must be writable by "
               "whoever runs the feeder, so do not leave it inside a "
               "read-only checkout (default: %(default)s, i.e. in the "
-              "current directory)"))
+              "current directory). With --branch/--build, this is the "
+              "BASE path: the actual file used is derived from it (e.g. "
+              "feeder_state.branch.feat-x.json), so a branch/build "
+              "invocation never shares mainline's high-water mark"))
     parser.add_argument(
         "--replay-dir", default=".", metavar="DIR",
         help=("directory for testboard_failed_batch_NNNN.json replay "
@@ -660,6 +742,35 @@ def main(argv=None):
     if args.config is not None:
         log.info("read settings from %s: %s", args.config,
                  ", ".join(sorted(config_settings)) or "(nothing set)")
+
+    # --branch/--build: mutually exclusive, non-empty after stripping
+    # (mirrors the server's own validation, WP-21 docs/STREAMS_PLAN.md
+    # section 3.7). Validated and normalized BEFORE anything below reads
+    # args.branch/args.build or args.state_file, so every later use -
+    # forget-state, status, preflight, the state file itself - sees the
+    # same, already-checked values.
+    if args.branch is not None and args.build is not None:
+        log.error(
+            "--branch and --build are mutually exclusive: a run belongs "
+            "to at most one stream")
+        return 2
+    if args.branch is not None:
+        args.branch = args.branch.strip() or None
+        if args.branch is None:
+            log.error("--branch must not be empty or whitespace-only")
+            return 2
+    if args.build is not None:
+        args.build = args.build.strip() or None
+        if args.build is None:
+            log.error("--build must not be empty or whitespace-only")
+            return 2
+    # The effective state file for THIS invocation - unchanged for a
+    # mainline run, derived (and therefore distinct from mainline's) for
+    # a --branch/--build one. Every later use of args.state_file already
+    # gets this via the mutated namespace: forget_state(), --status,
+    # run_preflight()'s writability check, and the hwm load/save below.
+    args.state_file = stream_state_path(
+        args.state_file, args.branch, args.build)
 
     # --url/--mode are required for a real import but meaningless when
     # only checking a reader, so they are validated here rather than by
@@ -779,6 +890,19 @@ def main(argv=None):
         if not run_preflight(args, log, feeder.preflight):
             return 2
 
+    if args.branch is not None:
+        log.info(
+            "stream: branch %r (state file %s) - the server's "
+            "/api/import response MUST acknowledge this in "
+            "streams_seen, or the run aborts before saving a "
+            "high-water mark", args.branch, args.state_file)
+    elif args.build is not None:
+        log.info(
+            "stream: build %r (state file %s) - the server's "
+            "/api/import response MUST acknowledge this in "
+            "streams_seen, or the run aborts before saving a "
+            "high-water mark", args.build, args.state_file)
+
     hwm = None  # type: Optional[datetime.datetime]
     if args.mode != BACKFILL:
         hwm = feeder.state.load_high_water_mark(args.state_file)
@@ -789,15 +913,27 @@ def main(argv=None):
     submitter = feeder.submitter.Submitter(
         args.url, batch_size=args.batch_size, replay_dir=args.replay_dir,
         max_consecutive_failures=args.max_consecutive_failures,
-        max_batch_bytes=args.max_batch_bytes)
+        max_batch_bytes=args.max_batch_bytes,
+        branch=args.branch, build=args.build)
     try:
         stats = submitter.submit(
-            limited(feeder.reader.iter_records(reader, since, until),
-                    args.limit, log),
+            limited(
+                stamped(
+                    feeder.reader.iter_records(reader, since, until),
+                    args.branch, args.build),
+                args.limit, log),
             dry_run=args.dry_run, since=since, until=until,
             show=args.show_records)
     except feeder.reader.ReaderFailed as exc:
         report_reader_failure(exc, log)
+        return 1
+    except feeder.submitter.StreamsAckMissing as exc:
+        # A distinct, non-retryable class of failure: the SERVER does
+        # not speak WP-21, not a transient network/data problem. No
+        # high-water mark is saved (we return before that code runs) -
+        # a normal --branch/--build re-run against a fixed server picks
+        # up from wherever the state file already was.
+        log.error("%s", exc)
         return 1
     except Exception as exc:
         log.error(

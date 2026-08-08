@@ -124,14 +124,22 @@ Validation rules per record:
 - `output`: required key, must be a string (may be `""`).
 - `source_link`: optional string, defaults to `""`.
 - `known_failure_reason`: optional, string or null, defaults to null.
+- `branch` / `build` (added WP-21): optional, string or null, mutually exclusive.
+  Present and non-empty (after stripping) means this run belongs to a STREAM beside
+  the mainline nightlies — a branch's CI results or a release build's, kept off
+  mainline's trend, triage and staleness entirely (see "Streams" below). Absent
+  (both null, or absent) means mainline, exactly what every feeder sent before this
+  field existed — back compat is free. A record naming both is rejected
+  (`"branch/build: mutually exclusive"`); one bad record never aborts the batch.
 - Unknown extra keys are ignored (forward compatibility).
 
 **Idempotency:** a run is uniquely keyed by
-`(environment, script, test_name, start_time)`. Re-importing the same run updates it
-in place — re-running an import is always safe and never duplicates data. A record
-that is **byte-identical** to what is stored (all fields, output included) writes
-nothing at all: feeders that re-push their whole recent window on a schedule cost
-the server nothing but reads.
+`(environment, script, test_name, start_time)` **on its stream** — see "Streams"
+below for the one edge case where the underlying table-level key (without the
+stream) collides. Re-importing the same run updates it in place — re-running an
+import is always safe and never duplicates data. A record that is **byte-identical**
+to what is stored (all fields, output included) writes nothing at all: feeders that
+re-push their whole recent window on a schedule cost the server nothing but reads.
 
 Response — `200` even when some records are rejected; one bad record never aborts the
 batch (valid records are still upserted):
@@ -151,7 +159,8 @@ batch (valid records are still upserted):
       "test_name": "test_bar",
       "start_time": "2026-07-25T02:14:07.123456"
     }
-  ]
+  ],
+  "streams_seen": ["branch:feature/checkout-v2"]
 }
 ```
 
@@ -166,6 +175,56 @@ byte-identical ones — its meaning on the wire has not changed, so a feeder sum
 (added 2026-07-31) refines it: the subset that required no write. A push whose
 records are all `unchanged` is the healthy steady state for a scheduled re-push,
 not a stall.
+
+`streams_seen` (added WP-21): the sorted `"{kind}:{name}"` of every non-mainline
+stream this batch NAMED (whether or not every individual record on it was stored —
+see the collision case below), `[]` for a batch with no `branch`/`build` records.
+**This is the key a `--branch`/`--build` feeder invocation checks for.** Every
+server before WP-21 ignores unknown JSON keys, so it would accept a `branch`/
+`build`-carrying batch and silently file the runs into mainline; a response with
+this key **absent entirely** (not present-and-empty) is the only signal that
+distinguishes that from a real WP-21 server answering a mainline-only batch, and
+the feeder treats it as fatal — see "Feeding in your own results" below.
+
+#### Streams (branch and build runs beside mainline)
+
+Added WP-21 (`docs/STREAMS_PLAN.md`). A record carrying `branch`/`build` is
+attributed to a STREAM — `(product, kind, name)`, where `product` is resolved
+from the record's `environment` (via the declared environment→product mapping,
+WP-20) **at the moment the stream is first seen**, then fixed for that stream's
+lifetime even if the mapping changes later. There is no registry to maintain: the
+first record naming a stream creates it, inside the same transaction as the
+import, the same way an unrecognised `environment` has always worked.
+
+**Mainline is provably unaffected.** `activity_hours`/`script_hours` (the trend,
+the staleness cutoff) are maintained only for mainline; a stream's un-retirement
+never fires (a branch run reporting against a mainline-retired test does not
+un-retire it — the branch may predate the decision); `/api/summary`, `/api/time`
+and the Timeline read mainline only, unconditionally, in this drop.
+
+**The one collision case.** Run identity is `(stream, environment, script,
+test_name, start_time)`, but the underlying `runs` table's UNIQUE constraint
+predates streams and is frozen at `(environment, script, test_name, start_time)`
+alone — no stream column. If a record's exact key is already claimed by a
+**different** stream (in practice: a branch run microsecond-identical to a
+mainline run of the same test — vanishingly unlikely, but the constraint makes it
+impossible to store either way), that record is **rejected**, not silently
+overwritten and not silently misfiled onto the other stream: it appears in
+`errors[]` naming both streams (e.g. `"...already recorded on stream 'mainline';
+this record targets stream 'branch:feature/x'..."`), and the rest of the batch is
+unaffected.
+
+`GET /api/streams?product=<name>` lists a product's non-mainline streams (id,
+kind, name, first_seen, last_seen, a current failing count) — `product` defaults
+to `""`, the implicit grouping for environments with no declared product; an
+unknown product is an empty list, never 404. `GET /api/compare?stream=<id>` (with
+an optional `category=` for one paginated slice, `limit`/`offset`) returns the
+five-way classification of that stream's tests against mainline
+(`new_failures`/`new_passes`/`both_failing`/`new_tests`/`no_result`) plus both
+sides' identity and `last_seen`; `baseline=` may currently only be the mainline
+stream's id (comparing against any other stream arrives in WP-22).
+`GET /api/dashboard`, test detail and test history all accept an optional
+`stream=<id>` (default: mainline).
 
 ### GET /api/dashboard — latest run per test (paginated)
 
@@ -319,19 +378,29 @@ Definitions (matching the analytics semantics above):
 
 ### GET /api/watch — the Watchlist page's data, one request per page load
 
-`?c=` is repeated, one per card, in request order: `c=p:<product>` or
-`c=e:<environment>`. Each comes back as `{spec, kind, name, ok, failing,
-new_failures, fixed, unexpected_passes, stale_before, last_reported}`
-(product cards carry `last_reported: null` — there is no single truthful
-"last reported" for a card spanning several environments) or, for a name
-that resolves to nothing, `{spec, kind, name, ok: false, error}`. The page
-still answers 200 around a mix of good and bad cards.
+`?c=` is repeated, one per card, in request order: `c=p:<product>`,
+`c=e:<environment>` or `c=s:<stream id>` (added WP-21). `p`/`e` cards come
+back as `{spec, kind, name, ok, failing, new_failures, fixed,
+unexpected_passes, stale_before, last_reported}` (product cards carry
+`last_reported: null` — there is no single truthful "last reported" for a
+card spanning several environments). `s` cards come back as `{spec,
+kind: "stream", name, ok, id, stream_kind, product, new_failures,
+new_passes, both_failing, new_tests, no_result, last_seen,
+baseline_last_seen}` — the same five-way classification as
+`GET /api/compare` for that stream against mainline, plus both sides'
+freshness so the card can show its own staleness warning. A name/id that
+resolves to nothing (including `s:1`, the mainline stream — it is never a
+Watchlist entry, the same rule `GET /api/streams` applies) is instead
+`{spec, kind, name, ok: false, error}`. The page still answers 200 around
+a mix of good and bad cards.
 
 **Cards per request are capped at 50.** A request naming more answers 413
 with the count and the limit in the message; a URL that long is treated as
-a mistake, not a use case. `c=s:...` (stream cards) 400s the WHOLE request
-with a "streams arrive in a later drop" message — that kind is reserved by
-the URL grammar so it never has to change, but nothing behind it exists yet.
+a mistake, not a use case. Every card kind, including `s:`, answers in O(1)
+queries regardless of how many cards of that kind are requested — one
+extra query total resolves every `s:` card's identity, and one more its
+compare counts, batched (`Storage.stream_identities`,
+`Storage.compare_counts_many`), the same shape `p:`/`e:` cards already used.
 
 ### GET /api/scripts/{environment}/{script}/executions — suite history
 
@@ -631,6 +700,41 @@ python run_feeder.py --url http://127.0.0.1:8000 --mode catchup \
     --reader jsonl --source 'results/*.jsonl' \
     --state-file /var/lib/testboard/feeder_state.json
 ```
+
+### Feeding a branch or build (WP-21)
+
+`--branch NAME` / `--build NAME` (mutually exclusive) stamp every record of
+the run as belonging to that stream instead of mainline — see "Streams" above
+for what that means server-side. Local validation mirrors the server's
+(non-empty after stripping, not both at once).
+
+```
+python run_feeder.py --url http://127.0.0.1:8000 --mode catchup \
+    --reader jsonl --source 'ci-results/*.jsonl' \
+    --branch feature/checkout-v2 \
+    --state-file /var/lib/testboard/feeder_state.json
+```
+
+Two things are different from a mainline run, both there to stop a branch
+invocation from ever silently landing in mainline or clobbering mainline's
+own progress:
+
+- **The response is checked for the `streams_seen` acknowledgment.** A
+  server that predates WP-21 ignores the unknown `branch`/`build` keys and
+  would file the runs into mainline without complaint — its response also
+  lacks `streams_seen` entirely, which is the only signal that tells a new
+  feeder it is talking to an old server. When that happens the run aborts
+  (exit 1) **before** saving a high-water mark, with a message naming the
+  batch and the server. This can only be caught at runtime, not by
+  `--check-reader` — it needs a real response from the real server.
+- **The high-water-mark file is a DIFFERENT path**, derived from
+  `--state-file`: `feeder_state.json` becomes
+  `feeder_state.branch.feature-checkout-v2.json` (branch names are
+  sanitized to filesystem-safe characters — they commonly contain `/`).
+  Without this, a branch's catchup run would read and advance the *same*
+  mark as the mainline nightly, fast-forwarding one past runs it has never
+  actually seen. `--status` and `--forget-state` resolve the same derived
+  path when given the same `--branch`/`--build`.
 
 ### Importing a long history a slice at a time
 
