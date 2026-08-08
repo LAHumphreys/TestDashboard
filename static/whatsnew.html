@@ -38,8 +38,36 @@
     <section class="release" data-drop-date="2026-08-14">
       <div class="section-head">
         <h2 class="eyebrow">14 August 2026</h2>
-        <span class="muted">New: the Watch page — build your own morning view</span>
+        <span class="muted">New: branches and builds beside mainline, plus the Watch page</span>
       </div>
+
+      <h3>New: branches and builds, compared to mainline</h3>
+      <ul>
+        <li><strong>A CI branch or a one-off build can now show up beside
+          your nightly results</strong>, without touching them — mainline
+          stays exactly what it always was, and nothing about this is
+          visible until your team actually feeds in a branch or a build.
+          Once one exists, a <strong>Build</strong> picker appears next to
+          the Environment filter on the dashboard; pick one to see it
+          compared against mainline.</li>
+        <li>The comparison page shows what's new: failing, passing, still
+          failing on both, brand-new tests, and tests with no result on one
+          side — each a tab with its own table, plus how many tests
+          <em>agree</em> and are not worth listing, and how much of the
+          estate has a result on this branch at all. Both sides' "last ran"
+          times are shown, and a warning appears if mainline itself hasn't
+          run recently enough to trust the comparison.</li>
+        <li>Open a test from a branch's table and its page now shows
+          mainline's result right beside the branch's, and any comment on
+          that test says which build or branch it was posted from.</li>
+        <li>The Watchlist (below) can carry a branch/build card too — add
+          one from the "Branch/build" option in the card picker to keep an
+          eye on a branch's health alongside your usual environments and
+          products.</li>
+        <li>If your site's feeder script submits branch or build results,
+          see the README's "Feeding a branch or build" section for the new
+          <code>--branch</code>/<code>--build</code> flags.</li>
+      </ul>
 
       <h3>New page: Watch</h3>
       <ul>
