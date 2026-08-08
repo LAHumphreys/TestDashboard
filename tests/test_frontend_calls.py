@@ -655,6 +655,7 @@ class PlantedWindowRegressionTest(unittest.TestCase):
 #: watch.js (and, in a later drop, other pages) calls its exports.
 _SHARED_MODULES = (
     "api.js", "charts.js", "sorting.js", "review.js", "products.js",
+    "compare.js",
 )
 
 
@@ -1061,6 +1062,199 @@ class ProductSwitcherHostManagedTest(unittest.TestCase):
             self.assertNotIn("}", guarded,
                 js + " calls renderSwitcher() outside the nearest "
                 "preceding if-guard")
+
+
+class StreamPickerTest(unittest.TestCase):
+    """streams.js (WP-21, docs/STREAMS_PLAN.md §3.6): the Build picker.
+
+    Mirrors ProductSwitcherTest's shape for the analogous WP-20 control —
+    same "assert against the source" method, same reasons (no JS runtime
+    here, see this file's module docstring).
+    """
+
+    def test_the_picker_hides_with_no_streams(self) -> None:
+        body = _function_body(read("streams.js"), "export function renderPicker(")
+        self.assertIn("streams.length === 0", body)
+        self.assertIn("container.hidden = true", body)
+
+    def test_selection_lives_in_the_url_not_local_storage(self) -> None:
+        """Unlike the product switcher, a branch is something you are
+        looking AT, not a standing preference — docs/STREAMS_PLAN.md
+        §0.9's "the URL is the whole configuration" rule."""
+        code = _strip_comments(read("streams.js"))
+        self.assertNotIn("localStorage", code)
+        self.assertIn("searchParams", code)
+
+    def test_it_fails_quietly_like_products_js(self) -> None:
+        code = _strip_comments(read("streams.js"))
+        self.assertNotIn("showError", code)
+        self.assertIn("catch", code)
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", read("streams.js"))
+
+    def test_it_is_mounted_only_on_the_dashboard(self) -> None:
+        """This drop's Build picker lives in index.html's toolbar only —
+        docs/STREAMS_PLAN.md §3.6 says "Toolbar gains the Build picker",
+        not every page. A page carrying no #stream-picker mount is
+        simply never touched by streams.js's init()."""
+        self.assertIn('src="streams.js"', read_text("index.html"))
+        self.assertIn('id="stream-picker"', read_text("index.html"))
+        for name in ("actions.html", "time.html", "timeline.html",
+                     "watch.html", "test.html", "script.html",
+                     "whatsnew.html"):
+            self.assertNotIn(
+                'src="streams.js"', read_text(name),
+                name + " should not load streams.js in this drop")
+
+
+class DeltaViewTest(unittest.TestCase):
+    """compare.js (WP-21, docs/STREAMS_PLAN.md §3.6): the dashboard's
+    branch-vs-mainline delta view, and the mainline-zero-visible-change
+    rule it exists to preserve."""
+
+    def test_the_selected_stream_comes_only_from_the_url(self) -> None:
+        body = _function_body(
+            read("compare.js"), "export function getSelectedStreamId(")
+        self.assertIn("window.location.search", body)
+        self.assertNotIn("localStorage", body)
+
+    def test_a_mainline_page_load_never_reaches_the_delta_view(self) -> None:
+        """The whole feature's footprint on a mainline page has to be
+        ONE guarded call, not a code path that merely renders nothing —
+        a fetch that still fires and is then hidden is not zero visible
+        change, it is zero visible change AND a wasted request."""
+        body = _function_body(read("app.js"), "function init()")
+        self.assertIn("getSelectedStreamId()", body)
+        call_at = body.index("initDeltaView(")
+        # The nearest preceding "if" must guard the call, and that
+        # branch must return before falling into the mainline code below
+        # it (buildResultToggles/refreshAll and everything after them).
+        guard_at = body.rindex("if (", 0, call_at)
+        branch = body[guard_at:body.index("}", call_at)]
+        self.assertIn("return", branch)
+
+    def test_the_new_sections_ship_hidden(self) -> None:
+        """branch-band and delta-section must be hidden in the SHIPPED
+        markup, not merely hidden by JS after load — a page that never
+        runs any script (or runs a stale cached bundle) must still show
+        the ordinary mainline layout, not a flash of delta-view markup."""
+        html = read_text("index.html")
+        self.assertIn('id="branch-band" class="branch-band" hidden', html)
+        delta_at = html.index('id="delta-section"')
+        self.assertIn("hidden", html[delta_at:delta_at + 60])
+
+    def test_initDeltaView_hides_every_mainline_section(self) -> None:
+        code = _strip_comments(read("compare.js"))
+        self.assertIn("MAINLINE_SECTIONS", code)
+        list_at = code.index("MAINLINE_SECTIONS = [")
+        list_block = code[list_at:code.index("];", list_at)]
+        for section_id in ("status-section", "charts-section",
+                            "triage-section", "browse-section"):
+            self.assertIn(section_id, list_block)
+        body = _function_body(
+            read("compare.js"), "export async function initDeltaView(")
+        self.assertIn("MAINLINE_SECTIONS", body)
+
+    def test_agree_and_coverage_are_derived_never_hardcoded(self) -> None:
+        """The "N tests agree" and coverage lines both read counts.agree
+        and totalCompared() (itself a sum over live data) — never a
+        number that is not one of the six counts the API returned."""
+        code = _strip_comments(read("compare.js"))
+        self.assertIn("counts.agree", code)
+        self.assertIn("totalCompared(counts)", code)
+
+    def test_no_result_is_never_a_result_chip(self) -> None:
+        """The same defect ResultEmphasisTest pins for a transition,
+        extended to a comparison: an absent side must never render as
+        a coloured pass/fail/etc. chip."""
+        body = _function_body(read("compare.js"), "function noResultCell()")
+        self.assertNotIn("resultChip(", body)
+        self.assertNotIn("ghostChip(", body)
+        mainline_body = _function_body(
+            read("compare.js"), "export function mainlineCell(")
+        self.assertIn("noResultCell()", mainline_body)
+        stream_body = _function_body(
+            read("compare.js"), "export function streamCell(")
+        self.assertIn("noResultCell()", stream_body)
+
+    def test_mainline_is_ghost_and_this_branch_is_solid(self) -> None:
+        code = _strip_comments(read("compare.js"))
+        mainline_body = _function_body(
+            code, "export function mainlineCell(")
+        self.assertIn("ghostChip(result)", mainline_body)
+        stream_body = _function_body(code, "export function streamCell(")
+        self.assertIn("resultChip(result)", stream_body)
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", read("compare.js"))
+
+
+class CompareStripTest(unittest.TestCase):
+    """test.js's compare strip (WP-21 §3.6): mainline's result beside a
+    branch's, on the test-detail page, only when scoped."""
+
+    def test_the_strip_hides_when_unscoped(self) -> None:
+        body = _function_body(read("test.js"), "async function loadCompareStrip(")
+        self.assertIn("streamId === null", body)
+        self.assertIn("strip.hidden = true", body)
+
+    def test_it_calls_the_shared_renderer(self) -> None:
+        code = _strip_comments(read("test.js"))
+        self.assertIn("renderCompareStrip", _imported_names(read("test.js")))
+        self.assertIn("renderCompareStrip(", code)
+
+    def test_history_and_detail_carry_the_stream_param(self) -> None:
+        code = _strip_comments(read("test.js"))
+        self.assertIn("withStream(myPath())", code)
+        self.assertIn('withStream(myPath("/history")', code)
+
+
+class CommentStreamTagTest(unittest.TestCase):
+    """The "posted from" tag on each comment (WP-21 §3.6) — every
+    comment shows in full regardless of the page's current scope, tagged
+    with the stream it was posted from, batch-resolved by the server."""
+
+    def test_comment_node_takes_the_batch_resolved_streams_map(self) -> None:
+        body = _function_body(read("test.js"), "function commentNode(")
+        self.assertIn("streams[String(comment.stream_id)]", body)
+        self.assertIn("posted from", body)
+
+    def test_load_comments_passes_the_servers_streams_map_through(self) -> None:
+        body = _function_body(
+            read("test.js"), "async function loadComments()")
+        self.assertIn("data.streams", body)
+        self.assertIn("commentNode(comment, streams)", body)
+
+    def test_a_comment_posted_from_a_scoped_page_is_tagged(self) -> None:
+        """Posting while scoped to a branch sends stream_id, so the
+        thread records what was true when the note was written."""
+        body = _function_body(
+            read("test.js"), "async function onCommentSubmit(")
+        self.assertIn("body.stream_id = streamId", body)
+
+
+class WatchStreamCardTest(unittest.TestCase):
+    """watch.js's `s:` card (WP-21 §3.6): a branch/build verdict card on
+    the Watchlist."""
+
+    def test_stream_cards_use_the_shared_category_labels(self) -> None:
+        body = _function_body(read("watch.js"), "function buildStreamCard(")
+        self.assertIn("CATEGORY_ORDER", body)
+        self.assertIn("CATEGORY_LABELS", body)
+
+    def test_the_open_link_uses_the_stream_id_not_its_name(self) -> None:
+        """Two products can each have a "feat/x" branch — only the id is
+        unambiguous (docs/STREAMS_PLAN.md §3.6)."""
+        body = _function_body(read("watch.js"), "function cardLink(")
+        self.assertIn('params.set("stream", String(card.id))', body)
+
+    def test_the_add_picker_offers_a_branch_build_option(self) -> None:
+        self.assertIn('<option value="s">', read_text("watch.html"))
+
+    def test_stream_picker_entries_are_keyed_by_id(self) -> None:
+        body = _function_body(read("watch.js"), "async function populatePicker(")
+        self.assertIn("value: String(stream.id)", body)
 
 
 class ProductColumnTest(unittest.TestCase):

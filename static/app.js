@@ -61,6 +61,7 @@ import {
 } from "./review.js";
 import { attachSorting, sortRows } from "./sorting.js";
 import { getSelectedProduct, renderSwitcher } from "./products.js";
+import { getSelectedStreamId, initDeltaView } from "./compare.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
@@ -1384,9 +1385,23 @@ function scrollTo(sectionId) {
 
 function init() {
   // "My actions" is scoped server-side to the signed-in user, so a
-  // username change has to go back to the server for it.
+  // username change has to go back to the server for it. Rendered
+  // before the stream check below: the header is not a mainline-only
+  // concept, so a branch-scoped page keeps it too.
   renderUserWidget(document.getElementById("user-widget"),
     () => { if (state.summary) { refreshSummary(); } });
+
+  // WP-21 (docs/STREAMS_PLAN.md §3.6): a branch-scoped page load swaps
+  // the WHOLE dashboard body for the delta view and never reaches
+  // anything below this check — no /api/summary fetch, no queues, no
+  // browse table. That is what keeps every mainline page (this branch
+  // never taken) at zero visible change.
+  const streamId = getSelectedStreamId();
+  if (streamId !== null) {
+    initDeltaView(streamId);
+    return;
+  }
+
   buildResultToggles();
 
   const url = new URL(window.location.href);

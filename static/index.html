@@ -26,11 +26,24 @@
   <main class="wide">
     <div id="error-banner" class="error-banner" role="alert" hidden></div>
 
+    <!-- Only visible when this page was opened ?stream=<id> (WP-21,
+         docs/STREAMS_PLAN.md §3.6) -- absent from the DOM's visible state
+         on every mainline visit. -->
+    <div id="branch-band" class="branch-band" hidden>
+      <span id="branch-band-text"></span>
+      <a href="index.html">Back to mainline</a>
+    </div>
+
     <!-- The one filter row: scopes every section below it. -->
     <section class="toolbar" aria-label="Scope">
-      <label class="toolbar-field">Environment
+      <label id="env-filter-field" class="toolbar-field">Environment
         <select id="filter-environment" aria-label="Environment filter"></select>
       </label>
+      <!-- The Build picker (WP-21): hidden by streams.js itself unless
+           the current product has at least one branch/build stream --
+           the same "container.hidden = true" rule products.js follows
+           for a single-product deployment. -->
+      <span id="stream-picker" class="stream-picker" hidden></span>
       <span id="refreshed-at" class="muted toolbar-meta"></span>
       <button id="reload-btn" type="button">Refresh</button>
     </section>
@@ -163,10 +176,43 @@
         <button id="show-more" type="button" hidden>Show more</button>
       </div>
     </section>
+
+    <!-- ============ Branch/build delta view (WP-21) ============
+         Swaps in for every section above when this page is opened
+         ?stream=<id>; the sections above are hidden outright, not
+         merely emptied — docs/STREAMS_PLAN.md §3.6 calls this a swap,
+         not an addition. Hidden (and never fetched) on every mainline
+         visit, which is what keeps this feature invisible there. -->
+    <section id="delta-section" aria-labelledby="delta-heading" hidden>
+      <div class="section-head">
+        <h2 id="delta-heading" class="eyebrow">Compare to mainline</h2>
+      </div>
+      <div id="delta-tiles" class="tile-row"></div>
+      <p id="delta-agree" class="muted"></p>
+      <p id="delta-coverage" class="muted"></p>
+      <p id="delta-baseline" class="muted"></p>
+      <p id="delta-stale-warning" class="empty-state" hidden></p>
+      <div id="delta-tabs" class="tab-row" role="tablist" aria-label="Comparison categories"></div>
+      <div class="table-wrap">
+        <table class="data-table" id="delta-table">
+          <thead>
+            <tr>
+              <th>Test</th>
+              <th>Mainline</th>
+              <th>This branch</th>
+            </tr>
+          </thead>
+          <tbody id="delta-body"></tbody>
+        </table>
+      </div>
+      <p id="delta-empty" class="empty-state" hidden></p>
+      <button id="delta-show-more" type="button" hidden>Show more</button>
+    </section>
   </main>
 
   <script type="module" src="app.js"></script>
   <script type="module" src="products.js"></script>
+  <script type="module" src="streams.js"></script>
   <script type="module" src="nav.js"></script>
 </body>
 </html>

@@ -36,6 +36,11 @@
       <div id="latest-run" class="latest-run"></div>
       <!-- Why this failure is expected, when the import says so. -->
       <div id="known-failure" class="known-failure" hidden></div>
+      <!-- Only shown when this page was opened with ?stream=<id> (WP-21,
+           docs/STREAMS_PLAN.md §3.6): mainline's own result beside this
+           branch's, for the SAME test. Absent entirely on every mainline
+           visit — zero visible change there. -->
+      <p id="compare-strip" class="compare-strip" hidden></p>
     </section>
 
     <section id="analytics-section" hidden>

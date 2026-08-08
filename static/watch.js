@@ -22,6 +22,7 @@ import {
   formatTime,
   showError,
 } from "./api.js";
+import { CATEGORY_LABELS, CATEGORY_ORDER, ageText } from "./compare.js";
 
 /** localStorage key holding this browser's default Watchlist query. */
 const DEFAULT_KEY = "testboard.watch.default";
@@ -94,6 +95,11 @@ function cardLink(card) {
     params.set("product", card.name);
   } else if (card.kind === "environment") {
     params.set("environment", card.name);
+  } else if (card.kind === "stream") {
+    // A stream is identified by ID, not name (two products can each
+    // have a "feat/x" branch) — the dashboard's delta view reads the
+    // same ?stream=<id> the Build picker writes.
+    params.set("stream", String(card.id));
   } else {
     return null;
   }
@@ -136,6 +142,47 @@ function buildOkCard(card, index, total) {
   div.appendChild(verdict);
 
   div.appendChild(el("p", "watch-card-fresh muted", freshnessLine(card)));
+
+  const link = cardLink(card);
+  if (link) {
+    const a = document.createElement("a");
+    a.href = link;
+    a.className = "watch-card-open";
+    a.textContent = "Open in dashboard →";
+    div.appendChild(a);
+  }
+
+  div.appendChild(buildCardControls(index, total));
+  return div;
+}
+
+/**
+ * A stream verdict card (WP-21, docs/STREAMS_PLAN.md §3.6): the
+ * compare-vs-mainline headline for one branch/build, both sides'
+ * freshness, click-through to the branch-scoped dashboard. Resolved on
+ * the server through the same storage reads /api/compare uses
+ * (Storage.compare_counts_many), so this card costs no more per-card
+ * work than an environment or product card does.
+ */
+function buildStreamCard(card, index, total) {
+  const div = el("div", "card watch-card");
+  const head = el("div", "watch-card-head");
+  head.appendChild(el("span", "watch-card-kind", card.stream_kind));
+  head.appendChild(el("span", "watch-card-name", card.name));
+  div.appendChild(head);
+  div.appendChild(el("p", "row-sub", card.product));
+
+  const verdict = el("div", "watch-card-verdict");
+  for (const key of CATEGORY_ORDER) {
+    verdict.appendChild(buildStat(CATEGORY_LABELS[key], card[key]));
+  }
+  div.appendChild(verdict);
+
+  const nowMs = Date.now();
+  const fresh = el("p", "watch-card-fresh muted",
+    "this branch " + ageText(card.last_seen, nowMs)
+    + " — mainline " + ageText(card.baseline_last_seen, nowMs));
+  div.appendChild(fresh);
 
   const link = cardLink(card);
   if (link) {
@@ -215,10 +262,15 @@ async function refresh() {
     clearNode(grid);
     const total = data.cards.length;
     data.cards.forEach((card, index) => {
-      grid.appendChild(
-        card.ok
-          ? buildOkCard(card, index, total)
-          : buildErrorCard(card, index, total));
+      let built;
+      if (!card.ok) {
+        built = buildErrorCard(card, index, total);
+      } else if (card.kind === "stream") {
+        built = buildStreamCard(card, index, total);
+      } else {
+        built = buildOkCard(card, index, total);
+      }
+      grid.appendChild(built);
     });
   } catch (err) {
     showError(err.message);
@@ -255,32 +307,55 @@ function addCard() {
 /* ================= the add-card picker ================= */
 
 /**
- * Populate the name dropdown from the declared products and known
- * environments. Decoration on top of the page's real job (showing the
- * cards already in the URL) — a failed fetch here must not block that,
- * so it fails quietly, same rule as nav.js.
+ * Populate the name dropdown from the declared products, known
+ * environments, and every product's streams. Decoration on top of the
+ * page's real job (showing the cards already in the URL) — a failed
+ * fetch here must not block that, so it fails quietly, same rule as
+ * nav.js.
+ *
+ * Entries are `{value, label}` uniformly (not bare strings): an
+ * environment/product card is named by its NAME, but a stream card is
+ * named by its ID (docs/STREAMS_PLAN.md §3.6 — two products can each
+ * have their own "feat/x" branch, so only the id is unambiguous), and
+ * /api/streams is per-product, unlike the flat /api/environments list
+ * beside it — one request per known product, plus "" for the implicit
+ * product, all in parallel.
  */
 async function populatePicker() {
   const kindSelect = document.getElementById("add-kind");
   const nameSelect = document.getElementById("add-name");
-  let names = { p: [], e: [] };
+  let entries = { p: [], e: [], s: [] };
   try {
     const [summary, environments] = await Promise.all([
       fetchJson("/api/summary?parts=headline"),
       fetchJson("/api/environments"),
     ]);
-    names = {
-      p: summary.products.map((entry) => entry.product),
-      e: environments.environments.map((entry) => entry.environment),
-    };
+    const productNames = summary.products.map((entry) => entry.product);
+    entries.p = productNames.map((name) => ({ value: name, label: name }));
+    entries.e = environments.environments.map((entry) => ({
+      value: entry.environment, label: entry.environment,
+    }));
+    const streamLists = await Promise.all(
+      [""].concat(productNames).map((product) =>
+        fetchJson("/api/streams?product=" + encodeURIComponent(product))
+          .catch(() => ({ streams: [] }))));
+    for (const page of streamLists) {
+      for (const stream of page.streams) {
+        entries.s.push({
+          value: String(stream.id),
+          label: (stream.product || "(no product)") + " · "
+            + stream.kind + ":" + stream.name,
+        });
+      }
+    }
   } catch (err) {
     return;
   }
   const fill = () => {
     clearNode(nameSelect);
-    for (const name of names[kindSelect.value] || []) {
-      const opt = el("option", "", name);
-      opt.value = name;
+    for (const entry of entries[kindSelect.value] || []) {
+      const opt = el("option", "", entry.label);
+      opt.value = entry.value;
       nameSelect.appendChild(opt);
     }
   };

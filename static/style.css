@@ -1918,6 +1918,7 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
 
 .watch-card-verdict {
   display: flex;
+  flex-wrap: wrap;
   gap: 14px;
 }
 
@@ -1953,3 +1954,48 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
 }
 
 .watch-card-remove { color: var(--c-fail); }
+
+/* ---------------- Streams / branch-vs-mainline delta (WP-21, docs/STREAMS_PLAN.md §3.6) ---------------- */
+
+.stream-picker { display: flex; align-items: center; }
+
+.stream-picker-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.stream-picker-label select { font: inherit; }
+
+/* A result cell with no data on that side at all — never a chip, so it
+   can never be mistaken for a real pass/fail/etc. value. */
+.chip-none {
+  font-size: 12px;
+  font-style: italic;
+}
+
+.branch-band {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  margin: 0 0 16px;
+  background: #fff3e0;
+  border: 1px solid #e0a95c;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.branch-band a { font-weight: 600; }
+
+.compare-strip {
+  display: inline-flex;
+  align-items: center;
+  margin: 6px 0 0;
+}
