@@ -42,6 +42,13 @@ EXCLUDED_CLASSES = {
         "asserts EXPLAIN QUERY PLAN output — SQLite's planner, "
         "SQLite's syntax. MariaDB index use is a different question "
         "for a different tool.",
+    "ComparePairsQueryPlanTest":
+        "asserts EXPLAIN QUERY PLAN output (WP-23 perf pass, the "
+        "compare pairs query) — SQLite's planner, SQLite's syntax, "
+        "same reason as TestSortIndexesAreUsed above. MariaDB's own "
+        "EXPLAIN was checked by hand against the local mariadbd "
+        "(eq_ref on the latest_runs PRIMARY KEY) — see the commit "
+        "message; there is no equivalent automated pin for it here.",
     "TestEnvironmentListingCost":
         "counts sqlite page reads to pin a query-shape regression; "
         "the instrument is engine-specific even though the shape "

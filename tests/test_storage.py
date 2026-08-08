@@ -3993,6 +3993,111 @@ class DerivedTablePartitionIsolationTest(StorageTestBase):
         self.assertEqual(len(y_script), 1)
 
 
+class ComparePairsQueryPlanTest(StorageTestBase):
+    """WP-23 perf pass: the compare pairs query must join ``latest_runs``
+    to ITSELF on its PRIMARY KEY, never through a materialized
+    ``(SELECT ... FROM latest_runs WHERE ...)`` derived table.
+
+    A derived table has no index of its own, so SQLite could only
+    nested-loop the two partitions against each other — the ORIGINAL
+    shape, one ``(SELECT ...) s``/``(SELECT ...) m`` per side. MEASURED
+    on the dev-scale seeded copy (``.../scratchpad/testboard-wp23.db``,
+    NOT production — a copy was taken via ``sqlite3.Connection.backup``
+    so the live server on port 8791 was never touched; build 2026.9.1
+    vs build 2026.9.0, 2036 ``latest_runs`` rows each side), 15 samples
+    each:
+
+        compare_counts (headline)        622.8ms -> 4.4ms  median
+        compare_category (one page)      643.6ms -> 4.1ms  median
+        compare_category_count           643.0ms -> 3.7ms  median
+        full page request (all three)   1942.5ms -> 12.2ms median
+
+    Asserting on the PLAN rather than a duration, the same reasoning
+    ``TestSortIndexesAreUsed`` above gives: a timing test on a fast dev
+    machine proves nothing about a slower one, but the plan is the same
+    on both. Calls :meth:`Storage._compare_pairs_sql` directly rather
+    than tracing a public wrapper — it is the one method every public
+    entry point (``compare_counts``, ``compare_category``,
+    ``compare_category_count``) shares, so this is the real query, not
+    a hand-rebuilt lookalike that could drift from it.
+    """
+
+    #: The four join partition aliases the pairs query builds — each
+    #: must be a PRIMARY KEY SEARCH on ``latest_runs`` (or, for the two
+    #: which are the "anchor" side of their half and read a RANGE over
+    #: one stream_id rather than a single triple, a covering index
+    #: search — see ``m2``'s "USING COVERING INDEX idx_latest_runs_result"
+    #: below); none may ever be table-scanned.
+    _JOIN_ALIASES = ("S", "M", "M2", "S2")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([make_record(test_name="test_a")])
+        self.store.upsert_runs([make_record(
+            test_name="test_a", branch="feat/x",
+            start=BASE + datetime.timedelta(hours=1))])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def _plan(self) -> List[str]:
+        environments = self.store.environments_for_product("Atlas")
+        sql, params = self.store._compare_pairs_sql(
+            self.stream_id, storage.MAINLINE_STREAM_ID, environments)
+        rows = self.store._conn().execute(
+            "EXPLAIN QUERY PLAN " + sql, params).fetchall()
+        return [str(row[-1]) for row in rows]
+
+    def test_every_join_side_is_indexed_never_scanned(self) -> None:
+        plan = self._plan()
+        plan_text = " | ".join(plan).upper()
+        for alias in self._JOIN_ALIASES:
+            self.assertIn(
+                "SEARCH {0} USING".format(alias), plan_text,
+                "{0} is not an indexed SEARCH — plan: {1}".format(
+                    alias, plan_text))
+            self.assertNotIn(
+                "SCAN {0} ".format(alias), plan_text,
+                "{0} is being table/subquery-scanned — the regression "
+                "this test exists to catch. Plan: {1}".format(
+                    alias, plan_text))
+
+    def test_no_materialized_subquery_join(self) -> None:
+        """The specific pre-fix shape, confirmed by reverting this
+        commit's SQL change and re-running this exact test: each side
+        was a parenthesised ``(SELECT ...)`` per partition, which
+        SQLite ran by MATERIALIZING it, then joining the other side
+        against that materialization with no index of its own —
+        "MATERIALIZE m" / "MATERIALIZE s2" in the plan, followed by a
+        "SCAN"/"AUTOMATIC COVERING INDEX" (built on the fly, over the
+        already-materialized rows) rather than a SEARCH on the real
+        table's PRIMARY KEY."""
+        plan_text = " | ".join(self._plan()).upper()
+        self.assertNotIn(
+            "MATERIALIZE", plan_text,
+            "a join side is being materialized as a derived table "
+            "again — the exact pre-fix regression: " + plan_text)
+
+    def test_the_joined_side_uses_the_latest_runs_primary_key(
+        self
+    ) -> None:
+        """``m``/``s2`` (the LEFT JOIN target on each side) must probe
+        the exact PRIMARY KEY — stream_id, environment, script,
+        test_name — not a partial prefix of it."""
+        plan = self._plan()
+        for alias in ("m", "s2"):
+            line = next(
+                (row for row in plan
+                 if row.strip().upper().startswith(
+                     "SEARCH {0} ".format(alias.upper()))),
+                None)
+            self.assertIsNotNone(line, "no SEARCH line for " + alias)
+            self.assertIn("stream_id=?", line)
+            self.assertIn("environment=?", line)
+            self.assertIn("script=?", line)
+            self.assertIn("test_name=?", line)
+
+
 class CompareStreamsTest(StorageTestBase):
     """docs/STREAMS_PLAN.md §3.5: the five counts, and the paginated
     per-category listing, of a stream-vs-mainline comparison."""

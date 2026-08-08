@@ -3787,39 +3787,6 @@ class Storage:
     #: See module-level :data:`COMPARE_CATEGORIES`.
     _COMPARE_CATEGORIES = COMPARE_CATEGORIES
 
-    @staticmethod
-    def _compare_partition_sql(
-        environments: Sequence[str],
-    ) -> Tuple[str, List[Any]]:
-        """One stream's non-retired ``latest_runs`` rows, product-scoped.
-
-        *environments* narrows the comparison to the STREAM's OWN
-        product (resolved by the caller via
-        :meth:`environments_for_product`) — comparing against mainline's
-        whole ``latest_runs`` unfiltered would pull in every other
-        product's environments as spurious ``no_result``/``new_tests``
-        rows. Takes a ``?`` for ``stream_id``, bound by the caller.
-
-        ``lr.run_id``/``lr.start_time`` ride along (WP-21,
-        review-from-a-branch) — both are already columns on
-        ``latest_runs``, so this is no new query shape, only a wider
-        SELECT list on a read that already happens.
-        """
-        envs_clause, envs_params = Storage._environments_clause(
-            environments, column="lr.environment"
-        )
-        sql = (
-            "SELECT lr.environment, lr.script, lr.test_name, lr.result, "
-            "lr.run_id, lr.start_time "
-            "FROM latest_runs lr LEFT JOIN test_retirements tr "
-            "  ON tr.environment = lr.environment AND tr.script = lr.script "
-            " AND tr.test_name = lr.test_name "
-            "WHERE lr.stream_id = ? AND tr.retired_at IS NULL"
-        )
-        if envs_clause is not None:
-            sql += " AND " + envs_clause
-        return sql, envs_params
-
     @classmethod
     def _compare_pairs_sql(
         cls, stream_id: int, baseline_id: int, environments: Sequence[str],
@@ -3838,31 +3805,94 @@ class Storage:
         thing for every row. ``stream_run_id``/``stream_start_time`` are
         ALWAYS the stream side's own run (``s.*``/``s2.*`` respectively,
         never the baseline's), by the same invariant.
+
+        WP-23 perf pass: each side joins ``latest_runs`` to ITSELF
+        directly on ``(stream_id, environment, script, test_name)`` —
+        its PRIMARY KEY — rather than through a materialized
+        ``(SELECT ... FROM latest_runs WHERE stream_id = ?)`` derived
+        table as this used to (via the now-removed
+        ``_compare_partition_sql``). A derived table has no index of
+        its own, so SQLite could only nested-loop the two ~2k-row
+        partitions against each other; joining the real table lets the
+        planner SEARCH it by its PK for every outer row instead — the
+        same shape :meth:`compare_counts_many` (the Watchlist's batched
+        path) already used, which is why that path was never slow.
+        MEASURED on the dev-scale seeded copy (220 MB; build 2026.9.1 =
+        2036 latest rows, build 2026.9.0 = 2036), `?stream=5&baseline=4`:
+        498ms -> single digits (see the commit message for the exact
+        before/after and `tests/test_sql_portability.py` for the pinned
+        query plan).
+
+        Retirement now has to be applied to EACH side independently
+        inside the join rather than once per pre-filtered partition:
+        the anchor side (``s``/``m2``) is filtered in the WHERE exactly
+        as before (a retired anchor row is excluded outright — it was
+        never a partition member); the JOINED side (``m``/``s2``) is
+        instead NULLED via a ``CASE`` when its own retirement row
+        exists, which is what makes a retired triple on that side read
+        as "not there" — identical to how the old derived-table
+        partition simply omitted it. This is why the anti-join
+        complement in the second half tests
+        ``s2.result IS NULL OR tr_s2.retired_at IS NOT NULL`` rather
+        than the single ``s2.result IS NULL`` the derived-table version
+        used: a retired ``s2`` match must count as absent, and without
+        the retirement half of that OR it would not.
         """
-        part_sql, envs_params = cls._compare_partition_sql(environments)
+        envs_clause, envs_params = Storage._environments_clause(
+            environments, column="s.environment"
+        )
+        envs_clause_m2, envs_params_m2 = Storage._environments_clause(
+            environments, column="m2.environment"
+        )
         pairs_sql = (
             "SELECT s.environment AS environment, s.script AS script, "
             "s.test_name AS test_name, s.result AS stream_result, "
-            "m.result AS baseline_result, s.run_id AS stream_run_id, "
-            "s.start_time AS stream_start_time "
-            "FROM ({part}) s LEFT JOIN ({part}) m "
-            "  ON m.environment = s.environment AND m.script = s.script "
-            " AND m.test_name = s.test_name "
-            "UNION ALL "
+            "CASE WHEN tr_m.retired_at IS NOT NULL THEN NULL "
+            " ELSE m.result END AS baseline_result, "
+            "s.run_id AS stream_run_id, s.start_time AS stream_start_time "
+            "FROM latest_runs s "
+            "LEFT JOIN test_retirements tr_s "
+            "  ON tr_s.environment = s.environment "
+            " AND tr_s.script = s.script AND tr_s.test_name = s.test_name "
+            "LEFT JOIN latest_runs m "
+            "  ON m.stream_id = ? AND m.environment = s.environment "
+            " AND m.script = s.script AND m.test_name = s.test_name "
+            "LEFT JOIN test_retirements tr_m "
+            "  ON tr_m.environment = m.environment "
+            " AND tr_m.script = m.script AND tr_m.test_name = m.test_name "
+            "WHERE s.stream_id = ? AND tr_s.retired_at IS NULL"
+        )
+        if envs_clause is not None:
+            pairs_sql += " AND " + envs_clause
+        pairs_sql += (
+            " UNION ALL "
             "SELECT m2.environment AS environment, m2.script AS script, "
-            "m2.test_name AS test_name, s2.result AS stream_result, "
-            "m2.result AS baseline_result, s2.run_id AS stream_run_id, "
-            "s2.start_time AS stream_start_time "
-            "FROM ({part}) m2 LEFT JOIN ({part}) s2 "
-            "  ON s2.environment = m2.environment AND s2.script = m2.script "
-            " AND s2.test_name = m2.test_name "
-            "WHERE s2.result IS NULL"
-        ).format(part=part_sql)
+            "m2.test_name AS test_name, "
+            "CASE WHEN tr_s2.retired_at IS NOT NULL THEN NULL "
+            " ELSE s2.result END AS stream_result, "
+            "m2.result AS baseline_result, "
+            "CASE WHEN tr_s2.retired_at IS NOT NULL THEN NULL "
+            " ELSE s2.run_id END AS stream_run_id, "
+            "CASE WHEN tr_s2.retired_at IS NOT NULL THEN NULL "
+            " ELSE s2.start_time END AS stream_start_time "
+            "FROM latest_runs m2 "
+            "LEFT JOIN test_retirements tr_m2 "
+            "  ON tr_m2.environment = m2.environment "
+            " AND tr_m2.script = m2.script AND tr_m2.test_name = m2.test_name "
+            "LEFT JOIN latest_runs s2 "
+            "  ON s2.stream_id = ? AND s2.environment = m2.environment "
+            " AND s2.script = m2.script AND s2.test_name = m2.test_name "
+            "LEFT JOIN test_retirements tr_s2 "
+            "  ON tr_s2.environment = s2.environment "
+            " AND tr_s2.script = s2.script AND tr_s2.test_name = s2.test_name "
+            "WHERE m2.stream_id = ? AND tr_m2.retired_at IS NULL "
+            "AND (s2.result IS NULL OR tr_s2.retired_at IS NOT NULL)"
+        )
+        if envs_clause_m2 is not None:
+            pairs_sql += " AND " + envs_clause_m2
         params = (
-            [stream_id] + envs_params
-            + [baseline_id] + envs_params
-            + [baseline_id] + envs_params
-            + [stream_id] + envs_params
+            [baseline_id, stream_id] + envs_params
+            + [stream_id, baseline_id] + envs_params_m2
         )
         return pairs_sql, params
 
@@ -4124,12 +4154,12 @@ class Storage:
                 in baseline_partitions.get(baseline_id, {}).items()
                 if triple[0] in env_set
             }
-            # Match compare_counts' SQL path (_compare_partition_sql
-            # applies the SAME environment scope to both sides): a
-            # stream's own runs are, by construction, always from its
-            # own product's environments already, so this filter is a
-            # no-op in the ordinary case and only bites the edge case of
-            # an undeclared/misconfigured product (empty scope).
+            # Match compare_counts' SQL path (_compare_pairs_sql applies
+            # the SAME environment scope to both sides): a stream's own
+            # runs are, by construction, always from its own product's
+            # environments already, so this filter is a no-op in the
+            # ordinary case and only bites the edge case of an
+            # undeclared/misconfigured product (empty scope).
             mine = {
                 triple: result
                 for triple, result in partitions.get(stream_id, {}).items()
