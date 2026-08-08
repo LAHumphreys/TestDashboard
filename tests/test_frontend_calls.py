@@ -588,7 +588,11 @@ class WindowWordingTest(unittest.TestCase):
 
     #: Pages that show counts bounded by the recency cutoff, or that
     #: label a time window at all (the Timeline is nothing but one).
-    _PAGES = ("app.js", "time.js", "timeline.js")
+    #: watch.js joined this list under WP-20: every card labels its own
+    #: freshness from its own `stale_before`/`last_reported`, and a card
+    #: mixing a product with several environments has no single
+    #: truthful window to describe from a constant.
+    _PAGES = ("app.js", "time.js", "timeline.js", "watch.js")
 
     def test_no_page_labels_the_window_from_recent_hours(self) -> None:
         offenders = {}  # type: Dict[str, List[int]]
@@ -617,7 +621,8 @@ class WindowWordingTest(unittest.TestCase):
     def test_nothing_still_calls_the_window_a_night(self) -> None:
         """A suite can run at any hour, more than once a day, or not for
         a long weekend. "Last night" is only ever right by luck."""
-        for name in ("app.js", "time.js", "actions.js", "timeline.js"):
+        for name in ("app.js", "time.js", "actions.js", "timeline.js",
+                     "watch.js"):
             self.assertNotIn(
                 "last night", _strip_comments(read(name)).lower(), name)
         self.assertNotIn(
@@ -646,8 +651,11 @@ class PlantedWindowRegressionTest(unittest.TestCase):
 #: The frontend's own shared modules. A name one of these exports is a
 #: name every other file has to IMPORT before using — ES modules have no
 #: implicit global scope, so a missing import is a ReferenceError at the
-#: moment the line runs, not at load.
-_SHARED_MODULES = ("api.js", "charts.js", "sorting.js", "review.js")
+#: moment the line runs, not at load. products.js joined under WP-20:
+#: watch.js (and, in a later drop, other pages) calls its exports.
+_SHARED_MODULES = (
+    "api.js", "charts.js", "sorting.js", "review.js", "products.js",
+)
 
 
 def _exported_names(source: str) -> List[str]:
@@ -920,6 +928,170 @@ class SummaryPartsFetchTest(unittest.TestCase):
         body = _function_body(read("app.js"), "function renderQueueTable()")
         self.assertIn("allEntries === null", body)
         self.assertIn("Loading queue", body)
+
+
+class ProductSwitcherTest(unittest.TestCase):
+    """products.js (WP-20, docs/STREAMS_PLAN.md §2.3): the header switcher.
+
+    There is no JavaScript runtime here (see this file's module
+    docstring), so "at least two products shows it, fewer hides it" is
+    asserted the same way every other property in this file is: against
+    the source, not by executing it.
+    """
+
+    def test_the_switcher_hides_below_two_products(self) -> None:
+        body = _function_body(read("products.js"), "export function renderSwitcher(")
+        self.assertIn("products.length < 2", body)
+        self.assertIn("container.hidden = true", body)
+
+    def test_selection_persists_in_local_storage(self) -> None:
+        code = _strip_comments(read("products.js"))
+        self.assertIn("window.localStorage.getItem", code)
+        self.assertIn("window.localStorage.setItem", code)
+
+    def test_a_stale_stored_selection_is_clamped_back_to_all_products(
+        self
+    ) -> None:
+        """A product this browser remembered but that has since been
+        renamed away must not pin the page to a filter nobody chose."""
+        body = _function_body(read("products.js"), "export function renderSwitcher(")
+        self.assertIn("names.indexOf(selected) === -1", body)
+
+    def test_it_fails_quietly_like_nav_js(self) -> None:
+        """Decoration on someone else's page: a failed fetch must leave
+        the page exactly as it shipped, never an error banner."""
+        code = _strip_comments(read("products.js"))
+        self.assertNotIn("showError", code)
+        self.assertIn("catch", code)
+
+    def test_it_is_mounted_only_where_it_can_do_something(self) -> None:
+        """§2.3 says the header gains the switcher, not every page —
+        whatsnew.html/script.html/test.html show no scoped data, so
+        mounting it there would be a new heavyweight request for a
+        control that changes nothing."""
+        for name in ("whatsnew.html", "script.html", "test.html"):
+            self.assertNotIn(
+                'src="products.js"', read_text(name),
+                name + " should not load products.js")
+        for name in ("index.html", "actions.html", "time.html",
+                     "timeline.html", "watch.html"):
+            self.assertIn(
+                'src="products.js"', read_text(name),
+                name + " is missing the product switcher")
+            self.assertIn(
+                'id="product-switcher"', read_text(name),
+                name + " has no switcher mount point")
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", read("products.js"))
+
+
+class WatchPageTest(unittest.TestCase):
+    """watch.js / watch.html (WP-20, docs/STREAMS_PLAN.md §2.4).
+
+    The Watchlist's URL grammar IS its persistence mechanism — no
+    account, no server-side saved view — so the round-trip property
+    (parse the URL, then rebuild the identical URL from what was parsed)
+    is the one this page cannot ship broken.
+    """
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", _strip_comments(read("watch.js")))
+
+    def test_spec_round_trips_through_split_and_join(self) -> None:
+        """splitSpec/joinSpec must be exact inverses, or a shared URL
+        silently mutates every time the page that built it re-saves it."""
+        code = _strip_comments(read("watch.js"))
+        self.assertIn("export function splitSpec(", code)
+        self.assertIn("export function joinSpec(", code)
+        self.assertIn("export function buildUrl(", code)
+        self.assertIn("export function parseSpecs(", code)
+
+    def test_the_split_is_at_the_first_colon_only(self) -> None:
+        """A product or environment name may itself contain a colon; the
+        kind letter never does. docs/STREAMS_PLAN.md §2.4 is explicit:
+        split at the FIRST colon."""
+        body = _function_body(read("watch.js"), "export function splitSpec(")
+        self.assertIn("indexOf(\":\")", body)
+        self.assertIn("slice(at + 1)", body)
+
+    def test_get_all_c_preserves_request_order(self) -> None:
+        """URLSearchParams.getAll keeps repeated params in the order they
+        appear — the property the whole page's ordering guarantee rests
+        on, on both the request out and the cards back."""
+        body = _function_body(read("watch.js"), "export function parseSpecs(")
+        self.assertIn('getAll("c")', body)
+
+    def test_the_default_is_read_from_local_storage(self) -> None:
+        code = _strip_comments(read("watch.js"))
+        self.assertIn("window.localStorage.getItem", code)
+        self.assertIn("window.localStorage.setItem", code)
+
+    def test_the_copy_link_input_is_a_plain_readonly_field(self) -> None:
+        """docs/STREAMS_PLAN.md §2.4: a VISIBLE readonly input, no
+        clipboard-API dependency."""
+        html = read_text("watch.html")
+        self.assertIn('id="watch-link"', html)
+        self.assertIn("readonly", html)
+        self.assertNotIn("navigator.clipboard", read("watch.js"))
+
+    def test_error_cards_are_rendered_and_ok_cards_are_distinguished(
+        self
+    ) -> None:
+        code = _strip_comments(read("watch.js"))
+        self.assertIn("card.ok", code)
+        self.assertIn("buildErrorCard", code)
+        self.assertIn("buildOkCard", code)
+
+    def test_card_controls_offer_remove_and_reorder(self) -> None:
+        """Add-a-card picker, remove, drag-free reorder — the editing
+        surface docs/STREAMS_PLAN.md §2.4 asks for (up/down buttons:
+        "keyboard-reachable beats drag")."""
+        code = _strip_comments(read("watch.js"))
+        self.assertIn("function moveCard(", code)
+        self.assertIn("function removeCard(", code)
+        self.assertIn("function addCard(", code)
+
+    def test_the_nav_entry_exists_on_every_page(self) -> None:
+        """§2.4: the page joins the header nav on every page — unlike
+        the switcher, it is NOT hidden for a single-product deployment
+        (environment cards still benefit)."""
+        for name in sorted(os.listdir(STATIC_DIR)):
+            if not name.endswith(".html"):
+                continue
+            self.assertIn(
+                'href="watch.html"', read_text(name),
+                name + " has no Watch nav entry")
+
+    def test_a_bare_visit_loads_the_saved_default(self) -> None:
+        body = _function_body(read("watch.js"), "function init()")
+        self.assertIn("readDefault", body)
+
+    def test_an_empty_watchlist_shows_how_to_not_a_blank_page(self) -> None:
+        html = read_text("watch.html")
+        self.assertIn('id="empty-state"', html)
+        code = _strip_comments(read("watch.js"))
+        self.assertIn('getElementById("empty-state")', code)
+
+
+class PlantedWatchRegressionTest(unittest.TestCase):
+    """Prove the round-trip and ordering detectors can fail."""
+
+    def test_a_split_at_the_last_colon_would_be_caught(self) -> None:
+        """The wrong implementation: a name containing ':' would lose
+        everything after its own first colon."""
+        planted = (
+            "function splitSpec(spec) {\n"
+            "  const at = spec.lastIndexOf(':');\n"
+            "  return { kind: spec.slice(0, at), name: spec.slice(at + 1) };\n"
+            "}\n"
+        )
+        self.assertNotIn("indexOf(\":\")", planted)
+
+    def test_a_missing_watch_link_would_be_caught(self) -> None:
+        planted = "<input id=\"share-link\" type=\"text\">"
+        self.assertNotIn('id="watch-link"', planted)
+
 
 if __name__ == "__main__":
     unittest.main()

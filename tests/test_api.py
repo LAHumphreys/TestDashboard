@@ -2716,6 +2716,20 @@ class TestWatch(ApiCase):
         )["cards"]
         self.assertFalse(card["ok"])
 
+    def test_error_card_kind_matches_the_ok_cards_spelling(self) -> None:
+        """A recognised kind's error card must say "environment"/
+        "product", the same word an ok card of that kind uses -- so the
+        frontend never has to special-case error cards to know what
+        they were trying to be."""
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:typo", "p:Nope", "e:linux-sim"]})
+        env_card, product_card, ok_card = data["cards"]
+        self.assertEqual(env_card["kind"], "environment")
+        self.assertEqual(product_card["kind"], "product")
+        self.assertEqual(ok_card["kind"], "environment")
+
     def test_an_unknown_kind_is_an_error_card(self) -> None:
         self._seed()
         (card,) = self.call(

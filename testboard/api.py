@@ -2228,7 +2228,7 @@ def _handle_watch(
         if kind == "e":
             if name not in known_environments:
                 cards.append(_watch_card_error(
-                    spec, kind, name,
+                    spec, "environment", name,
                     "nothing under this name — removed or renamed?"))
                 continue
             verdict = by_environment.get(name, zero)
@@ -2248,7 +2248,7 @@ def _handle_watch(
         elif kind == "p":
             if name not in declared_products:
                 cards.append(_watch_card_error(
-                    spec, kind, name,
+                    spec, "product", name,
                     "nothing under this name — removed or renamed?"))
                 continue
             verdict = by_product.get(name, zero)
