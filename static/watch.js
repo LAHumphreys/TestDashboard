@@ -124,6 +124,18 @@ function freshnessLine(card) {
   if (card.last_reported) {
     bits.push("last reported " + formatTime(card.last_reported));
   }
+  // A product spans environments reporting hours apart, so it gets no
+  // single timestamp (see the API's product-card comment). What it gets
+  // instead is the LAGGARD, by name: the environment furthest behind is
+  // the one the manager is actually waiting on, and naming it means an
+  // old-but-quiet environment can never hide behind a fresh one.
+  if (card.laggard) {
+    bits.push(card.laggard.last_reported
+      ? "slowest environment: " + card.laggard.environment
+        + ", last reported " + formatTime(card.laggard.last_reported)
+      : "environment " + card.laggard.environment
+        + " has never reported");
+  }
   bits.push("counted as quiet after " + formatTime(card.stale_before));
   return bits.join(" — ");
 }

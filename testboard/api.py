@@ -2697,6 +2697,32 @@ def _watch_card_error(
     }
 
 
+def _product_laggard(
+    environments: List[str],
+    latest_by_env: Dict[str, datetime.datetime],
+) -> Optional[Dict[str, Any]]:
+    """The product's furthest-behind environment, for its watch card.
+
+    See the product-card comment in :func:`_handle_watch` for why this
+    exists instead of a single ``last_reported`` timestamp. ``None``
+    only when the product has no environments at all (a mapping row
+    can outlive its environment's data). An environment with no
+    recorded run at all is the worst laggard and wins outright, with
+    ``last_reported`` null — absence of data must outrank old data,
+    never hide behind it.
+    """
+    if not environments:
+        return None
+    silent = [env for env in environments if env not in latest_by_env]
+    if silent:
+        return {"environment": sorted(silent)[0], "last_reported": None}
+    oldest = min(environments, key=lambda env: latest_by_env[env])
+    return {
+        "environment": oldest,
+        "last_reported": model.format_iso(latest_by_env[oldest]),
+    }
+
+
 def _handle_watch(
     storage: Storage,
     request: Request,
@@ -2904,6 +2930,19 @@ def _handle_watch(
                 # environment, and this page must never invent one
                 # truthful-looking timestamp out of several.
                 "last_reported": None,
+                # What a manager scanning the morning card actually
+                # needs instead: the LAGGARD — which of this product's
+                # environments is furthest behind, and since when. The
+                # oldest-across-environments principle recent_cutoff
+                # already uses, applied to reporting: it NAMES the
+                # environment, so unlike a single product timestamp it
+                # cannot mask a stale one (a newest-report figure is
+                # exactly the "says nothing about the one you are
+                # waiting on" trap the handover documents). An
+                # environment that has never reported is the worst
+                # laggard of all and wins with last_reported null.
+                "laggard": _product_laggard(
+                    product_to_envs.get(name, []), latest_by_env),
             })
         elif kind == "s":
             try:

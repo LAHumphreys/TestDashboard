@@ -3063,6 +3063,49 @@ class TestWatch(ApiCase):
         self.assertIsNone(card["last_reported"])
         self.assertIsNotNone(card["stale_before"])
 
+    def test_a_product_card_names_its_laggard_environment(self) -> None:
+        """A product spans environments reporting hours apart, so its
+        card carries no single timestamp (pinned above) — what it
+        carries instead is the furthest-behind environment BY NAME,
+        because "which one am I waiting on" is the morning question and
+        a newest-of-several figure is exactly the trap the handover
+        documents. Found in the 2026-08-09 manager-persona review."""
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1",
+                   start_time="2026-08-08T06:00:00.000000",
+                   end_time="2026-08-08T06:00:01.000000"),
+            record(environment="win-sim", test_name="t2",
+                   start_time="2026-08-05T04:30:00.000000",
+                   end_time="2026-08-05T04:30:01.000000"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Atlas"]}
+        )["cards"]
+        self.assertEqual(card["laggard"]["environment"], "win-sim")
+        self.assertEqual(card["laggard"]["last_reported"],
+                         "2026-08-05T04:30:00.000000")
+
+    def test_a_silent_environment_is_the_worst_laggard(self) -> None:
+        """An environment with NO recorded run outranks any old one —
+        absence of data must never hide behind stale data. Unreachable
+        through the API today (the product PUT refuses an unknown
+        environment, and dropping an environment takes its mapping with
+        it — environment_products is in _ENVIRONMENT_TABLES), so this
+        pins the DEFENSIVE branch of the pure helper directly: if some
+        future path ever leaves a mapping without data, the card must
+        point at the silence, not average over it."""
+        laggard = api._product_laggard(
+            ["linux-sim", "ghost-sim"],
+            {"linux-sim": datetime.datetime(2026, 8, 5, 4, 30)},
+        )
+        self.assertEqual(laggard["environment"], "ghost-sim")
+        self.assertIsNone(laggard["last_reported"])
+
+    def test_the_laggard_of_no_environments_is_none(self) -> None:
+        self.assertIsNone(api._product_laggard([], {}))
+
     def test_an_unknown_environment_is_an_error_card_not_404(self) -> None:
         self._seed()
         data = self.call(
