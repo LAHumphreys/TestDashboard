@@ -22,7 +22,7 @@ in this paragraph has shipped.
 | `wp-20-products` | **NEW.** WP-20 (products + Watchlist), migration 8. Built and suite-green on BOTH backends; operator note is `docs/drops/2026-08-14.md`, **date provisional** — re-date before pushing if it ships on a different day. Acceptance list is at the bottom of that note; no browser has rendered it |
 | `wp-14-in-run-progress` | parked WIP; **its migration is now 9** (WP-20 took 8 — the third time this exact swap has happened, see `UPGRADE_PLAN.md` §1) — renumber before merging |
 
-Suite: **1385 green** (skipped 1) on `wp-18-timeline`/`master`; **1491 green**
+Suite: **1385 green** (skipped 1) on `wp-18-timeline`/`master`; **1492 green**
 (skipped 1) SQLite-only on `wp-20-products`, which is 99+ commits' worth of
 tests ahead of it and not yet merged. **This session also ran the dual-backend
 suite against this dev machine's local `mariadbd`** (port 3307,
@@ -110,7 +110,13 @@ read per request; the Python is whatever was imported at process start.
 
 There is no browser here. Frontend changes are verified by the node DOM-shim
 harness in `.scratch/` (see the 2026-08-04 handover text in git history for
-its pieces); it cannot catch layout, colour or contrast.
+its pieces); it cannot catch layout, colour or contrast. This session drove
+`app.js` (the Dashboard) through it for the first time — previously only
+Timeline (`drive_timeline.mjs`, `drive_deeplink.mjs`) had been — and
+`domshim.mjs` gained `Element.hasAttribute`/`.dataset`,
+`document.createElementNS`, and a narrow `document.querySelectorAll` to get
+a full page through `init()`. It is gitignored: a fresh clone or another
+machine does NOT have these additions, only this checkout does.
 
 ---
 
