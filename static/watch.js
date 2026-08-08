@@ -291,7 +291,7 @@ async function populatePicker() {
 /* ================= init ================= */
 
 function init() {
-  const search = window.location.search;
+  const search = new URL(window.location.href).search;
   const saved = readDefault();
   state.specs = search
     ? parseSpecs(search)

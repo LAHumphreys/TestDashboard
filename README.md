@@ -317,6 +317,22 @@ Definitions (matching the analytics semantics above):
   FAIL. Within the slice it returns, `still_failing` is ordered
   oldest-regression-first.
 
+### GET /api/watch — the Watchlist page's data, one request per page load
+
+`?c=` is repeated, one per card, in request order: `c=p:<product>` or
+`c=e:<environment>`. Each comes back as `{spec, kind, name, ok, failing,
+new_failures, fixed, unexpected_passes, stale_before, last_reported}`
+(product cards carry `last_reported: null` — there is no single truthful
+"last reported" for a card spanning several environments) or, for a name
+that resolves to nothing, `{spec, kind, name, ok: false, error}`. The page
+still answers 200 around a mix of good and bad cards.
+
+**Cards per request are capped at 50.** A request naming more answers 413
+with the count and the limit in the message; a URL that long is treated as
+a mistake, not a use case. `c=s:...` (stream cards) 400s the WHOLE request
+with a "streams arrive in a later drop" message — that kind is reserved by
+the URL grammar so it never has to change, but nothing behind it exists yet.
+
 ### GET /api/scripts/{environment}/{script}/executions — suite history
 
 The estate is keyed on individual tests, but people run and reason about whole

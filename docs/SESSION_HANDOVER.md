@@ -4,10 +4,11 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-08-07**, after building WP-19 (MariaDB backend),
-folding it with WP-18 into the **2026-08-07 drop** — and after that drop
-**went live the same day**: migration 7 completed on the production database
-(30 s–2 min, operator-reported) and the Timeline is accepted.
+Last rewritten: **2026-08-08**, after building WP-20 (products + the
+Watchlist, drop 1 of `docs/STREAMS_PLAN.md`) on a fresh branch,
+`wp-20-products`. **Built and green, not yet accepted, not yet deployed** —
+the 2026-08-07 drop below is still the one running in production; nothing
+in this paragraph has shipped.
 
 ---
 
@@ -15,15 +16,22 @@ folding it with WP-18 into the **2026-08-07 drop** — and after that drop
 
 | | |
 |---|---|
-| **production** | **live on the 2026-08-07 drop** (schema v7). Confirm the box runs the FINAL drop commit `310f1c0` — What's new saying "7 August 2026" is the tell; older says 4 August |
+| **production** | **live on the 2026-08-07 drop** (schema v7). Confirm the box runs the FINAL drop commit `310f1c0` — What's new saying "7 August 2026" is the tell; older says 4 August. WP-20 below has NOT been deployed |
 | `origin/master` | `ea15ccc` — **stale**: push `wp-18-timeline` to `master` so the recorded state matches the deployed one |
 | `wp-18-timeline` | the 2026-08-07 drop, deployed. **All four CI legs green** including the new `python36-mariadb` |
-| `wp-14-in-run-progress` | parked WIP; **its migration is 8** — renumber before merging (registry §1) |
+| `wp-20-products` | **NEW.** WP-20 (products + Watchlist), migration 8. Built and suite-green; operator note is `docs/drops/2026-08-14.md`, **date provisional** — re-date before pushing if it ships on a different day. Acceptance list is at the bottom of that note; no browser has rendered it |
+| `wp-14-in-run-progress` | parked WIP; **its migration is now 9** (WP-20 took 8 — the third time this exact swap has happened, see `UPGRADE_PLAN.md` §1) — renumber before merging |
 
-Suite: **1385 green** (skipped 1) locally; **1749 OK (skipped 16)** on the CI
-MariaDB leg — 10.3, prod's stream. Schema moves to **migration 7** at deploy
-(the WP-18 half), so **the rollback is the database copy**, not `git
-checkout`. WP-19 consumed no version; 8 stays reserved for WP-15, 9 free.
+Suite: **1385 green** (skipped 1) on `wp-18-timeline`/`master`; **1484 green**
+(skipped 1) on `wp-20-products`, which is 99 commits' worth of tests ahead of
+it and not yet merged. CI's MariaDB leg has not been re-run against
+`wp-20-products` from this session — `TESTBOARD_TEST_DB_CNF` was unset here,
+so the dual-backend variants did not execute; the operator note says so.
+Schema moves to **migration 7** in production today; **migration 8 ships
+with WP-20**, whenever that is accepted — so until then the rollback for
+`wp-18-timeline`'s own drop is still the database copy, and WP-20's will be
+too once it ships. WP-19 consumed no version; WP-15 is now reserved on **9**,
+10 free.
 
 **SQLite is a permanent first-class backend** (user requirement, 2026-08-07):
 `--db PATH` unchanged forever, zero-setup second instances, both backends
@@ -44,7 +52,20 @@ from it.
 
 ## The immediate thing
 
-**The MariaDB migration itself — the drop is already live.** Steps 1 of the
+**Two independent threads are both live right now — do not conflate them.**
+
+**Thread A — accept and ship WP-20 (`wp-20-products`).** Built this session,
+suite-green, not deployed. Before it ships: read
+`docs/drops/2026-08-14.md`'s acceptance list (a human has to look at the
+Watch page and the switcher — nothing here has been seen in a browser),
+re-date the drop note and `whatsnew.html` if the ship day is not the 14th,
+run the migration-8 probe against a copy of PRODUCTION (not just the dev
+copy this session measured) and record the number, then push
+`wp-20-products` to `master` and follow the drop note's upgrade procedure.
+`wp-14-in-run-progress` must renumber its migration to **9** before it can
+merge, now that WP-20 has taken 8.
+
+**Thread B — the MariaDB migration itself, independent of WP-20.** Steps 1 of the
 plan (deploy; migration 7; Timeline acceptance) happened 2026-08-07. What
 remains: (2) §A server prep on the new account (target server confirmed
 MariaDB 10.3.39 via client banner — re-confirm server-side with

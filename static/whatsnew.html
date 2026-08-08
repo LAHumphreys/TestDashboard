@@ -35,6 +35,47 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-08-14">
+      <div class="section-head">
+        <h2 class="eyebrow">14 August 2026</h2>
+        <span class="muted">New: the Watch page — build your own morning view</span>
+      </div>
+
+      <h3>New page: Watch</h3>
+      <ul>
+        <li><strong>One page, the sets you actually check.</strong> Add a
+          card for any environment (and, once a second product exists, any
+          product) you're responsible for; each card shows what's failing,
+          what's new, what's been fixed, and when it was last heard from —
+          dated in its own words, not one page-wide timestamp. Click a card
+          to open that scope on the dashboard.</li>
+        <li><strong>The URL is the whole page.</strong> There's no login and
+          nothing saved on the server — build the page once, click
+          <em>Copy link</em>, and send the URL to whoever else needs it. Use
+          <em>Save as my default</em> so a bare visit to the Watch page
+          always opens to yours.</li>
+        <li><strong>Reorder and remove</strong> with the arrows on each
+          card — no drag-and-drop to fight with. A card for a name that no
+          longer exists says so plainly rather than just vanishing, so an
+          old shared link never looks like it silently lost something.</li>
+        <li>Find it in the nav on every page, labelled <strong>Watch</strong>.</li>
+      </ul>
+
+      <h3>Under the hood: products</h3>
+      <ul>
+        <li>testboard can now group environments into <strong>products</strong>,
+          for sites that run more than one. Nothing changes for anyone on a
+          single-product install — no new switcher, no new column, nothing
+          to configure. Once a second product is declared (in the
+          "Environment expectations" section of Open actions, which now has
+          a Product cell alongside the existing one), a <strong>Product</strong>
+          picker appears at the top of every page, and the home screen and
+          Open actions' tables gain a Product column so mixed views stay
+          readable — scoped to one product, the column disappears again and
+          the page says so.</li>
+      </ul>
+    </section>
+
     <section class="release" data-drop-date="2026-08-07">
       <div class="section-head">
         <h2 class="eyebrow">7 August 2026</h2>

@@ -114,16 +114,18 @@ claim is a RESERVATION, not a number: whatever ships next takes the lowest
 unshipped version, and the reservation follows it up. WP-19 (the MariaDB
 backend, 2026-08-07) deliberately consumed **no** version: the SQLite schema
 is untouched, and the MariaDB schema is only ever created by the migration
-tooling, never by the app. **When the WIP branch
-comes back it must renumber its migration entry to 8 before merging** — the
-registry is the coordination point, and this note is the hand-off.
+tooling, never by the app. (This note originally said the WIP branch must
+renumber its migration entry to 8 before merging — **superseded by the next
+note**, which moved that target to 9. Left here rather than deleted so the
+history of the swap reads in order.)
 
 **And why 8 and 9 swapped too (2026-08-08).** The same situation a third
 time: WP-20 (products, drop 1 of `docs/STREAMS_PLAN.md`) shipped while
 `wp-14-in-run-progress` was still parked, so the ship-first package took the
 next contiguous number (8) and the parked claim moved back one (9). The
-hand-off updates accordingly: **when the WIP branch comes back it must
-renumber its migration entry to 9 before merging.**
+hand-off updates accordingly — this is the CURRENT instruction: **when the
+WIP branch comes back it must renumber its migration entry to 9 before
+merging.**
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry
