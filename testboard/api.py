@@ -1492,6 +1492,48 @@ def _handle_test_detail(
     )
 
 
+def _handle_test_streams(
+    storage: Storage, environment: str, script: str, test_name: str,
+) -> Response:
+    """GET .../streams — this triple's latest result on every stream that
+    has one, newest first (WP-22, docs/STREAMS_PLAN.md §4.1).
+
+    Two frontend consumers share this one payload rather than each
+    getting a bespoke shape: the test page's "Every build" disclosure
+    (which additionally unions in the product's FULL stream list,
+    client-side, to render NO RESULT rows for the streams absent here
+    — see :meth:`Storage.stream_results_for_triple`'s docstring for why
+    that union is the caller's job, not this endpoint's) and the stream
+    dropdown next to it, which wants exactly this list and nothing more
+    — a dropdown entry with no result to show is not useful.
+
+    404 if the triple has never run ANYWHERE — the same rule
+    :func:`_handle_history` already follows, so a typo'd triple reads
+    as "no such test" rather than "ran nowhere".
+    """
+    _require_test(storage, environment, script, test_name)
+    results = storage.stream_results_for_triple(
+        environment, script, test_name
+    )
+    return _json_response(
+        200,
+        {
+            "environment": environment,
+            "script": script,
+            "test_name": test_name,
+            "results": [
+                {
+                    "stream": _stream_json(entry.stream),
+                    "result": entry.result.value,
+                    "run_id": entry.run_id,
+                    "start_time": model.format_iso(entry.start_time),
+                }
+                for entry in results
+            ],
+        },
+    )
+
+
 def _handle_history(
     storage: Storage,
     request: Request,
@@ -2375,13 +2417,17 @@ def _handle_streams_list(storage: Storage, request: Request) -> Response:
 def _handle_compare(storage: Storage, request: Request) -> Response:
     """GET /api/compare?stream=&baseline=&category=&limit=&offset=
 
-    docs/STREAMS_PLAN.md §3.5. ``stream`` is required. ``baseline``
-    defaults to mainline and — in THIS drop only — may not be anything
-    else: WP-22 lifts the restriction (§4.1); until then a non-mainline
-    baseline is a clear 400, not a query that silently compares the
-    wrong thing. ``category``, when given, selects ONE of the five
-    counts to return as a paginated list (``limit``/``offset``); when
-    absent the response carries the counts alone and an empty list.
+    docs/STREAMS_PLAN.md §3.5/§4.1. ``stream`` is required. ``baseline``
+    defaults to mainline; since WP-22 it may also be any stream of the
+    SAME product as ``stream`` — a build judged against the build
+    before it, or one branch against another, not only mainline. A
+    baseline naming a DIFFERENT product is a clear 400 naming both
+    products, never a query that silently compares against the wrong
+    environments (mainline is exempt from the product check on either
+    side — it is shared by every product by construction).
+    ``category``, when given, selects ONE of the five counts to return
+    as a paginated list (``limit``/``offset``); when absent the response
+    carries the counts alone and an empty list.
 
     The response carries both sides' identity and freshness
     (``last_seen``) so the UI can build its own honesty line ("baseline
@@ -2410,18 +2456,32 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
                 400, "baseline: must be an integer, got '{}'".format(
                     raw_baseline)
             )
-        if baseline_id != MAINLINE_STREAM_ID:
-            raise _HttpError(
-                400,
-                "baseline: only the mainline stream ({}) may be used as "
-                "a baseline in this drop — comparing against any other "
-                "stream arrives in a later drop (WP-22)".format(
-                    MAINLINE_STREAM_ID),
-            )
     baseline = storage.get_stream(baseline_id)
     if baseline is None:
         raise _HttpError(404, "unknown baseline stream: {}".format(
             baseline_id))
+    # WP-22 (docs/STREAMS_PLAN.md §4.1): baseline= now accepts any stream
+    # of the SAME product as *stream* — a build judged against the build
+    # before it, or one branch against another. Mainline is the one
+    # universal exception (its own "product" is '', shared by every
+    # product by construction — every comparison has defaulted to it
+    # since WP-21). A genuine cross-product pairing is refused outright:
+    # the environments filter both sides of the SQL join share
+    # (_compare_partition_sql) is resolved from the STREAM's product
+    # alone, so a mismatched baseline would not error, it would just
+    # silently compare against the wrong environments (empty on the
+    # baseline side) — a confusing "everything is new_tests" result
+    # rather than a clear refusal.
+    if (baseline.kind != "mainline" and stream.kind != "mainline"
+            and baseline.product != stream.product):
+        raise _HttpError(
+            400,
+            "cannot compare across products: stream '{}:{}' is in "
+            "product '{}', baseline '{}:{}' is in product '{}'".format(
+                stream.kind, stream.name, stream.product or "(none)",
+                baseline.kind, baseline.name, baseline.product or "(none)",
+            ),
+        )
 
     category = _query_single(request.query, "category")
     if category is not None and category not in COMPARE_CATEGORIES:
@@ -2642,13 +2702,27 @@ def _handle_watch(
         e for e in known_environments if e not in mapped_environments
     ]
     stream_identities = storage.stream_identities(requested_stream_ids)
+    # WP-22 (docs/STREAMS_PLAN.md §4.1): a BUILD-kind card's default
+    # baseline is the build before it, not mainline, when one exists —
+    # "failing in <name>" plus its vs-previous-build delta, the same
+    # default the build-scoped dashboard's "Compare to" control opens
+    # on. ONE query (bounded to the distinct products among the
+    # requested build cards), independent of how many s: cards the URL
+    # carries — see :meth:`Storage.previous_builds`.
+    predecessor_builds = storage.previous_builds(
+        list(stream_identities.values())
+    )
+    stream_baselines = {
+        stream_id: predecessor.stream_id
+        for stream_id, predecessor in predecessor_builds.items()
+    }
     stream_counts = storage.compare_counts_many({
         stream_id: (
             implicit_environments if stream.product == ""
             else product_to_envs.get(stream.product, [])
         )
         for stream_id, stream in stream_identities.items()
-    })
+    }, baselines=stream_baselines)
     mainline_last_seen = (
         storage.latest_run_time() if requested_stream_ids else None
     )
@@ -2753,6 +2827,17 @@ def _handle_watch(
                 new_failures=0, new_passes=0, both_failing=0,
                 new_tests=0, no_result=0, agree=0,
             ))
+            # WP-22: the baseline actually used (a predecessor build) is
+            # named explicitly rather than assumed to be mainline — the
+            # card's wording (watch.js) must say what it is really being
+            # compared against, not a hardcoded "mainline".
+            predecessor = predecessor_builds.get(stream_id)
+            baseline_kind = "mainline" if predecessor is None else "build"
+            baseline_name = "" if predecessor is None else predecessor.name
+            baseline_last_seen = (
+                mainline_last_seen if predecessor is None
+                else predecessor.last_seen
+            )
             cards.append({
                 "spec": spec, "kind": "stream", "name": stream.name,
                 "ok": True,
@@ -2766,9 +2851,11 @@ def _handle_watch(
                 "no_result": counts.no_result,
                 "agree": counts.agree,
                 "last_seen": model.format_iso(stream.last_seen),
+                "baseline_kind": baseline_kind,
+                "baseline_name": baseline_name,
                 "baseline_last_seen": (
-                    None if mainline_last_seen is None
-                    else model.format_iso(mainline_last_seen)
+                    None if baseline_last_seen is None
+                    else model.format_iso(baseline_last_seen)
                 ),
             })
         else:
@@ -3046,6 +3133,11 @@ def _route(
             _check_method(request.method, ("GET",))
             return _handle_history(
                 storage, request, environment, script, test_name
+            )
+        if action == "streams":
+            _check_method(request.method, ("GET",))
+            return _handle_test_streams(
+                storage, environment, script, test_name
             )
         if action == "comments":
             _check_method(request.method, ("GET", "POST"))

@@ -82,6 +82,7 @@ __all__ = [
     "EnvironmentExpectation",
     "EnvironmentProduct",
     "Stream",
+    "StreamResult",
     "CompareCounts",
     "CompareRow",
     "UpsertCounts",
@@ -1275,6 +1276,27 @@ class CompareRow(NamedTuple):
     stream_run_id: Optional[int]
     stream_start_time: Optional[datetime.datetime]
     assignee: Optional[str]
+
+
+class StreamResult(NamedTuple):
+    """One stream's latest result for a single (environment, script,
+    test_name) triple (WP-22, docs/STREAMS_PLAN.md §4.1: the test page's
+    "Every build" disclosure and its stream dropdown).
+
+    Produced by :meth:`Storage.stream_results_for_triple`, which reads
+    ONLY ``latest_runs`` rows that exist for the triple — a stream that
+    never ran this test is simply absent from the list (§0.6: "a stream
+    with no result for a test says nothing about it"). The caller
+    decides how to render that absence; this type never fakes a result
+    to paper over it. ``stream.failing`` is always 0 here (meaningless
+    for this read), the same convention :meth:`Storage.stream_identities`
+    uses.
+    """
+
+    stream: Stream
+    result: Result
+    run_id: int
+    start_time: datetime.datetime
 
 
 class ScriptHourBucket(NamedTuple):
@@ -3704,8 +3726,9 @@ class Storage:
 
     def compare_counts_many(
         self, stream_environments: Dict[int, Sequence[str]],
+        baselines: Optional[Dict[int, int]] = None,
     ) -> Dict[int, "CompareCounts"]:
-        """Compare N streams against mainline, in ONE query total.
+        """Compare N streams against their baselines, in ONE query total.
 
         For the Watchlist's ``s:`` cards (docs/STREAMS_PLAN.md §3.6):
         ``/api/watch`` already fetches every OTHER card's data in O(1)
@@ -3722,6 +3745,17 @@ class Storage:
         Streams that resolved to no environments (an undeclared product)
         get an all-zero :class:`CompareCounts`.
 
+        *baselines* is ``{stream_id: baseline_stream_id}`` (WP-22,
+        docs/STREAMS_PLAN.md §4.1: a build's default baseline is its
+        predecessor build, not mainline, when one exists — see
+        :meth:`previous_builds`). A stream absent from *baselines*, or
+        the argument omitted entirely, keeps the original behaviour
+        (compared against mainline) — every caller from before this
+        drop is unaffected. Every DISTINCT baseline id named (mainline
+        included) is folded into the SAME query's ``IN`` clause, so
+        this stays ONE query regardless of how many cards ask for a
+        non-mainline baseline, not one more per card.
+
         Unlike :meth:`compare_counts`, classification happens in PYTHON
         rather than as a SQL CASE: each requested stream can scope to a
         DIFFERENT set of environments (a different product), so a single
@@ -3730,27 +3764,34 @@ class Storage:
         thousands of tests) fetching the raw rows once and grouping in
         memory is simpler and no more expensive.
         ``tests/test_storage.py::CompareCountsManyTest`` cross-checks
-        this against :meth:`compare_counts` for the same stream, so the
-        two classifications cannot silently drift apart.
+        this against :meth:`compare_counts` for the same stream
+        (mainline and, for the WP-22 predecessor path, a non-mainline
+        baseline too), so the two classifications cannot silently drift
+        apart.
         """
         if not stream_environments:
             return {}
+        baselines = baselines or {}
         conn = self._conn()
         stream_ids = sorted(stream_environments)
         all_envs = sorted({
             env for envs in stream_environments.values() for env in envs
         })
+        baseline_ids = sorted({
+            baselines.get(stream_id, MAINLINE_STREAM_ID)
+            for stream_id in stream_ids
+        })
         id_placeholders = ", ".join("?" for _ in stream_ids)
         clauses = ["lr.stream_id IN ({0})".format(id_placeholders)]
         params = list(stream_ids)  # type: List[Any]
         if all_envs:
+            baseline_placeholders = ", ".join("?" for _ in baseline_ids)
             env_placeholders = ", ".join("?" for _ in all_envs)
             clauses.append(
-                "(lr.stream_id = ? AND lr.environment IN ({0}))".format(
-                    env_placeholders
-                )
+                "(lr.stream_id IN ({0}) AND lr.environment IN "
+                "({1}))".format(baseline_placeholders, env_placeholders)
             )
-            params.append(MAINLINE_STREAM_ID)
+            params.extend(baseline_ids)
             params.extend(all_envs)
         rows = conn.execute(
             "SELECT lr.stream_id, lr.environment, lr.script, "
@@ -3762,24 +3803,31 @@ class Storage:
             params,
         ).fetchall()
 
-        mainline = {}  # type: Dict[Tuple[str, str, str], str]
+        # A row can land in either bucket, or both — a stream can be one
+        # card's OWN stream and another card's baseline (e.g. an
+        # explicitly-requested predecessor build) in the same request.
+        baseline_partitions = {}  # type: Dict[int, Dict[Tuple[str, str, str], str]]
         partitions = {}  # type: Dict[int, Dict[Tuple[str, str, str], str]]
+        baseline_id_set = set(baseline_ids)
         for row in rows:
             sid, environment, script, test_name = (
                 int(row[0]), row[1], row[2], row[3]
             )
             triple = (environment, script, test_name)
-            if sid == MAINLINE_STREAM_ID:
-                mainline[triple] = row[4]
-            else:
+            if sid in baseline_id_set:
+                baseline_partitions.setdefault(sid, {})[triple] = row[4]
+            if sid in stream_environments:
                 partitions.setdefault(sid, {})[triple] = row[4]
 
         fail = Result.FAIL.value
         results = {}  # type: Dict[int, CompareCounts]
         for stream_id, envs in stream_environments.items():
             env_set = set(envs)
+            baseline_id = baselines.get(stream_id, MAINLINE_STREAM_ID)
             baseline = {
-                triple: result for triple, result in mainline.items()
+                triple: result
+                for triple, result
+                in baseline_partitions.get(baseline_id, {}).items()
                 if triple[0] in env_set
             }
             # Match compare_counts' SQL path (_compare_partition_sql
@@ -3847,6 +3895,107 @@ class Storage:
             )
             for row in rows
         }
+
+    def stream_results_for_triple(
+        self, environment: str, script: str, test_name: str,
+    ) -> List["StreamResult"]:
+        """Every stream's latest result for one (environment, script,
+        test_name) triple, newest first by that stream's own run
+        (WP-22, docs/STREAMS_PLAN.md §4.1).
+
+        Reads ``idx_latest_runs_triple (environment, script, test_name)``
+        — the index WP-21 added for exactly this query — joined to
+        ``streams`` for identity. Row count is the number of streams
+        that HAVE run this triple (bounded by the product's stream
+        count, small), never the number of streams that exist: a
+        stream with no result for this test is simply absent, per §0.6
+        — the caller (the test page's "Every build" table) is the one
+        that renders that absence as NO RESULT, by unioning this list
+        against ``GET /api/streams`` on the frontend; the dropdown next
+        to it wants exactly this list unmodified, since a dropdown
+        entry with nothing to show is not useful.
+
+        No product filter here even though every real-world caller is
+        scoped to one product: this triple's ``environment`` is already
+        the discriminator (a stream can only carry a run of this exact
+        environment if it was created by an import naming it, which
+        fixes that stream's product at creation time — see
+        :meth:`_find_or_create_stream`), so filtering again by a
+        product resolved from the CURRENT ``environment_products``
+        mapping would silently drop a legitimate row if that mapping
+        was ever changed after the fact. Reading by environment alone
+        is what stays correct across a remap.
+        """
+        rows = self._conn().execute(
+            "SELECT s.id, s.product, s.kind, s.name, s.first_seen, "
+            "s.last_seen, lr.result, lr.run_id, lr.start_time "
+            "FROM latest_runs lr JOIN streams s ON s.id = lr.stream_id "
+            "WHERE lr.environment = ? AND lr.script = ? "
+            "AND lr.test_name = ? ORDER BY lr.start_time DESC",
+            (environment, script, test_name),
+        ).fetchall()
+        return [
+            StreamResult(
+                stream=Stream(
+                    stream_id=int(row[0]), product=row[1], kind=row[2],
+                    name=row[3], first_seen=model.parse_iso(row[4]),
+                    last_seen=model.parse_iso(row[5]), failing=0,
+                ),
+                result=Result(row[6]),
+                run_id=int(row[7]),
+                start_time=model.parse_iso(row[8]),
+            )
+            for row in rows
+        ]
+
+    def previous_builds(
+        self, streams: Sequence["Stream"],
+    ) -> Dict[int, "Stream"]:
+        """For every ``kind='build'`` stream in *streams*, its nearest
+        earlier same-product build by ``last_seen`` (id as tiebreak) —
+        the WP-22 default comparison baseline (docs/STREAMS_PLAN.md
+        §4.1: "the previous build by last_seen where one exists, else
+        mainline"). A stream that is not a build, or has no earlier
+        build of the same product, is simply absent from the result;
+        the caller's own fallback is mainline, the same default every
+        comparison already has.
+
+        ONE query regardless of how many build streams are asked
+        about, bounded to their DISTINCT products (an ``IN`` clause,
+        one round trip) — the same flat-cost discipline
+        :meth:`compare_counts_many` and :meth:`stream_identities` hold
+        for ``/api/watch``'s ``s:`` cards, the only caller under that
+        constraint today.
+        """
+        builds = [stream for stream in streams if stream.kind == "build"]
+        if not builds:
+            return {}
+        products = sorted({stream.product for stream in builds})
+        placeholders = ", ".join("?" for _ in products)
+        rows = self._conn().execute(
+            "SELECT id, product, kind, name, first_seen, last_seen "
+            "FROM streams WHERE kind = 'build' AND product IN ({0}) "
+            "ORDER BY product, last_seen, id".format(placeholders),
+            products,
+        ).fetchall()
+        by_product = {}  # type: Dict[str, List[Sequence[Any]]]
+        for row in rows:
+            by_product.setdefault(row[1], []).append(row)
+        result = {}  # type: Dict[int, Stream]
+        for stream in builds:
+            predecessor = None  # type: Optional[Sequence[Any]]
+            for row in by_product.get(stream.product, []):
+                if int(row[0]) == stream.stream_id:
+                    break
+                predecessor = row
+            if predecessor is not None:
+                result[stream.stream_id] = Stream(
+                    stream_id=int(predecessor[0]), product=predecessor[1],
+                    kind=predecessor[2], name=predecessor[3],
+                    first_seen=model.parse_iso(predecessor[4]),
+                    last_seen=model.parse_iso(predecessor[5]), failing=0,
+                )
+        return result
 
     def known_environments(self) -> List[str]:
         """Every environment that has run a test or carries a declaration.

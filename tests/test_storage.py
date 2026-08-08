@@ -4094,6 +4094,222 @@ class CompareCountsManyTest(StorageTestBase):
         self.assertEqual(one, both)
 
 
+class CompareCountsManyBaselinesTest(StorageTestBase):
+    """compare_counts_many's WP-22 *baselines* argument (docs/STREAMS_PLAN.md
+    §4.1): a build compared against its predecessor build instead of
+    mainline, still in ONE query."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.PASS),
+            make_record(test_name="test_b", result=Result.FAIL),
+        ])
+        older = BASE + datetime.timedelta(hours=1)
+        newer = BASE + datetime.timedelta(hours=2)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="1.0", start=older),
+            make_record(test_name="test_b", result=Result.PASS,
+                        build="1.0", start=older),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="1.1", start=newer),
+            make_record(test_name="test_c", result=Result.PASS,
+                        build="1.1", start=newer),
+        ])
+        builds = {s.name: s.stream_id
+                  for s in self.store.list_streams("Atlas")}
+        self.build_1_0 = builds["1.0"]
+        self.build_1_1 = builds["1.1"]
+
+    def test_agrees_with_compare_counts_for_a_non_mainline_baseline(
+            self) -> None:
+        envs = self.store.environments_for_product("Atlas")
+        many = self.store.compare_counts_many(
+            {self.build_1_1: envs},
+            baselines={self.build_1_1: self.build_1_0},
+        )
+        self.assertEqual(
+            many[self.build_1_1],
+            self.store.compare_counts(
+                self.build_1_1, baseline_id=self.build_1_0),
+        )
+        # 1.0: test_a FAIL, test_b PASS. 1.1: test_a FAIL, test_c PASS.
+        # both_failing (test_a), no_result (test_b, absent from 1.1),
+        # new_tests (test_c, absent from 1.0).
+        counts = many[self.build_1_1]
+        self.assertEqual(counts.both_failing, 1)
+        self.assertEqual(counts.no_result, 1)
+        self.assertEqual(counts.new_tests, 1)
+
+    def test_a_stream_absent_from_baselines_still_compares_to_mainline(
+            self) -> None:
+        """Only streams NAMED in *baselines* change default -- everyone
+        else keeps comparing to mainline, unaffected by this drop."""
+        envs = self.store.environments_for_product("Atlas")
+        many = self.store.compare_counts_many(
+            {self.build_1_0: envs, self.build_1_1: envs},
+            baselines={self.build_1_1: self.build_1_0},
+        )
+        self.assertEqual(
+            many[self.build_1_0], self.store.compare_counts(self.build_1_0))
+
+    def test_query_count_does_not_grow_with_a_baseline_override(
+            self) -> None:
+        conn = self.store._conn()
+        envs = self.store.environments_for_product("Atlas")
+
+        def query_count(baselines: Optional[Dict[int, int]]) -> int:
+            statements = []  # type: List[str]
+            trace_sql_into(conn, statements)
+            try:
+                self.store.compare_counts_many(
+                    {self.build_1_1: envs}, baselines=baselines)
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        self.assertEqual(
+            query_count(None),
+            query_count({self.build_1_1: self.build_1_0}),
+        )
+
+
+class PreviousBuildsTest(StorageTestBase):
+    """Storage.previous_builds: the WP-22 default comparison baseline for
+    a build stream (docs/STREAMS_PLAN.md §4.1)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "win-sim", "Borealis", "alice", CREATED)
+        t0 = BASE
+        t1 = BASE + datetime.timedelta(hours=1)
+        t2 = BASE + datetime.timedelta(hours=2)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", build="1.0", start=t0),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", build="1.1", start=t1),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", build="1.2", start=t2),
+        ])
+        self.store.upsert_runs([
+            make_record(environment="win-sim", test_name="test_x",
+                        build="9.0", start=t0),
+        ])
+        atlas = {s.name: s for s in self.store.list_streams("Atlas")}
+        self.build_1_0 = atlas["1.0"]
+        self.build_1_1 = atlas["1.1"]
+        self.build_1_2 = atlas["1.2"]
+        self.build_9_0 = self.store.list_streams("Borealis")[0]
+
+    def test_the_newest_build_predecessor_is_the_one_just_before_it(
+            self) -> None:
+        result = self.store.previous_builds(
+            [self.build_1_0, self.build_1_1, self.build_1_2])
+        self.assertNotIn(self.build_1_0.stream_id, result)
+        self.assertEqual(
+            result[self.build_1_1.stream_id].name, "1.0")
+        self.assertEqual(
+            result[self.build_1_2.stream_id].name, "1.1")
+
+    def test_a_different_products_build_never_becomes_the_predecessor(
+            self) -> None:
+        """Atlas's oldest build has no predecessor even though Borealis
+        has an earlier one -- products never mix."""
+        result = self.store.previous_builds(
+            [self.build_1_0, self.build_9_0])
+        self.assertNotIn(self.build_1_0.stream_id, result)
+        self.assertNotIn(self.build_9_0.stream_id, result)
+
+    def test_a_branch_is_never_given_a_predecessor(self) -> None:
+        self.store.upsert_runs([
+            make_record(test_name="test_z", branch="feat/x")])
+        branch = self.store.list_streams("Atlas")[-1]
+        self.assertEqual(branch.kind, "branch")
+        result = self.store.previous_builds([branch])
+        self.assertEqual(result, {})
+
+    def test_empty_input_returns_empty_dict(self) -> None:
+        self.assertEqual(self.store.previous_builds([]), {})
+
+    def test_query_count_is_one_regardless_of_build_count(self) -> None:
+        conn = self.store._conn()
+
+        def query_count(streams: List["storage.Stream"]) -> int:
+            statements = []  # type: List[str]
+            trace_sql_into(conn, statements)
+            try:
+                self.store.previous_builds(streams)
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        self.assertEqual(
+            query_count([self.build_1_1]),
+            query_count([self.build_1_1, self.build_1_2]),
+        )
+
+
+class StreamResultsForTripleTest(StorageTestBase):
+    """Storage.stream_results_for_triple: this triple's latest result on
+    every stream that HAS one, newest first (docs/STREAMS_PLAN.md §4.1) —
+    the test page's "Every build" table and its stream dropdown."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        t0 = BASE
+        t1 = BASE + datetime.timedelta(hours=1)
+        t2 = BASE + datetime.timedelta(hours=2)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.PASS, start=t0),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="1.0", start=t1),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        branch="feat/x", start=t2),
+        ])
+        # A stream that exists but never ran test_a -- must never appear.
+        self.store.upsert_runs([
+            make_record(test_name="test_b", build="9.9", start=t0),
+        ])
+
+    def test_newest_first_across_every_stream_that_ran_it(self) -> None:
+        results = self.store.stream_results_for_triple(
+            "linux-sim", "suite.py", "test_a")
+        self.assertEqual(
+            [(r.stream.kind, r.stream.name) for r in results],
+            [("branch", "feat/x"), ("build", "1.0"), ("mainline", "")],
+        )
+        self.assertEqual(results[0].result, Result.FAIL)
+
+    def test_a_stream_with_no_result_for_the_triple_is_absent(self) -> None:
+        results = self.store.stream_results_for_triple(
+            "linux-sim", "suite.py", "test_a")
+        names = {r.stream.name for r in results}
+        self.assertNotIn("9.9", names)
+
+    def test_unknown_triple_returns_an_empty_list(self) -> None:
+        self.assertEqual(
+            self.store.stream_results_for_triple(
+                "linux-sim", "suite.py", "no_such_test"),
+            [],
+        )
+
+
 class StreamIdentitiesTest(StorageTestBase):
     """Batch stream metadata lookup for the Watchlist's s: cards."""
 

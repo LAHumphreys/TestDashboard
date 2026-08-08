@@ -771,6 +771,72 @@ class TestHistory(ApiCase):
         self.assert_405("POST", self.path, "GET")
 
 
+class TestStreamResults(ApiCase):
+    """GET .../streams (WP-22, docs/STREAMS_PLAN.md §4.1): a triple's
+    latest result on every stream that HAS one, newest first -- the test
+    page's "Every build" table and its stream dropdown."""
+
+    ENV = "linux-sim"
+    SCRIPT = "suite/alpha.py"
+    NAME = "test_flow"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="PASS"),
+        ])
+        self.call(
+            "PUT", "/api/environments/{}/product".format(self.ENV),
+            body={"product": "Atlas", "username": "amy"})
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="FAIL", build="1.0",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="FAIL", branch="feat/x",
+                   start_time="2026-07-25T04:00:00.000000",
+                   end_time="2026-07-25T04:00:03.000000"),
+        ])
+        # A stream that never ran THIS test -- must never appear.
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name="test_other", build="9.9",
+                   start_time="2026-07-25T02:30:00.000000",
+                   end_time="2026-07-25T02:30:03.000000"),
+        ])
+        self.path = test_path(self.ENV, self.SCRIPT, self.NAME, "/streams")
+
+    def test_newest_first_and_identity_shape(self) -> None:
+        data = self.call("GET", self.path)
+        self.assertEqual(data["environment"], self.ENV)
+        self.assertEqual(data["script"], self.SCRIPT)
+        self.assertEqual(data["test_name"], self.NAME)
+        kinds = [row["stream"]["kind"] for row in data["results"]]
+        self.assertEqual(kinds, ["branch", "build", "mainline"])
+        self.assertEqual(data["results"][0]["result"], "FAIL")
+        self.assertIn("run_id", data["results"][0])
+        self.assertIn("start_time", data["results"][0])
+
+    def test_a_stream_that_never_ran_this_test_is_absent(self) -> None:
+        data = self.call("GET", self.path)
+        names = {row["stream"]["name"] for row in data["results"]}
+        self.assertNotIn("9.9", names)
+
+    def test_unknown_triple_404(self) -> None:
+        self.call(
+            "GET",
+            test_path(self.ENV, self.SCRIPT, "no_such", "/streams"),
+            expect=404,
+        )
+
+    def test_wrong_method(self) -> None:
+        self.assert_405("POST", self.path, "GET")
+
+
 class TestRunEndpoint(ApiCase):
     """GET /api/runs/{run_id}: the only place output is returned."""
 
@@ -3032,6 +3098,11 @@ class TestWatchStreamCards(ApiCase):
         self.assertEqual(card["agree"], 0)
         self.assertIsNotNone(card["last_seen"])
         self.assertIsNotNone(card["baseline_last_seen"])
+        # WP-22: a branch has no predecessor concept, so its baseline is
+        # always mainline -- named explicitly, never assumed by the
+        # frontend from a hardcoded word.
+        self.assertEqual(card["baseline_kind"], "mainline")
+        self.assertEqual(card["baseline_name"], "")
 
     def test_an_unknown_stream_id_is_an_error_card(self) -> None:
         (card,) = self.call(
@@ -3123,6 +3194,76 @@ class TestWatchStreamCardImplicitProduct(ApiCase):
                 query={"stream": [str(self.stream_id)]}
             )["counts"]["new_failures"],
             "the card must agree with /api/compare for the same stream")
+
+
+class TestWatchBuildStreamCards(ApiCase):
+    """WP-22 (docs/STREAMS_PLAN.md §4.1): a build-kind s: card's default
+    baseline is its predecessor build, not mainline, when one exists --
+    the same default the build-scoped dashboard's "Compare to" control
+    opens on."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="PASS"),
+        ])
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="FAIL", build="1.0",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="FAIL", build="1.1",
+                   start_time="2026-07-25T04:00:00.000000",
+                   end_time="2026-07-25T04:00:03.000000"),
+            record(environment="linux-sim", test_name="test_b",
+                   result="PASS", build="1.1",
+                   start_time="2026-07-25T04:00:00.000000",
+                   end_time="2026-07-25T04:00:03.000000"),
+        ])
+        builds = {
+            s["name"]: s["id"] for s in self.call(
+                "GET", "/api/streams", query={"product": ["Atlas"]}
+            )["streams"]
+        }
+        self.build_1_0 = builds["1.0"]
+        self.build_1_1 = builds["1.1"]
+
+    def test_the_newer_builds_baseline_is_the_older_build(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.build_1_1)]})["cards"]
+        self.assertEqual(card["baseline_kind"], "build")
+        self.assertEqual(card["baseline_name"], "1.0")
+        # 1.0: test_a FAIL only. 1.1: test_a FAIL, test_b PASS (new).
+        self.assertEqual(card["both_failing"], 1)
+        self.assertEqual(card["new_tests"], 1)
+        self.assertEqual(card["new_failures"], 0)
+
+    def test_the_oldest_builds_baseline_is_mainline(self) -> None:
+        """1.0 has no earlier build -- falls back to mainline, matching
+        the dashboard's own "else mainline" default."""
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.build_1_0)]})["cards"]
+        self.assertEqual(card["baseline_kind"], "mainline")
+
+    def test_agrees_with_compare_using_the_same_baseline(self) -> None:
+        card = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.build_1_1)]})["cards"][0]
+        compared = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.build_1_1)],
+                   "baseline": [str(self.build_1_0)]})
+        self.assertEqual(card["both_failing"], compared["counts"]["both_failing"])
+        self.assertEqual(card["new_tests"], compared["counts"]["new_tests"])
 
 
 class TestEnvironmentUpdated(ApiCase):
@@ -3694,13 +3835,82 @@ class TestCompareEndpoint(ApiCase):
             "GET", "/api/compare", query={"stream": ["999999"]},
             expect=404)
 
-    def test_non_mainline_baseline_is_refused_in_this_drop(self) -> None:
+    def test_same_product_non_mainline_baseline_is_allowed(self) -> None:
+        """WP-22 (docs/STREAMS_PLAN.md §4.1) lifts the WP-21-era
+        restriction: baseline= now accepts any stream of the SAME
+        product as stream=, not only mainline. Comparing a stream
+        against itself is a degenerate case (every test agrees with
+        itself) rather than an error -- the point of this test is that
+        it is no longer REFUSED."""
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "baseline": [str(self.stream_id)]})
+        self.assertEqual(data["baseline"]["id"], self.stream_id)
+        self.assertEqual(data["counts"]["new_failures"], 0)
+        self.assertEqual(data["counts"]["new_tests"], 0)
+        self.assertEqual(data["counts"]["no_result"], 0)
+
+    def _make_other_product_stream(self) -> int:
+        """A second stream, in a DIFFERENT product, product fixed at
+        stream-creation time (declared before the BRANCH import,
+        matching docs/STREAMS_PLAN.md §3.3). The environment has to
+        exist (a mainline import) before /api/environments/{env}/product
+        will accept a declaration for it -- same rule as every other
+        expectation-style endpoint."""
+        self.import_runs([
+            record(environment="other-env", test_name="test_z",
+                   result="PASS"),
+        ])
+        self.call(
+            "PUT", "/api/environments/other-env/product",
+            body={"product": "Borealis", "username": "amy"})
+        self.import_runs([
+            record(environment="other-env", test_name="test_z",
+                   result="PASS", branch="feat/y",
+                   start_time="2026-07-25T04:00:00.000000",
+                   end_time="2026-07-25T04:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": ["Borealis"]}
+        )["streams"]
+        return int(streams[0]["id"])
+
+    def test_cross_product_baseline_is_refused(self) -> None:
+        """A baseline from a DIFFERENT product is refused with a clear
+        400 naming both products -- the environments filter is
+        resolved from stream='s own product alone, so a mismatched
+        baseline would otherwise silently compare against the wrong
+        environments instead of erroring."""
+        other_stream_id = self._make_other_product_stream()
         error = self.call(
             "GET", "/api/compare",
             query={"stream": [str(self.stream_id)],
+                   "baseline": [str(other_stream_id)]},
+            expect=400)
+        self.assertIn("Borealis", error["error"])
+
+    def test_cross_product_refusal_is_symmetric(self) -> None:
+        """The refusal fires however stream=/baseline= are assigned to
+        the two streams, not only in one direction."""
+        other_stream_id = self._make_other_product_stream()
+        error = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(other_stream_id)],
                    "baseline": [str(self.stream_id)]},
             expect=400)
-        self.assertIn("WP-22", error["error"])
+        self.assertIn("Borealis", error["error"])
+
+    def test_mainline_baseline_never_triggers_the_product_check(
+        self
+    ) -> None:
+        """Mainline is the one universal exception -- comparing any
+        stream against mainline must keep working regardless of the
+        stream's own product, exactly as it did before this drop."""
+        other_stream_id = self._make_other_product_stream()
+        data = self.call(
+            "GET", "/api/compare", query={"stream": [str(other_stream_id)]})
+        self.assertEqual(data["baseline"]["kind"], "mainline")
 
     def test_the_six_counts_and_both_sides_identity(self) -> None:
         data = self.call(
