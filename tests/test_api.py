@@ -2590,6 +2590,19 @@ class TestProductFiltering(ApiCase):
         self.assertIn("stale_before", scoped)
         self.assertIn("stale_before", unscoped)
 
+    def test_summary_unknown_product_is_empty_not_404(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/summary", query={"product": ["Nope"]})
+        self.assertEqual(data["status"]["total_tests"], 0)
+
+    def test_time_unknown_product_is_empty_not_404(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/time",
+            query={"product": ["Nope"], "include_stale": ["1"]})
+        self.assertEqual(data["items"], [])
+
     def test_time_product_filter(self) -> None:
         self._seed()
         data = self.call(
