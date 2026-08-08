@@ -398,6 +398,11 @@ def _summary_row_json(
         "known_failure_reason": row.known_failure_reason,
         "source_link": row.source_link,
         "assignee": row.assignee,
+        # WHERE the current assignment was made from (WP-21) — null for
+        # mainline/pre-existing. Open Actions is the one place that
+        # renders it (docs/STREAMS_PLAN.md §3.6); every other consumer
+        # of this endpoint ignores the field, same as any additive one.
+        "assignment_stream_id": row.assignment_stream_id,
         "retired_at": (
             None if row.retired_at is None
             else model.format_iso(row.retired_at)
@@ -772,6 +777,34 @@ def _resolve_stream_id(
     return stream_id
 
 
+def _validate_optional_stream_id(
+    storage: Storage, obj: Dict[str, Any]
+) -> Optional[int]:
+    """Parse an optional ``stream_id`` body field — an ANNOTATION, not a
+    scope (WP-21). Shared by comment creation and assignment: both
+    record "posted/made from" this stream, never partition by it.
+    Absent or ``null`` means no declared context, the same reading as
+    every comment/assignment made before this feature. 400 on a
+    non-integer, 404 on an id that names no stream.
+    """
+    raw_stream_id = obj.get("stream_id")
+    if raw_stream_id is None:
+        return None
+    if not isinstance(raw_stream_id, int) or isinstance(
+            raw_stream_id, bool):
+        raise _HttpError(
+            400,
+            "stream_id: must be an integer or null, got {}".format(
+                type(raw_stream_id).__name__
+            ),
+        )
+    if storage.get_stream(raw_stream_id) is None:
+        raise _HttpError(
+            404, "unknown stream: {}".format(raw_stream_id)
+        )
+    return raw_stream_id
+
+
 def _handle_dashboard(
     storage: Storage,
     request: Request,
@@ -808,6 +841,17 @@ def _handle_dashboard(
     include_unassigned = _query_single(
         request.query, "unassigned") in ("1", "true")
     assignees = request.query.get("assignee") or []
+    # WP-21, Open Actions' branch/mainline origin filter — WHERE the
+    # current assignment was made from, an axis entirely separate from
+    # `stream=` above (which scopes the test's own result).
+    assignment_origin = _query_single(request.query, "origin")
+    if assignment_origin is not None and assignment_origin not in (
+            "branch", "mainline"):
+        raise _HttpError(
+            400,
+            "origin: must be 'branch' or 'mainline', got '{}'".format(
+                assignment_origin),
+        )
 
     sort = _query_single(request.query, "sort") or _DEFAULT_SORT
     if sort not in DASHBOARD_SORTS:
@@ -840,6 +884,7 @@ def _handle_dashboard(
         "include_unassigned": include_unassigned,
         "environments": environments,
         "stream_id": stream_id,
+        "assignment_origin": assignment_origin,
     }  # type: Dict[str, Any]
     rows = storage.dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,
@@ -854,6 +899,18 @@ def _handle_dashboard(
     ]
     if with_streak:
         _add_streaks(storage, rows, payload, now(), stream_id)
+    # WP-21: batch-resolve every DISTINCT assignment_stream_id on THIS
+    # PAGE to its identity — the same shape the comments endpoint uses,
+    # needed here so Open Actions can render a "branch feat/x" tag
+    # without a lookup per row.
+    assignment_stream_ids = sorted({
+        row.assignment_stream_id for row in rows
+        if row.assignment_stream_id is not None
+    })
+    streams = (
+        storage.stream_identities(assignment_stream_ids)
+        if assignment_stream_ids else {}
+    )
     return _json_response(
         200,
         {
@@ -864,6 +921,9 @@ def _handle_dashboard(
             "with_streak": with_streak,
             "product": product,
             "stream": stream_id,
+            "streams": {
+                str(sid): _stream_json(s) for sid, s in streams.items()
+            },
         },
     )
 
@@ -1244,6 +1304,20 @@ def _handle_summary(
         nights.append(night)
 
     status = estate.status
+    # WP-21: every non-mainline stream currently annotating an
+    # assignment, resolved to its identity and ordered by id (dict
+    # iteration order is not a promised sort) — Open Actions' origin
+    # filter reads this the same way it already reads `assignees`
+    # below: the available VALUES to filter by, and (empty list) the
+    # "zero visible change" signal that no assignment carries a stream.
+    assignment_stream_ids = storage.assignment_stream_ids()
+    assignment_streams_by_id = storage.stream_identities(
+        assignment_stream_ids)
+    assignment_streams = [
+        _stream_json(assignment_streams_by_id[sid])
+        for sid in assignment_stream_ids
+        if sid in assignment_streams_by_id
+    ]
     payload = {
             "generated_at": model.format_iso(current),
             "environment": environment,
@@ -1257,6 +1331,13 @@ def _handle_summary(
             "environments": storage.environments(),
             "scripts": storage.scripts(environment),
             "assignees": storage.assignees(),
+            # WP-21: every non-mainline stream currently annotating an
+            # assignment, resolved to its identity — Open Actions' origin
+            # filter reads this the same way it already reads
+            # `assignees` above: the available VALUES to filter by, and
+            # (empty list) the "zero visible change" signal that no
+            # assignment carries a stream at all.
+            "assignment_streams": assignment_streams,
             "recent_hours": _SUMMARY_RECENT_HOURS,
             # The cutoff ITSELF, so the frontend stops recomputing it
             # from a fixed number of hours. It is what gates the offer
@@ -1536,22 +1617,7 @@ def _handle_comment_create(
     obj = _parse_json_object(request.body)
     username = _validate_username(obj, "username")
     text = _validate_comment_text(obj)
-    stream_id = None  # type: Optional[int]
-    raw_stream_id = obj.get("stream_id")
-    if raw_stream_id is not None:
-        if not isinstance(raw_stream_id, int) or isinstance(
-                raw_stream_id, bool):
-            raise _HttpError(
-                400,
-                "stream_id: must be an integer or null, got {}".format(
-                    type(raw_stream_id).__name__
-                ),
-            )
-        if storage.get_stream(raw_stream_id) is None:
-            raise _HttpError(
-                404, "unknown stream: {}".format(raw_stream_id)
-            )
-        stream_id = raw_stream_id
+    stream_id = _validate_optional_stream_id(storage, obj)
     comment = storage.add_comment(
         environment, script, test_name, username, text, now(),
         stream_id=stream_id,
@@ -1567,7 +1633,15 @@ def _handle_assignee(
     test_name: str,
     now: Callable[[], datetime.datetime],
 ) -> Response:
-    """PUT .../assignee — set or clear (null) the test's assignee."""
+    """PUT .../assignee — set or clear (null) the test's assignee.
+
+    Body gains an optional ``stream_id`` (WP-21) — WHERE the assignment
+    was made from, not part of its identity: the frontend sends the
+    page's current stream scope when set (docs/STREAMS_PLAN.md §3.6's
+    "triage still works from a branch"), never a partition of who owns
+    the test. Absent or ``null`` means mainline, or a client that has
+    not heard of streams — every assignment made before this feature.
+    """
     _require_test(storage, environment, script, test_name)
     obj = _parse_json_object(request.body)
     if "username" not in obj:
@@ -1590,8 +1664,10 @@ def _handle_assignee(
                 "intended.".format(assignee),
             )
     assigned_by = _validate_username(obj, "assigned_by")
+    stream_id = _validate_optional_stream_id(storage, obj)
     storage.set_assignee(
-        environment, script, test_name, assignee, assigned_by, now()
+        environment, script, test_name, assignee, assigned_by, now(),
+        stream_id=stream_id,
     )
     return _json_response(200, {"assignee": assignee})
 
@@ -2385,6 +2461,17 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
                     None if row.baseline_result is None
                     else row.baseline_result.value
                 ),
+                # WP-21: what the frontend's Review expander and
+                # assignee select need — the branch's own run (null
+                # exactly when there is nothing on the stream side to
+                # review) and the triple's CURRENT assignee (never
+                # partitioned by stream — see CompareRow).
+                "stream_run_id": row.stream_run_id,
+                "stream_start_time": (
+                    None if row.stream_start_time is None
+                    else model.format_iso(row.stream_start_time)
+                ),
+                "assignee": row.assignee,
             }
             for row in rows
         ]

@@ -211,6 +211,7 @@ CREATE TABLE assignments (
   assignee    {user} NULL,
   assigned_by {user} NOT NULL,
   assigned_at {stamp} NOT NULL,
+  stream_id   BIGINT NULL,
   PRIMARY KEY (id)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
@@ -219,6 +220,7 @@ CREATE TABLE current_assignments (
   script      {script} NOT NULL,
   test_name   {name} NOT NULL,
   assignee    {user} NULL,
+  stream_id   BIGINT NULL,
   PRIMARY KEY (environment, script, test_name)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 

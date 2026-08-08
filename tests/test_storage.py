@@ -1280,6 +1280,85 @@ class TestAssignments(StorageTestBase):
         )
 
 
+class TestAssignmentStreamId(StorageTestBase):
+    """``stream_id`` on set_assignee (WP-21, folded into migration 9):
+    WHERE an assignment was made from, an annotation on
+    assignments/current_assignments, never a partition of who owns the
+    test — the assignee itself is read the same way regardless
+    (docs/STREAMS_PLAN.md §3.4/§3.6)."""
+
+    TRIPLE = ("linux-sim", "suite.py", "test_a")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        self.stream_id = self.store.list_streams("")[0].stream_id
+
+    def _current_stream_id(self) -> Optional[int]:
+        """Read ``current_assignments.stream_id`` directly — there is no
+        higher-level accessor for it alone (the dashboard/queue reads
+        return the whole row; a bare assignment needs no test to
+        exist)."""
+        row = self.store._conn().execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = ? AND script = ? AND test_name = ?",
+            self.TRIPLE,
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def test_defaults_to_none(self) -> None:
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="alice", assigned_by="bob",
+            assigned_at=CREATED,
+        )
+        self.assertIsNone(self._current_stream_id())
+
+    def test_round_trips_when_given(self) -> None:
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="alice", assigned_by="bob",
+            assigned_at=CREATED, stream_id=self.stream_id,
+        )
+        self.assertEqual(self._current_stream_id(), self.stream_id)
+        # The assignee itself is unaffected -- it is not partitioned by
+        # stream_id, only annotated with it.
+        self.assertEqual(self.store.current_assignee(*self.TRIPLE), "alice")
+
+    def test_reassignment_updates_the_stream_id_too(self) -> None:
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="alice", assigned_by="bob",
+            assigned_at=CREATED, stream_id=self.stream_id,
+        )
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="carol", assigned_by="bob",
+            assigned_at=CREATED + datetime.timedelta(minutes=1),
+        )
+        self.assertIsNone(self._current_stream_id())
+        self.assertEqual(self.store.current_assignee(*self.TRIPLE), "carol")
+
+    def test_clearing_can_still_carry_a_stream_id(self) -> None:
+        """Clearing FROM a branch's view is itself a decision made
+        there -- the annotation is not only for the positive case."""
+        self.store.set_assignee(
+            *self.TRIPLE, assignee=None, assigned_by="bob",
+            assigned_at=CREATED, stream_id=self.stream_id,
+        )
+        self.assertIsNone(self.store.current_assignee(*self.TRIPLE))
+        self.assertEqual(self._current_stream_id(), self.stream_id)
+
+    def test_the_history_row_also_carries_it(self) -> None:
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="alice", assigned_by="bob",
+            assigned_at=CREATED, stream_id=self.stream_id,
+        )
+        row = self.store._conn().execute(
+            "SELECT stream_id FROM assignments WHERE "
+            "environment = ? AND script = ? AND test_name = ? "
+            "ORDER BY id DESC LIMIT 1",
+            self.TRIPLE,
+        ).fetchone()
+        self.assertEqual(row[0], self.stream_id)
+
+
 class TestThreading(StorageTestBase):
     """Per-thread connections: writes in one thread visible in another."""
 
@@ -3852,6 +3931,35 @@ class CompareStreamsTest(StorageTestBase):
         self.assertEqual(rows[0].test_name, "test_c")
         self.assertIsNone(rows[0].stream_result)
         self.assertEqual(rows[0].baseline_result, Result.PASS)
+        # test_c has no run on the stream side at all -- nothing to
+        # review there, a fact rather than a gap (WP-21 §3.6).
+        self.assertIsNone(rows[0].stream_run_id)
+
+    def test_stream_run_id_is_the_streams_own_run_never_the_baselines(
+            self) -> None:
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        self.assertIsNotNone(rows[0].stream_run_id)
+        branch_run = self.store.latest_run(
+            "linux-sim", "suite.py", "test_a", stream_id=self.stream_id)
+        self.assertEqual(rows[0].stream_run_id, branch_run.run_id)
+        mainline_run = self.store.latest_run(
+            "linux-sim", "suite.py", "test_a")
+        self.assertNotEqual(rows[0].stream_run_id, mainline_run.run_id)
+        self.assertEqual(rows[0].stream_start_time, branch_run.start_time)
+
+    def test_assignee_is_the_triples_current_assignee_not_stream_scoped(
+            self) -> None:
+        """Assigning is not partitioned by stream — a delta row must
+        show the SAME assignee the mainline dashboard shows for the
+        same test (docs/STREAMS_PLAN.md §3.4)."""
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        self.assertEqual(rows[0].assignee, "alice")
+
+    def test_assignee_is_none_when_unassigned(self) -> None:
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        self.assertIsNone(rows[0].assignee)
 
     def test_pagination_is_exact(self) -> None:
         total = self.store.compare_category_count(
@@ -4138,3 +4246,73 @@ class DashboardStreamScopingTest(StorageTestBase):
             start=BASE + datetime.timedelta(hours=2))])
         after = self.store.dashboard_count()
         self.assertEqual(before, after)
+
+
+class AssignmentOriginFilterTest(StorageTestBase):
+    """dashboard()/dashboard_count()'s ``assignment_origin`` filter
+    (WP-21, Open Actions §3.6) — WHERE the CURRENT assignment was made
+    from, an axis entirely separate from ``stream_id`` (which scopes
+    the test's own result, not who assigned it)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_a"),
+            make_record(test_name="test_b"),
+            make_record(test_name="test_c"),
+        ])
+        self.store.upsert_runs([make_record(branch="feat/x")])
+        self.stream_id = self.store.list_streams("")[0].stream_id
+        # test_a: assigned from mainline (no stream_id)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        # test_b: assigned from the branch
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "alice", "bob", CREATED,
+            stream_id=self.stream_id)
+        # test_c: never assigned at all
+
+    def test_no_filter_returns_everything(self) -> None:
+        self.assertEqual(self.store.dashboard_count(), 3)
+
+    def test_branch_origin_returns_only_the_branch_made_assignment(
+            self) -> None:
+        rows = self.store.dashboard(assignment_origin="branch")
+        self.assertEqual([r.test_name for r in rows], ["test_b"])
+        self.assertEqual(
+            self.store.dashboard_count(assignment_origin="branch"), 1)
+
+    def test_mainline_origin_includes_unassigned_and_mainline_made(
+            self) -> None:
+        """"mainline" reads as "not from a branch" — an unassigned test
+        was not made from anywhere, so it counts as mainline too, the
+        same way it counts as mainline for un-retirement (§3.4)."""
+        rows = self.store.dashboard(assignment_origin="mainline")
+        self.assertEqual(
+            sorted(r.test_name for r in rows), ["test_a", "test_c"])
+        self.assertEqual(
+            self.store.dashboard_count(assignment_origin="mainline"), 2)
+
+    def test_an_unknown_origin_value_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.dashboard(assignment_origin="nonsense")
+
+    def test_assignment_stream_ids_lists_only_non_mainline_ones(
+            self) -> None:
+        self.assertEqual(
+            self.store.assignment_stream_ids(), [self.stream_id])
+
+
+class AssignmentStreamIdsEmptyTest(StorageTestBase):
+    """assignment_stream_ids() on a database with no branch-originated
+    assignment at all — the signal Open Actions' filter reads to honour
+    "zero visible change when no assignment carries a stream"."""
+
+    def test_empty_with_only_mainline_assignments(self) -> None:
+        self.store.upsert_runs([make_record(test_name="test_a")])
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        self.assertEqual(self.store.assignment_stream_ids(), [])
+
+    def test_empty_with_no_assignments_at_all(self) -> None:
+        self.assertEqual(self.store.assignment_stream_ids(), [])

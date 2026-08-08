@@ -658,6 +658,25 @@ MIGRATIONS = [
             # that creates one. Row 1 is THE mainline stream and is
             # seeded by the python step below; every run recorded
             # before this migration is, and remains, on it.
+            #
+            # FOLDED IN, not appended as migration 10: the
+            # assignments/current_assignments ALTERs a few entries below
+            # were added after this entry first shipped internally, but
+            # before this branch was accepted or deployed anywhere —
+            # docs/STREAMS_PLAN.md §3.6's triage-from-a-branch behaviour
+            # (found in first human use of the branch dashboard) needs
+            # them, and migration 9 is still unshipped. No database
+            # anywhere has the narrower shape this entry had before the
+            # fold (this repo's own scratch copies do not count, and are
+            # rebuilt from v8 rather than trusted); a database that DOES
+            # exist at v9 already only if someone ran an earlier build of
+            # this exact branch, which is a dev machine, not a
+            # deployment. `CLAUDE.md`'s "never edit `MIGRATIONS[0]`" rule
+            # protects a migration that is IN PRODUCTION; this one is not
+            # yet, so folding here is the right side of that line, not a
+            # violation of it — a migration 10 for one more nullable
+            # column on a schema element nobody has deployed would just
+            # be two round trips of ALTER TABLE where one already does.
             """
             CREATE TABLE streams (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -696,6 +715,26 @@ MIGRATIONS = [
             # with it — the annotation still belongs to the triple.
             "ALTER TABLE comments ADD COLUMN stream_id INTEGER "
             "REFERENCES streams(id) ON DELETE SET NULL",
+            # Same shape as comments.stream_id, same reason, for the
+            # other annotation-not-identity table: an assignment is a
+            # decision about the (environment, script, test_name)
+            # triple, not about one stream's copy of it — triage from a
+            # branch assigns the SAME test everyone else sees
+            # (docs/STREAMS_PLAN.md §0.4/§3.6), so this is metadata
+            # about WHERE the assignment was made, never a partition key.
+            # NULL means "made before this column existed, or with no
+            # declared stream context" — the same reading as a null
+            # comment.stream_id, and what every assignment ever made
+            # before this migration has. ON DELETE SET NULL for the same
+            # reason: deleting a stream (tools/drop_stream.py) must not
+            # take an assignment's history with it.
+            "ALTER TABLE assignments ADD COLUMN stream_id INTEGER "
+            "REFERENCES streams(id) ON DELETE SET NULL",
+            # The CURRENT-state twin of the ALTER above — see its
+            # comment. Both are written together, in the same
+            # transaction, by Storage.set_assignee.
+            "ALTER TABLE current_assignments ADD COLUMN stream_id "
+            "INTEGER REFERENCES streams(id) ON DELETE SET NULL",
             # latest_runs is DERIVED (~12k rows: one per test, on
             # mainline alone — see migration 5's comment for the
             # precedent). It is rebuilt with the stream in the key
@@ -959,6 +998,12 @@ class TestSummaryRow(NamedTuple):
     source_link: str
     known_failure_reason: Optional[str]
     assignee: Optional[str]
+    #: WHERE the current assignment was made from (WP-21) — an
+    #: annotation, never a partition of the assignment itself (the
+    #: assignee above is the same regardless of which stream someone is
+    #: viewing). None for a mainline-made assignment, or one made before
+    #: this column existed. See Storage.set_assignee.
+    assignment_stream_id: Optional[int]
     retired_at: Optional[datetime.datetime]
     retired_by: Optional[str]
     #: Newest comment on this test — only populated when the caller asked
@@ -985,6 +1030,7 @@ class TestStatusRow(NamedTuple):
     source_link: str
     known_failure_reason: Optional[str]
     assignee: Optional[str]
+    assignment_stream_id: Optional[int]
     retired_at: Optional[datetime.datetime]
     retired_by: Optional[str]
     latest_comment: Optional["LatestComment"]
@@ -1208,7 +1254,17 @@ class CompareRow(NamedTuple):
     ``stream_result``/``baseline_result`` are ``None`` when that side has
     no result for the triple (a category-consistent fact — a row is
     only ever in the ``new_tests``/``no_result`` categories because one
-    side is None).
+    side is None). ``stream_run_id``/``stream_start_time`` (WP-21,
+    review-from-a-branch) are likewise ``None`` exactly when
+    ``stream_result`` is — a triple with no result on the stream side
+    has no run to review, which is a fact, not a gap: the frontend shows
+    no Review expander for those rows rather than a broken one. Both are
+    always the STREAM's own run, never the baseline's — reviewing a
+    branch's failure means that branch's output, and the shared review
+    panel's "View in timeline" link needs the right run's start time to
+    deep-link correctly. ``assignee`` is the triple's CURRENT assignee,
+    unpartitioned by stream (docs/STREAMS_PLAN.md §3.4: assigning from a
+    branch row assigns the same test everyone else sees).
     """
 
     environment: str
@@ -1216,6 +1272,9 @@ class CompareRow(NamedTuple):
     test_name: str
     stream_result: Optional[Result]
     baseline_result: Optional[Result]
+    stream_run_id: Optional[int]
+    stream_start_time: Optional[datetime.datetime]
+    assignee: Optional[str]
 
 
 class ScriptHourBucket(NamedTuple):
@@ -1565,8 +1624,8 @@ _LATEST_COMMENT_COLUMNS = (
 _STATUS_COLUMN_NAMES = (
     "lr.environment", "lr.script", "lr.test_name", "lr.run_id",
     "lr.result", "lr.start_time", "r.end_time", "r.source_link",
-    "r.known_failure_reason", "ca.assignee", "tr.retired_at",
-    "tr.retired_by",
+    "r.known_failure_reason", "ca.assignee", "ca.stream_id",
+    "tr.retired_at", "tr.retired_by",
 )
 
 #: Index of the first latest-comment column in a row that includes them,
@@ -1602,8 +1661,11 @@ def _summary_row_from(
         source_link=row[7],
         known_failure_reason=row[8],
         assignee=row[9],
-        retired_at=None if row[10] is None else model.parse_iso(row[10]),
-        retired_by=row[11],
+        assignment_stream_id=(
+            None if row[10] is None else int(row[10])
+        ),
+        retired_at=None if row[11] is None else model.parse_iso(row[11]),
+        retired_by=row[12],
         latest_comment=latest_comment,
     )
 
@@ -2590,6 +2652,7 @@ class Storage:
         include_unassigned: bool = False,
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
+        assignment_origin: Optional[str] = None,
     ) -> Tuple[List[str], List[Any]]:
         """Build the shared WHERE clauses for the dashboard list and count.
 
@@ -2606,7 +2669,15 @@ class Storage:
         stream's partition of ``latest_runs`` — the leading column of
         every WP-21 index (see migration 9), so this equality predicate
         is what keeps the sort indexes usable rather than forcing a
-        TEMP B-TREE.
+        TEMP B-TREE. *assignment_origin* (WP-21, ``"branch"`` or
+        ``"mainline"``, default no filter) is Open Actions' origin
+        filter — WHERE the CURRENT assignment was made from, an
+        entirely different axis from *stream_id* above (which scopes
+        the test's OWN result, not who assigned it or from where) —
+        server-side by the same rule the *assignees* filter already
+        follows (a client-side filter over one paged fetch would turn
+        "every branch-originated item" into "the branch-originated ones
+        that happen to be on this page").
         """
         clauses = ["lr.stream_id = ?"]  # type: List[str]
         params = [stream_id]  # type: List[Any]
@@ -2647,6 +2718,18 @@ class Storage:
             owner_clauses.append("ca.assignee IS NULL")
         if owner_clauses:
             clauses.append("({})".format(" OR ".join(owner_clauses)))
+
+        if assignment_origin == "branch":
+            clauses.append("(ca.stream_id IS NOT NULL AND ca.stream_id != ?)")
+            params.append(MAINLINE_STREAM_ID)
+        elif assignment_origin == "mainline":
+            clauses.append("(ca.stream_id IS NULL OR ca.stream_id = ?)")
+            params.append(MAINLINE_STREAM_ID)
+        elif assignment_origin is not None:
+            raise ValueError(
+                "assignment_origin must be 'branch', 'mainline' or None, "
+                "got {!r}".format(assignment_origin)
+            )
         return clauses, params
 
     @staticmethod
@@ -2683,6 +2766,7 @@ class Storage:
         offset: int = 0,
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
+        assignment_origin: Optional[str] = None,
     ) -> List[TestSummaryRow]:
         """Return ONE PAGE of the latest run per test, never with ``output``.
 
@@ -2701,7 +2785,9 @@ class Storage:
         returned row, so it is opt-in and never paid for by the home
         screen. *stream_id* (WP-21, default mainline) selects one
         partition of ``latest_runs`` — the ``/api/dashboard`` ``stream=``
-        param, resolved by the caller.
+        param, resolved by the caller. *assignment_origin* (WP-21,
+        Open Actions only) narrows by WHERE the current assignment was
+        made from — see :meth:`_dashboard_filters`.
 
         *sort* is a key of :data:`DASHBOARD_SORTS`; every ordering ends
         with the full test identity, so *limit*/*offset* paging is stable
@@ -2720,7 +2806,7 @@ class Storage:
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
-            stream_id,
+            stream_id, assignment_origin,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -2754,6 +2840,7 @@ class Storage:
         include_unassigned: bool = False,
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
+        assignment_origin: Optional[str] = None,
     ) -> int:
         """Exact number of tests matching the same filters as :meth:`dashboard`."""
         result_values = (
@@ -2764,7 +2851,7 @@ class Storage:
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
-            stream_id,
+            stream_id, assignment_origin,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
         if clauses:
@@ -2809,6 +2896,26 @@ class Storage:
             "WHERE assignee IS NOT NULL ORDER BY assignee"
         ).fetchall()
         return [row[0] for row in rows]
+
+    def assignment_stream_ids(self) -> List[int]:
+        """Every DISTINCT non-mainline stream currently annotating an
+        assignment (WP-21, docs/STREAMS_PLAN.md §3.6), sorted.
+
+        Open Actions' branch/mainline origin filter needs a real,
+        estate-wide existence check to honour "zero visible change when
+        no assignment carries a stream" — a check built only from
+        whichever page of rows happened to be fetched would flicker the
+        filter in and out as someone pages or re-filters. Mirrors
+        :meth:`assignees`' shape exactly, which the same page's owner
+        filter already reads the same way.
+        """
+        rows = self._conn().execute(
+            "SELECT DISTINCT stream_id FROM current_assignments "
+            "WHERE stream_id IS NOT NULL AND stream_id != ? "
+            "ORDER BY stream_id",
+            (MAINLINE_STREAM_ID,),
+        ).fetchall()
+        return [int(row[0]) for row in rows]
 
     def summary_rollup(
         self,
@@ -3376,12 +3483,18 @@ class Storage:
         whole ``latest_runs`` unfiltered would pull in every other
         product's environments as spurious ``no_result``/``new_tests``
         rows. Takes a ``?`` for ``stream_id``, bound by the caller.
+
+        ``lr.run_id``/``lr.start_time`` ride along (WP-21,
+        review-from-a-branch) — both are already columns on
+        ``latest_runs``, so this is no new query shape, only a wider
+        SELECT list on a read that already happens.
         """
         envs_clause, envs_params = Storage._environments_clause(
             environments, column="lr.environment"
         )
         sql = (
-            "SELECT lr.environment, lr.script, lr.test_name, lr.result "
+            "SELECT lr.environment, lr.script, lr.test_name, lr.result, "
+            "lr.run_id, lr.start_time "
             "FROM latest_runs lr LEFT JOIN test_retirements tr "
             "  ON tr.environment = lr.environment AND tr.script = lr.script "
             " AND tr.test_name = lr.test_name "
@@ -3404,21 +3517,26 @@ class Storage:
         (triples on the baseline the stream has nothing for, which the
         first half already excluded from double-counting). Columns are
         named consistently across both halves — ``stream_result``,
-        ``baseline_result`` — never swapped, so the caller's CASE
-        expression means the same thing for every row.
+        ``baseline_result``, ``stream_run_id``, ``stream_start_time`` —
+        never swapped, so the caller's CASE expression means the same
+        thing for every row. ``stream_run_id``/``stream_start_time`` are
+        ALWAYS the stream side's own run (``s.*``/``s2.*`` respectively,
+        never the baseline's), by the same invariant.
         """
         part_sql, envs_params = cls._compare_partition_sql(environments)
         pairs_sql = (
             "SELECT s.environment AS environment, s.script AS script, "
             "s.test_name AS test_name, s.result AS stream_result, "
-            "m.result AS baseline_result "
+            "m.result AS baseline_result, s.run_id AS stream_run_id, "
+            "s.start_time AS stream_start_time "
             "FROM ({part}) s LEFT JOIN ({part}) m "
             "  ON m.environment = s.environment AND m.script = s.script "
             " AND m.test_name = s.test_name "
             "UNION ALL "
             "SELECT m2.environment AS environment, m2.script AS script, "
             "m2.test_name AS test_name, s2.result AS stream_result, "
-            "m2.result AS baseline_result "
+            "m2.result AS baseline_result, s2.run_id AS stream_run_id, "
+            "s2.start_time AS stream_start_time "
             "FROM ({part}) m2 LEFT JOIN ({part}) s2 "
             "  ON s2.environment = m2.environment AND s2.script = m2.script "
             " AND s2.test_name = m2.test_name "
@@ -3513,12 +3631,27 @@ class Storage:
         pairs_sql, params = self._compare_pairs_sql(
             stream_id, baseline_id, environments
         )
+        # current_assignments is joined on the FINAL PAGE only (after
+        # categorization/pagination) — bounded by `limit`, the same
+        # shape as every other page-only join in this module (e.g. the
+        # dashboard's `ca` join), not a cost that grows with the
+        # comparison's size.
         sql = (
-            "SELECT environment, script, test_name, stream_result, "
-            "baseline_result FROM (SELECT environment, script, test_name, "
-            "stream_result, baseline_result, {0} AS category "
+            "SELECT categorized.environment, categorized.script, "
+            "categorized.test_name, categorized.stream_result, "
+            "categorized.baseline_result, categorized.stream_run_id, "
+            "categorized.stream_start_time, ca.assignee "
+            "FROM (SELECT environment, script, test_name, "
+            "stream_result, baseline_result, stream_run_id, "
+            "stream_start_time, {0} AS category "
             "FROM ({1}) pairs) categorized "
-            "WHERE category = ? ORDER BY environment, script, test_name "
+            "LEFT JOIN current_assignments ca "
+            "  ON ca.environment = categorized.environment "
+            " AND ca.script = categorized.script "
+            " AND ca.test_name = categorized.test_name "
+            "WHERE categorized.category = ? "
+            "ORDER BY categorized.environment, categorized.script, "
+            "categorized.test_name "
             "LIMIT ? OFFSET ?"
         ).format(self._COMPARE_CASE, pairs_sql)
         rows = self._conn().execute(
@@ -3531,6 +3664,11 @@ class Storage:
                 test_name=row[2],
                 stream_result=None if row[3] is None else Result(row[3]),
                 baseline_result=None if row[4] is None else Result(row[4]),
+                stream_run_id=None if row[5] is None else int(row[5]),
+                stream_start_time=(
+                    None if row[6] is None else model.parse_iso(row[6])
+                ),
+                assignee=row[7],
             )
             for row in rows
         ]
@@ -5019,6 +5157,7 @@ class Storage:
         assignee: Optional[str],
         assigned_by: str,
         assigned_at: datetime.datetime,
+        stream_id: Optional[int] = None,
     ) -> None:
         """Append an assignment-history row and update the current state.
 
@@ -5028,6 +5167,15 @@ class Storage:
         *assigned_by* and *assignee* (when not None) are implicitly
         created as users. Both writes share one transaction, so the log
         and the current state can never disagree.
+
+        *stream_id* (WP-21, default ``None``) is WHERE the assignment
+        was made from — an annotation on the assignment, never a
+        partition key: the test being assigned is the same test
+        regardless of which stream's dashboard someone was looking at
+        (docs/STREAMS_PLAN.md §3.4/§3.6). ``None`` means "made from
+        mainline, or before this column existed" — the API layer only
+        ever passes a non-None value when the caller was actually
+        scoped to a non-mainline stream.
         """
         conn = self._conn()
         triple = (environment, script, test_name)
@@ -5038,12 +5186,13 @@ class Storage:
                 self.ensure_user(assignee, assigned_at)
             conn.execute(
                 "INSERT INTO assignments (environment, script, test_name, "
-                "assignee, assigned_by, assigned_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "assignee, assigned_by, assigned_at, stream_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 triple + (
                     assignee,
                     assigned_by,
                     model.format_iso(assigned_at),
+                    stream_id,
                 ),
             )
             existing = conn.execute(
@@ -5054,15 +5203,17 @@ class Storage:
             if existing is None:
                 conn.execute(
                     "INSERT INTO current_assignments (environment, script, "
-                    "test_name, assignee) VALUES (?, ?, ?, ?)",
-                    triple + (assignee,),
+                    "test_name, assignee, stream_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    triple + (assignee, stream_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE current_assignments SET assignee = ? "
+                    "UPDATE current_assignments SET assignee = ?, "
+                    "stream_id = ? "
                     "WHERE environment = ? AND script = ? "
                     "AND test_name = ?",
-                    (assignee,) + triple,
+                    (assignee, stream_id) + triple,
                 )
             conn.execute("COMMIT")
         except Exception:

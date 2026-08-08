@@ -97,7 +97,7 @@ after a merge.
 | 6 | WP-17 | `activity_hours` table, `runs.output_fingerprint` | Yes — see §1.2 |
 | 7 | WP-18 | `script_hours` table *(took 7 from WP-15 — see below)* | Yes — see §1.2 |
 | 8 | WP-20 | `environment_products` table *(took 8 from WP-15 — see below)* | No |
-| 9 | WP-21 | `streams` table, `runs.stream_id`, `comments.stream_id`, `latest_runs` rebuilt with `stream_id` *(took 9 from WP-15 — see below)* | Yes — see §1.2 (`latest_runs` rebuild; ~12k rows) |
+| 9 | WP-21 | `streams` table, `runs.stream_id`, `comments.stream_id`, `assignments.stream_id`, `current_assignments.stream_id`, `latest_runs` rebuilt with `stream_id` *(took 9 from WP-15 — see below; the two `assignments`/`current_assignments` columns were folded in after this entry first landed but before this branch shipped anywhere — see the entry's own comment in `storage.py`)* | Yes — see §1.2 (`latest_runs` rebuild; ~12k rows) |
 | 10 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8, then 9 — see below)* | No |
 | 11+ | *unallocated* | Claim by editing this table in the same commit | — |
 

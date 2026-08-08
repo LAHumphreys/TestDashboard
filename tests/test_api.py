@@ -58,6 +58,7 @@ DASHBOARD_ROW_KEYS = {
     "known_failure_reason",
     "source_link",
     "assignee",
+    "assignment_stream_id",
     "retired_at",
     "retired_by",
 }
@@ -393,6 +394,75 @@ class TestDashboard(ApiCase):
 
     def test_wrong_method(self) -> None:
         self.assert_405("POST", "/api/dashboard", "GET")
+
+
+class TestDashboardAssignmentOrigin(ApiCase):
+    """``/api/dashboard``'s ``origin=`` filter and ``streams`` map
+    (WP-21, Open Actions §3.6)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a"),
+            record(test_name="test_b"),
+        ])
+        self.import_runs([record(
+            test_name="test_c", branch="feat/x",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.call(
+            "PUT", test_path("linux-sim", "suite/alpha.py", "test_a",
+                              "/assignee"),
+            body={"username": "alice", "assigned_by": "bob",
+                  "stream_id": self.stream_id})
+        self.call(
+            "PUT", test_path("linux-sim", "suite/alpha.py", "test_b",
+                              "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+
+    def test_no_filter_returns_the_streams_map_for_the_page(self) -> None:
+        data = self.call("GET", "/api/dashboard")
+        self.assertEqual(
+            data["streams"][str(self.stream_id)]["kind"], "branch")
+        self.assertEqual(
+            data["streams"][str(self.stream_id)]["name"], "feat/x")
+
+    def test_no_page_streams_no_map_entries(self) -> None:
+        """A test with no branch-originated assignment on the returned
+        page must not spuriously carry a streams entry."""
+        data = self.call(
+            "GET", "/api/dashboard", query={"q": ["test_b"]})
+        self.assertEqual(data["streams"], {})
+
+    def test_origin_branch_filters_to_the_branch_made_assignment(
+            self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"origin": ["branch"]}
+        )["tests"]
+        self.assertEqual([r["test_name"] for r in rows], ["test_a"])
+
+    def test_origin_mainline_excludes_the_branch_made_assignment(
+            self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"origin": ["mainline"]}
+        )["tests"]
+        self.assertNotIn(
+            "test_a", [r["test_name"] for r in rows])
+
+    def test_an_invalid_origin_value_is_400(self) -> None:
+        data = self.call(
+            "GET", "/api/dashboard", query={"origin": ["nonsense"]},
+            expect=400)
+        self.assertIn("origin", data["error"])
+
+    def test_row_carries_the_assignment_stream_id(self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"q": ["test_a"]}
+        )["tests"]
+        self.assertEqual(rows[0]["assignment_stream_id"], self.stream_id)
 
 
 class TestDashboardPaging(ApiCase):
@@ -1034,6 +1104,54 @@ class TestAssignee(ApiCase):
                   "comment": "suite dropped it"})
         self.call("PUT", "/api/users/alice/active",
                   body={"active": False, "changed_by": "bob"})
+
+
+class TestAssigneeStreamId(ApiCase):
+    """PUT .../assignee's optional ``stream_id`` (WP-21, folded into
+    migration 9): WHERE the assignment was made from — the frontend
+    sends the page's current stream scope when set."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_a")])
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_a", branch="feat/x",
+            result="FAIL",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.path = test_path(
+            "linux-sim", "suite/alpha.py", "test_a", "/assignee")
+
+    def test_defaults_to_null(self) -> None:
+        self.call("PUT", self.path,
+                   body={"username": "alice", "assigned_by": "bob"})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertIsNone(rows[0]["assignment_stream_id"])
+
+    def test_round_trips_when_given(self) -> None:
+        self.call("PUT", self.path, body={
+            "username": "alice", "assigned_by": "bob",
+            "stream_id": self.stream_id,
+        })
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(rows[0]["assignment_stream_id"], self.stream_id)
+        self.assertEqual(rows[0]["assignee"], "alice")
+
+    def test_unknown_stream_id_is_404(self) -> None:
+        self.call("PUT", self.path, body={
+            "username": "alice", "assigned_by": "bob",
+            "stream_id": 999999,
+        }, expect=404)
+
+    def test_non_integer_stream_id_is_400(self) -> None:
+        self.call("PUT", self.path, body={
+            "username": "alice", "assigned_by": "bob",
+            "stream_id": "nope",
+        }, expect=400)
 
 
 class TestSortingIsStable(ApiCase):
@@ -1989,6 +2107,44 @@ class TestActionsFilters(ApiCase):
         self.assertEqual(
             self.call("GET", "/api/summary")["assignees"], ["alice", "bob"]
         )
+
+
+class TestSummaryAssignmentStreams(ApiCase):
+    """``/api/summary``'s ``assignment_streams`` (WP-21, Open Actions'
+    origin filter) — the same "available values, empty means nothing to
+    filter" shape as ``assignees``."""
+
+    def test_empty_with_no_branch_originated_assignments(self) -> None:
+        self.import_runs([record(test_name="test_a")])
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_a",
+                      "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+        self.assertEqual(
+            self.call("GET", "/api/summary")["assignment_streams"], [])
+
+    def test_lists_every_stream_with_a_current_branch_assignment(
+            self) -> None:
+        self.import_runs([record(test_name="test_a")])
+        self.import_runs([record(
+            test_name="test_a", branch="feat/x",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        stream_id = streams[0]["id"]
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_a",
+                      "/assignee"),
+            body={"username": "alice", "assigned_by": "bob",
+                  "stream_id": stream_id})
+        result = self.call("GET", "/api/summary")["assignment_streams"]
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["id"], stream_id)
+        self.assertEqual(result[0]["kind"], "branch")
+        self.assertEqual(result[0]["name"], "feat/x")
 
 
 class TestScriptExecutions(ApiCase):
@@ -3577,6 +3733,31 @@ class TestCompareEndpoint(ApiCase):
         self.assertEqual(row["test_name"], "test_a")
         self.assertEqual(row["stream_result"], "FAIL")
         self.assertEqual(row["baseline_result"], "PASS")
+        # WP-21: what the delta view's Review expander/assignee select
+        # need — the branch's own run id, and the (unpartitioned)
+        # current assignee.
+        self.assertIsNotNone(row["stream_run_id"])
+        self.assertIsNone(row["assignee"])
+
+    def test_no_result_row_carries_no_run_to_review(self) -> None:
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "category": ["no_result"]})
+        [row] = data["tests"]
+        self.assertIsNone(row["stream_run_id"])
+
+    def test_the_row_shows_the_unpartitioned_current_assignee(self) -> None:
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_a", "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "category": ["new_failures"]})
+        [row] = data["tests"]
+        self.assertEqual(row["assignee"], "alice")
 
     def test_an_unknown_category_is_400(self) -> None:
         error = self.call(
