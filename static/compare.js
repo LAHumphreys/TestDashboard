@@ -398,6 +398,29 @@ function renderBaselineCard(streamMeta, baselineMeta, counts, nowMs) {
     + " — " + baseline + " last ran " + ageText(baselineMeta.last_seen, nowMs)
     + ".";
 
+  // WP-23 (docs/STREAMS_PLAN.md §5.2): drift framing built from data —
+  // "of N failing here, M fail on <baseline> too" — never a "behind by
+  // N commits" line (explicitly not knowable, not built: no VCS
+  // integration). N is new_failures+both_failing (both categories are
+  // guaranteed FAIL on THIS stream by CompareCounts' own definition);
+  // M is both_failing, the subset that is ALSO failing on the baseline
+  // — the honest way to separate "drift" (new_failures, unique to this
+  // stream) from "inherited" (both_failing, not this stream's doing).
+  const drift = document.getElementById("delta-drift");
+  if (drift) {
+    const failingHere = counts.new_failures + counts.both_failing;
+    if (failingHere === 0) {
+      drift.textContent = "Nothing is failing on this " + streamNoun + ".";
+    } else {
+      const failWord = counts.both_failing === 1 ? "fails" : "fail";
+      drift.textContent = "Of " + failingHere + " test"
+        + (failingHere === 1 ? "" : "s") + " failing here, "
+        + counts.both_failing + " also " + failWord + " on " + baseline
+        + " too.";
+    }
+    drift.hidden = false;
+  }
+
   // A stale baseline is a fact about the two timestamps just shown, not
   // a hidden threshold — 14 days is a display judgement about when the
   // WARNING earns its place on screen, not a value anything is filtered

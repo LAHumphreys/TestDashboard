@@ -215,6 +215,10 @@
       <p id="delta-agree" class="muted"></p>
       <p id="delta-coverage" class="muted"></p>
       <p id="delta-baseline" class="muted"></p>
+      <!-- WP-23 (docs/STREAMS_PLAN.md §5.2): "of N failing here, M fail
+           on <baseline> too" -- drift framing built from data, never a
+           "commits behind" line (not knowable, not built). -->
+      <p id="delta-drift" class="muted" hidden></p>
       <p id="delta-stale-warning" class="empty-state" hidden></p>
       <div id="delta-tabs" class="tab-row" role="tablist" aria-label="Comparison categories"></div>
       <div class="table-wrap">
