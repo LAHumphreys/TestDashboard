@@ -3647,6 +3647,14 @@ class SummaryStreamScopingTest(ApiCase):
             "GET", "/api/summary", query={"stream": [str(stream_id)]})
         expected = format_iso(NOW - datetime.timedelta(hours=36))
         self.assertEqual(scoped["stale_before"], expected)
+        # This is the number the branch dashboard's default-tab caption
+        # is built from. A single run against a stream whose own
+        # inferred test count is 1 clears the 50% coverage bar
+        # trivially (find_passes' denominator is THIS stream's own
+        # inferred count, not mainline's) -- one tiny, technically
+        # "covered" pass, nowhere near the "regular cadence" the
+        # caption's own >= 2 threshold is checking for.
+        self.assertEqual(scoped["covered_passes"], 1)
 
     def test_unknown_stream_is_a_404(self) -> None:
         self.seed()

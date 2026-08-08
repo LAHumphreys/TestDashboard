@@ -61,13 +61,34 @@ import {
 } from "./review.js";
 import { attachSorting, sortRows } from "./sorting.js";
 import { getSelectedProduct, renderSwitcher } from "./products.js";
-import { getSelectedStreamId, initDeltaView } from "./compare.js";
+import {
+  fetchCompare,
+  getSelectedBaselineId,
+  getSelectedStreamId,
+  initDeltaView,
+  renderBranchBand,
+  streamLabel,
+} from "./compare.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
 
+/** Covered passes (docs/STREAMS_PLAN.md §5.2) a branch needs in the
+ * 14-day lookback before its dashboard defaults to "Its own results"
+ * rather than "Difference from mainline". Not hidden: the caption this
+ * feeds (see selectBranchTab()) states the number and this threshold in
+ * plain words, built from data, never silently assumed. */
+const OWN_RESULTS_DEFAULT_PASSES = 2;
+
 const state = {
   environment: "",        // "" = all environments
+  // WP-23: non-null while viewing a branch stream's "Its own results"
+  // tab (docs/STREAMS_PLAN.md §5.2) -- summaryUrl/queueUrl/browseUrl
+  // append it as stream=, and a page that never opens a branch's own
+  // tab (every mainline visit, and a build/delta-only branch visit)
+  // leaves this null forever, which is what keeps those paths at zero
+  // visible change.
+  streamId: null,
   summary: null,          // last headline payload (no queue rows)
   // Queue rows by kind, fetched per tab on demand. Absent = not landed
   // yet for the current filters; renderQueueTable shows a loading line.
@@ -117,6 +138,37 @@ function appendProduct(qs) {
   }
 }
 
+/**
+ * Add `stream=<id>` (WP-23) IF this page is showing a branch's OWN
+ * results tab (state.streamId set by initBranchDashboard()). A page
+ * that never opens that tab never sets state.streamId, so this is a
+ * no-op there -- the same "absent = zero visible change" shape
+ * appendProduct() follows for a single-product deployment.
+ */
+function appendStream(qs) {
+  if (state.streamId !== null) {
+    qs.append("stream", String(state.streamId));
+  }
+}
+
+/**
+ * Stamp `stream_id` onto a page of dashboard/queue rows fetched while
+ * showing a branch's own-results tab -- assigneeSelect()/toggleReview()
+ * already read `entry.stream_id` generically (WP-21, api.js/review.js)
+ * to record WHERE an assignment/comment was made from, an annotation
+ * never a partition (docs/STREAMS_PLAN.md §0.4). A mainline page never
+ * calls this with a stream set, so those rows are untouched -- zero
+ * visible change there.
+ */
+function tagStream(rows) {
+  if (state.streamId !== null) {
+    for (const row of rows) {
+      row.stream_id = state.streamId;
+    }
+  }
+  return rows;
+}
+
 function summaryUrl() {
   const qs = new URLSearchParams();
   qs.append("parts", "headline");
@@ -124,6 +176,7 @@ function summaryUrl() {
     qs.append("environment", state.environment);
   }
   appendProduct(qs);
+  appendStream(qs);
   // The "my actions" queue is filtered server-side: picking a user's
   // tests out of an already-capped queue would hide their own work.
   // The headline needs the assignee too — the "mine" tab count.
@@ -143,6 +196,7 @@ function queueUrl(kind) {
     qs.append("environment", state.environment);
   }
   appendProduct(qs);
+  appendStream(qs);
   const me = getUsername();
   if (me) {
     qs.append("assignee", me);
@@ -157,6 +211,7 @@ function browseUrl(offset) {
     qs.append("environment", state.environment);
   }
   appendProduct(qs);
+  appendStream(qs);
   if (state.script) {
     qs.append("script", state.script);
   }
@@ -223,9 +278,9 @@ async function refreshAll() {
       if (seq !== state.requestSeq) {
         return;
       }
-      state.browseRows = page.tests;
+      state.browseRows = tagStream(page.tests);
       state.browseTotal = page.total;
-      renderBrowse(page.tests, false);
+      renderBrowse(state.browseRows, false);
     } catch (err) {
       if (seq === state.requestSeq) {
         showError(err.message);
@@ -253,6 +308,7 @@ async function loadQueue(kind, seq) {
     if (seq !== state.requestSeq) {
       return;
     }
+    tagStream(payload.queue.tests);
     state.queues[kind] = payload.queue;
     if (state.summary) {
       renderQueueTabs();
@@ -281,6 +337,7 @@ async function loadBrowse(append) {
     if (seq !== state.browseSeq) {
       return;  // a newer filter change already superseded this request
     }
+    tagStream(page.tests);
     state.browseRows = append
       ? state.browseRows.concat(page.tests) : page.tests;
     state.browseTotal = page.total;
@@ -335,6 +392,7 @@ async function fetchSummary() {
       const results = await summaryInFlight;
       state.summary = results[0];
       state.queues = {};
+      tagStream(results[1].queue.tests);
       state.queues[kind] = results[1].queue;
     } finally {
       summaryInFlight = null;
@@ -1383,24 +1441,28 @@ function scrollTo(sectionId) {
 
 /* ================= init ================= */
 
-function init() {
-  // "My actions" is scoped server-side to the signed-in user, so a
-  // username change has to go back to the server for it. Rendered
-  // before the stream check below: the header is not a mainline-only
-  // concept, so a branch-scoped page keeps it too.
-  renderUserWidget(document.getElementById("user-widget"),
-    () => { if (state.summary) { refreshSummary(); } });
+/** Sections that only mean something scoped to a real dashboard body
+ * (mainline, or a branch's "own results" tab) — the same set
+ * compare.js's MAINLINE_SECTIONS names, kept here too because app.js
+ * is what shows them again when switching back from the diff tab. */
+const DASHBOARD_SECTIONS = SECTIONS;
 
-  // WP-21 (docs/STREAMS_PLAN.md §3.6): a branch-scoped page load swaps
-  // the WHOLE dashboard body for the delta view and never reaches
-  // anything below this check — no /api/summary fetch, no queues, no
-  // browse table. That is what keeps every mainline page (this branch
-  // never taken) at zero visible change.
-  const streamId = getSelectedStreamId();
-  if (streamId !== null) {
-    initDeltaView(streamId);
+let mainlineControlsWired = false;
+
+/**
+ * Wire every one-time event listener the dashboard body needs
+ * (environment/script filters, search, toggles, sort headers, refresh,
+ * show-more). Idempotent — called once whether the page starts on a
+ * genuine mainline load or on a branch's "Its own results" tab, and
+ * NEVER again after that: switching between "Its own results" and
+ * "Difference from …" (see selectBranchTab()) must not pile up a
+ * second copy of every listener.
+ */
+function wireMainlineControls() {
+  if (mainlineControlsWired) {
     return;
   }
+  mainlineControlsWired = true;
 
   buildResultToggles();
 
@@ -1456,7 +1518,148 @@ function init() {
       refilterBrowse();
     });
   }
+}
 
+/**
+ * Show the dashboard body (status/charts/triage/browse), scoped to
+ * *streamId* if the "Its own results" tab is active — WP-23,
+ * docs/STREAMS_PLAN.md §5.2. Hides the delta section, wires the
+ * mainline controls exactly once, and reloads.
+ */
+function activateOwnResultsTab() {
+  document.getElementById("delta-section").hidden = true;
+  const envField = document.getElementById("env-filter-field");
+  if (envField) {
+    envField.hidden = false;
+  }
+  wireMainlineControls();
+  document.getElementById("loading-state").hidden = false;
+  refreshAll();
+}
+
+/** Swap to the delta ("Difference from …") view — hides the dashboard
+ * body outright, the same swap compare.js's own initDeltaView() has
+ * always done for a branch-scoped page. */
+function activateDiffTab(streamId) {
+  for (const id of DASHBOARD_SECTIONS) {
+    document.getElementById(id).hidden = true;
+  }
+  initDeltaView(streamId);
+}
+
+/**
+ * The two-tab header for a long-running branch stream (WP-23,
+ * docs/STREAMS_PLAN.md §5.2): "Its own results" (this same dashboard,
+ * scoped to the branch's own stream_id) and "Difference from
+ * <baseline>" (the WP-21/22 delta view, unchanged). BOTH tabs always
+ * exist for a branch stream — this is not gated on cadence, only the
+ * DEFAULT selection is (see the caption below).
+ *
+ * Release builds (kind 'build') and anything else non-branch keep the
+ * exact WP-21/22 behaviour — delta view only, no tab header — since
+ * §5.2 frames this as a BRANCH concept: an RC is not a second mainline
+ * with its own nightly cadence, and giving it a trend/staleness of its
+ * own would mostly be empty.
+ */
+function selectBranchTab(which, streamId) {
+  const ownBtn = document.getElementById("branch-tab-own");
+  const diffBtn = document.getElementById("branch-tab-diff");
+  ownBtn.setAttribute("aria-selected", which === "own" ? "true" : "false");
+  diffBtn.setAttribute("aria-selected", which === "diff" ? "true" : "false");
+  if (which === "own") {
+    state.streamId = streamId;
+    activateOwnResultsTab();
+  } else {
+    state.streamId = null;
+    activateDiffTab(streamId);
+  }
+}
+
+async function initBranchDashboard(streamId) {
+  let data;
+  try {
+    data = await fetchCompare(streamId, null, 0, getSelectedBaselineId());
+  } catch (err) {
+    showError(err.message);
+    return;
+  }
+  renderBranchBand(data.stream, data.baseline);
+
+  const tabs = document.getElementById("branch-tabs");
+  const caption = document.getElementById("branch-tab-caption");
+  if (data.stream.kind !== "branch" || !tabs) {
+    // Builds, and any deployment predating this drop's markup: the
+    // unchanged WP-21/22 delta-only behaviour.
+    if (tabs) {
+      tabs.hidden = true;
+    }
+    if (caption) {
+      caption.hidden = true;
+    }
+    activateDiffTab(streamId);
+    return;
+  }
+
+  const ownBtn = document.getElementById("branch-tab-own");
+  const diffBtn = document.getElementById("branch-tab-diff");
+  diffBtn.textContent = "Difference from " + streamLabel(data.baseline);
+  ownBtn.onclick = () => selectBranchTab("own", streamId);
+  diffBtn.onclick = () => selectBranchTab("diff", streamId);
+  tabs.hidden = false;
+
+  // The default tab: "Its own results" once the branch shows a
+  // regular-enough cadence, "Difference from …" otherwise. Stated in
+  // the caption FROM DATA — the covered-pass count and the threshold
+  // are both literally in the sentence, never a silent constant
+  // (docs/STREAMS_PLAN.md §5.2's own wording: "must be stated in the
+  // UI caption, not buried" — the same discipline WindowWordingTest
+  // holds every other recency line to).
+  let coveredPasses = 0;
+  try {
+    const headline = await fetchJson(
+      "/api/summary?parts=headline&stream=" + streamId);
+    coveredPasses = headline.covered_passes;
+  } catch (err) {
+    // The tab still works either way; the caption just falls back to
+    // the safe (diff) default below rather than guessing.
+  }
+  const preferOwn = coveredPasses >= OWN_RESULTS_DEFAULT_PASSES;
+  if (caption) {
+    const passWord = coveredPasses === 1 ? "pass" : "passes";
+    caption.hidden = false;
+    caption.textContent = preferOwn
+      ? ("Showing its own results by default — this branch has "
+         + "completed " + coveredPasses + " " + passWord + " in the "
+         + "last 14 days (" + OWN_RESULTS_DEFAULT_PASSES + " or more "
+         + "shows its own dashboard first).")
+      : ("Showing the difference from mainline by default — this "
+         + "branch has completed " + coveredPasses + " " + passWord
+         + " in the last 14 days (needs " + OWN_RESULTS_DEFAULT_PASSES
+         + " or more to show its own dashboard first).");
+  }
+  selectBranchTab(preferOwn ? "own" : "diff", streamId);
+}
+
+function init() {
+  // "My actions" is scoped server-side to the signed-in user, so a
+  // username change has to go back to the server for it. Rendered
+  // before the stream check below: the header is not a mainline-only
+  // concept, so a branch-scoped page keeps it too.
+  renderUserWidget(document.getElementById("user-widget"),
+    () => { if (state.summary) { refreshSummary(); } });
+
+  // WP-21/23 (docs/STREAMS_PLAN.md §3.6/§5.2): a branch-scoped page
+  // load never reaches the plain mainline path below this check — no
+  // unscoped /api/summary fetch, no queues, no browse table. That is
+  // what keeps every mainline page (this branch never taken) at zero
+  // visible change.
+  const streamId = getSelectedStreamId();
+  if (streamId !== null) {
+    initBranchDashboard(streamId);
+    return;
+  }
+
+  wireMainlineControls();
   refreshAll();
 }
 

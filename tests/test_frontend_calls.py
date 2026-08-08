@@ -1123,16 +1123,37 @@ class DeltaViewTest(unittest.TestCase):
         """The whole feature's footprint on a mainline page has to be
         ONE guarded call, not a code path that merely renders nothing —
         a fetch that still fires and is then hidden is not zero visible
-        change, it is zero visible change AND a wasted request."""
-        body = _function_body(read("app.js"), "function init()")
+        change, it is zero visible change AND a wasted request.
+
+        WIDENED for WP-23 (docs/STREAMS_PLAN.md §5.2), not weakened:
+        init() no longer calls initDeltaView() directly — it calls
+        initBranchDashboard(), which then picks between the branch
+        dashboard's two tabs ("its own results" / "difference from
+        mainline"). The invariant this test protects is unchanged (a
+        mainline load must never fire the delta view's fetch); it is
+        now checked through the new two-hop call chain instead of the
+        old direct one, with an explicit assertion that initDeltaView
+        does not leak into init()'s own body and that the guarded
+        branch never falls into the mainline continuation.
+        """
+        code = read("app.js")
+        body = _function_body(code, "function init()")
         self.assertIn("getSelectedStreamId()", body)
-        call_at = body.index("initDeltaView(")
+        call_at = body.index("initBranchDashboard(")
         # The nearest preceding "if" must guard the call, and that
         # branch must return before falling into the mainline code below
-        # it (buildResultToggles/refreshAll and everything after them).
+        # it (wireMainlineControls/refreshAll and everything after them).
         guard_at = body.rindex("if (", 0, call_at)
         branch = body[guard_at:body.index("}", call_at)]
         self.assertIn("return", branch)
+        self.assertNotIn("wireMainlineControls(", branch)
+        self.assertNotIn("refreshAll(", branch)
+        # initDeltaView itself must never appear in init()'s own body —
+        # only reachable through initBranchDashboard()/activateDiffTab(),
+        # both entirely inside the guarded branch checked above.
+        self.assertNotIn("initDeltaView(", body)
+        diff_body = _function_body(code, "function activateDiffTab(")
+        self.assertIn("initDeltaView(", diff_body)
 
     def test_the_new_sections_ship_hidden(self) -> None:
         """branch-band and delta-section must be hidden in the SHIPPED

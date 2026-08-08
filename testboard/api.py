@@ -1292,7 +1292,17 @@ def _handle_summary(
     # its OWN, never mainline's or another branch's (§5.2) — the two
     # clamps inside analytics.recent_cutoff (36h floor, 14-day ceiling)
     # apply to this stream's own passes, unchanged.
-    recent_cutoff = _recent_cutoff(storage, current, environments, stream_id)
+    pass_view = _pass_view(storage, current, environments, stream_id)
+    recent_cutoff = pass_view.cutoff.when
+    # WP-23: how many COVERED passes this stream has completed in the
+    # lookback window — the data behind the branch dashboard's
+    # own-results-vs-diff default (docs/STREAMS_PLAN.md §5.2 says the
+    # heuristic "must be stated in the UI caption, not buried"; this is
+    # the number that caption is built from, never a constant the
+    # frontend invents). Estate-wide/mainline callers get it too (it
+    # costs nothing extra — pass_view is already computed) but have no
+    # use for it.
+    covered_passes = sum(1 for entry in pass_view.passes if entry.covered)
 
     if part == "queue":
         kind = _query_single(request.query, "queue")
@@ -1383,6 +1393,11 @@ def _handle_summary(
             # assignment_streams) are ALWAYS estate-wide regardless —
             # see their own comments.
             "stream": stream_id,
+            # WP-23: covered passes THIS STREAM completed in the 14-day
+            # lookback — the branch dashboard's own-results-vs-diff
+            # default tab is built from this number, stated plainly in
+            # its caption (docs/STREAMS_PLAN.md §5.2).
+            "covered_passes": covered_passes,
             # ALWAYS estate-wide (see _products_summary) — this is what
             # lets a request scoped to one product still offer the
             # switcher's way back to "All products". Empty list = no

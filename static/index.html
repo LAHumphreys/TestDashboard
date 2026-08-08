@@ -34,6 +34,19 @@
       <a id="branch-band-back" href="index.html">Back to mainline</a>
     </div>
 
+    <!-- WP-23 (docs/STREAMS_PLAN.md §5.2): the two-tab header for a
+         long-running BRANCH stream only -- app.js's initBranchDashboard()
+         hides this outright for a build stream, or when this page is
+         not stream-scoped at all. Both tabs always exist; only the
+         DEFAULT selection depends on the branch's own cadence, and that
+         heuristic is stated in the caption below it, from data. -->
+    <div id="branch-tabs" class="tab-row" role="tablist"
+         aria-label="Branch dashboard view" hidden>
+      <button id="branch-tab-own" class="tab" type="button" role="tab">Its own results</button>
+      <button id="branch-tab-diff" class="tab" type="button" role="tab">Difference from mainline</button>
+    </div>
+    <p id="branch-tab-caption" class="muted" hidden></p>
+
     <!-- The one filter row: scopes every section below it. -->
     <section class="toolbar" aria-label="Scope">
       <label id="env-filter-field" class="toolbar-field">Environment
