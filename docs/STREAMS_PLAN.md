@@ -565,19 +565,27 @@ page answers "which builds fail this?" in one disclosure.
 Matches the plan above with these decisions made during implementation,
 recorded here rather than left implicit:
 
-- **Cross-product refusal rule, precisely:** allowed when either side is
-  `kind='mainline'`, or when both sides' `product` match; refused
-  otherwise, 400 naming both products. Mainline is exempt on EITHER side
-  (`stream=` or `baseline=`), not only as a baseline — the SQL is
-  symmetric and there is no reason the exemption should not be.
-- **"Searchable" (§4.1) was NOT built as a second datalist combo for the
-  Build picker itself** — that treatment went to the NEW "Compare to"
-  control only (§4.1's own explicit instruction), which needed it to let
-  a release manager type or pick a build/branch name. The picker stays
-  the WP-21 `<select>` with the new Builds/Branches `<optgroup>` split,
-  relying on native browser type-ahead. Revisit if a real deployment's
-  stream count makes this feel slow — the risk note in §4.3 already
-  expected this to need revisiting "if in doubt."
+- **Cross-product refusal rule, precisely:** refused whenever `baseline`
+  is non-mainline AND its `product` differs from `stream`'s — checked
+  regardless of which of the two happens to be mainline. An earlier pass
+  checked this only when NEITHER side was mainline, which let
+  `stream=<mainline id>&baseline=<a real product's stream>` through to
+  silently compare against mainline's own product (`''`) instead of the
+  baseline's real one; found in review and closed the same day (see
+  `docs/UPGRADE_PLAN_STATUS.md`'s WP-22 review entry). No shipped
+  frontend constructs that direction (`getSelectedStreamId()` is null
+  for mainline, never the literal id), but the endpoint is a documented
+  contract regardless.
+- **"Searchable" (§4.1) IS a datalist combo for the Build picker too**,
+  the same input+`<datalist>` pattern the "Compare to" control uses —
+  reversing an earlier pass's decision to keep it a native `<select>`
+  with optgroups. That decision rested on a premise that turned out
+  false on review: a `<select>`'s own type-ahead only PREFIX-matches,
+  so a release manager typing `rc2` against `2026.9.1-rc2` would find
+  nothing, and "substring on the name as written" (this section's own
+  words) was not actually true. `StreamPickerTest`'s assertions survive
+  the rewrite unchanged — none of them exercise `<select>`-specific
+  mechanics.
 - **The per-triple endpoint is `GET /api/tests/{env}/{script}/{test}/streams`**,
   an extension of the test-detail SHAPE (a sibling sub-resource, not a
   field folded into the existing detail payload) — chosen because it is

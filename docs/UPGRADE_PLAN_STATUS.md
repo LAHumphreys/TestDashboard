@@ -1792,3 +1792,56 @@ query-count tests needed the same `EXCLUDED_TESTS` treatment every other
 `python36-mariadb` leg has not been observed against this branch.
 `docs/drops/2026-08-14.md` rewritten to cover WP-20+21+22 as one coherent
 combined drop, per house rule.
+
+## WP-22 — three fixes from a second-pass review (2026-08-08, same day)
+
+A review pass of the WP-22 work above found three real issues before
+they shipped, none caught by the first DOM-shim pass:
+
+1. **`pickDefaultBuildBaseline` (frontend) disagreed with
+   `Storage.previous_builds` (backend) on a same-`last_seen` tie**,
+   despite the JS docstring claiming an exact mirror — the frontend
+   excluded a same-timestamp candidate outright where the backend's
+   `ORDER BY last_seen, id` includes the smaller-id one as the
+   predecessor. For two builds sharing a `last_seen` (reachable with
+   fixture data or a CI that stamps a whole batch identically), the
+   dashboard's default and the Watchlist card's default could name two
+   different predecessors for the same build. Fixed the JS exclusion to
+   match the SQL's `<` / `= and <` rule exactly; a synthetic-data
+   DOM-shim check (pure function logic, no server needed) pins both
+   directions.
+2. **`/api/compare`'s cross-product refusal was one-sided**: it only
+   fired when NEITHER side was mainline, so `stream=<mainline id>&
+   baseline=<a real product's stream>` passed through and silently
+   compared against mainline's own product (`''`, matching nothing the
+   baseline actually ran) — the exact "wrong environments, no error"
+   failure the guard exists to prevent, reachable from the direction
+   nobody checked. No shipped frontend constructs this
+   (`getSelectedStreamId()` is null for mainline, never the literal id),
+   but the endpoint is documented as symmetric in the README regardless.
+   Simplified the guard to drop the one-sided clause — "baseline is
+   non-mainline and its product differs from stream's" is symmetric by
+   construction and costs no new query. New regression test drives the
+   previously-broken direction.
+3. **Neither new control's `change` handler had ever actually been
+   fired** in the first DOM-shim pass — every check read rendered DOM
+   state (option text, preset values) but none dispatched the event
+   that navigates. This is the EXACT class of bug WP-21's first human
+   use found (`eb05c7a`: a control that rendered correctly and linked
+   to the wrong place). Added real `change` dispatches to the Build
+   picker, the "Compare to" control, and the test page's stream
+   switcher, asserting on the resulting `window.location.href` — all
+   three confirmed to navigate correctly, not merely render correctly.
+
+Also converted the Build picker from a `<select>` to the same
+input+datalist combo pattern the "Compare to" control uses: a native
+`<select>`'s type-ahead only prefix-matches, so §4.1's own "searchable
+(substring on the name as written)" was not actually satisfied — a
+release manager typing `rc2` against `2026.9.1-rc2` would have found
+nothing. This reverses the §4.4 "as built" note's earlier judgement call
+(kept native `<select>`) after a review pass showed the cited reason
+(test churn against `StreamPickerTest`) did not hold: none of that
+class's five assertions touch `<select>` mechanics.
+
+Suite: 1739 OK (skipped=1) SQLite-only; 2307 OK (skipped=18) dual-backend
+— both re-run after every fix in this entry.

@@ -26,7 +26,7 @@ except WP-23 (long-running branch streams — deliberately last, see below).
 | `wp-22-builds` | **WP-22 (release builds + compare-any-two), no migration — the current ship candidate, contains WP-20+21+22 in full.** `/api/compare?baseline=` now accepts any same-product stream, not only mainline; the Build picker gains a Builds group; the build-scoped dashboard gains a "Compare to" box defaulting to the predecessor build; the test page gains the "Every build" table + stream switcher explicitly requested after WP-21's first human use; the Watchlist's `s:` card works for builds. Suite green on BOTH backends. Operator note is `docs/drops/2026-08-14.md` — **date provisional**, re-date before pushing if it ships on a different day |
 | `wp-14-in-run-progress` | parked WIP; its migration is now **10** (WP-20 took 8, WP-21 took 9 — the registry note in `UPGRADE_PLAN.md` §1 tracks this renumbering) — renumber before merging |
 
-Suite on `wp-22-builds`: **1736 green** (skipped 1) SQLite-only; **2303
+Suite on `wp-22-builds`: **1739 green** (skipped 1) SQLite-only; **2307
 green** (skipped 18) with `TESTBOARD_TEST_DB_CNF` set against this dev
 machine's local `mariadbd` (port 3307, `.scratch/mariadb-test.cnf`) — both
 on the FINAL tree, re-run after every change this session. **CI's own
@@ -136,7 +136,7 @@ usage first, per `docs/STREAMS_PLAN.md` §5's own reasoning.
 ```bash
 git log --oneline -5                  # where am I
 git status --short                    # should be clean
-python -m unittest discover           # expect 1736 OK (skipped=1) on wp-22-builds
+python -m unittest discover           # expect 1739 OK (skipped=1) on wp-22-builds
 ```
 
 **If the UI looks wrong, check you restarted the server.** Static files are
