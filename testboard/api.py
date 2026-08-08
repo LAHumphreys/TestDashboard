@@ -2472,17 +2472,18 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
     # WP-22 (docs/STREAMS_PLAN.md §4.1): baseline= now accepts any stream
     # of the SAME product as *stream* — a build judged against the build
     # before it, or one branch against another. Mainline is the one
-    # universal exception (its own "product" is '', shared by every
-    # product by construction — every comparison has defaulted to it
-    # since WP-21). A genuine cross-product pairing is refused outright:
+    # universal exception, but ONLY on the baseline side of this check:
     # the environments filter both sides of the SQL join share
-    # (_compare_partition_sql) is resolved from the STREAM's product
-    # alone, so a mismatched baseline would not error, it would just
-    # silently compare against the wrong environments (empty on the
-    # baseline side) — a confusing "everything is new_tests" result
-    # rather than a clear refusal.
-    if (baseline.kind != "mainline" and stream.kind != "mainline"
-            and baseline.product != stream.product):
+    # (_compare_partition_sql) is resolved from *stream*'s own product
+    # ALWAYS, regardless of which side of the URL happens to be
+    # mainline — so `stream=<mainline>&baseline=<a real product's
+    # branch>` is refused exactly like the reverse would be, rather
+    # than silently scoping to mainline's own product ('', matching no
+    # real environment) and returning a confusing "everything is
+    # new_tests" instead of a clear refusal. (No shipped frontend ever
+    # constructs `stream=` as mainline explicitly — getSelectedStreamId()
+    # is null for it — but the API is a documented contract regardless.)
+    if baseline.kind != "mainline" and baseline.product != stream.product:
         raise _HttpError(
             400,
             "cannot compare across products: stream '{}:{}' is in "

@@ -1306,7 +1306,20 @@ class CompareToControlTest(unittest.TestCase):
         body = _function_body(
             read("compare.js"),
             "export function pickDefaultBuildBaseline(")
-        self.assertIn("candidate.last_seen >= streamMeta.last_seen", body)
+        self.assertIn("candidate.last_seen > streamMeta.last_seen", body)
+
+    def test_default_pick_ties_agree_with_the_backend(self) -> None:
+        """Storage.previous_builds breaks a last_seen TIE by id (ORDER BY
+        last_seen, id -- the entry immediately before self). This must
+        match exactly, or the same pair of builds gets two different
+        answers depending on which surface computed the default."""
+        body = _function_body(
+            read("compare.js"),
+            "export function pickDefaultBuildBaseline(")
+        self.assertIn(
+            "candidate.last_seen === streamMeta.last_seen\n"
+            "            && candidate.id >= streamMeta.id",
+            body)
 
     def test_the_baseline_param_lives_only_in_the_url(self) -> None:
         body = _function_body(
@@ -1327,15 +1340,28 @@ class CompareToControlTest(unittest.TestCase):
 
 
 class BuildPickerGroupingTest(unittest.TestCase):
-    """WP-22 (docs/STREAMS_PLAN.md §4.1): the Build picker's Builds
-    group, newest first by last_seen."""
+    """WP-22 (docs/STREAMS_PLAN.md §4.1): the Build picker is a
+    substring-searchable datalist combo (a native <select>'s type-ahead
+    only prefix-matches, which would find nothing for "rc2" typed
+    against "2026.9.1-rc2"), separating branches and builds, builds
+    newest first by last_seen."""
 
-    def test_builds_and_branches_get_separate_optgroups(self) -> None:
+    def test_picker_is_a_datalist_combo_not_a_select(self) -> None:
         body = _function_body(
             read("streams.js"), "export function renderPicker(")
         self.assertIn('"branch"', body)
         self.assertIn('"build"', body)
-        self.assertIn("optgroup", body)
+        self.assertIn("datalist", body)
+        self.assertNotIn("createElement(\"select\")", body)
+
+    def test_an_unrecognised_typed_value_is_a_no_op(self) -> None:
+        """A typo or a stale suggestion must not navigate anywhere --
+        the same rule compare.js's Compare-to control follows."""
+        body = _function_body(
+            read("streams.js"), "export function renderPicker(")
+        self.assertIn("target === undefined", body)
+        return_at = body.index("target === undefined")
+        self.assertIn("return", body[return_at:return_at + 40])
 
     def test_builds_are_sorted_newest_first(self) -> None:
         code = _strip_comments(read("streams.js"))

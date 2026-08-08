@@ -517,7 +517,16 @@ export function pickDefaultBuildBaseline(streamMeta, streams) {
     if (candidate.kind !== "build" || candidate.id === streamMeta.id) {
       continue;
     }
-    if (candidate.last_seen >= streamMeta.last_seen) {
+    // Mirrors Storage.previous_builds' own tie-break EXACTLY: a
+    // candidate qualifies when it is strictly earlier, or exactly as
+    // recent with a smaller id (never "==", which excluding with `>=`
+    // would silently disagree with the backend's `<` on the id side
+    // for two builds sharing a last_seen -- found only by comparing
+    // this function's behaviour against the backend's, not by reading
+    // either alone).
+    if (candidate.last_seen > streamMeta.last_seen
+        || (candidate.last_seen === streamMeta.last_seen
+            && candidate.id >= streamMeta.id)) {
       continue;   // ISO strings: lexical compare is chronological.
     }
     if (best === null || candidate.last_seen > best.last_seen

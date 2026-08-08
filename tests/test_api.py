@@ -3997,6 +3997,27 @@ class TestCompareEndpoint(ApiCase):
             "GET", "/api/compare", query={"stream": [str(other_stream_id)]})
         self.assertEqual(data["baseline"]["kind"], "mainline")
 
+    def test_mainline_used_explicitly_as_stream_is_checked_too(self) -> None:
+        """The product check is not one-sided: `stream=<mainline id>`
+        paired with a REAL other product's baseline must be refused just
+        like the reverse, not silently allowed through to compare
+        against the wrong environments (mainline's own resolved
+        environments are the IMPLICIT '' product's, which has nothing to
+        do with the baseline's real product). No shipped frontend
+        constructs this (getSelectedStreamId() is null for mainline,
+        never the numeric id), but the endpoint is a documented contract
+        regardless."""
+        other_stream_id = self._make_other_product_stream()
+        mainline_id = self.call(
+            "GET", "/api/compare", query={"stream": [str(self.stream_id)]}
+        )["baseline"]["id"]
+        error = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(mainline_id)],
+                   "baseline": [str(other_stream_id)]},
+            expect=400)
+        self.assertIn("Borealis", error["error"])
+
     def test_the_six_counts_and_both_sides_identity(self) -> None:
         data = self.call(
             "GET", "/api/compare", query={"stream": [str(self.stream_id)]})

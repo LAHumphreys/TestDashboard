@@ -27,8 +27,8 @@
 import { getSelectedProduct } from "./products.js";
 import { clearNode, el, fetchJson } from "./api.js";
 
-/** Newest first by `last_seen` — WP-22's ordering rule for the Builds
- * group (docs/STREAMS_PLAN.md §4.1). ISO strings, so lexical compare is
+/** Newest first by `last_seen` — WP-22's ordering rule for builds
+ * (docs/STREAMS_PLAN.md §4.1). ISO strings, so lexical compare is
  * chronological. */
 function byNewest(a, b) {
   return a.last_seen < b.last_seen ? 1 : -1;
@@ -39,13 +39,19 @@ function byNewest(a, b) {
  * Hides `container` when there are no streams to choose from — the one
  * visible signal a mainline-only product ever sees from this file.
  *
- * WP-22 (docs/STREAMS_PLAN.md §4.1): builds get their own `<optgroup>`,
- * newest first by `last_seen` — the version-string-as-written rule
- * (§0.7) means it is the only ordering that means anything, since the
- * name itself is never parsed. Branches keep their own group, in the
- * order the API returned (unchanged from WP-21). A single-kind product
- * (only branches, or only builds — the common case before a release
- * process exists) renders one group, not an empty one beside it.
+ * WP-22 (docs/STREAMS_PLAN.md §4.1): a plain `<input list=…>` +
+ * `<datalist>` combo, not a `<select>` — "searchable (substring on the
+ * name as written)" needs SUBSTRING matching (a release manager typing
+ * "rc2" against "2026.9.1-rc2"), and a native `<select>`'s own type-ahead
+ * only matches by PREFIX, which would find nothing for that exact case.
+ * The same pattern compare.js's "Compare to" control uses: the typed or
+ * picked TEXT is the label, matched back to an id via a map built fresh
+ * on every render; an unrecognised value (a typo, or a stale suggestion
+ * from before a page refresh) is a no-op, never a broken navigation.
+ * Builds are listed newest first by `last_seen` (branches keep the
+ * order the API returned) — the version-string-as-written rule (§0.7)
+ * means recency is the only ordering that means anything, since the
+ * name itself is never parsed.
  */
 export function renderPicker(container, streams, selectedId) {
   clearNode(container);
@@ -56,46 +62,54 @@ export function renderPicker(container, streams, selectedId) {
   container.hidden = false;
 
   const label = el("label", "stream-picker-label", "Build");
-  const select = document.createElement("select");
-  select.id = "stream-picker-select";
-  select.setAttribute("aria-label", "Build");
-  const mainlineOption = el("option", "", "Mainline nightlies");
-  mainlineOption.value = "";
-  select.appendChild(mainlineOption);
+  const input = document.createElement("input");
+  input.type = "text";
+  input.id = "stream-picker-input";
+  input.setAttribute("list", "stream-picker-options");
+  input.setAttribute("aria-label", "Build");
+
+  const datalist = document.createElement("datalist");
+  datalist.id = "stream-picker-options";
+
+  const labelToId = {};   // display text -> id ("" for mainline)
+  const mainlineLabel = "Mainline nightlies";
+  labelToId[mainlineLabel] = "";
+  const mainlineOpt = document.createElement("option");
+  mainlineOpt.value = mainlineLabel;
+  datalist.appendChild(mainlineOpt);
 
   const branches = streams.filter((s) => s.kind === "branch");
   const builds = streams.filter((s) => s.kind === "build").sort(byNewest);
-  const groups = [
-    ["Branches", branches],
-    ["Builds", builds],
-  ];
-  for (const entry of groups) {
-    const groupName = entry[0];
-    const groupStreams = entry[1];
-    if (groupStreams.length === 0) {
-      continue;
+  let selectedLabel = mainlineLabel;
+  for (const stream of branches.concat(builds)) {
+    const text = stream.kind + ":" + stream.name;
+    labelToId[text] = String(stream.id);
+    const opt = document.createElement("option");
+    opt.value = text;
+    datalist.appendChild(opt);
+    if (selectedId && stream.id === selectedId) {
+      selectedLabel = text;
     }
-    const optgroup = document.createElement("optgroup");
-    optgroup.label = groupName;
-    for (const stream of groupStreams) {
-      const opt = el("option", "", stream.kind + ":" + stream.name);
-      opt.value = String(stream.id);
-      optgroup.appendChild(opt);
-    }
-    select.appendChild(optgroup);
   }
-  select.value = selectedId ? String(selectedId) : "";
-  select.addEventListener("change", () => {
+
+  input.value = selectedLabel;
+  input.addEventListener("change", () => {
+    const target = labelToId[input.value];
+    if (target === undefined) {
+      return;   // not a recognised option -- leave the page as it is
+    }
     const url = new URL(window.location.href);
-    if (select.value) {
-      url.searchParams.set("stream", select.value);
+    if (target) {
+      url.searchParams.set("stream", target);
     } else {
       url.searchParams.delete("stream");
     }
     window.location.href = url.toString();
   });
-  label.appendChild(select);
+
+  label.appendChild(input);
   container.appendChild(label);
+  container.appendChild(datalist);
 }
 
 async function init() {
