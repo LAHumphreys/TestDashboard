@@ -23,7 +23,7 @@ still the one running in production; nothing in this paragraph has shipped.
 | `wp-21-streams` | **NEW, this session.** WP-21 (branches/builds beside mainline), migration 9, built on top of WP-20. Suite green on BOTH backends. Operator note is `docs/drops/2026-08-14.md`, rewritten this session to cover migrations 8 AND 9 as one drop — **date provisional**, re-date before pushing if it ships on a different day. Acceptance list is at the bottom of that note. **Unusually for this project, the frontend has partial real-server verification** (see below) — but still no browser |
 | `wp-14-in-run-progress` | parked WIP; its migration is now **10** (WP-20 took 8, WP-21 took 9 — the registry note in `UPGRADE_PLAN.md` §1 tracks this renumbering) — renumber before merging |
 
-Suite on `wp-21-streams`: **1641 green** (skipped 1) SQLite-only. The
+Suite on `wp-21-streams`: **1644 green** (skipped 1) SQLite-only. The
 dual-backend suite (`TESTBOARD_TEST_DB_CNF` against this dev machine's local
 `mariadbd`, port 3307, `.scratch/mariadb-test.cnf`) was re-run after every
 backend change this session, most recently after the two fixes described
@@ -152,7 +152,7 @@ feed.
 ```bash
 git log --oneline -5                  # where am I
 git status --short                    # should be clean
-python -m unittest discover           # expect 1641 OK (skipped=1) on wp-21-streams
+python -m unittest discover           # expect 1644 OK (skipped=1) on wp-21-streams
 ```
 
 **If the UI looks wrong, check you restarted the server.** Static files are
