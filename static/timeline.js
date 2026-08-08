@@ -43,6 +43,7 @@ import {
   runApiPath,
   showError,
 } from "./api.js";
+import { getSelectedProduct } from "./products.js";
 
 /* How far back "Earlier runs…" reaches: the server's own cap, which
  * matches retention — so it means "any recorded run", not a teaser. */
@@ -917,7 +918,17 @@ function handleHotkey(event) {
 
 async function loadEnvironments() {
   const data = await fetchJson("/api/environments");
-  const items = data.environments;
+  // WP-20: the picker itself is the "existing environment filter
+  // semantics" product= is defined to work through here (this page is
+  // inherently single-environment, so there is no separate product=
+  // request param to add — see /api/timeline's docstring). A selection
+  // that would leave nothing gets ignored rather than emptying the
+  // picker on a stale choice.
+  const product = getSelectedProduct();
+  const scoped = product
+    ? data.environments.filter((item) => item.product === product)
+    : data.environments;
+  const items = scoped.length ? scoped : data.environments;
   const select = document.getElementById("timeline-environment");
   clearNode(select);
   items.forEach((item) => {

@@ -61,6 +61,7 @@
           <thead>
             <tr>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="test_name">Test<span class="sort-arrow"></span></button></th>
+              <th id="product-col-head" class="product-col" hidden>Product</th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="result">Result<span class="sort-arrow"></span></button></th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="assignee">Assignee<span class="sort-arrow"></span></button></th>
               <!-- Latest comment has no sort: ordering by comment time
@@ -82,6 +83,7 @@
       <p id="empty-state" class="empty-state" hidden>Nothing matches these filters.</p>
       <div class="browse-footer">
         <span id="actions-count" class="muted"></span>
+        <span id="actions-product-note" class="muted" hidden></span>
         <button id="show-more" type="button" hidden>Show more</button>
       </div>
     </section>
@@ -141,6 +143,11 @@
             <thead>
               <tr>
                 <th>Environment</th>
+                <!-- Which product this environment belongs to (WP-20).
+                     Editable here, not hidden behind a details toggle of
+                     its own: this section is already the "administrative,
+                     rare" home for per-environment declarations. -->
+                <th>Product</th>
                 <th>Tests seen</th>
                 <th>Expected</th>
                 <th>Recent passes</th>

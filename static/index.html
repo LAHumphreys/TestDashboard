@@ -138,6 +138,7 @@
           <thead>
             <tr>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="environment">Environment<span class="sort-arrow"></span></button></th>
+              <th id="product-col-head" class="product-col" hidden>Product</th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="script">Script<span class="sort-arrow"></span></button></th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="test_name">Test<span class="sort-arrow"></span></button></th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="result">Result<span class="sort-arrow"></span></button></th>
@@ -153,6 +154,11 @@
       <p id="empty-state" class="empty-state" hidden>No tests match the current filters.</p>
       <div class="browse-footer">
         <span id="browse-count" class="muted"></span>
+        <!-- A column of identical values is noise: when the page is
+             scoped to one product, the Product column is dropped and
+             this line says so, rather than the absence reading as an
+             oversight. -->
+        <span id="browse-product-note" class="muted" hidden></span>
         <button id="show-more" type="button" hidden>Show more</button>
       </div>
     </section>

@@ -60,6 +60,7 @@ import {
   toggleReview,
 } from "./review.js";
 import { attachSorting, sortRows } from "./sorting.js";
+import { getSelectedProduct } from "./products.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
@@ -101,12 +102,27 @@ const SECTIONS = ["status-section", "charts-section", "triage-section",
 
 /* ================= data loading ================= */
 
+/**
+ * Add `product=<selected>` (WP-20) IF this browser has one selected.
+ * The server resolves it to an environment allow-list, exactly as if
+ * the environment filter had been set to every environment in it — see
+ * docs/STREAMS_PLAN.md §2.2. Single-product deployments never set one,
+ * so this is a no-op for them.
+ */
+function appendProduct(qs) {
+  const product = getSelectedProduct();
+  if (product) {
+    qs.append("product", product);
+  }
+}
+
 function summaryUrl() {
   const qs = new URLSearchParams();
   qs.append("parts", "headline");
   if (state.environment) {
     qs.append("environment", state.environment);
   }
+  appendProduct(qs);
   // The "my actions" queue is filtered server-side: picking a user's
   // tests out of an already-capped queue would hide their own work.
   // The headline needs the assignee too — the "mine" tab count.
@@ -125,6 +141,7 @@ function queueUrl(kind) {
   if (state.environment) {
     qs.append("environment", state.environment);
   }
+  appendProduct(qs);
   const me = getUsername();
   if (me) {
     qs.append("assignee", me);
@@ -138,6 +155,7 @@ function browseUrl(offset) {
   if (state.environment) {
     qs.append("environment", state.environment);
   }
+  appendProduct(qs);
   if (state.script) {
     qs.append("script", state.script);
   }
@@ -353,6 +371,7 @@ function renderHeadline() {
   renderCharts();
   renderQueues();
   populateScriptOptions();
+  updateProductColumn();
 }
 
 /* ================= toolbar ================= */
@@ -364,6 +383,28 @@ function renderToolbar() {
   const at = summary.generated_at;
   document.getElementById("refreshed-at").textContent =
     "Updated " + String(at).slice(11, 16) + " UTC";
+}
+
+/**
+ * Show the Product column exactly when the page SPANS products (two or
+ * more declared, and no product selected); when scoped to one, the
+ * footer says so instead — a column of identical values is noise
+ * (docs/STREAMS_PLAN.md §2.3, an established finding from the same
+ * project). A deployment with fewer than two declared products shows
+ * neither: zero visible change, the same rule the switcher follows.
+ */
+function updateProductColumn() {
+  const products = (state.summary && state.summary.products) || [];
+  const selected = getSelectedProduct();
+  const spans = products.length >= 2 && !selected;
+  const scoped = products.length >= 2 && Boolean(selected);
+  document.getElementById("product-col-head").hidden = !spans;
+  document.querySelectorAll("#dashboard-body .product-col")
+    .forEach((cell) => { cell.hidden = !spans; });
+  const note = document.getElementById("browse-product-note");
+  note.hidden = !scoped;
+  note.textContent = scoped
+    ? "Scoped to " + selected + " — no product column needed." : "";
 }
 
 function fillSelect(select, values, allLabel, selected) {
@@ -1183,6 +1224,10 @@ function renderBrowse(rows, append) {
     tbody.appendChild(buildRow(row));
   }
   updateSortIndicators();
+  // Newly appended rows (e.g. "Show more") start with their Product cell
+  // hidden — bring them into line with whatever the headline already
+  // decided, rather than waiting for the next full refresh.
+  updateProductColumn();
 
   const shown = state.browseRows.length;
   const total = state.browseTotal;
@@ -1213,6 +1258,13 @@ function buildRow(row) {
     tr.className = marker;
   }
   tr.appendChild(el("td", "", row.environment));
+
+  // Hidden by default; updateProductColumn() shows it once the headline
+  // (products.length, the current scope) has landed — which may arrive
+  // before or after this row does.
+  const productCell = el("td", "product-col", row.product);
+  productCell.hidden = true;
+  tr.appendChild(productCell);
 
   // The script is a link to that suite's execution history — the way to
   // answer "how did the whole suite do last night?".

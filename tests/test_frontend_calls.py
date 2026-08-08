@@ -986,6 +986,86 @@ class ProductSwitcherTest(unittest.TestCase):
         self.assertNotIn("innerHTML", read("products.js"))
 
 
+class ProductColumnTest(unittest.TestCase):
+    """The Product column on the browse/triage tables (WP-20 §2.3).
+
+    Shown exactly when the page SPANS products; when scoped to one, the
+    footer states it instead — "a column of identical values is noise",
+    an established finding this project has made before, so the exact
+    wording is pinned rather than merely "some note exists".
+    """
+
+    #: (page script, table body id) — the two tables that gain the column.
+    _TABLES = (("app.js", "dashboard-body"), ("actions.js", "actions-body"))
+
+    def test_the_scoped_footer_wording_is_exact(self) -> None:
+        for name, _ in self._TABLES:
+            code = _strip_comments(read(name))
+            self.assertIn(
+                "— no product column needed.", code,
+                name + " is missing the established footer wording")
+
+    def test_the_column_is_hidden_below_two_products(self) -> None:
+        for name, _ in self._TABLES:
+            body = _function_body(read(name), "function updateProductColumn()")
+            self.assertIn("products.length >= 2", body, name)
+
+    def test_product_is_appended_to_the_list_request_when_selected(
+        self
+    ) -> None:
+        for name, _ in self._TABLES:
+            code = _strip_comments(read(name))
+            self.assertIn("function appendProduct(", code, name)
+            self.assertIn('qs.append("product"', code, name)
+
+    def test_getSelectedProduct_is_imported_where_used(self) -> None:
+        for name, _ in self._TABLES:
+            code = read(name)
+            self.assertIn(
+                "getSelectedProduct", _imported_names(code),
+                name + " calls getSelectedProduct() without importing it")
+
+    def test_new_rows_start_with_the_cell_hidden(self) -> None:
+        """A row built before the current scope is known must default to
+        hidden — updateProductColumn() corrects it once data lands,
+        never the other way around (a flash of a column that then hides
+        would be worse than a brief absence)."""
+        for name, body_id in self._TABLES:
+            code = _strip_comments(read(name))
+            self.assertIn('"product-col"', code, name)
+            self.assertIn("productCell.hidden = true", code, name)
+
+
+class TimeAndTimelineProductTest(unittest.TestCase):
+    """docs/STREAMS_PLAN.md §2.3: "Time/Timeline pages: product scoping
+    only via the existing environment filter semantics" — Time appends
+    product= to its own request (the server resolves it); Timeline is
+    inherently single-environment, so it scopes its ENVIRONMENT PICKER
+    instead of adding a request parameter that endpoint does not read
+    from this page's shape.
+    """
+
+    def test_time_appends_product_to_its_request(self) -> None:
+        code = _strip_comments(read("time.js"))
+        self.assertIn("getSelectedProduct", _imported_names(read("time.js")))
+        self.assertIn('qs.append("product"', code)
+
+    def test_timeline_scopes_its_environment_picker(self) -> None:
+        code = _strip_comments(read("timeline.js"))
+        self.assertIn(
+            "getSelectedProduct", _imported_names(read("timeline.js")))
+        body = _function_body(read("timeline.js"), "async function loadEnvironments()")
+        self.assertIn("item.product === product", body)
+
+    def test_timeline_falls_back_when_the_product_has_no_environments(
+        self
+    ) -> None:
+        """A stale/renamed product selection must not empty the picker."""
+        body = _function_body(
+            read("timeline.js"), "async function loadEnvironments()")
+        self.assertIn("scoped.length ? scoped : data.environments", body)
+
+
 class WatchPageTest(unittest.TestCase):
     """watch.js / watch.html (WP-20, docs/STREAMS_PLAN.md §2.4).
 

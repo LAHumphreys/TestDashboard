@@ -49,6 +49,7 @@ import {
 } from "./api.js";
 import { treemapBoxes } from "./charts.js";
 import { attachSorting, sortRows } from "./sorting.js";
+import { getSelectedProduct } from "./products.js";
 
 const LEVELS = ["environment", "script", "test_name"];
 
@@ -83,6 +84,14 @@ function url() {
   }
   if (state.includeStale) {
     qs.append("include_stale", "1");
+  }
+  // WP-20: scope the drill-down to a declared product's environments —
+  // resolved server-side, same as every other product= filter
+  // (docs/STREAMS_PLAN.md §2.2). Harmless to send alongside an explicit
+  // `environment` once drilled in; the server combines both.
+  const product = getSelectedProduct();
+  if (product) {
+    qs.append("product", product);
   }
   return "/api/time?" + qs.toString();
 }
