@@ -156,13 +156,28 @@ function buildOkCard(card, index, total) {
   return div;
 }
 
+/** "mainline" or "build 2026.9.0" — the card's own copy of the same
+ * label rule compare.js's streamLabel() applies dashboard-side; kept
+ * local rather than imported so this file's only dependency on
+ * compare.js stays the category constants it already had. */
+function baselineLabel(card) {
+  return card.baseline_kind === "mainline"
+    ? "mainline" : card.baseline_kind + " " + card.baseline_name;
+}
+
 /**
- * A stream verdict card (WP-21, docs/STREAMS_PLAN.md §3.6): the
- * compare-vs-mainline headline for one branch/build, both sides'
- * freshness, click-through to the branch-scoped dashboard. Resolved on
- * the server through the same storage reads /api/compare uses
- * (Storage.compare_counts_many), so this card costs no more per-card
- * work than an environment or product card does.
+ * A stream verdict card (WP-21/WP-22, docs/STREAMS_PLAN.md §3.6/§4.1):
+ * "N failing in <name>", the compare-vs-baseline headline for one
+ * branch/build, both sides' freshness, click-through to the scoped
+ * dashboard. Resolved on the server through the same storage reads
+ * /api/compare uses (Storage.compare_counts_many), so this card costs
+ * no more per-card work than an environment or product card does.
+ *
+ * A BUILD's baseline is its predecessor build when one exists, not
+ * mainline (server-resolved, docs/STREAMS_PLAN.md §4.1) — `card.
+ * baseline_kind`/`baseline_name` name whatever it actually was, so
+ * nothing here assumes "mainline" the way the WP-21 version of this
+ * card did.
  */
 function buildStreamCard(card, index, total) {
   const div = el("div", "card watch-card");
@@ -172,6 +187,11 @@ function buildStreamCard(card, index, total) {
   div.appendChild(head);
   div.appendChild(el("p", "row-sub", card.product));
 
+  const failing = card.both_failing + card.new_failures;
+  div.appendChild(el("p", "watch-card-headline",
+    failing + (failing === 1 ? " test failing in " : " tests failing in ")
+    + card.name + "."));
+
   const verdict = el("div", "watch-card-verdict");
   for (const key of CATEGORY_ORDER) {
     verdict.appendChild(buildStat(CATEGORY_LABELS[key], card[key]));
@@ -180,8 +200,9 @@ function buildStreamCard(card, index, total) {
 
   const nowMs = Date.now();
   const fresh = el("p", "watch-card-fresh muted",
-    "this branch " + ageText(card.last_seen, nowMs)
-    + " — mainline " + ageText(card.baseline_last_seen, nowMs));
+    "this " + card.stream_kind + " " + ageText(card.last_seen, nowMs)
+    + " — " + baselineLabel(card) + " "
+    + ageText(card.baseline_last_seen, nowMs));
   div.appendChild(fresh);
 
   const link = cardLink(card);

@@ -1238,6 +1238,112 @@ class DeltaViewTest(unittest.TestCase):
                         "href is built from params")
 
 
+class BuildBaselineWordingTest(unittest.TestCase):
+    """WP-22 (docs/STREAMS_PLAN.md §4.1): every place that used to say
+    the literal word "mainline" now reads it from the baseline's own
+    identity -- a build's baseline is routinely a predecessor build."""
+
+    def test_streamLabel_is_the_one_place_the_wording_is_built(self) -> None:
+        body = _function_body(
+            read("compare.js"), "export function streamLabel(")
+        self.assertIn('"mainline"', body)
+        self.assertIn("meta.kind", body)
+        self.assertIn("meta.name", body)
+
+    def test_baseline_card_never_hardcodes_mainline_in_its_prose(
+            self) -> None:
+        body = _function_body(
+            read("compare.js"), "function renderBaselineCard(")
+        self.assertIn("streamLabel(baselineMeta)", body)
+        self.assertNotIn('"mainline last ran', body)
+        self.assertNotIn('"this branch', body)
+
+    def test_branch_band_accepts_an_optional_baseline(self) -> None:
+        body = _function_body(
+            read("compare.js"), "export function renderBranchBand(")
+        self.assertIn("baselineMeta", body)
+        self.assertIn("streamLabel(baselineMeta)", body)
+
+    def test_watch_card_reads_baseline_identity_from_the_card(
+            self) -> None:
+        code = _strip_comments(read("watch.js"))
+        body = _function_body(code, "function buildStreamCard(")
+        self.assertIn("baselineLabel(card)", body)
+        label_body = _function_body(code, "function baselineLabel(")
+        self.assertIn("card.baseline_kind", label_body)
+        self.assertIn("card.baseline_name", label_body)
+
+
+class CompareToControlTest(unittest.TestCase):
+    """The build-scoped dashboard's "Compare to" datalist combo (WP-22,
+    docs/STREAMS_PLAN.md §4.1) -- shown only for a kind='build' stream,
+    defaulting to the previous build by last_seen where one exists."""
+
+    def test_the_markup_ships_hidden(self) -> None:
+        html = read_text("index.html")
+        field_at = html.index('id="compare-to-field"')
+        self.assertIn("hidden", html[field_at:field_at + 60])
+        self.assertIn('id="compare-to-input"', html)
+        self.assertIn('id="compare-to-options"', html)
+        self.assertIn('list="compare-to-options"', html)
+
+    def test_the_control_hides_for_a_non_build_stream(self) -> None:
+        body = _function_body(
+            read("compare.js"), "function renderCompareToControl(")
+        self.assertIn('streamMeta.kind !== "build"', body)
+        self.assertIn("field.hidden = true", body)
+
+    def test_default_pick_excludes_self_and_non_builds(self) -> None:
+        body = _function_body(
+            read("compare.js"),
+            "export function pickDefaultBuildBaseline(")
+        self.assertIn('candidate.kind !== "build"', body)
+        self.assertIn("candidate.id === streamMeta.id", body)
+
+    def test_default_pick_only_considers_earlier_last_seen(self) -> None:
+        """A build with a LATER last_seen must never become the
+        default baseline -- "previous" means strictly earlier."""
+        body = _function_body(
+            read("compare.js"),
+            "export function pickDefaultBuildBaseline(")
+        self.assertIn("candidate.last_seen >= streamMeta.last_seen", body)
+
+    def test_the_baseline_param_lives_only_in_the_url(self) -> None:
+        body = _function_body(
+            read("compare.js"), "export function getSelectedBaselineId(")
+        self.assertIn("window.location.search", body)
+        self.assertNotIn("localStorage", body)
+
+    def test_a_branch_scoped_page_never_fetches_the_product_stream_list(
+            self) -> None:
+        """The extra /api/streams round trip this control needs is paid
+        ONLY by build-scoped pages -- a branch dashboard's cost must stay
+        exactly what it was in WP-21."""
+        body = _function_body(
+            read("compare.js"), "export async function initDeltaView(")
+        fetch_at = body.index("fetchProductStreams(")
+        guard_at = body.rindex('=== "build"', 0, fetch_at)
+        self.assertLess(guard_at, fetch_at)
+
+
+class BuildPickerGroupingTest(unittest.TestCase):
+    """WP-22 (docs/STREAMS_PLAN.md §4.1): the Build picker's Builds
+    group, newest first by last_seen."""
+
+    def test_builds_and_branches_get_separate_optgroups(self) -> None:
+        body = _function_body(
+            read("streams.js"), "export function renderPicker(")
+        self.assertIn('"branch"', body)
+        self.assertIn('"build"', body)
+        self.assertIn("optgroup", body)
+
+    def test_builds_are_sorted_newest_first(self) -> None:
+        code = _strip_comments(read("streams.js"))
+        self.assertIn(".sort(byNewest)", code)
+        sort_body = _function_body(code, "function byNewest(")
+        self.assertIn("a.last_seen < b.last_seen", sort_body)
+
+
 class CompareStripTest(unittest.TestCase):
     """test.js's compare strip (WP-21 §3.6): mainline's result beside a
     branch's, on the test-detail page, only when scoped."""

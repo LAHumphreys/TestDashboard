@@ -187,6 +187,17 @@
       <div class="section-head">
         <h2 id="delta-heading" class="eyebrow">Compare to mainline</h2>
       </div>
+      <!-- WP-22 (docs/STREAMS_PLAN.md §4.1): only shown when the scoped
+           stream is kind 'build' -- a plain datalist combo, never a
+           second navigation control for branches. Hidden by default so
+           a branch-scoped page (or one predating this drop's code)
+           shows zero visible change. -->
+      <p id="compare-to-field" class="muted" hidden>
+        <label for="compare-to-input">Compare to</label>
+        <input id="compare-to-input" list="compare-to-options" type="text" />
+        <datalist id="compare-to-options"></datalist>
+      </p>
+      <p id="delta-build-framing" class="muted" hidden></p>
       <div id="delta-tiles" class="tile-row"></div>
       <p id="delta-agree" class="muted"></p>
       <p id="delta-coverage" class="muted"></p>
@@ -198,8 +209,8 @@
           <thead>
             <tr>
               <th>Test</th>
-              <th>Mainline</th>
-              <th>This branch</th>
+              <th id="delta-col-baseline">Mainline</th>
+              <th id="delta-col-stream">This branch</th>
               <th>Assignee</th>
               <th>Output</th>
             </tr>

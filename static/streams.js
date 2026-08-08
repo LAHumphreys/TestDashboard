@@ -27,10 +27,25 @@
 import { getSelectedProduct } from "./products.js";
 import { clearNode, el, fetchJson } from "./api.js";
 
+/** Newest first by `last_seen` — WP-22's ordering rule for the Builds
+ * group (docs/STREAMS_PLAN.md §4.1). ISO strings, so lexical compare is
+ * chronological. */
+function byNewest(a, b) {
+  return a.last_seen < b.last_seen ? 1 : -1;
+}
+
 /**
  * Render the picker into `container` from the `/api/streams` list.
  * Hides `container` when there are no streams to choose from — the one
  * visible signal a mainline-only product ever sees from this file.
+ *
+ * WP-22 (docs/STREAMS_PLAN.md §4.1): builds get their own `<optgroup>`,
+ * newest first by `last_seen` — the version-string-as-written rule
+ * (§0.7) means it is the only ordering that means anything, since the
+ * name itself is never parsed. Branches keep their own group, in the
+ * order the API returned (unchanged from WP-21). A single-kind product
+ * (only branches, or only builds — the common case before a release
+ * process exists) renders one group, not an empty one beside it.
  */
 export function renderPicker(container, streams, selectedId) {
   clearNode(container);
@@ -47,10 +62,27 @@ export function renderPicker(container, streams, selectedId) {
   const mainlineOption = el("option", "", "Mainline nightlies");
   mainlineOption.value = "";
   select.appendChild(mainlineOption);
-  for (const stream of streams) {
-    const opt = el("option", "", stream.kind + ":" + stream.name);
-    opt.value = String(stream.id);
-    select.appendChild(opt);
+
+  const branches = streams.filter((s) => s.kind === "branch");
+  const builds = streams.filter((s) => s.kind === "build").sort(byNewest);
+  const groups = [
+    ["Branches", branches],
+    ["Builds", builds],
+  ];
+  for (const entry of groups) {
+    const groupName = entry[0];
+    const groupStreams = entry[1];
+    if (groupStreams.length === 0) {
+      continue;
+    }
+    const optgroup = document.createElement("optgroup");
+    optgroup.label = groupName;
+    for (const stream of groupStreams) {
+      const opt = el("option", "", stream.kind + ":" + stream.name);
+      opt.value = String(stream.id);
+      optgroup.appendChild(opt);
+    }
+    select.appendChild(optgroup);
   }
   select.value = selectedId ? String(selectedId) : "";
   select.addEventListener("change", () => {
