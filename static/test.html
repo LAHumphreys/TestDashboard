@@ -24,6 +24,18 @@
   <main>
     <div id="error-banner" class="error-banner" role="alert" hidden></div>
 
+    <!-- Only visible when this page was opened ?stream=<id> (WP-21,
+         docs/STREAMS_PLAN.md §3.6) -- absent from the DOM's visible
+         state on every mainline visit. Same band, same markup shape as
+         the dashboard's (compare.js's renderBranchBand renders both) --
+         found missing here in first human use: a reader deep in a
+         test's history/analytics/compare strip had no indication they
+         were scoped to a branch at all. -->
+    <div id="branch-band" class="branch-band" hidden>
+      <span id="branch-band-text"></span>
+      <a id="branch-band-back" href="test.html">Back to mainline</a>
+    </div>
+
     <section id="test-header">
       <h1 id="test-title">Test detail</h1>
       <p id="test-identity" class="muted identity-line"></p>

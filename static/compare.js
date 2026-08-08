@@ -32,6 +32,7 @@
 "use strict";
 
 import {
+  assigneeSelect,
   clearNode,
   el,
   fetchJson,
@@ -39,6 +40,7 @@ import {
   resultChip,
   showError,
 } from "./api.js";
+import { reopenIfOpen, toggleReview } from "./review.js";
 
 /** The five paginable comparison categories, in tab/tile display order. */
 export const CATEGORY_ORDER = [
@@ -167,6 +169,42 @@ export function renderTiles(container, counts) {
 
 /* ================= the paginated category table ================= */
 
+/** Review-panel options for a delta row (WP-21, docs/STREAMS_PLAN.md
+ * §0.4/§3.6's "triage still works from a branch").
+ *
+ * `staleBefore` is deliberately OMITTED (not null — genuinely absent):
+ * review.js's own retire gate is `isStale(entry, opts.staleBefore) &&
+ * !entry.retired_at`, and isStale() returns false outright when
+ * staleBefore is falsy, before it even looks at entry.retired_at.
+ * Retirement is a MAINLINE decision (§3.4) — a branch's own staleness
+ * says nothing about whether the test is still in the suite — so this
+ * is how the shared panel is told "never offer it here" without
+ * review.js having to know whose page it is on (it explicitly cannot;
+ * see its module docstring).
+ */
+function deltaReviewOptions() {
+  return {};
+}
+
+/**
+ * One delta-table row's entry for the shared review panel/assignee
+ * select: enough of the TestSummaryRow/TestStatusRow shape those expect
+ * to work unmodified, sourced from a CompareRow instead of a dashboard
+ * row. `stream_id` (WP-21) is this page's own scope, so an assignment
+ * made from here is annotated with where it came from.
+ */
+function reviewEntry(row, streamId) {
+  return {
+    environment: row.environment,
+    script: row.script,
+    test_name: row.test_name,
+    run_id: row.stream_run_id,
+    start_time: row.stream_start_time,
+    assignee: row.assignee,
+    stream_id: streamId,
+  };
+}
+
 function buildDeltaRow(row) {
   const tr = document.createElement("tr");
   const testCell = el("td", "wrap");
@@ -198,6 +236,34 @@ function buildDeltaRow(row) {
   const streamTd = document.createElement("td");
   streamTd.appendChild(streamCell(row.stream_result));
   tr.appendChild(streamTd);
+
+  // Triage from a branch (docs/STREAMS_PLAN.md §0.4/§3.6): the SAME
+  // assignee select the dashboard's own queue rows use, so a failure
+  // found on a branch can be taken/assigned exactly like a mainline one
+  // — assignment is never partitioned by stream, only annotated with
+  // where it was made (see reviewEntry()).
+  const entry = reviewEntry(row, streamId);
+  const assigneeTd = el("td", "assignee-cell");
+  assigneeTd.appendChild(assigneeSelect(entry, () => {}));
+  tr.appendChild(assigneeTd);
+
+  // The Review expander needs a run to show — a no_result row (present
+  // on mainline, absent on this branch) has none, and shows no button
+  // at all rather than one that opens onto nothing.
+  const outputTd = el("td", "review-cell");
+  if (row.stream_run_id !== null) {
+    const reviewBtn = el("button", "review-btn", "Review");
+    reviewBtn.type = "button";
+    reviewBtn.setAttribute("aria-expanded", "false");
+    reviewBtn.title = "Show this run's output, and assign it";
+    reviewBtn.addEventListener("click", () => toggleReview(
+      entry, tr, reviewBtn, deltaReviewOptions()));
+    outputTd.appendChild(reviewBtn);
+    // Keep the panel open across the re-render a category switch or
+    // "Show more" triggers — the same rule app.js's queue table follows.
+    reopenIfOpen(entry, tr, reviewBtn, deltaReviewOptions());
+  }
+  tr.appendChild(outputTd);
 
   return tr;
 }
@@ -287,11 +353,35 @@ function renderBaselineCard(streamMeta, baselineMeta, counts, nowMs) {
   }
 }
 
-function renderBranchBand(streamMeta) {
-  document.getElementById("branch-band-text").textContent =
-    "Viewing " + streamMeta.kind + " " + streamMeta.name
+/**
+ * The sticky "you are scoped to a branch" band — shared by the
+ * dashboard's delta view and the test-detail page (WP-21
+ * docs/STREAMS_PLAN.md §3.6: found in first human use, a reader deep in
+ * a test's history/analytics/compare strip had no indication they were
+ * scoped at all). Every page that mounts `#branch-band` renders it the
+ * same way, so "Back to mainline" means the same promise everywhere:
+ * this URL with ONLY `stream` removed — never a fixed page like
+ * `index.html`, which would silently drop test.html's
+ * environment/script/test_name and land on the wrong page entirely.
+ *
+ * Guards its own mount the way products.js's host-managed call sites do
+ * (ProductSwitcherHostManagedTest) — a page with no `#branch-band`
+ * simply does not render one, rather than throwing mid-render and
+ * taking the rest of that page's first paint down with it.
+ */
+export function renderBranchBand(streamMeta) {
+  const container = document.getElementById("branch-band");
+  if (!container) {
+    return;
+  }
+  const textEl = document.getElementById("branch-band-text");
+  const backLink = document.getElementById("branch-band-back");
+  textEl.textContent = "Viewing " + streamMeta.kind + " " + streamMeta.name
     + " — compared against mainline.";
-  document.getElementById("branch-band").hidden = false;
+  const url = new URL(window.location.href);
+  url.searchParams.delete("stream");
+  backLink.href = url.pathname + url.search;
+  container.hidden = false;
 }
 
 /** Sections that only mean something on the mainline dashboard. Hidden

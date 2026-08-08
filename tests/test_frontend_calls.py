@@ -1186,6 +1186,38 @@ class DeltaViewTest(unittest.TestCase):
         stream_body = _function_body(code, "export function streamCell(")
         self.assertIn("resultChip(result)", stream_body)
 
+    def test_delta_rows_offer_the_shared_assignee_select(self) -> None:
+        """Triage still works from a branch (docs/STREAMS_PLAN.md
+        §0.4/§3.6): the SAME control the dashboard's queue rows use, not
+        a second one."""
+        code = _strip_comments(read("compare.js"))
+        self.assertIn("assigneeSelect", _imported_names(read("compare.js")))
+        body = _function_body(code, "function buildDeltaRow(")
+        self.assertIn("assigneeSelect(entry", body)
+
+    def test_delta_rows_never_offer_retirement(self) -> None:
+        """Retirement is a MAINLINE decision (§3.4) — review.js's own
+        retire gate is `isStale(entry, opts.staleBefore) &&
+        !entry.retired_at`, and isStale() short-circuits false when
+        staleBefore is falsy. deltaReviewOptions() must never set it —
+        the shared panel cannot be told "no retire" any other way,
+        since it explicitly cannot know whose page it is on (see
+        ReviewPanelTest)."""
+        body = _function_body(
+            read("compare.js"), "function deltaReviewOptions(")
+        self.assertNotIn("staleBefore", body)
+
+    def test_the_review_button_is_absent_without_a_run_to_review(
+        self
+    ) -> None:
+        """A no_result row has no stream-side run — no button that
+        opens onto nothing, per CompareRow's own invariant."""
+        body = _function_body(read("compare.js"), "function buildDeltaRow(")
+        review_at = body.index("review-btn")
+        guard_at = body.rindex("if (", 0, review_at)
+        guarded = body[guard_at:body.index("}", review_at)]
+        self.assertIn("row.stream_run_id !== null", guarded)
+
     def test_no_innerHTML(self) -> None:
         self.assertNotIn("innerHTML", read("compare.js"))
 
@@ -1224,6 +1256,56 @@ class CompareStripTest(unittest.TestCase):
         code = _strip_comments(read("test.js"))
         self.assertIn("withStream(myPath())", code)
         self.assertIn('withStream(myPath("/history")', code)
+
+
+class TestPageBranchBandTest(unittest.TestCase):
+    """The branch band on test.html (WP-21 §3.6, found in first human
+    use): a reader deep in a test's history/analytics/compare strip had
+    no loud indication they were scoped to a branch at all. Shares
+    compare.js's renderBranchBand with the dashboard rather than a
+    second implementation, the same "one shared control" rule as the
+    assignee select / review panel."""
+
+    def test_the_band_ships_hidden_in_the_markup(self) -> None:
+        html = read_text("test.html")
+        band_at = html.index('id="branch-band"')
+        self.assertIn("hidden", html[band_at:band_at + 60])
+
+    def test_the_mount_ids_match_the_dashboards(self) -> None:
+        """renderBranchBand() is one function, shared — it can only work
+        unmodified on both pages if the element ids agree."""
+        for name in ("index.html", "test.html"):
+            html = read_text(name)
+            self.assertIn('id="branch-band"', html, name)
+            self.assertIn('id="branch-band-text"', html, name)
+            self.assertIn('id="branch-band-back"', html, name)
+
+    def test_test_js_calls_the_shared_renderer(self) -> None:
+        code = _strip_comments(read("test.js"))
+        self.assertIn("renderBranchBand", _imported_names(read("test.js")))
+        self.assertIn("renderBranchBand(", code)
+
+    def test_the_renderer_guards_a_missing_mount(self) -> None:
+        """Every page that might not carry the band (none do NOT carry
+        it today, but the guard is what makes that safe to change)
+        must not throw mid-render — the same rule
+        ProductSwitcherHostManagedTest pins for the product switcher's
+        host-managed call sites."""
+        body = _function_body(
+            read("compare.js"), "export function renderBranchBand(")
+        self.assertIn('getElementById("branch-band")', body)
+        guard_at = body.index("if (!container")
+        self.assertIn("return", body[guard_at:guard_at + 40])
+
+    def test_the_back_link_strips_only_the_stream_param(self) -> None:
+        """"Back to mainline" must preserve whatever else the page
+        needs (environment/script/test_name on test.html) — a fixed
+        target like index.html would land test.html's reader on the
+        wrong page entirely."""
+        body = _function_body(
+            read("compare.js"), "export function renderBranchBand(")
+        self.assertIn('searchParams.delete("stream")', body)
+        self.assertIn("backLink.href", body)
 
 
 class CommentStreamTagTest(unittest.TestCase):
@@ -1271,6 +1353,49 @@ class WatchStreamCardTest(unittest.TestCase):
     def test_stream_picker_entries_are_keyed_by_id(self) -> None:
         body = _function_body(read("watch.js"), "async function populatePicker(")
         self.assertIn("value: String(stream.id)", body)
+
+
+class OpenActionsOriginFilterTest(unittest.TestCase):
+    """Open Actions' branch/mainline origin filter and per-row tag
+    (WP-21, docs/STREAMS_PLAN.md §3.6, found in first human use)."""
+
+    def test_the_filter_is_server_side_not_a_client_reshuffle(self) -> None:
+        """The same rule SortingTest pins for this page's sort: a paged
+        table filtered in the browser shows "branch items that happen
+        to be on this page", not every branch item."""
+        body = _function_body(read("actions.js"), "function listUrl(")
+        self.assertIn('qs.append("origin", state.origin)', body)
+
+    def test_the_filter_hides_with_no_stream_originated_assignments(
+        self
+    ) -> None:
+        body = _function_body(
+            read("actions.js"), "function renderOriginFilter(")
+        self.assertIn("state.assignmentStreams.length === 0", body)
+        self.assertIn("container.hidden = true", body)
+
+    def test_the_mount_ships_hidden_in_the_markup(self) -> None:
+        html = read_text("actions.html")
+        mount_at = html.index('id="origin-filters"')
+        self.assertIn("hidden", html[mount_at:mount_at + 120])
+
+    def test_the_row_tag_is_resolved_from_the_pages_own_streams_map(
+        self
+    ) -> None:
+        """The same batched-resolution shape the comments endpoint
+        uses — never a lookup per row."""
+        body = _function_body(read("actions.js"), "function buildOwnerCell(")
+        self.assertIn("state.streams[String(row.assignment_stream_id)]",
+                       body)
+
+    def test_a_null_assignment_stream_id_gets_no_tag(self) -> None:
+        body = _function_body(read("actions.js"), "function buildOwnerCell(")
+        self.assertIn("row.assignment_stream_id === null", body)
+
+    def test_summary_and_page_streams_are_both_read(self) -> None:
+        code = _strip_comments(read("actions.js"))
+        self.assertIn("summary.assignment_streams", code)
+        self.assertIn("page.streams", code)
 
 
 class ProductColumnTest(unittest.TestCase):

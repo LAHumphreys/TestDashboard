@@ -1999,3 +1999,14 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
   align-items: center;
   margin: 6px 0 0;
 }
+
+/* Open Actions: a small "made from a branch" tag beside the assignee
+   select (WP-21, docs/STREAMS_PLAN.md §3.6). Text-only, no colour-alone
+   signal, matching the rest of this file's chip/tag language. */
+.origin-tag {
+  font-size: 11px;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+}

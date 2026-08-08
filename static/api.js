@@ -291,10 +291,20 @@ export function assigneeSelect(entry, onSaved) {
     }
     select.disabled = true;
     try {
+      const body = { username: target, assigned_by: me };
+      // WP-21: an entry built from a branch-scoped view (the delta
+      // table's rows) carries its own stream id, so the assignment
+      // records WHERE it was made from — an annotation, never a
+      // partition of who owns the test (docs/STREAMS_PLAN.md §3.4). An
+      // ordinary dashboard/queue entry never sets this, so the field is
+      // simply absent there, same as every assignment before WP-21.
+      if (entry.stream_id !== undefined && entry.stream_id !== null) {
+        body.stream_id = entry.stream_id;
+      }
       await putJson(
         testApiPath(entry.environment, entry.script, entry.test_name,
           "/assignee"),
-        { username: target, assigned_by: me });
+        body);
       entry.assignee = target;
       rememberUser(target);
       select.classList.toggle("is-unassigned", !target);

@@ -50,6 +50,13 @@
            everything nobody has picked up yet. -->
       <div id="owner-filters" class="owner-filters" role="group"
            aria-label="Filter by assignee"></div>
+      <!-- Only shown once at least one CURRENT assignment carries a
+           non-mainline stream (WP-21, docs/STREAMS_PLAN.md §3.6) --
+           zero visible change on every install that has never fed a
+           branch/build in. Populated and toggled entirely by
+           actions.js; see renderOriginFilter(). -->
+      <div id="origin-filters" class="owner-filters" role="group"
+           aria-label="Filter by assignment origin" hidden></div>
     </section>
 
     <section id="actions-section" aria-labelledby="actions-heading">
