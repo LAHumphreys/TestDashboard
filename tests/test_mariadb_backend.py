@@ -80,6 +80,9 @@ EXCLUDED_TESTS = {
         "counts queries via sqlite3's set_trace_callback.",
     "TestLatestRunTimeByEnvironment.test_it_never_touches_the_runs_table":
         "counts queries via sqlite3's set_trace_callback.",
+    "TestWatch.test_query_count_does_not_grow_with_card_count":
+        "counts queries via sqlite3's set_trace_callback, and reaches "
+        "into self.storage._conn() directly to register it.",
     "ScriptHoursTest.test_the_window_read_is_an_index_range_not_a_scan":
         "asserts the SQLite query plan; MariaDB's planner is a "
         "different instrument for a different day.",

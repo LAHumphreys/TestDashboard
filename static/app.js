@@ -60,7 +60,7 @@ import {
   toggleReview,
 } from "./review.js";
 import { attachSorting, sortRows } from "./sorting.js";
-import { getSelectedProduct } from "./products.js";
+import { getSelectedProduct, renderSwitcher } from "./products.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
@@ -372,6 +372,8 @@ function renderHeadline() {
   renderQueues();
   populateScriptOptions();
   updateProductColumn();
+  renderSwitcher(document.getElementById("product-switcher"),
+    state.summary.products || []);
 }
 
 /* ================= toolbar ================= */

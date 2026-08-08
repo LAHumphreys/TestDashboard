@@ -19,16 +19,24 @@ in this paragraph has shipped.
 | **production** | **live on the 2026-08-07 drop** (schema v7). Confirm the box runs the FINAL drop commit `310f1c0` — What's new saying "7 August 2026" is the tell; older says 4 August. WP-20 below has NOT been deployed |
 | `origin/master` | `ea15ccc` — **stale**: push `wp-18-timeline` to `master` so the recorded state matches the deployed one |
 | `wp-18-timeline` | the 2026-08-07 drop, deployed. **All four CI legs green** including the new `python36-mariadb` |
-| `wp-20-products` | **NEW.** WP-20 (products + Watchlist), migration 8. Built and suite-green; operator note is `docs/drops/2026-08-14.md`, **date provisional** — re-date before pushing if it ships on a different day. Acceptance list is at the bottom of that note; no browser has rendered it |
+| `wp-20-products` | **NEW.** WP-20 (products + Watchlist), migration 8. Built and suite-green on BOTH backends; operator note is `docs/drops/2026-08-14.md`, **date provisional** — re-date before pushing if it ships on a different day. Acceptance list is at the bottom of that note; no browser has rendered it |
 | `wp-14-in-run-progress` | parked WIP; **its migration is now 9** (WP-20 took 8 — the third time this exact swap has happened, see `UPGRADE_PLAN.md` §1) — renumber before merging |
 
-Suite: **1385 green** (skipped 1) on `wp-18-timeline`/`master`; **1484 green**
-(skipped 1) on `wp-20-products`, which is 99 commits' worth of tests ahead of
-it and not yet merged. CI's MariaDB leg has not been re-run against
-`wp-20-products` from this session — `TESTBOARD_TEST_DB_CNF` was unset here,
-so the dual-backend variants did not execute; the operator note says so.
-Schema moves to **migration 7** in production today; **migration 8 ships
-with WP-20**, whenever that is accepted — so until then the rollback for
+Suite: **1385 green** (skipped 1) on `wp-18-timeline`/`master`; **1491 green**
+(skipped 1) SQLite-only on `wp-20-products`, which is 99+ commits' worth of
+tests ahead of it and not yet merged. **This session also ran the dual-backend
+suite against this dev machine's local `mariadbd`** (port 3307,
+`.scratch/mariadb-test.cnf`) — **1919 green** (skipped 13) — confirming the
+generated `TestEnvironmentProduct(s)MariaDB`/`TestEnvironmentsForProductMariaDB`/
+`TestWatchMariaDB` classes pass against the real `environment_products` DDL.
+One new exclusion entry was needed
+(`TestWatch.test_query_count_does_not_grow_with_card_count`, a
+`set_trace_callback` instrument — same class of exclusion as several
+pre-existing ones). **Still outstanding: CI's own `python36-mariadb` leg
+(mariadb:10.3, prod's stream) has not been observed against this branch** —
+the local server is a newer MariaDB, functional evidence only, never a perf
+number. Schema moves to **migration 7** in production today; **migration 8
+ships with WP-20**, whenever that is accepted — so until then the rollback for
 `wp-18-timeline`'s own drop is still the database copy, and WP-20's will be
 too once it ships. WP-19 consumed no version; WP-15 is now reserved on **9**,
 10 free.

@@ -10,9 +10,16 @@
  * their header (index.html, actions.html, time.html, timeline.html,
  * watch.html) — a page that does not include this script, or that has no
  * mount point, is unaffected, the same "decoration that fails quietly"
- * rule nav.js follows for the What's-new marker. It fetches its own tiny
- * slice of /api/summary (parts=headline) independently of whatever else
- * the page fetches, exactly as nav.js independently fetches whatsnew.html.
+ * rule nav.js follows for the What's-new marker. Pages that fetch no
+ * `/api/summary` of their own (time.html, timeline.html, watch.html) get
+ * it fetched here, independently, exactly as nav.js independently fetches
+ * whatsnew.html. Pages that already fetch `/api/summary` for their own
+ * headline data (index.html, actions.html) mark their mount point
+ * `data-host-managed` and call `renderSwitcher` themselves once that
+ * fetch lands — a second, redundant `/api/summary` request on the two
+ * heaviest-traffic pages in the app is not an acceptable price for one
+ * `<select>`, and this module has no way to know the host already has
+ * the data short of being told.
  *
  * Selection persists per browser in localStorage (the same mechanism as
  * the What's-new unread state and the self-declared username) — there is
@@ -100,6 +107,11 @@ async function init() {
   const container = document.getElementById("product-switcher");
   if (!container) {
     return;   // this page carries no switcher mount point
+  }
+  if (container.hasAttribute("data-host-managed")) {
+    return;   // the host page already fetches /api/summary itself and
+              // calls renderSwitcher directly — fetching here too would
+              // be a second request for data the page already has
   }
   try {
     const data = await fetchJson("/api/summary?parts=headline");

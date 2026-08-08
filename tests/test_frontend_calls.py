@@ -986,6 +986,60 @@ class ProductSwitcherTest(unittest.TestCase):
         self.assertNotIn("innerHTML", read("products.js"))
 
 
+class ProductSwitcherHostManagedTest(unittest.TestCase):
+    """index.html and actions.html already fetch /api/summary for their
+    own headline data, so products.js's independent fetch of the same
+    endpoint would be a second request per load on the two heaviest
+    pages in the app. Those two pages mark their mount point
+    `data-host-managed` and call `renderSwitcher` themselves once their
+    own fetch lands; products.js's self-init skips its own fetch when it
+    sees that attribute. time.html/timeline.html/watch.html fetch no
+    summary of their own, so they keep the self-init path unmarked.
+    """
+
+    _SELF_INIT_PAGES = ("time.html", "timeline.html", "watch.html")
+    _HOST_MANAGED = (("index.html", "app.js"), ("actions.html", "actions.js"))
+
+    def test_init_skips_its_own_fetch_when_host_managed(self) -> None:
+        body = _function_body(read("products.js"), "async function init()")
+        self.assertIn("data-host-managed", body)
+        self.assertIn("hasAttribute", body)
+
+    def test_host_managed_pages_mark_the_mount_point(self) -> None:
+        for html, _ in self._HOST_MANAGED:
+            code = read_text(html)
+            self.assertIn(
+                "data-host-managed", code,
+                html + " must mark its mount point host-managed")
+
+    def test_self_init_pages_do_not_mark_the_mount_point(self) -> None:
+        for html in self._SELF_INIT_PAGES:
+            code = read_text(html)
+            self.assertNotIn(
+                "data-host-managed", code,
+                html + " has no host fetch of its own — it must keep "
+                "relying on products.js's self-init")
+
+    def test_host_pages_import_and_call_renderSwitcher(self) -> None:
+        for _, js in self._HOST_MANAGED:
+            code = read(js)
+            self.assertIn(
+                "renderSwitcher", _imported_names(code),
+                js + " calls renderSwitcher() without importing it")
+            self.assertIn(
+                "renderSwitcher(", _strip_comments(code),
+                js + " never calls renderSwitcher()")
+
+    def test_host_pages_still_load_products_js_for_getSelectedProduct(
+        self
+    ) -> None:
+        """The self-init skip must not turn into removing the script
+        tag — these pages still need getSelectedProduct() for their own
+        filtering, and the module must still be on the page to import."""
+        for html, _ in self._HOST_MANAGED:
+            self.assertIn('src="products.js"', read_text(html), html)
+
+
 class ProductColumnTest(unittest.TestCase):
     """The Product column on the browse/triage tables (WP-20 §2.3).
 
