@@ -3314,6 +3314,24 @@ class ActivityHoursTest(StorageTestBase):
         self.assertEqual(deleted, 1)
         self.assertEqual(self._invariant_diff(), 0)
 
+    def test_a_stream_drop_keeps_the_invariant(self) -> None:
+        """WP-23 (migration 10): tools/drop_stream.py deletes a stream's
+        runs AND its activity_hours rows -- if it only did the former,
+        the invariant would rot silently the moment the stream's runs
+        vanished but its hour buckets did not."""
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        branch_id = self.store.list_streams("")[0].stream_id
+        self.store.delete_stream(branch_id)
+        self.assertEqual(self._invariant_diff(), 0)
+        rows = self.store._conn().execute(
+            "SELECT COUNT(*) FROM activity_hours WHERE stream_id = ?",
+            (branch_id,)).fetchone()
+        self.assertEqual(rows[0], 0)
+
     def test_the_comparison_itself_can_fail(self) -> None:
         """Planted drift MUST be reported, or every pass above is noise."""
         self.store.upsert_runs([make_record()])
@@ -3485,6 +3503,23 @@ class ScriptHoursTest(StorageTestBase):
         deleted = self.store.prune_runs_before(BASE - 300 * day)
         self.assertEqual(deleted, 1)
         self.assertEqual(self._invariant_diff(), 0)
+
+    def test_a_stream_drop_keeps_the_invariant(self) -> None:
+        """WP-23 (migration 10): tools/drop_stream.py deletes a stream's
+        runs AND its script_hours rows -- the script_hours twin of
+        ActivityHoursTest's version of this test."""
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        branch_id = self.store.list_streams("")[0].stream_id
+        self.store.delete_stream(branch_id)
+        self.assertEqual(self._invariant_diff(), 0)
+        rows = self.store._conn().execute(
+            "SELECT COUNT(*) FROM script_hours WHERE stream_id = ?",
+            (branch_id,)).fetchone()
+        self.assertEqual(rows[0], 0)
 
     def test_the_comparison_itself_can_fail(self) -> None:
         """Planted drift MUST be reported, or every pass above is noise."""
