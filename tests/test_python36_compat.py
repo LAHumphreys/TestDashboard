@@ -463,6 +463,201 @@ class AnnotationsEvaluateTest(unittest.TestCase):
                            "annotation sweep covered almost nothing")
 
 
+#: Everything the interpreter provides without an import. An annotation
+#: whose root name is neither here, nor bound in some enclosing scope of
+#: the ``def``, is a NameError at def time on 3.6.
+_BUILTIN_NAMES = frozenset(dir(__import__("builtins")))
+
+
+def _scope_bound_names(body: List[ast.stmt]) -> set:
+    """Names bound by the statements of ONE scope.
+
+    Descends into compound statements (``if``/``for``/``try``/``with``)
+    because they share the enclosing scope, but never into a nested
+    ``def``/``class`` — those are new scopes and bind only their name
+    here. Ordering is deliberately ignored: a name bound anywhere in the
+    scope counts, which can under-report (name used before binding) but
+    never false-positives, and a NameError detector must not cry wolf.
+    """
+    bound = set()  # type: set
+
+    def collect_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            bound.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                collect_target(elt)
+        elif isinstance(target, ast.Starred):
+            collect_target(target.value)
+
+    def walk_stmts(stmts: List[ast.stmt]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                bound.add(stmt.name)
+                continue
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                for alias in stmt.names:
+                    bound.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    collect_target(target)
+            elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+                collect_target(stmt.target)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                collect_target(stmt.target)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                for item in stmt.items:
+                    if item.optional_vars is not None:
+                        collect_target(item.optional_vars)
+            elif isinstance(stmt, ast.Try):
+                for handler in stmt.handlers:
+                    if handler.name:
+                        bound.add(handler.name)
+            for field in ("body", "orelse", "finalbody"):
+                sub = getattr(stmt, field, None)
+                if sub:
+                    walk_stmts(sub)
+            for handler in getattr(stmt, "handlers", None) or []:
+                walk_stmts(handler.body)
+
+    walk_stmts(body)
+    return bound
+
+
+def _scope_child_defs(body: List[ast.stmt]) -> List[ast.stmt]:
+    """Every ``def``/``class`` belonging directly to this scope, however
+    deeply buried in ``if``/``for``/``try`` it is."""
+    children = []  # type: List[ast.stmt]
+
+    def walk_stmts(stmts: List[ast.stmt]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                children.append(stmt)
+                continue
+            for field in ("body", "orelse", "finalbody"):
+                sub = getattr(stmt, field, None)
+                if sub:
+                    walk_stmts(sub)
+            for handler in getattr(stmt, "handlers", None) or []:
+                walk_stmts(handler.body)
+
+    walk_stmts(body)
+    return children
+
+
+def annotation_name_gaps(source: str, filename: str
+                         ) -> List[Tuple[int, str]]:
+    """``(lineno, name)`` for every annotation name that resolves NOWHERE.
+
+    The runtime sweep in :class:`AnnotationsEvaluateTest` forces the
+    annotations of every module-level function and method — but a
+    function nested inside another only comes into existence when its
+    enclosing function RUNS, so on 3.6 its annotations are a NameError
+    at test runtime, which the sweep cannot reach and a 3.14
+    interpreter (PEP 649, lazy annotations) never evaluates at all.
+    That exact gap put a NameError onto three CI legs on 2026-08-08
+    (``tests.test_storage.CompareCountsManyTest``) while the local 3.14
+    suite stayed green — this detector is the widening, static so it
+    sees every ``def`` at every depth.
+
+    A name resolves if it is a builtin or bound in ANY enclosing scope
+    of the ``def`` (annotations evaluate where the ``def`` executes:
+    module scope, an outer function's scope including its parameters, or
+    an enclosing class body). String annotations are skipped — they are
+    forward references, never evaluated at def time on any version.
+    """
+    tree = ast.parse(source, filename=filename)
+    gaps = []  # type: List[Tuple[int, str]]
+
+    def check_function(func: ast.stmt, visible: set) -> None:
+        args = func.args  # type: ignore[attr-defined]
+        annotated = []  # type: List[ast.expr]
+        arg_lists = [args.args, args.kwonlyargs]
+        arg_lists.append(getattr(args, "posonlyargs", None) or [])
+        for arg_list in arg_lists:
+            for arg in arg_list:
+                if arg.annotation is not None:
+                    annotated.append(arg.annotation)
+        for special in (args.vararg, args.kwarg):
+            if special is not None and special.annotation is not None:
+                annotated.append(special.annotation)
+        returns = getattr(func, "returns", None)
+        if returns is not None:
+            annotated.append(returns)
+        for expr in annotated:
+            for node in ast.walk(expr):
+                if isinstance(node, ast.Name) and node.id not in visible:
+                    gaps.append((node.lineno, node.id))
+
+    def visit_scope(body: List[ast.stmt], scopes: List[set]) -> None:
+        visible = set(_BUILTIN_NAMES)
+        for scope in scopes:
+            visible |= scope
+        for child in _scope_child_defs(body):
+            if isinstance(child, ast.ClassDef):
+                visit_scope(child.body,
+                            scopes + [_scope_bound_names(child.body)])
+                continue
+            check_function(child, visible)
+            args = child.args  # type: ignore[attr-defined]
+            params = set()  # type: set
+            for arg_list in (args.args, args.kwonlyargs,
+                             getattr(args, "posonlyargs", None) or []):
+                for arg in arg_list:
+                    params.add(arg.arg)
+            for special in (args.vararg, args.kwarg):
+                if special is not None:
+                    params.add(special.arg)
+            visit_scope(child.body,
+                        scopes + [_scope_bound_names(child.body) | params])
+
+    visit_scope(tree.body, [_scope_bound_names(tree.body)])
+    return gaps
+
+
+class NestedAnnotationNamesTest(unittest.TestCase):
+    """Static widening of :class:`AnnotationsEvaluateTest` — see
+    :func:`annotation_name_gaps` for why the runtime sweep is not enough.
+    """
+
+    def test_the_detector_catches_an_unimported_nested_annotation(self) -> None:
+        planted = (
+            "def outer():\n"
+            "    def inner(x: Any) -> int:\n"
+            "        return 0\n"
+            "    return inner\n"
+        )
+        gaps = annotation_name_gaps(planted, "<planted>")
+        self.assertEqual([name for _lineno, name in gaps], ["Any"],
+                         "the detector must catch the exact shape that "
+                         "reached CI on 2026-08-08")
+
+    def test_enclosing_scope_names_are_not_flagged(self) -> None:
+        fine = (
+            "import typing\n"
+            "def outer(width: int):\n"
+            "    Row = dict\n"
+            "    def inner(x: Row, y: typing.Any, z: 'Forward',\n"
+            "              w: int = 0) -> None:\n"
+            "        pass\n"
+        )
+        self.assertEqual(annotation_name_gaps(fine, "<fine>"), [],
+                         "outer locals, parameters, attribute roots and "
+                         "string forward references all resolve")
+
+    def test_every_annotation_name_in_the_repo_resolves(self) -> None:
+        failures = []  # type: List[str]
+        for path in python_files():
+            for lineno, name in annotation_name_gaps(read(path), path):
+                failures.append(
+                    "%s:%d: %r" % (relative(path), lineno, name))
+        self.assertEqual(
+            failures, [],
+            "these annotation names are a def-time NameError on 3.6")
+
+
 class VendoredCodeTest(unittest.TestCase):
     """Vendored third-party source: correctness gates only.
 

@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from testboard import analytics, model, storage
 from testboard.model import Result, RunRecord
@@ -3966,7 +3966,8 @@ class CompareCountsManyTest(StorageTestBase):
             self) -> None:
         conn = self.store._conn()
 
-        def query_count(stream_environments: Any) -> int:
+        def query_count(
+                stream_environments: Dict[int, Sequence[str]]) -> int:
             statements = []  # type: List[str]
             trace_sql_into(conn, statements)
             try:
