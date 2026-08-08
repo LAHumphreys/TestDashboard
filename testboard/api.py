@@ -41,17 +41,23 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
 from testboard import analytics, model, site_notes
 from testboard.model import Result, RunRecord, StoredRun, ValidationError
 from testboard.storage import (
+    COMPARE_CATEGORIES,
     DASHBOARD_SORTS,
+    MAINLINE_STREAM_ID,
     QUEUE_KINDS,
     Comment,
+    CompareCounts,
+    CompareRow,
     FailureStreak,
     Storage,
+    Stream,
     TestStatusRow,
     TestSummaryRow,
     User,
@@ -408,12 +414,18 @@ def _summary_row_json(
 
 
 def _comment_json(comment: Comment) -> Dict[str, Any]:
-    """Serialize a comment to its JSON shape."""
+    """Serialize a comment to its JSON shape.
+
+    ``stream_id`` (WP-21) is the "posted from" tag — null for a comment
+    with no stream context (posted before migration 9, or a plain
+    triage comment never tied to an import).
+    """
     return {
         "id": comment.comment_id,
         "author": comment.author,
         "created_at": model.format_iso(comment.created_at),
         "text": comment.text,
+        "stream_id": comment.stream_id,
     }
 
 
@@ -450,6 +462,26 @@ def _handle_import(storage: Storage, request: Request) -> Response:
     valid records are upserted and each reject is reported with its index,
     a field-specific message and the record's identity fields (null when
     not extractable).
+
+    WP-21 (docs/STREAMS_PLAN.md §3.3): a record may carry ``branch`` or
+    ``build`` (mutually exclusive — a record with both is rejected at
+    parse time by :func:`model.parse_run_record`, before storage ever
+    sees it). The response gains ``streams_seen``: the sorted
+    ``"{kind}:{name}"`` of every non-mainline stream this batch NAMED
+    (whether or not every individual record on it was stored — see
+    below), ``[]`` for a pure-mainline batch. A ``--branch``/``--build``
+    feeder invocation must treat a response with no ``streams_seen`` key
+    at all as a hard failure: an old server ignores unknown keys and
+    would silently file branch runs into mainline, and this is the only
+    signal that tells a new feeder it is talking to one.
+
+    A second rejection channel, storage-side, joins the same ``errors``
+    array: :meth:`Storage.upsert_runs` can refuse a record whose exact
+    ``(environment, script, test_name, start_time)`` is already claimed
+    by a DIFFERENT stream (the frozen v1 UNIQUE on ``runs`` has no
+    stream column — docs/STREAMS_PLAN.md §3.2). ``UpsertRejection.index``
+    is the record's position within the VALID list handed to storage,
+    not the original ``runs`` index, so it is mapped back here.
     """
     envelope = _parse_json_body(request.body)
     if not isinstance(envelope, dict):
@@ -468,10 +500,11 @@ def _handle_import(storage: Storage, request: Request) -> Response:
         )
 
     valid = []  # type: List[RunRecord]
+    valid_indices = []  # type: List[int]
     errors = []  # type: List[Dict[str, Any]]
     for index, raw in enumerate(raw_runs):
         try:
-            valid.append(model.parse_run_record(raw))
+            record = model.parse_run_record(raw)
         except ValidationError as exc:
             errors.append(
                 {
@@ -483,7 +516,30 @@ def _handle_import(storage: Storage, request: Request) -> Response:
                     "start_time": _identity_field(raw, "start_time"),
                 }
             )
+            continue
+        valid.append(record)
+        valid_indices.append(index)
+
+    streams_seen = set()  # type: Set[str]
+    for record in valid:
+        if record.branch:
+            streams_seen.add("branch:" + record.branch)
+        elif record.build:
+            streams_seen.add("build:" + record.build)
+
     counts = storage.upsert_runs(valid)
+    for rejection in counts.rejections:
+        errors.append(
+            {
+                "index": valid_indices[rejection.index],
+                "error": rejection.message,
+                "environment": rejection.environment,
+                "script": rejection.script,
+                "test_name": rejection.test_name,
+                "start_time": model.format_iso(rejection.start_time),
+            }
+        )
+
     return _json_response(
         200,
         {
@@ -499,6 +555,7 @@ def _handle_import(storage: Storage, request: Request) -> Response:
             "unchanged": counts.unchanged,
             "rejected": len(errors),
             "errors": errors,
+            "streams_seen": sorted(streams_seen),
         },
     )
 
@@ -686,6 +743,35 @@ def _resolve_product_environments(
     return storage.environments_for_product(product)
 
 
+def _resolve_stream_id(
+    storage: Storage, request: Request, param: str = "stream"
+) -> int:
+    """Parse an optional ``stream=`` query param into a stream id.
+
+    WP-21 (docs/STREAMS_PLAN.md §3.5). Absent means mainline —
+    ``/api/dashboard``, test detail and history all default there, so
+    every deployed client that has never heard of streams keeps working
+    unchanged. 400 on a non-integer value; 404 on an integer that names
+    no stream (an id is opaque and typed by the caller, unlike a
+    product/environment NAME, so there is no "empty result" reading —
+    a stream either exists or the request is wrong).
+    """
+    raw = _query_single(request.query, param)
+    if raw is None:
+        return MAINLINE_STREAM_ID
+    try:
+        stream_id = int(raw)
+    except ValueError:
+        raise _HttpError(
+            400, "{}: must be an integer, got '{}'".format(param, raw)
+        )
+    if storage.get_stream(stream_id) is None:
+        raise _HttpError(
+            404, "unknown stream: {}".format(stream_id)
+        )
+    return stream_id
+
+
 def _handle_dashboard(
     storage: Storage,
     request: Request,
@@ -705,6 +791,7 @@ def _handle_dashboard(
     results = _parse_results_param(request)
     product = _query_single(request.query, "product")
     environments = _resolve_product_environments(storage, product)
+    stream_id = _resolve_stream_id(storage, request)
 
     stale_before = None  # type: Optional[datetime.datetime]
     if _query_single(request.query, "stale") in ("1", "true"):
@@ -752,6 +839,7 @@ def _handle_dashboard(
         "assignees": assignees,
         "include_unassigned": include_unassigned,
         "environments": environments,
+        "stream_id": stream_id,
     }  # type: Dict[str, Any]
     rows = storage.dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,
@@ -765,7 +853,7 @@ def _handle_dashboard(
         for row in rows
     ]
     if with_streak:
-        _add_streaks(storage, rows, payload, now())
+        _add_streaks(storage, rows, payload, now(), stream_id)
     return _json_response(
         200,
         {
@@ -775,6 +863,7 @@ def _handle_dashboard(
             "offset": offset,
             "with_streak": with_streak,
             "product": product,
+            "stream": stream_id,
         },
     )
 
@@ -784,6 +873,7 @@ def _add_streaks(
     rows: Sequence[TestSummaryRow],
     payload: List[Dict[str, Any]],
     now_value: datetime.datetime,
+    stream_id: int = MAINLINE_STREAM_ID,
 ) -> None:
     """Attach failing-since, last-pass and stability to a PAGE of rows.
 
@@ -796,19 +886,24 @@ def _add_streaks(
     three index seeks and are looked up only for rows whose latest run
     is a FAIL — the others have no streak to report. The result history
     is fetched for the whole page in a handful of batched queries (see
-    Storage.recent_results), never one per row.
+    Storage.recent_results), never one per row. *stream_id* (WP-21,
+    default mainline) scopes both to the SAME stream the page came from
+    — a branch-scoped dashboard's streaks must be that branch's own
+    history, never mainline's.
     """
     triples = [
         (row.environment, row.script, row.test_name) for row in rows
     ]
     since = now_value - datetime.timedelta(days=_STABILITY_WINDOW_DAYS)
     history = storage.recent_results(
-        triples, since, per_test_limit=_STABILITY_RUNS)
+        triples, since, per_test_limit=_STABILITY_RUNS,
+        stream_id=stream_id)
     for row, item in zip(rows, payload):
         key = (row.environment, row.script, row.test_name)
         if row.result is Result.FAIL:
             streak = storage.failure_streak_bounds(
-                row.environment, row.script, row.test_name, row.start_time
+                row.environment, row.script, row.test_name, row.start_time,
+                stream_id=stream_id,
             )
             item["failing_since"] = (
                 None if streak.failing_since is None
@@ -1256,19 +1351,30 @@ def _handle_summary(
 
 def _handle_test_detail(
     storage: Storage,
+    request: Request,
     environment: str,
     script: str,
     test_name: str,
     now: Callable[[], datetime.datetime],
 ) -> Response:
-    """GET /api/tests/{env}/{script}/{test} — state + analytics summary."""
-    latest = storage.latest_run(environment, script, test_name)
+    """GET /api/tests/{env}/{script}/{test} — state + analytics summary.
+
+    ``stream=`` (WP-21, default mainline) scopes BOTH the latest run and
+    the analytics window to one stream's own runs of the triple — a
+    branch's "latest" must be a branch run, and its failing-since must
+    not be inherited from mainline's history of the same test
+    (docs/STREAMS_PLAN.md §3.5).
+    """
+    stream_id = _resolve_stream_id(storage, request)
+    latest = storage.latest_run(
+        environment, script, test_name, stream_id=stream_id)
     if latest is None:
         raise _unknown_test(environment, script, test_name)
     now_dt = now()
     since = now_dt - datetime.timedelta(days=_ANALYTICS_MAX_DAYS)
     runs = storage.runs_since(
-        environment, script, test_name, since, _ANALYTICS_MAX_RUNS
+        environment, script, test_name, since, _ANALYTICS_MAX_RUNS,
+        stream_id=stream_id,
     )
     summary = analytics.compute_analytics(
         runs,
@@ -1290,6 +1396,7 @@ def _handle_test_detail(
             "analytics": analytics.analytics_to_dict(
                 summary, max_runs=_ANALYTICS_MAX_RUNS
             ),
+            "stream": stream_id,
         },
     )
 
@@ -1301,8 +1408,13 @@ def _handle_history(
     script: str,
     test_name: str,
 ) -> Response:
-    """GET .../history — paginated run history, newest first, no outputs."""
+    """GET .../history — paginated run history, newest first, no outputs.
+
+    ``stream=`` (WP-21, default mainline) — the history table is one
+    stream's runs of the triple, never a mix.
+    """
     _require_test(storage, environment, script, test_name)
+    stream_id = _resolve_stream_id(storage, request)
     limit = _DEFAULT_HISTORY_LIMIT
     raw_limit = _query_single(request.query, "limit")
     if raw_limit is not None:
@@ -1328,7 +1440,8 @@ def _handle_history(
         except ValueError as exc:
             raise _HttpError(400, "before: {}".format(exc))
     runs = storage.run_history(
-        environment, script, test_name, limit=limit, before=before
+        environment, script, test_name, limit=limit, before=before,
+        stream_id=stream_id,
     )
     return _json_response(200, {"runs": [_run_json(run) for run in runs]})
 
@@ -1377,13 +1490,35 @@ def _handle_comment_create(
     test_name: str,
     now: Callable[[], datetime.datetime],
 ) -> Response:
-    """POST .../comments — add a comment, implicitly creating the author."""
+    """POST .../comments — add a comment, implicitly creating the author.
+
+    Body gains an optional ``stream_id`` (WP-21) — "posted from", not
+    part of the comment's identity. Absent or ``null`` means no stream
+    context, the same as every comment posted before this migration.
+    """
     _require_test(storage, environment, script, test_name)
     obj = _parse_json_object(request.body)
     username = _validate_username(obj, "username")
     text = _validate_comment_text(obj)
+    stream_id = None  # type: Optional[int]
+    raw_stream_id = obj.get("stream_id")
+    if raw_stream_id is not None:
+        if not isinstance(raw_stream_id, int) or isinstance(
+                raw_stream_id, bool):
+            raise _HttpError(
+                400,
+                "stream_id: must be an integer or null, got {}".format(
+                    type(raw_stream_id).__name__
+                ),
+            )
+        if storage.get_stream(raw_stream_id) is None:
+            raise _HttpError(
+                404, "unknown stream: {}".format(raw_stream_id)
+            )
+        stream_id = raw_stream_id
     comment = storage.add_comment(
-        environment, script, test_name, username, text, now()
+        environment, script, test_name, username, text, now(),
+        stream_id=stream_id,
     )
     return _json_response(201, {"comment": _comment_json(comment)})
 
@@ -2088,6 +2223,157 @@ def _handle_environment_product(
     )
 
 
+def _stream_json(stream: Stream) -> Dict[str, Any]:
+    """Serialize a stream to its JSON shape (WP-21, docs/STREAMS_PLAN.md
+    §3.5). Timestamps only — no hidden staleness constant; the caller
+    (the Build picker) folds by age from ``last_seen`` itself."""
+    return {
+        "id": stream.stream_id,
+        "product": stream.product,
+        "kind": stream.kind,
+        "name": stream.name,
+        "first_seen": model.format_iso(stream.first_seen),
+        "last_seen": model.format_iso(stream.last_seen),
+        "failing": stream.failing,
+    }
+
+
+def _handle_streams_list(storage: Storage, request: Request) -> Response:
+    """GET /api/streams?product=… — the Build picker's data.
+
+    ``product`` defaults to ``""`` (the implicit "no product declared"
+    grouping, same reading as everywhere else in this feature). Never a
+    404 for an unknown product — a product exists by having
+    environments/streams, and an unknown one simply has none
+    (docs/STREAMS_PLAN.md §2.6's rule, extended to streams). Mainline
+    itself is never listed — it is the picker's default, not one of its
+    entries.
+    """
+    product = _query_single(request.query, "product") or ""
+    streams = storage.list_streams(product)
+    return _json_response(
+        200,
+        {
+            "product": product,
+            "streams": [_stream_json(stream) for stream in streams],
+        },
+    )
+
+
+def _handle_compare(storage: Storage, request: Request) -> Response:
+    """GET /api/compare?stream=&baseline=&category=&limit=&offset=
+
+    docs/STREAMS_PLAN.md §3.5. ``stream`` is required. ``baseline``
+    defaults to mainline and — in THIS drop only — may not be anything
+    else: WP-22 lifts the restriction (§4.1); until then a non-mainline
+    baseline is a clear 400, not a query that silently compares the
+    wrong thing. ``category``, when given, selects ONE of the five
+    counts to return as a paginated list (``limit``/``offset``); when
+    absent the response carries the counts alone and an empty list.
+
+    The response carries both sides' identity and freshness
+    (``last_seen``) so the UI can build its own honesty line ("baseline
+    N days old") from data, never from a constant.
+    """
+    raw_stream = _query_single(request.query, "stream")
+    if raw_stream is None:
+        raise _HttpError(400, "stream: required query parameter is missing")
+    try:
+        stream_id = int(raw_stream)
+    except ValueError:
+        raise _HttpError(
+            400, "stream: must be an integer, got '{}'".format(raw_stream)
+        )
+    stream = storage.get_stream(stream_id)
+    if stream is None:
+        raise _HttpError(404, "unknown stream: {}".format(stream_id))
+
+    raw_baseline = _query_single(request.query, "baseline")
+    baseline_id = MAINLINE_STREAM_ID
+    if raw_baseline is not None:
+        try:
+            baseline_id = int(raw_baseline)
+        except ValueError:
+            raise _HttpError(
+                400, "baseline: must be an integer, got '{}'".format(
+                    raw_baseline)
+            )
+        if baseline_id != MAINLINE_STREAM_ID:
+            raise _HttpError(
+                400,
+                "baseline: only the mainline stream ({}) may be used as "
+                "a baseline in this drop — comparing against any other "
+                "stream arrives in a later drop (WP-22)".format(
+                    MAINLINE_STREAM_ID),
+            )
+    baseline = storage.get_stream(baseline_id)
+    if baseline is None:
+        raise _HttpError(404, "unknown baseline stream: {}".format(
+            baseline_id))
+
+    category = _query_single(request.query, "category")
+    if category is not None and category not in COMPARE_CATEGORIES:
+        raise _HttpError(
+            400,
+            "category: unknown value '{}' (expected one of {})".format(
+                category, ", ".join(COMPARE_CATEGORIES)
+            ),
+        )
+
+    limit = _parse_int_param(
+        request, "limit", _DEFAULT_PAGE_LIMIT, 1, _MAX_PAGE_LIMIT
+    )
+    offset = _parse_int_param(request, "offset", 0, 0, _MAX_OFFSET)
+
+    counts = storage.compare_counts(stream_id, baseline_id=baseline_id)
+    tests = []  # type: List[Dict[str, Any]]
+    total = 0
+    if category is not None:
+        rows = storage.compare_category(
+            stream_id, category, baseline_id=baseline_id, limit=limit,
+            offset=offset,
+        )
+        total = storage.compare_category_count(
+            stream_id, category, baseline_id=baseline_id
+        )
+        tests = [
+            {
+                "environment": row.environment,
+                "script": row.script,
+                "test_name": row.test_name,
+                "stream_result": (
+                    None if row.stream_result is None
+                    else row.stream_result.value
+                ),
+                "baseline_result": (
+                    None if row.baseline_result is None
+                    else row.baseline_result.value
+                ),
+            }
+            for row in rows
+        ]
+
+    return _json_response(
+        200,
+        {
+            "stream": _stream_json(stream),
+            "baseline": _stream_json(baseline),
+            "counts": {
+                "new_failures": counts.new_failures,
+                "new_passes": counts.new_passes,
+                "both_failing": counts.both_failing,
+                "new_tests": counts.new_tests,
+                "no_result": counts.no_result,
+            },
+            "category": category,
+            "tests": tests,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
+
+
 #: Cards per /api/watch request. A URL this long is a mistake, not a use
 #: case (docs/STREAMS_PLAN.md §2.4) — stated in the refusal and the README.
 _WATCH_MAX_CARDS = 50
@@ -2491,6 +2777,14 @@ def _route(
         _check_method(request.method, ("GET",))
         return _handle_watch(storage, request, now)
 
+    if rest == ["streams"]:
+        _check_method(request.method, ("GET",))
+        return _handle_streams_list(storage, request)
+
+    if rest == ["compare"]:
+        _check_method(request.method, ("GET",))
+        return _handle_compare(storage, request)
+
     if rest == ["users"]:
         _check_method(request.method, ("GET", "POST"))
         if request.method == "GET":
@@ -2519,7 +2813,8 @@ def _route(
 
     if len(rest) == 4 and rest[0] == "tests":
         _check_method(request.method, ("GET",))
-        return _handle_test_detail(storage, rest[1], rest[2], rest[3], now)
+        return _handle_test_detail(
+            storage, request, rest[1], rest[2], rest[3], now)
 
     if len(rest) == 5 and rest[0] == "tests":
         environment, script, test_name, action = (
