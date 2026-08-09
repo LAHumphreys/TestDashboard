@@ -369,6 +369,23 @@ entry. Suite green both backends; whatsnew + operator note per house rules
 
 ## 3. WP-21 — Streams and branch builds *(drop 2; one migration + contract extension)*
 
+> **AS-BUILT NOTE (WP-25, 2026-08-09, `docs/ONE_KIND_PLAN.md`) — read this
+> before the section below.** The `branch`/`build` distinction this section
+> designs — two non-mainline stream kinds, a separate `--branch` feeder flag,
+> a two-group picker — **shipped nowhere**: it existed only on unreviewed
+> branches (`wp-21-streams` and its successors) before WP-25 collapsed it,
+> the same night, to one non-mainline kind, `build`. This is deletion before
+> first contact, not a migration: nothing below is wrong as a *record of what
+> was designed and built at the time*, and the log stays as it reads — but
+> `streams.kind` is `{mainline, build}` from here on, `branch` on the wire is
+> a loud per-record rejection, `--branch` does not exist as a feeder flag,
+> and every "branch vs. build" distinction described in this section (the
+> picker's two groups, the build-only "Compare to"/predecessor-baseline
+> gating, the Watch card's kind-conditional baseline) is gated on DATA now
+> (covered-pass thresholds, presence of a stream) rather than on kind, since
+> there is only one kind left to gate on. See `docs/ONE_KIND_PLAN.md` for
+> the reasoning and the full list of what changed.
+
 **Why.** "Did my branch break anything relative to mainline?" is the whole
 question. Today branch CI results either pollute mainline or go nowhere.
 Streams give branch runs a home that mainline never sees, and a delta view

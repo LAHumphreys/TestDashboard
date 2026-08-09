@@ -38,272 +38,61 @@
     <section class="release" data-drop-date="2026-08-14">
       <div class="section-head">
         <h2 class="eyebrow">14 August 2026</h2>
-        <span class="muted">New: branches and release builds beside mainline, compare any two, a long-running branch gets its own dashboard, plus the Watch page</span>
+        <span class="muted">New: products, the Watch page, and uploaded builds compared against mainline or each other</span>
       </div>
 
-      <h3>Fixed: a scoped page could leak other products' environments</h3>
+      <h3>What's new</h3>
       <ul>
-        <li>On a site with more than one product, scoping the home screen
-          to one product (or opening a branch/build's own dashboard) could
-          still offer every OTHER product's environments in the picker and
-          the "last reported" pills, even though every number on the page
-          was already correctly scoped. Found in live testing; fixed —
-          both now only ever list the environments that actually belong to
-          the page you're looking at.</li>
-        <li>The Build/branch picker box and the comparison page's "Compare
-          to" box looked out of place next to every other control on the
-          toolbar — a styling gap left over from switching them to a
-          type-to-filter field. Fixed; they now match.</li>
-        <li><strong>Jumping from a Watch card into the dashboard could
-          land on a blank page.</strong> Opening a card for a product
-          different from whatever this browser's Product switcher last
-          had selected set the environment filter correctly but left the
-          switcher on the OLD product — so the page rendered scoped to
-          the wrong one, and the environment filter matched nothing under
-          it. Fixed: every card's link now names its own product, and the
-          page adopts it — the switcher updates to match, and that
-          becomes your new default from then on, exactly as if you'd
-          picked it yourself.</li>
-        <li><strong>The Time and Timeline pages can now actually show a
-          branch's own data</strong> — the pages could already be asked
-          for it on the wire, but neither one knew how to read that
-          request from its own URL, so there was no way to get there.
-          Both now carry the same "you are scoped to a branch" band the
-          dashboard already shows, and expanding a row on a branch's
-          Timeline (or using its test-search box) now correctly reads
-          that branch's own runs, not mainline's.</li>
-        <li><strong>A few more links that quietly lost track of which
-          branch you were looking at, fixed.</strong> An Open Actions row
-          assigned from a branch now opens that SAME branch's test page,
-          not mainline's. "View in timeline" and "Open full test page"
-          from a branch's own triage panel now open that branch's own
-          pages too. And a branch's "Its own results" tab now has two
-          direct links — "This branch's Time" / "This branch's
-          Timeline" — into its own numbers.</li>
-        <li>Rounding out the same fix: a long-running branch's own
-          Triage queues and its own test list, and a stream-scoped
-          Timeline's expanded run rows, now all link back to that
-          SAME branch's test page too.</li>
-      </ul>
-
-      <h3>New: branches and builds, compared to mainline</h3>
-      <ul>
-        <li><strong>A CI branch or a one-off build can now show up beside
-          your nightly results</strong>, without touching them — mainline
-          stays exactly what it always was, and nothing about this is
-          visible until your team actually feeds in a branch or a build.
-          Once one exists, a <strong>Build</strong> picker appears next to
-          the Environment filter on the dashboard, listing branches then
-          builds (newest build first) — type any part of a name to filter
-          the list; pick one to see it compared against mainline.</li>
-        <li>The comparison page shows what's new: failing, passing, still
-          failing on both, brand-new tests, and tests with no result on one
-          side — each a tab with its own table, plus how many tests
-          <em>agree</em> and are not worth listing, and how much of the
-          estate has a result on this branch at all. Both sides' "last ran"
-          times are shown, and a warning appears if the comparison's other
-          side hasn't run recently enough to trust it.</li>
-        <li><strong>Triage works from a branch too</strong> — every row in
-          the comparison table can be assigned (or taken) right there, and
-          "Review" opens the same output/comment panel you already know
-          from the home screen and Open actions. A branch failure never
-          offers to retire the test — that stays a mainline call — but
-          otherwise it is the same triage you already do, one click closer.
-          A sticky band across the top of the page (and the test's own page,
-          if you follow a row there) always says which branch or build
-          you're looking at, and what it's being compared against, so it's
-          never a mystery how you got there.</li>
-        <li>Open a test from a branch's or build's table and its page now
-          shows the comparison result right beside its own, and any comment
-          on that test says which build or branch it was posted from.</li>
-        <li>That test page's link to its suite's own execution history
-          still opens mainline's (script history isn't scoped to a branch
-          or build yet) — it now says so, both on hover and right next to
-          the link, instead of quietly landing somewhere you didn't
-          expect.</li>
-        <li><strong>Open actions shows where an assignment came from.</strong>
-          If a test was assigned while looking at a branch or build, its row
-          carries a small tag saying which one — and once at least one
-          assignment has come from a branch, a filter appears alongside the
-          owner filters to show only branch-originated items, or only
-          mainline's own. <strong>Fixed:</strong> that row's result used to
-          show only mainline's — a test assigned from a struggling branch
-          could read "passing" even while it was still failing there. It now
-          shows both: mainline's result, then that branch or build's own,
-          side by side.</li>
-        <li>The Watchlist (below) can carry a branch/build card too — add
-          one from the "Branch/build" option in the card picker to keep an
-          eye on a branch's or build's health alongside your usual
-          environments and products.</li>
-        <li>If your site's feeder script submits branch or build results,
-          see the README's "Feeding a branch or build" section for the new
-          <code>--branch</code>/<code>--build</code> flags.</li>
-      </ul>
-
-      <h3>New: release builds — compare against any earlier build, not just mainline</h3>
-      <ul>
-        <li><strong>A build can now be judged against the build before
-          it, not only against mainline.</strong> Open a build's comparison
-          page and a new <strong>Compare to</strong> box appears above the
-          numbers — it defaults to the build's own predecessor when one
-          exists (the last time this same build name was cut, this box
-          shows which one it picked), and falls back to mainline when there
-          isn't one yet. Type or pick any other build or branch of the same
-          product to compare against that instead — nothing is parsed out
-          of the version string; builds are always ordered by when they
-          actually ran, never by name.</li>
-        <li>A build's page now says when it was built and whether anything
-          has run since — "Built 2 days ago — nothing has run since" if it
-          hasn't been re-cut, or its last run time if it has.</li>
-        <li><strong>A build's page now names both baselines at once.</strong>
-          Right under the header, a line reads "vs build 1.0.0: 4 new
-          failures · 2 fixed — vs mainline: 6 new failures" — whichever
-          baseline you're currently looking at plus the other one, so you
-          don't have to switch the <em>Compare to</em> box back and forth
-          to ask "but is it good against mainline too?" It fills in a
-          moment after the rest of the page (a second lookup), and stays
-          hidden entirely for the very first build of a product, which has
-          no earlier build to name.</li>
-        <li><strong>A test's own page can now show its result on every
-          build and branch of its product at once.</strong> Open the new
-          "Every build" section below Analytics: one row per stream that
-          has ever run this test, newest first, with the ones that never
-          ran it plainly marked <em>no result</em> rather than left off the
-          table or guessed at. There's also a quick switcher near the top
-          of the page — pick any stream from the list and jump straight to
-          this same test's result there.</li>
-        <li>A Watchlist card for a build now says how many tests are
-          failing in it by name, and compares it against its predecessor
-          build when one exists — the same default the comparison page
-          uses — falling back to mainline otherwise.</li>
-        <li>Comparing two builds (or a build and a branch) from different
-          products is refused with a clear message naming both — there is
-          nothing to compare across products, since they don't share
-          environments.</li>
-      </ul>
-
-      <h3>New: a long-running branch gets its own dashboard</h3>
-      <ul>
-        <li><strong>A branch that runs nightly for weeks now reads like a
-          second small testboard, not just a diff against mainline.</strong>
-          Open a branch with enough history and you'll see two tabs at the
-          top: <strong>Its own results</strong> (the same tiles, trend
-          chart and triage queues you already know from the home screen —
-          scoped to that branch alone) and <strong>Difference from
-          mainline</strong> (the comparison view from the August drop
-          above, unchanged). Both tabs are always there for a branch;
-          which one opens first depends on how much history the branch
-          has, and a line under the tabs says exactly why in plain
-          words — "this branch has completed 8 passes in the last 14
-          days" or similar, never a silent guess.</li>
-        <li>The Time and Timeline pages can now be scoped to a branch too —
-          so "where did the suite's time go last night" and "what order did
-          scripts run in" both work for a branch's own nightly run, not only
-          for mainline. <strong>The Build picker now lives on both pages
-          directly</strong> (it used to only be reachable from the
-          dashboard) — pick a branch or build right there, no detour
-          required. And the <strong>Dashboard / Time / Timeline</strong>
-          links in the header now keep whichever branch, build, or
-          environment you're currently looking at as you move between
-          them, instead of quietly dropping you back to mainline.</li>
-        <li><strong>Suite history works for branches now too</strong> — the
-          last page that didn't. Open a suite's execution history from a
-          branch (its own test list, a Timeline row, or a test's own page)
-          and it shows that branch's own runs and its own current results,
-          with the same "you are scoped to a branch" band every other page
-          shows. A branch now has every tool mainline does.</li>
-        <li>The comparison view now says, in one line, how much of what's
-          failing on a branch is really <em>new</em> there versus already
-          broken on mainline too — "Of 4 tests failing here, 1 also fails
-          on mainline too" — so a branch's own regressions don't get lost
-          in mainline's existing noise.</li>
-        <li>Mainline is completely unaffected either way — a branch's own
-          nightly history has never counted toward mainline's trend,
-          staleness, or triage queues, and this drop keeps it that way.</li>
-      </ul>
-
-      <h3>New page: Watch</h3>
-      <ul>
-        <li><strong>One page, the sets you actually check.</strong> Add a
-          card for any environment (and, once a second product exists, any
-          product) you're responsible for; each card shows what's failing,
-          what's new, what's been fixed, and when it was last heard from —
-          dated in its own words, not one page-wide timestamp. Click a card
-          to open that scope on the dashboard.</li>
-        <li><strong>The URL is the whole page.</strong> There's no login and
-          nothing saved on the server — build the page once, click
-          <em>Copy link</em>, and send the URL to whoever else needs it. Use
-          <em>Save as my default</em> so a bare visit to the Watch page
-          always opens to yours.</li>
-        <li><strong>Reorder and remove</strong> with the arrows on each
-          card — no drag-and-drop to fight with. A card for a name that no
-          longer exists says so plainly rather than just vanishing, so an
-          old shared link never looks like it silently lost something.</li>
-        <li>Find it in the nav on every page, labelled <strong>Watch</strong>.</li>
-        <li><strong>A card with a failing, unowned test now says so at a
-          glance.</strong> Any environment, product or branch/build card
-          with at least one currently-failing test that nobody has taken
-          gets a red-tinted border and an "Unassigned failing" count right
-          on the card — colour is never the only signal, the number is
-          always there in words too. A card with nothing unassigned looks
-          exactly as it always has.</li>
-        <li><strong>That count is now a way in, not just a number.</strong>
-          Click it on any card — environment, product, or a branch/build —
-          and the dashboard opens already filtered to exactly those
-          failing, unassigned tests. A long-running branch showing its own
-          results filters the same way; a build's (or a quieter branch's)
-          comparison view has no separate filter of its own, but every
-          failing row there already shows its assignee inline. The
-          dashboard itself also gained a plain <strong>Unassigned
-          only</strong> chip next to the result filters, for starting that
-          same filter from scratch.</li>
-        <li><strong>Cards can now declare how often they're expected to
-          report.</strong> Add <code>@1d</code>, <code>@7d</code>, or a
-          custom hour count to a card from the new dropdown next to the
-          picker (or by hand in the URL, e.g. <code>c=e:win-sim@36h</code>)
-          and the card gets an amber border plus a line saying so — "expected
-          within 1d — last run 3 days ago" — when it's overdue. A card with
-          no declared cadence behaves exactly as before; this is entirely
-          optional per card.</li>
-        <li><strong>Watch is cross-product</strong> — pick any product's
-          builds and branches in one composed view, even if your browser's
-          Product switcher (on the other pages) is currently set to
-          something else. The switcher itself is gone from this page — it
-          never scoped anything here, every card already names its own
-          scope. <strong>Fixed:</strong> a Watchlist saved as "my default"
-          could render completely empty the moment an unrelated link
-          parameter showed up beside it; it now loads reliably every time.</li>
-      </ul>
-
-      <h3>Under the hood: products</h3>
-      <ul>
-        <li>testboard can now group environments into <strong>products</strong>,
-          for sites that run more than one. Nothing changes for anyone on a
-          single-product install — no new switcher, no new column, nothing
-          to configure. Once a second product is declared (in the
-          "Environment expectations" section of Open actions, which now has
-          a Product cell alongside the existing one), a <strong>Product</strong>
-          picker appears at the top of every page, and the home screen and
-          Open actions' tables gain a Product column so mixed views stay
-          readable — scoped to one product, the column disappears again and
-          the page says so.</li>
-        <li><strong>Declaring products for an estate that already has a lot
-          of environments got faster.</strong> The same "Environment
-          expectations" section now offers an "Assign N unmapped
-          environments" button whenever at least one environment has no
-          product yet — type the product name once and it's applied to
-          every currently-unmapped environment in one action, instead of
-          one at a time. It disappears once nothing is left unmapped.</li>
-        <li>The home screen and a branch's comparison page do less work on
-          the server to build the same page you already see — no visible
-          change, just fewer round trips behind the scenes.</li>
-        <li><strong>The home screen and Watch remember what they just
-          computed.</strong> Reloading either within about a minute of the
-          last load is now near-instant — the numbers themselves are
-          exactly as fresh as before (still checked against every import,
-          triage action, and comment), only the repeat computation is
-          skipped. The very first load of a session, or a load more than a
-          minute after the last one, is unchanged.</li>
+        <li><strong>Products.</strong> If your site runs more than one
+          product, a <strong>Product</strong> switcher now appears at the
+          top of every page, scoping everything on it to the one you pick —
+          declared in the "Environment expectations" section of Open
+          actions. Nothing changes if your site only runs one.</li>
+        <li><strong>A new Watch page.</strong> Build a grid of cards for
+          the environments, products and builds you personally check, and
+          share the page by copying its URL — there's no login and nothing
+          saved on the server. Find it in the nav, labelled Watch.</li>
+        <li><strong>Uploading builds and comparing them.</strong> A CI
+          build or a one-off upload can now show up beside your nightly
+          results without touching them. Once one exists, a
+          <strong>Build</strong> picker appears next to the Environment
+          filter on the dashboard (and now on Time and Timeline too) — pick
+          one to compare it against mainline, or use the
+          <strong>Compare to</strong> box on its page to compare it against
+          any other build of the same product instead.</li>
+        <li><strong>Assigning from a build's failures.</strong> Every row
+          in a build's comparison table can be assigned, taken, or
+          reviewed right there — the same triage you already do on the
+          home screen, one click closer. A build's failure never offers to
+          retire the test; that stays a mainline call.</li>
+        <li><strong>Per-build test history and suite pages.</strong> A
+          test's own page now has an "Every build" section showing its
+          result on every build of its product at once; a suite's
+          execution history page now works for any build too, not only
+          mainline.</li>
+        <li><strong>Highlights and staleness cadences.</strong> A Watch
+          card with a failing, unowned test gets a red-tinted border and an
+          "Unassigned failing" count you can click straight into; add
+          <code>@1d</code>, <code>@7d</code>, or a custom hour count to a
+          card to have it flag itself when it's overdue.</li>
+        <li><strong>A long-running build gets its own dashboard.</strong>
+          Open one that's been running for weeks and you'll see two tabs:
+          <strong>Its own results</strong> (the same tiles, trend and
+          triage queues as the home screen, scoped to it alone) and
+          <strong>Difference from mainline</strong> — which one opens
+          first, and why, is stated in a line under the tabs.</li>
+        <li><strong>Fixed: the Time and Timeline pages could show a bare
+          empty page for a build that simply ran elsewhere.</strong> Scoped
+          to a build and looking at an environment it never reported on,
+          both pages now say which environments it DOES have runs on (each
+          a link to switch straight there), or that it has no runs at all,
+          instead of a page that looked broken.</li>
+        <li>A few smaller fixes from live testing: a scoped page could
+          briefly offer other products' environments in its pickers;
+          jumping from a Watch card to the dashboard could land on the
+          wrong product's page; and several links (Open actions rows,
+          "View in timeline", a build's quick Time/Timeline links) could
+          quietly drop back to mainline instead of following you.</li>
       </ul>
     </section>
 

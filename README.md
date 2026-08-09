@@ -124,14 +124,20 @@ Validation rules per record:
 - `output`: required key, must be a string (may be `""`).
 - `source_link`: optional string, defaults to `""`.
 - `known_failure_reason`: optional, string or null, defaults to null.
-- `branch` / `build` (added WP-21): optional, string or null, mutually exclusive.
-  Present and non-empty (after stripping) means this run belongs to a STREAM beside
-  the mainline nightlies — a branch's CI results or a release build's, kept off
-  mainline's trend, triage and staleness entirely (see "Streams" below). Absent
-  (both null, or absent) means mainline, exactly what every feeder sent before this
-  field existed — back compat is free. A record naming both is rejected
-  (`"branch/build: mutually exclusive"`); one bad record never aborts the batch.
-- Unknown extra keys are ignored (forward compatibility).
+- `build` (added WP-21): optional, string or null. Present and non-empty (after
+  stripping) means this run belongs to a STREAM beside the mainline nightlies — a
+  release build's results, or an RC's, kept off mainline's trend, triage and
+  staleness entirely (see "Streams" below). Absent (null, or absent) means
+  mainline, exactly what every feeder sent before this field existed — back compat
+  is free.
+- `branch` (WP-21 originally added it as a second stream kind; **removed by WP-25,
+  `docs/ONE_KIND_PLAN.md`, before it ever shipped anywhere** — the branch/build
+  distinction never earned its weight, so it was deleted, not migrated): a record
+  carrying this key is **REJECTED**, present or not, whatever its value —
+  `"branch: removed before this contract ever shipped — use build:"`. Checked by
+  key PRESENCE, not value, so `"branch": null` is rejected too; a client sending
+  it must switch to `build`. One bad record never aborts the batch.
+- Unknown extra keys (other than `branch`) are ignored (forward compatibility).
 
 **Idempotency:** a run is uniquely keyed by
 `(environment, script, test_name, start_time)` **on its stream** — see "Streams"
@@ -160,7 +166,7 @@ batch (valid records are still upserted):
       "start_time": "2026-07-25T02:14:07.123456"
     }
   ],
-  "streams_seen": ["branch:feature/checkout-v2"]
+  "streams_seen": ["build:2026.9.1-rc2"]
 }
 ```
 
@@ -176,35 +182,38 @@ byte-identical ones — its meaning on the wire has not changed, so a feeder sum
 records are all `unchanged` is the healthy steady state for a scheduled re-push,
 not a stall.
 
-`streams_seen` (added WP-21): the sorted `"{kind}:{name}"` of every non-mainline
+`streams_seen` (added WP-21): the sorted `"build:{name}"` of every non-mainline
 stream this batch NAMED (whether or not every individual record on it was stored —
-see the collision case below), `[]` for a batch with no `branch`/`build` records.
-**This is the key a `--branch`/`--build` feeder invocation checks for.** Every
-server before WP-21 ignores unknown JSON keys, so it would accept a `branch`/
-`build`-carrying batch and silently file the runs into mainline; a response with
+see the collision case below), `[]` for a batch with no `build` records.
+**This is the key a `--build` feeder invocation checks for.** Every
+server before WP-21 ignores unknown JSON keys, so it would accept a `build`-
+carrying batch and silently file the runs into mainline; a response with
 this key **absent entirely** (not present-and-empty) is the only signal that
 distinguishes that from a real WP-21 server answering a mainline-only batch, and
 the feeder treats it as fatal — see "Feeding in your own results" below.
 
-#### Streams (branch and build runs beside mainline)
+#### Streams (build runs beside mainline)
 
-Added WP-21 (`docs/STREAMS_PLAN.md`). A record carrying `branch`/`build` is
-attributed to a STREAM — `(product, kind, name)`, where `product` is resolved
-from the record's `environment` (via the declared environment→product mapping,
-WP-20) **at the moment the stream is first seen**, then fixed for that stream's
+Added WP-21 (`docs/STREAMS_PLAN.md`); narrowed from two non-mainline kinds
+(`branch`, `build`) to one (`build`) by WP-25 (`docs/ONE_KIND_PLAN.md`) — the
+`branch` kind never shipped anywhere, so this was a deletion, not a migration.
+A record carrying `build` is attributed to a STREAM — `(product, kind, name)`,
+`kind` always `'mainline'` or `'build'`, where `product` is resolved from the
+record's `environment` (via the declared environment→product mapping, WP-20)
+**at the moment the stream is first seen**, then fixed for that stream's
 lifetime even if the mapping changes later. There is no registry to maintain: the
 first record naming a stream creates it, inside the same transaction as the
 import, the same way an unrecognised `environment` has always worked.
 
 **Mainline is provably unaffected.** A stream's un-retirement never fires (a
-branch run reporting against a mainline-retired test does not un-retire it —
-the branch may predate the decision). `activity_hours`/`script_hours` (the
+build run reporting against a mainline-retired test does not un-retire it —
+the build may predate the decision). `activity_hours`/`script_hours` (the
 trend, the staleness cutoff, the Timeline's running order) are maintained
 for EVERY stream (WP-23) — each stream's rows are a disjoint partition
-(`stream_id` leads both tables' PRIMARY KEY), so a branch's own activity can
+(`stream_id` leads both tables' PRIMARY KEY), so a build's own activity can
 never change a byte of mainline's. `/api/summary`, `/api/time` and
 `/api/timeline` all accept an optional `stream=<id>` (default: mainline —
-every caller from before WP-23 sees no change); a long-running branch's
+every caller from before WP-23 sees no change); a long-running build's
 "own results" dashboard tab reads its own status/trend/triage/running-order
 through the exact same endpoints, scoped.
 
@@ -212,12 +221,12 @@ through the exact same endpoints, scoped.
 test_name, start_time)`, but the underlying `runs` table's UNIQUE constraint
 predates streams and is frozen at `(environment, script, test_name, start_time)`
 alone — no stream column. If a record's exact key is already claimed by a
-**different** stream (in practice: a branch run microsecond-identical to a
+**different** stream (in practice: a build run microsecond-identical to a
 mainline run of the same test — vanishingly unlikely, but the constraint makes it
 impossible to store either way), that record is **rejected**, not silently
 overwritten and not silently misfiled onto the other stream: it appears in
 `errors[]` naming both streams (e.g. `"...already recorded on stream 'mainline';
-this record targets stream 'branch:feature/x'..."`), and the rest of the batch is
+this record targets stream 'build:feature/x'..."`), and the rest of the batch is
 unaffected.
 
 `GET /api/streams?product=<name>` lists a product's non-mainline streams (id,
@@ -232,8 +241,10 @@ field rather than something the caller re-derives, since it is what the "N
 tests agree and are not listed" and coverage lines on the dashboard need)
 plus both sides' identity and `last_seen`; `baseline=` (WP-22) accepts any
 stream id of the SAME product as `stream=`, not only mainline — a build
-judged against the build before it, or one branch against another — and
-defaults to mainline when omitted. Mainline is the one universal exception
+judged against the build before it, or one build against another — and
+defaults to mainline when omitted (always, per WP-25's "default baseline is
+mainline" decision — see `docs/ONE_KIND_PLAN.md` §1.3; nothing picks a
+predecessor build automatically any more). Mainline is the one universal exception
 to the product check on either side (its own `product` is `""` by
 construction, shared by every product). A baseline naming a DIFFERENT
 product than `stream=` is refused with `400`, naming both products — the
@@ -267,9 +278,9 @@ fabricated. `404` if the triple has never run anywhere.
 Nothing here breaks an existing feeder, and nothing here requires one to change
 anything, but it is worth stating plainly what each generation of client sees:
 
-- **A feeder that has never heard of `branch`/`build`/products:** zero changes.
-  It sends the same transport schema it always has; absent `branch`/`build`
-  means mainline, exactly as before those fields existed; `product` is never on
+- **A feeder that has never heard of `build`/products:** zero changes.
+  It sends the same transport schema it always has; absent `build`
+  means mainline, exactly as before that field existed; `product` is never on
   the wire at all — it is a **server-side declaration**
   (`PUT /api/environments/{env}/product`), made by a human against an
   environment name, never sent or read by the feeder. A server upgraded under
@@ -278,12 +289,12 @@ anything, but it is worth stating plainly what each generation of client sees:
 - **Declaring a new product: ordering matters.** A stream's `product` is
   resolved from its environment's declared product **once, the moment the
   stream is first seen, then fixed for that stream's lifetime** (see
-  "Streams" above). If a new product's CI starts pushing branch/build results
+  "Streams" above). If a new product's CI starts pushing build results
   under an environment BEFORE that environment's product mapping is declared,
   the stream is created with product `""` and stays there permanently — there
   is no admin action that moves an existing stream to a different product
   after the fact. **Declare the environment→product mapping before that
-  product's branch/build CI first pushes**, not after. (This is also why the
+  product's build CI first pushes**, not after. (This is also why the
   Open Actions page's bulk "assign every unmapped environment to product X"
   control — a one-time upgrade-day convenience, see `docs/STREAMS_PLAN.md`
   §2 — is an explicit action a human runs deliberately, never a standing
@@ -291,16 +302,16 @@ anything, but it is worth stating plainly what each generation of client sees:
   silently mislabel a future product's environments if its first push beat
   its mapping, and that mistake would be permanent for any stream born under
   it.)
-- **A branch/build client** (`docs/STREAMS_PLAN.md` §3): set one field per
-  record (`"branch": "<name>"` or `"build": "<name>"`, never both), or use the
-  feeder's `--branch NAME`/`--build NAME` flags, which also require the
-  import response's `streams_seen` acknowledgment and abort loudly (exit 1, no
+- **A build client** (`docs/STREAMS_PLAN.md` §3; narrowed to build-only by
+  WP-25, `docs/ONE_KIND_PLAN.md` — `branch` was never a working option on any
+  shipped server): set `"build": "<name>"` on each record, or use the
+  feeder's `--build NAME` flag, which also requires the
+  import response's `streams_seen` acknowledgment and aborts loudly (exit 1, no
   high-water-mark saved) if it is absent — the one signal that tells a WP-21+
   server apart from an older one that would otherwise silently file everything
   into mainline (see `streams_seen` above). Each stream gets its own feeder
-  state file (`feeder_state.branch.<name>.json` / `feeder_state.build.<name>.json`),
-  so a branch's catch-up run never shares — or fights over — mainline's
-  high-water mark.
+  state file (`feeder_state.build.<name>.json`), so a build's catch-up run
+  never shares — or fights over — mainline's high-water mark.
 
 ### GET /api/dashboard — latest run per test (paginated)
 
@@ -357,7 +368,7 @@ With `with_comment=1` each row also carries
 from — `null` for mainline, unassigned, or a pre-WP-21 assignment. `streams`
 batch-resolves every DISTINCT non-null `assignment_stream_id` on the RETURNED
 PAGE to its identity (same shape as the comments endpoint's `streams` map,
-same reason: a "branch feat/x" tag needs a name, not just an id, and a lookup
+same reason: a "build 2026.9.1" tag needs a name, not just an id, and a lookup
 per row does not scale).
 
 `total` counts every test matching the filters, not the rows returned. Every
@@ -387,9 +398,12 @@ the estate, so the filter does not render at all.
 `covered_passes` (WP-23) is the count of COVERED passes (a block of activity
 that ran at least half the stream's own tests — the same inference the
 staleness cutoff is derived from) the requested stream completed in its own
-14-day lookback — the number the branch dashboard's two-tab header reads to
-decide whether "Its own results" or "Difference from mainline" opens by
-default, stated alongside the threshold in the caption rather than hidden.
+14-day lookback — the number a long-running stream's two-tab header reads to
+decide whether it exists at all, and whether "Its own results" or "Difference
+from mainline" opens by default (WP-25, `docs/ONE_KIND_PLAN.md` §1.4: the
+same threshold now gates both, replacing the old kind-based gate — a
+stream meeting it gets both tabs, however it was uploaded), stated alongside
+the threshold in the caption rather than hidden.
 
 None of this is proportional to the size of the estate: the headline counts come
 from a single `GROUP BY` (a few dozen rows however many tests exist), and each
@@ -416,7 +430,7 @@ waiting for its slowest piece (this is what the home screen does):
   "environments": ["linux-prod-sim", "linux-uat-sim"],
   "scripts": ["regression/user_lifecycle.py", "smoke/login.py"],
   "assignees": ["alice", "luke"],
-  "assignment_streams": [{"id": 2, "product": "", "kind": "branch",
+  "assignment_streams": [{"id": 2, "product": "", "kind": "build",
                           "name": "feat/x", "first_seen": "...",
                           "last_seen": "...", "failing": 0}],
   "recent_hours": 36,
@@ -497,12 +511,14 @@ baseline_kind, baseline_name, baseline_last_seen}` — the same five-way
 classification as `GET /api/compare` for that stream against its baseline,
 plus both sides' identity and freshness so the card can name what it was
 actually compared against and show its own staleness warning.
-`baseline_kind`/`baseline_name` (WP-22) are `"mainline"`/`""` for a branch
-(branches have no predecessor concept), or the nearest earlier same-product
-build by `last_seen` for a build that has one — the same default the
-build-scoped dashboard's "Compare to" control opens on
-(`Storage.previous_builds`) — falling back to mainline otherwise. A
-name/id that resolves to nothing (including `s:1`, the mainline stream —
+`baseline_kind`/`baseline_name` are always `"mainline"`/`""` (WP-25,
+`docs/ONE_KIND_PLAN.md` §1.4: "one wording for all streams" — WP-22 had this
+card default to the nearest earlier same-product build by `last_seen` when
+one existed; WP-25 removed that, the same "default baseline is mainline,
+always" decision applied to the dashboard's own delta view, so a card's
+verdict and the dashboard it links to never disagree about what they are
+comparing against). A name/id that resolves to nothing (including `s:1`, the
+mainline stream —
 it is never a Watchlist entry, the same rule `GET /api/streams` applies)
 is instead `{spec, kind, name, ok: false, error}`. The page still answers
 200 around a mix of good and bad cards.
@@ -599,7 +615,7 @@ newest comment is shown in the triage queues and the open-actions view.
   looking at when they wrote a line of it. `streams` batch-resolves every
   *distinct* non-null `stream_id` on the thread to its identity, in one extra
   query — this is what lets the UI show a "posted from mainline" / "posted
-  from branch feat/x" tag on each comment without a lookup per comment. A
+  from build 2026.9.1" tag on each comment without a lookup per comment. A
   comment with `stream_id: null` (posted before WP-21, or with no declared
   context) has no entry in `streams` and the UI shows it with no tag at all.
 - `POST` same path — body `{"username": "...", "text": "...", "stream_id":
@@ -621,7 +637,7 @@ history is kept for audit; the current assignee is the most recent entry. Return
 
 `stream_id` (WP-21) is optional and is an **annotation**, not a scope: it records
 WHERE the assignment was made from, never who or what it targets — the assignee
-itself is the same value seen from mainline or from any branch's view of the same
+itself is the same value seen from mainline or from any build's view of the same
 test. Omitted or `null` means mainline, or a client that predates this field —
 every assignment ever made before WP-21. When given it must reference an existing
 stream (`404` otherwise). Both `GET /api/dashboard` rows and `GET /api/compare`'s
@@ -836,26 +852,28 @@ python run_feeder.py --url http://127.0.0.1:8000 --mode catchup \
     --state-file /var/lib/testboard/feeder_state.json
 ```
 
-### Feeding a branch or build (WP-21)
+### Feeding a build (WP-21; narrowed to build-only by WP-25)
 
-`--branch NAME` / `--build NAME` (mutually exclusive) stamp every record of
-the run as belonging to that stream instead of mainline — see "Streams" above
-for what that means server-side. Local validation mirrors the server's
-(non-empty after stripping, not both at once).
+`--build NAME` stamps every record of the run as belonging to that stream
+instead of mainline — see "Streams" above for what that means server-side.
+(WP-21 originally shipped this alongside a second, `--branch`, flag; WP-25,
+`docs/ONE_KIND_PLAN.md`, removed `--branch` before it ever reached a server —
+the distinction never earned its weight.) Local validation mirrors the
+server's (non-empty after stripping).
 
 ```
 python run_feeder.py --url http://127.0.0.1:8000 --mode catchup \
     --reader jsonl --source 'ci-results/*.jsonl' \
-    --branch feature/checkout-v2 \
+    --build 2026.9.1-rc2 \
     --state-file /var/lib/testboard/feeder_state.json
 ```
 
-Two things are different from a mainline run, both there to stop a branch
+Two things are different from a mainline run, both there to stop a build
 invocation from ever silently landing in mainline or clobbering mainline's
 own progress:
 
 - **The response is checked for the `streams_seen` acknowledgment.** A
-  server that predates WP-21 ignores the unknown `branch`/`build` keys and
+  server that predates WP-21 ignores the unknown `build` key and
   would file the runs into mainline without complaint — its response also
   lacks `streams_seen` entirely, which is the only signal that tells a new
   feeder it is talking to an old server. When that happens the run aborts
@@ -864,12 +882,12 @@ own progress:
   `--check-reader` — it needs a real response from the real server.
 - **The high-water-mark file is a DIFFERENT path**, derived from
   `--state-file`: `feeder_state.json` becomes
-  `feeder_state.branch.feature-checkout-v2.json` (branch names are
+  `feeder_state.build.2026.9.1-rc2.json` (build names are
   sanitized to filesystem-safe characters — they commonly contain `/`).
-  Without this, a branch's catchup run would read and advance the *same*
+  Without this, a build's catchup run would read and advance the *same*
   mark as the mainline nightly, fast-forwarding one past runs it has never
   actually seen. `--status` and `--forget-state` resolve the same derived
-  path when given the same `--branch`/`--build`.
+  path when given the same `--build`.
 
 ### Importing a long history a slice at a time
 
