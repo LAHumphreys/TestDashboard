@@ -2259,6 +2259,28 @@ class WatchUnassignedStatLinkTest(unittest.TestCase):
     # "innerHTML" while explaining why there is none).
 
 
+class OpenActionsSummaryScopeTest(unittest.TestCase):
+    """actions.js's /api/summary fetch must carry the product scope.
+
+    The rows (listUrl) carried product= from WP-20 day one; the summary
+    fetch feeding the ENVIRONMENT FILTER and assignee list did not, so
+    a product-scoped page offered every product's environments — found
+    by the user twice on this page (2026-08-09). The server-side
+    catalog-scoping fix (0a42855) only helps callers who send the
+    param; this pins the sending.
+    """
+
+    def test_summary_is_fetched_through_the_scoped_helper(self) -> None:
+        src = read("actions.js")
+        self.assertIn("function summaryUrl()", src)
+        self.assertIn("fetchJson(summaryUrl())", src)
+        self.assertNotIn('fetchJson("/api/summary")', src,
+                         "a bare unscoped summary fetch is the bug "
+                         "coming back")
+        body = _function_body(src, "function summaryUrl()")
+        self.assertIn("appendProduct(qs)", body)
+
+
 class OpenActionsOriginFilterTest(unittest.TestCase):
     """Open Actions' branch/mainline origin filter and per-row tag
     (WP-21, docs/STREAMS_PLAN.md §3.6, found in first human use)."""
