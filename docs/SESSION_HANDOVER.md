@@ -12,20 +12,19 @@ in production. WP-20+21+22+23 now ship as ONE combined drop; there is
 nothing left in the products/streams design (`docs/STREAMS_PLAN.md`) that
 was planned and is unbuilt.
 
-> **Tonight's session runs TWO packages, IN THIS ORDER:**
-> 1. **[`ONE_KIND_PLAN.md`](ONE_KIND_PLAN.md) (WP-25, user-commissioned
->    2026-08-09 late-day):** collapse the branch/build distinction to
->    one non-mainline kind (`build`) — deletion before first contact,
->    nothing kind-shaped has shipped. Branch `wp-25-one-kind` off
->    `wp-23-longrunning`'s tip.
-> 2. **[`SCOPED_URLS_PLAN.md`](SCOPED_URLS_PLAN.md) (WP-24):** one
->    scope-aware URL builder ending the hand-built-URL bug family
->    (incident table in the doc). Branch `wp-24-scoped-urls` off
->    **WP-25's reviewed tip** — WP-25 deletes kind-gated URL sites
->    WP-24 would otherwise preserve, which is why the order matters.
->
-> Both docs are self-contained. Suite baseline: **1978 OK (skipped=1)**
-> — later than the counts elsewhere in this file, which predate the
+> **Tonight's session executes ONE document:
+> [`NIGHT_RUN_2026-08-09.md`](NIGHT_RUN_2026-08-09.md).** It sequences
+> the two package specs (`ONE_KIND_PLAN.md` then `SCOPED_URLS_PLAN.md`
+> — the order matters and the run doc says why), then a six-class
+> sanity net built from the last 48 hours' gotcha families, a
+> from-cold walk of the three canonical personas, consolidation to a
+> single ship branch (`streams-upgrade`) for the morning's one big
+> merge, and morning prep (seeded server + `MORNING_TESTING.md`
+> checklist). It also restates the full operating pattern — Sonnet
+> implements / coordinator reviews, hourly re-armed wakeups,
+> review-before-push, guardrails — so the fresh session needs nothing
+> from prior conversations. Suite baseline: **1978 OK (skipped=1)** —
+> later than the counts elsewhere in this file, which predate the
 > day's usability/perf rounds (see `UPGRADE_PLAN_STATUS.md`).
 
 ---
