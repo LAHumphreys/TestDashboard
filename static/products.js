@@ -155,6 +155,16 @@ export function renderSwitcher(container, products) {
     } else {
       url.searchParams.delete("product");
     }
+    // Changing a scope resets every narrower scope beneath it: a
+    // stream (and its baseline) and an environment filter all belong
+    // to the product they were chosen under. Carrying them across a
+    // product switch is either contradictory (another product's stream
+    // id, an out-of-product environment whose allow-list match is
+    // guaranteed empty) or at best never-chosen — the same
+    // stale-scope family as the Build picker's baseline carry-over.
+    url.searchParams.delete("stream");
+    url.searchParams.delete("baseline");
+    url.searchParams.delete("environment");
     window.location.href = url.toString();
   });
   label.appendChild(select);

@@ -122,6 +122,12 @@ export function renderPicker(container, streams, selectedId) {
     } else {
       url.searchParams.delete("stream");
     }
+    // A baseline belongs to the scope it was chosen in: carrying an
+    // RC's explicit baseline into a branch (a legal but never-chosen
+    // comparison) or into mainline (a dangling param) is the stale-
+    // scope cousin of the choosing-mainline sentinel bug. Changing
+    // stream resets it; the new scope re-derives its own default.
+    url.searchParams.delete("baseline");
     window.location.href = url.toString();
   });
 

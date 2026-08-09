@@ -1747,6 +1747,23 @@ class CompareToControlTest(unittest.TestCase):
         self.assertIn('candidate.kind !== "build"', body)
         self.assertIn("candidate.id === streamMeta.id", body)
 
+    def test_scope_changes_reset_narrower_scopes(self) -> None:
+        """Changing a scope resets every narrower scope beneath it
+        (product > stream > baseline; product > environment). Found by
+        auditing the whole control family after the choosing-mainline
+        sentinel bug (2026-08-09): the Build picker carried an RC's
+        baseline into branches/mainline, and the product switcher
+        carried another product's stream/baseline/environment — either
+        contradictory or never-chosen."""
+        picker = _function_body(
+            read("streams.js"), "export function renderPicker(")
+        self.assertIn('searchParams.delete("baseline")', picker)
+        switcher_src = read("products.js")
+        for param in ("stream", "baseline", "environment"):
+            self.assertIn(
+                'searchParams.delete("{0}")'.format(param), switcher_src,
+                "product switcher must reset " + param)
+
     def test_choosing_mainline_sets_an_explicit_baseline_param(self) -> None:
         """Choosing "Mainline nightlies" must write baseline=1, never
         DELETE the param: on a build page "no baseline" already means
