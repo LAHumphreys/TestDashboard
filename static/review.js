@@ -35,6 +35,7 @@ import {
   showError,
   testApiPath,
 } from "./api.js";
+import { pageUrl } from "./urls.js";
 
 /*
  * Which panels are open, keyed by test identity.
@@ -123,10 +124,6 @@ async function buildReviewPanel(entry, container, opts) {
   container.appendChild(panel);
 
   const head = el("div", "review-head");
-  const params = new URLSearchParams();
-  params.append("environment", entry.environment);
-  params.append("script", entry.script);
-  params.append("test_name", entry.test_name);
   // F2 (docs/STREAMS_PLAN.md §3.6/§0.9): a row read from a branch's own
   // dashboard tab (app.js's tagStream() stamps entry.stream_id on
   // exactly those rows — undefined/absent everywhere else, including
@@ -135,26 +132,27 @@ async function buildReviewPanel(entry, container, opts) {
   // mainline — "View in timeline" from a branch delta row used to
   // deep-link to the mainline timeline, where that run does not exist
   // at all (needs F7: timeline.js could not read `stream=` before it).
-  if (entry.stream_id) {
-    params.append("stream", String(entry.stream_id));
-  }
+  // A TRUTHY check, not `!== null`: undefined (the common case) must
+  // also skip the stream scope. This panel cannot know whose page it
+  // is on (see the module docstring), so BOTH links pass an entirely
+  // EXPLICIT scope — never pageUrl()'s default carriage, which reads
+  // whatever page happens to be hosting the panel.
+  const streamScope = entry.stream_id || null;
   const full = document.createElement("a");
-  full.href = "test.html?" + params.toString();
+  full.href = pageUrl("test", {
+    environment: entry.environment, script: entry.script,
+    test_name: entry.test_name,
+  }, { stream: streamScope, product: null, baseline: null });
   full.textContent = "Open full test page →";
   // The poisoned-data workflow's door: this run, in its night's running
   // order, with everything that ran before it listed above. `at` is the
   // run's start time, so the Timeline opens the run that CONTAINS this
   // result rather than whatever ran most recently.
-  const timelineParams = new URLSearchParams();
-  timelineParams.append("environment", entry.environment);
-  timelineParams.append("script", entry.script);
-  timelineParams.append("test", entry.test_name);
-  timelineParams.append("at", entry.start_time);
-  if (entry.stream_id) {
-    timelineParams.append("stream", String(entry.stream_id));
-  }
   const inTimeline = document.createElement("a");
-  inTimeline.href = "timeline.html?" + timelineParams.toString();
+  inTimeline.href = pageUrl("timeline", {
+    environment: entry.environment, script: entry.script,
+    test: entry.test_name, at: entry.start_time,
+  }, { stream: streamScope, product: null, baseline: null });
   inTimeline.textContent = "View in timeline →";
   inTimeline.title = "This run in its night's running order — what ran "
     + "before it is listed above it";

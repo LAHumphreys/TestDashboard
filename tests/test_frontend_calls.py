@@ -390,19 +390,24 @@ class ReviewPanelTest(unittest.TestCase):
         It is undefined everywhere else (a mainline row, or any Open
         Actions row, where the similarly-named assignment_stream_id is
         a DIFFERENT concept), so this must be a truthy check, not a
-        `!== null` one."""
+        `!== null` one.
+
+        WP-24: both links are now pageUrl() calls; the truthy
+        entry.stream_id check became one `entry.stream_id || null`
+        (streamScope), passed to BOTH calls as an EXPLICIT `stream`
+        override -- this panel cannot know whose page it is on (see the
+        module docstring), so it must never lean on pageUrl()'s default
+        scope carriage the way an ordinary page's own row links do."""
         body = _strip_comments(
             _function_body(read("review.js"),
                            "async function buildReviewPanel("))
-        self.assertEqual(body.count("if (entry.stream_id)"), 2, body)
-        self.assertIn('params.append("stream", String(entry.stream_id))',
-                       body)
-        self.assertIn(
-            'timelineParams.append("stream", String(entry.stream_id))',
-            body)
+        self.assertIn("const streamScope = entry.stream_id || null;", body)
+        self.assertEqual(body.count("stream: streamScope"), 2, body)
+        self.assertIn('full.href = pageUrl("test"', body)
+        self.assertIn('inTimeline.href = pageUrl("timeline"', body)
         # Never a `!== null` check: undefined (the common case, every
         # row that never touched a branch's own dashboard tab) must
-        # also skip appending the param.
+        # also resolve streamScope to null, which pageUrl() omits.
         self.assertNotIn("entry.stream_id !== null", body)
 
     def test_the_comment_stripper_does_not_hide_real_code(self) -> None:
@@ -2199,20 +2204,28 @@ class ScriptPageParityTest(unittest.TestCase):
         self.assertIn("state.streamId = rawStream ? parseInt", body)
 
     def test_executions_fetch_forwards_the_stream(self) -> None:
+        """WP-24: `path += "&stream=" + state.streamId` became an
+        explicit `stream: state.streamId` scope override on the
+        apiUrl() call -- same intent (this fetch forwards the page's
+        own stream scope)."""
         body = _function_body(
             read("script.js"), "async function loadExecutions()")
-        self.assertIn("if (state.streamId !== null) {", body)
-        self.assertIn('"&stream=" + state.streamId', body)
+        self.assertIn("apiUrl(", body)
+        self.assertIn("stream: state.streamId", body)
 
     def test_the_tests_table_fetch_also_forwards_the_stream(self) -> None:
         """The "tests in this suite" table reads /api/dashboard, a
         DIFFERENT endpoint from /executions — found by the same
         discipline F7's timeline.js fix used: every outbound request a
         stream-scoped page makes needs the param, not only the first
-        one."""
+        one.
+
+        WP-24: `qs.append("stream", ...)` became the same `stream:
+        state.streamId` scope override pattern as loadExecutions()
+        above, now on an apiUrl() call."""
         body = _function_body(read("script.js"), "async function loadTests(")
-        self.assertIn("if (state.streamId !== null) {", body)
-        self.assertIn('qs.append("stream", String(state.streamId))', body)
+        self.assertIn("apiUrl(", body)
+        self.assertIn("stream: state.streamId", body)
 
     def test_renders_the_shared_branch_band_when_scoped(self) -> None:
         self.assertIn(
@@ -2224,12 +2237,12 @@ class ScriptPageParityTest(unittest.TestCase):
         self.assertIn("renderBranchBand(data.stream_identity)", body)
 
     def test_the_tests_table_links_carry_the_stream(self) -> None:
+        """WP-24: the hand-rolled URLSearchParams/"test.html?" pair
+        became one pageUrl() call with an explicit `stream:
+        state.streamId` scope override."""
         body = _function_body(read("script.js"), "function renderTests(")
-        self.assertIn("if (state.streamId !== null) {", body)
-        stream_at = body.index("state.streamId !== null")
-        self.assertLess(
-            stream_at, body.index('"test.html?"'),
-            "the stream param must be appended BEFORE the href is built")
+        self.assertIn('link.href = pageUrl("test"', body)
+        self.assertIn("stream: state.streamId", body)
 
     def test_the_band_mount_ships_hidden_in_the_markup(self) -> None:
         html = read_text("script.html")
