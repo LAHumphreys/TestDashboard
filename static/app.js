@@ -69,6 +69,7 @@ import {
   renderBranchBand,
   streamLabel,
 } from "./compare.js";
+import { apiUrl, pageUrl } from "./urls.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
@@ -136,33 +137,6 @@ const SECTIONS = ["status-section", "charts-section", "triage-section",
 /* ================= data loading ================= */
 
 /**
- * Add `product=<selected>` (WP-20) IF this browser has one selected.
- * The server resolves it to an environment allow-list, exactly as if
- * the environment filter had been set to every environment in it — see
- * docs/STREAMS_PLAN.md §2.2. Single-product deployments never set one,
- * so this is a no-op for them.
- */
-function appendProduct(qs) {
-  const product = getSelectedProduct();
-  if (product) {
-    qs.append("product", product);
-  }
-}
-
-/**
- * Add `stream=<id>` (WP-23) IF this page is showing a branch's OWN
- * results tab (state.streamId set by initBranchDashboard()). A page
- * that never opens that tab never sets state.streamId, so this is a
- * no-op there -- the same "absent = zero visible change" shape
- * appendProduct() follows for a single-product deployment.
- */
-function appendStream(qs) {
-  if (state.streamId !== null) {
-    qs.append("stream", String(state.streamId));
-  }
-}
-
-/**
  * Stamp `stream_id` onto a page of dashboard/queue rows fetched while
  * showing a branch's own-results tab -- assigneeSelect()/toggleReview()
  * already read `entry.stream_id` generically (WP-21, api.js/review.js)
@@ -180,73 +154,55 @@ function tagStream(rows) {
   return rows;
 }
 
+/**
+ * The scope every one of this page's own /api/... fetches carries:
+ * `product` (WP-20) IF this browser has one selected -- the server
+ * resolves it to an environment allow-list, exactly as if the
+ * environment filter had been set to every environment in it, see
+ * docs/STREAMS_PLAN.md §2.2 -- and `stream` (WP-23) IF this page is
+ * showing a branch's OWN results tab (state.streamId, set by
+ * initBranchDashboard()). `product` is normalised to null rather than
+ * ""  so apiUrl() OMITS it when nothing is selected, matching this
+ * page's fetches from before WP-24 -- an explicit empty `product=`
+ * belongs to a NAVIGATION link (a standing choice worth restating),
+ * not one of these fetches, which have no such distinction to make.
+ */
+function apiScope() {
+  return { environment: state.environment, product: getSelectedProduct() || null,
+    stream: state.streamId };
+}
+
 function summaryUrl() {
-  const qs = new URLSearchParams();
-  qs.append("parts", "headline");
-  if (state.environment) {
-    qs.append("environment", state.environment);
-  }
-  appendProduct(qs);
-  appendStream(qs);
   // The "my actions" queue is filtered server-side: picking a user's
   // tests out of an already-capped queue would hide their own work.
   // The headline needs the assignee too — the "mine" tab count.
-  const me = getUsername();
-  if (me) {
-    qs.append("assignee", me);
-  }
-  return "/api/summary?" + qs.toString();
+  return apiUrl(
+    "/api/summary", { parts: "headline", assignee: getUsername() },
+    apiScope());
 }
 
 /** URL for one triage queue's rows. */
 function queueUrl(kind) {
-  const qs = new URLSearchParams();
-  qs.append("parts", "queue");
-  qs.append("queue", kind);
-  if (state.environment) {
-    qs.append("environment", state.environment);
-  }
-  appendProduct(qs);
-  appendStream(qs);
-  const me = getUsername();
-  if (me) {
-    qs.append("assignee", me);
-  }
-  return "/api/summary?" + qs.toString();
+  return apiUrl(
+    "/api/summary",
+    { parts: "queue", queue: kind, assignee: getUsername() },
+    apiScope());
 }
 
 /** URL for one page of the test list under the current filters. */
 function browseUrl(offset) {
-  const qs = new URLSearchParams();
-  if (state.environment) {
-    qs.append("environment", state.environment);
-  }
-  appendProduct(qs);
-  appendStream(qs);
-  if (state.script) {
-    qs.append("script", state.script);
-  }
-  for (const result of state.activeResults) {
-    qs.append("result", result);
-  }
-  if (state.staleOnly) {
-    qs.append("stale", "1");
-  }
-  if (state.showRetired) {
-    qs.append("retired", "1");
-  }
-  if (state.unassignedOnly) {
-    qs.append("unassigned", "1");
-  }
-  const query = state.qText.trim();
-  if (query) {
-    qs.append("q", query);
-  }
-  qs.append("sort", state.sortKey);
-  qs.append("order", state.sortAsc ? "asc" : "desc");
-  qs.append("limit", String(CHUNK));
-  qs.append("offset", String(offset));
-  return "/api/dashboard?" + qs.toString();
+  return apiUrl("/api/dashboard", {
+    script: state.script,
+    result: state.activeResults,
+    stale: state.staleOnly ? "1" : null,
+    retired: state.showRetired ? "1" : null,
+    unassigned: state.unassignedOnly ? "1" : null,
+    q: state.qText.trim(),
+    sort: state.sortKey,
+    order: state.sortAsc ? "asc" : "desc",
+    limit: CHUNK,
+    offset: offset,
+  }, apiScope());
 }
 
 /**
@@ -932,17 +888,17 @@ function queueColumns(queueId) {
     cell: (entry) => {
       const cell = el("td", "wrap");
       const link = document.createElement("a");
-      const params = new URLSearchParams();
-      params.append("environment", entry.environment);
-      params.append("script", entry.script);
-      params.append("test_name", entry.test_name);
       // Scope-carriage (found by the F1-F7 sweep's follow-up link-matrix
       // audit): on a long-running branch's "Its own results" tab, these
       // rows are the branch's own -- the link must land back on that
-      // SAME stream's test page, not mainline's. appendStream() is a
-      // no-op (state.streamId === null) on every mainline page.
-      appendStream(params);
-      link.href = "test.html?" + params.toString();
+      // SAME stream's test page, not mainline's. pageUrl()'s default
+      // scope carriage supplies `stream` (a no-op, state.streamId ===
+      // null, on every mainline page); product/baseline are explicitly
+      // nulled -- this link never carried either.
+      link.href = pageUrl("test", {
+        environment: entry.environment, script: entry.script,
+        test_name: entry.test_name,
+      }, { product: null, baseline: null });
       link.textContent = entry.test_name;
       cell.appendChild(link);
       cell.appendChild(el("span", "row-sub",
@@ -1282,12 +1238,9 @@ function populateScriptOptions() {
  * FINAL ROUND). No-op on mainline (state.streamId === null).
  */
 function scriptLink(environment, script, text) {
-  const params = new URLSearchParams();
-  params.append("environment", environment);
-  params.append("script", script);
-  appendStream(params);
   const link = document.createElement("a");
-  link.href = "script.html?" + params.toString();
+  link.href = pageUrl("script", { environment: environment, script: script },
+    { product: null, baseline: null });
   link.textContent = text || script;
   link.title = "Execution history for this suite";
   return link;
@@ -1368,16 +1321,14 @@ function buildRow(row) {
   const testCell = document.createElement("td");
   testCell.className = "wrap";
   const link = document.createElement("a");
-  const params = new URLSearchParams();
-  params.append("environment", row.environment);
-  params.append("script", row.script);
-  params.append("test_name", row.test_name);
   // Scope-carriage (F1-F7 sweep follow-up): the browse table on a
   // branch's "Its own results" tab shows that branch's own rows -- the
-  // link must land back on that SAME stream's test page. No-op on
+  // link must land back on that SAME stream's test page. pageUrl()'s
+  // default scope carriage is a no-op (state.streamId === null) on
   // mainline.
-  appendStream(params);
-  link.href = "test.html?" + params.toString();
+  link.href = pageUrl("test", {
+    environment: row.environment, script: row.script, test_name: row.test_name,
+  }, { product: null, baseline: null });
   link.textContent = row.test_name;
   testCell.appendChild(link);
   tr.appendChild(testCell);
@@ -1617,21 +1568,17 @@ function renderBranchQuickLinks(streamId) {
     mount.hidden = true;
     return;
   }
-  const timeParams = new URLSearchParams();
-  timeParams.append("stream", String(streamId));
-  timeParams.append("product", state.streamProduct || "");
-  const timelineParams = new URLSearchParams();
-  if (state.environment) {
-    timelineParams.append("environment", state.environment);
-  }
-  timelineParams.append("stream", String(streamId));
-  timelineParams.append("product", state.streamProduct || "");
-
   const timeLink = document.createElement("a");
-  timeLink.href = "time.html?" + timeParams.toString();
+  timeLink.href = pageUrl("time", {}, {
+    stream: streamId, product: state.streamProduct || "", environment: null,
+    baseline: null,
+  });
   timeLink.textContent = "This build's Time →";
   const timelineLink = document.createElement("a");
-  timelineLink.href = "timeline.html?" + timelineParams.toString();
+  timelineLink.href = pageUrl("timeline", {}, {
+    stream: streamId, product: state.streamProduct || "",
+    environment: state.environment, baseline: null,
+  });
   timelineLink.textContent = "This build's Timeline →";
 
   mount.appendChild(timeLink);

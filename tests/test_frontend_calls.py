@@ -557,9 +557,12 @@ class SortingTest(unittest.TestCase):
     """
 
     def test_open_actions_sorts_on_the_server(self) -> None:
+        """WP-24: `qs.append("sort"/"order", ...)` became `sort:`/
+        `order:` keys in the params object passed to apiUrl() — same
+        intent, both still travel on every list request."""
         code = _strip_comments(read("actions.js"))
-        self.assertIn('qs.append("sort", state.sortKey)', code)
-        self.assertIn('qs.append("order"', code)
+        self.assertIn("sort: state.sortKey", code)
+        self.assertIn("order: state.sortDescending", code)
         self.assertNotIn(
             "sortRows(", code,
             "actions.js pages its results, so it must not sort them in "
@@ -1067,9 +1070,11 @@ class SummaryPartsFetchTest(unittest.TestCase):
     """
 
     def test_the_page_asks_for_the_headline_not_the_monolith(self) -> None:
+        """WP-24: `qs.append("parts", "headline")` became `parts:
+        "headline"` in the params object passed to apiUrl()."""
         body = _function_body(read("app.js"), "function summaryUrl()")
         self.assertIn(
-            '"parts", "headline"', body,
+            'parts: "headline"', body,
             "summaryUrl() no longer asks for parts=headline; the home "
             "page is back to downloading every queue's rows on every "
             "refresh")
@@ -1603,21 +1608,24 @@ class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     separately, in ScriptPageParityTest and friends.)"""
 
     def test_queue_rows_carry_the_stream_into_the_test_link(self) -> None:
+        """WP-24: appendStream(params)+"test.html?"+params.toString()
+        became one pageUrl("test", ..., {product: null, baseline: null})
+        call -- `stream` is supplied by pageUrl()'s DEFAULT scope
+        carriage (this page's own, a no-op on mainline exactly as
+        appendStream() was), so there is no separate "appended before
+        the href" ordering left to check; the assertion that matters
+        now is that product/baseline are explicitly excluded (this link
+        never carried either) rather than silently inherited."""
         body = _strip_comments(_function_body(
             read("app.js"), "function queueColumns("))
-        self.assertIn("appendStream(params)", body)
-        stream_at = body.index("appendStream(params)")
-        self.assertLess(
-            stream_at, body.index('"test.html?"'),
-            "the stream param must be appended BEFORE the href is built")
+        self.assertIn('link.href = pageUrl("test"', body)
+        self.assertIn("{ product: null, baseline: null }", body)
 
     def test_browse_rows_carry_the_stream_into_the_test_link(self) -> None:
+        """WP-24: same conversion as the queue rows above."""
         body = _strip_comments(_function_body(read("app.js"), "function buildRow("))
-        self.assertIn("appendStream(params)", body)
-        stream_at = body.index("appendStream(params)")
-        self.assertLess(
-            stream_at, body.index('"test.html?"'),
-            "the stream param must be appended BEFORE the href is built")
+        self.assertIn('link.href = pageUrl("test"', body)
+        self.assertIn("{ product: null, baseline: null }", body)
 
     def test_timeline_run_rows_carry_the_stream_into_the_test_link(
         self
@@ -2236,11 +2244,14 @@ class ScriptPageParityTest(unittest.TestCase):
         self.assertNotIn("innerHTML", _strip_comments(read("script.js")))
 
     def test_app_js_scriptLink_carries_the_stream(self) -> None:
+        """WP-24: appendStream(params)+"script.html?" became one
+        pageUrl("script", ..., {product: null, baseline: null}) call --
+        `stream` comes from pageUrl()'s default scope carriage, same as
+        every other converted row link in this file."""
         body = _strip_comments(_function_body(
             read("app.js"), "function scriptLink("))
-        self.assertIn("appendStream(params)", body)
-        stream_at = body.index("appendStream(params)")
-        self.assertLess(stream_at, body.index('"script.html?"'))
+        self.assertIn('link.href = pageUrl("script"', body)
+        self.assertIn("{ product: null, baseline: null }", body)
 
     def test_timeline_js_block_link_carries_the_stream(self) -> None:
         """The audit's PART A note: the block row's own script.html
@@ -2482,6 +2493,13 @@ class OpenActionsSummaryScopeTest(unittest.TestCase):
     """
 
     def test_summary_is_fetched_through_the_scoped_helper(self) -> None:
+        """WP-24: the appendProduct(qs) helper is gone -- summaryUrl()
+        now calls apiUrl() with a product scope from
+        selectedProductScope() (getSelectedProduct() || null, so it is
+        OMITTED rather than sent empty when nothing is selected -- the
+        same behaviour appendProduct()'s `if (product)` guard gave).
+        Same assertion intent (the summary fetch carries the product
+        scope), now checking the apiUrl() call site."""
         src = read("actions.js")
         self.assertIn("function summaryUrl()", src)
         self.assertIn("fetchJson(summaryUrl())", src)
@@ -2489,7 +2507,8 @@ class OpenActionsSummaryScopeTest(unittest.TestCase):
                          "a bare unscoped summary fetch is the bug "
                          "coming back")
         body = _function_body(src, "function summaryUrl()")
-        self.assertIn("appendProduct(qs)", body)
+        self.assertIn("apiUrl(", body)
+        self.assertIn("selectedProductScope()", body)
 
 
 class OpenActionsOriginFilterTest(unittest.TestCase):
@@ -2499,9 +2518,13 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
     def test_the_filter_is_server_side_not_a_client_reshuffle(self) -> None:
         """The same rule SortingTest pins for this page's sort: a paged
         table filtered in the browser shows "branch items that happen
-        to be on this page", not every branch item."""
+        to be on this page", not every branch item.
+
+        WP-24: `qs.append("origin", state.origin)` became `origin:
+        state.origin` in the params object passed to apiUrl() -- same
+        intent, the origin filter still travels on every request."""
         body = _function_body(read("actions.js"), "function listUrl(")
-        self.assertIn('qs.append("origin", state.origin)', body)
+        self.assertIn("origin: state.origin", body)
 
     def test_the_filter_hides_with_no_stream_originated_assignments(
         self
@@ -2629,10 +2652,22 @@ class ProductColumnTest(unittest.TestCase):
     def test_product_is_appended_to_the_list_request_when_selected(
         self
     ) -> None:
+        """WP-24: the per-file `appendProduct(qs)` helper (each ending
+        in `qs.append("product", ...)`) is gone from both pages —
+        product scope now flows through apiUrl()'s `scope` argument,
+        built from getSelectedProduct() and normalised to null (so
+        apiUrl omits it) rather than "" when nothing is selected. Same
+        assertion intent (the list request carries the selected product
+        when there is one), now checking that each page's own list URL
+        builder actually calls apiUrl() with a product scope derived
+        from getSelectedProduct()."""
         for name, _ in self._TABLES:
             code = _strip_comments(read(name))
-            self.assertIn("function appendProduct(", code, name)
-            self.assertIn('qs.append("product"', code, name)
+            self.assertIn("getSelectedProduct() || null", code, name)
+            self.assertIn("apiUrl(", code, name)
+            self.assertIn(
+                "apiUrl", _imported_names(read(name)),
+                name + " calls apiUrl() without importing it")
 
     def test_getSelectedProduct_is_imported_where_used(self) -> None:
         for name, _ in self._TABLES:
@@ -2915,13 +2950,16 @@ class BranchQuickLinksTest(unittest.TestCase):
         self.assertIn("hidden", html[mount_at:mount_at + 60])
 
     def test_both_links_carry_the_streams_own_id(self) -> None:
+        """WP-24: the hand-rolled URLSearchParams/"time.html?"/
+        "timeline.html?" trio became two pageUrl() calls with an
+        explicit `stream: streamId` scope override each -- same
+        assertion intent (both links name the branch's own stream id),
+        now checking the pageUrl() call sites."""
         body = _function_body(
             read("app.js"), "function renderBranchQuickLinks(")
-        self.assertIn('timeParams.append("stream", String(streamId))', body)
-        self.assertIn(
-            'timelineParams.append("stream", String(streamId))', body)
-        self.assertIn('href = "time.html?"', body)
-        self.assertIn('href = "timeline.html?"', body)
+        self.assertIn('timeLink.href = pageUrl("time"', body)
+        self.assertIn('timelineLink.href = pageUrl("timeline"', body)
+        self.assertEqual(body.count("stream: streamId"), 2)
 
     def test_a_null_stream_id_hides_the_mount(self) -> None:
         """The own-results tab's own concept — the diff tab and a
@@ -2953,10 +2991,21 @@ class BranchQuickLinksTest(unittest.TestCase):
     ) -> None:
         """No environment filter set -- the Timeline link must still
         work (that page picks a sensible default itself), not send an
-        empty/undefined environment param."""
+        empty/undefined environment param.
+
+        WP-24: the explicit `if (state.environment) {...}` guard is
+        gone -- `environment: state.environment` is passed straight to
+        pageUrl()'s scope object, and urls.js's own encoding (pinned by
+        UrlsModuleTest) omits both "" and null the same way the old
+        guard did. Checking the pageUrl() call carries state.environment
+        (never a hardcoded value) preserves the same intent: an unset
+        filter must not send an empty/undefined environment param."""
         body = _function_body(
             read("app.js"), "function renderBranchQuickLinks(")
-        self.assertIn("if (state.environment) {", body)
+        timeline_at = body.index('timelineLink.href = pageUrl("timeline"')
+        self.assertIn(
+            "environment: state.environment",
+            body[timeline_at:timeline_at + 200])
 
     def test_both_links_are_scope_self_sufficient_with_a_product_param(
         self
@@ -2969,11 +3018,8 @@ class BranchQuickLinksTest(unittest.TestCase):
         stored product) can fail to even list the branch's environment."""
         body = _function_body(
             read("app.js"), "function renderBranchQuickLinks(")
-        self.assertIn(
-            'timeParams.append("product", state.streamProduct || "")', body)
-        self.assertIn(
-            'timelineParams.append("product", state.streamProduct || "")',
-            body)
+        self.assertEqual(
+            body.count('product: state.streamProduct || ""'), 2)
 
     def test_init_branch_dashboard_stashes_the_streams_product(self) -> None:
         """state.streamProduct must be set from the SAME fetchCompare
@@ -3042,9 +3088,14 @@ class BrowseFilterUrlInitTest(unittest.TestCase):
     def test_browse_url_carries_unassigned_only_when_the_toggle_is_on(
         self
     ) -> None:
+        """WP-24: the `if (state.unassignedOnly) { qs.append(...) }`
+        guard became a ternary inside the params object passed to
+        apiUrl() -- appendParams() (urls.js) omits null the same way
+        the old guard omitted the whole append call, so the on/off
+        behaviour is unchanged; only the shape of stating it moved."""
         body = _function_body(read("app.js"), "function browseUrl(")
-        self.assertIn("if (state.unassignedOnly) {", body)
-        self.assertIn('qs.append("unassigned", "1")', body)
+        self.assertIn(
+            'unassigned: state.unassignedOnly ? "1" : null', body)
 
     def test_the_toggle_chip_exists_and_ships_unpressed(self) -> None:
         html = read_text("index.html")
