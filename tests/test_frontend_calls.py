@@ -1731,6 +1731,47 @@ class TestPageBranchBandTest(unittest.TestCase):
         self.assertIn("backLink.href", body)
 
 
+class SuiteLinkHonestyTest(unittest.TestCase):
+    """F3 (docs/STREAMS_PLAN.md §5.2 "as built"): script.html has no
+    stream support of its own (a decision-list item, not this fix) —
+    the suite link on a stream-scoped test page silently jumps back to
+    MAINLINE's execution history. This does not add stream support;
+    it only stops the silent context switch by saying, in the link's
+    own title AND visibly beside it (never hover-only — the same
+    "never the only signal" rule the rest of this project follows),
+    that the link goes to mainline regardless of the page's own scope.
+    """
+
+    def test_the_title_is_conditional_on_stream_identity(self) -> None:
+        """CRLF line endings in this file mean an exact multi-line
+        literal match is fragile (bit a prior test in this file once);
+        several independent substring checks instead."""
+        body = _function_body(read("test.js"), "function renderDetail(")
+        self.assertIn("suiteLink.title = detail.stream_identity", body)
+        self.assertIn(
+            '"Execution history for this suite (mainline)"', body)
+        self.assertIn('"Execution history for this suite"', body)
+
+    def test_a_visible_mainline_note_is_added_beside_the_link_when_scoped(
+        self
+    ) -> None:
+        """Not hover-only: a reader who never hovers must still see it."""
+        body = _function_body(read("test.js"), "function renderDetail(")
+        self.assertIn("if (detail.stream_identity) {", body)
+        note_at = body.index("if (detail.stream_identity) {")
+        self.assertIn(
+            'createTextNode(" (mainline)")', body[note_at:note_at + 100])
+
+    def test_the_note_is_appended_after_the_link_not_before(self) -> None:
+        body = _function_body(read("test.js"), "function renderDetail(")
+        link_append_at = body.index("identity.appendChild(suiteLink)")
+        note_append_at = body.index('createTextNode(" (mainline)")')
+        self.assertLess(link_append_at, note_append_at)
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", _strip_comments(read("test.js")))
+
+
 class EveryBuildAndStreamSwitcherTest(unittest.TestCase):
     """test.js's WP-22 additions (docs/STREAMS_PLAN.md §4.1): the
     per-stream result dropdown near the top of the page, and the "Every

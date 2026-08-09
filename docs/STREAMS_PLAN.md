@@ -1067,6 +1067,22 @@ recorded here rather than left implicit:
     new failures · 257 fixed — vs mainline: 342 new failures" —
     exact-template match — strictly after the delta section's own
     render completed, never before.
+- **F3 (same usability sweep, smallest): the suite link on a
+  stream-scoped test page stops silently switching context.**
+  `script.html` has no stream support of its own — that is a
+  decision-list item, out of scope here — so the suite link on
+  `test.html` has always opened MAINLINE's execution history, even
+  when the page itself is stream-scoped. `test.js`'s `renderDetail()`
+  now says so honestly rather than fixing (or hiding) the mismatch:
+  when `detail.stream_identity` is non-null, the link's `title`
+  becomes "Execution history for this suite (mainline)" and a plain
+  " (mainline)" text node is appended right beside the link itself —
+  never hover-only, the same "never the only signal" rule this
+  project applies to colour/state everywhere else. A mainline visit
+  (`stream_identity` is always `null` there) is unchanged in both the
+  title and the visible text. Verified live via the DOM-shim harness:
+  a stream-scoped test page rendered both the annotated title and the
+  visible note; a mainline visit rendered neither.
 
 ---
 
