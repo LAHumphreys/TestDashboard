@@ -163,6 +163,39 @@ An environment absent from the table belongs to the implicit product `""`.
   filter semantics (`product=` resolves to environments); no new UI beyond
   the switcher scoping them.
 
+**Upgrade-day bulk assignment (WP-23 addendum, decided with the user).**
+Every pre-upgrade environment starts life unmapped (implicit product `""`)
+until someone declares it — fine for a handful of environments, tedious for
+an estate that already has dozens by the time products ship. The Open
+Actions environment-management view (§2.3's product cell, above) gains a
+small control, shown only while at least one environment is unmapped: a
+product-name field plus an "Assign N unmapped environments" button that
+issues the SAME `PUT /api/environments/{env}/product` the per-row Save
+button already uses, once per currently-unmapped environment — **no new API
+surface**, since the environment count is small and every PUT is
+independently idempotent (a partial failure mid-batch just leaves the
+remainder unmapped, safely retried by running the action again). Hidden
+entirely once nothing is unmapped: zero visible change on an estate that
+has already declared everything, or that never uses products at all.
+
+**Rejected alternative: a standing default product for new environments.**
+Considered and rejected. A standing default (e.g. "any environment with no
+mapping belongs to product X") would be silent and permanent in exactly the
+way this feature must not be: a NEW product's CI can begin pushing
+branch/build results under a freshly-seen environment before a human gets
+around to declaring its mapping, and a stream's `product` is fixed at the
+moment the stream is first seen (§3.1/README "What upgrading means for
+clients") — there is no admin action that moves an existing stream to a
+different product afterwards. A standing default would silently and
+irreversibly mislabel that product's environments the moment its first
+result arrived, with no error and no obvious symptom until someone asked
+why a stream showed up under the wrong product months later. The bulk
+action above is deliberately the opposite shape: explicit, one-time, run by
+a human who names the product being assigned, and it only ever touches
+environments that are unmapped **at the moment it is clicked** — it is a
+convenience for a backlog of already-known environments, never a rule
+applied to environments not yet seen.
+
 ### 2.4 The Watchlist page (`static/watch.html` + `/api/watch`)
 
 The morning view (decision §0.9). One page, a grid of **cards**, each card
@@ -179,6 +212,60 @@ watch.html?c=p:Atlas&c=e:lab-alpha&c=e:dp-cert
    s:<stream id>         stream card (WP-21+; ids are stable and avoid
                          quoting product/kind/name triples in URLs)
 ```
+
+**Declared staleness — an optional `@<n>h`/`@<n>d` suffix (WP-23, as
+built).** Different scopes have different cadences (a daily branch, a
+weekly build), and the URL is the whole configuration, so the expected
+cadence is part of the card spec, not a page-wide setting:
+
+```
+watch.html?c=e:win-sim@36h&c=p:Atlas@7d&c=s:2@1d
+```
+
+Parsing splits at the **LAST** `@` in the name — never the first — and
+only when the text after it matches `^\d+[hd]$`; names are free text and
+may themselves contain `@` (`p:release@2026` has no valid tail, so the
+whole thing is the name; `p:release@2026@1d` splits at the second `@`,
+name `release@2026`, expectation `1d`). No suffix means no staleness
+judgment at all — today's behaviour, byte for byte (`_parse_watch_spec`/
+`_EXPECTED_SUFFIX` in `testboard/api.py`, mirrored in `static/watch.js`'s
+`splitExpectedSuffix`/`EXPECTED_SUFFIX`, same regex on both sides).
+
+A card whose spec carries `@` gets two extra response fields — `expected`
+(the suffix, echoed) and `stale` (bool) — compared against the card's OWN
+freshness timestamp: environment → `last_reported`; product → its
+laggard's (the OLDEST-reporting environment — "everything reported" is
+the bar, not "something did"); stream → `last_seen` (always present, so a
+stream card is never stale-by-absence the way an environment/product card
+can be). The composer offers a cadence choice (none / 1d / 7d / custom
+hours) that round-trips through this grammar exactly.
+
+**Unassigned-failure highlight (WP-23, as built).** Every ok card also
+carries `unassigned_failing`: the count of tests in the card's own scope
+whose latest result is FAIL and which have no current assignee
+(assignments are triple-scoped and stream-agnostic — for an `s:` card the
+question is "failing on THIS stream and the TEST has no assignee";
+`e:`/`p:` cards are always mainline). Computed from exactly two aggregate
+queries per request regardless of card count — `Storage.
+unassigned_failing_by_environment()` (one row per environment, mainline)
+and `Storage.unassigned_failing_by_stream()` (batched across every
+requested stream id) — never a per-card query, preserving the flat-cost
+property `test_query_count_does_not_grow_with_card_count` pins (7 → 8
+queries for the FIRST card once this landed; still flat from 1 card to
+the 50-card cap).
+
+Frontend: `unassigned_failing > 0` gets the `watch-card-accent-fail`
+border (reusing `--c-fail`) plus an explicit "Unassigned failing" stat —
+colour is never the only carrier. `stale: true` gets a distinct
+`watch-card-accent-stale` border, the SAME non-result amber `.tl-partial`
+uses for a coverage warning (`#8a6d00`) — never `--c-fail`/`--c-fae`,
+since staleness is a timing fact, not a failure. **Accent precedence when
+a card is both:** the unassigned-failure accent wins the border (an owner
+gap is the more actionable fact); the staleness TEXT LINE
+("expected within 1d — last run 3 days ago", both halves real data —
+never a hidden constant) renders independently of which accent wins.
+`unassigned_failing === 0` and no `@` suffix ⇒ zero visual change, the
+card looks exactly as it did before this feature existed.
 
 A bare `watch.html` loads the browser's saved default (localStorage, same
 mechanism as the What's-new unread state). "Save as my default" and

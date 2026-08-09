@@ -262,6 +262,46 @@ it needs to render NO RESULT rows for streams absent here). A stream with
 no result for the triple is simply absent from `results` — never
 fabricated. `404` if the triple has never run anywhere.
 
+#### What upgrading means for clients
+
+Nothing here breaks an existing feeder, and nothing here requires one to change
+anything, but it is worth stating plainly what each generation of client sees:
+
+- **A feeder that has never heard of `branch`/`build`/products:** zero changes.
+  It sends the same transport schema it always has; absent `branch`/`build`
+  means mainline, exactly as before those fields existed; `product` is never on
+  the wire at all — it is a **server-side declaration**
+  (`PUT /api/environments/{env}/product`), made by a human against an
+  environment name, never sent or read by the feeder. A server upgraded under
+  a feeder that has not changed looks, to that feeder, identical to the one
+  before the upgrade.
+- **Declaring a new product: ordering matters.** A stream's `product` is
+  resolved from its environment's declared product **once, the moment the
+  stream is first seen, then fixed for that stream's lifetime** (see
+  "Streams" above). If a new product's CI starts pushing branch/build results
+  under an environment BEFORE that environment's product mapping is declared,
+  the stream is created with product `""` and stays there permanently — there
+  is no admin action that moves an existing stream to a different product
+  after the fact. **Declare the environment→product mapping before that
+  product's branch/build CI first pushes**, not after. (This is also why the
+  Open Actions page's bulk "assign every unmapped environment to product X"
+  control — a one-time upgrade-day convenience, see `docs/STREAMS_PLAN.md`
+  §2 — is an explicit action a human runs deliberately, never a standing
+  default applied automatically to new environments: a standing default would
+  silently mislabel a future product's environments if its first push beat
+  its mapping, and that mistake would be permanent for any stream born under
+  it.)
+- **A branch/build client** (`docs/STREAMS_PLAN.md` §3): set one field per
+  record (`"branch": "<name>"` or `"build": "<name>"`, never both), or use the
+  feeder's `--branch NAME`/`--build NAME` flags, which also require the
+  import response's `streams_seen` acknowledgment and abort loudly (exit 1, no
+  high-water-mark saved) if it is absent — the one signal that tells a WP-21+
+  server apart from an older one that would otherwise silently file everything
+  into mainline (see `streams_seen` above). Each stream gets its own feeder
+  state file (`feeder_state.branch.<name>.json` / `feeder_state.build.<name>.json`),
+  so a branch's catch-up run never shares — or fights over — mainline's
+  high-water mark.
+
 ### GET /api/dashboard — latest run per test (paginated)
 
 **This endpoint returns one page, never the whole estate.** With 12,000 tests a

@@ -3141,6 +3141,97 @@ class TestLatestRunTimeByEnvironment(StorageTestBase):
         self.assertIn("INDEX", plan.upper(), plan)
 
 
+class UnassignedFailingTest(StorageTestBase):
+    """The Watchlist's unassigned-failure highlight (docs/STREAMS_PLAN.md
+    §2.4): currently-FAILING tests with no current assignee, batched
+    per environment and per stream so /api/watch pays no per-card
+    query for it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="a",
+                        result=Result.FAIL),
+            make_record(environment="linux-sim", test_name="b",
+                        result=Result.FAIL),
+            make_record(environment="linux-sim", test_name="c",
+                        result=Result.PASS),
+            make_record(environment="win-sim", test_name="d",
+                        result=Result.FAIL),
+        ])
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "a", "alice", "bob", CREATED)
+
+    def test_counts_only_failing_and_unassigned(self) -> None:
+        counts = self.store.unassigned_failing_by_environment()
+        # test_a is FAIL but assigned; test_b is FAIL and unassigned;
+        # test_c passes. linux-sim's count is exactly test_b.
+        self.assertEqual(counts, {"linux-sim": 1, "win-sim": 1})
+
+    def test_assignment_is_by_triple_not_by_stream(self) -> None:
+        """Assignments are stream-agnostic: assigning "a" from mainline
+        must also clear IT off a branch's own unassigned-failing count
+        for the same triple, because there is only ever one owner."""
+        self.store.upsert_runs([make_record(
+            environment="linux-sim", test_name="a", result=Result.FAIL,
+            branch="feat/x", start=BASE + datetime.timedelta(hours=1))])
+        stream_id = self.store.list_streams("")[0].stream_id
+        counts = self.store.unassigned_failing_by_stream([stream_id])
+        # test_a fails on the branch too, but it is still assigned (the
+        # SAME assignment, made from mainline) -- zero, not one.
+        self.assertEqual(counts.get(stream_id, 0), 0)
+
+    def test_retired_tests_are_excluded(self) -> None:
+        self.store.set_retired(
+            "linux-sim", "suite.py", "b", True, "alice", "gone", CREATED)
+        counts = self.store.unassigned_failing_by_environment()
+        self.assertEqual(counts.get("linux-sim", 0), 0)
+
+    def test_a_clean_estate_has_no_entries(self) -> None:
+        empty_dir = tempfile.mkdtemp(prefix="testboard_storage_empty_")
+        self.addCleanup(shutil.rmtree, empty_dir, True)
+        store2 = Storage(os.path.join(empty_dir, "test.db"))
+        try:
+            self.assertEqual(store2.unassigned_failing_by_environment(), {})
+        finally:
+            store2.close()
+
+    def test_by_stream_batches_every_requested_id_in_one_query(
+        self
+    ) -> None:
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="e",
+                        result=Result.FAIL, branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+            make_record(environment="linux-sim", test_name="f",
+                        result=Result.FAIL, branch="feat/y",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        ids = [s.stream_id for s in self.store.list_streams("")]
+        conn = self.store._conn()
+        statements = []  # type: List[str]
+        trace_sql_into(conn, statements)
+        try:
+            counts = self.store.unassigned_failing_by_stream(ids)
+        finally:
+            conn.set_trace_callback(None)
+        selects = [s for s in statements if s.strip().upper().startswith(
+            "SELECT")]
+        self.assertEqual(len(selects), 1)
+        self.assertEqual(counts, {ids[0]: 1, ids[1]: 1})
+
+    def test_empty_stream_id_list_costs_no_query(self) -> None:
+        conn = self.store._conn()
+        statements = []  # type: List[str]
+        trace_sql_into(conn, statements)
+        try:
+            result = self.store.unassigned_failing_by_stream([])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(result, {})
+        self.assertEqual(statements, [])
+
+
 class EnvironmentDeleteTest(StorageTestBase):
     """Deleting an environment must leave the database consistent.
 

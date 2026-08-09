@@ -1267,6 +1267,17 @@ button.bar-row:focus-visible {
   line-height: 1.5;
 }
 
+.envs-bulk-assign {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 14px;
+  font-size: 13px;
+}
+
+.envs-bulk-assign input[type="text"] { width: 160px; }
+
 #people-table tr.is-inactive td:first-child {
   color: var(--muted);
   text-decoration: line-through;
@@ -1955,6 +1966,35 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
 }
 
 .watch-card-remove { color: var(--c-fail); }
+
+/* Unassigned-failure highlight (WP-23, docs/STREAMS_PLAN.md §2.4): a
+   card whose scope has at least one currently-failing test nobody
+   owns. Colour is never the only carrier -- the "Unassigned failing"
+   stat watch.js adds alongside this class says the same thing in
+   text. unassigned_failing === 0 means neither this class nor that
+   stat is ever added: zero visible change. */
+.watch-card-accent-fail { border-color: var(--c-fail); }
+.watch-card-accent-fail .watch-card-head {
+  background: #fdecea;
+  border-radius: 4px;
+  margin: -4px -6px 4px;
+  padding: 4px 6px;
+}
+
+/* Declared-staleness accent (WP-23): the SAME non-result amber
+   .tl-partial uses for "ran fewer tests than known" -- staleness is a
+   timing/coverage fact, not a failure, so it must never borrow the
+   red/green result palette (not --c-fail, not --c-fae). Only applied
+   when there is no unassigned-failure accent to show instead (see
+   applyWatchAccent() in watch.js) -- the staleness TEXT LINE below
+   still renders either way. */
+.watch-card-accent-stale { border-color: #8a6d00; }
+
+.watch-card-stale {
+  color: #8a6d00;
+  font-size: 12px;
+  margin: 0;
+}
 
 /* ---------------- Streams / branch-vs-mainline delta (WP-21, docs/STREAMS_PLAN.md §3.6) ---------------- */
 

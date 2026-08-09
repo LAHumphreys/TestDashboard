@@ -4453,6 +4453,77 @@ class Storage:
             for row in rows if row[1] is not None
         }
 
+    def unassigned_failing_by_environment(
+        self, stream_id: int = MAINLINE_STREAM_ID,
+    ) -> Dict[str, int]:
+        """Count of currently-FAILING, currently-UNASSIGNED tests, per
+        environment, on one stream (default mainline).
+
+        The Watchlist's unassigned-failure highlight (docs/STREAMS_PLAN.md
+        §2.4): ONE grouped aggregate over ``latest_runs`` LEFT JOIN
+        ``current_assignments`` — the same "fetch once, slice per card
+        in Python" shape every other Watchlist number already uses
+        (:func:`testboard.api._handle_watch`'s own docstring), so `e:`
+        cards read this dict directly and `p:` cards sum it over their
+        own environments, with NO extra query per card either way.
+        Assignments are TRIPLE-scoped, never stream-scoped (the same
+        assignee is read from a branch's own row of the same test —
+        see :class:`CompareRow`), so the join is on the plain triple,
+        not on stream_id — only ``latest_runs`` itself is scoped to
+        *stream_id*, deciding WHICH result counts as "currently
+        failing".
+
+        Retired tests are excluded, matching every other verdict number
+        on this page (:func:`analytics.summarize_by_product`) — a
+        retired test is not "in the suite" any more, so it cannot be a
+        failure needing an owner.
+        """
+        rows = self._conn().execute(
+            "SELECT lr.environment, COUNT(*) FROM latest_runs lr "
+            "LEFT JOIN current_assignments ca "
+            "  ON ca.environment = lr.environment "
+            " AND ca.script = lr.script AND ca.test_name = lr.test_name "
+            "LEFT JOIN test_retirements tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE lr.stream_id = ? AND lr.result = ? "
+            "AND ca.assignee IS NULL AND tr.retired_at IS NULL "
+            "GROUP BY lr.environment",
+            (stream_id, Result.FAIL.value),
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def unassigned_failing_by_stream(
+        self, stream_ids: Sequence[int],
+    ) -> Dict[int, int]:
+        """The same count as :meth:`unassigned_failing_by_environment`,
+        grouped by stream instead — the `s:` card's own question is
+        "failing on THIS stream and unassigned", never mainline's.
+
+        ONE query covering every requested id (the same
+        "batched, not per-card" shape :meth:`stream_identities` already
+        established) — ``{}`` with no query at all when *stream_ids* is
+        empty, so a request with no ``s:`` cards costs nothing extra
+        here either.
+        """
+        if not stream_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in stream_ids)
+        rows = self._conn().execute(
+            "SELECT lr.stream_id, COUNT(*) FROM latest_runs lr "
+            "LEFT JOIN current_assignments ca "
+            "  ON ca.environment = lr.environment "
+            " AND ca.script = lr.script AND ca.test_name = lr.test_name "
+            "LEFT JOIN test_retirements tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE lr.stream_id IN ({0}) AND lr.result = ? "
+            "AND ca.assignee IS NULL AND tr.retired_at IS NULL "
+            "GROUP BY lr.stream_id".format(placeholders),
+            list(stream_ids) + [Result.FAIL.value],
+        ).fetchall()
+        return {int(row[0]): int(row[1]) for row in rows}
+
     def latest_run_time(
         self, stream_id: int = MAINLINE_STREAM_ID
     ) -> Optional[datetime.datetime]:

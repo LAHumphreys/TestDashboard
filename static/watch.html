@@ -42,6 +42,18 @@
       <label class="toolbar-field">
         <select id="add-name" aria-label="Name"></select>
       </label>
+      <label class="toolbar-field">Expect within
+        <select id="add-cadence" aria-label="Declared cadence">
+          <option value="">no expectation</option>
+          <option value="1d">1 day</option>
+          <option value="7d">7 days</option>
+          <option value="custom">custom hours…</option>
+        </select>
+      </label>
+      <label class="toolbar-field" id="add-cadence-hours-label" hidden>
+        <input id="add-cadence-hours" type="text" inputmode="numeric"
+               placeholder="hours" aria-label="Custom hours" size="4">
+      </label>
       <button id="add-card-btn" type="button">Add card</button>
       <span class="toolbar-spacer"></span>
       <button id="save-default-btn" type="button">Save as my default</button>

@@ -41,6 +41,21 @@
         <span class="muted">New: branches and release builds beside mainline, compare any two, a long-running branch gets its own dashboard, plus the Watch page</span>
       </div>
 
+      <h3>Fixed: a scoped page could leak other products' environments</h3>
+      <ul>
+        <li>On a site with more than one product, scoping the home screen
+          to one product (or opening a branch/build's own dashboard) could
+          still offer every OTHER product's environments in the picker and
+          the "last reported" pills, even though every number on the page
+          was already correctly scoped. Found in live testing; fixed —
+          both now only ever list the environments that actually belong to
+          the page you're looking at.</li>
+        <li>The Build/branch picker box and the comparison page's "Compare
+          to" box looked out of place next to every other control on the
+          toolbar — a styling gap left over from switching them to a
+          type-to-filter field. Fixed; they now match.</li>
+      </ul>
+
       <h3>New: branches and builds, compared to mainline</h3>
       <ul>
         <li><strong>A CI branch or a one-off build can now show up beside
@@ -166,6 +181,21 @@
           longer exists says so plainly rather than just vanishing, so an
           old shared link never looks like it silently lost something.</li>
         <li>Find it in the nav on every page, labelled <strong>Watch</strong>.</li>
+        <li><strong>A card with a failing, unowned test now says so at a
+          glance.</strong> Any environment, product or branch/build card
+          with at least one currently-failing test that nobody has taken
+          gets a red-tinted border and an "Unassigned failing" count right
+          on the card — colour is never the only signal, the number is
+          always there in words too. A card with nothing unassigned looks
+          exactly as it always has.</li>
+        <li><strong>Cards can now declare how often they're expected to
+          report.</strong> Add <code>@1d</code>, <code>@7d</code>, or a
+          custom hour count to a card from the new dropdown next to the
+          picker (or by hand in the URL, e.g. <code>c=e:win-sim@36h</code>)
+          and the card gets an amber border plus a line saying so — "expected
+          within 1d — last run 3 days ago" — when it's overdue. A card with
+          no declared cadence behaves exactly as before; this is entirely
+          optional per card.</li>
       </ul>
 
       <h3>Under the hood: products</h3>
@@ -180,6 +210,13 @@
           Open actions' tables gain a Product column so mixed views stay
           readable — scoped to one product, the column disappears again and
           the page says so.</li>
+        <li><strong>Declaring products for an estate that already has a lot
+          of environments got faster.</strong> The same "Environment
+          expectations" section now offers an "Assign N unmapped
+          environments" button whenever at least one environment has no
+          product yet — type the product name once and it's applied to
+          every currently-unmapped environment in one action, instead of
+          one at a time. It disappears once nothing is left unmapped.</li>
       </ul>
     </section>
 

@@ -146,6 +146,24 @@
           passes below are not counting.
         </p>
         <p id="envs-cutoff" class="muted"></p>
+        <!-- Upgrade-day bulk assign (WP-23 addendum): before any product
+             is declared, every environment is implicitly product "" —
+             this turns "declare N environments one at a time" into one
+             action. Hidden whenever nothing is unmapped: zero visible
+             change on an estate that has already been fully declared, or
+             that has never used products at all. Deliberately NOT a
+             standing default applied automatically on import — see
+             docs/STREAMS_PLAN.md §2 for why. -->
+        <div id="envs-bulk-assign" class="envs-bulk-assign" hidden>
+          <label class="toolbar-field">
+            Assign <span id="envs-bulk-count">0</span> unmapped
+            environment(s) to
+            <input id="envs-bulk-product" type="text"
+                   placeholder="product name"
+                   aria-label="Product to bulk-assign unmapped environments to">
+          </label>
+          <button id="envs-bulk-btn" type="button">Assign</button>
+        </div>
         <div class="table-wrap">
           <table class="data-table" id="envs-table">
             <thead>

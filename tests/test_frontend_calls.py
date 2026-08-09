@@ -1733,6 +1733,95 @@ class ProductColumnTest(unittest.TestCase):
             self.assertIn("productCell.hidden = true", code, name)
 
 
+class BulkAssignUnmappedTest(unittest.TestCase):
+    """The upgrade-day bulk "assign every unmapped environment to
+    product X" action (WP-23 addendum, docs/STREAMS_PLAN.md §2) —
+    static/actions.html + static/actions.js. Explicit, one-time,
+    never a standing default (see the decision recorded in
+    docs/STREAMS_PLAN.md §2)."""
+
+    def test_the_control_ships_hidden_in_the_markup(self) -> None:
+        html = read_text("actions.html")
+        mount_at = html.index('id="envs-bulk-assign"')
+        self.assertIn("hidden", html[mount_at:mount_at + 60])
+
+    def test_the_control_lives_inside_the_envs_details_section(
+        self
+    ) -> None:
+        """Loaded lazily with the rest of the environment-expectations
+        section, not a separate always-fetched control."""
+        html = read_text("actions.html")
+        details_at = html.index('id="envs-details"')
+        bulk_at = html.index('id="envs-bulk-assign"')
+        table_at = html.index('id="envs-table"')
+        self.assertLess(details_at, bulk_at)
+        self.assertLess(bulk_at, table_at)
+
+    def test_load_envs_refreshes_the_bulk_control_from_the_same_fetch(
+        self
+    ) -> None:
+        """No second request for the unmapped list — it is
+        data.environments, already in memory from the one fetch
+        loadEnvs() already makes."""
+        body = _function_body(read("actions.js"), "async function loadEnvs(")
+        self.assertIn("updateBulkAssignControl(data.environments)", body)
+
+    def test_the_control_filters_by_unmapped_product(self) -> None:
+        body = _function_body(
+            read("actions.js"), "function updateBulkAssignControl(")
+        self.assertIn("!item.product", body)
+
+    def test_the_control_hides_when_nothing_is_unmapped(self) -> None:
+        """Zero visible change: an estate with every environment already
+        declared (or none using products at all) never shows this."""
+        body = _function_body(
+            read("actions.js"), "function updateBulkAssignControl(")
+        self.assertIn("unmappedEnvs.length === 0", body)
+
+    def test_bulk_assign_reuses_the_existing_per_environment_endpoint(
+        self
+    ) -> None:
+        """No new API surface (the addendum's explicit instruction):
+        the SAME PUT saveEnvProduct already issues, once per unmapped
+        environment."""
+        body = _function_body(
+            read("actions.js"), "async function bulkAssignUnmapped(")
+        self.assertIn('"/api/environments/"', body)
+        self.assertIn('"/product"', body)
+        self.assertIn("for (const item of unmappedEnvs)", body)
+
+    def test_a_partial_failure_still_refreshes_the_table(self) -> None:
+        """A failure partway through the loop (env 3 of 5, say) still
+        committed 1 and 2 server-side — the table/count must not keep
+        showing the pre-click unmapped count against what the server
+        actually holds now. loadEnvs() belongs in a finally, not only
+        the success path."""
+        body = _function_body(
+            read("actions.js"), "async function bulkAssignUnmapped(")
+        finally_at = body.index("} finally {")
+        self.assertIn("await loadEnvs()", body[finally_at:])
+
+    def test_bulk_assign_requires_a_typed_product_name(self) -> None:
+        """The confirm-before-do gate: a required, validated input —
+        the same idiom review.js's retirement reason box uses — not a
+        browser confirm() dialog."""
+        body = _function_body(
+            read("actions.js"), "async function bulkAssignUnmapped(")
+        self.assertIn("if (!product)", body)
+
+    def test_bulk_assign_requires_a_username(self) -> None:
+        body = _function_body(
+            read("actions.js"), "async function bulkAssignUnmapped(")
+        self.assertIn("requireUsername()", body)
+
+    def test_no_confirm_dialog_is_introduced(self) -> None:
+        """Precedent check, pinned: nothing in this codebase uses
+        window.confirm() anywhere, so this feature must not be the
+        first — the required-input gate above is the established
+        substitute."""
+        self.assertNotIn("confirm(", _strip_comments(read("actions.js")))
+
+
 class TimeAndTimelineProductTest(unittest.TestCase):
     """docs/STREAMS_PLAN.md §2.3: "Time/Timeline pages: product scoping
     only via the existing environment filter semantics" — Time appends
@@ -1851,6 +1940,156 @@ class WatchPageTest(unittest.TestCase):
         self.assertIn('getElementById("empty-state")', code)
 
 
+class WatchStalenessGrammarTest(unittest.TestCase):
+    """The "@<n>h"/"@<n>d" declared-staleness suffix (WP-23,
+    docs/STREAMS_PLAN.md §2.4) — watch.js's mirror of
+    testboard/api.py's _parse_watch_spec()/_EXPECTED_SUFFIX, so a URL
+    built by the composer and a hand-typed one parse identically."""
+
+    #: Round-trip specs watch.js's splitSpec/joinSpec must satisfy.
+    #: There is no JS engine in this suite (every other frontend test
+    #: in this file is a static source-pattern check on the same
+    #: basis), so these are exercised for REAL here against the
+    #: PYTHON side instead (testboard/api.py's _parse_watch_spec,
+    #: which watch.js's splitExpectedSuffix/EXPECTED_SUFFIX is a
+    #: byte-for-byte mirror of, pinned by
+    #: test_the_regex_matches_the_servers_grammar_exactly above) — a
+    #: genuine round-trip failure in the shared grammar fails here,
+    #: rather than being asserted only in prose. The JS side itself
+    #: was additionally re-verified by hand against a live server (see
+    #: the drop note) since a source-pattern check cannot execute
+    #: splitSpec/joinSpec directly.
+    _ROUND_TRIP_SPECS = [
+        "e:linux-sim",
+        "e:win-sim@36h",
+        "p:Atlas@7d",
+        "s:2@1d",
+        "p:release@2026",       # "@" present, no valid suffix
+        "p:release@2026@1d",    # "@" present twice, suffix at the last
+        "e:foo@3w",              # invalid unit, stays part of the name
+    ]
+
+    def test_the_regex_matches_the_servers_grammar_exactly(self) -> None:
+        """testboard/api.py's _EXPECTED_SUFFIX is r"^\\d+[hd]$" —
+        pinned here so the two patterns cannot drift apart silently."""
+        code = _strip_comments(read("watch.js"))
+        self.assertIn("EXPECTED_SUFFIX = /^\\d+[hd]$/", code)
+
+    def test_the_shared_grammar_round_trips_for_real(self) -> None:
+        """Executes the actual round trip against the PYTHON side of
+        the shared grammar (see _ROUND_TRIP_SPECS's own comment for
+        why Python, not JS) — split, then rebuild the same way
+        joinSpec does, and the result must be the exact input."""
+        from testboard import api
+        for spec in self._ROUND_TRIP_SPECS:
+            kind, name, expected = api._parse_watch_spec(spec)
+            rebuilt = kind + ":" + name + (
+                "@" + expected if expected else "")
+            self.assertEqual(rebuilt, spec, spec)
+
+    def test_a_bare_kind_with_no_colon_does_not_round_trip(self) -> None:
+        """The one known asymmetry, pinned rather than left as
+        folklore: a spec with no colon at all (already an error card,
+        never a valid kind) parses to an empty name and rebuilds with
+        a trailing colon it did not have — "garbage" in, "garbage:"
+        out. Harmless (this shape is never round-tripped through the
+        UI, which always writes a real kind), but real, so it is
+        asserted here rather than silently assumed away."""
+        from testboard import api
+        kind, name, expected = api._parse_watch_spec("garbage")
+        rebuilt = kind + ":" + name + ("@" + expected if expected else "")
+        self.assertEqual(rebuilt, "garbage:")
+        self.assertNotEqual(rebuilt, "garbage")
+
+    def test_split_uses_the_last_at_not_the_first(self) -> None:
+        body = _function_body(read("watch.js"), "function splitExpectedSuffix(")
+        self.assertIn("lastIndexOf(\"@\")", body)
+
+    def test_join_only_appends_when_expected_is_set(self) -> None:
+        body = _function_body(read("watch.js"), "export function joinSpec(")
+        self.assertIn("entry.expected", body)
+        self.assertIn('"@"', body)
+
+    def test_the_composer_offers_a_cadence_choice(self) -> None:
+        html = read_text("watch.html")
+        self.assertIn('id="add-cadence"', html)
+        self.assertIn('value="1d"', html)
+        self.assertIn('value="7d"', html)
+        self.assertIn('value="custom"', html)
+        self.assertIn('id="add-cadence-hours"', html)
+
+    def test_read_cadence_builds_the_same_suffix_grammar(self) -> None:
+        body = _function_body(read("watch.js"), "function readCadence(")
+        self.assertIn('"custom"', body)
+        self.assertIn('hours + "h"', body)
+
+    def test_add_card_carries_the_cadence_through(self) -> None:
+        body = _function_body(read("watch.js"), "function addCard(")
+        self.assertIn("expected: readCadence()", body)
+
+    def test_unassigned_failing_is_a_stat_only_when_nonzero(self) -> None:
+        """Zero visible change: the established house rule, pinned for
+        both card builders — a zero count adds neither the stat nor
+        the accent class."""
+        code = _strip_comments(read("watch.js"))
+        for signature in (
+            "function buildOkCard(", "function buildStreamCard("
+        ):
+            body = _function_body(code, signature)
+            self.assertIn("if (card.unassigned_failing)", body, signature)
+
+    def test_accent_precedence_is_unassigned_failure_over_staleness(
+        self
+    ) -> None:
+        """docs/STREAMS_PLAN.md §2.4's decision: the border shows the
+        unassigned-failure accent first; staleness only gets the
+        border when there is no unassigned failure to show instead —
+        but its text line (stalenessText) is independent of this and
+        always renders when declared."""
+        body = _function_body(read("watch.js"), "function applyWatchAccent(")
+        fail_at = body.index("watch-card-accent-fail")
+        stale_at = body.index("watch-card-accent-stale")
+        self.assertLess(fail_at, stale_at)
+        self.assertIn("else if", body)
+
+    def test_staleness_text_uses_both_real_halves(self) -> None:
+        """Not a hidden constant on either side: the suffix comes from
+        the card (echoed from the URL) and the age from ageText() over
+        the card's own freshness timestamp."""
+        body = _function_body(read("watch.js"), "function stalenessText(")
+        self.assertIn("card.expected", body)
+        self.assertIn("ageText(", body)
+
+    def test_staleness_line_is_absent_with_no_declared_expectation(
+        self
+    ) -> None:
+        code = _strip_comments(read("watch.js"))
+        for signature in (
+            "function buildOkCard(", "function buildStreamCard("
+        ):
+            body = _function_body(code, signature)
+            self.assertIn("stalenessText(card", body, signature)
+
+    def test_stream_cards_own_freshness_is_last_seen(self) -> None:
+        body = _function_body(read("watch.js"), "function cardFreshnessIso(")
+        self.assertIn("card.last_seen", body)
+
+    def test_product_cards_own_freshness_is_its_laggard(self) -> None:
+        body = _function_body(read("watch.js"), "function cardFreshnessIso(")
+        self.assertIn("card.laggard.last_reported", body)
+
+    def test_the_stale_accent_is_not_the_result_palette(self) -> None:
+        """House rule: staleness is a timing/coverage fact, not a
+        failure, so its accent must reuse the SAME amber precedent
+        .tl-partial established — never --c-fail or --c-fae."""
+        css = read_text("style.css")
+        rule_at = css.index(".watch-card-accent-stale")
+        rule = css[rule_at:css.index("}", rule_at)]
+        self.assertIn("#8a6d00", rule)
+        self.assertNotIn("--c-fail", rule)
+        self.assertNotIn("--c-fae", rule)
+
+
 class PlantedWatchRegressionTest(unittest.TestCase):
     """Prove the round-trip and ordering detectors can fail."""
 
@@ -1868,6 +2107,18 @@ class PlantedWatchRegressionTest(unittest.TestCase):
     def test_a_missing_watch_link_would_be_caught(self) -> None:
         planted = "<input id=\"share-link\" type=\"text\">"
         self.assertNotIn('id="watch-link"', planted)
+
+    def test_a_first_at_split_would_be_caught(self) -> None:
+        """The wrong implementation: splitting the "@" suffix at the
+        FIRST "@" would truncate a name like "release@2026@1d" down to
+        "release", losing "2026" — the detector wants the LAST one."""
+        planted = (
+            "function splitExpectedSuffix(rest) {\n"
+            "  const atSign = rest.indexOf('@');\n"
+            "  return { name: rest.slice(0, atSign) };\n"
+            "}\n"
+        )
+        self.assertNotIn("lastIndexOf(\"@\")", planted)
 
 
 if __name__ == "__main__":

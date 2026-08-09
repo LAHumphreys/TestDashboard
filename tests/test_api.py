@@ -3060,6 +3060,100 @@ def _trace_sql_into(conn: sqlite3.Connection, into: List[str]) -> None:
     conn.set_trace_callback(lambda statement: into.append(statement))
 
 
+class ParseWatchSpecTest(unittest.TestCase):
+    """:func:`api._parse_watch_spec` — the ``kind:name@expected``
+    grammar, pure and offline (docs/STREAMS_PLAN.md §2.4)."""
+
+    def test_no_colon_is_kind_with_empty_name_and_no_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("garbage"),
+                          ("garbage", "", None))
+
+    def test_plain_kind_name_has_no_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:linux-sim"),
+                          ("e", "linux-sim", None))
+
+    def test_day_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("p:Atlas@7d"),
+                          ("p", "Atlas", "7d"))
+
+    def test_hour_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:win-sim@36h"),
+                          ("e", "win-sim", "36h"))
+
+    def test_numeric_stream_id_with_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("s:2@1d"),
+                          ("s", "2", "1d"))
+
+    def test_a_name_containing_at_with_no_valid_tail_is_not_split(
+        self
+    ) -> None:
+        """A build/branch name is free text and may itself contain
+        "@" — "release@2026" has no digit+unit tail, so it is not a
+        suffix at all, and the WHOLE thing is the name."""
+        self.assertEqual(api._parse_watch_spec("p:release@2026"),
+                          ("p", "release@2026", None))
+
+    def test_an_invalid_unit_is_part_of_the_name(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:foo@3w"),
+                          ("e", "foo@3w", None))
+
+    def test_a_non_digit_count_is_part_of_the_name(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:foo@d"),
+                          ("e", "foo@d", None))
+
+    def test_double_at_splits_at_the_last_one_only(self) -> None:
+        """"release@2026@1d" -- the name legitimately contains an "@",
+        and the suffix is still found, at the LAST "@"."""
+        self.assertEqual(api._parse_watch_spec("p:release@2026@1d"),
+                          ("p", "release@2026", "1d"))
+
+    def test_at_with_empty_tail_is_part_of_the_name(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:foo@"),
+                          ("e", "foo@", None))
+
+
+class ParseExpectedAgeTest(unittest.TestCase):
+    """:func:`api._parse_expected_age` — the two units the grammar
+    allows, days and hours."""
+
+    def test_days(self) -> None:
+        self.assertEqual(
+            api._parse_expected_age("7d"), datetime.timedelta(days=7))
+
+    def test_hours(self) -> None:
+        self.assertEqual(
+            api._parse_expected_age("36h"), datetime.timedelta(hours=36))
+
+
+class ApplyStalenessTest(unittest.TestCase):
+    """:func:`api._apply_staleness` — the pure comparison, offline."""
+
+    NOW = datetime.datetime(2026, 8, 9, 12, 0, 0)
+
+    def test_no_expected_adds_nothing_at_all(self) -> None:
+        card = {}  # type: Dict[str, Any]
+        api._apply_staleness(card, None, self.NOW, self.NOW)
+        self.assertEqual(card, {})
+
+    def test_never_reported_is_stale_regardless_of_age(self) -> None:
+        card = {}  # type: Dict[str, Any]
+        api._apply_staleness(card, "7d", None, self.NOW)
+        self.assertEqual(card["expected"], "7d")
+        self.assertTrue(card["stale"])
+
+    def test_within_the_declared_age_is_not_stale(self) -> None:
+        card = {}  # type: Dict[str, Any]
+        recent = self.NOW - datetime.timedelta(hours=1)
+        api._apply_staleness(card, "1d", recent, self.NOW)
+        self.assertFalse(card["stale"])
+
+    def test_older_than_the_declared_age_is_stale(self) -> None:
+        card = {}  # type: Dict[str, Any]
+        old = self.NOW - datetime.timedelta(days=3)
+        api._apply_staleness(card, "1d", old, self.NOW)
+        self.assertTrue(card["stale"])
+
+
 class TestWatch(ApiCase):
     """GET /api/watch (WP-20, docs/STREAMS_PLAN.md §2.4): the whole
     Watchlist page in one request, cards in request order."""
@@ -3101,6 +3195,45 @@ class TestWatch(ApiCase):
         self.assertEqual(card["new_failures"], 1)
         self.assertIsNotNone(card["last_reported"])
         self.assertIsNotNone(card["stale_before"])
+        # WP-23: t1 fails and nobody owns it.
+        self.assertEqual(card["unassigned_failing"], 1)
+        # No "@" suffix in the spec -- no staleness judgment at all.
+        self.assertNotIn("stale", card)
+        self.assertNotIn("expected", card)
+
+    def test_an_environment_cards_unassigned_failing_excludes_assigned(
+        self
+    ) -> None:
+        self._seed()
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "t1") + "/assignee",
+            body={"username": "alice", "assigned_by": "bob"})
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:linux-sim"]}
+        )["cards"]
+        self.assertEqual(card["failing"], 1)  # still failing
+        self.assertEqual(card["unassigned_failing"], 0)  # but owned
+
+    def test_an_environment_card_declares_staleness_fresh(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:linux-sim@7d"]}
+        )["cards"]
+        self.assertEqual(card["expected"], "7d")
+        self.assertFalse(card["stale"])
+
+    def test_an_environment_card_declares_staleness_stale(self) -> None:
+        self.import_runs([record(
+            environment="linux-sim", test_name="t1", result="FAIL",
+            start_time="2026-07-01T00:00:00.000000",
+            end_time="2026-07-01T00:00:01.000000")])
+        self._declare("linux-sim", "Atlas")
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:linux-sim@1h"]}
+        )["cards"]
+        self.assertEqual(card["expected"], "1h")
+        self.assertTrue(card["stale"])
 
     def test_a_product_card(self) -> None:
         self._seed()
@@ -3112,6 +3245,50 @@ class TestWatch(ApiCase):
         self.assertEqual(card["failing"], 2)
         self.assertIsNone(card["last_reported"])
         self.assertIsNotNone(card["stale_before"])
+        # WP-23: t1 (linux-sim) and t2 (win-sim) both fail, unowned.
+        self.assertEqual(card["unassigned_failing"], 2)
+        self.assertNotIn("stale", card)
+        self.assertNotIn("expected", card)
+
+    def test_a_product_cards_unassigned_failing_sums_its_environments(
+        self
+    ) -> None:
+        self._seed()
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "t1") + "/assignee",
+            body={"username": "alice", "assigned_by": "bob"})
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Atlas"]}
+        )["cards"]
+        self.assertEqual(card["failing"], 2)
+        self.assertEqual(card["unassigned_failing"], 1)  # only t2 now
+
+    def test_a_product_cards_staleness_is_judged_by_its_laggard(
+        self
+    ) -> None:
+        """docs/STREAMS_PLAN.md §2.4: the product's freshness timestamp
+        is deliberately its OLDEST-reporting environment, not its
+        newest -- "everything reported" is the bar, not "something
+        did"."""
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1",
+                   start_time="2026-07-26T10:00:00.000000",
+                   end_time="2026-07-26T10:00:01.000000"),
+            record(environment="win-sim", test_name="t2",
+                   start_time="2026-07-01T00:00:00.000000",
+                   end_time="2026-07-01T00:00:01.000000"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Atlas@1d"]}
+        )["cards"]
+        # linux-sim reported 2h ago (fresh); win-sim reported 25 days
+        # ago -- the laggard -- so the CARD is stale even though its
+        # newest environment is not.
+        self.assertEqual(card["laggard"]["environment"], "win-sim")
+        self.assertTrue(card["stale"])
 
     def test_a_product_card_names_its_laggard_environment(self) -> None:
         """A product spans environments reporting hours apart, so its
@@ -3324,6 +3501,53 @@ class TestWatchStreamCards(ApiCase):
         # frontend from a hardcoded word.
         self.assertEqual(card["baseline_kind"], "mainline")
         self.assertEqual(card["baseline_name"], "")
+        # WP-23: test_a fails on the branch and is unassigned.
+        self.assertEqual(card["unassigned_failing"], 1)
+        self.assertNotIn("stale", card)
+        self.assertNotIn("expected", card)
+
+    def test_a_stream_cards_unassigned_failing_excludes_assigned(
+        self
+    ) -> None:
+        """Assignments are stream-agnostic (docs/STREAMS_PLAN.md §3.6):
+        assigning test_a — from mainline, no stream_id at all — still
+        clears it off the BRANCH card's unassigned-failing count,
+        because there is only ever one owner for a triple."""
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_a")
+            + "/assignee",
+            body={"username": "alice", "assigned_by": "bob"})
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.stream_id)]})["cards"]
+        self.assertEqual(card["unassigned_failing"], 0)
+
+    def test_a_stream_cards_staleness_uses_last_seen(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}@1d".format(self.stream_id)]})["cards"]
+        self.assertEqual(card["expected"], "1d")
+        # The branch's only run is 2026-07-25T03:00, NOW is
+        # 2026-07-26T12:00 -- about 33h, older than the declared 1d.
+        self.assertTrue(card["stale"])
+
+    def test_a_stream_cards_staleness_when_fresh(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}@7d".format(self.stream_id)]})["cards"]
+        self.assertFalse(card["stale"])
+
+    def test_both_unassigned_failing_and_stale_can_show_on_one_card(
+        self
+    ) -> None:
+        """The two are independent facts about the same card — both
+        keys are present together when both are true."""
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}@1h".format(self.stream_id)]})["cards"]
+        self.assertEqual(card["unassigned_failing"], 1)
+        self.assertTrue(card["stale"])
 
     def test_an_unknown_stream_id_is_an_error_card(self) -> None:
         (card,) = self.call(

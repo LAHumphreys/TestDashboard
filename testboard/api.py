@@ -32,6 +32,7 @@ Python 3.6 compatible; standard library only.
 import datetime
 import json
 import logging
+import re
 import urllib.parse
 from typing import (
     Any,
@@ -2700,8 +2701,15 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
 _WATCH_MAX_CARDS = 50
 
 
-def _parse_watch_spec(spec: str) -> Tuple[str, str]:
-    """Split one ``c=`` value into ``(kind, name)`` at the FIRST colon.
+#: The declared-staleness suffix (docs/STREAMS_PLAN.md §2.4): a plain
+#: integer count of hours or days, e.g. "1d", "36h". Anything else after
+#: the last "@" is part of the name, not a suffix — see
+#: :func:`_parse_watch_spec`.
+_EXPECTED_SUFFIX = re.compile(r"^\d+[hd]$")
+
+
+def _parse_watch_spec(spec: str) -> Tuple[str, str, Optional[str]]:
+    """Split one ``c=`` value into ``(kind, name, expected)``.
 
     docs/STREAMS_PLAN.md §2.4: "a one-letter kind, a colon, then the
     name". *spec* has already been through the query-string decoder
@@ -2712,11 +2720,66 @@ def _parse_watch_spec(spec: str) -> Tuple[str, str]:
     kind — an ``ok: false`` card, not a parse error, because a
     stale or hand-edited URL should degrade to "this one card is
     wrong", never to a broken page.
+
+    The name may carry an OPTIONAL declared-staleness suffix,
+    ``@<n>h`` or ``@<n>d``, split at the LAST ``@`` in the name — but
+    only when the text after it matches :data:`_EXPECTED_SUFFIX`.
+    Names are free text and may themselves contain ``@`` (a branch or
+    build name), so an invalid or absent tail is part of the name, not
+    an error: ``"e:release@2026"`` has the plain name
+    ``"release@2026"`` and no declared expectation; ``"s:2@1d"`` has
+    name ``"2"`` and expectation ``"1d"``.
     """
     if ":" not in spec:
-        return spec, ""
+        return spec, "", None
     kind, name = spec.split(":", 1)
-    return kind, name
+    at = name.rfind("@")
+    if at == -1:
+        return kind, name, None
+    tail = name[at + 1:]
+    if not _EXPECTED_SUFFIX.match(tail):
+        return kind, name, None
+    return kind, name[:at], tail
+
+
+def _parse_expected_age(expected: str) -> datetime.timedelta:
+    """``"1d"`` -> one day, ``"36h"`` -> 36 hours.
+
+    *expected* is assumed already validated by :data:`_EXPECTED_SUFFIX`
+    (every caller gets it from :func:`_parse_watch_spec`, which never
+    hands back a tail that does not match).
+    """
+    unit = expected[-1]
+    count = int(expected[:-1])
+    if unit == "d":
+        return datetime.timedelta(days=count)
+    return datetime.timedelta(hours=count)
+
+
+def _apply_staleness(
+    card: Dict[str, Any],
+    expected: Optional[str],
+    last_reported: Optional[datetime.datetime],
+    now_value: datetime.datetime,
+) -> None:
+    """Add the DECLARED staleness verdict to *card*, in place.
+
+    docs/STREAMS_PLAN.md §2.4: staleness is judged only when the URL
+    itself declares an expectation — no *expected* means no judgment
+    at all, and both keys are omitted (today's behaviour, byte for
+    byte: the "zero visible change" rule applies to a card with no
+    ``@`` suffix same as it does to one with zero unassigned
+    failures). A card whose freshness timestamp is ``None`` (never
+    reported) is stale by definition — absence of data cannot read as
+    fresher than old data.
+    """
+    if expected is None:
+        return
+    card["expected"] = expected
+    if last_reported is None:
+        card["stale"] = True
+        return
+    card["stale"] = last_reported < now_value - _parse_expected_age(expected)
 
 
 def _watch_card_error(
@@ -2765,7 +2828,20 @@ def _handle_watch(
     docs/STREAMS_PLAN.md §2.4. ``c`` is repeated, ORDER PRESERVED — the
     URL is the entire configuration, there is no server-side saved view,
     so the response's card order is exactly the request's. Each value is
-    ``kind:name`` (see :func:`_parse_watch_spec`).
+    ``kind:name``, with an optional ``@<n>h``/``@<n>d`` declared-
+    staleness suffix on the name (see :func:`_parse_watch_spec`).
+
+    Every ok card carries ``unassigned_failing`` (WP-23): the count of
+    tests in the card's own scope whose latest result is FAIL and which
+    have no current assignee — the highlight the morning scan needs,
+    computed from two aggregate queries total (see the
+    ``unassigned_by_env``/``unassigned_by_stream`` fetches below), never
+    per card. A card whose spec carried an ``@`` suffix also carries
+    ``expected`` (the suffix, echoed) and ``stale`` (bool) — the card's
+    own freshness timestamp (environment: ``last_reported``; product:
+    its laggard's; stream: ``last_seen``) compared against the declared
+    age. No suffix means neither key is present at all — declaring
+    nothing is not the same as declaring "never stale".
 
     ``p`` (product) and ``e`` (environment) resolve to verdict cards.
     ``s`` (stream, WP-21) resolves to a branch/build VERDICT card — the
@@ -2806,7 +2882,7 @@ def _handle_watch(
         )
     parsed = [
         (spec,) + _parse_watch_spec(spec) for spec in specs
-    ]  # type: List[Tuple[str, str, str]]
+    ]  # type: List[Tuple[str, str, str, Optional[str]]]
 
     # WP-21: every s: card's stream id, valid-integer ones only (a
     # non-integer becomes an error card in the main loop below, same as
@@ -2814,7 +2890,7 @@ def _handle_watch(
     # the per-card loop, so this stays O(1) queries regardless of how
     # many s: cards the request names.
     requested_stream_ids = set()  # type: Set[int]
-    for _spec, kind, name in parsed:
+    for _spec, kind, name, _expected in parsed:
         if kind != "s":
             continue
         try:
@@ -2841,6 +2917,16 @@ def _handle_watch(
         product_to_envs.setdefault(product, []).append(environment)
     declared_products = set(product_to_envs)
     latest_by_env = storage.latest_run_time_by_environment()
+    # Unassigned-failure highlight (WP-23, docs/STREAMS_PLAN.md §2.4):
+    # two aggregate queries total, regardless of card count. "e"/"p"
+    # cards are always mainline (there is no such thing as a branch
+    # environment or a branch product), so one per-environment
+    # aggregate on mainline covers both; "s" cards get their own
+    # per-stream aggregate, batched across every requested id.
+    unassigned_by_env = storage.unassigned_failing_by_environment()
+    unassigned_by_stream = storage.unassigned_failing_by_stream(
+        list(requested_stream_ids)
+    )
 
     # WP-21: identities + compare counts for every requested s: card, in
     # three queries total (mainline's own clock included) regardless of
@@ -2920,7 +3006,7 @@ def _handle_watch(
         return analytics.recent_cutoff(scoped, fallback, floor).when
 
     cards = []  # type: List[Dict[str, Any]]
-    for spec, kind, name in parsed:
+    for spec, kind, name, expected in parsed:
         if kind == "e":
             if name not in known_environments:
                 cards.append(_watch_card_error(
@@ -2928,7 +3014,8 @@ def _handle_watch(
                     "nothing under this name — removed or renamed?"))
                 continue
             verdict = by_environment.get(name, zero)
-            cards.append({
+            env_last_reported = latest_by_env.get(name)
+            card = {
                 "spec": spec, "kind": "environment", "name": name,
                 "ok": True,
                 "failing": verdict.failing,
@@ -2937,10 +3024,13 @@ def _handle_watch(
                 "unexpected_passes": verdict.unexpected_passes,
                 "stale_before": model.format_iso(card_cutoff([name])),
                 "last_reported": (
-                    None if name not in latest_by_env
-                    else model.format_iso(latest_by_env[name])
+                    None if env_last_reported is None
+                    else model.format_iso(env_last_reported)
                 ),
-            })
+                "unassigned_failing": unassigned_by_env.get(name, 0),
+            }  # type: Dict[str, Any]
+            _apply_staleness(card, expected, env_last_reported, now_value)
+            cards.append(card)
         elif kind == "p":
             if name not in declared_products:
                 cards.append(_watch_card_error(
@@ -2948,7 +3038,18 @@ def _handle_watch(
                     "nothing under this name — removed or renamed?"))
                 continue
             verdict = by_product.get(name, zero)
-            cards.append({
+            product_envs = product_to_envs.get(name, [])
+            laggard = _product_laggard(product_envs, latest_by_env)
+            # The card's OWN freshness timestamp is the laggard's — the
+            # oldest-across-environments environment, deliberately: "1d"
+            # declared on a product means every one of its environments
+            # reported within a day, and the laggard is exactly the
+            # timestamp that answers that.
+            laggard_last_reported = (
+                None if laggard is None
+                else latest_by_env.get(laggard["environment"])
+            )
+            card = {
                 "spec": spec, "kind": "product", "name": name,
                 "ok": True,
                 "failing": verdict.failing,
@@ -2956,7 +3057,7 @@ def _handle_watch(
                 "fixed": verdict.fixed,
                 "unexpected_passes": verdict.unexpected_passes,
                 "stale_before": model.format_iso(
-                    card_cutoff(product_to_envs.get(name, []))),
+                    card_cutoff(product_envs)),
                 # No single "last reported" for a multi-environment
                 # product — env_updated already answers that per
                 # environment, and this page must never invent one
@@ -2973,9 +3074,14 @@ def _handle_watch(
                 # waiting on" trap the handover documents). An
                 # environment that has never reported is the worst
                 # laggard of all and wins with last_reported null.
-                "laggard": _product_laggard(
-                    product_to_envs.get(name, []), latest_by_env),
-            })
+                "laggard": laggard,
+                "unassigned_failing": sum(
+                    unassigned_by_env.get(e, 0) for e in product_envs
+                ),
+            }  # type: Dict[str, Any]
+            _apply_staleness(
+                card, expected, laggard_last_reported, now_value)
+            cards.append(card)
         elif kind == "s":
             try:
                 stream_id = int(name)
@@ -3014,7 +3120,7 @@ def _handle_watch(
                 mainline_last_seen if predecessor is None
                 else predecessor.last_seen
             )
-            cards.append({
+            card = {
                 "spec": spec, "kind": "stream", "name": stream.name,
                 "ok": True,
                 "id": stream.stream_id,
@@ -3033,7 +3139,11 @@ def _handle_watch(
                     None if baseline_last_seen is None
                     else model.format_iso(baseline_last_seen)
                 ),
-            })
+                "unassigned_failing": unassigned_by_stream.get(
+                    stream_id, 0),
+            }  # type: Dict[str, Any]
+            _apply_staleness(card, expected, stream.last_seen, now_value)
+            cards.append(card)
         else:
             cards.append(_watch_card_error(
                 spec, kind, name,

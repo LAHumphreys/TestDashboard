@@ -28,7 +28,7 @@ import { CATEGORY_LABELS, CATEGORY_ORDER, ageText } from "./compare.js";
 const DEFAULT_KEY = "testboard.watch.default";
 
 const state = {
-  specs: [],   // [{kind, name}], in display/request order
+  specs: [],   // [{kind, name, expected}], in display/request order
 };
 
 /* ================= URL grammar =================
@@ -36,20 +36,45 @@ const state = {
  * "kind:name", split at the FIRST colon (docs/STREAMS_PLAN.md §2.4) — a
  * product or environment name may itself contain a colon, and the kind
  * letter never does.
+ *
+ * The name may carry an OPTIONAL declared-staleness suffix, "@<n>h" or
+ * "@<n>d" (WP-23), split at the LAST "@" — but only when the text after
+ * it matches EXPECTED_SUFFIX. A branch/build/product name is free text
+ * and may itself contain "@", so an invalid or absent tail is part of
+ * the name, not a suffix: mirrors testboard/api.py's
+ * _parse_watch_spec()/_EXPECTED_SUFFIX exactly, so the same URL parses
+ * the same way on both sides.
  */
+const EXPECTED_SUFFIX = /^\d+[hd]$/;
 
-/** "e:lab-alpha" -> {kind: "e", name: "lab-alpha"}. */
+/** Split "name" (or "name@1d") into {name, expected}. */
+function splitExpectedSuffix(rest) {
+  const atSign = rest.lastIndexOf("@");
+  if (atSign === -1) {
+    return { name: rest, expected: null };
+  }
+  const tail = rest.slice(atSign + 1);
+  if (!EXPECTED_SUFFIX.test(tail)) {
+    return { name: rest, expected: null };
+  }
+  return { name: rest.slice(0, atSign), expected: tail };
+}
+
+/** "e:lab-alpha@36h" -> {kind: "e", name: "lab-alpha", expected: "36h"}. */
 export function splitSpec(spec) {
   const at = spec.indexOf(":");
   if (at === -1) {
-    return { kind: spec, name: "" };
+    return { kind: spec, name: "", expected: null };
   }
-  return { kind: spec.slice(0, at), name: spec.slice(at + 1) };
+  const kind = spec.slice(0, at);
+  const suffix = splitExpectedSuffix(spec.slice(at + 1));
+  return { kind: kind, name: suffix.name, expected: suffix.expected };
 }
 
-/** {kind, name} -> "e:lab-alpha", the inverse of splitSpec. */
+/** {kind, name, expected} -> "e:lab-alpha@36h", the inverse of splitSpec. */
 export function joinSpec(entry) {
-  return entry.kind + ":" + entry.name;
+  const base = entry.kind + ":" + entry.name;
+  return entry.expected ? base + "@" + entry.expected : base;
 }
 
 /** Parse a location.search string into [{kind, name}, ...], order kept. */
@@ -140,8 +165,56 @@ function freshnessLine(card) {
   return bits.join(" — ");
 }
 
+/** The ISO timestamp a card's OWN declared-staleness judgment is made
+ * against (WP-23, docs/STREAMS_PLAN.md §2.4) — matches _handle_watch's
+ * choice server-side: environment -> last_reported; product -> its
+ * laggard's; stream -> last_seen. */
+function cardFreshnessIso(card) {
+  if (card.kind === "stream") {
+    return card.last_seen;
+  }
+  if (card.kind === "product") {
+    return card.laggard ? card.laggard.last_reported : null;
+  }
+  return card.last_reported;
+}
+
+/**
+ * The declared-staleness wording line — present only when the card's
+ * spec carried an "@" suffix (``card.expected`` is omitted entirely
+ * otherwise, per the API contract). Both halves are real data:
+ * ``card.expected`` is the URL's own declaration, echoed back by the
+ * server, and the age comes from the card's own freshness timestamp
+ * via the same ageText() the branch card's freshness line already
+ * uses — never a hidden constant standing in for either half.
+ */
+function stalenessText(card, nowMs) {
+  if (!card.expected) {
+    return null;
+  }
+  return "expected within " + card.expected + " — last run "
+    + ageText(cardFreshnessIso(card), nowMs);
+}
+
+/**
+ * Accent precedence (WP-23, docs/STREAMS_PLAN.md §2.4): a card can be
+ * both stale AND carry unassigned failures at once. The BORDER always
+ * shows the unassigned-failure accent when there is one — an owner gap
+ * is the more actionable of the two facts — while the staleness TEXT
+ * LINE (stalenessText above) is added independently of which accent
+ * wins the border, so neither fact is ever silently dropped.
+ */
+function applyWatchAccent(div, card) {
+  if (card.unassigned_failing) {
+    div.classList.add("watch-card-accent-fail");
+  } else if (card.stale) {
+    div.classList.add("watch-card-accent-stale");
+  }
+}
+
 function buildOkCard(card, index, total) {
   const div = el("div", "card watch-card");
+  applyWatchAccent(div, card);
   const head = el("div", "watch-card-head");
   head.appendChild(el("span", "watch-card-kind", card.kind));
   head.appendChild(el("span", "watch-card-name", card.name));
@@ -151,9 +224,21 @@ function buildOkCard(card, index, total) {
   verdict.appendChild(buildStat("Failing", card.failing));
   verdict.appendChild(buildStat("New failures", card.new_failures));
   verdict.appendChild(buildStat("Fixed", card.fixed));
+  // Zero visible change (docs/STREAMS_PLAN.md §2.4): an
+  // unassigned-failure count of zero adds no stat and no accent — the
+  // card looks exactly as it did before this feature existed.
+  if (card.unassigned_failing) {
+    verdict.appendChild(
+      buildStat("Unassigned failing", card.unassigned_failing));
+  }
   div.appendChild(verdict);
 
   div.appendChild(el("p", "watch-card-fresh muted", freshnessLine(card)));
+
+  const stale = stalenessText(card, Date.now());
+  if (stale) {
+    div.appendChild(el("p", "watch-card-stale", stale));
+  }
 
   const link = cardLink(card);
   if (link) {
@@ -218,6 +303,7 @@ function baselineLabel(card) {
  */
 function buildStreamCard(card, index, total) {
   const div = el("div", "card watch-card");
+  applyWatchAccent(div, card);
   const head = el("div", "watch-card-head");
   head.appendChild(el("span", "watch-card-kind", card.stream_kind));
   head.appendChild(el("span", "watch-card-name", card.name));
@@ -233,6 +319,11 @@ function buildStreamCard(card, index, total) {
   for (const key of CATEGORY_ORDER) {
     verdict.appendChild(buildStat(CATEGORY_LABELS[key], card[key]));
   }
+  // Zero visible change: see the identical comment in buildOkCard.
+  if (card.unassigned_failing) {
+    verdict.appendChild(
+      buildStat("Unassigned failing", card.unassigned_failing));
+  }
   div.appendChild(verdict);
 
   const nowMs = Date.now();
@@ -241,6 +332,11 @@ function buildStreamCard(card, index, total) {
     + " — " + baselineLabel(card) + " "
     + ageText(card.baseline_last_seen, nowMs));
   div.appendChild(fresh);
+
+  const stale = stalenessText(card, nowMs);
+  if (stale) {
+    div.appendChild(el("p", "watch-card-stale", stale));
+  }
 
   const link = cardLink(card);
   if (link) {
@@ -352,13 +448,30 @@ function removeCard(index) {
   refresh();
 }
 
+/**
+ * The composer's cadence choice (WP-23): none / 1d / 7d / a custom
+ * hour count. Returns the "@" suffix value ("1d", "36h", ...) or null
+ * for "no expectation" — the exact grammar :func:`splitSpec` parses
+ * back out, so what the picker builds and what a hand-typed URL means
+ * are the same thing.
+ */
+function readCadence() {
+  const cadence = document.getElementById("add-cadence").value;
+  if (cadence === "custom") {
+    const hours = parseInt(
+      document.getElementById("add-cadence-hours").value, 10);
+    return hours > 0 ? hours + "h" : null;
+  }
+  return cadence || null;
+}
+
 function addCard() {
   const kind = document.getElementById("add-kind").value;
   const name = document.getElementById("add-name").value;
   if (!name) {
     return;
   }
-  state.specs.push({ kind: kind, name: name });
+  state.specs.push({ kind: kind, name: name, expected: readCadence() });
   refresh();
 }
 
@@ -432,6 +545,12 @@ function init() {
 
   document.getElementById("add-card-btn")
     .addEventListener("click", addCard);
+
+  const cadenceSelect = document.getElementById("add-cadence");
+  const hoursLabel = document.getElementById("add-cadence-hours-label");
+  cadenceSelect.addEventListener("change", () => {
+    hoursLabel.hidden = cadenceSelect.value !== "custom";
+  });
 
   document.getElementById("save-default-btn").addEventListener("click", () => {
     writeDefault(currentQuery().toString());

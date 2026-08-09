@@ -109,6 +109,16 @@ EXCLUDED_TESTS = {
         "a perf pin calibrated on SQLite. On an emulated local server "
         "or a CI container the number measures the environment, not a "
         "regression; MariaDB perf comes from the real box (drop note).",
+    "UnassignedFailingTest.test_by_stream_batches_every_requested_id_in_one_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "UnassignedFailingTest.test_empty_stream_id_list_costs_no_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "UnassignedFailingTest.test_a_clean_estate_has_no_entries":
+        "constructs a second Storage(path) directly (a fresh SQLite "
+        "file) rather than through the backend hook; there is no "
+        "equivalent 'fresh empty database' to point at without "
+        "dropping the sacrificial one mid-suite, same reasoning as "
+        "TestLatestRunDuration above.",
 }  # type: Dict[str, str]
 
 if backends.MARIADB_AVAILABLE:
