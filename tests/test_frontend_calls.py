@@ -368,6 +368,44 @@ class ResultEmphasisTest(unittest.TestCase):
             self.assertIn(queue, code)
 
 
+class SharedControlStylingTest(unittest.TestCase):
+    """The Build picker looked "out of place" — browser-default, not
+    styled at all — because WP-22 swapped it from ``<select>`` to
+    ``<input type="text" list=…>`` (a combo box) and the shared base
+    control rule near the top of style.css only ever named
+    ``select, input[type="search"], textarea``. The regression shape:
+    a control's TYPE changed and the stylesheet silently did not follow
+    — pinned here so the same class of gap (a new/changed input type
+    landing outside the shared rule) is caught by the suite, not by
+    someone noticing the page "looks off" in a real browser.
+    """
+
+    def test_the_shared_base_rule_covers_text_inputs(self) -> None:
+        css = read_text("style.css")
+        self.assertIn('input[type="text"]', css)
+        rule_at = css.index('input[type="text"]')
+        # It must be in the SAME rule as select/input[type="search"],
+        # not a copy-pasted duplicate elsewhere — the whole point is
+        # ONE shared rule every control type stays under.
+        line = css[css.rfind("\n", 0, rule_at) + 1:css.index("{", rule_at)]
+        self.assertIn("select", line)
+        self.assertIn('input[type="search"]', line)
+
+    def test_the_build_and_compare_to_combos_are_wide_enough_to_read(
+        self
+    ) -> None:
+        css = read_text("style.css")
+        self.assertIn("#stream-picker-input", css)
+        self.assertIn("#compare-to-input", css)
+
+    def test_the_dead_select_rule_is_gone(self) -> None:
+        """The picker has not been a <select> since WP-22; a rule
+        still targeting one is either dead or, worse, a sign the two
+        drifted apart again."""
+        css = read_text("style.css")
+        self.assertNotIn(".stream-picker-label select", css)
+
+
 def read_text(name: str) -> str:
     """Read any file from the static directory as text."""
     with io.open(os.path.join(STATIC_DIR, name), "rb") as handle:

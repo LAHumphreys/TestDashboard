@@ -105,11 +105,12 @@ button.linkish {
 
 button.linkish:hover { background: none; color: #0d3f7c; }
 
-select, input[type="search"], textarea {
+select, input[type="search"], input[type="text"], textarea {
   background: var(--card);
   border: 1px solid #c9c9c4;
   border-radius: 6px;
   padding: 5px 8px;
+  font: inherit;
 }
 
 textarea {
@@ -1962,12 +1963,19 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
 .stream-picker-label {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
+  gap: 8px;
   color: var(--muted);
+  font-size: 13px;
 }
 
-.stream-picker-label select { font: inherit; }
+/* WP-22 swapped the picker from <select> to <input type="text" list=…>
+   (a combo box, so a branch name can be typed/filtered rather than
+   only picked); this box is what makes "branch:feature/checkout-rewrite"
+   readable rather than clipped to a default text-input width. Same
+   combo-box idiom, same width need, for the delta view's "Compare to"
+   input (compare.js) — "build:2026.9.1" / "Mainline nightlies" are no
+   shorter. */
+#stream-picker-input, #compare-to-input { min-width: 220px; }
 
 /* A result cell with no data on that side at all — never a chip, so it
    can never be mistaken for a real pass/fail/etc. value. */
