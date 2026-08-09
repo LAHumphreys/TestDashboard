@@ -386,6 +386,18 @@ entry. Suite green both backends; whatsnew + operator note per house rules
 > there is only one kind left to gate on. See `docs/ONE_KIND_PLAN.md` for
 > the reasoning and the full list of what changed.
 
+> **AS-BUILT NOTE (WP-24, 2026-08-09→10, `docs/SCOPED_URLS_PLAN.md`).**
+> Every scope-carriage rule this plan states — `product` adopts and
+> resets the levels beneath it (`aeea626`), `baseline=1` is the explicit
+> mainline encoding (`89012d4`), links restate the scope they were built
+> under — now lives in ONE module, `static/urls.js`, and
+> `tests/test_frontend_calls.py::ScopedUrlConstructionTest` fails the
+> build on any hand-built scoped URL outside it. The per-site fixes this
+> plan's rounds record (F1/F2/F6, the PART A audit, the nav addendum)
+> are all conversions' behavioral oracles now, not the mechanism. The
+> Watch page's `c=` grammar (§2.4) keeps its own documented URL
+> language, exempt by name in the guard.
+
 **Why.** "Did my branch break anything relative to mainline?" is the whole
 question. Today branch CI results either pollute mainline or go nowhere.
 Streams give branch runs a home that mainline never sees, and a delta view

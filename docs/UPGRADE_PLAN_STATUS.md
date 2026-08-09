@@ -2705,3 +2705,102 @@ Phase 5 (consolidation), after WP-24 lands on top of this tip, not to
 this package. No browser has rendered any of this session's frontend
 changes; the sanity net and persona walks in `NIGHT_RUN_2026-08-09.md`
 Phases 3–4 are where that gets covered.
+
+---
+
+## 2026-08-09→10 — the overnight round: WP-25 review fix, WP-24, the sanity net, the persona walks (branch `wp-24-scoped-urls`, ship branch `streams-upgrade`)
+
+One coordinated overnight session (`docs/NIGHT_RUN_2026-08-09.md` was
+the score; Sonnet implementers built, the coordinator reviewed every
+diff, ran every gate, and pushed). Chain: `wp-23-longrunning` →
+`wp-25-one-kind` → `wp-24-scoped-urls`, consolidated as
+**`streams-upgrade`** — the single morning-merge candidate.
+
+**Correction to the WP-25 entry above:** `BuildVerdictLineTest` did not
+stay deleted. Coordinator review ruled the F5 verdict line's deletion
+an over-deletion (a kind-GATED feature, which §1.4 says becomes
+data-gated, not deleted — and the RC-owner journey depends on it);
+restored in `96af20a`, adapted to the one-kind world (hidden for
+mainline scope or no predecessor; 11 tests, up from 9). The restore
+does NOT un-orphan `previous_builds`/`compare_counts_many(baselines=)`
+— checked against the call graph, their one caller was always the
+Watch `s:` card, which WP-25 deliberately fixed to verdict-vs-mainline.
+Keep-or-delete is on the morning decision list.
+
+**WP-24 (scoped URLs)** landed per `docs/SCOPED_URLS_PLAN.md`: one
+module (`static/urls.js`) owns every scoped URL; every construction
+site converted in nine reviewable commits; `ScopedUrlConstructionTest`
++ planted-regression proof; Watch `c=` grammar exempt by name;
+`actions.js`/`test.js` NUL sentinels byte-checked after every touch.
+Two deviations accepted on review: explicit empty `product=` for "All
+products" (the spec's own encoding — absence never encodes a choice)
+and scope params trailing page-specific params (nothing observes
+ordering). A `withEnvironment()` was deliberately NOT added —
+`setEnvironment()` preserves an open-ended bag of other params, a
+shape none of the fixed builders fit; the site is allowlisted in the
+guard with a companion test that fails if the exemption stops being
+needed.
+
+**The sanity net** (`.scratch/net/run_net.py`, ~17s, unattended) now
+automates the six gotcha classes of the pre-drop rounds and is the
+repeatable "fix then re-verify" loop the morning will use. It earned
+its keep twice in one night:
+
+1. `origin=branch` terminology leak — the Open Actions origin filter
+   never learned the one-kind dialect (API 400'd `origin=build`; chip
+   said "Branch-originated"). Renamed value + label, dead spelling now
+   a loud 400/ValueError, chip value/label pinned by a new guard
+   (`91fe0bd`).
+2. **The night's biggest catch:** WP-24's conversion dropped `stream=`
+   from four row-link sites (app.js queue/browse/scriptLink,
+   compare.js delta rows) — 517 failing links, one root cause: naming
+   `product: null` in a `pageUrl()` override suppresses default
+   carriage for the levels product contains, so `stream` was reset
+   unless ALSO named. The full unit suite stayed green through it
+   (the converted guards grepped for the builder call, which passes
+   with or without stream) — the DOM-shim walk was the only thing
+   that saw it. Fixed by naming `stream` explicitly at each site
+   (the F6 quick-links pattern, which is why those were never broken);
+   the four guards now pin the full override literals (`36c9ddf`).
+   Fourth consecutive session the DOM-shim method caught what static
+   checks could not.
+
+**The persona walks** (manager / delver / RC owner, from cold,
+transcribed mechanically, judged by the coordinator) produced three
+fixes in one commit (`2adc1d2`): the test page's assignee PUT now
+sends `stream_id` like the review panel and the page's own comment
+form always did (the RC owner's Open-Actions-origin step was silently
+broken without it); three visible dead-kind strings renamed (Watch
+composer "Branch/build"→"Build", the two-tab `aria-label`, the delta
+table's static "This branch" header) with a new
+`OneKindVisibleWordingTest` sweeping rendered text/aria-label/title
+for the word; and the test page's latest-run line gained the review
+panel's scoped "View in timeline →" link (the delver journey
+dead-ended without any route to Timeline from `test.html`).
+Judgment calls deliberately NOT coded went to the morning decision
+list (in the morning summary and `SESSION_HANDOVER.md`).
+
+**Measurements (dev copy, 540k runs / 12k tests, tip `91fe0bd`,
+port-8955 scratch server — NOT production):** endpoint storm after the
+WP-24 refactor — `/api/summary` median 78.7ms (p95 89.7),
+`?parts=headline` 16.0ms, `/api/dashboard?limit=250` 6.4ms,
+`/api/time` 1.8ms, `/api/environments` 1.3ms, `/api/watch` single
+`e:` card 12.0ms; summary cold-vs-warm 105.7 vs 80.6ms (~25ms residual
+cold cost — carried decision item, now with a number). In family with
+the perf round's recorded values; WP-24 is server-untouched by
+construction and measured as a no-op.
+
+**Gates, all green on the final tip `2adc1d2`:** suite 2022 OK
+(skipped=1) SQLite / 2705 OK (skipped=44) dual-backend (every skip
+per-test-reasoned; 36 of 44 are `set_trace_callback` query-count
+instruments with no MariaDB equivalent — the O(N)-query guards are
+SQLite-enforced only, a known asymmetry); all four CI legs green on
+every push (runs 31333569214, 31336413657, 31336591743, 31337219319,
+31338682000); sanity net fully green (18.1s); legacy walks: deeplink
+and timeline pass, branch-tabs' 3 short-lived-branch failures are the
+expected WP-25 §1.4 behavior change (tab header existence now
+threshold-gated), not a regression.
+
+Suite counts by commit: 1978 (baseline) → 1991 (WP-25 + verdict-line
+restore) → 2013 (WP-24) → 2016 (origin rename) → 2017 (four-site fix)
+→ 2022 (persona fixes). Every increase is guards, none is weakening.
