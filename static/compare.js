@@ -702,7 +702,16 @@ function renderCompareToControl(streamMeta, baselineMeta, streams) {
     }
     const url = new URL(window.location.href);
     if (chosen === null) {
-      url.searchParams.delete("baseline");
+      // EXPLICIT mainline, as an EXPLICIT param. Deleting the param
+      // instead was the bug the first RC reviewer hit: on a build page
+      // "no baseline" already means "default to the previous build"
+      // (pickDefaultBuildBaseline), so choosing mainline was
+      // indistinguishable from choosing nothing and snapped straight
+      // back to the predecessor. Mainline's stream id is 1 by
+      // migration-9 invariant (storage.MAINLINE_STREAM_ID; the row is
+      // seeded by the migration itself), the same invariant the s:
+      // Watch-card grammar already leans on server-side.
+      url.searchParams.set("baseline", "1");
     } else {
       url.searchParams.set("baseline", String(chosen));
     }

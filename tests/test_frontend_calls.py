@@ -1747,6 +1747,19 @@ class CompareToControlTest(unittest.TestCase):
         self.assertIn('candidate.kind !== "build"', body)
         self.assertIn("candidate.id === streamMeta.id", body)
 
+    def test_choosing_mainline_sets_an_explicit_baseline_param(self) -> None:
+        """Choosing "Mainline nightlies" must write baseline=1, never
+        DELETE the param: on a build page "no baseline" already means
+        "default to the previous build", so an absence-encoded mainline
+        choice is indistinguishable from no choice and snaps back to
+        the predecessor — reported live by the first person to switch
+        an RC's comparison back to mainline (2026-08-09). Mainline's
+        stream id is 1 by migration-9 invariant (MAINLINE_STREAM_ID)."""
+        body = _function_body(
+            read("compare.js"), "function renderCompareToControl(")
+        self.assertIn('url.searchParams.set("baseline", "1")', body)
+        self.assertNotIn('searchParams.delete("baseline")', body)
+
     def test_default_pick_only_considers_earlier_last_seen(self) -> None:
         """A build with a LATER last_seen must never become the
         default baseline -- "previous" means strictly earlier."""
