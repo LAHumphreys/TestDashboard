@@ -980,18 +980,30 @@ recorded here rather than left implicit:
     message used the plural, which the server would silently ignore.
   - **`watch.js`.** `buildStat()` gained an optional third argument that
     turns the stat's value into a link — every other call site is
-    unaffected. The "Unassigned failing" stat on a product/environment
-    card now links to `index.html` scoped to the card (its `cardLink()`
-    params plus `result=FAIL&unassigned=1`, the toggle chip's own URL
-    contract above) — clicking the number lands on exactly those rows,
-    filtered, rather than only naming a count. A stream card's stat
-    instead links to its own branch-scoped dashboard UNCHANGED (the
-    plain `cardLink()` target): the delta view has no `result=`/
-    `unassigned=` filters of its own to receive them, and its delta
-    table already shows every row's assignee inline, so filtering would
-    be redundant there, not an enrichment. Zero visible change when the
-    stat itself is absent (`unassigned_failing` is 0) — the exact rule
-    the stat's own existence already followed.
+    unaffected. The "Unassigned failing" stat on EVERY card kind
+    (product, environment, and stream) now links to `index.html`
+    scoped to the card (its `cardLink()` params plus
+    `result=FAIL&unassigned=1`, the toggle chip's own URL contract
+    above) — clicking the number lands on exactly those rows, filtered,
+    rather than only naming a count. Zero visible change when the stat
+    itself is absent (`unassigned_failing` is 0) — the exact rule the
+    stat's own existence already followed.
+
+    A stream card's link was originally special-cased to OMIT
+    `result=`/`unassigned=`, reasoning that "the delta view already
+    shows every row's assignee inline" — **advisor-caught as wrong for
+    a long-running branch**: a branch with `OWN_RESULTS_DEFAULT_PASSES`
+    (2) or more covered passes defaults to "Its own results"
+    (`app.js`'s `initBranchDashboard`), not the delta view at all, and
+    that tab is the SAME browse table/filter row these params are
+    built for (`activateOwnResultsTab()` calls `wireMainlineControls()`,
+    the one place that reads them from the URL). Appending them to
+    every card kind unconditionally is safe: on a build or a SPARSE
+    branch (which still default to the diff tab), `compare.js`'s
+    `initDeltaView` never reads `result=`/`unassigned=` from the URL at
+    all, so they are simply inert there, not a wrong filter — the
+    delta table's own inline assignees are still what a reader sees in
+    that case, just without a redundant filtered detour.
   - **Perf**, per the coordinator's explicit ask: no new endpoint, no
     new query shape on either side — the toggle reuses `/api/dashboard`'s
     existing `unassigned=`/`assignee=` filters (already flat, already
@@ -1001,9 +1013,14 @@ recorded here rather than left implicit:
     `?environment=linux-sim&result=FAIL&unassigned=1` rendered with the
     "Unassigned only" chip and the FAIL toggle both already pressed, and
     exactly the one matching row on screen; a Watch page with a product,
-    environment and stream card each showing "Unassigned failing" — the
-    product/environment stat links carried `result=FAIL&unassigned=1`
-    beside their own scope, the stream stat link carried neither.
+    environment and stream card each showing "Unassigned failing" — all
+    three stat links carried `result=FAIL&unassigned=1` beside their
+    own scope (product/environment/stream). A SEPARATE live check, run
+    after the advisor caught the stream-card special case above, seeded
+    a long-running branch (4 covered passes, defaulting to "Its own
+    results") with an unassigned failure and confirmed clicking its
+    Watch card's stat lands there with the filter ALREADY applied —
+    the exact case the original special-cased design would have missed.
 - **F5 (same usability sweep): a build's delta view names BOTH
   canonical baselines, not just the one currently selected.**
   - **`compare.js`.** New `renderBuildVerdict(streamId, data,

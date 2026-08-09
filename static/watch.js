@@ -169,19 +169,28 @@ function buildStat(label, value, href) {
 
 /**
  * Where the "Unassigned failing" stat itself links to (F4) -- an
- * enrichment on top of cardLink(): a product/environment card's stat
- * scopes the dashboard's browse table straight to the failing,
- * unassigned rows (?result=FAIL&unassigned=1 -- the "Unassigned only"
- * toggle chip's own URL contract, read by app.js's
- * wireMainlineControls()). A stream card instead links to its own
- * branch-scoped dashboard UNCHANGED: the delta view has no result=/
- * unassigned= filters of its own to receive them, and its delta table
- * already shows every row's assignee inline, so a second filtered view
- * would be redundant rather than an enrichment.
+ * enrichment on top of cardLink(): scopes the dashboard's browse table
+ * straight to the failing, unassigned rows (?result=FAIL&unassigned=1
+ * -- the "Unassigned only" toggle chip's own URL contract, read by
+ * app.js's wireMainlineControls()).
+ *
+ * Applied to EVERY card kind, including stream -- advisor-caught: the
+ * original design special-cased stream cards to omit these params,
+ * reasoning that "the delta view already shows assignees inline". That
+ * holds for a build or a sparse (<2 covered passes) branch, both of
+ * which land on the DIFF tab -- but a long-running branch with 2+
+ * covered passes (OWN_RESULTS_DEFAULT_PASSES, app.js) defaults to
+ * "Its own results" instead, which is the SAME browse table/filter
+ * row this function's params are built for (activateOwnResultsTab()
+ * calls wireMainlineControls(), the one place that reads them from the
+ * URL). Appending them unconditionally is safe either way: the diff
+ * tab's rendering path (compare.js's initDeltaView) never reads
+ * result=/unassigned= from the URL at all, so on a build or sparse
+ * branch they are simply inert extra params, not a wrong filter.
  */
 function unassignedStatLink(card) {
   const base = cardLink(card);
-  if (!base || card.kind === "stream") {
+  if (!base) {
     return base;
   }
   const at = base.indexOf("?");

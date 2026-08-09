@@ -1943,13 +1943,21 @@ class WatchUnassignedStatLinkTest(unittest.TestCase):
         self.assertIn('params.set("result", "FAIL")', body)
         self.assertIn('params.set("unassigned", "1")', body)
 
-    def test_stream_cards_are_returned_unchanged(self) -> None:
-        """The delta view has nothing to do with result=/unassigned= —
-        appending them would be a dead param, not an enrichment."""
+    def test_stream_cards_also_get_result_and_unassigned(self) -> None:
+        """Advisor-caught regression risk: a special case that omitted
+        these params for kind === 'stream' (reasoning "the delta view
+        already shows assignees inline") is WRONG for a long-running
+        branch — 2+ covered passes (OWN_RESULTS_DEFAULT_PASSES, app.js)
+        defaults to "Its own results", the SAME browse table these
+        params are built for, not the delta view at all. Applying them
+        unconditionally is safe either way: the diff tab's own render
+        path never reads result=/unassigned= from the URL, so they are
+        inert there rather than wrong."""
         body = _function_body(
             read("watch.js"), "function unassignedStatLink(")
-        stream_check_at = body.index('card.kind === "stream"')
-        self.assertIn("return base", body[stream_check_at:stream_check_at + 60])
+        self.assertNotIn('card.kind === "stream"', body)
+        self.assertIn('params.set("result", "FAIL")', body)
+        self.assertIn('params.set("unassigned", "1")', body)
 
     def test_both_call_sites_pass_the_link_only_when_nonzero(self) -> None:
         """Zero visible change (the same rule the stat's own existence
