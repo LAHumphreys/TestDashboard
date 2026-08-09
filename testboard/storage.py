@@ -3084,7 +3084,9 @@ class Storage:
         row = self._conn().execute(sql, params).fetchone()
         return int(row[0])
 
-    def environments(self) -> List[str]:
+    def environments(
+        self, environments: Optional[Sequence[str]] = None,
+    ) -> List[str]:
         """Return every distinct environment with a recorded test, sorted.
 
         Mainline only (WP-21): this feeds the estate-wide environment
@@ -3093,24 +3095,54 @@ class Storage:
         it — the same reasoning as :meth:`summary_rollup` and every
         other estate view (docs/STREAMS_PLAN.md §1, "estate views read
         stream_id = 1").
+
+        *environments* (WP-23 fix) is the WP-20 ``product=`` allow-list,
+        applied here the same way :meth:`dashboard` already applies it —
+        ``None`` means no filter (every deployed caller before this fix
+        saw exactly that, so this is additive). Its absence was the bug:
+        ``/api/summary?product=Atlas`` and ``?product=Beacon`` returned
+        the IDENTICAL environments list, because this method never
+        looked at product scope at all — found live, "both products
+        seem to have the same envs".
         """
-        rows = self._conn().execute(
+        clause, clause_params = self._environments_clause(
+            environments, column="environment"
+        )
+        sql = (
             "SELECT DISTINCT environment FROM latest_runs "
-            "WHERE stream_id = ? ORDER BY environment",
-            (MAINLINE_STREAM_ID,),
-        ).fetchall()
+            "WHERE stream_id = ?"
+        )
+        params = [MAINLINE_STREAM_ID] + clause_params  # type: List[Any]
+        if clause is not None:
+            sql += " AND " + clause
+        sql += " ORDER BY environment"
+        rows = self._conn().execute(sql, params).fetchall()
         return [row[0] for row in rows]
 
-    def scripts(self, environment: Optional[str] = None) -> List[str]:
+    def scripts(
+        self,
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
+    ) -> List[str]:
         """Return every distinct script name (optionally in one env), sorted.
 
-        Mainline only (WP-21) — see :meth:`environments`.
+        Mainline only (WP-21) — see :meth:`environments`. *environments*
+        (WP-23 fix) is the same product allow-list :meth:`environments`
+        takes, combined with *environment* by AND — never contradictory
+        in practice, since a caller passes an exact environment or a
+        product scope, not conflicting values for both.
         """
+        clause, clause_params = self._environments_clause(
+            environments, column="environment"
+        )
         sql = "SELECT DISTINCT script FROM latest_runs WHERE stream_id = ?"
         params = [MAINLINE_STREAM_ID]  # type: List[Any]
         if environment is not None:
             sql += " AND environment = ?"
             params.append(environment)
+        if clause is not None:
+            sql += " AND " + clause
+            params.extend(clause_params)
         sql += " ORDER BY script"
         return [row[0] for row in self._conn().execute(sql, params)]
 
@@ -4377,7 +4409,9 @@ class Storage:
         return row is not None
 
     def latest_run_time_by_environment(
-        self, stream_id: int = MAINLINE_STREAM_ID,
+        self,
+        stream_id: int = MAINLINE_STREAM_ID,
+        environments: Optional[Sequence[str]] = None,
     ) -> Dict[str, datetime.datetime]:
         """When each environment last reported anything.
 
@@ -4397,13 +4431,23 @@ class Storage:
         environment's MAINLINE "last reported" line look fresher than
         mainline actually is. The default preserves that; the "own
         results" tab passes its own stream's id to get the branch's own
-        clock instead.
+        clock instead. *environments* (WP-23 fix) is the WP-20
+        ``product=`` allow-list — without it a product-scoped page's
+        environment pills included every OTHER product's environments
+        too (found live alongside the same bug in :meth:`environments`).
         """
-        rows = self._conn().execute(
+        clause, clause_params = self._environments_clause(
+            environments, column="environment"
+        )
+        sql = (
             "SELECT environment, MAX(start_time) FROM latest_runs "
-            "WHERE stream_id = ? GROUP BY environment",
-            (stream_id,),
-        ).fetchall()
+            "WHERE stream_id = ?"
+        )
+        params = [stream_id] + clause_params  # type: List[Any]
+        if clause is not None:
+            sql += " AND " + clause
+        sql += " GROUP BY environment"
+        rows = self._conn().execute(sql, params).fetchall()
         return {
             row[0]: model.parse_iso(row[1])
             for row in rows if row[1] is not None

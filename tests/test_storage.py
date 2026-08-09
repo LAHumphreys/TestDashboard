@@ -1546,6 +1546,58 @@ class TestPreviousResult(StorageTestBase):
             self.store.scripts(environment="env-a"), ["a.py", "m.py"]
         )
 
+    def test_environments_narrowed_by_an_allow_list(self) -> None:
+        """WP-23 fix: environments() never took a product allow-list at
+        all, which is what let /api/summary?product=X return every
+        OTHER product's environments too — found live."""
+        self.store.upsert_runs([
+            make_record(environment="env-a"),
+            make_record(environment="env-b"),
+            make_record(environment="env-c"),
+        ])
+        self.assertEqual(
+            self.store.environments(environments=["env-a", "env-c"]),
+            ["env-a", "env-c"])
+
+    def test_environments_none_means_unfiltered(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-a"),
+            make_record(environment="env-b"),
+        ])
+        self.assertEqual(
+            self.store.environments(environments=None),
+            self.store.environments())
+
+    def test_environments_empty_allow_list_means_nothing(self) -> None:
+        """The established convention (_environments_clause): an
+        explicitly EMPTY sequence is "match nothing" (an unknown/
+        undeclared product), not "no filter"."""
+        self.store.upsert_runs([make_record(environment="env-a")])
+        self.assertEqual(self.store.environments(environments=[]), [])
+
+    def test_scripts_narrowed_by_an_allow_list(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-a", script="a.py"),
+            make_record(environment="env-b", script="b.py"),
+        ])
+        self.assertEqual(
+            self.store.scripts(environments=["env-a"]), ["a.py"])
+
+    def test_scripts_environment_and_allow_list_combine(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-a", script="a.py"),
+            make_record(environment="env-a", script="b.py",
+                        test_name="test_b"),
+        ])
+        self.assertEqual(
+            self.store.scripts(
+                environment="env-a", environments=["env-a", "env-c"]),
+            ["a.py", "b.py"])
+        self.assertEqual(
+            self.store.scripts(
+                environment="env-a", environments=["env-c"]),
+            [])
+
 
 class TestLatestRunsMaintenance(StorageTestBase):
     """latest_runs stays in lockstep with upserts, including backfills."""
@@ -3038,6 +3090,19 @@ class TestLatestRunTimeByEnvironment(StorageTestBase):
 
     def test_an_empty_estate_is_an_empty_map(self) -> None:
         self.assertEqual(self.store.latest_run_time_by_environment(), {})
+
+    def test_narrowed_by_an_allow_list(self) -> None:
+        """WP-23 fix: a product-scoped page's environment_updated pills
+        must not include another product's environments — found live
+        alongside the same gap in environments()/scripts()."""
+        self._seed()
+        self.assertEqual(
+            sorted(self.store.latest_run_time_by_environment(
+                environments=["linux-sim"])),
+            ["linux-sim"])
+        self.assertEqual(
+            self.store.latest_run_time_by_environment(environments=[]),
+            {})
 
     def test_a_re_import_of_an_older_run_does_not_move_it_back(
         self

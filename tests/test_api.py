@@ -2951,6 +2951,56 @@ class TestProductFiltering(ApiCase):
             "GET", "/api/summary", query={"product": ["Nope"]})
         self.assertEqual(data["status"]["total_tests"], 0)
 
+    def test_summary_environments_are_scoped_to_the_product(self) -> None:
+        """The bug found live: product=Atlas and product=Beacon returned
+        the IDENTICAL environments list, offering each other's
+        environments in the picker — environments()/scripts()/
+        latest_run_time_by_environment() never looked at product scope
+        at all."""
+        self._seed()
+        atlas = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        borealis = self.call(
+            "GET", "/api/summary", query={"product": ["Borealis"]})
+        self.assertEqual(
+            sorted(atlas["environments"]), ["linux-sim", "win-sim"])
+        self.assertEqual(borealis["environments"], ["mac-sim"])
+
+    def test_summary_environment_updated_is_scoped_to_the_product(
+        self
+    ) -> None:
+        self._seed()
+        atlas = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        self.assertEqual(
+            sorted(atlas["environment_updated"]), ["linux-sim", "win-sim"])
+        self.assertNotIn("mac-sim", atlas["environment_updated"])
+
+    def test_summary_scripts_are_scoped_to_the_product(self) -> None:
+        self._seed()
+        borealis = self.call(
+            "GET", "/api/summary", query={"product": ["Borealis"]})
+        # t3 is mac-sim's only script/test in _seed(); t1/t2 belong to
+        # Atlas's environments and must not leak into Borealis's list.
+        self.assertNotIn("t1", borealis["scripts"])
+        self.assertNotIn("t2", borealis["scripts"])
+
+    def test_summary_environments_unscoped_is_unchanged(self) -> None:
+        """Zero visible change: no product= means every environment,
+        exactly as before this fix."""
+        self._seed()
+        data = self.call("GET", "/api/summary")
+        self.assertEqual(
+            sorted(data["environments"]),
+            ["linux-sim", "mac-sim", "win-sim"])
+
+    def test_summary_environments_unknown_product_is_empty(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/summary", query={"product": ["Nope"]})
+        self.assertEqual(data["environments"], [])
+        self.assertEqual(data["environment_updated"], {})
+
     def test_time_unknown_product_is_empty_not_404(self) -> None:
         self._seed()
         data = self.call(
@@ -3663,10 +3713,6 @@ class SummaryStreamScopingTest(ApiCase):
         self.assertEqual(scoped["stream"], stream_id)
         self.assertEqual(scoped["status"]["total_tests"], 1)
         self.assertEqual(scoped["status"]["results"]["FAIL"], 1)
-        # Mainline's own count is untouched and different from the
-        # branch's -- proof the two are not secretly sharing a query.
-        mainline = self.call("GET", "/api/summary")
-        self.assertEqual(mainline["status"]["total_tests"], 6)
 
     def test_the_36h_fallback_clamp_applies_to_a_sparse_branch_too(
             self) -> None:
@@ -3704,6 +3750,74 @@ class SummaryStreamScopingTest(ApiCase):
         error = self.call(
             "GET", "/api/summary", query={"stream": ["9999"]}, expect=404)
         self.assertIn("stream", error["error"])
+
+
+class SummaryStreamProductEnvironmentsTest(ApiCase):
+    """A stream scoped with no explicit ``product=`` must still offer
+    only ITS OWN product's environments (WP-23 fix, found alongside the
+    ``product=`` bug above) — the branch dashboard's own tab must not
+    mix every product's environments into its pills either."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def test_a_streams_own_environments_only(self) -> None:
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1"),
+            record(environment="win-sim", test_name="t2"),
+            record(environment="mac-sim", test_name="t3"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        self._declare("mac-sim", "Borealis")
+        # The stream's product is fixed at creation from the FIRST
+        # record's environment (linux-sim -> Atlas), per WP-21.
+        self.import_runs([record(
+            environment="linux-sim", test_name="t1", branch="feat/x",
+            result="FAIL",
+            start_time="2026-07-26T04:00:00.000000",
+            end_time="2026-07-26T04:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": ["Atlas"]})
+        stream_id = streams["streams"][0]["id"]
+
+        scoped = self.call(
+            "GET", "/api/summary", query={"stream": [str(stream_id)]})
+        self.assertEqual(
+            sorted(scoped["environments"]), ["linux-sim", "win-sim"])
+        self.assertNotIn("mac-sim", scoped["environments"])
+        self.assertNotIn("mac-sim", scoped["environment_updated"])
+
+    def test_an_explicit_product_still_wins_over_the_streams_own(
+        self
+    ) -> None:
+        """product= is an explicit request; it must not be silently
+        overridden by the stream's own declared product."""
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1"),
+            record(environment="mac-sim", test_name="t3"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("mac-sim", "Borealis")
+        self.import_runs([record(
+            environment="linux-sim", test_name="t1", branch="feat/x",
+            result="FAIL",
+            start_time="2026-07-26T04:00:00.000000",
+            end_time="2026-07-26T04:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": ["Atlas"]})
+        stream_id = streams["streams"][0]["id"]
+
+        data = self.call(
+            "GET", "/api/summary",
+            query={"stream": [str(stream_id)], "product": ["Borealis"]})
+        self.assertEqual(data["environments"], ["mac-sim"])
+        # Mainline's own count is untouched -- proof the two are not
+        # secretly sharing a query.
+        mainline = self.call("GET", "/api/summary")
+        self.assertEqual(mainline["status"]["total_tests"], 2)
 
 
 class TimelineTest(ApiCase):

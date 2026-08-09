@@ -1237,10 +1237,18 @@ def _handle_summary(
     ``environment_updated``/``latest_run_time`` to one stream's OWN
     partition — the "own results" tab of a long-running branch stream's
     dashboard (docs/STREAMS_PLAN.md §5.2) is this same endpoint with
-    ``stream=<its id>``. ``products``/``environments``/``scripts``/
-    ``assignees``/``assignment_streams`` stay ALWAYS estate-wide
-    regardless — they are catalog data, not one stream's results.
-    Absent, every deployed caller from before this drop sees no change.
+    ``stream=<its id>``. ``products``/``assignees``/``assignment_streams``
+    stay ALWAYS estate-wide regardless — they are catalogs of every
+    product/assignee that exists, not one stream's or one product's
+    results, and the switcher/filters they feed need the full list to
+    offer a way back to "All products"/"Everyone". ``environments``/
+    ``scripts``/``environment_updated``, by contrast, ARE narrowed by
+    ``product=`` (and, absent that, by a scoped ``stream=``'s own
+    declared product) — this was a real bug, found live:
+    ``?product=Atlas`` and ``?product=Beacon`` returned the identical
+    ``environments`` list, offering each other's environments in the
+    picker. Absent both, every deployed caller from before this drop
+    sees no change.
 
     ``parts`` slices the payload so the home screen can paint
     progressively instead of waiting for its slowest piece:
@@ -1279,6 +1287,28 @@ def _handle_summary(
     # endpoint, scoped — absent, the default (mainline) means every
     # deployed caller from before this drop sees no change at all.
     stream_id = _resolve_stream_id(storage, request)
+
+    # WP-23 fix: the CATALOG fields below (environments/scripts/
+    # environment_updated) must be scoped the same way product=
+    # already scopes the estate counts — found live, "product=Atlas
+    # and product=Beacon return the same environments list", because
+    # environments()/scripts()/latest_run_time_by_environment() never
+    # looked at product scope at all. A stream scoped with no explicit
+    # product= resolves to ITS OWN declared product (fixed at stream
+    # creation, WP-21) rather than staying unscoped — a branch
+    # dashboard's own tab must not offer every product's environments
+    # either. Deliberately kept SEPARATE from `environments` above:
+    # that variable also scopes the numeric estate rollups below, which
+    # are already correctly narrowed by stream_id alone for a
+    # stream-scoped request — widening THAT filter too would be a
+    # different, unrequested behaviour change.
+    catalog_environments = environments
+    if catalog_environments is None and stream_id != MAINLINE_STREAM_ID:
+        scoped_stream = storage.get_stream(stream_id)
+        if scoped_stream is not None:
+            catalog_environments = storage.environments_for_product(
+                scoped_stream.product
+            )
     # One lookup, threaded through every queue below rather than
     # re-fetched per queue (see _summary_queue_json's docstring).
     env_to_product = storage.environment_products_map()
@@ -1404,8 +1434,10 @@ def _handle_summary(
             # products declared, the frontend's signal to show nothing
             # product-shaped at all.
             "products": _products_summary(storage, recent_cutoff),
-            "environments": storage.environments(),
-            "scripts": storage.scripts(environment),
+            "environments": storage.environments(
+                environments=catalog_environments),
+            "scripts": storage.scripts(
+                environment, environments=catalog_environments),
             "assignees": storage.assignees(),
             # WP-21: every non-mainline stream currently annotating an
             # assignment, resolved to its identity — Open Actions' origin
@@ -1432,7 +1464,7 @@ def _handle_summary(
                 environment_name: model.format_iso(when)
                 for environment_name, when
                 in storage.latest_run_time_by_environment(
-                    stream_id).items()
+                    stream_id, environments=catalog_environments).items()
             },
             "queue_cap": _SUMMARY_QUEUE_CAP,
             "status": {
