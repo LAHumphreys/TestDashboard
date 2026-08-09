@@ -81,6 +81,36 @@ scratch DB contains kind='branch' rows; recreate rather than migrate
 scratch data). Estimated as one medium implementer round (~2–3h) plus
 review — smaller than WP-21, larger than a fix round.
 
+## 2b. Also in this round (user-reported, 2026-08-09 evening)
+
+1. **Stream-scoped Time/Timeline empty states must say WHERE the data
+   is.** A build that ran on one environment shows a bare empty page on
+   every other environment (verified live: 2026.9.1 = 0 rows on
+   atlas-lab-alpha, 69 on atlas-lab-bravo — the data is honest, the
+   page is not). When `stream=` is set and the current environment has
+   no rows, the empty state names the environments the stream DOES have
+   runs on — each a link that switches only the environment param
+   (scope rules apply) — or states plainly that the stream has no runs
+   anywhere. The list comes from the stream's `latest_runs` partition
+   (one grouped query, O(partition), no new endpoint unless the payload
+   genuinely lacks it). Same treatment on Time. Guard test per the
+   empty-state patterns.
+2. **Rewrite the combined drop's What's New section for scannability.**
+   User verdict: "simply unreadable — no one will get past the first
+   section... highlight the new functionality, not a work of
+   literature." Rewrite `static/whatsnew.html`'s 2026-08-14 section
+   AFTER the kind collapse (so wording matches the one-kind world):
+   lead with what a tester can now DO, one short bullet per capability
+   (products switcher and scoping; the Watch page and its URL-shared
+   cards; uploading builds and comparing them — vs mainline or each
+   other; assigning from a build's failures; per-build test history and
+   suite pages; the highlights and staleness cadences), each bullet one
+   sentence with WHERE to click, details deferred to the pages
+   themselves. Keep `data-drop-date` and the heading in lockstep
+   (`DropDateTest`); keep the tester-not-operator voice rule from
+   CLAUDE.md; the operator note stays detailed — it has a different
+   reader and is not this item's target.
+
 ## 3. Verification
 
 - Full suite green every commit; dual-backend if the local MariaDB
