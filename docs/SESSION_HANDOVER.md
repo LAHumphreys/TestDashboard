@@ -12,15 +12,21 @@ in production. WP-20+21+22+23 now ship as ONE combined drop; there is
 nothing left in the products/streams design (`docs/STREAMS_PLAN.md`) that
 was planned and is unbuilt.
 
-> **Tonight's session starts here → [`SCOPED_URLS_PLAN.md`](SCOPED_URLS_PLAN.md)
-> (WP-24, user-commissioned 2026-08-09):** one scope-aware URL builder
-> module ending the hand-built-URL bug family (seven+ live incidents,
-> incident table in the doc). Branch `wp-24-scoped-urls` off
-> `wp-23-longrunning`'s tip. The doc is self-contained: design, decided
-> items, enforcement guard, verification, risks. Suite baseline at doc
-> time: **1978 OK (skipped=1)** — later than the counts elsewhere in this
-> file, which predate the day's usability/perf rounds (see
-> `UPGRADE_PLAN_STATUS.md` for the day's log).
+> **Tonight's session runs TWO packages, IN THIS ORDER:**
+> 1. **[`ONE_KIND_PLAN.md`](ONE_KIND_PLAN.md) (WP-25, user-commissioned
+>    2026-08-09 late-day):** collapse the branch/build distinction to
+>    one non-mainline kind (`build`) — deletion before first contact,
+>    nothing kind-shaped has shipped. Branch `wp-25-one-kind` off
+>    `wp-23-longrunning`'s tip.
+> 2. **[`SCOPED_URLS_PLAN.md`](SCOPED_URLS_PLAN.md) (WP-24):** one
+>    scope-aware URL builder ending the hand-built-URL bug family
+>    (incident table in the doc). Branch `wp-24-scoped-urls` off
+>    **WP-25's reviewed tip** — WP-25 deletes kind-gated URL sites
+>    WP-24 would otherwise preserve, which is why the order matters.
+>
+> Both docs are self-contained. Suite baseline: **1978 OK (skipped=1)**
+> — later than the counts elsewhere in this file, which predate the
+> day's usability/perf rounds (see `UPGRADE_PLAN_STATUS.md`).
 
 ---
 
