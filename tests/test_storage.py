@@ -4048,19 +4048,43 @@ class ComparePairsQueryPlanTest(StorageTestBase):
             "EXPLAIN QUERY PLAN " + sql, params).fetchall()
         return [str(row[-1]) for row in rows]
 
+    @staticmethod
+    def _alias_line(plan: List[str], alias: str) -> Optional[str]:
+        """The plan line for *alias*, across EQP dialects.
+
+        Modern SQLite prints ``SEARCH m USING ...``; the 3.26 bundled
+        with RHEL 8's Python 3.6 — the PRODUCTION interpreter, and the
+        two CI legs that caught this — prints
+        ``SEARCH TABLE latest_runs AS m USING ...``. The first CI run
+        of this test asserted the modern spelling only and failed on
+        both 3.6 legs while the underlying PLAN was correct (fully
+        indexed PK probes); this helper is the widening, matching the
+        ALIAS rather than one version's phrasing. SCAN lines are
+        matched the same two ways by the caller.
+        """
+        upper = alias.upper()
+        for row in plan:
+            text = row.strip().upper()
+            for verb in ("SEARCH", "SCAN"):
+                if (text.startswith("{0} {1} ".format(verb, upper))
+                        or (text.startswith(verb + " TABLE ")
+                            and " AS {0} ".format(upper) in text)):
+                    return text
+        return None
+
     def test_every_join_side_is_indexed_never_scanned(self) -> None:
         plan = self._plan()
         plan_text = " | ".join(plan).upper()
         for alias in self._JOIN_ALIASES:
-            self.assertIn(
-                "SEARCH {0} USING".format(alias), plan_text,
-                "{0} is not an indexed SEARCH — plan: {1}".format(
+            line = self._alias_line(plan, alias)
+            self.assertIsNotNone(
+                line, "no SEARCH/SCAN line for {0} — plan: {1}".format(
                     alias, plan_text))
-            self.assertNotIn(
-                "SCAN {0} ".format(alias), plan_text,
-                "{0} is being table/subquery-scanned — the regression "
-                "this test exists to catch. Plan: {1}".format(
-                    alias, plan_text))
+            self.assertTrue(
+                line.startswith("SEARCH") and "USING" in line,
+                "{0} is not an indexed SEARCH — the regression this "
+                "test exists to catch. Its line: {1}".format(
+                    alias, line))
 
     def test_no_materialized_subquery_join(self) -> None:
         """The specific pre-fix shape, confirmed by reverting this
@@ -4086,16 +4110,14 @@ class ComparePairsQueryPlanTest(StorageTestBase):
         test_name — not a partial prefix of it."""
         plan = self._plan()
         for alias in ("m", "s2"):
-            line = next(
-                (row for row in plan
-                 if row.strip().upper().startswith(
-                     "SEARCH {0} ".format(alias.upper()))),
-                None)
+            line = self._alias_line(plan, alias)
             self.assertIsNotNone(line, "no SEARCH line for " + alias)
-            self.assertIn("stream_id=?", line)
-            self.assertIn("environment=?", line)
-            self.assertIn("script=?", line)
-            self.assertIn("test_name=?", line)
+            for column in ("STREAM_ID=?", "ENVIRONMENT=?",
+                           "SCRIPT=?", "TEST_NAME=?"):
+                self.assertIn(
+                    column, line,
+                    "{0} does not probe the full PRIMARY KEY — its "
+                    "line: {1}".format(alias, line))
 
 
 class CompareStreamsTest(StorageTestBase):
