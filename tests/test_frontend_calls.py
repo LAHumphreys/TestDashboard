@@ -109,6 +109,110 @@ class CoverageTest(unittest.TestCase):
             self.assertGreater(len(scripts()[name]), 1000, name)
 
 
+class UrlsModuleTest(unittest.TestCase):
+    """urls.js (WP-24, docs/SCOPED_URLS_PLAN.md): the one module that
+    builds every scoped URL, both navigation hrefs and /api/... fetch
+    query strings. Same "assert against the source" method every other
+    class in this file uses (there is no JS runtime here — see the
+    module docstring) — these are urls.js's OWN unit tests, standing in
+    for the ones a real JS test runner would carry, since "no npm, no
+    build step" rules one out (CLAUDE.md constraint 3)."""
+
+    def test_the_public_surface_is_exactly_the_spec_names(self) -> None:
+        code = read("urls.js")
+        for name in ("currentScope", "pageUrl", "apiUrl", "withStream",
+                     "withBaseline", "withProduct"):
+            self.assertIn(
+                "export function " + name + "(", code,
+                name + " is missing from urls.js's public surface")
+
+    def test_current_scope_reads_only_location_search(self) -> None:
+        body = _function_body(read("urls.js"), "export function currentScope(")
+        self.assertIn("window.location.search", body)
+        self.assertNotIn("localStorage", body)
+
+    def test_current_scope_distinguishes_absent_from_explicit_empty(
+        self
+    ) -> None:
+        """product's "" ("All products", explicit) vs null (absent,
+        say nothing) is the encoding the adoption rule depends on —
+        currentScope() must echo an explicit `?product=` back as ""
+        rather than folding it into null the way every other level
+        does (none of the other three has a meaningful empty state)."""
+        body = _function_body(read("urls.js"), "export function currentScope(")
+        self.assertIn("params.has(key) ? params.get(key) : null", body)
+
+    def test_product_resets_stream_baseline_and_environment(self) -> None:
+        """The hierarchy rule: product contains stream and environment,
+        so naming it as an override resets both — and stream contains
+        baseline, so product's reset reaches it too."""
+        body = _function_body(read("urls.js"), "function resolveScope(")
+        product_at = body.index('if (names(overrides, "product")) {')
+        stream_at = body.index('if (names(overrides, "stream")) {')
+        block = body[product_at:stream_at]
+        for reset in ('result.stream = null', 'result.baseline = null',
+                      'result.environment = null'):
+            self.assertIn(reset, block, "product override must reset " + reset)
+
+    def test_stream_resets_baseline_only(self) -> None:
+        """Stream contains baseline, not environment — changing the
+        Build picker must never drop the dashboard's own environment
+        filter (streams.js never touched it, and this pins that)."""
+        body = _function_body(read("urls.js"), "function resolveScope(")
+        stream_at = body.index('if (names(overrides, "stream")) {')
+        baseline_at = body.index('if (names(overrides, "baseline")) {')
+        block = body[stream_at:baseline_at]
+        self.assertIn("result.baseline = null", block)
+        self.assertNotIn("result.environment", block)
+
+    def test_an_explicit_sibling_value_beats_the_automatic_reset(
+        self
+    ) -> None:
+        """cardLink() (watch.js) and environmentSwitchUrl() (time.js/
+        timeline.js) name product/stream together with a sibling level
+        on purpose — resolveScope() must let the explicit value win,
+        never silently reset what the SAME call just set."""
+        body = _function_body(read("urls.js"), "function resolveScope(")
+        self.assertIn('if (!names(overrides, "stream")) {', body)
+        self.assertIn('if (!names(overrides, "environment")) {', body)
+
+    def test_product_empty_string_is_written_explicitly(self) -> None:
+        body = _function_body(
+            read("urls.js"), "function appendProductParam(")
+        self.assertIn("value === null || value === undefined", body)
+        self.assertNotIn('value === ""', body)
+
+    def test_stream_baseline_environment_never_write_empty(self) -> None:
+        body = _function_body(
+            read("urls.js"), "function appendPlainScopeParam(")
+        self.assertIn('value === ""', body)
+
+    def test_page_url_appends_dot_html(self) -> None:
+        body = _function_body(read("urls.js"), "export function pageUrl(")
+        self.assertIn('page + ".html"', body)
+
+    def test_with_baseline_mainline_is_the_only_explicit_one_encoding(
+        self
+    ) -> None:
+        body = _function_body(read("urls.js"), "export function withBaseline(")
+        self.assertIn('baselineIdOrMainline === "mainline"', body)
+        self.assertIn('"1"', body)
+
+    def test_with_product_resets_the_levels_it_contains(self) -> None:
+        body = _function_body(read("urls.js"), "export function withProduct(")
+        self.assertIn("currentUrlWithScope({ product:", body)
+
+    def test_params_key_order_is_preserved_not_alphabetised(self) -> None:
+        """A converted call site relies on this to reproduce its old
+        query string byte for byte: Object.keys() order, not a sort."""
+        body = _function_body(read("urls.js"), "function appendParams(")
+        self.assertIn("Object.keys(params)", body)
+        self.assertNotIn(".sort(", body)
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", read("urls.js"))
+
+
 class UserListTest(unittest.TestCase):
     """One page, one request for the user list."""
 
@@ -1561,18 +1665,32 @@ class NavScopeCarriageTest(unittest.TestCase):
         """Pins the array to EXACTLY these three -- not "contains", so
         a future edit that adds actions.html/watch.html/whatsnew.html
         (sending a param to a page that would misread it) has to touch
-        this test, not slip through unnoticed."""
-        code = _strip_comments(read("nav.js"))
+        this test, not slip through unnoticed.
+
+        WP-24: the allowlist itself moved to urls.js as
+        NAV_SCOPE_PAGES (data shared by every pageUrl() caller that
+        needs to know which pages are nav-bar targets); nav.js keeps
+        only the separate CARRIED_PARAMS question. Assertion intent is
+        unchanged -- still pinned to exactly these three, still failing
+        if a fourth page is added silently."""
+        code = _strip_comments(read("urls.js"))
         self.assertIn(
-            'const STREAM_AWARE_HREFS = '
+            'export const NAV_SCOPE_PAGES = '
             '["index.html", "time.html", "timeline.html"];',
             code,
         )
+        self.assertIn(
+            'from "./urls.js"', _strip_comments(read("nav.js")),
+            "nav.js must import NAV_SCOPE_PAGES rather than redefining it")
 
     def test_non_matching_links_are_left_alone(self) -> None:
+        """WP-24: the allowlist check itself is unchanged in shape
+        (still a NAV_SCOPE_PAGES.indexOf(href) === -1 guard before
+        `continue`) -- only the array's home moved, see the test
+        above."""
         body = _function_body(
             read("nav.js"), "export function carryScopeIntoNav(")
-        self.assertIn("STREAM_AWARE_HREFS.indexOf(href) === -1", body)
+        self.assertIn("NAV_SCOPE_PAGES.indexOf(href) === -1", body)
         self.assertIn("continue", body)
 
     def test_init_calls_it_independently_of_the_whatsnew_fetch(
