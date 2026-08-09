@@ -1629,10 +1629,10 @@ function renderBranchQuickLinks(streamId) {
 
   const timeLink = document.createElement("a");
   timeLink.href = "time.html?" + timeParams.toString();
-  timeLink.textContent = "This branch's Time →";
+  timeLink.textContent = "This build's Time →";
   const timelineLink = document.createElement("a");
   timelineLink.href = "timeline.html?" + timelineParams.toString();
-  timelineLink.textContent = "This branch's Timeline →";
+  timelineLink.textContent = "This build's Timeline →";
 
   mount.appendChild(timeLink);
   mount.appendChild(document.createTextNode("  ·  "));
@@ -1670,18 +1670,16 @@ function activateDiffTab(streamId) {
 }
 
 /**
- * The two-tab header for a long-running branch stream (WP-23,
- * docs/STREAMS_PLAN.md §5.2): "Its own results" (this same dashboard,
- * scoped to the branch's own stream_id) and "Difference from
- * <baseline>" (the WP-21/22 delta view, unchanged). BOTH tabs always
- * exist for a branch stream — this is not gated on cadence, only the
- * DEFAULT selection is (see the caption below).
- *
- * Release builds (kind 'build') and anything else non-branch keep the
- * exact WP-21/22 behaviour — delta view only, no tab header — since
- * §5.2 frames this as a BRANCH concept: an RC is not a second mainline
- * with its own nightly cadence, and giving it a trend/staleness of its
- * own would mostly be empty.
+ * The two-tab header for a long-running stream (WP-23,
+ * docs/STREAMS_PLAN.md §5.2; DATA-gated by WP-25, docs/ONE_KIND_PLAN.md
+ * §1.4): "Its own results" (this same dashboard, scoped to the stream's
+ * own stream_id) and "Difference from <baseline>" (the WP-21/22 delta
+ * view, unchanged). Both tabs exist together, or not at all — see
+ * initBranchDashboard(), which decides that from the SAME covered-pass
+ * threshold that used to decide only the default selection: a stream
+ * meeting it is exactly what "long-running enough for its own dashboard"
+ * means, however it was uploaded. A one-shot upload stays delta-only,
+ * the same behaviour every stream had before WP-23.
  */
 function selectBranchTab(which, streamId) {
   const ownBtn = document.getElementById("branch-tab-own");
@@ -1699,8 +1697,26 @@ function selectBranchTab(which, streamId) {
 
 async function initBranchDashboard(streamId) {
   let data;
+  let coveredPasses = 0;
   try {
-    data = await fetchCompare(streamId, null, 0, getSelectedBaselineId());
+    // Fired together (WP-25, docs/ONE_KIND_PLAN.md §1.4): the covered-
+    // pass count now decides whether the tab header exists AT ALL, not
+    // only which tab it defaults to, so it has to be on hand before
+    // that decision is made rather than fetched afterwards -- a build-
+    // scoped page therefore now pays this one extra counts-only request
+    // it did not pay before (a branch-scoped page always did).
+    const [compareData, headline] = await Promise.all([
+      fetchCompare(streamId, null, 0, getSelectedBaselineId()),
+      fetchJson("/api/summary?parts=headline&stream=" + streamId)
+        .catch(() => null),
+    ]);
+    data = compareData;
+    if (headline) {
+      coveredPasses = headline.covered_passes;
+    }
+    // A failed headline fetch leaves coveredPasses at 0 -- the tab
+    // header simply does not appear this load, the same safe fallback
+    // the old code used for the default-selection choice alone.
   } catch (err) {
     showError(err.message);
     return;
@@ -1712,9 +1728,15 @@ async function initBranchDashboard(streamId) {
 
   const tabs = document.getElementById("branch-tabs");
   const caption = document.getElementById("branch-tab-caption");
-  if (data.stream.kind !== "branch" || !tabs) {
-    // Builds, and any deployment predating this drop's markup: the
-    // unchanged WP-21/22 delta-only behaviour.
+  // WP-25 (docs/ONE_KIND_PLAN.md §1.4): "any stream whose covered-passes
+  // count meets the existing threshold gets both tabs, however it was
+  // uploaded" -- meeting the threshold IS what "prefer its own results"
+  // means, so the same test now gates existence AND default together;
+  // below it, a stream stays delta-only, the WP-21/22 behaviour every
+  // stream had before WP-23 (and everything WP-25 collapsed the 'build'
+  // kind into keeps, unless it earns its own dashboard by cadence).
+  const meetsThreshold = coveredPasses >= OWN_RESULTS_DEFAULT_PASSES;
+  if (!meetsThreshold || !tabs) {
     if (tabs) {
       tabs.hidden = true;
     }
@@ -1732,37 +1754,23 @@ async function initBranchDashboard(streamId) {
   diffBtn.onclick = () => selectBranchTab("diff", streamId);
   tabs.hidden = false;
 
-  // The default tab: "Its own results" once the branch shows a
-  // regular-enough cadence, "Difference from …" otherwise. Stated in
-  // the caption FROM DATA — the covered-pass count and the threshold
-  // are both literally in the sentence, never a silent constant
-  // (docs/STREAMS_PLAN.md §5.2's own wording: "must be stated in the
-  // UI caption, not buried" — the same discipline WindowWordingTest
-  // holds every other recency line to).
-  let coveredPasses = 0;
-  try {
-    const headline = await fetchJson(
-      "/api/summary?parts=headline&stream=" + streamId);
-    coveredPasses = headline.covered_passes;
-  } catch (err) {
-    // The tab still works either way; the caption just falls back to
-    // the safe (diff) default below rather than guessing.
-  }
-  const preferOwn = coveredPasses >= OWN_RESULTS_DEFAULT_PASSES;
+  // Stated in the caption FROM DATA -- the covered-pass count and the
+  // threshold are both literally in the sentence, never a silent
+  // constant (docs/STREAMS_PLAN.md §5.2's own wording: "must be stated
+  // in the UI caption, not buried" -- the same discipline
+  // WindowWordingTest holds every other recency line to). The "showing
+  // the difference by default" wording this caption used to carry for a
+  // below-threshold stream is gone WITH the case it described: that
+  // stream no longer reaches this branch of the code at all.
   if (caption) {
     const passWord = coveredPasses === 1 ? "pass" : "passes";
     caption.hidden = false;
-    caption.textContent = preferOwn
-      ? ("Showing its own results by default — this branch has "
-         + "completed " + coveredPasses + " " + passWord + " in the "
-         + "last 14 days (" + OWN_RESULTS_DEFAULT_PASSES + " or more "
-         + "shows its own dashboard first).")
-      : ("Showing the difference from mainline by default — this "
-         + "branch has completed " + coveredPasses + " " + passWord
-         + " in the last 14 days (needs " + OWN_RESULTS_DEFAULT_PASSES
-         + " or more to show its own dashboard first).");
+    caption.textContent = "Showing its own results by default — this "
+      + "stream has completed " + coveredPasses + " " + passWord
+      + " in the last 14 days (" + OWN_RESULTS_DEFAULT_PASSES
+      + " or more shows its own dashboard first).";
   }
-  selectBranchTab(preferOwn ? "own" : "diff", streamId);
+  selectBranchTab("own", streamId);
 }
 
 function init() {

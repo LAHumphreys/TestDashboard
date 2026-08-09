@@ -50,7 +50,7 @@ import {
 import { treemapBoxes } from "./charts.js";
 import { attachSorting, sortRows } from "./sorting.js";
 import { getSelectedProduct } from "./products.js";
-import { renderBranchBand } from "./compare.js";
+import { renderBranchBand, renderStreamEnvironmentHint } from "./compare.js";
 
 const LEVELS = ["environment", "script", "test_name"];
 
@@ -103,6 +103,29 @@ function url() {
     qs.append("product", product);
   }
   return "/api/time?" + qs.toString();
+}
+
+/**
+ * A link to this SAME page scoped to a DIFFERENT environment (WP-25,
+ * docs/ONE_KIND_PLAN.md §2b.1) -- the stream-environment-hint's link
+ * target. Deliberately drops `script`: a script from the environment
+ * being LEFT may not exist under the new one, so the link lands one
+ * drill level up (the environment's own script breakdown) rather than
+ * risk a dead combination. `stream`/`product` carry through unchanged --
+ * switching environment never changes which stream or product scope is
+ * being read.
+ */
+function environmentSwitchUrl(environment) {
+  const params = new URLSearchParams();
+  params.append("environment", environment);
+  if (state.streamId !== null) {
+    params.append("stream", String(state.streamId));
+  }
+  const product = getSelectedProduct();
+  if (product) {
+    params.append("product", product);
+  }
+  return "time.html?" + params.toString();
 }
 
 async function load() {
@@ -181,15 +204,24 @@ function render(data) {
 
   if (state.items.length === 0) {
     clearNode(chart);
-    // An empty page here almost always means "the suite has not run
-    // lately", not "there is nothing to measure". Say which, and point
-    // at the way to see it anyway — an all-or-nothing recency cutoff
-    // otherwise blanks the page after any long weekend.
-    empty.textContent = data.excluded_tests
-      ? "Nothing has reported since " + formatTime(data.stale_before)
-        + ". Turn on “Include tests that have not run recently” to see "
-        + "the breakdown from their last run."
-      : "Nothing to show here.";
+    if (data.stream_environments) {
+      // WP-25 (docs/ONE_KIND_PLAN.md §2b.1): scoped to a stream, and
+      // THIS environment is empty for it -- say where the stream's data
+      // actually is, rather than a bare "nothing to show" that reads as
+      // a data problem when the data is simply elsewhere.
+      renderStreamEnvironmentHint(
+        empty, data.stream_environments, environmentSwitchUrl);
+    } else {
+      // An empty page here almost always means "the suite has not run
+      // lately", not "there is nothing to measure". Say which, and point
+      // at the way to see it anyway — an all-or-nothing recency cutoff
+      // otherwise blanks the page after any long weekend.
+      empty.textContent = data.excluded_tests
+        ? "Nothing has reported since " + formatTime(data.stale_before)
+          + ". Turn on “Include tests that have not run recently” to see "
+          + "the breakdown from their last run."
+        : "Nothing to show here.";
+    }
     empty.hidden = false;
     renderTable();
     return;

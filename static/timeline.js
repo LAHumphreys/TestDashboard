@@ -44,7 +44,7 @@ import {
   showError,
 } from "./api.js";
 import { getSelectedProduct } from "./products.js";
-import { renderBranchBand } from "./compare.js";
+import { renderBranchBand, renderStreamEnvironmentHint } from "./compare.js";
 
 /* How far back "Earlier runs…" reaches: the server's own cap, which
  * matches retention — so it means "any recorded run", not a teaser. */
@@ -84,6 +84,30 @@ function timelineUrl() {
     qs.append("stream", String(state.streamId));
   }
   return "/api/timeline?" + qs.toString();
+}
+
+/**
+ * A link to this SAME page scoped to a DIFFERENT environment (WP-25,
+ * docs/ONE_KIND_PLAN.md §2b.1) -- the stream-environment-hint's link
+ * target. Deliberately drops `days`/`from`/`to`: a window chosen for the
+ * environment being LEFT has no meaning for the new one, so the link
+ * lands on its own newest block, the page's ordinary default.
+ * `stream`/`product` carry through unchanged, product so the switcher
+ * on the next load still offers the right environment list
+ * (adoptProductFromUrl(), products.js) -- the same scope-self-
+ * sufficient rule every other stream link in this app follows.
+ */
+function environmentSwitchUrl(environment) {
+  const params = new URLSearchParams();
+  params.append("environment", environment);
+  if (state.streamId !== null) {
+    params.append("stream", String(state.streamId));
+  }
+  const product = getSelectedProduct();
+  if (product) {
+    params.append("product", product);
+  }
+  return "timeline.html?" + params.toString();
 }
 
 function runsUrl(row) {
@@ -204,10 +228,19 @@ function render(data) {
   const meta = document.getElementById("timeline-meta");
   if (!state.rows.length) {
     meta.textContent = "";
-    empty.textContent = data.window === null
-      ? "No activity in the last " + data.days
-        + " days for this environment."
-      : "Nothing ran in this window.";
+    if (data.stream_environments) {
+      // WP-25 (docs/ONE_KIND_PLAN.md §2b.1): scoped to a stream, and
+      // THIS environment is empty for it -- say where the stream's data
+      // actually is, rather than a bare "nothing ran" that reads as a
+      // data problem when the data is simply on another environment.
+      renderStreamEnvironmentHint(
+        empty, data.stream_environments, environmentSwitchUrl);
+    } else {
+      empty.textContent = data.window === null
+        ? "No activity in the last " + data.days
+          + " days for this environment."
+        : "Nothing ran in this window.";
+    }
     empty.hidden = false;
     failureNav.hidden = true;
     return;

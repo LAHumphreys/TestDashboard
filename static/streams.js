@@ -17,7 +17,7 @@
  * Mounted only on index.html, where the toolbar this picker lives in is
  * — a page with no `#stream-picker` element is unaffected. Renders
  * nothing (a hidden container) when the current product has no declared
- * branch/build streams, so a deployment that has not adopted WP-21 yet —
+ * build streams, so a deployment that has not adopted WP-21 yet —
  * or a product with only mainline traffic — sees zero visible change,
  * the same rule products.js follows for a single-product deployment.
  */
@@ -48,10 +48,12 @@ function byNewest(a, b) {
  * picked TEXT is the label, matched back to an id via a map built fresh
  * on every render; an unrecognised value (a typo, or a stale suggestion
  * from before a page refresh) is a no-op, never a broken navigation.
- * Builds are listed newest first by `last_seen` (branches keep the
- * order the API returned) — the version-string-as-written rule (§0.7)
- * means recency is the only ordering that means anything, since the
- * name itself is never parsed.
+ * ONE flat group, newest first by `last_seen` (WP-25, docs/ONE_KIND_PLAN.md
+ * §1.4: the branch/build split died with the `branch` kind — there was
+ * never more than one group of streams to browse, only one group's
+ * worth of code pretending there might be two) — the version-string-as-
+ * written rule (§0.7) means recency is the only ordering that means
+ * anything, since the name itself is never parsed.
  */
 export function renderPicker(container, streams, selectedId) {
   clearNode(container);
@@ -78,10 +80,8 @@ export function renderPicker(container, streams, selectedId) {
   mainlineOpt.value = mainlineLabel;
   datalist.appendChild(mainlineOpt);
 
-  const branches = streams.filter((s) => s.kind === "branch");
-  const builds = streams.filter((s) => s.kind === "build").sort(byNewest);
   let selectedLabel = mainlineLabel;
-  for (const stream of branches.concat(builds)) {
+  for (const stream of streams.slice().sort(byNewest)) {
     const text = stream.kind + ":" + stream.name;
     labelToId[text] = String(stream.id);
     const opt = document.createElement("option");

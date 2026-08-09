@@ -1457,94 +1457,6 @@ class DeltaViewTest(unittest.TestCase):
         self.assertIn("reviewEntry(row, streamId)", row_body)
 
 
-class BuildVerdictLineTest(unittest.TestCase):
-    """F5 (docs/STREAMS_PLAN.md §5.2 "as built"): a build compared
-    against only one baseline at a time answers "is this RC good?"
-    incompletely. The verdict line names BOTH canonical baselines —
-    the previous build and mainline — built from one extra counts-only
-    /api/compare call for whichever of the two is not already loaded,
-    fired lazily so it never delays first paint."""
-
-    def test_the_mount_ships_hidden_in_the_markup(self) -> None:
-        html = read_text("index.html")
-        mount_at = html.index('id="delta-verdict"')
-        self.assertIn("hidden", html[mount_at:mount_at + 60])
-
-    def test_hidden_for_a_non_build_stream(self) -> None:
-        body = _function_body(
-            read("compare.js"), "async function renderBuildVerdict(")
-        kind_at = body.index('data.stream.kind !== "build"')
-        self.assertIn("line.hidden = true", body[kind_at:kind_at + 80])
-
-    def test_hidden_with_no_predecessor_build(self) -> None:
-        """A product's first build has nothing to name as "the previous
-        build" — the line stays hidden rather than half-naming one
-        side of a two-sided sentence."""
-        body = _function_body(
-            read("compare.js"), "async function renderBuildVerdict(")
-        pred_at = body.index("predecessor === null")
-        self.assertIn("line.hidden = true", body[pred_at:pred_at + 80])
-
-    def test_reuses_already_loaded_counts_instead_of_refetching(
-        self
-    ) -> None:
-        """Whichever baseline this page was actually opened with must
-        NOT be fetched a second time — that is the whole "ONE extra
-        call" saving."""
-        body = _function_body(
-            read("compare.js"), "async function renderBuildVerdict(")
-        self.assertIn(
-            "currentBaselineId === predecessor.id ? data.counts : null",
-            body)
-        self.assertIn(
-            "currentBaselineId === null ? data.counts : null", body)
-
-    def test_a_failed_extra_fetch_hides_rather_than_shows_an_error(
-        self
-    ) -> None:
-        """Enrichment only — a failure here must not put an error
-        banner over a delta view that otherwise loaded fine."""
-        body = _function_body(
-            read("compare.js"), "async function renderBuildVerdict(")
-        catch_at = body.index("} catch (err) {")
-        catch_block = body[catch_at:body.index("}", catch_at + 20) + 1]
-        self.assertIn("line.hidden = true", catch_block)
-        self.assertNotIn("showError", catch_block)
-
-    def test_guards_against_a_stale_render(self) -> None:
-        body = _function_body(
-            read("compare.js"), "async function renderBuildVerdict(")
-        self.assertIn("deltaState.streamId !== streamId", body)
-
-    def test_wording_names_both_baselines_and_both_counts(self) -> None:
-        body = _function_body(
-            read("compare.js"), "async function renderBuildVerdict(")
-        self.assertIn('"vs " + streamLabel(predecessor)', body)
-        self.assertIn("predecessorCounts.new_failures", body)
-        self.assertIn("predecessorCounts.new_passes", body)
-        self.assertIn('" fixed"', body)
-        self.assertIn('" — vs mainline: "', body)
-        self.assertIn("mainlineCounts.new_failures", body)
-
-    def test_initDeltaView_calls_it_without_awaiting(self) -> None:
-        """The whole point: this call must not sit on the critical path
-        between the main fetch resolving and delta-section becoming
-        visible."""
-        body = _strip_comments(
-            _function_body(
-                read("compare.js"), "export async function initDeltaView("))
-        call_at = body.index("renderBuildVerdict(streamId, data, productStreams)")
-        self.assertNotIn(
-            "await renderBuildVerdict",
-            body[max(0, call_at - 10):call_at + 10])
-        visible_at = body.index('document.getElementById("delta-section").hidden = false')
-        self.assertLess(call_at, visible_at,
-                         "fired before the section is shown, not after")
-
-    def test_no_innerHTML(self) -> None:
-        self.assertNotIn("innerHTML", _strip_comments(read("compare.js")))
-
-
 class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     """PART A of a follow-up link-matrix audit (after the F1-F7
     usability sweep): three more test.html links that only became
@@ -1722,9 +1634,10 @@ class BuildBaselineWordingTest(unittest.TestCase):
 
 
 class CompareToControlTest(unittest.TestCase):
-    """The build-scoped dashboard's "Compare to" datalist combo (WP-22,
-    docs/STREAMS_PLAN.md §4.1) -- shown only for a kind='build' stream,
-    defaulting to the previous build by last_seen where one exists."""
+    """The dashboard's "Compare to" datalist combo (WP-22,
+    docs/STREAMS_PLAN.md §4.1; un-gated by WP-25, docs/ONE_KIND_PLAN.md
+    §1.3) -- shown for EVERY non-mainline stream, the default baseline
+    always mainline unless this control is used to name another."""
 
     def test_the_markup_ships_hidden(self) -> None:
         html = read_text("index.html")
@@ -1734,18 +1647,18 @@ class CompareToControlTest(unittest.TestCase):
         self.assertIn('id="compare-to-options"', html)
         self.assertIn('list="compare-to-options"', html)
 
-    def test_the_control_hides_for_a_non_build_stream(self) -> None:
+    def test_the_control_hides_only_for_mainline(self) -> None:
         body = _function_body(
             read("compare.js"), "function renderCompareToControl(")
-        self.assertIn('streamMeta.kind !== "build"', body)
+        self.assertIn('streamMeta.kind === "mainline"', body)
         self.assertIn("field.hidden = true", body)
 
-    def test_default_pick_excludes_self_and_non_builds(self) -> None:
-        body = _function_body(
-            read("compare.js"),
-            "export function pickDefaultBuildBaseline(")
-        self.assertIn('candidate.kind !== "build"', body)
-        self.assertIn("candidate.id === streamMeta.id", body)
+    def test_pickDefaultBuildBaseline_is_gone(self) -> None:
+        """WP-25 (docs/ONE_KIND_PLAN.md §1.3, user decision, explicit):
+        default baseline is mainline, always -- the Compare-to control
+        above is how a predecessor gets chosen now, not an automatic
+        pick. Deleted with its feature, not merely unused."""
+        self.assertNotIn("pickDefaultBuildBaseline", read("compare.js"))
 
     def test_scope_changes_reset_narrower_scopes(self) -> None:
         """Changing a scope resets every narrower scope beneath it
@@ -1777,42 +1690,25 @@ class CompareToControlTest(unittest.TestCase):
         self.assertIn('url.searchParams.set("baseline", "1")', body)
         self.assertNotIn('searchParams.delete("baseline")', body)
 
-    def test_default_pick_only_considers_earlier_last_seen(self) -> None:
-        """A build with a LATER last_seen must never become the
-        default baseline -- "previous" means strictly earlier."""
-        body = _function_body(
-            read("compare.js"),
-            "export function pickDefaultBuildBaseline(")
-        self.assertIn("candidate.last_seen > streamMeta.last_seen", body)
-
-    def test_default_pick_ties_agree_with_the_backend(self) -> None:
-        """Storage.previous_builds breaks a last_seen TIE by id (ORDER BY
-        last_seen, id -- the entry immediately before self). This must
-        match exactly, or the same pair of builds gets two different
-        answers depending on which surface computed the default."""
-        body = _function_body(
-            read("compare.js"),
-            "export function pickDefaultBuildBaseline(")
-        self.assertIn(
-            "candidate.last_seen === streamMeta.last_seen\n"
-            "            && candidate.id >= streamMeta.id",
-            body)
-
     def test_the_baseline_param_lives_only_in_the_url(self) -> None:
         body = _function_body(
             read("compare.js"), "export function getSelectedBaselineId(")
         self.assertIn("window.location.search", body)
         self.assertNotIn("localStorage", body)
 
-    def test_a_branch_scoped_page_never_fetches_the_product_stream_list(
+    def test_a_mainline_scoped_page_never_fetches_the_product_stream_list(
             self) -> None:
-        """The extra /api/streams round trip this control needs is paid
-        ONLY by build-scoped pages -- a branch dashboard's cost must stay
-        exactly what it was in WP-21."""
+        """WIDENED for WP-25 (docs/ONE_KIND_PLAN.md §1.3): the extra
+        /api/streams round trip the Compare-to control needs is paid by
+        every NON-MAINLINE page now (the control is un-gated from
+        kind='build' to "any non-mainline stream"), not only a
+        build-scoped one -- but a hand-crafted `?stream=1` must still
+        skip it, the same defence the old branch/build split gave for
+        free."""
         body = _function_body(
             read("compare.js"), "export async function initDeltaView(")
         fetch_at = body.index("fetchProductStreams(")
-        guard_at = body.rindex('=== "build"', 0, fetch_at)
+        guard_at = body.rindex('!== "mainline"', 0, fetch_at)
         self.assertLess(guard_at, fetch_at)
 
 
@@ -1820,16 +1716,24 @@ class BuildPickerGroupingTest(unittest.TestCase):
     """WP-22 (docs/STREAMS_PLAN.md §4.1): the Build picker is a
     substring-searchable datalist combo (a native <select>'s type-ahead
     only prefix-matches, which would find nothing for "rc2" typed
-    against "2026.9.1-rc2"), separating branches and builds, builds
-    newest first by last_seen."""
+    against "2026.9.1-rc2"). WIDENED for WP-25 (docs/ONE_KIND_PLAN.md
+    §1.4): the branch/build group split is gone -- one flat group,
+    newest first by last_seen, since streams.kind is only ever
+    'mainline' or 'build' now."""
 
     def test_picker_is_a_datalist_combo_not_a_select(self) -> None:
         body = _function_body(
             read("streams.js"), "export function renderPicker(")
-        self.assertIn('"branch"', body)
-        self.assertIn('"build"', body)
         self.assertIn("datalist", body)
         self.assertNotIn("createElement(\"select\")", body)
+
+    def test_the_group_split_is_gone(self) -> None:
+        """No separate branches/builds arrays -- one filter-free sort
+        over the whole list."""
+        body = _strip_comments(_function_body(
+            read("streams.js"), "export function renderPicker("))
+        self.assertNotIn('kind === "branch"', body)
+        self.assertNotIn("branches.concat(builds)", body)
 
     def test_an_unrecognised_typed_value_is_a_no_op(self) -> None:
         """A typo or a stale suggestion must not navigate anywhere --
@@ -1840,7 +1744,7 @@ class BuildPickerGroupingTest(unittest.TestCase):
         return_at = body.index("target === undefined")
         self.assertIn("return", body[return_at:return_at + 40])
 
-    def test_builds_are_sorted_newest_first(self) -> None:
+    def test_streams_are_sorted_newest_first(self) -> None:
         code = _strip_comments(read("streams.js"))
         self.assertIn(".sort(byNewest)", code)
         sort_body = _function_body(code, "function byNewest(")
@@ -2626,6 +2530,71 @@ class TimeAndTimelineStreamScopingTest(unittest.TestCase):
         body = _function_body(read("timeline.js"), "function syncUrl()")
         self.assertIn(
             'url.searchParams.set("stream", String(state.streamId))', body)
+
+
+class StreamEnvironmentEmptyStateTest(unittest.TestCase):
+    """WP-25 (docs/ONE_KIND_PLAN.md §2b.1, user-reported 2026-08-09): a
+    build that ran on one environment showed a bare empty page on every
+    OTHER environment. `stream_environments` (present only when scoped
+    and genuinely empty) is rendered as links that switch only the
+    environment param, or "no runs anywhere" when the list is empty."""
+
+    def test_the_shared_renderer_handles_both_cases(self) -> None:
+        body = _function_body(
+            read("compare.js"),
+            "export function renderStreamEnvironmentHint(")
+        self.assertIn("!environments.length", body)
+        self.assertIn("This stream has no runs on any environment", body)
+        self.assertIn("createElement(\"a\")", body)
+        self.assertIn("link.href = linkFor(environment)", body)
+
+    def test_the_shared_renderer_uses_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", _strip_comments(read("compare.js")))
+
+    def test_both_pages_import_the_shared_renderer(self) -> None:
+        for name in ("time.js", "timeline.js"):
+            self.assertIn(
+                "renderStreamEnvironmentHint", _imported_names(read(name)),
+                name)
+
+    def test_both_pages_render_it_only_when_the_field_is_present(
+        self
+    ) -> None:
+        for name, signature in (
+            ("time.js", "function render(data)"),
+            ("timeline.js", "function render(data)"),
+        ):
+            body = _function_body(read(name), signature)
+            self.assertIn("data.stream_environments", body, name)
+            self.assertIn("renderStreamEnvironmentHint(", body, name)
+
+    def test_both_link_builders_switch_only_the_environment_param(
+        self
+    ) -> None:
+        """`stream`/`product` carry through; `environment` is the only
+        param that changes -- a reader must never lose their scope by
+        following the hint."""
+        for name in ("time.js", "timeline.js"):
+            body = _function_body(read(name), "function environmentSwitchUrl(")
+            self.assertIn('params.append("environment", environment)', body)
+            self.assertIn("state.streamId !== null", body)
+            self.assertIn("getSelectedProduct()", body)
+
+    def test_time_link_builder_drops_the_script_drill(self) -> None:
+        """A script from the environment being LEFT may not exist under
+        the new one -- the link must not carry a stale/dead combination
+        forward."""
+        body = _function_body(read("time.js"), "function environmentSwitchUrl(")
+        self.assertNotIn("state.script", body)
+
+    def test_timeline_link_builder_drops_the_chosen_window(self) -> None:
+        """A window chosen for the old environment has no meaning for
+        the new one -- the link must land on its own newest block."""
+        body = _function_body(
+            read("timeline.js"), "function environmentSwitchUrl(")
+        self.assertNotIn("state.days", body)
+        self.assertNotIn("state.from", body)
+        self.assertNotIn("state.to", body)
 
 
 class BranchQuickLinksTest(unittest.TestCase):

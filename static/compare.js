@@ -76,11 +76,12 @@ export function getSelectedStreamId() {
 
 /**
  * The baseline this page was explicitly opened with, from `?baseline=<id>`
- * — null means "no explicit choice", which is NOT necessarily mainline:
- * a build-scoped page with no explicit baseline still defaults to its
- * predecessor build client-side (see :func:`pickDefaultBuildBaseline`),
- * the same "the URL is the whole configuration" rule getSelectedStreamId()
- * follows (WP-22, docs/STREAMS_PLAN.md §4.1).
+ * — null means "no explicit choice", which IS mainline: WP-25
+ * (docs/ONE_KIND_PLAN.md §1.3) deleted the WP-22 client-side default-pick
+ * (a build-scoped page no longer auto-selects its predecessor build) —
+ * the default baseline is mainline, always; the Compare-to control is how
+ * a predecessor is chosen now. Follows the same "the URL is the whole
+ * configuration" rule getSelectedStreamId() does.
  */
 export function getSelectedBaselineId() {
   const raw = new URLSearchParams(window.location.search).get("baseline");
@@ -366,9 +367,9 @@ function renderTabs() {
 
 /**
  * All wording here is built from streamMeta's / baselineMeta's own
- * kind/name — never the literal word "mainline" or "branch" (WP-22,
- * docs/STREAMS_PLAN.md §4.1: a build's baseline is routinely another
- * build, not mainline, since it defaults to its predecessor). The
+ * kind/name — never the literal word "mainline" hardcoded for the OTHER
+ * side (WP-22, docs/STREAMS_PLAN.md §4.1: a build's baseline can be any
+ * other stream once the Compare-to control names one explicitly). The
  * heading and the two column headers are set here too so the whole
  * section reads consistently, not just the prose lines.
  */
@@ -446,12 +447,12 @@ function renderBaselineCard(streamMeta, baselineMeta, counts, nowMs) {
  * <when>" once it has been re-imported (a rebuild). Worded from
  * first_seen/last_seen themselves, never a constant — the same
  * WindowWordingTest discipline every other recency line in this project
- * follows. Hidden for anything that is not kind 'build' (branches and
- * mainline have no "built once" framing that means anything).
+ * follows. Hidden for mainline (which has no "built once" framing that
+ * means anything).
  */
 function renderBuildFraming(streamMeta, nowMs) {
   const line = document.getElementById("delta-build-framing");
-  if (streamMeta.kind !== "build") {
+  if (streamMeta.kind === "mainline") {
     line.hidden = true;
     return;
   }
@@ -462,82 +463,6 @@ function renderBuildFraming(streamMeta, nowMs) {
   line.hidden = false;
 }
 
-/** "1 new failure"/"2 new failures" — the one pluralisation rule this
- * file's counts share, factored out once F5 needed it a second time. */
-function countWord(n, noun) {
-  return n + " " + noun + (n === 1 ? "" : "s");
-}
-
-/**
- * F5 (docs/STREAMS_PLAN.md §5.2 "as built"): a build's delta view only
- * ever answers "is this RC good?" against ONE baseline at a time — this
- * line names the OTHER canonical baseline too, so a reader comparing
- * against the previous build still sees mainline's own verdict (or vice
- * versa) without a second navigation. Hidden outright for anything that
- * is not kind 'build' (a branch has no "previous build" concept), or a
- * build with no predecessor to name (the first build of a product).
- *
- * LAZY: called fire-and-forget from initDeltaView, AFTER first paint —
- * this function's own fetch(es) must never be awaited on the critical
- * path (measured cost is in the F5 commit message). One of the two
- * legs is usually already on hand (whichever baseline this page was
- * actually opened with), so the common case costs exactly ONE extra
- * counts-only /api/compare call; only an explicit ?baseline= naming a
- * THIRD build (neither the predecessor nor mainline) costs two.
- *
- * Guards against a stale render the same way a page-wide requestSeq
- * would: initDeltaView only ever calls this once per build page load
- * (a build has no own-results/diff tab switch to re-enter it, and
- * changing the "Compare to" baseline is a full navigation, not an
- * in-place re-render — so deltaState.streamId cannot legitimately
- * change out from under this call), but the check costs nothing and
- * makes that invariant load-bearing rather than assumed.
- */
-async function renderBuildVerdict(streamId, data, productStreams) {
-  const line = document.getElementById("delta-verdict");
-  if (!line) {
-    return;
-  }
-  if (data.stream.kind !== "build") {
-    line.hidden = true;
-    return;
-  }
-  const predecessor = pickDefaultBuildBaseline(data.stream, productStreams);
-  if (predecessor === null) {
-    line.hidden = true;
-    return;
-  }
-  const currentBaselineId =
-    data.baseline.kind === "mainline" ? null : data.baseline.id;
-  let predecessorCounts =
-    currentBaselineId === predecessor.id ? data.counts : null;
-  let mainlineCounts = currentBaselineId === null ? data.counts : null;
-  try {
-    if (predecessorCounts === null) {
-      const page = await fetchCompare(streamId, null, 0, predecessor.id);
-      predecessorCounts = page.counts;
-    }
-    if (mainlineCounts === null) {
-      const page = await fetchCompare(streamId, null, 0, null);
-      mainlineCounts = page.counts;
-    }
-  } catch (err) {
-    // Enrichment only — a failed extra fetch must not show an error
-    // banner over a delta view that otherwise loaded fine.
-    line.hidden = true;
-    return;
-  }
-  if (deltaState.streamId !== streamId) {
-    return;   // the page moved on while this was in flight
-  }
-  line.textContent =
-    "vs " + streamLabel(predecessor) + ": "
-    + countWord(predecessorCounts.new_failures, "new failure")
-    + " · " + predecessorCounts.new_passes + " fixed"
-    + " — vs mainline: "
-    + countWord(mainlineCounts.new_failures, "new failure");
-  line.hidden = false;
-}
 
 /**
  * The sticky "you are scoped to a branch" band — shared by the
@@ -559,8 +484,9 @@ async function renderBuildVerdict(streamId, data, productStreams) {
  * test-detail compare strip always compares against mainline and has no
  * baseline object to pass, so omitting it keeps that call site's wording
  * exactly what it was before this drop. The dashboard's delta view
- * always passes the ACTUAL baseline — which, for a build, is routinely
- * a predecessor build rather than mainline.
+ * always passes the ACTUAL baseline — mainline by default (WP-25,
+ * docs/ONE_KIND_PLAN.md §1.3: the client-side predecessor-build default
+ * is gone), or whatever the Compare-to control was explicitly set to.
  */
 export function renderBranchBand(streamMeta, baselineMeta) {
   const container = document.getElementById("branch-band");
@@ -578,6 +504,45 @@ export function renderBranchBand(streamMeta, baselineMeta) {
   container.hidden = false;
 }
 
+/**
+ * Fill *container* (cleared first) with the stream-scoped empty-state
+ * hint the Time and Timeline pages share (WP-25, docs/ONE_KIND_PLAN.md
+ * §2b.1, user-reported 2026-08-09): a build that ran on one environment
+ * showed a bare empty page on every OTHER environment -- the data was
+ * honest, the page was not. *environments* is the payload's own
+ * `stream_environments` list (Storage.environments_for_stream, one
+ * grouped query over the stream's own latest_runs partition -- present
+ * only when the caller was ALREADY empty and scoped away from mainline,
+ * so a page with data never fetches or renders this). *linkFor* builds
+ * each environment's href -- the CALLER's job, since Time and Timeline
+ * build slightly different query strings around the shared
+ * `environment` switch (Time carries `group_by`/`script`; Timeline
+ * carries `days`/`from`/`to`); each link changes ONLY the environment
+ * param, per the scope-self-sufficient rule every other stream link in
+ * this app follows.
+ */
+export function renderStreamEnvironmentHint(container, environments, linkFor) {
+  clearNode(container);
+  if (!environments.length) {
+    container.appendChild(document.createTextNode(
+      "This stream has no runs on any environment."));
+    return;
+  }
+  container.appendChild(document.createTextNode(
+    "This stream has no runs on this environment. It does have runs "
+    + "on: "));
+  environments.forEach((environment, index) => {
+    if (index > 0) {
+      container.appendChild(document.createTextNode(", "));
+    }
+    const link = document.createElement("a");
+    link.href = linkFor(environment);
+    link.textContent = environment;
+    container.appendChild(link);
+  });
+  container.appendChild(document.createTextNode("."));
+}
+
 /** Sections that only mean something on the mainline dashboard. Hidden
  * outright while scoped to a branch — docs/STREAMS_PLAN.md §3.6 calls
  * this a swap, not an addition. */
@@ -585,12 +550,11 @@ const MAINLINE_SECTIONS = [
   "status-section", "charts-section", "triage-section", "browse-section",
 ];
 
-/* ================= build-scoped "Compare to" control (WP-22) ================= */
+/* ================= "Compare to" control (WP-22, un-gated by WP-25) ================= */
 
-/** GET /api/streams?product= — every same-product stream (branches AND
- * builds), the raw data both the default-baseline pick and the "Compare
- * to" datalist need. A failed fetch degrades to "mainline only" rather
- * than breaking the delta view that already loaded. */
+/** GET /api/streams?product= — every same-product stream, the raw data
+ * the "Compare to" datalist needs. A failed fetch degrades to "mainline
+ * only" rather than breaking the delta view that already loaded. */
 async function fetchProductStreams(product) {
   try {
     const data = await fetchJson(
@@ -602,49 +566,13 @@ async function fetchProductStreams(product) {
 }
 
 /**
- * The WP-22 default: the nearest earlier same-product BUILD by
- * `last_seen` (id as tiebreak), or null (meaning mainline) when none
- * exists (docs/STREAMS_PLAN.md §4.1: "the previous build by last_seen
- * where one exists, else mainline"). Mirrors
- * Storage.previous_builds' ordering rule exactly — the backend needs its
- * own copy for the O(1) Watchlist card path, this is the frontend's for
- * a page that already has the full stream list in hand and gains
- * nothing from a second round trip to ask the server the same question.
- */
-export function pickDefaultBuildBaseline(streamMeta, streams) {
-  let best = null;
-  for (const candidate of streams) {
-    if (candidate.kind !== "build" || candidate.id === streamMeta.id) {
-      continue;
-    }
-    // Mirrors Storage.previous_builds' own tie-break EXACTLY: a
-    // candidate qualifies when it is strictly earlier, or exactly as
-    // recent with a smaller id (never "==", which excluding with `>=`
-    // would silently disagree with the backend's `<` on the id side
-    // for two builds sharing a last_seen -- found only by comparing
-    // this function's behaviour against the backend's, not by reading
-    // either alone).
-    if (candidate.last_seen > streamMeta.last_seen
-        || (candidate.last_seen === streamMeta.last_seen
-            && candidate.id >= streamMeta.id)) {
-      continue;   // ISO strings: lexical compare is chronological.
-    }
-    if (best === null || candidate.last_seen > best.last_seen
-        || (candidate.last_seen === best.last_seen
-            && candidate.id > best.id)) {
-      best = candidate;
-    }
-  }
-  return best;
-}
-
-/**
- * The "Compare to" datalist combo (WP-22, docs/STREAMS_PLAN.md §4.1):
- * shown only when the scoped stream is kind 'build' — a branch has no
- * predecessor concept, so this stays hidden (and *streams* is never
- * fetched) for every branch-scoped page, keeping that case's footprint
- * at zero. A plain `<input list=…>`, not a `<select>`: the text typed
- * or picked IS the label ("build:1.0"), matched back to an id through a
+ * The "Compare to" datalist combo (WP-22, docs/STREAMS_PLAN.md §4.1;
+ * un-gated by WP-25, docs/ONE_KIND_PLAN.md §1.3): shown for EVERY
+ * non-mainline stream — since the default baseline is always mainline
+ * now (no client-side predecessor pick), this control is how a
+ * predecessor gets chosen at all, for any stream, not only a 'build'
+ * one. A plain `<input list=…>`, not a `<select>`: the text typed or
+ * picked IS the label ("build:1.0"), matched back to an id through a
  * small map built fresh on every render; an unrecognised value (a typo)
  * is a no-op, not a broken navigation.
  */
@@ -653,7 +581,7 @@ function renderCompareToControl(streamMeta, baselineMeta, streams) {
   if (!field) {
     return;
   }
-  if (streamMeta.kind !== "build") {
+  if (streamMeta.kind === "mainline") {
     field.hidden = true;
     return;
   }
@@ -702,15 +630,19 @@ function renderCompareToControl(streamMeta, baselineMeta, streams) {
     }
     const url = new URL(window.location.href);
     if (chosen === null) {
-      // EXPLICIT mainline, as an EXPLICIT param. Deleting the param
-      // instead was the bug the first RC reviewer hit: on a build page
-      // "no baseline" already means "default to the previous build"
-      // (pickDefaultBuildBaseline), so choosing mainline was
-      // indistinguishable from choosing nothing and snapped straight
-      // back to the predecessor. Mainline's stream id is 1 by
-      // migration-9 invariant (storage.MAINLINE_STREAM_ID; the row is
-      // seeded by the migration itself), the same invariant the s:
-      // Watch-card grammar already leans on server-side.
+      // EXPLICIT mainline, as an EXPLICIT param, even though "no
+      // baseline" already means mainline server-side (WP-25,
+      // docs/ONE_KIND_PLAN.md §1.3 deleted the client-side predecessor-
+      // build default that used to apply here).
+      // KEPT deliberately per that same decision: it costs nothing and
+      // makes the choice explicit rather than merely absent -- this is
+      // also the exact encoding that fixed the original "choosing
+      // mainline snaps back to the predecessor" bug the first RC
+      // reviewer hit, before the predecessor default existed to snap
+      // back to at all. Mainline's stream id is 1 by migration-9
+      // invariant (storage.MAINLINE_STREAM_ID; the row is seeded by the
+      // migration itself), the same invariant the s: Watch-card grammar
+      // already leans on server-side.
       url.searchParams.set("baseline", "1");
     } else {
       url.searchParams.set("baseline", String(chosen));
@@ -729,13 +661,13 @@ function renderCompareToControl(streamMeta, baselineMeta, streams) {
  * table) never executes, which is what keeps this feature's entire
  * footprint on a mainline page at zero.
  *
- * Baseline resolution (WP-22, docs/STREAMS_PLAN.md §4.1): an explicit
- * `?baseline=` wins outright. Otherwise, for a BUILD-kind stream only,
- * the product's stream list is fetched once and the previous build (if
- * any) becomes the baseline for this load — a second /api/compare
- * fetch, paid only by build-scoped pages, never by branch-scoped ones
- * (which keep the original single-fetch cost this function has had
- * since WP-21).
+ * Baseline resolution (WP-25, docs/ONE_KIND_PLAN.md §1.3, superseding
+ * WP-22's client-side predecessor-build default): an explicit
+ * `?baseline=` wins outright; otherwise the server's own default
+ * (mainline) stands — no second /api/compare fetch to guess at a
+ * "better" default. The product's stream list is still fetched once,
+ * for any non-mainline stream, because the Compare-to control (which
+ * IS how a predecessor gets chosen now) needs it.
  */
 export async function initDeltaView(streamId) {
   deltaState.streamId = streamId;
@@ -754,16 +686,8 @@ export async function initDeltaView(streamId) {
 
   let productStreams = [];
   try {
-    const explicitBaselineId = getSelectedBaselineId();
-    let data = await fetchCompare(streamId, null, 0, explicitBaselineId);
-    if (explicitBaselineId === null && data.stream.kind === "build") {
-      productStreams = await fetchProductStreams(data.stream.product);
-      const predecessor = pickDefaultBuildBaseline(
-        data.stream, productStreams);
-      if (predecessor !== null) {
-        data = await fetchCompare(streamId, null, 0, predecessor.id);
-      }
-    } else if (data.stream.kind === "build") {
+    const data = await fetchCompare(streamId, null, 0, getSelectedBaselineId());
+    if (data.stream.kind !== "mainline") {
       productStreams = await fetchProductStreams(data.stream.product);
     }
     deltaState.baselineId =
@@ -774,12 +698,6 @@ export async function initDeltaView(streamId) {
     renderTiles(document.getElementById("delta-tiles"), data.counts);
     renderBaselineCard(data.stream, data.baseline, data.counts, Date.now());
     renderTabs();
-    // F5: fire-and-forget, deliberately NOT awaited — its own fetch(es)
-    // must never hold up the section becoming visible on the next line.
-    // The .catch() here is a pure safety net (the function's own
-    // try/catch already turns a failed fetch into "stay hidden", never
-    // a throw) against any future change making that no longer true.
-    renderBuildVerdict(streamId, data, productStreams).catch(() => {});
     document.getElementById("delta-section").hidden = false;
     loading.hidden = true;
     await loadCategory(true);
