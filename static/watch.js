@@ -602,8 +602,21 @@ async function populatePicker() {
 
 function init() {
   const search = new URL(window.location.href).search;
+  // BUGFIX (ADDENDUM to the perf round): this used to branch on
+  // whether `search` was non-empty AT ALL, not on whether it actually
+  // carried a `c=` card -- so ANY other param arriving alongside it
+  // (a stray ?product=, adopted by products.js's adoptProductFromUrl()
+  // from a stale link, or set by the switcher that used to live on
+  // this page) took the `search` branch, found zero `c=` values, and
+  // silently discarded the saved default entirely: a shareable
+  // Watchlist with cards saved as "my default" would render EMPTY the
+  // moment a `?product=` param showed up next to it. Checking for `c`
+  // specifically is what "the URL is the whole configuration" (this
+  // file's own module docstring) actually requires -- a param this
+  // page does not speak is not part of that configuration.
+  const hasCards = new URLSearchParams(search).has("c");
   const saved = readDefault();
-  state.specs = search
+  state.specs = hasCards
     ? parseSpecs(search)
     : (saved ? parseSpecs("?" + saved) : []);
 

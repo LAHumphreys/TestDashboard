@@ -1410,6 +1410,81 @@ recorded here rather than left implicit:
     2026-08-09 in the addendum below this one), so carrying `stream=`
     into `actions.html` would imply a per-stream assignment view that
     does not exist and never has.
+- **ADDENDUM 2 (2026-08-09): the Watch page wrongly behaved
+  product-scoped.** §2.4 above never actually designed a switcher
+  ONTO this page as a deliberate choice — `watch.html` mounted
+  `#product-switcher` the same way every other page in the header did,
+  boilerplate from WP-20's original "every page gets the switcher"
+  rollout, and nobody had asked "does scoping the WHOLE page to one
+  product make sense here" — it does not: §0.9 already says a manager
+  composes cards ACROSS products, the URL is the whole configuration.
+  Two symptoms, reported live by the user, one shared root cause:
+
+  1. **The composer's stream list looked product-filtered.**
+     Investigated and LIVE-VERIFIED (node DOM-shim harness, two
+     products seeded, `localStorage` set to one of them) that this
+     symptom does **NOT actually reproduce** — `populatePicker()`
+     already fetches every known product's streams in parallel
+     (`[""].concat(productNames).map(...)`, `Promise.all`), labels each
+     `«product» · kind:name`, and `watch.js` has zero references to
+     `getSelectedProduct()` anywhere. Whatever the user saw, it was not
+     this function filtering by the global product — recorded here
+     rather than "fixed" so a future reader does not go looking for a
+     filter that was never there. `WatchHasNoProductSwitcherTest` pins
+     the composer stays this way going forward.
+  2. **Switching the global product wiped the composed dashboard —
+     genuinely real, but not in the switcher itself.** The FIRST-pass
+     investigation (this same session) tested the switcher's URL
+     rewrite in isolation and found it correctly preserves `c=` params
+     (`new URL(window.location.href)`-based, same pattern the streams
+     picker uses) — an advisor review caught the actual bug before this
+     shipped: `watch.js`'s `init()` decided whether to read `c=` from
+     the URL, or fall back to the saved default, by checking whether
+     `location.search` was non-empty AT ALL — not whether it had a `c=`
+     param specifically. So `watch.html?product=Atlas` (no `c=` at
+     all — exactly what the switcher's own navigation produces, or any
+     other stray param arriving from a stale link) took the "the URL
+     has cards" branch, found none, and silently discarded the saved
+     default: a shareable Watchlist saved as "my default" rendered
+     COMPLETELY EMPTY the moment an unrelated param showed up beside
+     it. Fixed: the branch now checks
+     `new URLSearchParams(search).has("c")` specifically. Live
+     reproduction BEFORE the fix (2 cards on a bare visit, 0 after
+     `?product=Atlas` was added with the identical saved default) and
+     confirmation AFTER (2 cards in both cases) both via the node
+     DOM-shim harness against the same scratch server, file changes
+     alone (no restart needed — static files are read fresh per
+     request).
+  - **Root fix, independent of the bug above and justified on its own
+    terms**: the `#product-switcher` mount is REMOVED from
+    `watch.html` entirely — the page is cross-product by definition, so
+    a control that scopes the WHOLE page to one product has no honest
+    job to do there, and its own navigation (however correctly it
+    preserves params) is still an action nobody visiting a cross-product
+    page should be offered. `<script src="products.js">` STAYS on the
+    page — kept for `adoptProductFromUrl()`'s site-wide "the URL wins"
+    behaviour (a `?product=` arriving via any other route, e.g. this
+    session's earlier "scope-self-sufficient card link" fix, should
+    still update the STANDING selection for whichever page the user
+    goes to NEXT, even though it does nothing to Watch itself) —
+    `products.js`'s own `init()` already guards a missing mount (the
+    WP-20 null-deref fix, verified rather than assumed:
+    `if (!container) { return; }` runs before `renderSwitcher()` is
+    ever called). `StreamPickerTest`-adjacent guard
+    (`test_it_is_mounted_only_where_it_can_do_something`) WIDENED to
+    drop `watch.html` from the pages asserting the mount, keeping the
+    `src="products.js"` assertion for it unchanged.
+  - **Live-verified, node DOM-shim harness against a scratch server**
+    (own port, own throwaway db, never the shared 8791 instance): the
+    saved-default wipe reproduced then fixed (above); the composer
+    listing both seeded products' streams/environments/products with
+    `localStorage` pinned to one of them; and — the mount genuinely
+    absent this time (not merely unregistered in the harness) —
+    `watch.js` and `products.js` both loading against real markup with
+    NO `#product-switcher` element anywhere in the DOM, no exception
+    thrown, the page's own card still rendering normally.
+  - **Not verified**: layout/legibility of the header without the
+    switcher at a real screen size — no browser has rendered it.
 
 ---
 

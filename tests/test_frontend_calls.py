@@ -1036,13 +1036,19 @@ class ProductSwitcherTest(unittest.TestCase):
         """§2.3 says the header gains the switcher, not every page —
         whatsnew.html/script.html/test.html show no scoped data, so
         mounting it there would be a new heavyweight request for a
-        control that changes nothing."""
+        control that changes nothing. watch.html WIDENED this test's
+        exception list rather than weakening it (CLAUDE.md) -- ADDENDUM
+        to the perf round: Watch is cross-product BY DEFINITION
+        (docs/STREAMS_PLAN.md §0.9), so a switcher that scopes the page
+        to ONE product is not "changes nothing", it is actively wrong;
+        see WatchHasNoProductSwitcherTest for the removal itself and
+        why products.js is still loaded there regardless."""
         for name in ("whatsnew.html", "script.html", "test.html"):
             self.assertNotIn(
                 'src="products.js"', read_text(name),
                 name + " should not load products.js")
         for name in ("index.html", "actions.html", "time.html",
-                     "timeline.html", "watch.html"):
+                     "timeline.html"):
             self.assertIn(
                 'src="products.js"', read_text(name),
                 name + " is missing the product switcher")
@@ -2772,6 +2778,83 @@ class WatchPageTest(unittest.TestCase):
         self.assertIn('id="empty-state"', html)
         code = _strip_comments(read("watch.js"))
         self.assertIn('getElementById("empty-state")', code)
+
+    def test_a_stray_param_no_longer_discards_the_saved_default(
+        self
+    ) -> None:
+        """ADDENDUM to the perf round: init() used to branch on whether
+        the URL had ANY query string at all, not on whether it had a
+        `c=` card -- so a bare ?product=Atlas (the switcher's own
+        navigation, or any stale link) took the "the URL has cards"
+        branch, found none, and silently discarded a saved default
+        entirely: a shareable Watchlist saved as "my default" rendered
+        EMPTY the moment an unrelated param showed up beside it. Live
+        reproduction and fix confirmed via the node DOM-shim harness --
+        see the commit message. This pins the source-level fix: the
+        branch condition must ask about `c` specifically, not `search`
+        as a whole."""
+        body = _function_body(read("watch.js"), "function init()")
+        self.assertIn('new URLSearchParams(search).has("c")', body)
+        self.assertNotIn("state.specs = search\n", body)
+
+
+class WatchHasNoProductSwitcherTest(unittest.TestCase):
+    """ADDENDUM to the perf round: the Watch page wrongly behaved
+    product-scoped. Watch is cross-product BY DEFINITION
+    (docs/STREAMS_PLAN.md §0.9 -- a manager composes cards across
+    products; the URL is the whole configuration), so a global product
+    switcher that scopes the WHOLE page to one product is not a
+    no-op there the way it is on a single-product install -- it is
+    actively wrong, and switching it used to navigate destructively
+    (see WatchPageTest.test_a_stray_param_no_longer_discards_the_saved_default
+    for the other half of that same bug)."""
+
+    def test_the_mount_is_gone(self) -> None:
+        html = read_text("watch.html")
+        self.assertNotIn('id="product-switcher"', html)
+
+    def test_products_js_is_still_loaded(self) -> None:
+        """Kept for adoptProductFromUrl()'s site-wide "the URL wins"
+        behaviour, and because products.js's own init() already guards
+        a missing mount (StreamsSwitcherTest-style null check) -- there
+        is nothing here that NEEDS removing the script tag too, and
+        removing it would be a bigger diff for no behavioural gain."""
+        self.assertIn('src="products.js"', read_text("watch.html"))
+
+    def test_products_js_survives_a_missing_mount_without_throwing(
+        self
+    ) -> None:
+        """The WP-20 null-deref fix this addendum leans on (products.js's
+        own init(), not a page-specific one): it must return before
+        calling renderSwitcher() with a null container."""
+        body = _function_body(read("products.js"), "async function init()")
+        guard_at = body.index("if (!container)")
+        return_at = body.index("return", guard_at)
+        render_at = body.index("renderSwitcher(")
+        self.assertLess(guard_at, return_at)
+        self.assertLess(return_at, render_at)
+
+    def test_watch_js_never_reads_the_global_product(self) -> None:
+        """The composer (populatePicker) and everything else on this
+        page must never filter by getSelectedProduct() -- every card
+        already carries its own scope, and the page is cross-product by
+        design. (Verified this was ALREADY true before this addendum,
+        live via the node DOM-shim harness with localStorage set to one
+        product and a second product's streams still offered -- see the
+        commit message; this pins it stays that way.)"""
+        self.assertNotIn("getSelectedProduct", read("watch.js"))
+
+    def test_the_composer_fetches_every_products_streams_in_parallel(
+        self
+    ) -> None:
+        """populatePicker()'s own claim, pinned: one /api/streams
+        request per known product (plus the implicit "" product), never
+        filtered to a single selected one."""
+        body = _function_body(
+            read("watch.js"), "async function populatePicker(")
+        self.assertIn('[""].concat(productNames)', body)
+        self.assertIn("Promise.all(", body)
+        self.assertIn('"/api/streams?product="', body)
 
 
 class WatchStalenessGrammarTest(unittest.TestCase):

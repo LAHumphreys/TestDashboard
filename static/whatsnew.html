@@ -261,6 +261,14 @@
           within 1d — last run 3 days ago" — when it's overdue. A card with
           no declared cadence behaves exactly as before; this is entirely
           optional per card.</li>
+        <li><strong>Watch is cross-product</strong> — pick any product's
+          builds and branches in one composed view, even if your browser's
+          Product switcher (on the other pages) is currently set to
+          something else. The switcher itself is gone from this page — it
+          never scoped anything here, every card already names its own
+          scope. <strong>Fixed:</strong> a Watchlist saved as "my default"
+          could render completely empty the moment an unrelated link
+          parameter showed up beside it; it now loads reliably every time.</li>
       </ul>
 
       <h3>Under the hood: products</h3>

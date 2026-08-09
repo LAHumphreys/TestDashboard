@@ -2278,3 +2278,73 @@ Suite, final tree after this entry: 1933 OK (skipped=1) SQLite-only;
 Not verified: layout/legibility of the picker on time.html/
 timeline.html's toolbar, and of the nav bar's rewritten links, at a
 real screen size -- no browser has rendered any of this.
+
+## 2026-08-09 -- addendum 2: the Watch page wrongly behaved product-scoped
+
+User-reported live. Watch is cross-product by definition (a manager
+composes cards across products in one view; the URL is the whole
+configuration, docs/STREAMS_PLAN.md Sec0.9) -- watch.html mounted the
+global product switcher the same way every other header-nav page did,
+boilerplate left over from WP-20's original rollout; nobody had asked
+whether scoping the WHOLE page to one product made sense there. It
+does not.
+
+Two reported symptoms, one investigation, one real bug found (not the
+one first suspected), plus a justified removal:
+
+- Symptom 1 (the composer looked product-filtered): INVESTIGATED, does
+  NOT reproduce. populatePicker() already fetches every known
+  product's streams in parallel ([""].concat(productNames), one
+  /api/streams request per product, Promise.all) and watch.js has zero
+  references to getSelectedProduct() anywhere. Verified live (node
+  DOM-shim harness, two products seeded, localStorage pinned to one)
+  before writing this down as correct rather than "fixed" -- a future
+  reader should not go looking for a filter that was never there. New
+  guard test (WatchHasNoProductSwitcherTest.
+  test_the_composer_fetches_every_products_streams_in_parallel /
+  test_watch_js_never_reads_the_global_product) pins it stays this
+  way.
+- Symptom 2 (switching the product wiped a saved default): REAL, but
+  not where first suspected. A first-pass investigation tested the
+  switcher's own URL rewrite in isolation and found it correctly
+  preserves c= params (same new URL(window.location.href) pattern the
+  streams.js picker uses) -- an advisor review caught the actual bug
+  before this shipped: watch.js's init() decided whether to read c=
+  from the URL, or fall back to the saved default, by checking whether
+  location.search was non-empty AT ALL, not whether it specifically
+  had a c= param. watch.html?product=Atlas (no c= at all -- exactly
+  what the switcher's own navigation produces, or any other stray
+  param arriving from a stale link) took the "the URL has cards"
+  branch, found none, and silently discarded the saved default: a
+  shareable Watchlist saved as "my default" rendered COMPLETELY EMPTY
+  the moment an unrelated param showed up beside it. Fixed with one
+  condition: new URLSearchParams(search).has("c"). Live-reproduced
+  BEFORE the fix (2 cards on a bare visit, 0 after ?product=Atlas was
+  added with the identical saved default) and confirmed AFTER (2 cards
+  in both cases), same scratch server, file changes alone -- no
+  restart needed, static files are read fresh per request.
+- The #product-switcher mount is REMOVED from watch.html entirely,
+  independent of the bug above and justified on its own terms: the
+  page has no honest job for a control that scopes the WHOLE page to
+  one product. <script src="products.js"> stays loaded, kept for
+  adoptProductFromUrl()'s site-wide "the URL wins" behaviour; its own
+  init() already guards a missing mount (the WP-20 null-deref fix,
+  verified live rather than assumed: watch.js and products.js both
+  loaded against markup with genuinely no #product-switcher element
+  anywhere in the DOM -- not merely unregistered in the test harness --
+  no exception thrown, the page's own card rendering normally).
+
+This is the second time in one session an advisor review caught a real
+bug a first-pass live verification missed by testing the SUSPECTED
+mechanism in isolation rather than the actual reported symptom
+end-to-end (the switcher's URL rewrite alone looked correct; the bug
+was in a DIFFERENT function's branch condition, only visible testing
+the full saved-default-plus-stray-param path). Worth remembering: a
+symptom description names what the USER saw, not necessarily which
+function is at fault.
+
+Suite, final tree after this entry: 1939 OK (skipped=1) SQLite-only;
+2579 OK (skipped=28) combined SQLite+MariaDB 10.3 dual-backend leg.
+
+Not verified: layout/legibility of the header without the switcher, at
+a real screen size -- no browser has rendered it.
