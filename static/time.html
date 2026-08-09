@@ -51,6 +51,12 @@
     <nav id="breadcrumb" class="breadcrumb" aria-label="Drill-down"></nav>
 
     <div class="filter-row" aria-label="Scope">
+      <!-- The Build picker (WP-21/WP-23 nav-scope addendum): same mount
+           point and same streams.js:renderPicker() as index.html --
+           hidden unless the current product has a branch/build stream.
+           Lets a branch/build be selected straight from this page,
+           without a round trip through the dashboard first. -->
+      <span id="stream-picker" class="stream-picker" hidden></span>
       <button id="stale-toggle" class="toggle" type="button" aria-pressed="false">
         Include tests that have not run recently
       </button>
@@ -83,6 +89,7 @@
 
   <script type="module" src="time.js"></script>
   <script type="module" src="products.js"></script>
+  <script type="module" src="streams.js"></script>
   <script type="module" src="nav.js"></script>
 </body>
 </html>

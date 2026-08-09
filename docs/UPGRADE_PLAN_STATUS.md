@@ -2226,3 +2226,55 @@ Not verified: production timing (dev-scale only, per CLAUDE.md); the
 coordinator's own 5-environment/127-row estate was not reproduced
 exactly. Backend-only change -- no frontend files touched, nothing new
 to render.
+
+## 2026-08-09 — addendum: the last two scope-entry gaps
+
+User-reported, live: "how do I select a build when on the Timeline
+view?" Two gaps, both frontend-only, no migration:
+
+1. The Build picker (`streams.js`) was mounted only on `index.html`.
+   `renderPicker()` was always page-agnostic (its own docstring already
+   said so); `time.html` and `timeline.html` gain the identical
+   `#stream-picker` mount and `streams.js` import. Verified LIVE (node
+   DOM-shim harness against a scratch server) that the picker's
+   `new URL(window.location.href)`-based rewrite preserves each page's
+   OTHER params -- `environment=` on timeline.html, `environment=`/
+   `script=` on time.html -- in both directions (picking a build, and
+   switching back to mainline). Widened (not weakened) the guard test
+   that used to pin "mounted only on the dashboard" to pin the new,
+   larger set of pages instead, and to keep pinning the pages that
+   still correctly do NOT get it.
+2. The nav bar itself dropped scope: every page's header links were
+   bare hrefs (`<a href="timeline.html">Timeline</a>`), so
+   Dashboard -> Timeline from a build-scoped page silently landed on
+   mainline -- the exact bug family the whole link-matrix audit sweep
+   fixed everywhere else, sitting in the one piece of markup every page
+   shares. New `nav.js:carryScopeIntoNav(nav, currentSearch)`: when the
+   CURRENT page's own URL carries `stream=`/`product=`/`environment=`,
+   those (and only those present) are appended to the nav's links
+   targeting `index.html`/`time.html`/`timeline.html` --
+   deliberately excluding `actions.html` (assignments stay
+   one-owner-per-test and estate-level, never stream-scoped -- decided
+   and recorded in docs/STREAMS_PLAN.md), `watch.html` (its own `c=`
+   URL grammar is untouched), and `whatsnew.html` (never scoped). Reads
+   the CURRENT URL directly, never `getSelectedProduct()`'s
+   localStorage -- the same "the URL is the whole configuration" rule
+   stream scoping already follows. Runs independently of the
+   What's-new date fetch, so a flaky `whatsnew.html` fetch cannot also
+   silently break the nav bar. Zero change on an unscoped page.
+
+Live-verified, node DOM-shim harness against a scratch server (own
+port, own throwaway db, never the shared 8791 instance), the exact
+walk asked for: a build-scoped dashboard's rewritten nav carries
+`stream=`/`environment=` into Dashboard/Time/Timeline while leaving
+Open actions/Watch/What's new untouched; following the rewritten
+Timeline link lands on that SAME branch's Timeline, its band and Build
+picker both showing it; a plain unscoped page load leaves every nav
+href byte-identical to the shipped markup.
+
+Suite, final tree after this entry: 1933 OK (skipped=1) SQLite-only;
+2573 OK (skipped=28) combined SQLite+MariaDB 10.3 dual-backend leg.
+
+Not verified: layout/legibility of the picker on time.html/
+timeline.html's toolbar, and of the nav bar's rewritten links, at a
+real screen size -- no browser has rendered any of this.

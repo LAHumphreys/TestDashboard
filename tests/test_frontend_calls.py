@@ -1259,19 +1259,29 @@ class StreamPickerTest(unittest.TestCase):
     def test_no_innerHTML(self) -> None:
         self.assertNotIn("innerHTML", read("streams.js"))
 
-    def test_it_is_mounted_only_on_the_dashboard(self) -> None:
-        """This drop's Build picker lives in index.html's toolbar only —
-        docs/STREAMS_PLAN.md §3.6 says "Toolbar gains the Build picker",
-        not every page. A page carrying no #stream-picker mount is
-        simply never touched by streams.js's init()."""
-        self.assertIn('src="streams.js"', read_text("index.html"))
-        self.assertIn('id="stream-picker"', read_text("index.html"))
-        for name in ("actions.html", "time.html", "timeline.html",
-                     "watch.html", "test.html", "script.html",
-                     "whatsnew.html"):
+    def test_it_is_mounted_on_every_stream_aware_page(self) -> None:
+        """WIDENED (ADDENDUM to the perf round; was
+        "mounted only on the dashboard", CLAUDE.md: widen a guard test's
+        scope, never weaken its assertion, and say so — this is that).
+        Originally the Build picker lived in index.html's toolbar only
+        (docs/STREAMS_PLAN.md §3.6's original "Toolbar gains the Build
+        picker"); it now also lives on time.html and timeline.html —
+        the same pages nav.js's carryScopeIntoNav() targets, and the
+        two pages that could already be ASKED for a stream on the wire
+        (F7) but had no way to get there directly. A page carrying no
+        #stream-picker mount is simply never touched by streams.js's
+        init(); actions.html/watch.html/test.html/script.html/
+        whatsnew.html are still correctly excluded — see
+        NavScopeCarriageTest's STREAM_AWARE_HREFS pin for the same
+        three-page list, kept in agreement by this test."""
+        for name in ("index.html", "time.html", "timeline.html"):
+            self.assertIn('src="streams.js"', read_text(name), name)
+            self.assertIn('id="stream-picker"', read_text(name), name)
+        for name in ("actions.html", "watch.html", "test.html",
+                     "script.html", "whatsnew.html"):
             self.assertNotIn(
                 'src="streams.js"', read_text(name),
-                name + " should not load streams.js in this drop")
+                name + " should not load streams.js")
 
 
 class DeltaViewTest(unittest.TestCase):
@@ -1566,6 +1576,107 @@ class ScopeCarriageLinkMatrixTest(unittest.TestCase):
         self.assertLess(
             stream_at, body.rindex('"test.html?"'),
             "the stream param must be appended BEFORE the href is built")
+
+
+class TimelineTimePickerParityTest(unittest.TestCase):
+    """ADDENDUM to the perf round: the Build picker was mounted only on
+    index.html -- time.html and timeline.html could already be ASKED
+    for a stream on the wire (state.streamId, F7) but had no way to
+    GET there except a link from a branch's own dashboard. streams.js's
+    renderPicker() is page-agnostic (its own docstring says so); this
+    is just the missing mount points."""
+
+    def test_time_html_mounts_the_picker_and_loads_streams_js(
+        self
+    ) -> None:
+        html = read_text("time.html")
+        mount_at = html.index('id="stream-picker"')
+        self.assertIn("hidden", html[mount_at:mount_at + 60])
+        self.assertIn('src="streams.js"', html)
+
+    def test_timeline_html_mounts_the_picker_and_loads_streams_js(
+        self
+    ) -> None:
+        html = read_text("timeline.html")
+        mount_at = html.index('id="stream-picker"')
+        self.assertIn("hidden", html[mount_at:mount_at + 60])
+        self.assertIn('src="streams.js"', html)
+
+    def test_neither_mount_duplicates_the_id(self) -> None:
+        for page in ("time.html", "timeline.html"):
+            html = read_text(page)
+            self.assertEqual(
+                html.count('id="stream-picker"'), 1,
+                "{} has {} stream-picker mounts".format(
+                    page, html.count('id="stream-picker"')),
+            )
+
+
+class NavScopeCarriageTest(unittest.TestCase):
+    """ADDENDUM to the perf round: nav.js's header links were bare
+    hrefs, so Dashboard -> Timeline (or any of the three stream-aware
+    pages) from a scoped page silently landed on mainline -- the same
+    family of bug as ScopeCarriageLinkMatrixTest above, in the nav bar
+    itself this time. carryScopeIntoNav() is the pure function that
+    does the rewrite; live behaviour (a real walk through the rewritten
+    link) was also driven against a scratch server this round -- see
+    the commit message."""
+
+    def test_only_carries_when_the_url_actually_has_a_scoping_param(
+        self
+    ) -> None:
+        body = _function_body(
+            read("nav.js"), "export function carryScopeIntoNav(")
+        self.assertIn("params.has(name)", body)
+        self.assertIn("carry.length === 0", body)
+
+    def test_the_carried_param_list_is_exactly_the_scoping_family(
+        self
+    ) -> None:
+        code = _strip_comments(read("nav.js"))
+        self.assertIn(
+            'const CARRIED_PARAMS = ["stream", "product", "environment"];',
+            code,
+        )
+
+    def test_only_index_time_and_timeline_are_targets(self) -> None:
+        """Pins the array to EXACTLY these three -- not "contains", so
+        a future edit that adds actions.html/watch.html/whatsnew.html
+        (sending a param to a page that would misread it) has to touch
+        this test, not slip through unnoticed."""
+        code = _strip_comments(read("nav.js"))
+        self.assertIn(
+            'const STREAM_AWARE_HREFS = '
+            '["index.html", "time.html", "timeline.html"];',
+            code,
+        )
+
+    def test_non_matching_links_are_left_alone(self) -> None:
+        body = _function_body(
+            read("nav.js"), "export function carryScopeIntoNav(")
+        self.assertIn("STREAM_AWARE_HREFS.indexOf(href) === -1", body)
+        self.assertIn("continue", body)
+
+    def test_init_calls_it_independently_of_the_whatsnew_fetch(
+        self
+    ) -> None:
+        """The scope-carriage rewrite must not be gated behind the
+        What's new date fetch succeeding -- a network hiccup fetching
+        whatsnew.html must not also silently break the nav bar."""
+        body = _strip_comments(_function_body(
+            read("nav.js"), "async function init("))
+        call_at = body.index("carryScopeIntoNav(")
+        fetch_at = body.index('fetch("whatsnew.html"')
+        self.assertLess(
+            call_at, fetch_at,
+            "carryScopeIntoNav must run before the whatsnew fetch, not "
+            "depend on it succeeding")
+
+    def test_no_innerHTML(self) -> None:
+        # _strip_comments first: nav.js's own docstring literally
+        # explains "no innerHTML anywhere near it" in prose, which a
+        # naive check would flag as a false positive.
+        self.assertNotIn("innerHTML", _strip_comments(read("nav.js")))
 
 
 class BuildBaselineWordingTest(unittest.TestCase):

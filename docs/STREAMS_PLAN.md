@@ -1352,6 +1352,64 @@ recorded here rather than left implicit:
     only, per CLAUDE.md); the coordinator's own 5-environment/127-row
     estate was not reproduced exactly, so the absolute ms figures above
     are this session's own dev-scale numbers, not a replication of theirs.
+- **ADDENDUM to the PERF ROUND (2026-08-09): "how do I select a build
+  when on the Timeline view?" — the last two scope-entry gaps.**
+  1. **The Build picker was mounted only on `index.html`.** Its own
+     `renderPicker()` was always page-agnostic (its docstring already
+     said so); `time.html` and `timeline.html` gain the identical
+     `#stream-picker` mount and `streams.js` import — same
+     hidden-when-no-streams rule, same behaviour. Verified LIVE (not
+     assumed) that the picker's `new URL(window.location.href)`-based
+     rewrite preserves each page's OTHER params: `environment=` on
+     timeline.html, `environment=`/`script=` on time.html, in both
+     directions (picking a build, and switching back to mainline).
+     `StreamPickerTest.test_it_is_mounted_only_on_the_dashboard`
+     WIDENED (CLAUDE.md: widen, never weaken) to
+     `test_it_is_mounted_on_every_stream_aware_page` — pins all THREE
+     pages now carry it, and the same five that must not
+     (actions/watch/test/script/whatsnew) still don't.
+  2. **The nav bar itself dropped scope** — `nav.js`'s header links
+     were bare hrefs (`<a href="timeline.html">Timeline</a>`), so
+     Dashboard → Timeline from a build-scoped page silently landed on
+     mainline: the exact bug family the whole link-matrix audit sweep
+     fixed everywhere else, sitting in the one piece of markup every
+     page shares. New `nav.js:carryScopeIntoNav(nav, currentSearch)`:
+     when the CURRENT page's own URL carries `stream=`/`product=`/
+     `environment=`, those (and only those present) are appended to
+     the nav's links targeting `index.html`/`time.html`/
+     `timeline.html` — `STREAM_AWARE_HREFS`, deliberately excluding
+     `actions.html` (assignments stay one-owner-per-test, estate-level,
+     never stream-scoped — see the decision entry below), `watch.html`
+     (its own `c=` URL grammar is untouched — appending a global scope
+     there would be a lie on top of a different lie), and
+     `whatsnew.html` (never scoped). Reads from the URL directly, never
+     from `getSelectedProduct()`'s localStorage — matching stream's own
+     "the URL is the whole configuration" rule (§0.9), extended here:
+     a page's OWN address bar is what travels, not a standing
+     preference the address bar happens not to mention. Runs
+     independently of the What's-new date fetch (a pure sibling-DOM
+     rewrite via `#nav-whatsnew`'s own parent, chosen over
+     `.site-nav a` so it needs no CSS selector support the DOM-shim
+     harness would otherwise have to grow), so a flaky `whatsnew.html`
+     fetch cannot also silently break the nav bar. Zero visible change
+     on an unscoped page — nothing is even re-set to its own value.
+  - **Live-verified**, node DOM-shim harness against a scratch server
+    (own port, own throwaway db, never the shared 8791 instance),
+    exactly the walk the ask named: a build-scoped `index.html`'s
+    rewritten nav — `Dashboard`/`Time`/`Timeline` all carrying
+    `stream=`/`environment=`, `Open actions`/`Watch`/`What's new` all
+    untouched — then FOLLOWING the rewritten Timeline link and
+    confirming the destination page arrives build-scoped: the branch
+    band naming the same branch, and the Build picker pre-selecting
+    that same branch. A second scratch page confirmed a plain unscoped
+    load leaves every nav href byte-identical to the shipped markup.
+  - **Decision, recorded explicitly since it will look like an
+    oversight otherwise**: Open Actions stays estate-level, not
+    stream-scoped, by design — an assignment is one owner per triple
+    regardless of which stream it was made from (§0.4, reconfirmed
+    2026-08-09 in the addendum below this one), so carrying `stream=`
+    into `actions.html` would imply a per-stream assignment view that
+    does not exist and never has.
 
 ---
 

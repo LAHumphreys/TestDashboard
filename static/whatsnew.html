@@ -192,11 +192,16 @@
           has, and a line under the tabs says exactly why in plain
           words — "this branch has completed 8 passes in the last 14
           days" or similar, never a silent guess.</li>
-        <li>The Time and Timeline pages can now be scoped to a branch too
-          (via the same picker, from a branch's own dashboard) — so "where
-          did the suite's time go last night" and "what order did scripts
-          run in" both work for a branch's own nightly run, not only for
-          mainline.</li>
+        <li>The Time and Timeline pages can now be scoped to a branch too —
+          so "where did the suite's time go last night" and "what order did
+          scripts run in" both work for a branch's own nightly run, not only
+          for mainline. <strong>The Build picker now lives on both pages
+          directly</strong> (it used to only be reachable from the
+          dashboard) — pick a branch or build right there, no detour
+          required. And the <strong>Dashboard / Time / Timeline</strong>
+          links in the header now keep whichever branch, build, or
+          environment you're currently looking at as you move between
+          them, instead of quietly dropping you back to mainline.</li>
         <li><strong>Suite history works for branches now too</strong> — the
           last page that didn't. Open a suite's execution history from a
           branch (its own test list, a Timeline row, or a test's own page)
