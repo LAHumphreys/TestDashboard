@@ -41,6 +41,7 @@ import {
   showError,
 } from "./api.js";
 import { reopenIfOpen, toggleReview } from "./review.js";
+import { apiUrl, pageUrl, withBaseline, withStream } from "./urls.js";
 
 /** The five paginable comparison categories, in tab/tile display order. */
 export const CATEGORY_ORDER = [
@@ -147,17 +148,16 @@ export function ageText(iso, nowMs) {
  * before this drop keeps working unchanged.
  */
 export async function fetchCompare(streamId, category, offset, baselineId) {
-  const qs = new URLSearchParams();
-  qs.append("stream", String(streamId));
-  if (baselineId !== null && baselineId !== undefined) {
-    qs.append("baseline", String(baselineId));
-  }
+  const params = {};
   if (category) {
-    qs.append("category", category);
-    qs.append("limit", String(PAGE_LIMIT));
-    qs.append("offset", String(offset || 0));
+    params.category = category;
+    params.limit = PAGE_LIMIT;
+    params.offset = offset || 0;
   }
-  return fetchJson("/api/compare?" + qs.toString());
+  return fetchJson(apiUrl("/api/compare", params, {
+    stream: streamId,
+    baseline: baselineId === undefined ? null : baselineId,
+  }));
 }
 
 /** Every test compared, including the ones that agree — counts.agree is
@@ -248,20 +248,20 @@ function buildDeltaRow(row) {
   const tr = document.createElement("tr");
   const testCell = el("td", "wrap");
   const link = document.createElement("a");
-  const params = new URLSearchParams();
-  params.append("environment", row.environment);
-  params.append("script", row.script);
-  params.append("test_name", row.test_name);
   // Carry the page's stream scope into the link: the whole point of
   // clicking a delta row is reading THIS branch's history/output of the
   // test, and test.html only shows that when ?stream= arrives with it.
   // Without this line the stream-scoped test page is unreachable by
   // clicking — found by the first human to use the branch dashboard.
+  // pageUrl()'s default scope carriage supplies `stream` (this page's
+  // own — the same value getSelectedStreamId() reads); `product` and
+  // `baseline` are explicitly nulled because this link never carried
+  // either (test.html has no product concept, and a baseline belongs to
+  // the scope it was chosen in, not to a linked-to test page).
   const streamId = getSelectedStreamId();
-  if (streamId !== null) {
-    params.append("stream", String(streamId));
-  }
-  link.href = "test.html?" + params.toString();
+  link.href = pageUrl("test", {
+    environment: row.environment, script: row.script, test_name: row.test_name,
+  }, { product: null, baseline: null });
   link.textContent = row.test_name;
   testCell.appendChild(link);
   testCell.appendChild(el("span", "row-sub",
@@ -620,9 +620,12 @@ export function renderBranchBand(streamMeta, baselineMeta) {
   const baseline = baselineMeta ? streamLabel(baselineMeta) : "mainline";
   textEl.textContent = "Viewing " + streamMeta.kind + " " + streamMeta.name
     + " — compared against " + baseline + ".";
-  const url = new URL(window.location.href);
-  url.searchParams.delete("stream");
-  backLink.href = url.pathname + url.search;
+  // withStream(null) (WP-24, urls.js): this URL with ONLY `stream`
+  // removed (and, per the scope hierarchy, the `baseline` it contains)
+  // — never a fixed page like index.html, which would silently drop
+  // test.html's environment/script/test_name and land on the wrong
+  // page entirely.
+  backLink.href = withStream(null);
   container.hidden = false;
 }
 
@@ -680,7 +683,7 @@ const MAINLINE_SECTIONS = [
 async function fetchProductStreams(product) {
   try {
     const data = await fetchJson(
-      "/api/streams?product=" + encodeURIComponent(product));
+      apiUrl("/api/streams", {}, { product: product }));
     return data.streams || [];
   } catch (err) {
     return [];
@@ -750,26 +753,22 @@ function renderCompareToControl(streamMeta, baselineMeta, streams) {
     if (chosen === undefined) {
       return;   // not a recognised option -- leave the view as it is
     }
-    const url = new URL(window.location.href);
-    if (chosen === null) {
-      // EXPLICIT mainline, as an EXPLICIT param, even though "no
-      // baseline" already means mainline server-side (WP-25,
-      // docs/ONE_KIND_PLAN.md §1.3 deleted the client-side predecessor-
-      // build default that used to apply here).
-      // KEPT deliberately per that same decision: it costs nothing and
-      // makes the choice explicit rather than merely absent -- this is
-      // also the exact encoding that fixed the original "choosing
-      // mainline snaps back to the predecessor" bug the first RC
-      // reviewer hit, before the predecessor default existed to snap
-      // back to at all. Mainline's stream id is 1 by migration-9
-      // invariant (storage.MAINLINE_STREAM_ID; the row is seeded by the
-      // migration itself), the same invariant the s: Watch-card grammar
-      // already leans on server-side.
-      url.searchParams.set("baseline", "1");
-    } else {
-      url.searchParams.set("baseline", String(chosen));
-    }
-    window.location.href = url.toString();
+    // EXPLICIT mainline, as an EXPLICIT param, even though "no
+    // baseline" already means mainline server-side (WP-25,
+    // docs/ONE_KIND_PLAN.md §1.3 deleted the client-side predecessor-
+    // build default that used to apply here).
+    // KEPT deliberately per that same decision: it costs nothing and
+    // makes the choice explicit rather than merely absent -- this is
+    // also the exact encoding that fixed the original "choosing
+    // mainline snaps back to the predecessor" bug the first RC
+    // reviewer hit, before the predecessor default existed to snap
+    // back to at all. Mainline's stream id is 1 by migration-9
+    // invariant (storage.MAINLINE_STREAM_ID; the row is seeded by the
+    // migration itself), the same invariant the s: Watch-card grammar
+    // already leans on server-side. withBaseline("mainline") (WP-24,
+    // urls.js) is the one path allowed to write that explicit "1".
+    window.location.href = chosen === null
+      ? withBaseline("mainline") : withBaseline(chosen);
   };
   field.hidden = false;
 }

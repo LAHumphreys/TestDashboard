@@ -33,6 +33,7 @@
 "use strict";
 
 import { clearNode, el, fetchJson } from "./api.js";
+import { withProduct } from "./urls.js";
 
 /** localStorage key holding the selected product ("" = All products). */
 const PRODUCT_KEY = "testboard.product";
@@ -149,23 +150,16 @@ export function renderSwitcher(container, products) {
     // to whatever the URL said, discarding the choice just made. "The
     // URL wins" only holds together if changing the switcher also
     // rewrites the URL, not just localStorage.
-    const url = new URL(window.location.href);
-    if (select.value) {
-      url.searchParams.set("product", select.value);
-    } else {
-      url.searchParams.delete("product");
-    }
-    // Changing a scope resets every narrower scope beneath it: a
-    // stream (and its baseline) and an environment filter all belong
-    // to the product they were chosen under. Carrying them across a
-    // product switch is either contradictory (another product's stream
-    // id, an out-of-product environment whose allow-list match is
-    // guaranteed empty) or at best never-chosen — the same
-    // stale-scope family as the Build picker's baseline carry-over.
-    url.searchParams.delete("stream");
-    url.searchParams.delete("baseline");
-    url.searchParams.delete("environment");
-    window.location.href = url.toString();
+    //
+    // withProduct() (WP-24, urls.js) resets stream/baseline/environment
+    // per the scope hierarchy — a stream (and its baseline) and an
+    // environment filter all belong to the product they were chosen
+    // under. Carrying them across a product switch is either
+    // contradictory (another product's stream id, an out-of-product
+    // environment whose allow-list match is guaranteed empty) or at
+    // best never-chosen — the same stale-scope family as the Build
+    // picker's baseline carry-over.
+    window.location.href = withProduct(select.value);
   });
   label.appendChild(select);
   container.appendChild(label);

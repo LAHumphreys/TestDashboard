@@ -26,6 +26,7 @@
 
 import { getSelectedProduct } from "./products.js";
 import { clearNode, el, fetchJson } from "./api.js";
+import { apiUrl, currentScope, withStream } from "./urls.js";
 
 /** Newest first by `last_seen` — WP-22's ordering rule for builds
  * (docs/STREAMS_PLAN.md §4.1). ISO strings, so lexical compare is
@@ -116,19 +117,14 @@ export function renderPicker(container, streams, selectedId) {
       return;   // not a recognised option -- leave the page as it is
     }
     delete input.dataset.restore;   // a real choice; nothing to restore
-    const url = new URL(window.location.href);
-    if (target) {
-      url.searchParams.set("stream", target);
-    } else {
-      url.searchParams.delete("stream");
-    }
-    // A baseline belongs to the scope it was chosen in: carrying an
-    // RC's explicit baseline into a branch (a legal but never-chosen
-    // comparison) or into mainline (a dangling param) is the stale-
-    // scope cousin of the choosing-mainline sentinel bug. Changing
-    // stream resets it; the new scope re-derives its own default.
-    url.searchParams.delete("baseline");
-    window.location.href = url.toString();
+    // withStream() (WP-24, urls.js) resets `baseline` per the scope
+    // hierarchy: a baseline belongs to the scope it was chosen in --
+    // carrying an RC's explicit baseline into a branch (a legal but
+    // never-chosen comparison) or into mainline (a dangling param) is
+    // the stale-scope cousin of the choosing-mainline sentinel bug.
+    // Changing stream resets it; the new scope re-derives its own
+    // default.
+    window.location.href = withStream(target || null);
   });
 
   label.appendChild(input);
@@ -142,12 +138,10 @@ async function init() {
     return;   // this page carries no Build picker mount point
   }
   try {
-    const product = getSelectedProduct();
     const data = await fetchJson(
-      "/api/streams?product=" + encodeURIComponent(product));
-    const rawStream = new URLSearchParams(window.location.search)
-      .get("stream");
-    const selectedId = rawStream ? parseInt(rawStream, 10) : null;
+      apiUrl("/api/streams", {}, { product: getSelectedProduct() }));
+    const selectedId = currentScope().stream
+      ? parseInt(currentScope().stream, 10) : null;
     renderPicker(container, data.streams || [], selectedId);
   } catch (err) {
     /* Decoration: a failed fetch leaves the page exactly as it shipped. */

@@ -1172,16 +1172,27 @@ class ProductSwitcherTest(unittest.TestCase):
         fresh switcher pick right back to the URL's product on the very
         next load, if the change handler only called
         window.location.reload() -- the same URL, product param and
-        all. The switcher must rewrite `product` in the URL itself."""
+        all. The switcher must rewrite `product` in the URL itself.
+
+        WP-24: the hand-rolled `url.searchParams.set/delete` triple
+        (product, then the stream/baseline/environment reset) moved
+        into urls.js's withProduct(), which every scope-mutation
+        helper's caller now goes through — same assertion intent
+        (rewrites the URL itself, never a bare reload), now checking
+        the withProduct() call site rather than the inline
+        searchParams mechanics that no longer exist here."""
         body = _function_body(
             _strip_comments(read("products.js")),
             "export function renderSwitcher(")
         change_at = body.index('addEventListener("change"')
         handler = body[change_at:]
         self.assertNotIn("location.reload()", handler)
-        self.assertIn('url.searchParams.set("product", select.value)',
+        self.assertIn("withProduct(select.value)", handler)
+        self.assertIn("window.location.href = withProduct(select.value)",
                        handler)
-        self.assertIn('url.searchParams.delete("product")', handler)
+        self.assertIn(
+            "withProduct", _imported_names(read("products.js")),
+            "products.js calls withProduct() without importing it")
 
     def test_the_stale_selection_clamp_runs_even_below_two_products(
         self
@@ -1356,10 +1367,21 @@ class StreamPickerTest(unittest.TestCase):
     def test_selection_lives_in_the_url_not_local_storage(self) -> None:
         """Unlike the product switcher, a branch is something you are
         looking AT, not a standing preference — docs/STREAMS_PLAN.md
-        §0.9's "the URL is the whole configuration" rule."""
+        §0.9's "the URL is the whole configuration" rule.
+
+        WP-24: streams.js no longer touches `searchParams` directly —
+        selection reading/writing goes through urls.js's
+        currentScope()/withStream(), which is itself pinned to
+        location.search only (UrlsModuleTest). Same assertion intent
+        (URL, never localStorage), now checking that streams.js
+        actually imports the URL-reading/writing helpers rather than
+        keeping its own copy."""
         code = _strip_comments(read("streams.js"))
         self.assertNotIn("localStorage", code)
-        self.assertIn("searchParams", code)
+        for name in ("currentScope", "withStream"):
+            self.assertIn(
+                name, _imported_names(read("streams.js")),
+                "streams.js uses " + name + " without importing it")
 
     def test_it_fails_quietly_like_products_js(self) -> None:
         code = _strip_comments(read("streams.js"))
@@ -1535,14 +1557,23 @@ class DeltaViewTest(unittest.TestCase):
         the MAINLINE view of a test they opened FROM a branch, which
         reads as "the branch has no detail pages". Found by the first
         human to use the branch dashboard, 2026-08-08 — the DOM-shim
-        checks rendered rows, not where their links lead."""
+        checks rendered rows, not where their links lead.
+
+        WP-24: the hand-rolled params/href pair became one pageUrl()
+        call, whose DEFAULT scope carriage is what now supplies
+        `stream` (this page's own — read the same way
+        getSelectedStreamId() already does). Same assertion intent
+        (the link is built off this page's own selected stream, via
+        pageUrl -- not a hand-rolled "test.html?" concatenation
+        anywhere in this file, which the enforcement test polices
+        globally), now checking the pageUrl() call site."""
         body = _function_body(read("compare.js"), "function buildDeltaRow(")
         self.assertIn("getSelectedStreamId()", body)
         stream_at = body.index("getSelectedStreamId()")
-        self.assertIn('params.append("stream"', body[stream_at:])
-        self.assertLess(stream_at, body.index('"test.html?"'),
-                        "the stream param must be appended BEFORE the "
-                        "href is built from params")
+        self.assertIn('link.href = pageUrl("test"', body[stream_at:])
+        self.assertIn(
+            "pageUrl", _imported_names(read("compare.js")),
+            "compare.js calls pageUrl() without importing it")
 
     def test_review_entry_carries_the_streams_id_for_f2(self) -> None:
         """F2 (docs/STREAMS_PLAN.md §5.2 "as built"): review.js's shared
@@ -1913,15 +1944,29 @@ class CompareToControlTest(unittest.TestCase):
         sentinel bug (2026-08-09): the Build picker carried an RC's
         baseline into branches/mainline, and the product switcher
         carried another product's stream/baseline/environment — either
-        contradictory or never-chosen."""
+        contradictory or never-chosen.
+
+        WP-24: the resets themselves are no longer hand-rolled
+        `searchParams.delete(...)` calls in each of the two controls —
+        they are urls.js's resolveScope() hierarchy rule (product
+        resets stream/baseline/environment; stream resets baseline),
+        exercised through withStream()/withProduct(). Same assertion
+        intent (a scope change resets what it contains), now checking
+        that both controls actually call the shared helper rather than
+        keeping their own copy of the reset logic — and UrlsModuleTest
+        pins the reset logic itself directly."""
         picker = _function_body(
             read("streams.js"), "export function renderPicker(")
-        self.assertIn('searchParams.delete("baseline")', picker)
-        switcher_src = read("products.js")
-        for param in ("stream", "baseline", "environment"):
-            self.assertIn(
-                'searchParams.delete("{0}")'.format(param), switcher_src,
-                "product switcher must reset " + param)
+        self.assertIn("withStream(target || null)", picker)
+        self.assertIn(
+            "withStream", _imported_names(read("streams.js")),
+            "streams.js calls withStream() without importing it")
+        switcher_body = _function_body(
+            read("products.js"), "export function renderSwitcher(")
+        self.assertIn("withProduct(select.value)", switcher_body)
+        self.assertIn(
+            "withProduct", _imported_names(read("products.js")),
+            "products.js calls withProduct() without importing it")
 
     def test_choosing_mainline_sets_an_explicit_baseline_param(self) -> None:
         """Choosing "Mainline nightlies" must write baseline=1, never
@@ -1930,11 +1975,20 @@ class CompareToControlTest(unittest.TestCase):
         choice is indistinguishable from no choice and snaps back to
         the predecessor — reported live by the first person to switch
         an RC's comparison back to mainline (2026-08-09). Mainline's
-        stream id is 1 by migration-9 invariant (MAINLINE_STREAM_ID)."""
+        stream id is 1 by migration-9 invariant (MAINLINE_STREAM_ID).
+
+        WP-24: this encoding is now urls.js's withBaseline("mainline"),
+        the ONE call site allowed to write the explicit "1"
+        (UrlsModuleTest pins the "1" encoding itself). Same assertion
+        intent, now checking the call site rather than the inline
+        searchParams.set that no longer exists here."""
         body = _function_body(
             read("compare.js"), "function renderCompareToControl(")
-        self.assertIn('url.searchParams.set("baseline", "1")', body)
+        self.assertIn('withBaseline("mainline")', body)
         self.assertNotIn('searchParams.delete("baseline")', body)
+        self.assertIn(
+            "withBaseline", _imported_names(read("compare.js")),
+            "compare.js calls withBaseline() without importing it")
 
     def test_the_baseline_param_lives_only_in_the_url(self) -> None:
         body = _function_body(
@@ -2060,11 +2114,18 @@ class TestPageBranchBandTest(unittest.TestCase):
         """"Back to mainline" must preserve whatever else the page
         needs (environment/script/test_name on test.html) — a fixed
         target like index.html would land test.html's reader on the
-        wrong page entirely."""
+        wrong page entirely.
+
+        WP-24: this is now withStream(null) (urls.js) — same intent
+        (this URL, with stream cleared, everything else untouched),
+        pinned in UrlsModuleTest for the general mechanism and here
+        for the call site."""
         body = _function_body(
             read("compare.js"), "export function renderBranchBand(")
-        self.assertIn('searchParams.delete("stream")', body)
-        self.assertIn("backLink.href", body)
+        self.assertIn("backLink.href = withStream(null)", body)
+        self.assertIn(
+            "withStream", _imported_names(read("compare.js")),
+            "compare.js calls withStream() without importing it")
 
 
 class SuiteLinkParityTest(unittest.TestCase):
