@@ -127,6 +127,17 @@ async function buildReviewPanel(entry, container, opts) {
   params.append("environment", entry.environment);
   params.append("script", entry.script);
   params.append("test_name", entry.test_name);
+  // F2 (docs/STREAMS_PLAN.md §3.6/§0.9): a row read from a branch's own
+  // dashboard tab (app.js's tagStream() stamps entry.stream_id on
+  // exactly those rows — undefined/absent everywhere else, including
+  // every Open Actions row, since that is a DIFFERENT concept there,
+  // assignment_stream_id) must open BOTH links on that stream, not
+  // mainline — "View in timeline" from a branch delta row used to
+  // deep-link to the mainline timeline, where that run does not exist
+  // at all (needs F7: timeline.js could not read `stream=` before it).
+  if (entry.stream_id) {
+    params.append("stream", String(entry.stream_id));
+  }
   const full = document.createElement("a");
   full.href = "test.html?" + params.toString();
   full.textContent = "Open full test page →";
@@ -139,6 +150,9 @@ async function buildReviewPanel(entry, container, opts) {
   timelineParams.append("script", entry.script);
   timelineParams.append("test", entry.test_name);
   timelineParams.append("at", entry.start_time);
+  if (entry.stream_id) {
+    timelineParams.append("stream", String(entry.stream_id));
+  }
   const inTimeline = document.createElement("a");
   inTimeline.href = "timeline.html?" + timelineParams.toString();
   inTimeline.textContent = "View in timeline →";

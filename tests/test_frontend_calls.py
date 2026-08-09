@@ -272,6 +272,35 @@ class ReviewPanelTest(unittest.TestCase):
                 "review.js must not reach into a page's state; pass it "
                 "in through options instead (found " + forbidden + ")")
 
+    def test_both_review_links_carry_the_entrys_stream_when_set(
+        self
+    ) -> None:
+        """F2: "View in timeline" (and the same bug found right beside
+        it, "Open full test page") must not deep-link a branch row's
+        run into MAINLINE's timeline/test page, where it does not
+        exist. entry.stream_id is stamped two ways: app.js's
+        tagStream() on rows read from a branch's own dashboard tab, and
+        compare.js's reviewEntry() on every delta-table row (the case
+        the bug report actually named — see
+        DeltaViewTest.test_review_entry_carries_the_streams_id_for_f2).
+        It is undefined everywhere else (a mainline row, or any Open
+        Actions row, where the similarly-named assignment_stream_id is
+        a DIFFERENT concept), so this must be a truthy check, not a
+        `!== null` one."""
+        body = _strip_comments(
+            _function_body(read("review.js"),
+                           "async function buildReviewPanel("))
+        self.assertEqual(body.count("if (entry.stream_id)"), 2, body)
+        self.assertIn('params.append("stream", String(entry.stream_id))',
+                       body)
+        self.assertIn(
+            'timelineParams.append("stream", String(entry.stream_id))',
+            body)
+        # Never a `!== null` check: undefined (the common case, every
+        # row that never touched a branch's own dashboard tab) must
+        # also skip appending the param.
+        self.assertNotIn("entry.stream_id !== null", body)
+
     def test_the_comment_stripper_does_not_hide_real_code(self) -> None:
         """The scan above runs on stripped source, so prove the stripper
         removes prose and keeps code — otherwise it could hide the very
@@ -1395,6 +1424,22 @@ class DeltaViewTest(unittest.TestCase):
                         "the stream param must be appended BEFORE the "
                         "href is built from params")
 
+    def test_review_entry_carries_the_streams_id_for_f2(self) -> None:
+        """F2 (docs/STREAMS_PLAN.md §5.2 "as built"): review.js's shared
+        panel appends stream= to its links whenever entry.stream_id is
+        truthy. That check is generic -- it also has to be satisfied by
+        a DELTA row's entry (the case the bug report actually named:
+        "View in timeline" from a branch delta row), not only by a row
+        read from a branch's own dashboard tab. reviewEntry() is what
+        supplies it here; buildDeltaRow must pass its OWN streamId
+        through, not the entry's/row's environment (a delta row has no
+        stream_id field of its own -- see CompareRow's fields in
+        api.py's /api/compare docstring)."""
+        entry_body = _function_body(read("compare.js"), "function reviewEntry(")
+        self.assertIn("stream_id: streamId", entry_body)
+        row_body = _function_body(read("compare.js"), "function buildDeltaRow(")
+        self.assertIn("reviewEntry(row, streamId)", row_body)
+
 
 class BuildBaselineWordingTest(unittest.TestCase):
     """WP-22 (docs/STREAMS_PLAN.md §4.1): every place that used to say
@@ -1794,6 +1839,32 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
         self.assertIn("summary.assignment_streams", code)
         self.assertIn("page.streams", code)
 
+    def test_a_branch_originated_row_links_to_the_streams_own_test_page(
+        self
+    ) -> None:
+        """F1: a row whose CURRENT assignment carries a non-mainline
+        origin must land on that stream's own test page — landing on
+        mainline's view of "why is this broken in the RC" is the exact
+        ambiguity the origin tag beside this link already warns about.
+        Resolved from the same batched state.streams map the tag uses,
+        never a lookup per row."""
+        body = _function_body(read("actions.js"), "function buildRow(")
+        self.assertIn(
+            "row.assignment_stream_id === null", body)
+        self.assertIn(
+            "state.streams[String(row.assignment_stream_id)]", body)
+        self.assertIn('params.append("stream", String(originStream.id))',
+                       body)
+        self.assertIn(
+            'params.append("product", originStream.product || "")', body)
+
+    def test_a_mainline_originated_row_link_is_unchanged(self) -> None:
+        """A null assignment_stream_id must not append either param —
+        the ordinary test.html link every row had before this feature."""
+        body = _strip_comments(
+            _function_body(read("actions.js"), "function buildRow("))
+        self.assertIn("if (originStream) {", body)
+
 
 class ProductColumnTest(unittest.TestCase):
     """The Product column on the browse/triage tables (WP-20 §2.3).
@@ -2030,6 +2101,94 @@ class TimeAndTimelineStreamScopingTest(unittest.TestCase):
         body = _function_body(read("timeline.js"), "function syncUrl()")
         self.assertIn(
             'url.searchParams.set("stream", String(state.streamId))', body)
+
+
+class BranchQuickLinksTest(unittest.TestCase):
+    """F6: the branch dashboard's "Its own results" tab links to that
+    SAME branch's own Time and Timeline pages (needs F7,
+    docs/STREAMS_PLAN.md §5.2 "as built")."""
+
+    def test_the_mount_ships_hidden_in_the_markup(self) -> None:
+        html = read_text("index.html")
+        mount_at = html.index('id="branch-quick-links"')
+        self.assertIn("hidden", html[mount_at:mount_at + 60])
+
+    def test_both_links_carry_the_streams_own_id(self) -> None:
+        body = _function_body(
+            read("app.js"), "function renderBranchQuickLinks(")
+        self.assertIn('timeParams.append("stream", String(streamId))', body)
+        self.assertIn(
+            'timelineParams.append("stream", String(streamId))', body)
+        self.assertIn('href = "time.html?"', body)
+        self.assertIn('href = "timeline.html?"', body)
+
+    def test_a_null_stream_id_hides_the_mount(self) -> None:
+        """The own-results tab's own concept — the diff tab and a
+        mainline load must never show it."""
+        body = _function_body(
+            read("app.js"), "function renderBranchQuickLinks(")
+        null_at = body.index("streamId === null")
+        self.assertIn("mount.hidden = true", body[null_at:null_at + 60])
+
+    def test_the_diff_tab_explicitly_hides_the_links(self) -> None:
+        body = _function_body(read("app.js"), "function activateDiffTab(")
+        self.assertIn("renderBranchQuickLinks(null)", body)
+
+    def test_own_results_activation_renders_the_links(self) -> None:
+        body = _function_body(
+            read("app.js"), "function activateOwnResultsTab()")
+        self.assertIn("renderBranchQuickLinks(state.streamId)", body)
+
+    def test_changing_the_environment_filter_updates_the_links(
+        self
+    ) -> None:
+        """The Timeline link names the CURRENT environment filter —
+        stale after a filter change would point at the wrong one."""
+        body = _function_body(read("app.js"), "function setEnvironment(")
+        self.assertIn("renderBranchQuickLinks(state.streamId)", body)
+
+    def test_the_timeline_link_only_names_an_environment_when_one_is_set(
+        self
+    ) -> None:
+        """No environment filter set -- the Timeline link must still
+        work (that page picks a sensible default itself), not send an
+        empty/undefined environment param."""
+        body = _function_body(
+            read("app.js"), "function renderBranchQuickLinks(")
+        self.assertIn("if (state.environment) {", body)
+
+    def test_both_links_are_scope_self_sufficient_with_a_product_param(
+        self
+    ) -> None:
+        """Advisor-caught regression: Time/Timeline both load products.js
+        and adopt ?product= into localStorage (commit 4725bbc). Without
+        this param these links silently reintroduce that exact bug --
+        opened from a browser whose stored product differs from the
+        branch's own, Timeline's environment picker (filtered by the
+        stored product) can fail to even list the branch's environment."""
+        body = _function_body(
+            read("app.js"), "function renderBranchQuickLinks(")
+        self.assertIn(
+            'timeParams.append("product", state.streamProduct || "")', body)
+        self.assertIn(
+            'timelineParams.append("product", state.streamProduct || "")',
+            body)
+
+    def test_init_branch_dashboard_stashes_the_streams_product(self) -> None:
+        """state.streamProduct must be set from the SAME fetchCompare
+        payload the branch band already reads, before either tab can
+        render -- a link built before this line ran would carry a stale
+        or empty product regardless of the branch's real one."""
+        body = _function_body(
+            read("app.js"), "async function initBranchDashboard(")
+        band_at = body.index("renderBranchBand(")
+        stash_at = body.index("state.streamProduct = data.stream.product")
+        self.assertGreater(
+            stash_at, band_at,
+            "stash reads the same payload renderBranchBand already used")
+        self.assertLess(
+            stash_at, body.index("tabs = document.getElementById"),
+            "must be stashed before either tab (own/diff) can render")
 
 
 class WatchPageTest(unittest.TestCase):

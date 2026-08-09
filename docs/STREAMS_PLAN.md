@@ -898,6 +898,72 @@ recorded here rather than left implicit:
   visible change when absent). Neither page has an in-page stream
   switcher of its own — the scope is fixed at load from the URL, the
   same way a Watch card's link or a shared deep link sets it.
+- **F1/F2/F6 fixes (same usability sweep): three more links that
+  silently dropped a branch's own scope, all fixed with the SAME
+  pattern this section's F7 entry and §2.4's Watch-card fix already
+  established — append `stream=`/`product=` from data already on hand,
+  never a new query.**
+  - **Open Actions.** A row whose CURRENT assignment carries a non-
+    mainline origin (`assignment_stream_id`) linked to `test.html`
+    WITHOUT `stream=` — "why is this broken in the RC" landed on
+    mainline's view of the same test, exactly the ambiguity the
+    origin tag beside the link already warns about. Fixed: that link
+    now also carries `stream=<origin>` and `product=<the stream's own
+    product>`, resolved from the SAME batched `state.streams` map the
+    origin tag already reads (no per-row lookup). A mainline-
+    originated row's link is unchanged. **Known limitation, by design
+    of the row itself, not this fix:** the row's own `result`/`run_id`
+    are always MAINLINE's (`/api/dashboard` lists stream 1 only), so
+    the target link can point at a stream where the triple has no run
+    at all — confirmed live: `GET /api/tests/.../{test}?stream=<origin
+    that never ran it>` returns 404 (`"unknown test: no runs recorded
+    for …"`), and `test.js` turns that into a plain "Could not load
+    test: …" error banner rather than a blank page or silently-wrong
+    data. Not fixed further: the coordinator's ask was literally this
+    link, the failure mode is legible rather than misleading, and
+    there is no query the frontend can afford per row to predict it
+    (the whole estate-scale discipline this file keeps citing).
+  - **`review.js`'s shared panel.** "View in timeline" (and the same
+    bug found right beside it while fixing it — "Open full test
+    page") dropped the stream: opened from a branch delta row — the
+    case the bug report actually named — they deep-linked into
+    MAINLINE's timeline/test page, where that run does not exist at
+    all. `entry.stream_id` is stamped onto exactly the rows that need
+    it two ways: `app.js`'s `tagStream()` on the branch "own results"
+    tab's own rows, and `compare.js`'s `reviewEntry()` on every DELTA
+    row (this is what actually answers the bug report — undefined
+    everywhere else, including every Open Actions row, where the
+    similarly-named `assignment_stream_id` is a DIFFERENT concept);
+    appending it needed F7 landed first, since `timeline.html` could
+    not read `stream=` before that.
+  - **The branch dashboard's "Its own results" tab** gains two quick
+    links into that SAME branch's own Time and Timeline pages
+    (`renderBranchQuickLinks()` in `app.js`), shown only on that tab
+    (hidden on "Difference from …" and on every mainline load) and
+    kept in step with the dashboard's own environment filter. Needed
+    F7 for the same reason. Both links also carry `product=` —
+    `state.streamProduct`, stashed by `initBranchDashboard()` from the
+    same `fetchCompare` payload `renderBranchBand` already reads —
+    without it these are exactly the bug commit `4725bbc` fixed:
+    Time/Timeline both load `products.js`, which adopts `?product=`
+    into localStorage, so a browser holding a DIFFERENT product than
+    the branch's own would render Timeline's environment picker
+    filtered to the wrong product (caught in review before shipping —
+    the first live check used a scratch estate with only the implicit
+    `""` product, where wrong-product and right-product looked
+    identical).
+  - **Verified live**, same DOM-shim method, in two passes (the second
+    to re-check the review finding above against a NON-empty product,
+    since the first pass could not have told a wrong product from a
+    missing one): a row assigned from a branch, opened on Open
+    Actions, whose link carried the exact `stream=`/`product=`
+    expected; the branch dashboard's own-results tab showing both
+    quick links with the branch's actual `stream=2&product=Beacon`;
+    and a review panel opened from BOTH the own-results tab and a
+    branch delta row (the "New tests" category, since this scratch
+    estate's branch tests never ran on mainline at all), whose "Open
+    full test page" and "View in timeline" links both carried the
+    branch's stream id in every case.
 
 ---
 

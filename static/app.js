@@ -89,6 +89,12 @@ const state = {
   // leaves this null forever, which is what keeps those paths at zero
   // visible change.
   streamId: null,
+  // F6 (docs/STREAMS_PLAN.md §5.2 "as built"): the SCOPED STREAM's own
+  // product, stashed by initBranchDashboard() from data.stream.product
+  // so renderBranchQuickLinks() can make its Time/Timeline links scope-
+  // self-sufficient (the jump-fix principle, commit 4725bbc) rather
+  // than relying on whatever this browser's switcher last stored.
+  streamProduct: "",
   summary: null,          // last headline payload (no queue rows)
   // Queue rows by kind, fetched per tab on demand. Absent = not landed
   // yet for the current filters; renderQueueTable shows a loading line.
@@ -502,6 +508,11 @@ function setEnvironment(environment, keepScript) {
     url.searchParams.delete("environment");
   }
   window.history.replaceState(null, "", url.toString());
+  // F6: the quick links' Timeline target names the CURRENT environment
+  // filter — keep them in step with it, own-results tab only.
+  if (state.streamId !== null) {
+    renderBranchQuickLinks(state.streamId);
+  }
   refreshAll();
 }
 
@@ -1521,6 +1532,59 @@ function wireMainlineControls() {
 }
 
 /**
+ * F6 (docs/STREAMS_PLAN.md §5.2 "as built"): quick links from a
+ * branch's "Its own results" tab into that SAME branch's own Time and
+ * Timeline pages — needs F7 (those pages could not read `stream=`
+ * before it). `environment=` is included only when the dashboard's own
+ * environment filter is currently set to one; Timeline still works
+ * without it (it picks a sensible default itself), Time never needed
+ * one. Hidden outright when leaving the tab (mainline, or "Difference
+ * from …") — this is an "own results" concept only.
+ *
+ * Both links also carry `product=` (state.streamProduct, stashed by
+ * initBranchDashboard from data.stream.product — empty string included
+ * when the estate has no products). Without it these links are exactly
+ * the bug commit 4725bbc fixed: Time/Timeline load products.js, which
+ * adopts `?product=` into localStorage, but absent the param they keep
+ * whatever this browser last had — Timeline's environment picker is
+ * filtered by that stored product, so a wrong-product browser opening
+ * this link can find a picker that does not even list the branch's own
+ * environment.
+ */
+function renderBranchQuickLinks(streamId) {
+  const mount = document.getElementById("branch-quick-links");
+  if (!mount) {
+    return;
+  }
+  clearNode(mount);
+  if (streamId === null) {
+    mount.hidden = true;
+    return;
+  }
+  const timeParams = new URLSearchParams();
+  timeParams.append("stream", String(streamId));
+  timeParams.append("product", state.streamProduct || "");
+  const timelineParams = new URLSearchParams();
+  if (state.environment) {
+    timelineParams.append("environment", state.environment);
+  }
+  timelineParams.append("stream", String(streamId));
+  timelineParams.append("product", state.streamProduct || "");
+
+  const timeLink = document.createElement("a");
+  timeLink.href = "time.html?" + timeParams.toString();
+  timeLink.textContent = "This branch's Time →";
+  const timelineLink = document.createElement("a");
+  timelineLink.href = "timeline.html?" + timelineParams.toString();
+  timelineLink.textContent = "This branch's Timeline →";
+
+  mount.appendChild(timeLink);
+  mount.appendChild(document.createTextNode("  ·  "));
+  mount.appendChild(timelineLink);
+  mount.hidden = false;
+}
+
+/**
  * Show the dashboard body (status/charts/triage/browse), scoped to
  * *streamId* if the "Its own results" tab is active — WP-23,
  * docs/STREAMS_PLAN.md §5.2. Hides the delta section, wires the
@@ -1533,6 +1597,7 @@ function activateOwnResultsTab() {
     envField.hidden = false;
   }
   wireMainlineControls();
+  renderBranchQuickLinks(state.streamId);
   document.getElementById("loading-state").hidden = false;
   refreshAll();
 }
@@ -1544,6 +1609,7 @@ function activateDiffTab(streamId) {
   for (const id of DASHBOARD_SECTIONS) {
     document.getElementById(id).hidden = true;
   }
+  renderBranchQuickLinks(null);   // F6: "own results" concept only
   initDeltaView(streamId);
 }
 
@@ -1584,6 +1650,9 @@ async function initBranchDashboard(streamId) {
     return;
   }
   renderBranchBand(data.stream, data.baseline);
+  // F6: stashed once here, before either tab renders, so
+  // renderBranchQuickLinks() can make its links scope-self-sufficient.
+  state.streamProduct = data.stream.product || "";
 
   const tabs = document.getElementById("branch-tabs");
   const caption = document.getElementById("branch-tab-caption");

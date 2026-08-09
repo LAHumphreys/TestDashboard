@@ -47,6 +47,13 @@
     </div>
     <p id="branch-tab-caption" class="muted" hidden></p>
 
+    <!-- F6 (docs/STREAMS_PLAN.md §5.2 "as built"): "Its own results" quick
+         links into this branch's own Time/Timeline, populated by
+         app.js's activateOwnResultsTab() — needs F7 (those pages could
+         not read `stream=` before it). Hidden outright on mainline and
+         on the "Difference from …" tab. -->
+    <p id="branch-quick-links" class="muted" hidden></p>
+
     <!-- The one filter row: scopes every section below it. -->
     <section class="toolbar" aria-label="Scope">
       <label id="env-filter-field" class="toolbar-field">Environment
