@@ -2080,9 +2080,22 @@ class CompareStripTest(unittest.TestCase):
         self.assertIn("renderCompareStrip(", code)
 
     def test_history_and_detail_carry_the_stream_param(self) -> None:
+        """WP-24: test.js's own local `withStream(url)` helper (append-
+        stream-to-an-already-built-URL-string) is GONE — a genuine name
+        collision with urls.js's exported withStream() (a different,
+        picker-navigation helper: "current page with one scope level
+        changed"), so it was deleted rather than kept alongside a
+        same-named import. Both call sites now go through apiUrl()
+        with an explicit `stream: streamApiScope()` override
+        (streamApiScope() is the NaN-guard the old helper carried
+        inline); same assertion intent (both fetches carry this page's
+        own stream scope)."""
         code = _strip_comments(read("test.js"))
-        self.assertIn("withStream(myPath())", code)
-        self.assertIn('withStream(myPath("/history")', code)
+        self.assertNotIn("function withStream(", code)
+        self.assertIn("function streamApiScope()", code)
+        self.assertIn("apiUrl(myPath(), {}, {", code)
+        self.assertIn('apiUrl(myPath("/history"), {', code)
+        self.assertEqual(code.count("stream: streamApiScope()"), 2)
 
 
 class TestPageBranchBandTest(unittest.TestCase):
@@ -2156,14 +2169,14 @@ class SuiteLinkParityTest(unittest.TestCase):
     """
 
     def test_the_link_carries_the_pages_own_stream(self) -> None:
+        """WP-24: the hand-rolled params/"script.html?" pair became one
+        pageUrl() call with an explicit `stream: streamId` override —
+        same intent (the page's own raw, un-NaN-guarded streamId, same
+        as before this conversion)."""
         body = _function_body(read("test.js"), "function renderDetail(")
-        self.assertIn("if (streamId !== null) {", body)
-        stream_at = body.index("if (streamId !== null) {")
-        self.assertIn('params.append("stream", String(streamId))',
-                       body[stream_at:stream_at + 100])
-        self.assertLess(
-            stream_at, body.index('"script.html?"'),
-            "the stream param must be appended BEFORE the href is built")
+        self.assertIn('suiteLink.href = pageUrl("script"', body)
+        self.assertIn("{ stream: streamId, product: null, baseline: null }",
+                       body)
 
     def test_the_mainline_honesty_label_is_gone(self) -> None:
         """F3's "(mainline)" title/note both depended on
@@ -2176,7 +2189,7 @@ class SuiteLinkParityTest(unittest.TestCase):
         body = _strip_comments(
             _function_body(read("test.js"), "function renderDetail("))
         link_section = body[
-            body.index("const params = new URLSearchParams();"):
+            body.index("identity.appendChild(document.createTextNode("):
             body.index("identity.appendChild(suiteLink);")]
         self.assertNotIn("(mainline)", link_section)
         self.assertNotIn("detail.stream_identity", link_section)
@@ -2308,10 +2321,14 @@ class EveryBuildAndStreamSwitcherTest(unittest.TestCase):
         self.assertIn("field.hidden = true", body)
 
     def test_switching_never_changes_which_test_is_shown(self) -> None:
+        """WP-24: the params.append() triple became one pageUrl() call
+        whose `params` argument names all three identity fields — same
+        intent, switching streams never changes environment/script/
+        test_name."""
         body = _function_body(read("test.js"), "function testPageUrl(")
-        self.assertIn('params.append("environment"', body)
-        self.assertIn('params.append("script"', body)
-        self.assertIn('params.append("test_name"', body)
+        self.assertIn("environment: ident.environment", body)
+        self.assertIn("script: ident.script", body)
+        self.assertIn("test_name: ident.test_name", body)
 
     def test_the_dropdown_only_lists_results_never_widened(self) -> None:
         """docs/STREAMS_PLAN.md §4.1: the dropdown wants exactly the
