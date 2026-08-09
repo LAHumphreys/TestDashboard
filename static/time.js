@@ -51,6 +51,7 @@ import { treemapBoxes } from "./charts.js";
 import { attachSorting, sortRows } from "./sorting.js";
 import { getSelectedProduct } from "./products.js";
 import { renderBranchBand, renderStreamEnvironmentHint } from "./compare.js";
+import { apiUrl, pageUrl } from "./urls.js";
 
 const LEVELS = ["environment", "script", "test_name"];
 
@@ -80,29 +81,17 @@ function level() {
 }
 
 function url() {
-  const qs = new URLSearchParams();
-  qs.append("group_by", level());
-  if (state.environment !== null) {
-    qs.append("environment", state.environment);
-  }
-  if (state.script !== null) {
-    qs.append("script", state.script);
-  }
-  if (state.includeStale) {
-    qs.append("include_stale", "1");
-  }
-  if (state.streamId !== null) {
-    qs.append("stream", String(state.streamId));
-  }
   // WP-20: scope the drill-down to a declared product's environments —
   // resolved server-side, same as every other product= filter
   // (docs/STREAMS_PLAN.md §2.2). Harmless to send alongside an explicit
   // `environment` once drilled in; the server combines both.
-  const product = getSelectedProduct();
-  if (product) {
-    qs.append("product", product);
-  }
-  return "/api/time?" + qs.toString();
+  return apiUrl("/api/time", {
+    group_by: level(),
+    environment: state.environment,
+    script: state.script,
+    include_stale: state.includeStale ? "1" : null,
+  }, { stream: state.streamId, product: getSelectedProduct() || null,
+    baseline: null });
 }
 
 /**
@@ -116,16 +105,10 @@ function url() {
  * being read.
  */
 function environmentSwitchUrl(environment) {
-  const params = new URLSearchParams();
-  params.append("environment", environment);
-  if (state.streamId !== null) {
-    params.append("stream", String(state.streamId));
-  }
-  const product = getSelectedProduct();
-  if (product) {
-    params.append("product", product);
-  }
-  return "time.html?" + params.toString();
+  return pageUrl("time", { environment: environment }, {
+    stream: state.streamId, product: getSelectedProduct() || null,
+    baseline: null,
+  });
 }
 
 async function load() {

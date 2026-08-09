@@ -45,6 +45,7 @@ import {
 } from "./api.js";
 import { getSelectedProduct } from "./products.js";
 import { renderBranchBand, renderStreamEnvironmentHint } from "./compare.js";
+import { apiUrl, pageUrl } from "./urls.js";
 
 /* How far back "Earlier runs…" reaches: the server's own cap, which
  * matches retention — so it means "any recorded run", not a teaser. */
@@ -71,19 +72,13 @@ const state = {
 };
 
 function timelineUrl() {
-  const qs = new URLSearchParams();
-  qs.append("environment", state.environment);
-  if (state.days !== null) {
-    qs.append("days", String(state.days));
-  }
-  if (state.from !== null && state.to !== null) {
-    qs.append("from", state.from);
-    qs.append("to", state.to);
-  }
-  if (state.streamId !== null) {
-    qs.append("stream", String(state.streamId));
-  }
-  return "/api/timeline?" + qs.toString();
+  const windowSet = state.from !== null && state.to !== null;
+  return apiUrl("/api/timeline", {
+    environment: state.environment,
+    days: state.days,
+    from: windowSet ? state.from : null,
+    to: windowSet ? state.to : null,
+  }, { stream: state.streamId, product: null, baseline: null });
 }
 
 /**
@@ -98,47 +93,40 @@ function timelineUrl() {
  * sufficient rule every other stream link in this app follows.
  */
 function environmentSwitchUrl(environment) {
-  const params = new URLSearchParams();
-  params.append("environment", environment);
-  if (state.streamId !== null) {
-    params.append("stream", String(state.streamId));
-  }
-  const product = getSelectedProduct();
-  if (product) {
-    params.append("product", product);
-  }
-  return "timeline.html?" + params.toString();
+  return pageUrl("timeline", { environment: environment }, {
+    stream: state.streamId, product: getSelectedProduct() || null,
+    baseline: null,
+  });
 }
 
 function runsUrl(row) {
-  const qs = new URLSearchParams({ from: row.started, to: row.ended });
-  if (state.streamId !== null) {
-    qs.append("stream", String(state.streamId));
-  }
-  return "/api/scripts/" + encodeURIComponent(state.environment)
-    + "/" + encodeURIComponent(row.script) + "/runs?" + qs.toString();
+  // environment is embedded in the PATH below, not the query string --
+  // explicitly nulled so it is never also carried into the query by
+  // apiUrl()'s default scope carriage (this page's own URL carries
+  // `environment=` too, as the page's own identity).
+  return apiUrl(
+    "/api/scripts/" + encodeURIComponent(state.environment)
+      + "/" + encodeURIComponent(row.script) + "/runs",
+    { from: row.started, to: row.ended },
+    { stream: state.streamId, product: null, baseline: null,
+      environment: null });
 }
 
 /** Keep the address bar shareable: environment always, window when
  * explicitly chosen. The default (newest block) is deliberately NOT
  * written — a link saved today should show the newest run tomorrow. */
 function syncUrl() {
-  const url = new URL(window.location.href);
-  url.search = "";
-  if (state.environment) {
-    url.searchParams.set("environment", state.environment);
-  }
-  if (state.days !== null) {
-    url.searchParams.set("days", String(state.days));
-  }
-  if (state.from !== null && state.to !== null) {
-    url.searchParams.set("from", state.from);
-    url.searchParams.set("to", state.to);
-  }
-  if (state.streamId !== null) {
-    url.searchParams.set("stream", String(state.streamId));
-  }
-  window.history.replaceState(null, "", url.toString());
+  const windowSet = state.from !== null && state.to !== null;
+  // pageUrl() rebuilds the whole query string from `state`, the same
+  // shape timelineUrl() already sends the server -- so the address bar
+  // matches the fetch it caused. A relative "timeline.html?..." resolves
+  // against the current document exactly like the pathname it replaces.
+  window.history.replaceState(null, "", pageUrl("timeline", {
+    environment: state.environment,
+    days: state.days,
+    from: windowSet ? state.from : null,
+    to: windowSet ? state.to : null,
+  }, { stream: state.streamId, product: null, baseline: null }));
 }
 
 /** "2026-07-25T02:14:07.123456" -> "02:14" (display only; date is in
@@ -519,18 +507,14 @@ function buildRow(row, domainFrom, span, showDate) {
     showDate ? formatTime(row.started).slice(5, 16)
       : clockTime(row.started)));
 
-  const params = new URLSearchParams();
-  params.append("environment", state.environment);
-  params.append("script", row.script);
   // Script-page parity (FINAL ROUND): a stream-scoped Timeline's block
   // row must land on that SAME stream's suite history, not mainline's
-  // -- script.html now honours stream= (previously a dead param). No-op
-  // on mainline.
-  if (state.streamId !== null) {
-    params.append("stream", String(state.streamId));
-  }
+  // -- script.html now honours stream= (previously a dead param).
+  // pageUrl()'s default scope carriage is a no-op on mainline.
   const link = el("a", "tl-script", row.script);
-  link.href = "script.html?" + params.toString();
+  link.href = pageUrl("script", {
+    environment: state.environment, script: row.script,
+  }, { stream: state.streamId, product: null, baseline: null });
   link.title = "Execution history for this suite";
   line.appendChild(link);
 
@@ -654,19 +638,16 @@ function renderDetail(detail, data) {
     tr.appendChild(el("td", "", formatTime(run.start_time).slice(11)));
 
     const cell = el("td", "wrap");
-    const params = new URLSearchParams();
-    params.append("environment", data.environment);
-    params.append("script", data.script);
-    params.append("test_name", run.test_name);
     // Scope-carriage (F1-F7 sweep follow-up): a run row expanded on a
     // branch's Timeline must link to that SAME stream's test page --
     // the same state.streamId this file's other outbound requests
-    // already carry (runsUrl() above). No-op on mainline.
-    if (state.streamId !== null) {
-      params.append("stream", String(state.streamId));
-    }
+    // already carry (runsUrl() above). pageUrl()'s default scope
+    // carriage is a no-op on mainline.
     const link = el("a", "", run.test_name);
-    link.href = "test.html?" + params.toString();
+    link.href = pageUrl("test", {
+      environment: data.environment, script: data.script,
+      test_name: run.test_name,
+    }, { stream: state.streamId, product: null, baseline: null });
     cell.appendChild(link);
     tr.appendChild(cell);
 
@@ -785,14 +766,9 @@ let suggestionNames = [];
 let completionIndex = -1;
 
 async function fetchSearchMatches(query) {
-  const qs = new URLSearchParams();
-  qs.append("environment", state.environment);
-  qs.append("q", query);
-  qs.append("limit", "20");
-  if (state.streamId !== null) {
-    qs.append("stream", String(state.streamId));
-  }
-  const data = await fetchJson("/api/dashboard?" + qs.toString());
+  const data = await fetchJson(apiUrl("/api/dashboard", {
+    environment: state.environment, q: query, limit: "20",
+  }, { stream: state.streamId, product: null, baseline: null }));
   return data.tests.map((test) => ({
     script: test.script, test_name: test.test_name,
   }));

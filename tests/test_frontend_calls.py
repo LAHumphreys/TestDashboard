@@ -1635,13 +1635,14 @@ class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     def test_timeline_run_rows_carry_the_stream_into_the_test_link(
         self
     ) -> None:
+        """WP-24: the hand-rolled params/"test.html?" pair became one
+        pageUrl() call with an explicit `stream: state.streamId` scope
+        override -- same intent (a run row's link carries this page's
+        own stream scope)."""
         body = _strip_comments(_function_body(
             read("timeline.js"), "function renderDetail("))
-        self.assertIn("if (state.streamId !== null) {", body)
-        stream_at = body.index("state.streamId !== null")
-        self.assertLess(
-            stream_at, body.rindex('"test.html?"'),
-            "the stream param must be appended BEFORE the href is built")
+        self.assertIn('link.href = pageUrl("test"', body)
+        self.assertIn("stream: state.streamId", body)
 
 
 class TimelineTimePickerParityTest(unittest.TestCase):
@@ -2271,14 +2272,14 @@ class ScriptPageParityTest(unittest.TestCase):
         link was found unscoped in the same pass as the run-row test
         links, but left for script-page parity to fix here, since a
         stream= param on it was only useful once script.html could
-        read one."""
+        read one.
+
+        WP-24: same pageUrl() conversion as the run-row test link
+        above."""
         body = _strip_comments(_function_body(
             read("timeline.js"), "function buildRow("))
-        self.assertIn("if (state.streamId !== null) {", body)
-        stream_at = body.index("state.streamId !== null")
-        self.assertLess(
-            stream_at, body.index('"script.html?"'),
-            "the stream param must be appended BEFORE the href is built")
+        self.assertIn('link.href = pageUrl("script"', body)
+        self.assertIn("stream: state.streamId", body)
 
 
 class EveryBuildAndStreamSwitcherTest(unittest.TestCase):
@@ -2799,9 +2800,13 @@ class TimeAndTimelineProductTest(unittest.TestCase):
     """
 
     def test_time_appends_product_to_its_request(self) -> None:
+        """WP-24: `qs.append("product", product)` became `product:
+        getSelectedProduct() || null` in the scope object passed to
+        apiUrl() — same intent (a selected product is sent; nothing
+        selected omits it, matching the old `if (product)` guard)."""
         code = _strip_comments(read("time.js"))
         self.assertIn("getSelectedProduct", _imported_names(read("time.js")))
-        self.assertIn('qs.append("product"', code)
+        self.assertIn("product: getSelectedProduct() || null", code)
 
     def test_timeline_scopes_its_environment_picker(self) -> None:
         code = _strip_comments(read("timeline.js"))
@@ -2836,8 +2841,11 @@ class TimeAndTimelineStreamScopingTest(unittest.TestCase):
             self.assertIn("state.streamId", body, name)
 
     def test_time_forwards_stream_to_its_request(self) -> None:
+        """WP-24: `qs.append("stream", ...)` became an explicit `stream:
+        state.streamId` scope override on the apiUrl() call."""
         body = _function_body(read("time.js"), "function url()")
-        self.assertIn('qs.append("stream", String(state.streamId))', body)
+        self.assertIn("apiUrl(", body)
+        self.assertIn("stream: state.streamId", body)
 
     def test_timeline_forwards_stream_to_every_one_of_its_requests(
         self
@@ -2846,7 +2854,11 @@ class TimeAndTimelineStreamScopingTest(unittest.TestCase):
         (runsUrl) and the test-search suggestions fetch
         (fetchSearchMatches) both hit different endpoints and would
         otherwise silently read MAINLINE's data while the page itself
-        is scoped to a branch."""
+        is scoped to a branch.
+
+        WP-24: each `qs.append("stream", ...)` became an explicit
+        `stream: state.streamId` scope override on an apiUrl() call --
+        same intent, checked per call site."""
         code = read("timeline.js")
         for signature in (
             "function timelineUrl()",
@@ -2854,9 +2866,8 @@ class TimeAndTimelineStreamScopingTest(unittest.TestCase):
             "async function fetchSearchMatches(",
         ):
             body = _function_body(code, signature)
-            self.assertIn(
-                'qs.append("stream", String(state.streamId))', body,
-                signature)
+            self.assertIn("apiUrl(", body, signature)
+            self.assertIn("stream: state.streamId", body, signature)
 
     def test_both_pages_render_the_branch_band_when_scoped(self) -> None:
         for name in ("time.js", "timeline.js"):
@@ -2881,10 +2892,15 @@ class TimeAndTimelineStreamScopingTest(unittest.TestCase):
         """syncUrl() rewrites the address bar on every block/day
         change — an omission here would silently drop the scope from
         a reload or a copied link even though in-memory state still
-        had it right for the NEXT fetch."""
+        had it right for the NEXT fetch.
+
+        WP-24: syncUrl() rebuilds the query string through pageUrl()
+        (same shape timelineUrl() already sends the server) rather than
+        mutating searchParams in place -- same intent, checking the
+        `stream: state.streamId` override passed to it."""
         body = _function_body(read("timeline.js"), "function syncUrl()")
-        self.assertIn(
-            'url.searchParams.set("stream", String(state.streamId))', body)
+        self.assertIn("pageUrl(", body)
+        self.assertIn("stream: state.streamId", body)
 
 
 class StreamEnvironmentEmptyStateTest(unittest.TestCase):
@@ -2928,11 +2944,19 @@ class StreamEnvironmentEmptyStateTest(unittest.TestCase):
     ) -> None:
         """`stream`/`product` carry through; `environment` is the only
         param that changes -- a reader must never lose their scope by
-        following the hint."""
+        following the hint.
+
+        WP-24: both builders are now one pageUrl("time"/"timeline",
+        {environment: ...}, {stream: ..., product: ..., baseline:
+        null}) call each -- same intent (environment is the identity
+        param that changes; stream/product are explicit overrides
+        carrying the page's own values, not pageUrl()'s default
+        carriage, since a hint link is built from a DIFFERENT
+        environment than the one currently in the URL)."""
         for name in ("time.js", "timeline.js"):
             body = _function_body(read(name), "function environmentSwitchUrl(")
-            self.assertIn('params.append("environment", environment)', body)
-            self.assertIn("state.streamId !== null", body)
+            self.assertIn("{ environment: environment }", body)
+            self.assertIn("stream: state.streamId", body)
             self.assertIn("getSelectedProduct()", body)
 
     def test_time_link_builder_drops_the_script_drill(self) -> None:
