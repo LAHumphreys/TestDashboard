@@ -2596,23 +2596,34 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
         mainline's view of "why is this broken in the RC" is the exact
         ambiguity the origin tag beside this link already warns about.
         Resolved from the same batched state.streams map the tag uses,
-        never a lookup per row."""
+        never a lookup per row.
+
+        WP-24: the params.append() pair became one pageUrl() call whose
+        `linkScope` argument names the origin stream's own id/product —
+        same intent, checked via the linkScope assignment instead of
+        the params.append() calls that no longer exist."""
         body = _function_body(read("actions.js"), "function buildRow(")
         self.assertIn(
             "row.assignment_stream_id === null", body)
         self.assertIn(
             "state.streams[String(row.assignment_stream_id)]", body)
-        self.assertIn('params.append("stream", String(originStream.id))',
-                       body)
-        self.assertIn(
-            'params.append("product", originStream.product || "")', body)
+        self.assertIn("stream: originStream.id,", body)
+        self.assertIn('product: originStream.product || ""', body)
+        self.assertIn('link.href = pageUrl("test"', body)
 
     def test_a_mainline_originated_row_link_is_unchanged(self) -> None:
-        """A null assignment_stream_id must not append either param —
-        the ordinary test.html link every row had before this feature."""
+        """A null assignment_stream_id must not carry a stream/product
+        scope — the ordinary test.html link every row had before this
+        feature. WP-24: `if (originStream) { params.append(...) }`
+        became `if (originStream) { linkScope = {...} }`, still gated
+        by the same truthy check."""
         body = _strip_comments(
-            _function_body(read("actions.js"), "function buildRow("))
+            _function_body(read("actions.js"), "function buildRow(")
+        )
         self.assertIn("if (originStream) {", body)
+        self.assertIn(
+            "let linkScope = { stream: null, product: null, "
+            "baseline: null };", body)
 
 
 class OpenActionsTruthfulResultTest(unittest.TestCase):
