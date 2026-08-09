@@ -2298,6 +2298,47 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
         self.assertIn("if (originStream) {", body)
 
 
+class OpenActionsTruthfulResultTest(unittest.TestCase):
+    """ADDENDUM to the perf round: a row whose assignment origin is a
+    non-mainline stream must not show ONLY mainline's result chip — an
+    "assigned from the RC" row reading PASS while the RC failure it
+    represents is live was a contradiction on its face
+    (docs/STREAMS_PLAN.md §5.4). Reuses the SAME compare-strip visual
+    language test.js's own compare strip already uses (ghost mainline
+    chip, solid origin-stream chip, "no result" text rather than a
+    colour for absence) — never a new visual vocabulary."""
+
+    def test_renderCompareStrip_is_imported_from_compare_js(self) -> None:
+        code = _strip_comments(read("actions.js"))
+        self.assertIn(
+            'import { renderCompareStrip } from "./compare.js";', code)
+
+    def test_a_non_mainline_origin_row_uses_the_compare_strip(self) -> None:
+        body = _strip_comments(
+            _function_body(read("actions.js"), "function buildRow("))
+        self.assertIn("if (originStream) {", body)
+        strip_at = body.index("if (originStream) {")
+        self.assertIn(
+            "renderCompareStrip(resultCell, originStream, row.result,",
+            body[strip_at:],
+        )
+        self.assertIn("row.origin_result)", body[strip_at:])
+
+    def test_a_mainline_origin_row_keeps_the_plain_single_chip(
+        self
+    ) -> None:
+        """Zero visible change for a mainline-origin row: the plain
+        resultChip() path, not the compare strip."""
+        body = _strip_comments(
+            _function_body(read("actions.js"), "function buildRow("))
+        self.assertIn("} else {", body)
+        else_at = body.index("} else {", body.index("if (originStream) {"))
+        self.assertIn("resultChip(row.result)", body[else_at:])
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", _strip_comments(read("actions.js")))
+
+
 class ProductColumnTest(unittest.TestCase):
     """The Product column on the browse/triage tables (WP-20 §2.3).
 

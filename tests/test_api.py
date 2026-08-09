@@ -1306,6 +1306,118 @@ class TestAssigneeStreamId(ApiCase):
         }, expect=400)
 
 
+class TestOriginResultTruthfulDisplay(ApiCase):
+    """ADDENDUM to the perf round: a row whose assignment origin is a
+    non-mainline stream must not show only mainline's result -- that
+    read as a contradiction on its face ("assigned from the RC" showing
+    PASS while the RC failure it represents is live). ``origin_result``
+    (docs/STREAMS_PLAN.md §5.4) is the batched fix.
+
+    Fixture, deliberately the exact contradiction case: mainline's
+    test_a PASSES, the branch feat/x's test_a FAILS -- the same shape
+    TestAssigneeStreamId already seeds, reused here.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_a", result="PASS")])
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_a", branch="feat/x",
+            result="FAIL",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.path = test_path(
+            "linux-sim", "suite/alpha.py", "test_a", "/assignee")
+
+    def test_non_mainline_origin_carries_its_own_result(self) -> None:
+        self.call("PUT", self.path, body={
+            "username": "alice", "assigned_by": "bob",
+            "stream_id": self.stream_id,
+        })
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(rows[0]["result"], "PASS")   # mainline, unchanged
+        self.assertEqual(rows[0]["origin_result"], "FAIL")   # the branch
+
+    def test_mainline_origin_has_no_origin_result_field_at_all(
+        self
+    ) -> None:
+        """Not merely null -- ABSENT, so a mainline-origin row's payload
+        is byte-identical to before this addendum (zero visible
+        change)."""
+        self.call("PUT", self.path,
+                   body={"username": "alice", "assigned_by": "bob"})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertNotIn("origin_result", rows[0])
+
+    def test_the_origin_stream_never_ran_the_test_gives_none(self) -> None:
+        """Never a fabricated result, never a colour for absence --
+        None (rendered client-side as "no result")."""
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_never_on_branch",
+            result="PASS")])
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py",
+                      "test_never_on_branch", "/assignee"),
+            body={"username": "alice", "assigned_by": "bob",
+                  "stream_id": self.stream_id})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertIsNone(rows["test_never_on_branch"]["origin_result"])
+
+    def test_an_estate_with_no_stream_origin_assignments_costs_no_extra_query(
+        self
+    ) -> None:
+        """The common case -- no row on the page has a non-mainline
+        origin -- must not run the batched lookup at all."""
+        self.call("PUT", self.path,
+                   body={"username": "alice", "assigned_by": "bob"})
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", "/api/dashboard")
+        finally:
+            conn.set_trace_callback(None)
+        origin_queries = [s for s in seen if "FROM latest_runs WHERE (" in s]
+        self.assertEqual(origin_queries, [])
+
+    def test_many_origin_rows_cost_exactly_one_extra_query(self) -> None:
+        """Batched, not per-row -- several rows with a non-mainline
+        origin on one page must still cost ONE extra query total."""
+        names = ["test_a", "test_b", "test_c"]
+        for name in names[1:]:
+            self.import_runs([record(
+                environment="linux-sim", test_name=name, result="PASS")])
+            self.import_runs([record(
+                environment="linux-sim", test_name=name, branch="feat/x",
+                result="FAIL",
+                start_time="2026-07-25T03:00:00.000000",
+                end_time="2026-07-25T03:00:03.000000")])
+        for name in names:
+            self.call(
+                "PUT",
+                test_path("linux-sim", "suite/alpha.py", name, "/assignee"),
+                body={"username": "alice", "assigned_by": "bob",
+                      "stream_id": self.stream_id})
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            data = self.call("GET", "/api/dashboard")
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(data["tests"]), 3)
+        origin_queries = [s for s in seen if "FROM latest_runs WHERE (" in s]
+        self.assertEqual(len(origin_queries), 1, origin_queries)
+
+
 class TestSortingIsStable(ApiCase):
     """Every sort key must page without repeating or skipping a row.
 

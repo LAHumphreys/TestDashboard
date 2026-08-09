@@ -2348,3 +2348,77 @@ Suite, final tree after this entry: 1939 OK (skipped=1) SQLite-only;
 
 Not verified: layout/legibility of the header without the switcher, at
 a real screen size -- no browser has rendered it.
+
+## 2026-08-09 -- addendum 3: Open Actions' truthful display, §0.4 reconfirmed
+
+User decision, direct: assignment stays one owner per triple
+(docs/STREAMS_PLAN.md Sec0 item 4, reconfirmed and recorded there) --
+this addendum is a DISPLAY fix, not a data-model change. The seam it
+closes, previously flagged as an accepted limitation and no longer
+accepted: a row's result chip in Open Actions is always mainline's
+(the page's own /api/dashboard call never carries stream= --
+assignments are estate-level), but the row's CURRENT assignment can
+have been made from a non-mainline stream whose own result for the
+same triple disagrees -- an "assigned from the RC" row could read
+mainline's PASS while the RC failure it represents was still live, a
+contradiction on its face.
+
+Fix: for a row with a non-mainline origin, the result cell now shows
+BOTH sides, reusing the EXACT compare-strip visual language
+compare.js:renderCompareStrip() already built for the test-detail
+page's own mainline-vs-branch strip -- imported directly into
+actions.js rather than reinvented: ghost mainline chip, solid
+origin-stream chip, "no result" text (never a colour) when either side
+is absent. A mainline-origin row is byte-for-byte unchanged -- the
+plain single resultChip() it always had.
+
+Mechanics: new Storage.latest_results_for_streams(keys) -- batched by
+(stream_id, environment, script, test_name), latest_runs's own PRIMARY
+KEY, so every key is an index seek. ONE query for the whole page's
+non-mainline-origin rows (chunked at _RECENT_CHUNK, the same 100-key
+batch size failure_streak_bounds_many/recent_results use -- this
+session's own PERF ROUND discipline applied to its own addendum),
+never a lookup per row; skipped entirely when nothing on the page has
+a non-mainline origin, which is every existing /api/dashboard caller
+including the plain index.html dashboard -- zero new queries for them.
+_handle_dashboard extends the existing per-row payload with
+origin_result (present, possibly null, only for rows that have
+assignment_stream_id -- ABSENT, not merely null, for every
+mainline-origin row, so an existing caller's payload is byte-identical
+to before this addendum) rather than reshaping the endpoint.
+
+Measured: the batched query costs exactly ONE extra round trip
+regardless of how many origin rows are on the page (1 row or several,
+both pinned by test) -- no per-row cost.
+
+Live-verified, node DOM-shim harness against a scratch server (own
+port, own throwaway db, never the shared 8791 instance), two real
+assignments through the actual API (not synthetic JSON): a row
+assigned from a branch where mainline FAILS and the branch PASSES
+rendered both chips (ghost FAIL, solid PASS) labelled "mainline" and
+the branch's own name; a row assigned from the same branch for a test
+it never ran rendered mainline's ghost chip plus literal "no result"
+text carrying no result-colour class. First attempt at the live
+verification used an unreachable fixture (mainline PASS/branch FAIL --
+Open Actions' own result filter has no "all results" or "PASS" option,
+only "open" (FAIL + UNEXPECTED_PASS), "FAIL", or "UNEXPECTED_PASS", so
+a mainline-PASS row can never appear on this page at all); caught by
+running the driver against the real page rather than trusting the
+scenario, and re-seeded to a reachable contradiction (mainline FAIL,
+branch already PASSING) before re-verifying.
+
+Incidental finding, out of scope, not fixed: static/actions.js has
+carried a literal U+0000 (NUL) byte inside the UNASSIGNED sentinel
+string literal (const UNASSIGNED = "\x00unassigned";) since the file's
+very FIRST commit (ed4a59a6, 2026-07-28) -- valid JavaScript, and
+harmless in practice because every read and write of the sentinel goes
+through the SAME constant reference, never compared against a literal
+"unassigned" typed elsewhere. Left alone -- unrelated to this
+addendum's scope.
+
+Suite, final tree after this entry: 1954 OK (skipped=1) SQLite-only;
+2605 OK (skipped=33) combined SQLite+MariaDB 10.3 dual-backend leg.
+
+Not verified: layout/legibility of the two-chip strip inside Open
+Actions' existing result column at a real screen size -- the column
+may need to be wider than it is today. No browser has rendered it.

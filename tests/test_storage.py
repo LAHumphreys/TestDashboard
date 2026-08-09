@@ -2824,6 +2824,117 @@ class TestRecentResults(StorageTestBase):
         self.assertEqual(len(selects), 1)
 
 
+class TestLatestResultsForStreams(StorageTestBase):
+    """Storage.latest_results_for_streams -- ADDENDUM to the perf round
+    (Open Actions' truthful display, docs/STREAMS_PLAN.md §5.4). Same
+    batching discipline as TestRecentResults above: a page of rows
+    asking "what did THIS stream see for this test" one at a time is a
+    query per row, the exact shape this project's own guard tests exist
+    to catch.
+    """
+
+    def _seed_mainline_and_branch(
+        self,
+        test_name: str = "test_a",
+        mainline_result: Result = Result.PASS,
+        branch_result: Result = Result.FAIL,
+    ) -> int:
+        """Mainline's own result, then the SAME triple on a branch with
+        a DIFFERENT result -- the exact contradiction case this feature
+        exists for. Returns the branch's stream_id."""
+        self.store.upsert_runs([make_record(
+            test_name=test_name, result=mainline_result, start=BASE,
+        )])
+        self.store.upsert_runs([make_record(
+            test_name=test_name, result=branch_result,
+            start=BASE + datetime.timedelta(days=1), branch="feat/x",
+        )])
+        streams = self.store.list_streams("")
+        return streams[0].stream_id
+
+    def test_the_origin_streams_own_result_is_returned(self) -> None:
+        branch_id = self._seed_mainline_and_branch()
+        found = self.store.latest_results_for_streams(
+            [(branch_id, "linux-sim", "suite.py", "test_a")])
+        self.assertEqual(
+            found[(branch_id, "linux-sim", "suite.py", "test_a")],
+            Result.FAIL,
+        )
+
+    def test_a_triple_the_stream_never_ran_is_simply_absent(self) -> None:
+        branch_id = self._seed_mainline_and_branch()
+        found = self.store.latest_results_for_streams(
+            [(branch_id, "linux-sim", "suite.py", "test_never_ran")])
+        self.assertEqual(found, {})
+
+    def test_mainline_and_branch_are_kept_separate_by_stream_id(
+        self
+    ) -> None:
+        """The same triple, two different stream_id keys, must not
+        collide -- proving the batched query keys on stream_id too, not
+        only the triple."""
+        branch_id = self._seed_mainline_and_branch()
+        found = self.store.latest_results_for_streams([
+            (1, "linux-sim", "suite.py", "test_a"),
+            (branch_id, "linux-sim", "suite.py", "test_a"),
+        ])
+        self.assertEqual(found[(1, "linux-sim", "suite.py", "test_a")],
+                          Result.PASS)
+        self.assertEqual(
+            found[(branch_id, "linux-sim", "suite.py", "test_a")],
+            Result.FAIL,
+        )
+
+    def test_empty_input_issues_no_query(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            found = self.store.latest_results_for_streams([])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(found, {})
+        self.assertEqual(seen, [])
+
+    def test_the_query_count_is_bounded_by_chunks_not_keys(self) -> None:
+        """250 keys must not mean 250 queries. Chunked at _RECENT_CHUNK
+        (100): ceil(250/100) = 3."""
+        records = []
+        for index in range(250):
+            records.append(make_record(
+                test_name="t%03d" % index, result=Result.PASS, start=BASE,
+            ))
+        self.store.upsert_runs(records)
+        keys = [
+            (1, "linux-sim", "suite.py", "t%03d" % i) for i in range(250)
+        ]
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            found = self.store.latest_results_for_streams(keys)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(found), 250)
+        selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
+        self.assertEqual(
+            len(selects), 3,
+            "expected ceil(250/100) queries, got {0}".format(len(selects)))
+
+    def test_duplicate_keys_are_not_fetched_twice(self) -> None:
+        branch_id = self._seed_mainline_and_branch()
+        key = (branch_id, "linux-sim", "suite.py", "test_a")
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            self.store.latest_results_for_streams([key, key, key])
+        finally:
+            conn.set_trace_callback(None)
+        selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
+        self.assertEqual(len(selects), 1)
+
+
 class TestSortIndexesAreUsed(StorageTestBase):
     """Migration 4: the descending sorts must not sort the whole table.
 

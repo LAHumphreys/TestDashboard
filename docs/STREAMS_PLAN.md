@@ -60,6 +60,19 @@ WP-15 on 8) move up behind it.
    with product and environment cards and gains branch/build cards in
    WP-21/22; the card grammar is designed for that from day one.
 
+**Item 4 reconfirmed (User, 2026-08-09), during the perf round's Open
+Actions addendum.** The question was raised directly: should an
+assignment be scoped per-stream instead of per-triple, now that a row's
+displayed result can visibly disagree between mainline and its
+assignment's origin stream (§5.4's ADDENDUM 3)? Decision: **no** — one
+owner per triple, unchanged. The fix for the disagreement is
+TRUTHFUL DISPLAY (show both sides), not a second axis of ownership;
+splitting assignment by stream would mean the same failing test could
+have a different owner on mainline and on every branch that touches
+it, which is a different, larger feature nobody has asked for and
+which item 4's own reasoning ("visible from mainline and vice versa")
+was written to prevent.
+
 Terminology: **"stream" is the internal name** (tables, code, API params).
 The UI calls the picker **"Build"** with "Mainline nightlies" as the default
 entry — testers pick builds and branches; they never need the word stream.
@@ -1485,6 +1498,72 @@ recorded here rather than left implicit:
     thrown, the page's own card still rendering normally.
   - **Not verified**: layout/legibility of the header without the
     switcher at a real screen size — no browser has rendered it.
+- **ADDENDUM 3 (2026-08-09): Open Actions' truthful display, and §0.4
+  reconfirmed.** The user decided directly (see §0's item-4
+  reconfirmation note above) that assignment stays one-owner-per-triple
+  — this addendum is a DISPLAY fix, not a data-model change. The seam:
+  a row's `result` chip is always mainline's (Open Actions never scopes
+  `/api/dashboard` by `stream=` — assignments are estate-level), but a
+  row's CURRENT assignment can have been made from a non-mainline
+  stream whose own result for the same triple disagrees — an
+  "assigned from the RC" row could read mainline's PASS while the RC
+  failure it represents was still live, a contradiction on its face.
+  Previously flagged as an accepted limitation in an earlier report;
+  no longer accepted.
+  - **Fix**: for a row with a non-mainline origin, the result cell
+    shows BOTH sides, reusing the EXACT compare-strip visual language
+    `compare.js:renderCompareStrip()` already built for the test-detail
+    page's own mainline-vs-branch strip — imported directly into
+    `actions.js` rather than reinventing it: ghost mainline chip →
+    solid origin-stream chip, or "no result" text (never a colour) when
+    the origin never ran the test or mainline never saw it. A
+    mainline-origin row is byte-for-byte unchanged — the plain single
+    `resultChip()` it always had.
+  - **Mechanics**: new `Storage.latest_results_for_streams(keys)` —
+    batched by `(stream_id, environment, script, test_name)`,
+    `latest_runs`'s own PRIMARY KEY, so every key is an index seek. ONE
+    query for the whole page's non-mainline-origin rows (chunked at
+    `_RECENT_CHUNK`, the same 100-key batch size
+    `failure_streak_bounds_many`/`recent_results` use), never a lookup
+    per row — the perf round's own discipline applied to its own
+    addendum. Skipped ENTIRELY when nothing on the page has a
+    non-mainline origin, which is every existing caller of
+    `/api/dashboard` including the plain index.html dashboard — zero
+    new queries for them. `_handle_dashboard` extends the existing
+    per-row payload with `origin_result` (present, possibly `null`,
+    only for rows that have `assignment_stream_id` — ABSENT, not
+    merely null, for every mainline-origin row, so an existing caller's
+    payload is byte-identical to before this addendum) rather than
+    reshaping the endpoint.
+  - **Measured, dev-scale**: the batched query costs exactly ONE extra
+    round trip regardless of how many origin rows are on the page (1
+    row or several, both pinned by test) — no per-row cost, matching
+    the perf round's own target for this class of fix.
+  - **Live-verified**, node DOM-shim harness against a scratch server
+    (own port, own throwaway db, never the shared 8791 instance), two
+    real assignments through the actual API (not synthetic JSON): a
+    row assigned from a branch where mainline FAILS and the branch
+    PASSES rendered both chips (ghost FAIL, solid PASS) labelled
+    "mainline" and the branch's own name; a row assigned from the same
+    branch for a test it never ran rendered mainline's ghost chip plus
+    literal "no result" text carrying no result-colour class; a
+    mainline-origin row (not driven separately here, but exercised by
+    every other passing Open Actions test in the suite) kept the plain
+    single chip.
+  - **Incidental finding, out of scope, not fixed**: `static/actions.js`
+    has carried a literal U+0000 (NUL) byte inside the `UNASSIGNED`
+    sentinel string literal (`const UNASSIGNED = "\x00unassigned";`)
+    since the file's very FIRST commit (`ed4a59a6`, 2026-07-28) — valid
+    JavaScript (a string may contain any code point), and harmless in
+    practice because every read AND write of the sentinel goes through
+    the SAME constant reference, never compared against a literal
+    `"unassigned"` typed elsewhere. Left alone — unrelated to this
+    addendum's scope, and "harmless but odd" is not the same bar as
+    "found while doing the work asked for."
+  - **Not verified**: layout/legibility of the two-chip strip inside
+    Open Actions' existing result column at a real screen size — the
+    column may need to be wider than it is today; no browser has
+    rendered it.
 
 ---
 

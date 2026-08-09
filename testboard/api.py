@@ -931,6 +931,38 @@ def _handle_dashboard(
         storage.stream_identities(assignment_stream_ids)
         if assignment_stream_ids else {}
     )
+    # WP-23 perf-round ADDENDUM 3: truthful display for Open Actions.
+    # `row.result` above is ALWAYS mainline's (this endpoint is never
+    # scoped by stream_id for that page — assignments are estate-level,
+    # §0.4) but a row whose CURRENT assignment was made from a
+    # non-mainline stream can have a DIFFERENT result there — an
+    # "assigned from the RC" row reading PASS while the RC failure it
+    # represents is still live is a contradiction on its face. ONE
+    # batched query for the page's non-mainline-origin rows (the PK
+    # serves it — see Storage.latest_results_for_streams), never a
+    # lookup per row; skipped outright when nothing on the page has a
+    # non-mainline origin (the common case — every existing caller of
+    # this endpoint, including the plain dashboard, sees no new query
+    # at all). `origin_result` is present in the JSON only for rows
+    # that have an origin stream; absent (not merely null) everywhere
+    # else, so a caller with no stream-origin assignments sees a
+    # byte-identical payload to before this addendum.
+    if assignment_stream_ids:
+        origin_results = storage.latest_results_for_streams([
+            (row.assignment_stream_id, row.environment, row.script,
+             row.test_name)
+            for row in rows if row.assignment_stream_id is not None
+        ])
+        for row, item in zip(rows, payload):
+            if row.assignment_stream_id is not None:
+                key = (
+                    row.assignment_stream_id, row.environment, row.script,
+                    row.test_name,
+                )
+                result = origin_results.get(key)
+                item["origin_result"] = (
+                    None if result is None else result.value
+                )
     return _json_response(
         200,
         {

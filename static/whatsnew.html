@@ -126,7 +126,11 @@
           carries a small tag saying which one — and once at least one
           assignment has come from a branch, a filter appears alongside the
           owner filters to show only branch-originated items, or only
-          mainline's own.</li>
+          mainline's own. <strong>Fixed:</strong> that row's result used to
+          show only mainline's — a test assigned from a struggling branch
+          could read "passing" even while it was still failing there. It now
+          shows both: mainline's result, then that branch or build's own,
+          side by side.</li>
         <li>The Watchlist (below) can carry a branch/build card too — add
           one from the "Branch/build" option in the card picker to keep an
           eye on a branch's or build's health alongside your usual

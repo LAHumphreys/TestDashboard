@@ -137,6 +137,19 @@ EXCLUDED_TESTS = {
     "TestSummary."
     "test_the_full_payload_counts_every_queue_in_one_grouped_query":
         "counts queries via sqlite3's set_trace_callback.",
+    "TestLatestResultsForStreams.test_empty_input_issues_no_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestLatestResultsForStreams."
+    "test_the_query_count_is_bounded_by_chunks_not_keys":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestLatestResultsForStreams.test_duplicate_keys_are_not_fetched_twice":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestOriginResultTruthfulDisplay."
+    "test_an_estate_with_no_stream_origin_assignments_costs_no_extra_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestOriginResultTruthfulDisplay."
+    "test_many_origin_rows_cost_exactly_one_extra_query":
+        "counts queries via sqlite3's set_trace_callback.",
 }  # type: Dict[str, str]
 
 if backends.MARIADB_AVAILABLE:

@@ -4977,6 +4977,57 @@ class Storage:
             key: series[-limit:] for key, series in found.items()
         }
 
+    def latest_results_for_streams(
+        self,
+        keys: Sequence[Tuple[int, str, str, str]],
+    ) -> Dict[Tuple[int, str, str, str], Result]:
+        """Batched ``latest_runs.result`` lookup, keyed by ``(stream_id,
+        environment, script, test_name)`` — ``latest_runs``'s own PRIMARY
+        KEY, so every key is an index seek, never a scan.
+
+        WP-23 perf-round ADDENDUM 3 (Open Actions' truthful display,
+        docs/STREAMS_PLAN.md §5.4): a row's own ``result`` from
+        :meth:`dashboard` is always MAINLINE's (Open Actions never
+        passes ``stream_id`` to that call — assignments are estate-level,
+        §0.4) — but when the row's CURRENT assignment was made from a
+        non-mainline stream, that stream's OWN latest result for the
+        same triple can disagree with mainline's, and showing only
+        mainline's was a contradiction on its face ("assigned from the
+        RC" reading PASS while the RC failure it represents is live). A
+        key ABSENT from the returned dict means no result at all on
+        that stream for that triple — never fabricated, never defaulted
+        to a colour.
+
+        Chunked at :data:`_RECENT_CHUNK` (100, the same batch size
+        :meth:`recent_results` uses) to stay under SQLite's
+        999-bound-parameter ceiling — each key costs 4 params here, the
+        same as a triple costs 3 there.
+        """
+        found = {}  # type: Dict[Tuple[int, str, str, str], Result]
+        unique = list(dict.fromkeys(keys))
+        if not unique:
+            return found
+        conn = self._conn()
+        for start in range(0, len(unique), _RECENT_CHUNK):
+            chunk = unique[start:start + _RECENT_CHUNK]
+            clause = " OR ".join(
+                "(stream_id = ? AND environment = ? AND script = ? "
+                "AND test_name = ?)"
+                for _ in chunk
+            )
+            params = []  # type: List[Any]
+            for stream_id, environment, script, test_name in chunk:
+                params.extend([stream_id, environment, script, test_name])
+            rows = conn.execute(
+                "SELECT stream_id, environment, script, test_name, "
+                "result FROM latest_runs WHERE " + clause,
+                tuple(params),
+            ).fetchall()
+            for row in rows:
+                key = (int(row[0]), row[1], row[2], row[3])
+                found[key] = Result(row[4])
+        return found
+
     def failure_streak_bounds(
         self,
         environment: str,
