@@ -2013,3 +2013,99 @@ re-push timing. All numbers DEV data (~1/4 production size).
   pool pressure; every cost above was SQL, not starvation.
 - Remaining dev-only numbers needing production confirmation are listed
   in docs/drops/2026-08-14.md's not-verified section.
+
+## 2026-08-09 — usability sweep (F1-F7) and the branch-parity closeout
+
+Continuation of the streams work: seven small usability fixes (F1-F7)
+plus a link-matrix audit that found the remaining places a stream-scoped
+page's own links silently dropped back to mainline, closed in two final
+commits. This entry is the permanent measurement record; per-feature
+detail lives in docs/STREAMS_PLAN.md Sec5.4 "as built", the drop-facing
+summary in docs/drops/2026-08-14.md.
+
+**F5's verdict line — measured cost, not the ~15ms assumed at the ask.**
+A build's delta view previously named only one baseline at a time; the
+new line names both (previous build and mainline) via one extra
+counts-only /api/compare call, fired fire-and-forget so it never sits
+on the critical path. Measured storage-layer compare_counts, synthetic
+~12,000-test/3-environment product (CLAUDE.md's own nightly scale), 30
+samples after warmup:
+  - Migrated copy of the repo-root dev db: median 141-158ms.
+  - A database built FRESH at the identical scale (rules out the
+    migrated file's accumulated layout as the explanation): median
+    115-125ms against a real baseline partition. This run caught a
+    seeding bug on the way there: two streams sharing one start_time
+    collide on upsert_runs's legacy-key check (the runs table's UNIQUE
+    on (environment, script, test_name, start_time) has no stream
+    column), and the second silently writes zero rows — a first
+    attempt compared against an empty partition and returned a bogus
+    ~45ms. Worth remembering for any future seeding across streams.
+  - End-to-end (HTTP+JSON) on the fresh db: ~125ms counts-only,
+    ~347-404ms for a full page (counts plus one category's rows).
+  - Live via the DOM-shim harness: delta-section's own render completed
+    at +742ms from module load, the verdict line filled in at +870ms —
+    a +128ms delay, matching the standalone measurement, landing
+    strictly after first paint.
+  - Framing: the "15ms end-to-end" figure already in this log (the
+    2026-08-09 overnight perf pass entry above) was measured on a
+    smaller dataset than the full nightly estate — this is a scale
+    difference between two honest measurements, not a regression
+    between them.
+  All figures dev-tier hardware, dev-scale data, never production.
+
+**PART B's EXPLAIN QUERY PLAN verdict for
+GET /api/scripts/{env}/{script}/executions?stream=: BYTE-IDENTICAL, not
+degraded.** storage.script_runs()'s SQL already carried a stream_id
+predicate in its WHERE clause for every caller since F7 (WP-streams
+work); this change only changes which VALUE gets bound to it here, not
+the query's shape. Ran the plan for stream_id=1 (mainline) and
+stream_id=3 (a build) against the same real script: both give SEARCH
+runs USING INDEX sqlite_autoindex_runs_1 (environment=? AND script=?)
+then USE TEMP B-TREE FOR ORDER BY. Worth recording plainly, since it
+generalises beyond this one endpoint: the runs UNIQUE index's third
+column is test_name, ahead of start_time, so start_time and stream_id
+are both row-level filters over the whole (environment, script)
+prefix, never further index-narrowed — a PRE-EXISTING characteristic
+of this query since before F7, not introduced or worsened by adding
+stream= here. Anyone adding another predicate to script_runs() later
+should expect the same shape, not a new index seek.
+
+Measured, dev-tier hardware, ~12k-test/540k-run dev-scale data (a copy
+of the repo-root dev db): a busy real script (1,350 mainline runs), 40
+samples after warmup — unscoped (the pre-existing behaviour) median
+38.35ms, p95 40.55ms; explicit stream=1 (same value, the new code
+path) median 38.16ms, p95 39.37ms — statistically indistinguishable,
+confirming _resolve_stream_id() costs nothing measurable on the hot
+mainline path (it returns immediately without a query when stream= is
+absent). A build stream with far fewer runs for the same script
+answered in median 5.19ms, p95 5.50ms — faster, never slower.
+analytics.group_executions needed no change: confirmed by reading it,
+a pure function over whatever runs it is handed, with no
+environment/script/stream awareness of its own.
+
+**Decisions recorded because they will look like oversights otherwise:**
+  - storage.script_exists() stays UNSCOPED by stream, matching /runs's
+    own precedent — a script's identity is not partitioned by stream,
+    only its runs are.
+  - F3's "(mainline)" honesty label on test.js's suite link is
+    SUPERSEDED, not kept alongside the fix: once script.html itself
+    honours stream=, the label's premise (the link always lands on
+    mainline) no longer holds, so the link now carries stream= through
+    instead and the title/text revert to their plain pre-F3 constants.
+  - The Watch card's unassigned-failing stat link applies the
+    result=FAIL&unassigned=1 filter to every card kind, not only
+    branches — the original stream-card special case was wrong for
+    long-running branches, caught and fixed after committing F4.
+  - script.html gained no product switcher — environment= already
+    fully disambiguates the page, so product= would be inert there.
+
+Suite, final tree after every commit in this entry: 1906 OK (skipped=1)
+SQLite-only; 2528 OK (skipped=21) combined SQLite+MariaDB 10.3
+dual-backend leg (TESTBOARD_TEST_DB_CNF set, CI's own
+python36-mariadb leg's stream).
+
+No browser has rendered any of this — the branch band's layout above
+script.html's executions chart, the suite-history table scoped to a
+branch, screen size and contrast are all unverified, same standing
+caveat as every prior round. Listed in docs/drops/2026-08-14.md's
+not-verified section.
