@@ -489,6 +489,13 @@ function buildRow(row, domainFrom, span, showDate) {
   const params = new URLSearchParams();
   params.append("environment", state.environment);
   params.append("script", row.script);
+  // Script-page parity (FINAL ROUND): a stream-scoped Timeline's block
+  // row must land on that SAME stream's suite history, not mainline's
+  // -- script.html now honours stream= (previously a dead param). No-op
+  // on mainline.
+  if (state.streamId !== null) {
+    params.append("stream", String(state.streamId));
+  }
   const link = el("a", "tl-script", row.script);
   link.href = "script.html?" + params.toString();
   link.title = "Execution history for this suite";

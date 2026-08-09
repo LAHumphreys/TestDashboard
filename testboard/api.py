@@ -1850,7 +1850,17 @@ def _handle_script_executions(
     no batch id, so executions are inferred from the run timings — see
     :func:`testboard.analytics.group_executions`.
 
-    Query parameters: ``days`` (1..90, default 14).
+    Query parameters: ``days`` (1..90, default 14), ``stream=`` (script-
+    page parity, default mainline — the same param `/api/scripts/{env}/
+    {script}/runs` has accepted since F7). ``storage.script_runs()``
+    already carries a ``stream_id`` predicate in its SQL for every
+    caller, mainline included — passing the resolved value through here
+    changes what that predicate matches, not the query's shape at all,
+    so this endpoint's own EXPLAIN QUERY PLAN is unaffected by this
+    change (measured, see docs/STREAMS_PLAN.md §5.4 "as built").
+    ``script_exists()`` deliberately stays UNSCOPED (matches ``/runs``'s
+    own existing behaviour): a script's identity is not partitioned by
+    stream, only its runs are.
     """
     if not storage.script_exists(environment, script):
         raise _HttpError(
@@ -1859,13 +1869,22 @@ def _handle_script_executions(
                 environment, script
             ),
         )
+    stream_id = _resolve_stream_id(storage, request)
+    # Same reason /api/time and /api/timeline fetch this (F7): the page
+    # needs a stream's kind/name to render its own branch band, only
+    # paid when scoped away from mainline.
+    stream = (
+        None if stream_id == MAINLINE_STREAM_ID
+        else storage.get_stream(stream_id)
+    )
     days = _parse_int_param(
         request, "days", _EXECUTIONS_DEFAULT_DAYS, 1,
         _EXECUTIONS_MAX_DAYS,
     )
     since = now() - datetime.timedelta(days=days)
     runs = storage.script_runs(
-        environment, script, since, _EXECUTIONS_MAX_RUNS
+        environment, script, since, _EXECUTIONS_MAX_RUNS,
+        stream_id=stream_id,
     )
     executions = analytics.group_executions(
         runs, gap_minutes=_EXECUTION_GAP_MINUTES
@@ -1875,6 +1894,9 @@ def _handle_script_executions(
         {
             "environment": environment,
             "script": script,
+            "stream": stream_id,
+            "stream_identity": None if stream is None else _stream_json(
+                stream),
             "days": days,
             "gap_minutes": _EXECUTION_GAP_MINUTES,
             "run_count": len(runs),

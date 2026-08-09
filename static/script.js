@@ -28,6 +28,7 @@ import {
   showError,
 } from "./api.js";
 import { stackedColumnChart } from "./charts.js";
+import { renderBranchBand } from "./compare.js";
 
 /** Tests listed per page in the lower table. */
 const CHUNK = 100;
@@ -38,6 +39,11 @@ const state = {
   days: 14,
   tests: [],
   total: 0,
+  // Script-page parity (FINAL ROUND, docs/STREAMS_PLAN.md §5.2 "as
+  // built"): this page had no stream support of its own before this --
+  // absent means mainline, the same "zero visible change" rule every
+  // other stream-aware page follows (WP-23's `?stream=` grammar).
+  streamId: null,
 };
 
 /* The same status colours the rest of the dashboard uses. */
@@ -58,8 +64,11 @@ function scriptApiPath(suffix) {
 async function loadExecutions() {
   clearError();
   try {
-    const data = await fetchJson(
-      scriptApiPath("/executions") + "?days=" + state.days);
+    let path = scriptApiPath("/executions") + "?days=" + state.days;
+    if (state.streamId !== null) {
+      path += "&stream=" + state.streamId;
+    }
+    const data = await fetchJson(path);
     renderExecutions(data);
   } catch (err) {
     showError(err.message);
@@ -76,6 +85,12 @@ async function loadTests(append) {
   qs.append("sort", "test_name");
   qs.append("limit", String(CHUNK));
   qs.append("offset", String(append ? state.tests.length : 0));
+  // Script-page parity: the "tests in this suite" table must show THIS
+  // stream's own current results, not mainline's, when scoped -- the
+  // same /api/dashboard?stream= every other list in the app reads.
+  if (state.streamId !== null) {
+    qs.append("stream", String(state.streamId));
+  }
   try {
     const page = await fetchJson("/api/dashboard?" + qs.toString());
     state.tests = append ? state.tests.concat(page.tests) : page.tests;
@@ -89,6 +104,13 @@ async function loadTests(append) {
 /* ================= executions ================= */
 
 function renderExecutions(data) {
+  // Script-page parity: the same guard time.js/timeline.js/test.js use
+  // -- the band only ever draws when this page was actually asked to
+  // scope to a stream AND the server named one back. A mainline load
+  // (state.streamId === null) never touches renderBranchBand at all.
+  if (state.streamId !== null && data.stream_identity) {
+    renderBranchBand(data.stream_identity);
+  }
   const executions = data.executions;
   document.getElementById("empty-state").hidden = executions.length !== 0;
   document.getElementById("executions-meta").textContent =
@@ -198,6 +220,11 @@ function renderTests(rows, append) {
     params.append("environment", row.environment);
     params.append("script", row.script);
     params.append("test_name", row.test_name);
+    // Scope-carriage: this page's own scope, so the test opened from
+    // it lands on that SAME stream, not mainline's.
+    if (state.streamId !== null) {
+      params.append("stream", String(state.streamId));
+    }
     link.href = "test.html?" + params.toString();
     link.textContent = row.test_name;
     cell.appendChild(link);
@@ -240,6 +267,8 @@ function init() {
   const url = new URL(window.location.href);
   state.environment = url.searchParams.get("environment") || "";
   state.script = url.searchParams.get("script") || "";
+  const rawStream = url.searchParams.get("stream");
+  state.streamId = rawStream ? parseInt(rawStream, 10) : null;
   if (!state.environment || !state.script) {
     showError("This page needs an environment and a script in the URL.");
     document.getElementById("loading-state").hidden = true;

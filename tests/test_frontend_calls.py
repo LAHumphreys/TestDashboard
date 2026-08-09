@@ -1770,50 +1770,133 @@ class TestPageBranchBandTest(unittest.TestCase):
         self.assertIn("backLink.href", body)
 
 
-class SuiteLinkHonestyTest(unittest.TestCase):
-    """F3 (docs/STREAMS_PLAN.md §5.2 "as built"): script.html has no
-    stream support of its own (a decision-list item, not this fix) —
-    the suite link on a stream-scoped test page silently jumps back to
-    MAINLINE's execution history. This does not add stream support;
-    it only stops the silent context switch by saying, in the link's
-    own title AND visibly beside it (never hover-only — the same
-    "never the only signal" rule the rest of this project follows),
-    that the link goes to mainline regardless of the page's own scope.
-
-    Superseded by script-page parity, PART B of the same audit this
-    file's ScopeCarriageLinkMatrixTest covers PART A of — see
-    ScriptPageParityTest once that lands; this class is pinned exactly
-    as committed for F3 until then.
+class SuiteLinkParityTest(unittest.TestCase):
+    """F3, superseded (docs/STREAMS_PLAN.md §5.2 "as built"):
+    script.html originally had no stream support of its own, so a
+    stream-scoped test page's suite link silently jumped back to
+    MAINLINE's execution history — F3 could only say so (a title plus
+    a visible "(mainline)" note), not fix it. Script-page parity (the
+    FINAL ROUND) gives script.html real stream support, so the suite
+    link now carries `stream=` through instead — the same scope-self-
+    sufficient pattern every other inbound link to a scoped page
+    follows — and the honesty label is gone because the thing it was
+    warning about no longer happens.
     """
 
-    def test_the_title_is_conditional_on_stream_identity(self) -> None:
-        """CRLF line endings in this file mean an exact multi-line
-        literal match is fragile (bit a prior test in this file once);
-        several independent substring checks instead."""
+    def test_the_link_carries_the_pages_own_stream(self) -> None:
         body = _function_body(read("test.js"), "function renderDetail(")
-        self.assertIn("suiteLink.title = detail.stream_identity", body)
-        self.assertIn(
-            '"Execution history for this suite (mainline)"', body)
-        self.assertIn('"Execution history for this suite"', body)
+        self.assertIn("if (streamId !== null) {", body)
+        stream_at = body.index("if (streamId !== null) {")
+        self.assertIn('params.append("stream", String(streamId))',
+                       body[stream_at:stream_at + 100])
+        self.assertLess(
+            stream_at, body.index('"script.html?"'),
+            "the stream param must be appended BEFORE the href is built")
 
-    def test_a_visible_mainline_note_is_added_beside_the_link_when_scoped(
-        self
-    ) -> None:
-        """Not hover-only: a reader who never hovers must still see it."""
-        body = _function_body(read("test.js"), "function renderDetail(")
-        self.assertIn("if (detail.stream_identity) {", body)
-        note_at = body.index("if (detail.stream_identity) {")
-        self.assertIn(
-            'createTextNode(" (mainline)")', body[note_at:note_at + 100])
+    def test_the_mainline_honesty_label_is_gone(self) -> None:
+        """F3's "(mainline)" title/note both depended on
+        detail.stream_identity being truthy — neither should exist any
+        more now that the link honours the page's own scope instead of
+        silently ignoring it. Scoped to just the suite-link-building
+        portion of renderDetail(): the function legitimately reads
+        detail.stream_identity elsewhere too (state.streamIdentity,
+        unrelated to this link)."""
+        body = _strip_comments(
+            _function_body(read("test.js"), "function renderDetail("))
+        link_section = body[
+            body.index("const params = new URLSearchParams();"):
+            body.index("identity.appendChild(suiteLink);")]
+        self.assertNotIn("(mainline)", link_section)
+        self.assertNotIn("detail.stream_identity", link_section)
 
-    def test_the_note_is_appended_after_the_link_not_before(self) -> None:
+    def test_the_title_is_a_plain_constant_again(self) -> None:
         body = _function_body(read("test.js"), "function renderDetail(")
-        link_append_at = body.index("identity.appendChild(suiteLink)")
-        note_append_at = body.index('createTextNode(" (mainline)")')
-        self.assertLess(link_append_at, note_append_at)
+        self.assertIn(
+            'suiteLink.title = "Execution history for this suite";', body)
 
     def test_no_innerHTML(self) -> None:
         self.assertNotIn("innerHTML", _strip_comments(read("test.js")))
+
+
+class ScriptPageParityTest(unittest.TestCase):
+    """Script-page parity, PART B of the FINAL ROUND's link-matrix
+    audit follow-up (docs/STREAMS_PLAN.md §5.2 "as built"): script.html
+    was the last mainline-only tool. It now accepts `?stream=`, forwards
+    it to every request it makes, renders the shared branch band, and
+    every inbound link to it (from app.js, timeline.js, test.js) carries
+    the scope through — the same pattern the rest of the app already
+    follows."""
+
+    def test_state_reads_stream_from_the_url(self) -> None:
+        body = _function_body(read("script.js"), "function init()")
+        self.assertIn('url.searchParams.get("stream")', body)
+        self.assertIn("state.streamId = rawStream ? parseInt", body)
+
+    def test_executions_fetch_forwards_the_stream(self) -> None:
+        body = _function_body(
+            read("script.js"), "async function loadExecutions()")
+        self.assertIn("if (state.streamId !== null) {", body)
+        self.assertIn('"&stream=" + state.streamId', body)
+
+    def test_the_tests_table_fetch_also_forwards_the_stream(self) -> None:
+        """The "tests in this suite" table reads /api/dashboard, a
+        DIFFERENT endpoint from /executions — found by the same
+        discipline F7's timeline.js fix used: every outbound request a
+        stream-scoped page makes needs the param, not only the first
+        one."""
+        body = _function_body(read("script.js"), "async function loadTests(")
+        self.assertIn("if (state.streamId !== null) {", body)
+        self.assertIn('qs.append("stream", String(state.streamId))', body)
+
+    def test_renders_the_shared_branch_band_when_scoped(self) -> None:
+        self.assertIn(
+            "renderBranchBand", _imported_names(read("script.js")))
+        body = _function_body(
+            read("script.js"), "function renderExecutions(")
+        self.assertIn(
+            "if (state.streamId !== null && data.stream_identity) {", body)
+        self.assertIn("renderBranchBand(data.stream_identity)", body)
+
+    def test_the_tests_table_links_carry_the_stream(self) -> None:
+        body = _function_body(read("script.js"), "function renderTests(")
+        self.assertIn("if (state.streamId !== null) {", body)
+        stream_at = body.index("state.streamId !== null")
+        self.assertLess(
+            stream_at, body.index('"test.html?"'),
+            "the stream param must be appended BEFORE the href is built")
+
+    def test_the_band_mount_ships_hidden_in_the_markup(self) -> None:
+        html = read_text("script.html")
+        self.assertIn('id="branch-band" class="branch-band" hidden', html)
+
+    def test_the_mount_ids_match_the_other_pages(self) -> None:
+        html = read_text("script.html")
+        self.assertIn('id="branch-band-text"', html)
+        self.assertIn('id="branch-band-back"', html)
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", _strip_comments(read("script.js")))
+
+    def test_app_js_scriptLink_carries_the_stream(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function scriptLink("))
+        self.assertIn("appendStream(params)", body)
+        stream_at = body.index("appendStream(params)")
+        self.assertLess(stream_at, body.index('"script.html?"'))
+
+    def test_timeline_js_block_link_carries_the_stream(self) -> None:
+        """The audit's PART A note: the block row's own script.html
+        link was found unscoped in the same pass as the run-row test
+        links, but left for script-page parity to fix here, since a
+        stream= param on it was only useful once script.html could
+        read one."""
+        body = _strip_comments(_function_body(
+            read("timeline.js"), "function buildRow("))
+        self.assertIn("if (state.streamId !== null) {", body)
+        stream_at = body.index("state.streamId !== null")
+        self.assertLess(
+            stream_at, body.index('"script.html?"'),
+            "the stream param must be appended BEFORE the href is built")
 
 
 class EveryBuildAndStreamSwitcherTest(unittest.TestCase):

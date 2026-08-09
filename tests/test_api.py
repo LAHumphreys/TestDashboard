@@ -2445,6 +2445,51 @@ class TestScriptExecutions(ApiCase):
         self.seed()
         self.assert_405("POST", self.path(), "GET")
 
+    def test_mainline_has_no_stream_identity(self) -> None:
+        self.seed()
+        data = self.call("GET", self.path(), query={"days": ["30"]})
+        self.assertEqual(data["stream"], 1)
+        self.assertIsNone(data["stream_identity"])
+
+    def test_stream_param_reads_the_branch_own_executions(self) -> None:
+        """Script-page parity (FINAL ROUND, docs/STREAMS_PLAN.md §5.2
+        "as built"): storage.script_runs() already carries a stream_id
+        predicate for every caller (F7); this endpoint just did not
+        pass one through yet. group_executions() aggregates away test
+        names, so the proof here is EXECUTION SIZE: mainline gets one
+        run, the branch gets two runs in the SAME window -- if either
+        side leaked the other's data the totals would disagree with
+        this."""
+        base = "2026-07-25T02:00:00.000000"
+        self.import_runs([record(
+            script=self.SCRIPT, test_name="mainline_only",
+            start_time=base, end_time=base,
+        )])
+        self.import_runs([
+            record(script=self.SCRIPT, test_name="branch_a", branch="feat/x",
+                   start_time=base, end_time=base),
+            record(script=self.SCRIPT, test_name="branch_b", branch="feat/x",
+                   start_time=base, end_time=base),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+
+        mainline = self.call(
+            "GET", self.path(), query={"days": ["30"]})
+        self.assertEqual(mainline["stream"], 1)
+        self.assertIsNone(mainline["stream_identity"])
+        self.assertEqual(len(mainline["executions"]), 1)
+        self.assertEqual(mainline["executions"][0]["total"], 1)
+
+        branch = self.call(
+            "GET", self.path(),
+            query={"days": ["30"], "stream": [str(stream_id)]})
+        self.assertEqual(branch["stream"], stream_id)
+        self.assertEqual(branch["stream_identity"]["kind"], "branch")
+        self.assertEqual(branch["stream_identity"]["name"], "feat/x")
+        self.assertEqual(len(branch["executions"]), 1)
+        self.assertEqual(branch["executions"][0]["total"], 2)
+
 
 class TestFrontendSortContract(unittest.TestCase):
     """The UI's sortable columns must be keys the server actually serves.

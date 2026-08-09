@@ -1131,6 +1131,93 @@ recorded here rather than left implicit:
   results") — its browse table's, and its "Still failing" queue's,
   test links both carried `stream=2`; a stream-scoped Timeline's
   expanded run row's test link carried it too.
+- **Link-matrix audit follow-up, PART B (FINAL ROUND): script-page
+  parity — the last mainline-only tool.** `script.html` (suite
+  execution history) now accepts `?stream=`, the same as every other
+  page. This closes the user's explicit requirement: "detailed
+  analysis on a product's branch using all the same tools as
+  mainline."
+  - **`testboard/api.py`.** Both script endpoints now accept `stream=`
+    (default mainline): `GET /api/scripts/{env}/{script}/runs` already
+    did (F7); `GET /api/scripts/{env}/{script}/executions` gained it
+    here, resolved the same way and echoed back as `stream` plus a
+    `stream_identity` object (`None` on mainline) so the page can
+    render its own branch band without a second fetch — the identical
+    pattern `/api/time`/`/api/timeline` already established.
+    `storage.script_runs()` **already carried a `stream_id` predicate
+    in its SQL for every caller** (F7) — this change only changes
+    which VALUE gets bound to it for this one endpoint, not the query
+    shape at all. `storage.script_exists()` deliberately stays
+    UNSCOPED, matching `/runs`'s own precedent: a script's identity is
+    not partitioned by stream, only its runs are.
+  - **`testboard/analytics.group_executions()` needed NO change**,
+    confirmed by reading it: it is a pure function over whatever
+    `Sequence[StoredRun]` it is handed, with no awareness of
+    environment, script, or stream at all — the scoping happens
+    entirely in what `storage.script_runs()` feeds it, one layer down.
+  - **EXPLAIN QUERY PLAN verdict: byte-identical, not degraded.**
+    `script_runs()`'s SQL text is unchanged by this drop (the
+    `stream_id = ?` predicate was already there since F7); SQLite does
+    not plan differently for different bound VALUES of the same
+    literal predicate, confirmed by running the plan for both
+    `stream_id=1` (mainline) and `stream_id=3` (a build) against the
+    same real script — identical output both times:
+    `SEARCH runs USING INDEX sqlite_autoindex_runs_1 (environment=? AND
+    script=?)` followed by `USE TEMP B-TREE FOR ORDER BY`. Worth
+    recording plainly since it is NOT what "bounded window" might
+    suggest: the UNIQUE index's third column is `test_name`, before
+    `start_time`, so a fixed `(environment, script)` prefix does not
+    give SQLite an ordered-by-time seek — `start_time`/`stream_id` are
+    both applied as row-level filters over that whole prefix, and the
+    final `ORDER BY start_time` needs a temp b-tree regardless of
+    scope. This is a PRE-EXISTING characteristic of `script_runs()`
+    (unchanged since before F7), not something this drop introduces or
+    worsens.
+  - **Measured, dev-tier hardware, ~12k-test/540k-run dev-scale data**
+    (a copy of the repo-root dev db — never called production, per
+    house rules): `/api/scripts/{env}/{script}/executions` against a
+    busy real script (1,350 mainline runs), 40 samples after warmup —
+    **unscoped (the pre-existing behaviour): median 38.35 ms, p95
+    40.55 ms**; **explicit `stream=1` (same value, the new code path):
+    median 38.16 ms, p95 39.37 ms** — statistically indistinguishable,
+    confirming the extra `_resolve_stream_id()` call costs nothing
+    measurable on the hot (absent-param) mainline path, since it
+    returns immediately without a query when `stream=` is not in the
+    request. A build stream with far fewer runs for the same script
+    answered in **median 5.19 ms** — faster, as expected, never slower.
+  - **`static/script.js`.** Reads `?stream=` into `state.streamId` at
+    init, forwards it to BOTH requests the page makes (`/executions`
+    AND the "tests in this suite" table's `/api/dashboard` call — a
+    DIFFERENT endpoint, found by the same discipline F7's timeline.js
+    fix used: every outbound request needs the param, not only the
+    first one), renders the shared branch band
+    (`compare.js:renderBranchBand`) guarded the same way
+    time.js/timeline.js/test.js already are, and its own test.html
+    links now carry the stream through.
+  - **`static/script.html`** gains the `#branch-band` mount, identical
+    markup to every other stream-aware page.
+  - **Every inbound link to `script.html` now carries the stream**:
+    `static/app.js`'s `scriptLink()` (the app's one script.html
+    link-builder), `static/timeline.js`'s block-row script link (found
+    unscoped in the PART A audit pass, fixed here since it was only
+    useful once `script.html` could read the param), and
+    `static/test.js`'s suite link.
+  - **F3 SUPERSEDED.** `test.js`'s suite link no longer needs the
+    "(mainline)" honesty label — the title reverts to the plain
+    constant it was before F3, and the link carries `stream=` through
+    instead, the same scope-self-sufficient pattern every other
+    inbound link to a scoped page follows. A mainline visit is
+    byte-for-byte unchanged either way.
+  - **Verified live**, same DOM-shim method, two passes: (1) a
+    stream-scoped `script.html` rendered its executions, its branch
+    band naming the branch, and its "tests in this suite" table's link
+    carrying `stream=2`; the same page unscoped showed no band text and
+    (as seeded) no executions for that mainline environment/script
+    pair. (2) All three inbound links — `app.js`'s browse table's
+    script column, `timeline.js`'s block row, `test.js`'s suite link —
+    confirmed to carry `stream=2` into `script.html`, and `test.js`'s
+    link confirmed to show the plain title with no visible "(mainline)"
+    note any more.
 
 ---
 

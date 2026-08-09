@@ -1276,11 +1276,16 @@ function populateScriptOptions() {
   fillSelect(scriptSelect, scripts, "All scripts", state.script);
 }
 
-/** A link to one suite's execution history. */
+/**
+ * A link to one suite's execution history — script.html, now stream-
+ * scoped the same way the rest of the app is (script-page parity,
+ * FINAL ROUND). No-op on mainline (state.streamId === null).
+ */
 function scriptLink(environment, script, text) {
   const params = new URLSearchParams();
   params.append("environment", environment);
   params.append("script", script);
+  appendStream(params);
   const link = document.createElement("a");
   link.href = "script.html?" + params.toString();
   link.textContent = text || script;
