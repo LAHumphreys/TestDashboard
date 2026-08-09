@@ -964,6 +964,46 @@ recorded here rather than left implicit:
     estate's branch tests never ran on mainline at all), whose "Open
     full test page" and "View in timeline" links both carried the
     branch's stream id in every case.
+- **F4 (same usability sweep): the Watch card's unassigned-failing
+  stat becomes a way in, not only a number.**
+  - **`app.js`.** The browse filter row's state (`result=`, `unassigned=`,
+    and — "for symmetry", trivial once the other two existed — `stale=`)
+    is now read from the page's own URL at load, BEFORE
+    `buildResultToggles()`/the sync calls paint the controls, so a deep
+    link lands with its toggles already showing the state it set. New
+    plain **"Unassigned only"** toggle chip, same `aria-pressed` pattern
+    as `stale-toggle`/`retired-toggle`, wired to `/api/dashboard`'s
+    existing `unassigned=1` (`include_unassigned`) filter — no new
+    endpoint, no new query shape. Fixed the coordinator's own wording in
+    passing: the server's param is `result=` (singular, repeatable — see
+    `_parse_results_param`), never `results=`; the usability-batch
+    message used the plural, which the server would silently ignore.
+  - **`watch.js`.** `buildStat()` gained an optional third argument that
+    turns the stat's value into a link — every other call site is
+    unaffected. The "Unassigned failing" stat on a product/environment
+    card now links to `index.html` scoped to the card (its `cardLink()`
+    params plus `result=FAIL&unassigned=1`, the toggle chip's own URL
+    contract above) — clicking the number lands on exactly those rows,
+    filtered, rather than only naming a count. A stream card's stat
+    instead links to its own branch-scoped dashboard UNCHANGED (the
+    plain `cardLink()` target): the delta view has no `result=`/
+    `unassigned=` filters of its own to receive them, and its delta
+    table already shows every row's assignee inline, so filtering would
+    be redundant there, not an enrichment. Zero visible change when the
+    stat itself is absent (`unassigned_failing` is 0) — the exact rule
+    the stat's own existence already followed.
+  - **Perf**, per the coordinator's explicit ask: no new endpoint, no
+    new query shape on either side — the toggle reuses `/api/dashboard`'s
+    existing `unassigned=`/`assignee=` filters (already flat, already
+    paginated), and the stat link is a client-side URL construction
+    from data the card already has.
+  - **Verified live**, same DOM-shim method: a page loaded
+    `?environment=linux-sim&result=FAIL&unassigned=1` rendered with the
+    "Unassigned only" chip and the FAIL toggle both already pressed, and
+    exactly the one matching row on screen; a Watch page with a product,
+    environment and stream card each showing "Unassigned failing" — the
+    product/environment stat links carried `result=FAIL&unassigned=1`
+    beside their own scope, the stream stat link carried neither.
 
 ---
 

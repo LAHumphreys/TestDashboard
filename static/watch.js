@@ -146,11 +146,49 @@ function cardLink(card) {
   return "index.html?" + params.toString();
 }
 
-function buildStat(label, value) {
+/**
+ * *href*, when given, turns the stat's value into a link rather than
+ * plain text (F4, docs/STREAMS_PLAN.md §5.2 "as built") -- every OTHER
+ * call site omits it and gets the exact unlinked stat this page has
+ * always rendered.
+ */
+function buildStat(label, value, href) {
   const stat = el("div", "watch-stat");
-  stat.appendChild(el("span", "watch-stat-value", String(value)));
+  if (href) {
+    const link = document.createElement("a");
+    link.href = href;
+    link.className = "watch-stat-value";
+    link.textContent = String(value);
+    stat.appendChild(link);
+  } else {
+    stat.appendChild(el("span", "watch-stat-value", String(value)));
+  }
   stat.appendChild(el("span", "watch-stat-label", label));
   return stat;
+}
+
+/**
+ * Where the "Unassigned failing" stat itself links to (F4) -- an
+ * enrichment on top of cardLink(): a product/environment card's stat
+ * scopes the dashboard's browse table straight to the failing,
+ * unassigned rows (?result=FAIL&unassigned=1 -- the "Unassigned only"
+ * toggle chip's own URL contract, read by app.js's
+ * wireMainlineControls()). A stream card instead links to its own
+ * branch-scoped dashboard UNCHANGED: the delta view has no result=/
+ * unassigned= filters of its own to receive them, and its delta table
+ * already shows every row's assignee inline, so a second filtered view
+ * would be redundant rather than an enrichment.
+ */
+function unassignedStatLink(card) {
+  const base = cardLink(card);
+  if (!base || card.kind === "stream") {
+    return base;
+  }
+  const at = base.indexOf("?");
+  const params = new URLSearchParams(at === -1 ? "" : base.slice(at + 1));
+  params.set("result", "FAIL");
+  params.set("unassigned", "1");
+  return (at === -1 ? base : base.slice(0, at)) + "?" + params.toString();
 }
 
 /**
@@ -243,8 +281,9 @@ function buildOkCard(card, index, total) {
   // unassigned-failure count of zero adds no stat and no accent — the
   // card looks exactly as it did before this feature existed.
   if (card.unassigned_failing) {
-    verdict.appendChild(
-      buildStat("Unassigned failing", card.unassigned_failing));
+    verdict.appendChild(buildStat(
+      "Unassigned failing", card.unassigned_failing,
+      unassignedStatLink(card)));
   }
   div.appendChild(verdict);
 
@@ -336,8 +375,9 @@ function buildStreamCard(card, index, total) {
   }
   // Zero visible change: see the identical comment in buildOkCard.
   if (card.unassigned_failing) {
-    verdict.appendChild(
-      buildStat("Unassigned failing", card.unassigned_failing));
+    verdict.appendChild(buildStat(
+      "Unassigned failing", card.unassigned_failing,
+      unassignedStatLink(card)));
   }
   div.appendChild(verdict);
 

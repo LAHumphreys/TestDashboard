@@ -165,6 +165,12 @@
         <div id="result-toggles" class="result-toggles" role="group" aria-label="Filter by result"></div>
         <button id="stale-toggle" class="toggle" type="button" aria-pressed="false">Not run recently</button>
         <button id="retired-toggle" class="toggle" type="button" aria-pressed="false">Include retired</button>
+        <!-- F4 (docs/STREAMS_PLAN.md §5.2 "as built"): wired to the
+             API's existing include_unassigned/assignee=  filters
+             (unassigned=1 on the wire) -- no new endpoint. Doubles as
+             the landing spot for a Watch card's "N unassigned failing"
+             stat, via ?unassigned=1 read at load. -->
+        <button id="unassigned-toggle" class="toggle" type="button" aria-pressed="false">Unassigned only</button>
         <input id="filter-q" type="search" placeholder="Search test name…" autocomplete="off" aria-label="Search test name">
       </div>
       <div class="table-wrap">

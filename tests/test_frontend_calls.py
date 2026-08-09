@@ -1797,6 +1797,57 @@ class CardLinkScopeSelfSufficiencyTest(unittest.TestCase):
         self.assertEqual(product_branch.count("params.set("), 1)
 
 
+class WatchUnassignedStatLinkTest(unittest.TestCase):
+    """F4(b) (docs/STREAMS_PLAN.md §5.2 "as built"): a Watch card's
+    "Unassigned failing" stat is a way IN, not only a number — a
+    product/environment card's stat scopes the dashboard's browse
+    table straight to the failing, unassigned rows; a stream card's
+    stat goes to its own branch-scoped dashboard instead, since that
+    view already shows every row's assignee inline (no result=/
+    unassigned= filters of its own to receive them)."""
+
+    def test_product_and_environment_cards_add_result_and_unassigned(
+        self
+    ) -> None:
+        body = _function_body(
+            read("watch.js"), "function unassignedStatLink(")
+        self.assertIn('params.set("result", "FAIL")', body)
+        self.assertIn('params.set("unassigned", "1")', body)
+
+    def test_stream_cards_are_returned_unchanged(self) -> None:
+        """The delta view has nothing to do with result=/unassigned= —
+        appending them would be a dead param, not an enrichment."""
+        body = _function_body(
+            read("watch.js"), "function unassignedStatLink(")
+        stream_check_at = body.index('card.kind === "stream"')
+        self.assertIn("return base", body[stream_check_at:stream_check_at + 60])
+
+    def test_both_call_sites_pass_the_link_only_when_nonzero(self) -> None:
+        """Zero visible change (the same rule the stat's own existence
+        already follows): a card with no unassigned failures gets
+        neither the stat nor a dead link."""
+        for fn in ("function buildOkCard(", "function buildStreamCard("):
+            body = _function_body(read("watch.js"), fn)
+            guard_at = body.index("if (card.unassigned_failing) {")
+            block = body[guard_at:body.index("}", guard_at) + 1]
+            self.assertIn("unassignedStatLink(card)", block)
+
+    def test_the_linked_stat_reuses_the_shared_stat_markup(self) -> None:
+        """buildStat's existing (label, value) call sites must be
+        unaffected — this is an optional third argument, not a parallel
+        rendering path that could drift from the plain stat's markup."""
+        body = _function_body(read("watch.js"), "function buildStat(")
+        self.assertIn("function buildStat(label, value, href)", body)
+        self.assertIn("if (href) {", body)
+        # The unlinked branch is the exact call the page always made.
+        self.assertIn(
+            'el("span", "watch-stat-value", String(value))', body)
+    # No dedicated no-innerHTML check here — WatchPageTest already pins
+    # that invariant for the whole file (correctly, via _strip_comments
+    # — this file's own module docstring literally contains the word
+    # "innerHTML" while explaining why there is none).
+
+
 class OpenActionsOriginFilterTest(unittest.TestCase):
     """Open Actions' branch/mainline origin filter and per-row tag
     (WP-21, docs/STREAMS_PLAN.md §3.6, found in first human use)."""
@@ -2189,6 +2240,75 @@ class BranchQuickLinksTest(unittest.TestCase):
         self.assertLess(
             stash_at, body.index("tabs = document.getElementById"),
             "must be stashed before either tab (own/diff) can render")
+
+
+class BrowseFilterUrlInitTest(unittest.TestCase):
+    """F4(a) (docs/STREAMS_PLAN.md §5.2 "as built"): the browse filter
+    row's state can be set from the page's own URL at load, so a deep
+    link (a Watch card's stat link, or any other) can land pre-
+    filtered rather than landing on the unfiltered table with the
+    reader having to reapply the same filters by hand.
+
+    The server's own contract is ``result=`` (singular, repeatable —
+    see api.py's _parse_results_param), not ``results=`` — pinned here
+    since the coordinator's own usability-batch message used the wrong
+    (plural) name.
+    """
+
+    def test_wiring_reads_result_unassigned_and_stale_from_the_url(
+        self
+    ) -> None:
+        body = _function_body(
+            read("app.js"), "function wireMainlineControls(")
+        self.assertIn('url.searchParams.getAll("result")', body)
+        self.assertIn(
+            'url.searchParams.get("unassigned") === "1"', body)
+        self.assertIn('url.searchParams.get("stale") === "1"', body)
+        # Never the plural form -- that is not a param the server reads.
+        self.assertNotIn('"results"', body)
+
+    def test_url_state_is_read_before_the_toggles_are_painted(self) -> None:
+        """Reading state.activeResults/staleOnly/unassignedOnly AFTER
+        buildResultToggles()/the sync calls paint the controls would
+        leave their initial aria-pressed out of step with the URL that
+        was just used to set them."""
+        body = _strip_comments(_function_body(
+            read("app.js"), "function wireMainlineControls("))
+        url_read_at = body.index('url.searchParams.getAll("result")')
+        build_at = body.index("buildResultToggles()")
+        self.assertLess(url_read_at, build_at)
+        self.assertIn("syncResultToggles()", body[build_at:])
+        self.assertIn("syncStaleToggle()", body[build_at:])
+        self.assertIn("syncUnassignedToggle()", body[build_at:])
+
+    def test_only_known_result_values_are_accepted(self) -> None:
+        """An unrecognised ?result= value must not silently poison
+        state.activeResults with a string the server would 400 on the
+        very next request."""
+        body = _function_body(
+            read("app.js"), "function wireMainlineControls(")
+        self.assertIn("RESULTS.indexOf(raw) !== -1", body)
+
+    def test_browse_url_carries_unassigned_only_when_the_toggle_is_on(
+        self
+    ) -> None:
+        body = _function_body(read("app.js"), "function browseUrl(")
+        self.assertIn("if (state.unassignedOnly) {", body)
+        self.assertIn('qs.append("unassigned", "1")', body)
+
+    def test_the_toggle_chip_exists_and_ships_unpressed(self) -> None:
+        html = read_text("index.html")
+        toggle_at = html.index('id="unassigned-toggle"')
+        self.assertIn('aria-pressed="false"', html[toggle_at:toggle_at + 80])
+
+    def test_the_toggle_is_wired_to_state_and_refilters(self) -> None:
+        body = _function_body(
+            read("app.js"), "function wireMainlineControls(")
+        click_at = body.index('getElementById("unassigned-toggle")')
+        handler = body[click_at:click_at + 250]
+        self.assertIn("state.unassignedOnly = !state.unassignedOnly", handler)
+        self.assertIn("syncUnassignedToggle()", handler)
+        self.assertIn("refilterBrowse()", handler)
 
 
 class WatchPageTest(unittest.TestCase):

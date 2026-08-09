@@ -1942,6 +1942,15 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
   font-variant-numeric: tabular-nums;
 }
 
+/* F4 (docs/STREAMS_PLAN.md §5.2 "as built"): the "Unassigned failing"
+   stat is a link when the count is nonzero -- same size/weight as the
+   plain stat value it replaces, underlined only to say "this one is
+   clickable" without a whole second visual language. */
+a.watch-stat-value {
+  color: var(--c-fail);
+  text-decoration: underline;
+}
+
 .watch-stat-label { font-size: 11px; color: var(--muted); }
 
 .watch-card-fresh { font-size: 12px; margin: 0; }

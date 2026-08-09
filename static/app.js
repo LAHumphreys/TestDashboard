@@ -109,6 +109,11 @@ const state = {
   sortAsc: true,
   activeResults: new Set(),
   staleOnly: false,
+  // F4 (docs/STREAMS_PLAN.md §5.2 "as built"): the browse filter row's
+  // "Unassigned only" chip -- wired to /api/dashboard's existing
+  // include_unassigned param (unassigned=1 on the wire), the same
+  // filter Open Actions has always been able to apply server-side.
+  unassignedOnly: false,
   qText: "",
   qTimer: null,
   requestSeq: 0,
@@ -229,6 +234,9 @@ function browseUrl(offset) {
   }
   if (state.showRetired) {
     qs.append("retired", "1");
+  }
+  if (state.unassignedOnly) {
+    qs.append("unassigned", "1");
   }
   const query = state.qText.trim();
   if (query) {
@@ -1445,6 +1453,11 @@ function syncRetiredToggle() {
     .setAttribute("aria-pressed", state.showRetired ? "true" : "false");
 }
 
+function syncUnassignedToggle() {
+  document.getElementById("unassigned-toggle")
+    .setAttribute("aria-pressed", state.unassignedOnly ? "true" : "false");
+}
+
 function scrollTo(sectionId) {
   document.getElementById(sectionId)
     .scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1475,10 +1488,31 @@ function wireMainlineControls() {
   }
   mainlineControlsWired = true;
 
-  buildResultToggles();
-
   const url = new URL(window.location.href);
   state.environment = url.searchParams.get("environment") || "";
+
+  // F4 (docs/STREAMS_PLAN.md §5.2 "as built"): URL-driven filter state,
+  // so a deep link (a Watch card's "N unassigned failing" stat, or any
+  // other) can land pre-filtered rather than only naming a number.
+  // Read BEFORE buildResultToggles()/the sync calls below paint the
+  // controls, so their initial aria-pressed state already matches —
+  // reading it after would need a second render pass.
+  for (const raw of url.searchParams.getAll("result")) {
+    if (RESULTS.indexOf(raw) !== -1) {
+      state.activeResults.add(raw);
+    }
+  }
+  if (url.searchParams.get("unassigned") === "1") {
+    state.unassignedOnly = true;
+  }
+  if (url.searchParams.get("stale") === "1") {
+    state.staleOnly = true;
+  }
+
+  buildResultToggles();
+  syncResultToggles();
+  syncStaleToggle();
+  syncUnassignedToggle();
 
   envSelect.addEventListener("change",
     () => setEnvironment(envSelect.value));
@@ -1506,6 +1540,12 @@ function wireMainlineControls() {
     .addEventListener("click", () => {
       state.showRetired = !state.showRetired;
       syncRetiredToggle();
+      refilterBrowse();
+    });
+  document.getElementById("unassigned-toggle")
+    .addEventListener("click", () => {
+      state.unassignedOnly = !state.unassignedOnly;
+      syncUnassignedToggle();
       refilterBrowse();
     });
   document.getElementById("reload-btn")
