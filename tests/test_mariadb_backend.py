@@ -150,6 +150,31 @@ EXCLUDED_TESTS = {
     "TestOriginResultTruthfulDisplay."
     "test_many_origin_rows_cost_exactly_one_extra_query":
         "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_repeat_summary_rollup_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_repeat_queue_counts_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_repeat_status_queue_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest."
+    "test_repeat_test_counts_by_environment_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest."
+    "test_repeat_latest_run_time_by_environment_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_repeat_environments_and_scripts_are_cache_hits":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest."
+    "test_repeat_failure_streak_bounds_many_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_prune_runs_before_invalidates":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_a_different_cutoff_is_a_different_key":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_ttl_bound_expires_the_memo":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_within_ttl_still_hits":
+        "counts queries via sqlite3's set_trace_callback.",
 }  # type: Dict[str, str]
 
 if backends.MARIADB_AVAILABLE:

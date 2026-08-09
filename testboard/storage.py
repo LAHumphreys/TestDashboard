@@ -108,6 +108,43 @@ _TREND_CACHE_TTL_SECONDS = 60.0
 #: grow the cache without limit.
 _TREND_CACHE_MAX_ENTRIES = 32
 
+#: Cap on the summary/watch memo (below) -- deliberately larger than
+#: :data:`_TREND_CACHE_MAX_ENTRIES`: that cache holds one method's keys,
+#: this one is shared by several (summary_rollup, queue_counts,
+#: status_queue x6 kinds, test_counts_by_environment,
+#: latest_run_time_by_environment, environments, scripts), so the same
+#: "one or two working sets" sizing works out to more raw entries. Same
+#: full-clear-rather-than-evict policy as the trend cache, same reason:
+#: the scope-key space (stream x environment/product-allowlist x cutoff)
+#: is small, so unbounded growth -- not eviction quality -- is the risk.
+#:
+#: Deliberately does NOT also size :meth:`Storage.failure_streak_bounds_
+#: many`'s per-entry memo (see :data:`_STREAK_CACHE_MAX_ENTRIES`) --
+#: measured live on this project's own ~12k-mainline-test / 5-env
+#: estate copy: one unscoped ``/api/summary`` request alone touched 139
+#: distinct keys once every queue kind's status_queue entry and every
+#: FAIL row's failure-streak entry were counted, comfortably over this
+#: cap on its own. Sharing one dict meant the per-request cap-then-clear
+#: fired MID-request, wiping summary_rollup/queue_counts and the
+#: earlier-processed queue kinds before the request even finished --
+#: found by profiling a "warm" repeat call that was still costing 28 SQL
+#: statements. Splitting the two removes the coupling: this cap only
+#: has to hold one scope's worth of ~20 request-composition keys, never
+#: however many tests happen to be failing across whatever pages were
+#: viewed.
+_SUMMARY_CACHE_MAX_ENTRIES = 128
+
+#: Cap on the per-entry failure-streak memo (see
+#: :meth:`Storage.failure_streak_bounds_many`), separate from
+#: :data:`_SUMMARY_CACHE_MAX_ENTRIES` for the reason documented there.
+#: Sized to the estate, not to one request: the working set is "every
+#: currently-FAIL triple anyone has looked at recently", which is
+#: bounded by how many tests are failing estate-wide (typically a small
+#: fraction of the total), not by one page's row cap -- 4096 covers
+#: several thousand simultaneously-failing tests before the same
+#: full-clear-and-refill policy kicks in.
+_STREAK_CACHE_MAX_ENTRIES = 4096
+
 #: Connections are thread-local and the page cache is per connection, so
 #: a cache budget has to be divided by the number of threads that might
 #: hold one — not handed to each of them.
@@ -2030,6 +2067,25 @@ class Storage:
         # trend request can never serve, or be served by, mainline's.
         self._trend_cache = {}  # type: Dict[Tuple[int, str, Optional[str], Optional[Tuple[str, ...]]], Tuple[float, List[DailyResultCount]]]
         self._trend_lock = threading.Lock()
+        # WP-23 "ONE MORE PERF SLICE": one shared TTL-bounded memo for the
+        # handful of expensive /api/summary and /api/watch storage reads
+        # (see _cached_summary/_store_summary below) -- same discipline as
+        # _trend_cache, generalised to hold several methods' keys in one
+        # dict rather than one dict per method, since there are too many
+        # of them to justify the trend cache's per-method duplication.
+        # Every key's first element is the method's own name, so no two
+        # methods can ever collide on a key.
+        self._summary_cache = {}  # type: Dict[Tuple[Any, ...], Tuple[float, Any]]
+        self._summary_lock = threading.Lock()
+        # A SEPARATE dict for failure_streak_bounds_many's per-entry memo
+        # (see _cached_streak/_store_streak below and
+        # _STREAK_CACHE_MAX_ENTRIES) -- sharing _summary_cache measured as
+        # a real bug, not a hypothetical one: one entries-set worth of
+        # per-triple keys blew past _SUMMARY_CACHE_MAX_ENTRIES mid-request
+        # and cleared summary_rollup/queue_counts before the SAME request
+        # finished using them.
+        self._streak_cache = {}  # type: Dict[Tuple[Any, ...], Tuple[float, Any]]
+        self._streak_lock = threading.Lock()
         self._migrate()
 
     @classmethod
@@ -2528,8 +2584,10 @@ class Storage:
         if inserted or updated:
             # An all-unchanged push proved the memoized trend is still
             # true; clearing it would make the feeder's 10-minute no-op
-            # re-push defeat the memo forever.
+            # re-push defeat the memo forever. Same reasoning for the
+            # summary/watch memo (WP-23 "ONE MORE PERF SLICE").
             self._invalidate_trend_cache()
+            self._invalidate_summary_cache()
         return UpsertCounts(
             inserted=inserted, updated=updated, unchanged=unchanged,
             rejections=rejections,
@@ -3104,7 +3162,19 @@ class Storage:
         the IDENTICAL environments list, because this method never
         looked at product scope at all — found live, "both products
         seem to have the same envs".
+
+        WP-23 "ONE MORE PERF SLICE": memoized (see
+        :meth:`_cached_summary`) -- cheap per call (single-digit ms) but
+        called on every ``/api/summary`` load regardless of ``parts=``,
+        so it is part of the fixed per-request floor the memo targets.
         """
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = ("environments", envs_key)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
         clause, clause_params = self._environments_clause(
             environments, column="environment"
         )
@@ -3117,7 +3187,9 @@ class Storage:
             sql += " AND " + clause
         sql += " ORDER BY environment"
         rows = self._conn().execute(sql, params).fetchall()
-        return [row[0] for row in rows]
+        result = [row[0] for row in rows]
+        self._store_summary(key, result)
+        return result
 
     def scripts(
         self,
@@ -3131,7 +3203,17 @@ class Storage:
         takes, combined with *environment* by AND — never contradictory
         in practice, since a caller passes an exact environment or a
         product scope, not conflicting values for both.
+
+        WP-23 "ONE MORE PERF SLICE": memoized (see
+        :meth:`_cached_summary`) -- same reasoning as :meth:`environments`.
         """
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = ("scripts", environment, envs_key)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
         clause, clause_params = self._environments_clause(
             environments, column="environment"
         )
@@ -3144,7 +3226,9 @@ class Storage:
             sql += " AND " + clause
             params.extend(clause_params)
         sql += " ORDER BY script"
-        return [row[0] for row in self._conn().execute(sql, params)]
+        result = [row[0] for row in self._conn().execute(sql, params)]
+        self._store_summary(key, result)
+        return result
 
     def assignees(self) -> List[str]:
         """Return every user who currently owns at least one test, sorted."""
@@ -3196,7 +3280,34 @@ class Storage:
         ``/api/summary`` itself stays mainline by default (unchanged
         behaviour for every existing caller), but the "own results" tab
         reads this with the branch's stream id.
+
+        WP-23 "ONE MORE PERF SLICE": memoized (see
+        :meth:`_cached_summary`), keyed on the EXACT *recent_cutoff*
+        value -- never rounded or truncated to an hour the way the trend
+        cache's ``since`` is, because *recent_cutoff* is reported
+        verbatim as ``stale_before`` and gates every ``recent``-column
+        count; two different real cutoffs sharing one cache slot would
+        serve counts computed for the wrong window. This is safe rather
+        than merely correct-but-useless: on a healthy estate
+        *recent_cutoff* is data-derived (the start of a covered pass)
+        and stable across nearby requests, so repeat loads still hit; on
+        a sparse estate the 36h wall-clock fallback moves every request
+        and the memo quietly stops helping -- it helps exactly when
+        there is enough data for the number to matter. ``/api/watch``
+        computes this SAME (mainline, unscoped) cutoff for its own
+        ``summary_rollup`` call (see ``_handle_watch``), so the two
+        endpoints share one cache entry on the common unscoped load.
         """
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = (
+            "summary_rollup", recent_cutoff, environment, envs_key,
+            stream_id,
+        )
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
         sql = (
             "SELECT lr.environment, lr.result, lr.prev_result, "
             "CASE WHEN lr.start_time >= ? THEN 1 ELSE 0 END AS recent, "
@@ -3223,7 +3334,7 @@ class Storage:
             " GROUP BY lr.environment, lr.result, lr.prev_result, recent, "
             "retired ORDER BY lr.environment, lr.result"
         )
-        return [
+        result = [
             RollupCount(
                 environment=row[0],
                 result=Result(row[1]),
@@ -3234,6 +3345,8 @@ class Storage:
             )
             for row in self._conn().execute(sql, params).fetchall()
         ]
+        self._store_summary(key, result)
+        return result
 
     def assigned_open_count(
         self,
@@ -3430,7 +3543,17 @@ class Storage:
         Even so this is a high-water mark: a test that quietly stopped
         being run and was never retired stays here forever. That is what
         :meth:`declared_test_counts` exists to override.
+
+        WP-23 "ONE MORE PERF SLICE": memoized (see
+        :meth:`_cached_summary`) -- this is the ``_pass_view`` input
+        both ``/api/summary`` and ``/api/watch`` fetch on every request,
+        for the SAME (mainline, unscoped) key on the common unscoped
+        load, so one computation serves both endpoints.
         """
+        key = ("test_counts_by_environment", stream_id)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
         rows = self._conn().execute(
             "SELECT lr.environment, COUNT(*) FROM latest_runs AS lr "
             "LEFT JOIN test_retirements AS tr "
@@ -3441,7 +3564,9 @@ class Storage:
             + " GROUP BY lr.environment",
             (stream_id,),
         ).fetchall()
-        return {row[0]: int(row[1]) for row in rows}
+        result = {row[0]: int(row[1]) for row in rows}
+        self._store_summary(key, result)
+        return result
 
     # ------------------------------------------------------------------
     # Declared environment expectations (migration 5)
@@ -3813,6 +3938,7 @@ class Storage:
             conn.execute("ROLLBACK")
             raise
         self._invalidate_trend_cache()
+        self._invalidate_summary_cache()
         return deleted
 
     #: Categories a comparison classifies every test into — the "five
@@ -4435,7 +4561,18 @@ class Storage:
         ``product=`` allow-list — without it a product-scoped page's
         environment pills included every OTHER product's environments
         too (found live alongside the same bug in :meth:`environments`).
+
+        WP-23 "ONE MORE PERF SLICE": memoized (see
+        :meth:`_cached_summary`) -- same shared-key reasoning as
+        :meth:`test_counts_by_environment`.
         """
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = ("latest_run_time_by_environment", stream_id, envs_key)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
         clause, clause_params = self._environments_clause(
             environments, column="environment"
         )
@@ -4448,10 +4585,12 @@ class Storage:
             sql += " AND " + clause
         sql += " GROUP BY environment"
         rows = self._conn().execute(sql, params).fetchall()
-        return {
+        result = {
             row[0]: model.parse_iso(row[1])
             for row in rows if row[1] is not None
         }
+        self._store_summary(key, result)
+        return result
 
     def unassigned_failing_by_environment(
         self, stream_id: int = MAINLINE_STREAM_ID,
@@ -4778,7 +4917,28 @@ class Storage:
         somebody already worked out about this failure, which is the
         first thing a person triaging it needs to know. One index seek
         per returned row.
+
+        WP-23 "ONE MORE PERF SLICE": memoized (see
+        :meth:`_cached_summary`) -- the single most expensive part of
+        ``/api/summary``'s full (unpaginated) payload, measured, because
+        every kind's row FETCH (unlike the counts above) was never
+        batched. *with_latest_comment* is part of the cache key, so a
+        comment-bearing entry can never satisfy a comment-free request or
+        vice versa; comment TEXT is part of the cached VALUE, so
+        :meth:`add_comment` and :meth:`set_retired` (which also posts
+        one) both invalidate this alongside the runs/assignment/
+        retirement writes every other cached method already needs.
         """
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = (
+            "status_queue", kind, environment, limit, assignee,
+            stale_before, with_latest_comment, envs_key, stream_id,
+        )
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
             stream_id,
@@ -4799,7 +4959,7 @@ class Storage:
         prev_index = len(_STATUS_COLUMN_NAMES) + (
             _LATEST_COMMENT_COUNT if with_latest_comment else 0
         )
-        return [
+        result = [
             TestStatusRow(
                 *_summary_row_from(
                     row,
@@ -4813,6 +4973,8 @@ class Storage:
             )
             for row in self._conn().execute(sql, params).fetchall()
         ]
+        self._store_summary(key, result)
+        return result
 
     def status_queue_count(
         self,
@@ -4866,9 +5028,26 @@ class Storage:
         every kind reads the same scoped partition. *stale_before* is
         required (as it is for :meth:`status_queue_count`) because
         ``not_run`` is always one of :data:`QUEUE_KINDS`.
+
+        WP-23 "ONE MORE PERF SLICE": memoized (see
+        :meth:`_cached_summary`), keyed on the exact *stale_before* value
+        -- see :meth:`summary_rollup` for why cutoffs are never rounded
+        for caching purposes. Invalidated by assignment writes too (not
+        only runs/retirement writes), since the ``mine`` column and the
+        ``assigned``/``unassigned`` kinds read ``current_assignments``.
         """
         if stale_before is None:
             raise ValueError("queue_counts needs stale_before")
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = (
+            "queue_counts", environment, assignee, stale_before, envs_key,
+            stream_id,
+        )
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
         # not_run's predicate carries the one parameterised placeholder
         # among QUEUE_KINDS (`lr.start_time < ?`) -- its bind value is
         # appended in the same left-to-right order the columns
@@ -4912,6 +5091,7 @@ class Storage:
         counts["mine"] = (
             int(row[len(QUEUE_KINDS)] or 0) if include_mine else 0
         )
+        self._store_summary(key, counts)
         return counts
 
     def recent_results(
@@ -5139,6 +5319,22 @@ class Storage:
         single-triple contract (a stream's ``latest_runs`` has at most
         one current start_time per triple, so this is not a loss of
         information).
+
+        WP-23 "ONE MORE PERF SLICE": memoized PER ENTRY, in the SEPARATE
+        :attr:`_streak_cache` dict (:meth:`_cached_streak`/
+        :meth:`_store_streak`), unlike every other cached method here
+        which memoizes one whole call's result into :attr:`_summary_cache`
+        -- see :data:`_STREAK_CACHE_MAX_ENTRIES` for why sharing the one
+        dict was wrong (measured: it thrashed :attr:`_summary_cache` mid-
+        request). A queue's row set changes page to page and request to
+        request even when the underlying failures do not (different
+        LIMIT, different sort tie-breaks upstream), so caching the batch
+        call as one unit would almost never hit; caching each
+        ``(stream_id, environment, script, test_name, start_time)``
+        streak individually means a test that is STILL failing on the
+        next request is a hit even though the page around it changed.
+        Only genuine misses reach the chunked batch machinery below,
+        which is otherwise unchanged.
         """
         unique = list(dict.fromkeys(
             (env, script, test, model.format_iso(latest))
@@ -5147,9 +5343,21 @@ class Storage:
         result = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
         if not unique:
             return result
+        to_compute = []  # type: List[Tuple[str, str, str, str]]
+        for env, script, test, start_iso in unique:
+            triple = (env, script, test)
+            cache_key = ("failure_streak", stream_id, env, script, test,
+                         start_iso)
+            cached = self._cached_streak(cache_key)
+            if cached is None:
+                to_compute.append((env, script, test, start_iso))
+            else:
+                result[triple] = cached
+        if not to_compute:
+            return result
         conn = self._conn()
-        for start in range(0, len(unique), _RECENT_CHUNK):
-            chunk = unique[start:start + _RECENT_CHUNK]
+        for start in range(0, len(to_compute), _RECENT_CHUNK):
+            chunk = to_compute[start:start + _RECENT_CHUNK]
             bounds = self._streak_bound_many(conn, chunk, stream_id)
             since_inputs = [
                 (env, script, test, start_iso, bounds[(env, script, test)])
@@ -5166,20 +5374,26 @@ class Storage:
                 self._streak_pass_many(conn, pass_inputs, stream_id)
                 if pass_inputs else {}
             )  # type: Dict[Tuple[str, str, str], Optional[str]]
-            for (env, script, test, _start_iso) in chunk:
+            for (env, script, test, start_iso) in chunk:
                 key = (env, script, test)
                 failing_since_iso = since_map[key]
                 if failing_since_iso is None:
-                    result[key] = FailureStreak(
+                    streak = FailureStreak(
                         failing_since=None, last_pass_before=None)
-                    continue
-                pass_iso = pass_map.get(key)
-                result[key] = FailureStreak(
-                    failing_since=model.parse_iso(failing_since_iso),
-                    last_pass_before=(
-                        None if pass_iso is None
-                        else model.parse_iso(pass_iso)
-                    ),
+                else:
+                    pass_iso = pass_map.get(key)
+                    streak = FailureStreak(
+                        failing_since=model.parse_iso(failing_since_iso),
+                        last_pass_before=(
+                            None if pass_iso is None
+                            else model.parse_iso(pass_iso)
+                        ),
+                    )
+                result[key] = streak
+                self._store_streak(
+                    ("failure_streak", stream_id, env, script, test,
+                     start_iso),
+                    streak,
                 )
         return result
 
@@ -5411,6 +5625,98 @@ class Storage:
         with self._trend_lock:
             self._trend_cache.clear()
 
+    def _cached_summary(self, key: Tuple[Any, ...]) -> Optional[Any]:
+        """Return a memoized summary/watch component for *key*, or None.
+
+        Same TTL semantics as :meth:`_cached_trend`, reusing
+        :data:`_TREND_CACHE_TTL_SECONDS` rather than a second constant:
+        it bounds how stale an answer can be after a write made by a
+        DIFFERENT process (an offline tool while the server is up); a
+        write made by THIS process invalidates at once, via
+        :meth:`_invalidate_summary_cache`.
+        """
+        now = time.time()
+        with self._summary_lock:
+            entry = self._summary_cache.get(key)
+            if entry is None:
+                return None
+            stored_at, value = entry
+            if now - stored_at > _TREND_CACHE_TTL_SECONDS:
+                del self._summary_cache[key]
+                return None
+            return value
+
+    def _store_summary(self, key: Tuple[Any, ...], value: Any) -> None:
+        """Memoize a computed summary/watch component, bounding cache size."""
+        with self._summary_lock:
+            if len(self._summary_cache) >= _SUMMARY_CACHE_MAX_ENTRIES:
+                self._summary_cache.clear()
+            self._summary_cache[key] = (time.time(), value)
+
+    def _cached_streak(self, key: Tuple[Any, ...]) -> Optional[Any]:
+        """Return a memoized failure streak for *key*, or None.
+
+        Same TTL/lock discipline as :meth:`_cached_summary`, against the
+        SEPARATE dict :meth:`failure_streak_bounds_many` uses -- see
+        :data:`_STREAK_CACHE_MAX_ENTRIES` for why it is not the same
+        dict.
+        """
+        now = time.time()
+        with self._streak_lock:
+            entry = self._streak_cache.get(key)
+            if entry is None:
+                return None
+            stored_at, value = entry
+            if now - stored_at > _TREND_CACHE_TTL_SECONDS:
+                del self._streak_cache[key]
+                return None
+            return value
+
+    def _store_streak(self, key: Tuple[Any, ...], value: Any) -> None:
+        """Memoize one computed failure streak, bounding cache size."""
+        with self._streak_lock:
+            if len(self._streak_cache) >= _STREAK_CACHE_MAX_ENTRIES:
+                self._streak_cache.clear()
+            self._streak_cache[key] = (time.time(), value)
+
+    def _invalidate_summary_cache(self) -> None:
+        """Drop every memoized summary/watch component, BOTH dicts.
+
+        Called from every mutator that can change what any of the cached
+        methods below would compute -- ``runs``/``latest_runs`` writes
+        (:meth:`upsert_runs`, :meth:`delete_stream`,
+        :meth:`prune_runs_before`, :meth:`delete_environment` -- the same
+        four sites that already call :meth:`_invalidate_trend_cache`),
+        ``current_assignments`` writes (:meth:`set_assignee`, which
+        ``queue_counts``/``status_queue``'s assigned/mine predicates
+        read), ``test_retirements`` writes (:meth:`set_retired`, which
+        ``summary_rollup``/``queue_counts``/``status_queue``/
+        ``test_counts_by_environment`` all read), and comment writes
+        (:meth:`add_comment`, plus :meth:`set_retired` again -- it also
+        posts one -- since ``status_queue(with_latest_comment=True)``
+        caches the comment text itself). Unconditional full clear, same
+        as the trend cache: the scope-key space is small, so there is no
+        value in selective invalidation, only risk in getting it wrong.
+        Clears :attr:`_streak_cache` too -- every one of those writes can
+        also change a failure's streak bounds (a new run, a pruned or
+        deleted stream/environment) or make an entry irrelevant (a
+        retirement), and the two dicts share one external invalidation
+        surface even though they are sized and populated differently.
+
+        ``set_environment_product``/``clear_environment_product`` are
+        deliberately NOT here: every cached method below takes its
+        product/environment scope as an explicit ``environments``
+        allow-list argument (never joins ``environment_products``
+        itself), and that allow-list is part of every cache key, so a
+        remap changes which KEY a request computes rather than making an
+        existing entry wrong -- the old entry is simply never looked up
+        again, not served stale.
+        """
+        with self._summary_lock:
+            self._summary_cache.clear()
+        with self._streak_lock:
+            self._streak_cache.clear()
+
     def test_exists(
         self, environment: str, script: str, test_name: str
     ) -> bool:
@@ -5637,6 +5943,11 @@ class Storage:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        # WP-23 "ONE MORE PERF SLICE": summary_rollup/queue_counts/
+        # status_queue all read test_retirements' "retired" flag, and
+        # status_queue(with_latest_comment=True) would otherwise cache
+        # the comment this just posted as missing.
+        self._invalidate_summary_cache()
         return Comment(
             comment_id=comment_id,
             environment=environment,
@@ -5776,6 +6087,7 @@ class Storage:
             conn.execute("ROLLBACK")
             raise
         self._invalidate_trend_cache()
+        self._invalidate_summary_cache()
         return deleted
 
     def count_environment_rows(self, environment: str) -> Dict[str, int]:
@@ -5847,6 +6159,7 @@ class Storage:
         # true. (activity_hours needs no special step: it is in
         # _ENVIRONMENT_TABLES, so the environment's rows are gone.)
         self._invalidate_trend_cache()
+        self._invalidate_summary_cache()
         return deleted
 
     def vacuum(self) -> None:
@@ -6061,6 +6374,11 @@ class Storage:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        # WP-23 "ONE MORE PERF SLICE": status_queue(with_latest_comment=
+        # True) caches each row's comment text; a new comment must not
+        # keep serving the previous one (or "no comment") until the TTL
+        # expires.
+        self._invalidate_summary_cache()
         return Comment(
             comment_id=comment_id,
             environment=environment,
@@ -6197,6 +6515,10 @@ class Storage:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        # WP-23 "ONE MORE PERF SLICE": queue_counts' "mine" column and
+        # status_queue's assigned/unassigned kinds both read
+        # current_assignments.
+        self._invalidate_summary_cache()
 
     def current_assignee(
         self, environment: str, script: str, test_name: str

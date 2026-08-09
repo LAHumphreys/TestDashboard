@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from testboard import analytics, model, storage
 from testboard.model import Result, RunRecord
@@ -5326,3 +5326,301 @@ class AssignmentStreamIdsEmptyTest(StorageTestBase):
 
     def test_empty_with_no_assignments_at_all(self) -> None:
         self.assertEqual(self.store.assignment_stream_ids(), [])
+
+
+class SummaryCacheTest(StorageTestBase):
+    """WP-23 "ONE MORE PERF SLICE": the shared summary/watch memo
+    (``Storage._summary_cache``) -- same TTL-bounded, write-invalidated
+    discipline as ``_trend_cache`` (:class:`EnvironmentDeleteTest`'s
+    ``test_the_trend_cache_is_invalidated``, :class:`ActivityHoursTest`'s
+    ``test_reads_come_from_the_derived_table_not_from_runs``), but one
+    dict shared by several methods (``summary_rollup``, ``queue_counts``,
+    ``status_queue``, ``test_counts_by_environment``,
+    ``latest_run_time_by_environment``, ``environments``, ``scripts``,
+    the per-entry ``failure_streak_bounds_many``) rather than one dict
+    per method.
+
+    Every "is a cache hit" assertion is a QUERY COUNT, not a value
+    comparison -- a memo that silently recomputes every time would pass
+    a value-only test while giving back none of the measured saving.
+    """
+
+    def _query_count(self, action: Callable[[], None]) -> int:
+        statements = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, statements)
+        try:
+            action()
+        finally:
+            conn.set_trace_callback(None)
+        return len(statements)
+
+    def _expire_the_summary_cache(self) -> None:
+        """Simulate every entry ageing past the TTL -- a write made by a
+        DIFFERENT process, which this process's own invalidation calls
+        cannot see, so only the TTL bound catches it."""
+        too_old = storage._TREND_CACHE_TTL_SECONDS + 1.0
+        for key, (stored_at, value) in list(self.store._summary_cache.items()):
+            self.store._summary_cache[key] = (stored_at - too_old, value)
+
+    # -- repeat call is a genuine cache hit (no new SQL) -----------------
+
+    def test_repeat_summary_rollup_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        first = self.store.summary_rollup(cutoff)
+        self.assertGreater(sum(c.count for c in first), 0)
+        cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
+        self.assertEqual(
+            cost, 0, "a repeat call for the SAME cutoff touched SQL")
+
+    def test_repeat_queue_counts_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        stale_before = BASE + datetime.timedelta(hours=1)
+        self.store.queue_counts(stale_before=stale_before)
+        cost = self._query_count(
+            lambda: self.store.queue_counts(stale_before=stale_before))
+        self.assertEqual(cost, 0)
+
+    def test_repeat_status_queue_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        self.store.status_queue("still_failing")
+        cost = self._query_count(
+            lambda: self.store.status_queue("still_failing"))
+        self.assertEqual(cost, 0)
+
+    def test_repeat_test_counts_by_environment_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record()])
+        self.store.test_counts_by_environment()
+        cost = self._query_count(
+            lambda: self.store.test_counts_by_environment())
+        self.assertEqual(cost, 0)
+
+    def test_repeat_latest_run_time_by_environment_is_a_cache_hit(
+        self,
+    ) -> None:
+        self.store.upsert_runs([make_record()])
+        self.store.latest_run_time_by_environment()
+        cost = self._query_count(
+            lambda: self.store.latest_run_time_by_environment())
+        self.assertEqual(cost, 0)
+
+    def test_repeat_environments_and_scripts_are_cache_hits(self) -> None:
+        self.store.upsert_runs([make_record()])
+        self.store.environments()
+        self.store.scripts()
+        cost = self._query_count(lambda: (
+            self.store.environments(), self.store.scripts()))
+        self.assertEqual(cost, 0)
+
+    def test_repeat_failure_streak_bounds_many_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        entry = ("linux-sim", "suite.py", "test_a", BASE)
+        self.store.failure_streak_bounds_many([entry])
+        cost = self._query_count(
+            lambda: self.store.failure_streak_bounds_many([entry]))
+        self.assertEqual(cost, 0)
+
+    # -- every listed mutator invalidates ---------------------------------
+
+    def test_upsert_runs_invalidates(self) -> None:
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        before = self.store.summary_rollup(cutoff)
+        self.assertEqual(sum(c.count for c in before), 1)
+        self.store.upsert_runs([make_record(test_name="test_b")])
+        after = self.store.summary_rollup(cutoff)
+        self.assertEqual(
+            sum(c.count for c in after), 2,
+            "the memo kept serving the pre-import rollup")
+
+    def test_delete_stream_invalidates(self) -> None:
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        branch_id = self.store.list_streams("")[0].stream_id
+        before = self.store.test_counts_by_environment(branch_id)
+        self.assertEqual(before.get("linux-sim"), 1)
+        self.store.delete_stream(branch_id)
+        after = self.store.test_counts_by_environment(branch_id)
+        self.assertEqual(
+            after.get("linux-sim", 0), 0,
+            "the memo kept serving the deleted stream's counts")
+
+    def test_prune_runs_before_invalidates(self) -> None:
+        """prune_runs_before only ever deletes NON-latest runs (see its
+        own docstring), so a single-run estate has nothing observable
+        for it to change -- this checks the memo is torn down (a fresh
+        query, not a served value) rather than a rollup NUMBER, which
+        would be the same before and after regardless of whether
+        invalidation fired at all."""
+        day = datetime.timedelta(days=1)
+        self.store.upsert_runs([make_record(start=BASE - 400 * day)])
+        cutoff = BASE
+        self.store.summary_rollup(cutoff)
+        self.store.prune_runs_before(BASE - 300 * day)
+        cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
+        self.assertGreater(
+            cost, 0, "the memo survived a prune untouched")
+
+    def test_delete_environment_invalidates(self) -> None:
+        self.store.upsert_runs([make_record(environment="UNKNOWN")])
+        before = self.store.environments()
+        self.assertIn("UNKNOWN", before)
+        self.store.delete_environment("UNKNOWN")
+        after = self.store.environments()
+        self.assertNotIn(
+            "UNKNOWN", after,
+            "the memo kept serving a deleted environment")
+
+    def test_set_assignee_invalidates_queue_counts(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        stale_before = BASE + datetime.timedelta(hours=1)
+        before = self.store.queue_counts(
+            stale_before=stale_before, assignee="alice")
+        self.assertEqual(before["mine"], 0)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        after = self.store.queue_counts(
+            stale_before=stale_before, assignee="alice")
+        self.assertEqual(
+            after["mine"], 1,
+            "the memo kept serving zero assigned tests")
+
+    def test_set_retired_invalidates_summary_rollup(self) -> None:
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        before = self.store.summary_rollup(cutoff)
+        self.assertFalse(any(c.retired for c in before))
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "amy", "gone",
+            CREATED)
+        after = self.store.summary_rollup(cutoff)
+        self.assertTrue(
+            any(c.retired for c in after),
+            "the memo kept serving the pre-retirement rollup")
+
+    def test_set_retired_invalidates_test_counts(self) -> None:
+        """test_counts_by_environment excludes retired tests -- the
+        SAME rollup a retirement comment write must also invalidate."""
+        self.store.upsert_runs([make_record()])
+        before = self.store.test_counts_by_environment()
+        self.assertEqual(before.get("linux-sim"), 1)
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "amy", "gone",
+            CREATED)
+        after = self.store.test_counts_by_environment()
+        self.assertEqual(
+            after.get("linux-sim", 0), 0,
+            "the memo kept counting a just-retired test")
+
+    def test_add_comment_invalidates_status_queue_comment_payload(
+        self,
+    ) -> None:
+        # Two FAILs, so prev_result is FAIL too and the row lands in
+        # "still_failing" rather than "new_failures".
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        self.store.upsert_runs([make_record(
+            result=Result.FAIL,
+            start=BASE + datetime.timedelta(hours=1),
+            end=BASE + datetime.timedelta(hours=1, seconds=3))])
+        (row_before,) = self.store.status_queue(
+            "still_failing", with_latest_comment=True)
+        self.assertIsNone(row_before.latest_comment)
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "note", CREATED)
+        (row_after,) = self.store.status_queue(
+            "still_failing", with_latest_comment=True)
+        self.assertIsNotNone(
+            row_after.latest_comment,
+            "the memo kept serving the comment-less row")
+
+    def test_environment_products_write_needs_no_invalidation(self) -> None:
+        """Audited, not merely untested: every cached method takes its
+        product/environment scope as an explicit `environments`
+        allow-list argument rather than joining `environment_products`
+        itself, so a remap changes which KEY a request computes rather
+        than making an existing entry wrong. Proof: an environment's
+        estate-wide (unscoped) `environments()` entry, cached BEFORE a
+        product declaration, must still list it AFTER -- an unscoped
+        read was never keyed by product in the first place."""
+        self.store.upsert_runs([make_record()])
+        before = self.store.environments()
+        self.assertIn("linux-sim", before)
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "amy", CREATED)
+        after = self.store.environments()
+        self.assertIn("linux-sim", after)
+
+    # -- scope-key isolation ----------------------------------------------
+
+    def test_scope_key_isolation_by_environments_allow_list(self) -> None:
+        """Product A's memo entry must never answer for product B."""
+        self.store.upsert_runs([
+            make_record(environment="linux-sim"),
+            make_record(environment="win-sim"),
+        ])
+        only_linux = self.store.latest_run_time_by_environment(
+            environments=["linux-sim"])
+        only_win = self.store.latest_run_time_by_environment(
+            environments=["win-sim"])
+        self.assertEqual(sorted(only_linux), ["linux-sim"])
+        self.assertEqual(sorted(only_win), ["win-sim"])
+
+    def test_scope_key_isolation_by_stream(self) -> None:
+        """A branch's memo entry must never answer for mainline's."""
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        branch_id = self.store.list_streams("")[0].stream_id
+        mainline_counts = self.store.test_counts_by_environment()
+        branch_counts = self.store.test_counts_by_environment(branch_id)
+        self.assertEqual(mainline_counts.get("linux-sim"), 1)
+        self.assertEqual(branch_counts.get("linux-sim"), 1)
+        # Both counts happen to be 1 (one test each) -- the isolation
+        # that matters is that a SUBSEQUENT write to only one stream
+        # cannot leak into the other's still-cached entry.
+        self.store.upsert_runs([
+            make_record(test_name="test_c", branch="feat/x",
+                        start=BASE + datetime.timedelta(hours=2)),
+        ])
+        mainline_after = self.store.test_counts_by_environment()
+        self.assertEqual(
+            mainline_after.get("linux-sim"), 1,
+            "a branch-only import changed mainline's cached count")
+
+    def test_a_different_cutoff_is_a_different_key(self) -> None:
+        """summary_rollup must never round/truncate the cutoff for
+        caching purposes -- two distinct real cutoffs sharing one slot
+        would serve counts computed for the wrong window."""
+        self.store.upsert_runs([make_record()])
+        self.store.summary_rollup(BASE - datetime.timedelta(hours=1))
+        cost = self._query_count(
+            lambda: self.store.summary_rollup(BASE))
+        self.assertGreater(
+            cost, 0,
+            "a different cutoff reused another cutoff's cached rows")
+
+    # -- TTL bound ----------------------------------------------------------
+
+    def test_ttl_bound_expires_the_memo(self) -> None:
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        self.store.summary_rollup(cutoff)
+        self._expire_the_summary_cache()
+        cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
+        self.assertGreater(
+            cost, 0, "an entry older than the TTL was still served")
+
+    def test_within_ttl_still_hits(self) -> None:
+        """The expiry helper itself must be capable of NOT expiring --
+        otherwise test_ttl_bound_expires_the_memo above is vacuous."""
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        self.store.summary_rollup(cutoff)
+        cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
+        self.assertEqual(cost, 0)

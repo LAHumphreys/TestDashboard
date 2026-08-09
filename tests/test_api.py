@@ -3706,11 +3706,23 @@ class TestWatch(ApiCase):
         """§0.4: no new list query may cost more the more cards are
         asked for. One card and fifty must cost the SAME number of
         queries -- every card after the first fetch is a Python-side
-        slice of data already in memory."""
+        slice of data already in memory.
+
+        WP-23 "ONE MORE PERF SLICE" widened this: each measured call is
+        now preceded by an identical untraced warm-up call, so both
+        measurements start from the SAME (warm) summary/watch memo
+        state. Without it a bare comparison of a cold call against a
+        warm one would fail for a reason unrelated to card count --
+        exactly the false positive this guard must not produce. The
+        original finding -- card count must not change query count --
+        is unchanged and still enforced; only cache STATE is now held
+        equal between the two sides of the comparison, matching the
+        steady-state repeat-load traffic the memo targets."""
         self._seed()
         conn = self.storage._conn()
 
         def query_count(specs: List[str]) -> int:
+            self.call("GET", "/api/watch", query={"c": specs})
             statements = []  # type: List[str]
             _trace_sql_into(conn, statements)
             try:
@@ -3845,10 +3857,15 @@ class TestWatchStreamCards(ApiCase):
         """The same §0.4 flat-cost property TestWatch pins for e:/p:
         cards, extended here to s: cards -- a SEPARATE assertion rather
         than editing TestWatch's, since that one is specifically about
-        the pre-existing card kinds and must keep passing unchanged."""
+        the pre-existing card kinds and must keep passing unchanged.
+
+        WP-23 "ONE MORE PERF SLICE": same warm-up-before-each-measurement
+        widening as ``TestWatch.test_query_count_does_not_grow_with_card_
+        count`` -- see its docstring for why."""
         conn = self.storage._conn()
 
         def query_count(specs: List[str]) -> int:
+            self.call("GET", "/api/watch", query={"c": specs})
             statements = []  # type: List[str]
             _trace_sql_into(conn, statements)
             try:

@@ -296,8 +296,14 @@
           one at a time. It disappears once nothing is left unmapped.</li>
         <li>The home screen and a branch's comparison page do less work on
           the server to build the same page you already see — no visible
-          change, just fewer round trips behind the scenes. Still being
-          tightened; more of this to come.</li>
+          change, just fewer round trips behind the scenes.</li>
+        <li><strong>The home screen and Watch remember what they just
+          computed.</strong> Reloading either within about a minute of the
+          last load is now near-instant — the numbers themselves are
+          exactly as fresh as before (still checked against every import,
+          triage action, and comment), only the repeat computation is
+          skipped. The very first load of a session, or a load more than a
+          minute after the last one, is unchanged.</li>
       </ul>
     </section>
 

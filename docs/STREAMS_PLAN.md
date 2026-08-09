@@ -1564,6 +1564,114 @@ recorded here rather than left implicit:
     Open Actions' existing result column at a real screen size — the
     column may need to be wider than it is today; no browser has
     rendered it.
+- **ADDENDUM 4 (2026-08-09): summary/watch memoization, one more perf
+  slice.** The PERF ROUND above closed the redundant/duplicated work
+  the coordinator's perf-log named, but said so explicitly: "the
+  remaining ~130 ms is spent in code this round did not touch". User
+  calibration made that remainder the target: the real production
+  estate is 12k tests over 5 environments — this session's own
+  dev-scale copies ARE production scale for size, so `/api/summary` at
+  ~205 ms and `/api/watch` at ~250 ms are day-one experience.
+  - **Design: component-level memoization, at the `Storage` level, not
+    HTTP.** Copies `_trend_cache`'s exact TTL-bounded, write-invalidated
+    pattern (`_TREND_CACHE_TTL_SECONDS`, 60s, reused rather than
+    duplicated) into a new shared `_summary_cache` dict, keyed
+    `(method_name, *scope)`. Chosen over caching `_handle_summary`'s
+    whole composed response because `_handle_watch` has no equivalent
+    composed call to hook — it calls `summary_rollup`/
+    `test_counts_by_environment`/`latest_run_time_by_environment`
+    directly, so only a memo living below both handlers can serve both.
+    Eight methods memoized: `summary_rollup`, `queue_counts`,
+    `status_queue` (all 6 kinds), `test_counts_by_environment`,
+    `latest_run_time_by_environment`, `environments`, `scripts` —
+    widened from the coordinator's originally-named five once
+    attribution showed those five alone would land around 76 ms warm,
+    short of the 30 ms target. `failure_streak_bounds_many` is memoized
+    PER ENTRY, in its OWN separate cache dict (`_streak_cache`) — see
+    the bug below for why sharing one dict with the other seven was
+    wrong, not merely suboptimal.
+  - **`/api/watch` reuses the memo, deliberately without a second cache
+    layer of its own** (the coordinator's instruction): it now computes
+    its estate-wide rollup cutoff via `_pass_view` — the SAME function
+    `/api/summary` already used — instead of `now()`, which the existing
+    code already documented as "any value works" for that argument.
+    Verified directly: a warm `/api/watch` call issued right after a
+    warm `/api/summary` call adds ZERO new cache entries and costs 4.8
+    ms, against 24.2 ms cold.
+  - **Bug found and fixed before measuring**: the first version shared
+    ONE 128-entry cache between the ~20 request-composition keys and
+    `failure_streak_bounds_many`'s per-triple keys. A "warm" repeat
+    `/api/summary` call was still costing 28 raw SQL statements;
+    profiling found why — one unscoped request on the production-shape
+    estate touches 139 distinct keys once every queue kind and FAIL
+    row's streak entry is counted, over the 128 cap on its own, so the
+    cap-then-clear policy fired MID-request and wiped
+    `summary_rollup`/`queue_counts`/the earlier-processed queue kinds
+    before the SAME request finished using them. Fixed by giving
+    `failure_streak_bounds_many` its own dict (cap 4096, sized to the
+    estate's plausible simultaneously-failing-test count, not to one
+    request's key count).
+  - **Measured, HTTP end-to-end, a COPY of the shared server's actual
+    production-shape database** (5 environments, ~65k runs, ~12.8k
+    mainline tests), as a genuine paired A/B — a `git worktree` at this
+    branch's pre-change tip (`0a44ea0`) against the working tree, both
+    serving the SAME db file, back-to-back in one session (an EARLIER
+    same-session measurement showed OS file-cache warmth alone can move
+    these numbers 2–3×, so a naive "before" taken minutes apart from
+    "after" would have overstated the win): `/api/summary` median
+    **62.8 ms → 4.5 ms** warm; `/api/summary?parts=headline` **39.4 ms
+    → 3.2 ms**; `/api/watch` 8 mixed cards **107.8 ms → 68.6 ms**, of
+    which `compare_counts_many` (the `s:` stream card, a pre-existing,
+    already-flat, deliberately-not-memoized-here cost) accounts for
+    most of the remainder — the SAME 8 cards minus the one `s:` card:
+    **26.3 ms → 11.9 ms**. Cold (one request against a just-started
+    process): three paired samples, before {98.9, 131.3, 115.5} ms,
+    after {148.8, 185.6, 115.7} ms — same order of magnitude, after
+    running somewhat higher on 2 of 3, plausibly the small fixed cost of
+    cache-key construction that now runs on every cached call whether
+    it hits or not.
+  - **Invalidator audit** (the trend cache's clear list was the
+    checklist): `upsert_runs`/`delete_stream`/`prune_runs_before`/
+    `delete_environment` (already invalidated the trend cache; extended
+    to this memo too), plus THREE newly-identified sites the trend
+    cache never needed — `set_assignee` (queue/status-queue assigned
+    predicates read `current_assignments`), `set_retired`
+    (`summary_rollup`/`queue_counts`/`status_queue`/
+    `test_counts_by_environment` all read `test_retirements`, and it
+    also posts a comment), `add_comment` (`status_queue
+    (with_latest_comment=True)` caches the comment TEXT). Audited and
+    confirmed NOT needed: `set_environment_product`/
+    `clear_environment_product` — every cached method takes its
+    product/environment scope as an explicit `environments` allow-list
+    argument rather than joining `environment_products`, so a remap
+    changes which KEY a request computes, never makes an existing entry
+    wrong.
+  - **Tests**: `tests/test_storage.py::SummaryCacheTest`, 21 new tests
+    (repeat-call-is-a-hit per memoized shape, one per invalidator,
+    scope-key isolation, TTL expiry). Two existing guard tests
+    (`TestWatch`/`TestWatchStreamCards`'s query-count-flat-with-card-
+    count tests) started failing once the memo made a second identical
+    request cheaper than the first — WIDENED, not weakened: each now
+    primes an identical untraced warm-up call before tracing, holding
+    cache STATE equal between the comparison's two sides so the
+    original card-count invariant is still enforced.
+  - **Side effect worth naming**: `status_queue`'s `ORDER BY environment`
+    with a `LIMIT` and no unique tiebreak means two identical executions
+    of the same query could previously return different subsets of a
+    capped queue (observed directly while debugging the cache-thrashing
+    bug above). Pre-existing, unrelated to this change, deliberately not
+    fixed here — but the memo now means a repeat load inside the TTL
+    returns the same rows each time, where before it could silently
+    shuffle.
+  - **Not verified**: the measurement database is a static COPY, never
+    re-fed during this session. On a live server fed every 10 minutes,
+    `summary_rollup`/`queue_counts`/`status_queue`'s cutoff argument is
+    usually DATA-derived and stable across nearby requests (a covered
+    pass's start time); on an estate that has gone quiet long enough to
+    fall back to the 36-hour wall-clock window, that specific
+    cutoff-keyed cache stops helping until the estate is active again —
+    documented, correct, and not separately measured live. See
+    `docs/drops/2026-08-14.md`'s "Addendum 4" for the full account.
 
 ---
 

@@ -3054,13 +3054,15 @@ def _handle_watch(
     now_value = now()
     fallback = now_value - datetime.timedelta(hours=_SUMMARY_RECENT_HOURS)
     floor = now_value - datetime.timedelta(days=_PASS_LOOKBACK_DAYS)
-    inferred = storage.test_counts_by_environment()
-    declared = storage.declared_test_counts()
-    effective = analytics.effective_test_counts(inferred, declared)
-    all_passes = analytics.find_passes(
-        storage.activity_buckets(floor), effective,
-        gap_hours=_PASS_GAP_HOURS, coverage=_PASS_COVERAGE,
-    )
+    # WP-23 "ONE MORE PERF SLICE": this is _pass_view's own (mainline,
+    # unscoped) computation, called directly rather than duplicated, so
+    # that on the common unscoped load /api/watch's cutoff is
+    # BYTE-IDENTICAL to /api/summary's -- not just the same formula --
+    # and the two endpoints' summary_rollup calls (below) share one
+    # memo entry instead of computing the same estate-wide rollup twice.
+    pass_view = _pass_view(storage, now_value)
+    all_passes = pass_view.passes
+    estate_cutoff = pass_view.cutoff.when
     known_environments = set(storage.known_environments())
     env_to_product = storage.environment_products_map()
     product_to_envs = {}  # type: Dict[str, List[str]]
@@ -3129,9 +3131,14 @@ def _handle_watch(
     # ONE estate-wide rollup. The recent_cutoff argument only feeds a
     # column the verdict below never reads — none of failing/
     # new_failures/fixed/unexpected_passes is recency-gated (see
-    # analytics.summarize_by_product) — so any value works and no
-    # per-card (or per-scope) query is needed for it.
-    rollup_counts = storage.summary_rollup(now_value)
+    # analytics.summarize_by_product) — so any value would work here and
+    # no per-card (or per-scope) query is needed for it. WP-23 "ONE MORE
+    # PERF SLICE" passes estate_cutoff rather than now_value precisely
+    # BECAUSE any value works: it costs nothing and lets this call reuse
+    # /api/summary's own memoized summary_rollup(estate_cutoff, ...) on
+    # the common unscoped load, instead of missing on a now()-unique key
+    # every single request.
+    rollup_counts = storage.summary_rollup(estate_cutoff)
     by_environment = {
         row.product: row
         for row in analytics.summarize_by_product(
