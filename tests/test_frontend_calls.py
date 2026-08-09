@@ -2156,13 +2156,21 @@ class CompareStripTest(unittest.TestCase):
         with an explicit `stream: streamApiScope()` override
         (streamApiScope() is the NaN-guard the old helper carried
         inline); same assertion intent (both fetches carry this page's
-        own stream scope)."""
+        own stream scope).
+
+        WIDENED 2026-08-09 (persona-walk round): the count grew from 2
+        to 3 when renderLatest() gained the "View in timeline" link,
+        which carries the same page scope through the same override
+        (TestPageTimelineLinkTest pins that site's own shape). The
+        assertion's intent is unchanged — every carrier of this page's
+        stream scope uses the NaN-guarded form, and the count pin still
+        fails if one of the three sites loses it."""
         code = _strip_comments(read("test.js"))
         self.assertNotIn("function withStream(", code)
         self.assertIn("function streamApiScope()", code)
         self.assertIn("apiUrl(myPath(), {}, {", code)
         self.assertIn('apiUrl(myPath("/history"), {', code)
-        self.assertEqual(code.count("stream: streamApiScope()"), 2)
+        self.assertEqual(code.count("stream: streamApiScope()"), 3)
 
 
 class TestPageBranchBandTest(unittest.TestCase):
@@ -2464,6 +2472,18 @@ class CommentStreamTagTest(unittest.TestCase):
         thread records what was true when the note was written."""
         body = _function_body(
             read("test.js"), "async function onCommentSubmit(")
+        self.assertIn("body.stream_id = streamId", body)
+
+    def test_an_assignment_made_from_a_scoped_page_is_tagged(self) -> None:
+        """The assignee PUT sends stream_id under the SAME guard the
+        comment POST above has always used. Found by the 2026-08-09
+        persona walk: assigning from a build-scoped test page landed as
+        mainline-origin — no origin tag in Open Actions, origin filter
+        never appeared — while the identical action through the
+        dashboard's review panel (api.js assigneeSelect) carried it.
+        One action, two on-screen controls, one behavior."""
+        body = _function_body(
+            read("test.js"), "async function onAssigneeChange()")
         self.assertIn("body.stream_id = streamId", body)
 
 
@@ -3812,6 +3832,81 @@ class ScopedUrlConstructionTest(unittest.TestCase):
     def test_a_planted_environment_param_would_be_caught(self) -> None:
         planted = 'qs.append("environment", state.environment);'
         self.assertTrue(_ENVIRONMENT_PARAM_RE.search(planted))
+
+
+class TestPageTimelineLinkTest(unittest.TestCase):
+    """test.html's route to the Timeline (2026-08-09 persona walk): the
+    delver journey reads "test page → history → timeline of that
+    night", and the page had NO on-screen route to the Timeline at all
+    — the scoped "View in timeline" link existed only on the
+    dashboard's review panel, one step earlier, so anyone who followed
+    "Open full test page" lost it. The latest-run line now carries the
+    same link, same wording, same `at=` semantics as review.js's."""
+
+    def test_the_latest_run_line_links_into_the_timeline(self) -> None:
+        body = _function_body(read("test.js"), "function renderLatest(")
+        self.assertIn('pageUrl("timeline"', body)
+        self.assertIn("at: latest.start_time", body)
+        self.assertIn("View in timeline", body)
+
+    def test_the_link_names_stream_alongside_product_null(self) -> None:
+        """Naming `product` in an overrides object suppresses default
+        carriage for every level it contains — the WP-24 four-site fix
+        round's lesson, pinned here the same way as at those sites."""
+        body = _function_body(read("test.js"), "function renderLatest(")
+        self.assertIn(
+            "{ stream: streamApiScope(), product: null, baseline: null }",
+            body)
+
+
+class OneKindVisibleWordingTest(unittest.TestCase):
+    """WP-25's done-when: no UI STRING distinguishes branch from build.
+    The 2026-08-09 persona walk found three VISIBLE strings the
+    collapse missed — watch.html's composer option ("Branch/build"),
+    index.html's tab-list aria-label ("Branch dashboard view"), and the
+    delta table's static column header ("This branch") — invisible to
+    the per-file guards because nothing pinned visible wording as a
+    CLASS. This sweep does: rendered text nodes and aria-label/title
+    attribute values in the shipped markup may not say "branch".
+    Element ids and class names (branch-band, branch-tabs) are exempt —
+    invisible plumbing, and renaming them is churn with no user-visible
+    gain. HTML comments are stripped first: historical reasoning keeps
+    its vocabulary."""
+
+    @staticmethod
+    def _visible_branch_hits(html: str) -> List[str]:
+        stripped = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+        hits = []  # type: List[str]
+        for match in re.finditer(r">([^<>]*)<", stripped):
+            if "branch" in match.group(1).lower():
+                hits.append(match.group(1).strip())
+        for match in re.finditer(
+                r'(?:aria-label|title)="([^"]*)"', stripped):
+            if "branch" in match.group(1).lower():
+                hits.append(match.group(1))
+        return hits
+
+    def test_no_visible_branch_wording_in_any_page(self) -> None:
+        for name in sorted(os.listdir(STATIC_DIR)):
+            if not name.endswith(".html"):
+                continue
+            hits = self._visible_branch_hits(read(name))
+            self.assertEqual(
+                [], hits,
+                "{} shows branch-kind wording to a user: {!r}".format(
+                    name, hits))
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted regression — the compat-gate pattern: a detector
+        that has never failed is not known to work."""
+        self.assertEqual(
+            ["This branch"],
+            self._visible_branch_hits(
+                "<th>This branch</th><!-- a branch comment -->"))
+        self.assertEqual(
+            ["Branch dashboard view"],
+            self._visible_branch_hits(
+                '<div aria-label="Branch dashboard view"></div>'))
 
 
 if __name__ == "__main__":
