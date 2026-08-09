@@ -603,8 +603,21 @@ function renderCompareToControl(streamMeta, baselineMeta, streams) {
 
   input.value = baselineMeta.kind === "mainline"
     ? mainlineLabel : baselineMeta.kind + ":" + baselineMeta.name;
-  // Idempotent assignment, same reasoning as the show-more/reload
-  // buttons below: this control can be re-rendered by a reload.
+  // Clear-on-focus / restore-on-blur, same defect and same cure as the
+  // Build picker (see streams.js renderPicker): a datalist filters by
+  // the box's current text, so a pre-filled box offers no suggestions
+  // until hand-cleared. Idempotent handler assignment throughout, same
+  // reasoning as the show-more/reload buttons below: this control can
+  // be re-rendered by a reload.
+  input.onfocus = () => {
+    input.dataset.restore = input.value;
+    input.value = "";
+  };
+  input.onblur = () => {
+    if (input.value.trim() === "" && input.dataset.restore) {
+      input.value = input.dataset.restore;
+    }
+  };
   input.onchange = () => {
     const chosen = labelToId[input.value];
     if (chosen === undefined) {

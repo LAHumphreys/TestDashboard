@@ -93,11 +93,29 @@ export function renderPicker(container, streams, selectedId) {
   }
 
   input.value = selectedLabel;
+  // A datalist filters its suggestions by the input's CURRENT text, so
+  // a box already holding "Mainline nightlies" offers nothing until the
+  // user hand-deletes it — reported as "switching off mainline is
+  // annoying" by the first person to use it (2026-08-09). So: empty the
+  // box on focus (every option becomes visible, typing starts a fresh
+  // substring search), and put the old value back on blur if nothing
+  // was chosen — an aborted click must never leave the control blank,
+  // because the box doubles as the ONLY statement of the current scope.
+  input.addEventListener("focus", () => {
+    input.dataset.restore = input.value;
+    input.value = "";
+  });
+  input.addEventListener("blur", () => {
+    if (input.value.trim() === "" && input.dataset.restore) {
+      input.value = input.dataset.restore;
+    }
+  });
   input.addEventListener("change", () => {
     const target = labelToId[input.value];
     if (target === undefined) {
       return;   // not a recognised option -- leave the page as it is
     }
+    delete input.dataset.restore;   // a real choice; nothing to restore
     const url = new URL(window.location.href);
     if (target) {
       url.searchParams.set("stream", target);

@@ -1077,6 +1077,29 @@ class StreamPickerTest(unittest.TestCase):
         self.assertIn("streams.length === 0", body)
         self.assertIn("container.hidden = true", body)
 
+    def test_both_datalist_combos_clear_on_focus_and_restore_on_blur(
+            self) -> None:
+        """A datalist filters its suggestions by the input's CURRENT
+        text, so a combo pre-filled with the current scope offers
+        NOTHING until the user hand-deletes it — reported by the first
+        person to switch off mainline (2026-08-09). Both combos (the
+        Build picker and Compare-to) must empty themselves on focus and
+        put the old value back on blur when nothing was chosen: the box
+        doubles as the only statement of the current scope, so an
+        aborted click must never leave it blank."""
+        picker = _function_body(
+            read("streams.js"), "export function renderPicker(")
+        compare_to = _function_body(
+            read("compare.js"), "function renderCompareToControl(")
+        for name, body in (("streams.js renderPicker", picker),
+                           ("compare.js renderCompareToControl",
+                            compare_to)):
+            for needle in ("dataset.restore", 'input.value = ""'):
+                self.assertIn(
+                    needle, body,
+                    "{0}: missing the clear-on-focus/restore-on-blur "
+                    "pattern ({1!r})".format(name, needle))
+
     def test_selection_lives_in_the_url_not_local_storage(self) -> None:
         """Unlike the product switcher, a branch is something you are
         looking AT, not a standing preference — docs/STREAMS_PLAN.md
