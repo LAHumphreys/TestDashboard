@@ -107,12 +107,13 @@ def _format_duration(seconds: float) -> str:
 
 
 class StreamsAckMissing(Exception):
-    """Raised when a ``--branch``/``--build`` run gets a 200 with no
-    ``streams_seen`` key at all (WP-21, docs/STREAMS_PLAN.md §3.3/§3.7).
+    """Raised when a ``--build`` run gets a 200 with no ``streams_seen``
+    key at all (WP-21, docs/STREAMS_PLAN.md §3.3/§3.7; ``--branch``
+    removed by WP-25, docs/ONE_KIND_PLAN.md, before it ever shipped).
 
     Every deployed server before this drop ignores unknown JSON keys, so
-    a feeder sending ``branch``/``build`` at a pre-WP-21 server would
-    silently import those runs into MAINLINE — the same class of danger
+    a feeder sending ``build`` at a pre-WP-21 server would silently
+    import those runs into MAINLINE — the same class of danger
     as the schema-version refusal, and handled the same way: refuse
     loudly instead of corrupting quietly. Raised from inside
     :meth:`Submitter._handle_success` on the FIRST batch that exhibits
@@ -295,7 +296,6 @@ class Submitter:
                  max_consecutive_failures: int = 3,
                  max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
                  clock: Callable[[], float] = time.time,
-                 branch: Optional[str] = None,
                  build: Optional[str] = None) -> None:
         """Configure the submitter.
 
@@ -320,11 +320,12 @@ class Submitter:
         history means thousands of files and hours of retry backoff for
         an import that cannot succeed.
 
-        ``branch``/``build`` (WP-21, mutually exclusive, validated by the
-        CLI before this is constructed) do NOT stamp records here — that
-        happens in run_feeder.py, on the raw dicts, before they ever
-        reach :meth:`submit`. Their only job in this class is to say
-        "this run expects the streams_seen acknowledgment"; see
+        ``build`` (WP-21, validated by the CLI before this is
+        constructed; ``--branch`` removed by WP-25 before it ever
+        shipped) does NOT stamp records here — that happens in
+        run_feeder.py, on the raw dicts, before they ever reach
+        :meth:`submit`. Its only job in this class is to say "this run
+        expects the streams_seen acknowledgment"; see
         :class:`StreamsAckMissing`.
         """
         self._url = normalize_url(url)
@@ -338,7 +339,7 @@ class Submitter:
         self._max_batch_bytes = max(1, int(max_batch_bytes))
         self._clock = clock
         self._max_accepted = None  # type: Optional[datetime.datetime]
-        self._expect_streams_ack = branch is not None or build is not None
+        self._expect_streams_ack = build is not None
 
     def submit(self, records: Iterable[Dict[str, Any]],
                dry_run: bool = False,
@@ -594,15 +595,15 @@ class Submitter:
             payload = {}
         if self._expect_streams_ack and "streams_seen" not in payload:
             raise StreamsAckMissing(
-                "batch {0}: this run was given --branch/--build, but the "
+                "batch {0}: this run was given --build, but the "
                 "server's response to POST {1} has no 'streams_seen' key "
                 "at all. That key was added in WP-21; a server without it "
-                "does not know about branch/build runs and would silently "
+                "does not know about build runs and would silently "
                 "file them into MAINLINE. Batch {0} itself DID get a real "
                 "200 (its data is stored, most likely in mainline) — "
                 "aborting before any further batch does the same. Update "
                 "the dashboard server to a build that includes WP-21, or "
-                "drop --branch/--build to import as mainline "
+                "drop --build to import as mainline "
                 "deliberately.".format(batch_number, self._url)
             )
         inserted = int(payload.get("inserted", 0) or 0)

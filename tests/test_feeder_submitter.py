@@ -158,7 +158,6 @@ class SubmitterTestBase(unittest.TestCase):
                        max_retries: int = 3,
                        backoff_seconds: float = 2.0,
                        url: str = URL,
-                       branch: Optional[str] = None,
                        build: Optional[str] = None) -> Submitter:
         """Build a Submitter wired to the fakes and the temp replay dir."""
         return Submitter(
@@ -169,7 +168,6 @@ class SubmitterTestBase(unittest.TestCase):
             opener=opener,
             sleep=self.sleep,
             replay_dir=self.replay_dir,
-            branch=branch,
             build=build,
         )
 
@@ -569,47 +567,42 @@ class DescribeConnectionErrorTest(unittest.TestCase):
 
 
 class StreamsAckTest(SubmitterTestBase):
-    """WP-21 (docs/STREAMS_PLAN.md section 3.3/3.7): a --branch/--build
-    submitter must abort if the server's response has no streams_seen
-    key at all — the sign of a server that predates WP-21 and would
-    silently file the runs into mainline."""
+    """WP-21 (docs/STREAMS_PLAN.md section 3.3/3.7): a --build submitter
+    must abort if the server's response has no streams_seen key at all —
+    the sign of a server that predates WP-21 and would silently file the
+    runs into mainline. (--branch died with WP-25, docs/ONE_KIND_PLAN.md,
+    before it ever shipped.)"""
 
     def test_mainline_never_checks_for_the_key(self) -> None:
-        """No branch/build given: an old-shaped response is fine."""
+        """No build given: an old-shaped response is fine."""
         opener = FakeOpener([(200, ok_body_without_streams_seen())])
         submitter = self.make_submitter(opener)
         stats = submitter.submit([make_raw(0)])
         self.assertEqual(stats.sent, 1)
 
-    def test_branch_with_the_key_present_succeeds(self) -> None:
+    def test_build_with_the_key_present_succeeds(self) -> None:
         opener = FakeOpener([(200, ok_body(inserted=1,
-                                            streams_seen=["branch:feat/x"]))])
-        submitter = self.make_submitter(opener, branch="feat/x")
+                                            streams_seen=["build:feat/x"]))])
+        submitter = self.make_submitter(opener, build="feat/x")
         stats = submitter.submit([make_raw(0)])
         self.assertEqual(stats.sent, 1)
 
-    def test_branch_with_an_empty_list_still_succeeds(self) -> None:
+    def test_build_with_an_empty_list_still_succeeds(self) -> None:
         """The key must be PRESENT; an empty list is a legitimate answer
         (e.g. every record in this particular batch got rejected before
         being counted, though the key itself was echoed back)."""
         opener = FakeOpener([(200, ok_body(inserted=0, streams_seen=[]))])
-        submitter = self.make_submitter(opener, branch="feat/x")
+        submitter = self.make_submitter(opener, build="feat/x")
         stats = submitter.submit([make_raw(0)])
         self.assertEqual(stats.sent, 1)
 
-    def test_branch_with_the_key_absent_raises(self) -> None:
+    def test_build_with_the_key_absent_raises(self) -> None:
         opener = FakeOpener([(200, ok_body_without_streams_seen())])
-        submitter = self.make_submitter(opener, branch="feat/x")
+        submitter = self.make_submitter(opener, build="feat/x")
         with self.assertRaises(StreamsAckMissing) as caught:
             submitter.submit([make_raw(0)])
         self.assertIn("streams_seen", str(caught.exception))
-        self.assertIn("--branch/--build", str(caught.exception))
-
-    def test_build_with_the_key_absent_raises(self) -> None:
-        opener = FakeOpener([(200, ok_body_without_streams_seen())])
-        submitter = self.make_submitter(opener, build="2026.9.1")
-        with self.assertRaises(StreamsAckMissing):
-            submitter.submit([make_raw(0)])
+        self.assertIn("--build", str(caught.exception))
 
     def test_the_triggering_batch_still_counts_as_sent_not_replayed(
             self) -> None:
@@ -617,7 +610,7 @@ class StreamsAckTest(SubmitterTestBase):
         No replay file should be written for it; the exception is the
         signal, not a batch failure."""
         opener = FakeOpener([(200, ok_body_without_streams_seen())])
-        submitter = self.make_submitter(opener, branch="feat/x")
+        submitter = self.make_submitter(opener, build="feat/x")
         with self.assertRaises(StreamsAckMissing):
             submitter.submit([make_raw(0)])
         self.assertEqual(self.replay_files_on_disk(), [])
@@ -626,11 +619,11 @@ class StreamsAckTest(SubmitterTestBase):
         """The first batch acks fine; the second does not (e.g. a
         rolling deploy landed an old node mid-import) - still aborts."""
         opener = FakeOpener([
-            (200, ok_body(inserted=1, streams_seen=["branch:feat/x"])),
+            (200, ok_body(inserted=1, streams_seen=["build:feat/x"])),
             (200, ok_body_without_streams_seen()),
         ])
         submitter = self.make_submitter(
-            opener, batch_size=1, branch="feat/x")
+            opener, batch_size=1, build="feat/x")
         with self.assertRaises(StreamsAckMissing):
             submitter.submit([make_raw(0, minutes=0), make_raw(1, minutes=1)])
 
