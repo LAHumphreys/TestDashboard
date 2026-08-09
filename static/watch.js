@@ -23,6 +23,7 @@ import {
   showError,
 } from "./api.js";
 import { CATEGORY_LABELS, CATEGORY_ORDER, ageText } from "./compare.js";
+import { pageUrl } from "./urls.js";
 
 /** localStorage key holding this browser's default Watchlist query. */
 const DEFAULT_KEY = "testboard.watch.default";
@@ -128,22 +129,33 @@ function writeDefault(query) {
  * URL is the whole configuration" rule the Watchlist's own URL follows.
  */
 function cardLink(card) {
-  const params = new URLSearchParams();
+  // Every branch composes through pageUrl() (WP-24) — this is the
+  // "non-c=" part of the exemption watch.js's own module docstring and
+  // docs/SCOPED_URLS_PLAN.md §4 both call out: the card's OWN scope is
+  // always passed as an EXPLICIT override, never pageUrl()'s default
+  // carriage (which would read whatever this browser's own address bar
+  // happens to hold, defeating the whole point of a card that names
+  // its own scope). `baseline`/`environment`/`stream` all end up null
+  // for a plain product card, `stream`/`baseline` null for an
+  // environment card, and `baseline`/`environment` null for a stream
+  // card — the SAME cascade the hierarchy rule already produces from
+  // naming `product` alone; each branch below only needs to add
+  // whatever ELSE the original single-field append also stated.
   if (card.kind === "product") {
-    params.set("product", card.name);
-  } else if (card.kind === "environment") {
-    params.set("environment", card.name);
-    params.set("product", card.product || "");
-  } else if (card.kind === "stream") {
+    return pageUrl("index", {}, { product: card.name });
+  }
+  if (card.kind === "environment") {
+    return pageUrl("index", { environment: card.name },
+      { product: card.product || "" });
+  }
+  if (card.kind === "stream") {
     // A stream is identified by ID, not name (two products can each
     // have a "feat/x" branch) — the dashboard's delta view reads the
     // same ?stream=<id> the Build picker writes.
-    params.set("stream", String(card.id));
-    params.set("product", card.product || "");
-  } else {
-    return null;
+    return pageUrl("index", {},
+      { stream: card.id, product: card.product || "" });
   }
-  return "index.html?" + params.toString();
+  return null;
 }
 
 /**

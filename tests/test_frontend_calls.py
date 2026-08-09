@@ -2388,9 +2388,14 @@ class WatchStreamCardTest(unittest.TestCase):
 
     def test_the_open_link_uses_the_stream_id_not_its_name(self) -> None:
         """Two products can each have a "feat/x" branch — only the id is
-        unambiguous (docs/STREAMS_PLAN.md §3.6)."""
+        unambiguous (docs/STREAMS_PLAN.md §3.6).
+
+        WP-24: cardLink() composes through pageUrl() (its own
+        docstring's exemption note) — `params.set("stream", ...)`
+        became `stream: card.id` in the explicit scope override."""
         body = _function_body(read("watch.js"), "function cardLink(")
-        self.assertIn('params.set("stream", String(card.id))', body)
+        stream_at = body.index('card.kind === "stream"')
+        self.assertIn("stream: card.id", body[stream_at:])
 
     def test_the_open_link_also_carries_the_streams_own_product(
         self
@@ -2398,9 +2403,13 @@ class WatchStreamCardTest(unittest.TestCase):
         """WP-23 bugfix: a stream card's link must be scope-self-
         sufficient — landing on index.html with only ?stream= set would
         render under whatever product this browser's switcher last had
-        stored, not necessarily the stream's own."""
+        stored, not necessarily the stream's own.
+
+        WP-24: `params.set("product", ...)` became `product:
+        card.product || ""` in the same scope override."""
         body = _function_body(read("watch.js"), "function cardLink(")
-        self.assertIn('params.set("product", card.product || "")', body)
+        stream_at = body.index('card.kind === "stream"')
+        self.assertIn('product: card.product || ""', body[stream_at:])
 
     def test_the_add_picker_offers_a_branch_build_option(self) -> None:
         self.assertIn('<option value="s">', read_text("watch.html"))
@@ -2418,22 +2427,30 @@ class CardLinkScopeSelfSufficiencyTest(unittest.TestCase):
     whole configuration", extended to a card's OWN link)."""
 
     def test_environment_card_link_carries_its_own_product(self) -> None:
+        """WP-24: `params.set("product", ...)` became `product:
+        card.product || ""` in the explicit scope override passed to
+        pageUrl() alongside `{ environment: card.name }`."""
         body = _function_body(read("watch.js"), "function cardLink(")
         env_at = body.index('card.kind === "environment"')
         stream_at = body.index('card.kind === "stream"')
         environment_branch = body[env_at:stream_at]
-        self.assertIn('params.set("product", card.product || "")',
-                       environment_branch)
+        self.assertIn('product: card.product || ""', environment_branch)
+        self.assertIn('{ environment: card.name }', environment_branch)
 
     def test_product_card_link_is_unchanged(self) -> None:
         """A product card already names the product by construction —
-        no second field to add, and the existing single params.set()
-        call must still be the only one for that branch."""
+        no second field to add.
+
+        WP-24: the single params.set() call became one pageUrl() call
+        with a single-key scope override — same intent, checking the
+        override carries exactly `product`, no `environment`/`stream`
+        alongside it."""
         body = _function_body(read("watch.js"), "function cardLink(")
         product_at = body.index('card.kind === "product"')
         env_at = body.index('card.kind === "environment"')
         product_branch = body[product_at:env_at]
-        self.assertEqual(product_branch.count("params.set("), 1)
+        self.assertIn('pageUrl("index", {}, { product: card.name })',
+                       product_branch)
 
 
 class WatchUnassignedStatLinkTest(unittest.TestCase):
