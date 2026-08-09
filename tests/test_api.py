@@ -408,7 +408,7 @@ class TestDashboardAssignmentOrigin(ApiCase):
             record(test_name="test_b"),
         ])
         self.import_runs([record(
-            test_name="test_c", branch="feat/x",
+            test_name="test_c", build="feat/x",
             start_time="2026-07-25T03:00:00.000000",
             end_time="2026-07-25T03:00:03.000000")])
         streams = self.call(
@@ -427,13 +427,13 @@ class TestDashboardAssignmentOrigin(ApiCase):
     def test_no_filter_returns_the_streams_map_for_the_page(self) -> None:
         data = self.call("GET", "/api/dashboard")
         self.assertEqual(
-            data["streams"][str(self.stream_id)]["kind"], "branch")
+            data["streams"][str(self.stream_id)]["kind"], "build")
         self.assertEqual(
             data["streams"][str(self.stream_id)]["name"], "feat/x")
 
     def test_no_page_streams_no_map_entries(self) -> None:
-        """A test with no branch-originated assignment on the returned
-        page must not spuriously carry a streams entry."""
+        """A test with no non-mainline-originated assignment on the
+        returned page must not spuriously carry a streams entry."""
         data = self.call(
             "GET", "/api/dashboard", query={"q": ["test_b"]})
         self.assertEqual(data["streams"], {})
@@ -866,7 +866,7 @@ class TestStreamResults(ApiCase):
         ])
         self.import_runs([
             record(environment=self.ENV, script=self.SCRIPT,
-                   test_name=self.NAME, result="FAIL", branch="feat/x",
+                   test_name=self.NAME, result="FAIL", build="feat/x",
                    start_time="2026-07-25T04:00:00.000000",
                    end_time="2026-07-25T04:00:03.000000"),
         ])
@@ -886,7 +886,7 @@ class TestStreamResults(ApiCase):
         self.assertEqual(data["test_name"], self.NAME)
         self.assertEqual(data["product"], "Atlas")
         kinds = [row["stream"]["kind"] for row in data["results"]]
-        self.assertEqual(kinds, ["branch", "build", "mainline"])
+        self.assertEqual(kinds, ["build", "build", "mainline"])
         self.assertEqual(data["results"][0]["result"], "FAIL")
         self.assertIn("run_id", data["results"][0])
         self.assertIn("start_time", data["results"][0])
@@ -1268,7 +1268,7 @@ class TestAssigneeStreamId(ApiCase):
         self.import_runs([record(
             environment="linux-sim", test_name="test_a")])
         self.import_runs([record(
-            environment="linux-sim", test_name="test_a", branch="feat/x",
+            environment="linux-sim", test_name="test_a", build="feat/x",
             result="FAIL",
             start_time="2026-07-25T03:00:00.000000",
             end_time="2026-07-25T03:00:03.000000")])
@@ -1323,7 +1323,7 @@ class TestOriginResultTruthfulDisplay(ApiCase):
         self.import_runs([record(
             environment="linux-sim", test_name="test_a", result="PASS")])
         self.import_runs([record(
-            environment="linux-sim", test_name="test_a", branch="feat/x",
+            environment="linux-sim", test_name="test_a", build="feat/x",
             result="FAIL",
             start_time="2026-07-25T03:00:00.000000",
             end_time="2026-07-25T03:00:03.000000")])
@@ -1396,7 +1396,7 @@ class TestOriginResultTruthfulDisplay(ApiCase):
             self.import_runs([record(
                 environment="linux-sim", test_name=name, result="PASS")])
             self.import_runs([record(
-                environment="linux-sim", test_name=name, branch="feat/x",
+                environment="linux-sim", test_name=name, build="feat/x",
                 result="FAIL",
                 start_time="2026-07-25T03:00:00.000000",
                 end_time="2026-07-25T03:00:03.000000")])
@@ -1622,7 +1622,7 @@ class TimeStreamScopingTest(ApiCase):
         before = self.call("GET", "/api/time")
         self.import_runs([
             record(environment="linux", script="a.py",
-                   test_name="branch_only", branch="feat/x",
+                   test_name="branch_only", build="feat/x",
                    start_time=format_iso(NOW - datetime.timedelta(hours=1)),
                    end_time=format_iso(NOW - datetime.timedelta(hours=1)
                                        + datetime.timedelta(seconds=99))),
@@ -1633,7 +1633,7 @@ class TimeStreamScopingTest(ApiCase):
     def test_stream_param_reads_the_branch_own_time(self) -> None:
         self.import_runs([
             record(environment="linux", script="a.py",
-                   test_name="branch_only", branch="feat/x",
+                   test_name="branch_only", build="feat/x",
                    start_time=format_iso(NOW - datetime.timedelta(hours=1)),
                    end_time=format_iso(NOW - datetime.timedelta(hours=1)
                                        + datetime.timedelta(seconds=99))),
@@ -1652,7 +1652,7 @@ class TimeStreamScopingTest(ApiCase):
         field test detail already echoes as "stream_identity"."""
         self.import_runs([
             record(environment="linux", script="a.py",
-                   test_name="branch_only", branch="feat/x",
+                   test_name="branch_only", build="feat/x",
                    start_time=format_iso(NOW - datetime.timedelta(hours=1)),
                    end_time=format_iso(NOW - datetime.timedelta(hours=1)
                                        + datetime.timedelta(seconds=99))),
@@ -1662,12 +1662,55 @@ class TimeStreamScopingTest(ApiCase):
         data = self.call(
             "GET", "/api/time", query={"stream": [str(stream_id)]})
         self.assertEqual(data["stream_identity"]["id"], stream_id)
-        self.assertEqual(data["stream_identity"]["kind"], "branch")
+        self.assertEqual(data["stream_identity"]["kind"], "build")
         self.assertEqual(data["stream_identity"]["name"], "feat/x")
 
     def test_mainline_has_no_stream_identity(self) -> None:
         data = self.call("GET", "/api/time")
         self.assertIsNone(data["stream_identity"])
+
+
+class TimeStreamEnvironmentHintTest(ApiCase):
+    """WP-25 (docs/ONE_KIND_PLAN.md §2b.1, user-reported 2026-08-09): a
+    build that ran on one environment showed a bare empty page on every
+    OTHER environment — the data was honest, the page was not.
+    ``stream_environments`` names where the stream's data actually is."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="atlas-lab-bravo", script="a.py",
+                   test_name="t", build="2026.9.1",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=10))),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        self.stream_id = streams["streams"][0]["id"]
+
+    def test_empty_on_a_different_environment_names_the_real_one(
+            self) -> None:
+        data = self.call(
+            "GET", "/api/time",
+            query={"stream": [str(self.stream_id)],
+                   "environment": ["atlas-lab-alpha"], "group_by": ["script"]})
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["stream_environments"], ["atlas-lab-bravo"])
+
+    def test_present_and_populated_costs_nothing_extra(self) -> None:
+        data = self.call(
+            "GET", "/api/time",
+            query={"stream": [str(self.stream_id)],
+                   "environment": ["atlas-lab-bravo"], "group_by": ["script"]})
+        self.assertNotEqual(data["items"], [])
+        self.assertIsNone(data["stream_environments"])
+
+    def test_mainline_never_carries_the_field(self) -> None:
+        data = self.call(
+            "GET", "/api/time", query={"environment": ["nope-at-all"],
+                                        "group_by": ["script"]})
+        self.assertEqual(data["items"], [])
+        self.assertIsNone(data["stream_environments"])
 
 
 class TestUsers(ApiCase):
@@ -2531,7 +2574,7 @@ class TestSummaryAssignmentStreams(ApiCase):
             self) -> None:
         self.import_runs([record(test_name="test_a")])
         self.import_runs([record(
-            test_name="test_a", branch="feat/x",
+            test_name="test_a", build="feat/x",
             start_time="2026-07-25T03:00:00.000000",
             end_time="2026-07-25T03:00:03.000000")])
         streams = self.call(
@@ -2546,7 +2589,7 @@ class TestSummaryAssignmentStreams(ApiCase):
         result = self.call("GET", "/api/summary")["assignment_streams"]
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["id"], stream_id)
-        self.assertEqual(result[0]["kind"], "branch")
+        self.assertEqual(result[0]["kind"], "build")
         self.assertEqual(result[0]["name"], "feat/x")
 
 
@@ -2652,9 +2695,9 @@ class TestScriptExecutions(ApiCase):
             start_time=base, end_time=base,
         )])
         self.import_runs([
-            record(script=self.SCRIPT, test_name="branch_a", branch="feat/x",
+            record(script=self.SCRIPT, test_name="branch_a", build="feat/x",
                    start_time=base, end_time=base),
-            record(script=self.SCRIPT, test_name="branch_b", branch="feat/x",
+            record(script=self.SCRIPT, test_name="branch_b", build="feat/x",
                    start_time=base, end_time=base),
         ])
         streams = self.call("GET", "/api/streams", query={"product": [""]})
@@ -2671,7 +2714,7 @@ class TestScriptExecutions(ApiCase):
             "GET", self.path(),
             query={"days": ["30"], "stream": [str(stream_id)]})
         self.assertEqual(branch["stream"], stream_id)
-        self.assertEqual(branch["stream_identity"]["kind"], "branch")
+        self.assertEqual(branch["stream_identity"]["kind"], "build")
         self.assertEqual(branch["stream_identity"]["name"], "feat/x")
         self.assertEqual(len(branch["executions"]), 1)
         self.assertEqual(branch["executions"][0]["total"], 2)
@@ -3760,7 +3803,7 @@ class TestWatchStreamCards(ApiCase):
         self._declare("linux-sim", "Atlas")
         self.import_runs([
             record(environment="linux-sim", test_name="test_a",
-                   result="FAIL", branch="feat/x",
+                   result="FAIL", build="feat/x",
                    start_time="2026-07-25T03:00:00.000000",
                    end_time="2026-07-25T03:00:03.000000"),
         ])
@@ -3775,16 +3818,16 @@ class TestWatchStreamCards(ApiCase):
         self.assertTrue(card["ok"])
         self.assertEqual(card["kind"], "stream")
         self.assertEqual(card["name"], "feat/x")
-        self.assertEqual(card["stream_kind"], "branch")
+        self.assertEqual(card["stream_kind"], "build")
         self.assertEqual(card["product"], "Atlas")
         self.assertEqual(card["new_failures"], 1)   # test_a
         self.assertEqual(card["no_result"], 1)      # test_b
         self.assertEqual(card["agree"], 0)
         self.assertIsNotNone(card["last_seen"])
         self.assertIsNotNone(card["baseline_last_seen"])
-        # WP-22: a branch has no predecessor concept, so its baseline is
-        # always mainline -- named explicitly, never assumed by the
-        # frontend from a hardcoded word.
+        # WP-25 (docs/ONE_KIND_PLAN.md §1.4): one wording for every
+        # stream -- the baseline is always mainline, named explicitly,
+        # never assumed by the frontend from a hardcoded word.
         self.assertEqual(card["baseline_kind"], "mainline")
         self.assertEqual(card["baseline_name"], "")
         # WP-23: test_a fails on the branch and is unassigned.
@@ -3908,7 +3951,7 @@ class TestWatchStreamCardImplicitProduct(ApiCase):
         # in the implicit "" product, same as a fresh install.
         self.import_runs([
             record(environment="linux-sim", test_name="test_a",
-                   result="FAIL", branch="feat/x",
+                   result="FAIL", build="feat/x",
                    start_time="2026-07-25T03:00:00.000000",
                    end_time="2026-07-25T03:00:03.000000"),
         ])
@@ -3933,10 +3976,14 @@ class TestWatchStreamCardImplicitProduct(ApiCase):
 
 
 class TestWatchBuildStreamCards(ApiCase):
-    """WP-22 (docs/STREAMS_PLAN.md §4.1): a build-kind s: card's default
-    baseline is its predecessor build, not mainline, when one exists --
-    the same default the build-scoped dashboard's "Compare to" control
-    opens on."""
+    """WP-25 (docs/ONE_KIND_PLAN.md §1.4, user decision, explicit): the
+    s: card's verdict is ALWAYS against mainline -- one wording for every
+    stream. WP-22 had a build-kind card default to its predecessor build
+    when one existed (see git history for that behaviour); WP-25 removed
+    it, the same "default baseline is mainline, always" decision applied
+    to the dashboard's own delta view. A card reading "vs build 1.0"
+    that clicked through to a dashboard reading "vs mainline" would be
+    exactly the two-surfaces-disagree bug this decision avoids."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -3971,33 +4018,32 @@ class TestWatchBuildStreamCards(ApiCase):
         self.build_1_0 = builds["1.0"]
         self.build_1_1 = builds["1.1"]
 
-    def test_the_newer_builds_baseline_is_the_older_build(self) -> None:
+    def test_a_later_builds_verdict_is_still_against_mainline(self) -> None:
+        """Even though 1.0 (an earlier same-product build) exists, the
+        card must NOT default to it -- mainline only."""
         (card,) = self.call(
             "GET", "/api/watch",
             query={"c": ["s:{}".format(self.build_1_1)]})["cards"]
-        self.assertEqual(card["baseline_kind"], "build")
-        self.assertEqual(card["baseline_name"], "1.0")
-        # 1.0: test_a FAIL only. 1.1: test_a FAIL, test_b PASS (new).
-        self.assertEqual(card["both_failing"], 1)
+        self.assertEqual(card["baseline_kind"], "mainline")
+        self.assertEqual(card["baseline_name"], "")
+        # mainline: test_a PASS only. 1.1: test_a FAIL, test_b PASS (new).
+        self.assertEqual(card["new_failures"], 1)
         self.assertEqual(card["new_tests"], 1)
-        self.assertEqual(card["new_failures"], 0)
+        self.assertEqual(card["both_failing"], 0)
 
-    def test_the_oldest_builds_baseline_is_mainline(self) -> None:
-        """1.0 has no earlier build -- falls back to mainline, matching
-        the dashboard's own "else mainline" default."""
+    def test_the_oldest_builds_baseline_is_also_mainline(self) -> None:
         (card,) = self.call(
             "GET", "/api/watch",
             query={"c": ["s:{}".format(self.build_1_0)]})["cards"]
         self.assertEqual(card["baseline_kind"], "mainline")
 
-    def test_agrees_with_compare_using_the_same_baseline(self) -> None:
+    def test_agrees_with_compare_using_the_default_baseline(self) -> None:
         card = self.call(
             "GET", "/api/watch",
             query={"c": ["s:{}".format(self.build_1_1)]})["cards"][0]
         compared = self.call(
             "GET", "/api/compare",
-            query={"stream": [str(self.build_1_1)],
-                   "baseline": [str(self.build_1_0)]})
+            query={"stream": [str(self.build_1_1)]})
         self.assertEqual(card["both_failing"], compared["counts"]["both_failing"])
         self.assertEqual(card["new_tests"], compared["counts"]["new_tests"])
 
@@ -4181,11 +4227,11 @@ class SummaryStreamScopingTest(ApiCase):
         self.seed()
         before = self.call("GET", "/api/summary")
         self.import_runs([
-            record(test_name="test_new_fail", branch="feat/x",
+            record(test_name="test_new_fail", build="feat/x",
                    result="FAIL",
                    start_time="2026-07-26T04:00:00.000000",
                    end_time="2026-07-26T04:00:03.000000"),
-            record(test_name="test_branch_only", branch="feat/x",
+            record(test_name="test_branch_only", build="feat/x",
                    result="PASS",
                    start_time="2026-07-26T04:01:00.000000",
                    end_time="2026-07-26T04:01:03.000000"),
@@ -4199,7 +4245,7 @@ class SummaryStreamScopingTest(ApiCase):
         before = self.call(
             "GET", "/api/summary", query={"days": ["7"]})["trend"]
         self.import_runs([
-            record(test_name="test_trend_branch", branch="feat/y",
+            record(test_name="test_trend_branch", build="feat/y",
                    result="FAIL",
                    start_time="2026-07-26T05:00:00.000000",
                    end_time="2026-07-26T05:00:03.000000"),
@@ -4216,7 +4262,7 @@ class SummaryStreamScopingTest(ApiCase):
         copy of mainline's."""
         self.seed()
         self.import_runs([
-            record(test_name="test_branch_only", branch="feat/x",
+            record(test_name="test_branch_only", build="feat/x",
                    result="FAIL",
                    start_time="2026-07-26T04:00:00.000000",
                    end_time="2026-07-26T04:00:03.000000"),
@@ -4239,7 +4285,7 @@ class SummaryStreamScopingTest(ApiCase):
         never something looser."""
         self.seed()
         self.import_runs([
-            record(test_name="test_branch_only", branch="feat/z",
+            record(test_name="test_branch_only", build="feat/z",
                    result="PASS",
                    start_time="2026-07-26T04:00:00.000000",
                    end_time="2026-07-26T04:00:03.000000"),
@@ -4290,7 +4336,7 @@ class SummaryStreamProductEnvironmentsTest(ApiCase):
         # The stream's product is fixed at creation from the FIRST
         # record's environment (linux-sim -> Atlas), per WP-21.
         self.import_runs([record(
-            environment="linux-sim", test_name="t1", branch="feat/x",
+            environment="linux-sim", test_name="t1", build="feat/x",
             result="FAIL",
             start_time="2026-07-26T04:00:00.000000",
             end_time="2026-07-26T04:00:03.000000")])
@@ -4317,7 +4363,7 @@ class SummaryStreamProductEnvironmentsTest(ApiCase):
         self._declare("linux-sim", "Atlas")
         self._declare("mac-sim", "Borealis")
         self.import_runs([record(
-            environment="linux-sim", test_name="t1", branch="feat/x",
+            environment="linux-sim", test_name="t1", build="feat/x",
             result="FAIL",
             start_time="2026-07-26T04:00:00.000000",
             end_time="2026-07-26T04:00:03.000000")])
@@ -4515,12 +4561,12 @@ class TimelineTest(ApiCase):
 
 class TimelineStreamScopingTest(ApiCase):
     """WP-23 (docs/STREAMS_PLAN.md §5.2): ``/api/timeline`` accepts
-    ``stream=`` (default mainline) so a long-running branch's running
+    ``stream=`` (default mainline) so a long-running stream's running
     order reads from its OWN ``script_hours`` partition."""
 
     def _night(
         self, days_ago: int, environment: str = "linux-sim",
-        branch: Optional[str] = None,
+        build: Optional[str] = None,
     ) -> None:
         base = (NOW - datetime.timedelta(days=days_ago)).replace(
             hour=2, minute=0, second=0, microsecond=0)
@@ -4529,22 +4575,22 @@ class TimelineStreamScopingTest(ApiCase):
             start_time=format_iso(base),
             end_time=format_iso(base + datetime.timedelta(seconds=30)),
         )
-        if branch:
-            rec["branch"] = branch
+        if build:
+            rec["build"] = build
         self.import_runs([rec])
 
-    def test_a_branch_import_leaves_the_mainline_timeline_unaffected(
+    def test_a_build_import_leaves_the_mainline_timeline_unaffected(
             self) -> None:
         self._night(1)
         before = self.call(
             "GET", "/api/timeline", query={"environment": ["linux-sim"]})
-        self._night(1, branch="feat/x")
+        self._night(1, build="feat/x")
         after = self.call(
             "GET", "/api/timeline", query={"environment": ["linux-sim"]})
         self.assertEqual(before, after)
 
-    def test_stream_param_reads_the_branch_own_running_order(self) -> None:
-        self._night(1, branch="feat/x")
+    def test_stream_param_reads_the_streams_own_running_order(self) -> None:
+        self._night(1, build="feat/x")
         streams = self.call("GET", "/api/streams", query={"product": [""]})
         stream_id = streams["streams"][0]["id"]
         data = self.call(
@@ -4566,7 +4612,7 @@ class TimelineStreamScopingTest(ApiCase):
         """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): the Timeline page
         needs a stream's kind/name to render the branch band, the same
         field test detail already echoes as "stream_identity"."""
-        self._night(1, branch="feat/x")
+        self._night(1, build="feat/x")
         streams = self.call("GET", "/api/streams", query={"product": [""]})
         stream_id = streams["streams"][0]["id"]
         data = self.call(
@@ -4574,7 +4620,7 @@ class TimelineStreamScopingTest(ApiCase):
             query={"environment": ["linux-sim"],
                    "stream": [str(stream_id)]})
         self.assertEqual(data["stream_identity"]["id"], stream_id)
-        self.assertEqual(data["stream_identity"]["kind"], "branch")
+        self.assertEqual(data["stream_identity"]["kind"], "build")
         self.assertEqual(data["stream_identity"]["name"], "feat/x")
 
     def test_mainline_has_no_stream_identity(self) -> None:
@@ -4582,6 +4628,60 @@ class TimelineStreamScopingTest(ApiCase):
         data = self.call(
             "GET", "/api/timeline", query={"environment": ["linux-sim"]})
         self.assertIsNone(data["stream_identity"])
+
+
+class TimelineStreamEnvironmentHintTest(ApiCase):
+    """WP-25 (docs/ONE_KIND_PLAN.md §2b.1, user-reported 2026-08-09): a
+    build that ran on one environment showed a bare empty page on every
+    OTHER environment — verified live: 2026.9.1 = 0 rows on
+    atlas-lab-alpha, 69 on atlas-lab-bravo. ``stream_environments``
+    names where the stream's data actually is."""
+
+    def _night(
+        self, days_ago: int, environment: str, build: Optional[str] = None,
+    ) -> None:
+        base = (NOW - datetime.timedelta(days=days_ago)).replace(
+            hour=2, minute=0, second=0, microsecond=0)
+        rec = record(
+            environment=environment, script="a.py", test_name="t0",
+            start_time=format_iso(base),
+            end_time=format_iso(base + datetime.timedelta(seconds=30)),
+        )
+        if build:
+            rec["build"] = build
+        self.import_runs([rec])
+
+    def setUp(self) -> None:
+        super().setUp()
+        # atlas-lab-alpha is a KNOWN environment (mainline only) so the
+        # scoped request below 404s for the right reason (empty) rather
+        # than the wrong one (unknown environment).
+        self._night(1, "atlas-lab-alpha")
+        self._night(1, "atlas-lab-bravo", build="2026.9.1")
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        self.stream_id = streams["streams"][0]["id"]
+
+    def test_empty_on_a_different_environment_names_the_real_one(
+            self) -> None:
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["atlas-lab-alpha"],
+                   "stream": [str(self.stream_id)]})
+        self.assertEqual(data["rows"], [])
+        self.assertEqual(data["stream_environments"], ["atlas-lab-bravo"])
+
+    def test_present_and_populated_costs_nothing_extra(self) -> None:
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["atlas-lab-bravo"],
+                   "stream": [str(self.stream_id)]})
+        self.assertNotEqual(data["rows"], [])
+        self.assertIsNone(data["stream_environments"])
+
+    def test_mainline_never_carries_the_field(self) -> None:
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["atlas-lab-alpha"]})
+        self.assertIsNone(data["stream_environments"])
 
 
 class ScriptWindowRunsTest(ApiCase):
@@ -4664,7 +4764,7 @@ class ScriptWindowRunsTest(ApiCase):
                    end_time=format_iso(base + datetime.timedelta(seconds=3))),
         ])
         self.import_runs([
-            record(test_name="branch_only", branch="feat/x",
+            record(test_name="branch_only", build="feat/x",
                    start_time=format_iso(base),
                    end_time=format_iso(base + datetime.timedelta(seconds=3))),
         ])
@@ -4692,7 +4792,11 @@ class ScriptWindowRunsTest(ApiCase):
 
 
 class TestImportStreamsContract(ApiCase):
-    """WP-21 (docs/STREAMS_PLAN.md §3.3): branch/build on /api/import."""
+    """WP-21 (docs/STREAMS_PLAN.md §3.3): build on /api/import. Narrowed
+    to build-only by WP-25 (docs/ONE_KIND_PLAN.md §1.2): the `branch`
+    kind died before it ever shipped, so a record carrying `branch` is
+    now a loud per-record rejection, not a second stream kind — see
+    TestImportBranchFieldRejected below for that half."""
 
     def _declare(self, environment: str, product: str) -> None:
         self.call(
@@ -4703,11 +4807,6 @@ class TestImportStreamsContract(ApiCase):
         data = self.import_runs([record(test_name="t1")])
         self.assertEqual(data["streams_seen"], [])
 
-    def test_a_branch_record_is_named_in_streams_seen(self) -> None:
-        data = self.import_runs(
-            [record(test_name="t1", branch="feat/x")])
-        self.assertEqual(data["streams_seen"], ["branch:feat/x"])
-
     def test_a_build_record_is_named_in_streams_seen(self) -> None:
         data = self.import_runs(
             [record(test_name="t1", build="2026.9.1")])
@@ -4715,30 +4814,22 @@ class TestImportStreamsContract(ApiCase):
 
     def test_streams_seen_is_sorted_and_deduplicated(self) -> None:
         data = self.import_runs([
-            record(test_name="t1", branch="feat/y",
+            record(test_name="t1", build="feat/y",
                    start_time="2026-07-25T02:00:00.000000",
                    end_time="2026-07-25T02:00:03.000000"),
-            record(test_name="t2", branch="feat/x",
+            record(test_name="t2", build="feat/x",
                    start_time="2026-07-25T02:01:00.000000",
                    end_time="2026-07-25T02:01:03.000000"),
-            record(test_name="t3", branch="feat/x",
+            record(test_name="t3", build="feat/x",
                    start_time="2026-07-25T02:02:00.000000",
                    end_time="2026-07-25T02:02:03.000000"),
         ])
         self.assertEqual(
-            data["streams_seen"], ["branch:feat/x", "branch:feat/y"])
+            data["streams_seen"], ["build:feat/x", "build:feat/y"])
 
-    def test_branch_and_build_together_is_rejected_per_record(self) -> None:
-        data = self.import_runs([
-            {**record(test_name="t1"), "branch": "x", "build": "y"},
-        ])
-        self.assertEqual(data["rejected"], 1)
-        self.assertIn("mutually exclusive", data["errors"][0]["error"])
-        self.assertEqual(data["streams_seen"], [])
-
-    def test_blank_branch_is_mainline(self) -> None:
+    def test_blank_build_is_mainline(self) -> None:
         data = self.import_runs(
-            [record(test_name="t1", branch="   ")])
+            [record(test_name="t1", build="   ")])
         self.assertEqual(data["streams_seen"], [])
         self.assertEqual(data["inserted"], 1)
 
@@ -4746,24 +4837,74 @@ class TestImportStreamsContract(ApiCase):
             self) -> None:
         self.import_runs([record(test_name="t1")])
         data = self.import_runs(
-            [record(test_name="t1", branch="feat/x")])
+            [record(test_name="t1", build="feat/x")])
         self.assertEqual(data["inserted"], 0)
         self.assertEqual(data["rejected"], 1)
         error = data["errors"][0]
         self.assertIn("mainline", error["error"])
-        self.assertIn("branch:feat/x", error["error"])
+        self.assertIn("build:feat/x", error["error"])
         self.assertEqual(error["test_name"], "t1")
 
     def test_the_rest_of_a_mixed_batch_still_imports(self) -> None:
         self.import_runs([record(test_name="t1")])
         data = self.import_runs([
-            record(test_name="t1", branch="feat/x"),  # collides
-            record(test_name="t2", branch="feat/x",
+            record(test_name="t1", build="feat/x"),  # collides
+            record(test_name="t2", build="feat/x",
                    start_time="2026-07-25T03:00:00.000000",
                    end_time="2026-07-25T03:00:03.000000"),  # fine
         ])
         self.assertEqual(data["inserted"], 1)
         self.assertEqual(data["rejected"], 1)
+
+
+class TestImportBranchFieldRejected(ApiCase):
+    """WP-25 (docs/ONE_KIND_PLAN.md §1.2): the `branch` kind died before
+    it ever shipped anywhere -- a record carrying `branch` is REJECTED
+    loudly, per-record, through the REAL import path (not just
+    :func:`testboard.model.parse_run_record` in isolation), because
+    unknown-key tolerance would otherwise file a stale script's runs
+    into mainline silently the moment `branch`'s handling was removed --
+    the same "old-server trap" class of danger §3.3 documents."""
+
+    def test_branch_is_rejected_with_the_documented_message(self) -> None:
+        data = self.import_runs(
+            [record(test_name="t1", branch="feat/x")])
+        self.assertEqual(data["inserted"], 0)
+        self.assertEqual(data["rejected"], 1)
+        self.assertEqual(
+            data["errors"][0]["error"],
+            "branch: removed before this contract ever shipped — use "
+            "build:")
+        self.assertEqual(data["streams_seen"], [])
+
+    def test_rejected_by_presence_not_value(self) -> None:
+        """A blank/null branch is still a `branch` key on the wire --
+        rejected the same as any other value, never quietly read as
+        mainline the way a blank `build` is."""
+        data = self.import_runs(
+            [record(test_name="t1", branch=None)])
+        self.assertEqual(data["rejected"], 1)
+        self.assertIn("branch:", data["errors"][0]["error"])
+
+    def test_branch_and_build_together_is_still_rejected(self) -> None:
+        """Both present used to be its own "mutually exclusive" error;
+        now `branch`'s own rejection fires first regardless, since it is
+        checked before `build` is even read."""
+        data = self.import_runs([
+            {**record(test_name="t1"), "branch": "x", "build": "y"},
+        ])
+        self.assertEqual(data["rejected"], 1)
+        self.assertIn("branch:", data["errors"][0]["error"])
+        self.assertEqual(data["streams_seen"], [])
+
+    def test_the_rest_of_a_mixed_batch_still_imports(self) -> None:
+        data = self.import_runs([
+            record(test_name="t1", branch="feat/x"),   # rejected
+            record(test_name="t2", build="feat/x"),    # fine
+        ])
+        self.assertEqual(data["inserted"], 1)
+        self.assertEqual(data["rejected"], 1)
+        self.assertEqual(data["streams_seen"], ["build:feat/x"])
 
 
 class TestStreamsEndpoint(ApiCase):
@@ -4774,28 +4915,28 @@ class TestStreamsEndpoint(ApiCase):
             "PUT", "/api/environments/{}/product".format(environment),
             body={"product": product, "username": "amy"})
 
-    def test_empty_when_no_branch_or_build_reported(self) -> None:
+    def test_empty_when_no_build_reported(self) -> None:
         self.import_runs([record()])
         data = self.call("GET", "/api/streams", query={"product": [""]})
         self.assertEqual(data["streams"], [])
 
     def test_mainline_is_never_listed(self) -> None:
-        self.import_runs([record(branch="feat/x")])
+        self.import_runs([record(build="feat/x")])
         data = self.call("GET", "/api/streams", query={"product": [""]})
         names = [(s["kind"], s["name"]) for s in data["streams"]]
         self.assertNotIn(("mainline", ""), names)
-        self.assertIn(("branch", "feat/x"), names)
+        self.assertIn(("build", "feat/x"), names)
 
     def test_streams_carry_id_timestamps_and_failing_count(self) -> None:
         self.import_runs([
-            record(test_name="t1", result="FAIL", branch="feat/x"),
-            record(test_name="t2", result="PASS", branch="feat/x",
+            record(test_name="t1", result="FAIL", build="feat/x"),
+            record(test_name="t2", result="PASS", build="feat/x",
                    start_time="2026-07-25T03:00:00.000000",
                    end_time="2026-07-25T03:00:03.000000"),
         ])
         [stream] = self.call(
             "GET", "/api/streams", query={"product": [""]})["streams"]
-        self.assertEqual(stream["kind"], "branch")
+        self.assertEqual(stream["kind"], "build")
         self.assertEqual(stream["name"], "feat/x")
         self.assertEqual(stream["failing"], 1)
         self.assertIn("first_seen", stream)
@@ -4806,7 +4947,7 @@ class TestStreamsEndpoint(ApiCase):
         self.import_runs([record(environment="linux-sim")])
         self._declare("linux-sim", "Atlas")
         self.import_runs([record(
-            environment="linux-sim", test_name="t2", branch="feat/x",
+            environment="linux-sim", test_name="t2", build="feat/x",
             start_time="2026-07-25T03:00:00.000000",
             end_time="2026-07-25T03:00:03.000000")])
         self.assertEqual(
@@ -4824,7 +4965,7 @@ class TestStreamsEndpoint(ApiCase):
         self.assertEqual(data["streams"], [])
 
     def test_missing_product_defaults_to_the_implicit_one(self) -> None:
-        self.import_runs([record(branch="feat/x")])
+        self.import_runs([record(build="feat/x")])
         without = self.call("GET", "/api/streams")["streams"]
         withempty = self.call(
             "GET", "/api/streams", query={"product": [""]})["streams"]
@@ -4841,10 +4982,10 @@ class TestCompareEndpoint(ApiCase):
             record(test_name="test_b", result="FAIL"),
         ])
         self.import_runs([
-            record(test_name="test_a", result="FAIL", branch="feat/x",
+            record(test_name="test_a", result="FAIL", build="feat/x",
                    start_time="2026-07-25T03:00:00.000000",
                    end_time="2026-07-25T03:00:03.000000"),
-            record(test_name="test_c", result="PASS", branch="feat/x",
+            record(test_name="test_c", result="PASS", build="feat/x",
                    start_time="2026-07-25T03:00:00.000000",
                    end_time="2026-07-25T03:00:03.000000"),
         ])
@@ -4893,7 +5034,7 @@ class TestCompareEndpoint(ApiCase):
             body={"product": "Borealis", "username": "amy"})
         self.import_runs([
             record(environment="other-env", test_name="test_z",
-                   result="PASS", branch="feat/y",
+                   result="PASS", build="feat/y",
                    start_time="2026-07-25T04:00:00.000000",
                    end_time="2026-07-25T04:00:03.000000"),
         ])
@@ -5086,7 +5227,7 @@ class TestDashboardStreamParam(ApiCase):
         super().setUp()
         self.import_runs([record(test_name="test_a")])
         self.import_runs([
-            record(test_name="test_b", branch="feat/x",
+            record(test_name="test_b", build="feat/x",
                    start_time="2026-07-25T03:00:00.000000",
                    end_time="2026-07-25T03:00:03.000000"),
         ])
@@ -5129,7 +5270,7 @@ class TestDetailAndHistoryStreamParam(ApiCase):
             test_name="shared_name", result="PASS")])
         self.import_runs([record(
             environment="linux-sim", script="suite/alpha.py",
-            test_name="shared_name", result="FAIL", branch="feat/x",
+            test_name="shared_name", result="FAIL", build="feat/x",
             start_time="2026-07-25T03:00:00.000000",
             end_time="2026-07-25T03:00:03.000000")])
         streams = self.call(
@@ -5149,7 +5290,7 @@ class TestDetailAndHistoryStreamParam(ApiCase):
             "GET", self.path, query={"stream": [str(self.stream_id)]})
         self.assertEqual(data["latest"]["result"], "FAIL")
         self.assertEqual(data["stream"], self.stream_id)
-        self.assertEqual(data["stream_identity"]["kind"], "branch")
+        self.assertEqual(data["stream_identity"]["kind"], "build")
         self.assertEqual(data["stream_identity"]["name"], "feat/x")
 
     def test_history_default_is_mainline(self) -> None:
@@ -5172,7 +5313,7 @@ class TestCommentStreamId(ApiCase):
         super().setUp()
         self.import_runs([record(test_name="test_a")])
         self.import_runs([record(
-            test_name="test_a", branch="feat/x", result="FAIL",
+            test_name="test_a", build="feat/x", result="FAIL",
             start_time="2026-07-25T03:00:00.000000",
             end_time="2026-07-25T03:00:03.000000")])
         streams = self.call(
@@ -5218,7 +5359,7 @@ class TestCommentStreamId(ApiCase):
             sorted(streams), sorted([str(MAINLINE_STREAM_ID),
                                       str(self.stream_id)]))
         self.assertEqual(streams[str(MAINLINE_STREAM_ID)]["kind"], "mainline")
-        self.assertEqual(streams[str(self.stream_id)]["kind"], "branch")
+        self.assertEqual(streams[str(self.stream_id)]["kind"], "build")
         self.assertEqual(streams[str(self.stream_id)]["name"], "feat/x")
 
     def test_unknown_stream_id_is_404(self) -> None:

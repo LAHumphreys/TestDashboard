@@ -687,11 +687,12 @@ MIGRATIONS = [
     (
         9,
         [
-            # Streams: branch/build runs beside the mainline nightlies
+            # Streams: build runs beside the mainline nightlies
             # (docs/STREAMS_PLAN.md, WP-21, drop 2 of the products &
-            # streams work). OBSERVED, not registered: a stream row is
-            # created lazily inside the import transaction the first
-            # time an import record names a branch/build
+            # streams work; kind narrowed to {mainline, build} by WP-25 —
+            # see the AMENDED note below). OBSERVED, not registered: a
+            # stream row is created lazily inside the import transaction
+            # the first time an import record names a build
             # (Storage._find_or_create_stream) — there is no admin UI
             # that creates one. Row 1 is THE mainline stream and is
             # seeded by the python step below; every run recorded
@@ -715,6 +716,18 @@ MIGRATIONS = [
             # violation of it — a migration 10 for one more nullable
             # column on a schema element nobody has deployed would just
             # be two round trips of ALTER TABLE where one already does.
+            #
+            # AMENDED AGAIN IN PLACE (WP-25, docs/ONE_KIND_PLAN.md,
+            # 2026-08-09), same precedent as the fold above and for the
+            # same reason -- still unshipped anywhere, so this is deletion
+            # before first contact, not a migration: the 'branch' kind is
+            # gone. ``kind`` was NEVER constrained by a CHECK -- validation
+            # lived entirely in Python (Storage._stream_key_for) -- so
+            # this amendment is comment-only; the DDL below is BYTE
+            # IDENTICAL to what shipped internally. From this commit on,
+            # every stream this migration's own writer or any later
+            # import creates has ``kind`` = ``'mainline'`` (row 1, seeded
+            # below) or ``'build'`` -- never ``'branch'``.
             """
             CREATE TABLE streams (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1418,10 +1431,13 @@ class EnvironmentProduct(NamedTuple):
 
 
 class Stream(NamedTuple):
-    """One observed branch/build/mainline stream (migration 9, WP-21).
+    """One observed build/mainline stream (migration 9, WP-21; kind
+    narrowed from {mainline, branch, build} to {mainline, build} by
+    WP-25, docs/ONE_KIND_PLAN.md — the ``branch`` kind died before it
+    ever shipped, so ``kind`` is either ``'mainline'`` or ``'build'``).
 
     OBSERVED, not registered: created lazily inside the import
-    transaction the first time a record names a branch/build (see
+    transaction the first time a record names a build (see
     :meth:`Storage._find_or_create_stream`); there is no admin UI that
     creates one. Row 1 is THE mainline stream (``product=''``,
     ``kind='mainline'``, ``name=''``), seeded by migration 9.
@@ -2223,12 +2239,13 @@ class Storage:
     def _stream_key_for(rec: RunRecord) -> Optional[Tuple[str, str]]:
         """``(kind, name)`` for a non-mainline record, or None for mainline.
 
-        ``branch``/``build`` are already mutually exclusive by the time a
-        record reaches here — :func:`model.parse_run_record` rejects a
-        record carrying both, per-record, before it is ever batched.
+        ``kind`` is always ``"build"`` — the only non-mainline kind left
+        after WP-25 (docs/ONE_KIND_PLAN.md) collapsed the streams.kind
+        enum from {mainline, branch, build} to {mainline, build}; the
+        ``branch`` kind died before it ever shipped, so this is deletion,
+        not migration. :func:`model.parse_run_record` rejects a record
+        carrying ``branch`` outright, before it is ever batched.
         """
-        if rec.branch:
-            return ("branch", rec.branch)
         if rec.build:
             return ("build", rec.build)
         return None
@@ -3792,7 +3809,9 @@ class Storage:
         return cursor.rowcount > 0
 
     # ------------------------------------------------------------------
-    # Streams (migration 9, WP-21) — observed branch/build/mainline runs
+    # Streams (migration 9, WP-21) — observed build/mainline runs (the
+    # 'branch' kind died before it ever shipped; see migration 9's own
+    # comment and docs/ONE_KIND_PLAN.md, WP-25)
     # ------------------------------------------------------------------
 
     def _stream_from_row(self, row: Sequence[Any]) -> "Stream":
@@ -3827,6 +3846,28 @@ class Storage:
         if row is None:
             return None
         return self._stream_from_row(row)
+
+    def environments_for_stream(self, stream_id: int) -> List[str]:
+        """Every environment *stream_id* has at least one run on,
+        sorted (docs/ONE_KIND_PLAN.md §2b.1, WP-25).
+
+        A build that ran on one environment shows a bare empty page on
+        every OTHER environment's Time/Timeline — the data is honest
+        (the build never ran there), the page was not (it said nothing
+        about where the data actually is). This is that "where" query:
+        ONE grouped read over *this stream's own* ``latest_runs``
+        partition — O(the partition), never O(the estate), the same
+        discipline every other stream read here follows. Called only
+        when the caller already knows it is scoped away from mainline
+        and the current view came back empty; a page with data never
+        pays for it.
+        """
+        rows = self._conn().execute(
+            "SELECT DISTINCT environment FROM latest_runs "
+            "WHERE stream_id = ? ORDER BY environment",
+            (stream_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
 
     def list_streams(self, product: str) -> List["Stream"]:
         """Every non-mainline stream of *product*, id ascending.

@@ -302,7 +302,7 @@ class InstrumentStorageTest(unittest.TestCase):
             result=Result.PASS, start_time=NOW,
             end_time=NOW + datetime.timedelta(seconds=1),
             output="out", source_link="", known_failure_reason=None,
-            branch=None, build=None)])
+            build=None)])
         self.assertEqual(counts.inserted, 1)            # behaviour preserved
         page = self.store.dashboard(limit=10, offset=0)
         self.assertEqual(len(page), 1)

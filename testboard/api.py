@@ -470,17 +470,19 @@ def _handle_import(storage: Storage, request: Request) -> Response:
     a field-specific message and the record's identity fields (null when
     not extractable).
 
-    WP-21 (docs/STREAMS_PLAN.md §3.3): a record may carry ``branch`` or
-    ``build`` (mutually exclusive — a record with both is rejected at
-    parse time by :func:`model.parse_run_record`, before storage ever
-    sees it). The response gains ``streams_seen``: the sorted
-    ``"{kind}:{name}"`` of every non-mainline stream this batch NAMED
-    (whether or not every individual record on it was stored — see
-    below), ``[]`` for a pure-mainline batch. A ``--branch``/``--build``
-    feeder invocation must treat a response with no ``streams_seen`` key
-    at all as a hard failure: an old server ignores unknown keys and
-    would silently file branch runs into mainline, and this is the only
-    signal that tells a new feeder it is talking to one.
+    WP-21 (docs/STREAMS_PLAN.md §3.3): a record may carry ``build``. A
+    record carrying ``branch`` is REJECTED, loudly, per-record — the
+    ``branch`` kind died (WP-25, docs/ONE_KIND_PLAN.md) before it ever
+    shipped anywhere, so tolerating the key would silently file a stale
+    script's runs into mainline; see :func:`model.parse_run_record`.
+    The response gains ``streams_seen``: the sorted ``"build:{name}"``
+    of every non-mainline stream this batch NAMED (whether or not every
+    individual record on it was stored — see below), ``[]`` for a
+    pure-mainline batch. A ``--build`` feeder invocation must treat a
+    response with no ``streams_seen`` key at all as a hard failure: an
+    old server ignores unknown keys and would silently file those runs
+    into mainline, and this is the only signal that tells a new feeder
+    it is talking to one.
 
     A second rejection channel, storage-side, joins the same ``errors``
     array: :meth:`Storage.upsert_runs` can refuse a record whose exact
@@ -529,9 +531,7 @@ def _handle_import(storage: Storage, request: Request) -> Response:
 
     streams_seen = set()  # type: Set[str]
     for record in valid:
-        if record.branch:
-            streams_seen.add("branch:" + record.branch)
-        elif record.build:
+        if record.build:
             streams_seen.add("build:" + record.build)
 
     counts = storage.upsert_runs(valid)
@@ -2068,7 +2068,12 @@ def _handle_timeline(
     tables are now maintained for every stream (migration 10), so this
     page reads a long-running branch's OWN running order the same way
     it reads mainline's — zero visible change when the param is absent
-    (docs/STREAMS_PLAN.md §5.2).
+    (docs/STREAMS_PLAN.md §5.2). ``stream_environments`` (WP-25,
+    docs/ONE_KIND_PLAN.md §2b.1) is present only when scoped to a
+    stream AND this environment came back empty for it: every
+    environment the stream DOES have runs on, from its own
+    ``latest_runs`` partition — how the page tells "this build never
+    ran here" apart from "nothing ran anywhere".
     """
     environment = _query_single(request.query, "environment")
     product = _query_single(request.query, "product")
@@ -2167,6 +2172,18 @@ def _handle_timeline(
         ]
         known = storage.script_test_counts(environment, stream_id)
 
+    # WP-25 (docs/ONE_KIND_PLAN.md §2b.1): a build that ran on one
+    # environment shows a bare empty page on every OTHER environment —
+    # the data is honest, the page was not. Only paid for when both
+    # conditions hold (scoped away from mainline, and this environment
+    # is genuinely empty for it): a page with data never runs the extra
+    # query.
+    stream_environments = (
+        storage.environments_for_stream(stream_id)
+        if stream is not None and not rows
+        else None
+    )
+
     return _json_response(
         200,
         {
@@ -2175,6 +2192,7 @@ def _handle_timeline(
             "stream": stream_id,
             "stream_identity": None if stream is None else _stream_json(
                 stream),
+            "stream_environments": stream_environments,
             "days": days,
             "gap_minutes": _EXECUTION_GAP_MINUTES,
             # Newest block first: that is the one being looked at.
@@ -2335,7 +2353,10 @@ def _handle_time(
     ``environment IN (...)``, same as every other filter here.
     ``stream=`` (an id, WP-23, default mainline) scopes to one stream's
     own latest-run durations — zero visible change when absent
-    (docs/STREAMS_PLAN.md §5.2).
+    (docs/STREAMS_PLAN.md §5.2). ``stream_environments`` (WP-25,
+    docs/ONE_KIND_PLAN.md §2b.1) is present only when scoped to a
+    stream AND this view came back empty: every environment the stream
+    DOES have runs on, from its own ``latest_runs`` partition.
 
     Aggregates the newest run of each test, so it answers "where did the
     last run of the suite spend its time" — not a historical window.
@@ -2374,6 +2395,16 @@ def _handle_time(
         )
     except ValueError as exc:
         raise _HttpError(400, "group_by: {}".format(exc))
+    # WP-25 (docs/ONE_KIND_PLAN.md §2b.1): a build that ran on one
+    # environment shows a bare empty page on every OTHER environment —
+    # the data is honest, the page was not. Only paid for when both
+    # conditions hold (scoped away from mainline, and this view is
+    # genuinely empty): a page with data never runs the extra query.
+    stream_environments = (
+        storage.environments_for_stream(stream_id)
+        if stream is not None and not rollup.slices
+        else None
+    )
     return _json_response(
         200,
         {
@@ -2384,6 +2415,7 @@ def _handle_time(
             "stream": stream_id,
             "stream_identity": None if stream is None else _stream_json(
                 stream),
+            "stream_environments": stream_environments,
             "items": [
                 {
                     "key": item.key,
@@ -3104,27 +3136,23 @@ def _handle_watch(
         e for e in known_environments if e not in mapped_environments
     ]
     stream_identities = storage.stream_identities(requested_stream_ids)
-    # WP-22 (docs/STREAMS_PLAN.md §4.1): a BUILD-kind card's default
-    # baseline is the build before it, not mainline, when one exists —
-    # "failing in <name>" plus its vs-previous-build delta, the same
-    # default the build-scoped dashboard's "Compare to" control opens
-    # on. ONE query (bounded to the distinct products among the
-    # requested build cards), independent of how many s: cards the URL
-    # carries — see :meth:`Storage.previous_builds`.
-    predecessor_builds = storage.previous_builds(
-        list(stream_identities.values())
-    )
-    stream_baselines = {
-        stream_id: predecessor.stream_id
-        for stream_id, predecessor in predecessor_builds.items()
-    }
+    # WP-25 (docs/ONE_KIND_PLAN.md §1.4): one wording for every s: card —
+    # the verdict is ALWAYS against mainline, never a predecessor build.
+    # (WP-22 had this card default to the build before it, when one
+    # existed; WP-25's "default baseline is mainline, always" applies
+    # here too — a card reading "vs build 2026.9.0" that clicked through
+    # to a dashboard reading "vs mainline" would be the same
+    # two-surfaces-disagree class of bug the dashboard's own default-pick
+    # deletion fixes.) *baselines* is omitted, so
+    # :meth:`Storage.compare_counts_many` falls back to mainline for
+    # every stream, same as any caller from before WP-22.
     stream_counts = storage.compare_counts_many({
         stream_id: (
             implicit_environments if stream.product == ""
             else product_to_envs.get(stream.product, [])
         )
         for stream_id, stream in stream_identities.items()
-    }, baselines=stream_baselines)
+    })
     mainline_last_seen = (
         storage.latest_run_time() if requested_stream_ids else None
     )
@@ -3274,17 +3302,11 @@ def _handle_watch(
                 new_failures=0, new_passes=0, both_failing=0,
                 new_tests=0, no_result=0, agree=0,
             ))
-            # WP-22: the baseline actually used (a predecessor build) is
-            # named explicitly rather than assumed to be mainline — the
-            # card's wording (watch.js) must say what it is really being
-            # compared against, not a hardcoded "mainline".
-            predecessor = predecessor_builds.get(stream_id)
-            baseline_kind = "mainline" if predecessor is None else "build"
-            baseline_name = "" if predecessor is None else predecessor.name
-            baseline_last_seen = (
-                mainline_last_seen if predecessor is None
-                else predecessor.last_seen
-            )
+            # WP-25 (docs/ONE_KIND_PLAN.md §1.4): always mainline — see
+            # the comment on stream_counts above.
+            baseline_kind = "mainline"
+            baseline_name = ""
+            baseline_last_seen = mainline_last_seen
             card = {
                 "spec": spec, "kind": "stream", "name": stream.name,
                 "ok": True,

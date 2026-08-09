@@ -2,19 +2,21 @@
 # -*- coding: utf-8 -*-
 """Delete one stream, and everything belonging to it, from a database.
 
-The `drop_environment.py` analogue for a typo'd or dead branch/build
-stream (docs/STREAMS_PLAN.md §3.8): a CI job pointed `--branch` at the
-wrong name, a one-off RC nobody needs kept, a spelling mistake that will
+The `drop_environment.py` analogue for a typo'd or dead build stream
+(docs/STREAMS_PLAN.md §3.8): a CI job pointed `--build` at the wrong
+name, a one-off RC nobody needs kept, a spelling mistake that will
 otherwise sit in the Build picker forever. It is NOT a lifecycle tool --
 there are no declared stream states (docs/STREAMS_PLAN.md §6's 2026-08-08
 decision) -- this is the manual pressure valve for a stream that should
 simply not exist, the same relationship `drop_environment.py` has to
-retirement.
+retirement. No `--kind` flag (WP-25, docs/ONE_KIND_PLAN.md): the
+`branch` kind died before it ever shipped, so `--product` plus `--name`
+identify a stream uniquely among the one kind left.
 
     python3 tools/drop_stream.py --db testboard.db \
-        --product Atlas --kind branch --name feat/typo
+        --product Atlas --name feat/typo
     python3 tools/drop_stream.py --db testboard.db \
-        --product Atlas --kind branch --name feat/typo --dry-run
+        --product Atlas --name feat/typo --dry-run
 
 Works against either backend: pass --db for SQLite (as above) or
 --db-config plus --site-notes for MariaDB, the same flags run_server.py
@@ -23,7 +25,7 @@ and the other tools use.
 **This cannot be undone.** So:
 
 - `--dry-run` reports the row counts and changes nothing. Run it first.
-- Without `--yes` the stream's "kind:name" has to be typed back at the
+- Without `--yes` the stream's "build:name" has to be typed back at the
   prompt.
 - The mainline stream (id 1) is REFUSED unconditionally -- there is no
   flag that overrides this.
@@ -58,9 +60,9 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="drop_stream.py",
         description=(
-            "Delete one stream (a branch or build, never mainline) and "
-            "all of its runs, outputs and latest_runs partition from a "
-            "testboard database. This cannot be undone."
+            "Delete one build stream (never mainline) and all of its "
+            "runs, outputs and latest_runs partition from a testboard "
+            "database. This cannot be undone."
         ),
     )
     parser.add_argument(
@@ -79,11 +81,13 @@ def build_parser():
               "\"\" for the implicit product (environments with no "
               "declared mapping)"))
     parser.add_argument(
-        "--kind", required=True, choices=("branch", "build"),
-        help="the stream's kind (never 'mainline' -- that one is refused)")
-    parser.add_argument(
         "--name", required=True, metavar="NAME",
-        help="the stream's name, exact match, case sensitive")
+        help=("the stream's name, exact match, case sensitive. "
+              "--product plus --name identify it -- streams.kind is "
+              "always 'build' (WP-25, docs/ONE_KIND_PLAN.md: the "
+              "'branch' kind died before it ever shipped) and mainline "
+              "is refused unconditionally, so there is nothing left for "
+              "a --kind flag to select between"))
     parser.add_argument(
         "--dry-run", action="store_true",
         help="report what would be deleted, then exit without changing it")
@@ -111,10 +115,10 @@ def _report(counts):
 
 def _confirm(label):
     # type: (str) -> bool
-    """Ask the operator to type the stream's kind:name back."""
+    """Ask the operator to type the stream's build:name label back."""
     try:
         typed = input(
-            "\nType the stream's kind:name to confirm deletion "
+            "\nType the stream's build:name to confirm deletion "
             "(anything else aborts): ")
     except EOFError:
         # No terminal (cron, a pipe). Refusing is the safe reading of
@@ -192,19 +196,25 @@ def main(argv=None):
     if storage is None:
         return 2
 
-    label = "{0}:{1}".format(args.kind, args.name)
+    label = "build:{0}".format(args.name)
 
     try:
         streams = storage.list_streams(args.product)
         match = None
         for stream in streams:
-            if stream.kind == args.kind and stream.name == args.name:
+            # kind == "build" defensively, even though list_streams()
+            # already excludes mainline (id != MAINLINE_STREAM_ID) and
+            # every non-mainline stream is 'build' post-WP-25 -- this is
+            # what keeps product+name unable to ever select the mainline
+            # row, the same guarantee --kind used to provide by never
+            # accepting 'mainline' as a choice.
+            if stream.kind == "build" and stream.name == args.name:
                 match = stream
                 break
         if match is None:
             print(
-                "\nNo stream named {0!r} of kind {1!r} exists under "
-                "product {2!r}.".format(args.name, args.kind, args.product))
+                "\nNo stream named {0!r} exists under product "
+                "{1!r}.".format(args.name, args.product))
             if streams:
                 print("Streams that DO exist under this product:")
                 for stream in streams:

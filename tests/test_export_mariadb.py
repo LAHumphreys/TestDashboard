@@ -116,7 +116,6 @@ class ExportTest(unittest.TestCase):
                 output="line one\nline two\ttabbed\nback\\slash\ncafé 🙂",
                 source_link="",
                 known_failure_reason=None,
-                branch=None,
                 build=None,
             ),
             RunRecord(
@@ -126,7 +125,6 @@ class ExportTest(unittest.TestCase):
                 end_time=start + datetime.timedelta(seconds=1),
                 output="", source_link="http://x/y",
                 known_failure_reason="known",
-                branch=None,
                 build=None,
             ),
         ])

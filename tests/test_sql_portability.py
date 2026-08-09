@@ -225,7 +225,7 @@ class RunIdStabilityTest(unittest.TestCase):
             result=result, start_time=start,
             end_time=start + self.datetime.timedelta(seconds=2),
             output=output, source_link="", known_failure_reason=None,
-            branch=None, build=None,
+            build=None,
         )
 
     def _run_id(self):

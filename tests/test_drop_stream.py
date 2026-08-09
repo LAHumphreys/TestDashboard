@@ -5,6 +5,11 @@ tag surviving with stream_id cleared) is covered by
 tests/test_storage.py::DropStreamTest. What is worth testing here is the
 CLI's own job: it must be hard to run by accident, and it must refuse
 mainline unconditionally, no flag around it.
+
+WP-25 (docs/ONE_KIND_PLAN.md): the `branch` kind died before it ever
+shipped, so `--kind` is gone from the CLI -- `--product` plus `--name`
+identify a stream among the one kind left, and the confirmation label is
+"build:name" rather than "kind:name".
 """
 
 import contextlib
@@ -25,7 +30,7 @@ NOW = datetime.datetime(2026, 7, 25, 2, 0, 0)
 
 
 class TestDropStreamCLI(unittest.TestCase):
-    """A scratch database holding a mainline test and one branch stream."""
+    """A scratch database holding a mainline test and one build stream."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="testboard-drop-stream-")
@@ -40,14 +45,14 @@ class TestDropStreamCLI(unittest.TestCase):
                 test_name="test_a", result=Result.PASS,
                 start_time=NOW, end_time=NOW + datetime.timedelta(seconds=1),
                 output="out", source_link="", known_failure_reason=None,
-                branch=None, build=None),
+                build=None),
             RunRecord(
                 environment="linux-sim", script="suite.py",
                 test_name="test_a", result=Result.FAIL,
                 start_time=NOW + datetime.timedelta(hours=1),
                 end_time=NOW + datetime.timedelta(hours=1, seconds=1),
                 output="out", source_link="", known_failure_reason=None,
-                branch="feat/x", build=None),
+                build="feat/x"),
         ])
         store.close()
 
@@ -66,8 +71,7 @@ class TestDropStreamCLI(unittest.TestCase):
 
     def base_args(self) -> List[str]:
         return [
-            "--db", self.db, "--product", "Atlas", "--kind", "branch",
-            "--name", "feat/x",
+            "--db", self.db, "--product", "Atlas", "--name", "feat/x",
         ]
 
     def test_dry_run_changes_nothing(self) -> None:
@@ -77,13 +81,13 @@ class TestDropStreamCLI(unittest.TestCase):
         self.assertEqual(len(self.stream_ids()), 1)
 
     def test_a_wrong_confirmation_aborts(self) -> None:
-        rc, out = self.run_cli(self.base_args(), answer="branch:wrong")
+        rc, out = self.run_cli(self.base_args(), answer="build:wrong")
         self.assertEqual(rc, 1)
         self.assertIn("Aborted", out)
         self.assertEqual(len(self.stream_ids()), 1)
 
-    def test_the_exact_kind_name_confirms(self) -> None:
-        rc, _ = self.run_cli(self.base_args(), answer="branch:feat/x")
+    def test_the_exact_build_name_confirms(self) -> None:
+        rc, _ = self.run_cli(self.base_args(), answer="build:feat/x")
         self.assertEqual(rc, 0)
         self.assertEqual(self.stream_ids(), [])
 
@@ -98,7 +102,7 @@ class TestDropStreamCLI(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = drop_stream.main([
-                "--db", self.db, "--product", "Atlas", "--kind", "branch",
+                "--db", self.db, "--product", "Atlas",
                 "--name", "typo-name", "--yes",
             ])
         self.assertEqual(rc, 0)
@@ -106,14 +110,16 @@ class TestDropStreamCLI(unittest.TestCase):
         self.assertEqual(len(self.stream_ids()), 1)
 
     def test_mainline_is_refused_even_by_id_lookup(self) -> None:
-        """There is no way to spell mainline via --product/--kind/--name
-        (kind is restricted to branch/build by argparse choices), so this
-        also proves that restriction is doing its job."""
+        """There is no way to spell mainline via --product/--name: the
+        lookup itself only ever considers kind == 'build' rows (and
+        list_streams() already excludes id 1), so this also proves that
+        restriction is doing its job -- the same guarantee --kind's
+        removed 'branch'/'build' choices used to provide by never
+        accepting 'mainline'."""
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = drop_stream.main([
-                "--db", self.db, "--product", "", "--kind", "branch",
-                "--name", "mainline",
+                "--db", self.db, "--product", "", "--name", "mainline",
             ])
         # Not found (mainline is never in list_streams), reported as 0,
         # never as a delete.
@@ -124,7 +130,7 @@ class TestDropStreamCLI(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             rc = drop_stream.main([
                 "--db", os.path.join(self.tmp, "no.db"),
-                "--product", "Atlas", "--kind", "branch", "--name", "x",
+                "--product", "Atlas", "--name", "x",
                 "--yes",
             ])
         self.assertEqual(rc, 2)
@@ -134,7 +140,7 @@ class TestDropStreamCLI(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = drop_stream.main([
-                "--db", self.db, "--product", "Atlas", "--kind", "branch",
+                "--db", self.db, "--product", "Atlas",
                 "--name", "   ", "--yes",
             ])
         self.assertEqual(rc, 2)
@@ -145,7 +151,7 @@ class TestDropStreamCLI(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             rc = drop_stream.main([
                 "--db", self.db, "--db-config", "x.cnf",
-                "--product", "Atlas", "--kind", "branch", "--name", "x",
+                "--product", "Atlas", "--name", "x",
                 "--yes",
             ])
         self.assertEqual(rc, 2)
@@ -155,10 +161,20 @@ class TestDropStreamCLI(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = drop_stream.main([
-                "--product", "Atlas", "--kind", "branch", "--name", "x",
+                "--product", "Atlas", "--name", "x",
                 "--yes",
             ])
         self.assertEqual(rc, 2)
+
+    def test_no_kind_flag_exists(self) -> None:
+        """WP-25: --kind was removed with the 'branch' kind, not merely
+        made optional -- an old invocation still spelling --kind must
+        fail argument parsing, not silently ignore the flag."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                drop_stream.build_parser().parse_args(
+                    self.base_args() + ["--kind", "build"])
 
     def test_the_mainline_runs_and_comments_are_untouched(self) -> None:
         store = Storage(self.db)
