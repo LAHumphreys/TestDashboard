@@ -12,6 +12,16 @@ in production. WP-20+21+22+23 now ship as ONE combined drop; there is
 nothing left in the products/streams design (`docs/STREAMS_PLAN.md`) that
 was planned and is unbuilt.
 
+> **Tonight's session starts here → [`SCOPED_URLS_PLAN.md`](SCOPED_URLS_PLAN.md)
+> (WP-24, user-commissioned 2026-08-09):** one scope-aware URL builder
+> module ending the hand-built-URL bug family (seven+ live incidents,
+> incident table in the doc). Branch `wp-24-scoped-urls` off
+> `wp-23-longrunning`'s tip. The doc is self-contained: design, decided
+> items, enforcement guard, verification, risks. Suite baseline at doc
+> time: **1978 OK (skipped=1)** — later than the counts elsewhere in this
+> file, which predate the day's usability/perf rounds (see
+> `UPGRADE_PLAN_STATUS.md` for the day's log).
+
 ---
 
 ## Where the code is
