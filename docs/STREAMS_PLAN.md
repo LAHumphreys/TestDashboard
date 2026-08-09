@@ -280,7 +280,21 @@ the environment, plus its last-reported time (the env-pill fact). Every
 card labels its freshness from its own data — `WindowWordingTest` applies
 per card; there is no page-wide "as of" line because there is no single
 truthful one. Card click-through: product → `index.html` scoped to it,
-environment → `index.html` with the environment filter set.
+environment → `index.html` with the environment filter set, stream →
+`index.html?stream=<id>`. **Every link is scope-self-sufficient (WP-23
+bugfix, "as built"):** an environment or stream card's link ALSO carries
+`?product=<its own product>` — including the empty string for an
+environment nobody has mapped — because a link that only set the
+environment/stream filter left the PRODUCT scope to whatever this
+browser's switcher last had stored, which silently rendered under the
+wrong product (an environment filter under the wrong product resolves to
+an empty allow-list — a blank page, not an error). `index.html` (and
+every other page the switcher appears on) ADOPTS a present `?product=`
+param as both the rendered scope and the new stored selection —
+"the URL wins, and winning makes it stick" (§0.9's principle, extended
+from the Watchlist's own URL to a card's link) — so a shared Watch-card
+link reopens the exact same scope for anyone, not whatever product they
+happened to have selected last.
 
 **A missing scope is an explicit error card, not a gap.** A shared URL
 outlives renames and deletions; a card for an environment that no longer

@@ -54,6 +54,16 @@
           to" box looked out of place next to every other control on the
           toolbar — a styling gap left over from switching them to a
           type-to-filter field. Fixed; they now match.</li>
+        <li><strong>Jumping from a Watch card into the dashboard could
+          land on a blank page.</strong> Opening a card for a product
+          different from whatever this browser's Product switcher last
+          had selected set the environment filter correctly but left the
+          switcher on the OLD product — so the page rendered scoped to
+          the wrong one, and the environment filter matched nothing under
+          it. Fixed: every card's link now names its own product, and the
+          page adopts it — the switcher updates to match, and that
+          becomes your new default from then on, exactly as if you'd
+          picked it yourself.</li>
       </ul>
 
       <h3>New: branches and builds, compared to mainline</h3>

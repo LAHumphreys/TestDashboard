@@ -61,26 +61,70 @@ export function setSelectedProduct(product) {
 }
 
 /**
+ * "The URL wins, and winning makes it stick" (WP-23 bugfix,
+ * docs/STREAMS_PLAN.md §0.9/§2.4) — the same principle the Watchlist's
+ * own URL already follows: a link built from one product's scope (a
+ * Watch card, a shared deep link) must reopen that SAME scope for
+ * anyone, not whatever THIS browser's switcher last remembered. Found
+ * live: an environment card link set `?environment=` correctly but the
+ * switcher still read the OLD stored product from localStorage, so the
+ * page rendered scoped to the wrong product — and an environment param
+ * from another product under that scope resolves to an empty allow-list,
+ * i.e. a silently blank page.
+ *
+ * A `product` query param — present at all, including empty — is
+ * ADOPTED: it becomes both the rendered scope (every caller of
+ * getSelectedProduct() sees it) AND the new stored selection, exactly
+ * as if the user had picked it from the switcher themselves. No
+ * `product` param at all is today's behaviour unchanged: read whatever
+ * is already stored. An empty `product=` means "All products" and
+ * clears the stored selection the same way manually picking "All
+ * products" from the switcher already does.
+ *
+ * Runs unconditionally at MODULE EVALUATION time (a plain top-level
+ * call, not inside the async init() below) so it completes before ANY
+ * importing page's own init() can call getSelectedProduct() to build
+ * its first request — ES modules evaluate an import's top-level code
+ * before resuming the importing module's own, so this ordering holds
+ * regardless of which page imports this file or in what sequence.
+ */
+function adoptProductFromUrl() {
+  const params = new URL(window.location.href).searchParams;
+  if (!params.has("product")) {
+    return;   // no param at all: today's behaviour, read what is stored
+  }
+  setSelectedProduct(params.get("product") || "");
+}
+
+adoptProductFromUrl();
+
+/**
  * Render the switcher into `container` from the `products` list
  * `/api/summary` returns. Hides `container` (and clears a stale
  * selection) when fewer than two products are declared — the one
  * visible signal a single-product deployment ever sees from this file.
+ *
+ * The stale/bogus-selection clamp below runs BEFORE the `< 2` early
+ * return, not after: a `?product=` adopted from a stale or hand-typed
+ * URL (adoptProductFromUrl() above, unconditional at module-eval time)
+ * must not stick forever on a single-product or no-products install,
+ * which has no switcher UI to ever clear it again otherwise.
  */
 export function renderSwitcher(container, products) {
   clearNode(container);
+  const names = (products || []).map((entry) => entry.product);
+  let selected = getSelectedProduct();
+  if (selected && names.indexOf(selected) === -1) {
+    // A product this browser remembered (or just adopted from a URL)
+    // does not exist — renamed away, or never real to begin with.
+    selected = "";
+    setSelectedProduct("");
+  }
   if (!products || products.length < 2) {
     container.hidden = true;
     return;
   }
   container.hidden = false;
-
-  const names = products.map((entry) => entry.product);
-  let selected = getSelectedProduct();
-  if (selected && names.indexOf(selected) === -1) {
-    // A product this browser remembered has since been renamed away.
-    selected = "";
-    setSelectedProduct("");
-  }
 
   const label = el("label", "product-switcher-label", "Product");
   const select = document.createElement("select");
@@ -97,7 +141,21 @@ export function renderSwitcher(container, products) {
   select.value = selected;
   select.addEventListener("change", () => {
     setSelectedProduct(select.value);
-    window.location.reload();
+    // NOT window.location.reload(): a page reached via a Watch card's
+    // scope-self-sufficient link (or any other ?product= URL) would
+    // reload the SAME query string, and adoptProductFromUrl() would
+    // immediately overwrite this pick right back to the URL's product
+    // on the very next load -- the switcher would silently snap back
+    // to whatever the URL said, discarding the choice just made. "The
+    // URL wins" only holds together if changing the switcher also
+    // rewrites the URL, not just localStorage.
+    const url = new URL(window.location.href);
+    if (select.value) {
+      url.searchParams.set("product", select.value);
+    } else {
+      url.searchParams.delete("product");
+    }
+    window.location.href = url.toString();
   });
   label.appendChild(select);
   container.appendChild(label);

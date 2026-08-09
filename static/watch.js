@@ -113,18 +113,33 @@ function writeDefault(query) {
 
 /* ================= rendering ================= */
 
-/** Where a card's "Open in dashboard" link goes, or null (unknown kind). */
+/**
+ * Where a card's "Open in dashboard" link goes, or null (unknown kind).
+ *
+ * SCOPE-SELF-SUFFICIENT (WP-23 bugfix, docs/STREAMS_PLAN.md §0.9): a
+ * card whose scope differs from whatever product this browser last had
+ * selected must still land on the right page, not on the OLD product
+ * with an environment filter that then matches nothing under it. Every
+ * link that names an environment or a stream also names ITS OWN
+ * product — including the empty string for an environment nobody has
+ * mapped, meaning "All products" — so index.html's own
+ * adoptProductFromUrl() (products.js) has something to adopt. A card's
+ * own `?product=` always wins over whatever was stored, the same "the
+ * URL is the whole configuration" rule the Watchlist's own URL follows.
+ */
 function cardLink(card) {
   const params = new URLSearchParams();
   if (card.kind === "product") {
     params.set("product", card.name);
   } else if (card.kind === "environment") {
     params.set("environment", card.name);
+    params.set("product", card.product || "");
   } else if (card.kind === "stream") {
     // A stream is identified by ID, not name (two products can each
     // have a "feat/x" branch) — the dashboard's delta view reads the
     // same ?stream=<id> the Build picker writes.
     params.set("stream", String(card.id));
+    params.set("product", card.product || "");
   } else {
     return null;
   }

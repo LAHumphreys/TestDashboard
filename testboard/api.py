@@ -3018,6 +3018,13 @@ def _handle_watch(
             card = {
                 "spec": spec, "kind": "environment", "name": name,
                 "ok": True,
+                # WP-23 bugfix: the card's link must be scope-
+                # self-sufficient (docs/STREAMS_PLAN.md §0.9) — an
+                # unmapped environment's product is "" by construction,
+                # same as env_to_product.get(...) everywhere else in
+                # this handler, and the frontend sends it through
+                # exactly as-is, even when empty.
+                "product": env_to_product.get(name, ""),
                 "failing": verdict.failing,
                 "new_failures": verdict.new_failures,
                 "fixed": verdict.fixed,

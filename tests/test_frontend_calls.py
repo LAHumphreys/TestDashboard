@@ -1024,6 +1024,82 @@ class ProductSwitcherTest(unittest.TestCase):
     def test_no_innerHTML(self) -> None:
         self.assertNotIn("innerHTML", read("products.js"))
 
+    def test_changing_the_switcher_rewrites_the_url_not_a_bare_reload(
+        self
+    ) -> None:
+        """WP-23 bugfix, caught before it shipped: a page reached via a
+        scope-self-sufficient ?product= link (a Watch card, any shared
+        URL) would have adoptProductFromUrl() immediately overwrite a
+        fresh switcher pick right back to the URL's product on the very
+        next load, if the change handler only called
+        window.location.reload() -- the same URL, product param and
+        all. The switcher must rewrite `product` in the URL itself."""
+        body = _function_body(
+            _strip_comments(read("products.js")),
+            "export function renderSwitcher(")
+        change_at = body.index('addEventListener("change"')
+        handler = body[change_at:]
+        self.assertNotIn("location.reload()", handler)
+        self.assertIn('url.searchParams.set("product", select.value)',
+                       handler)
+        self.assertIn('url.searchParams.delete("product")', handler)
+
+    def test_the_stale_selection_clamp_runs_even_below_two_products(
+        self
+    ) -> None:
+        """A bogus or renamed ?product= adopted from a stale/hand-typed
+        URL must not stick forever on a single-product or no-products
+        install, which has no switcher UI to ever clear it again --
+        the clamp has to run BEFORE the `< 2` early return, not after
+        it."""
+        body = _function_body(
+            read("products.js"), "export function renderSwitcher(")
+        clamp_at = body.index("names.indexOf(selected) === -1")
+        early_return_at = body.index("products.length < 2")
+        self.assertLess(clamp_at, early_return_at)
+
+
+class ProductUrlAdoptionTest(unittest.TestCase):
+    """"The URL wins, and winning makes it stick" (WP-23 bugfix,
+    docs/STREAMS_PLAN.md §0.9): a `?product=` param is adopted as both
+    the rendered scope and the new stored selection — found live, a
+    Watch card link for one product rendered scoped to whatever
+    product this browser's switcher had last remembered instead."""
+
+    def test_adoption_runs_at_module_evaluation_time(self) -> None:
+        """Must be a plain top-level call, not inside init()'s async
+        body — ES modules evaluate an import's top-level code before
+        resuming the importing module's own, which is what guarantees
+        this lands before any page's first getSelectedProduct() call.
+        Buried inside async init() would race that guarantee away."""
+        code = _strip_comments(read("products.js"))
+        self.assertIn("\nadoptProductFromUrl();\n", code)
+
+    def test_a_present_param_overwrites_the_stored_selection(self) -> None:
+        body = _function_body(
+            read("products.js"), "function adoptProductFromUrl(")
+        self.assertIn('params.has("product")', body)
+        self.assertIn("setSelectedProduct(params.get(\"product\") || \"\")",
+                       body)
+
+    def test_an_absent_param_leaves_storage_untouched(self) -> None:
+        """No `product` key at all means today's behaviour — read
+        whatever is already stored, never clear it."""
+        body = _function_body(
+            read("products.js"), "function adoptProductFromUrl(")
+        self.assertIn("if (!params.has(\"product\")) {\n    return;", body)
+
+    def test_an_empty_param_clears_the_selection_not_just_the_render(
+        self
+    ) -> None:
+        """setSelectedProduct("") is the SAME clear path a manual
+        switch to "All products" already uses (see setSelectedProduct
+        above) — an empty ?product= is not merely "render unscoped
+        this once", it is a real adoption."""
+        body = _function_body(
+            read("products.js"), "function adoptProductFromUrl(")
+        self.assertIn("params.get(\"product\") || \"\"", body)
+
 
 class ProductSwitcherHostManagedTest(unittest.TestCase):
     """index.html and actions.html already fetch /api/summary for their
@@ -1632,12 +1708,48 @@ class WatchStreamCardTest(unittest.TestCase):
         body = _function_body(read("watch.js"), "function cardLink(")
         self.assertIn('params.set("stream", String(card.id))', body)
 
+    def test_the_open_link_also_carries_the_streams_own_product(
+        self
+    ) -> None:
+        """WP-23 bugfix: a stream card's link must be scope-self-
+        sufficient — landing on index.html with only ?stream= set would
+        render under whatever product this browser's switcher last had
+        stored, not necessarily the stream's own."""
+        body = _function_body(read("watch.js"), "function cardLink(")
+        self.assertIn('params.set("product", card.product || "")', body)
+
     def test_the_add_picker_offers_a_branch_build_option(self) -> None:
         self.assertIn('<option value="s">', read_text("watch.html"))
 
     def test_stream_picker_entries_are_keyed_by_id(self) -> None:
         body = _function_body(read("watch.js"), "async function populatePicker(")
         self.assertIn("value: String(stream.id)", body)
+
+
+class CardLinkScopeSelfSufficiencyTest(unittest.TestCase):
+    """WP-23 bugfix: a Watch card whose scope differs from whatever
+    product this browser's switcher last had selected must still land
+    on the RIGHT scope, not the OLD one with a now-mismatched
+    environment filter (docs/STREAMS_PLAN.md §0.9's "the URL is the
+    whole configuration", extended to a card's OWN link)."""
+
+    def test_environment_card_link_carries_its_own_product(self) -> None:
+        body = _function_body(read("watch.js"), "function cardLink(")
+        env_at = body.index('card.kind === "environment"')
+        stream_at = body.index('card.kind === "stream"')
+        environment_branch = body[env_at:stream_at]
+        self.assertIn('params.set("product", card.product || "")',
+                       environment_branch)
+
+    def test_product_card_link_is_unchanged(self) -> None:
+        """A product card already names the product by construction —
+        no second field to add, and the existing single params.set()
+        call must still be the only one for that branch."""
+        body = _function_body(read("watch.js"), "function cardLink(")
+        product_at = body.index('card.kind === "product"')
+        env_at = body.index('card.kind === "environment"')
+        product_branch = body[product_at:env_at]
+        self.assertEqual(product_branch.count("params.set("), 1)
 
 
 class OpenActionsOriginFilterTest(unittest.TestCase):

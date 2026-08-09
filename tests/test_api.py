@@ -3200,6 +3200,26 @@ class TestWatch(ApiCase):
         # No "@" suffix in the spec -- no staleness judgment at all.
         self.assertNotIn("stale", card)
         self.assertNotIn("expected", card)
+        # WP-23 bugfix: the card names its OWN product, so the frontend
+        # link is scope-self-sufficient rather than trusting whatever
+        # product this browser's switcher happens to have stored.
+        self.assertEqual(card["product"], "Atlas")
+
+    def test_an_environment_cards_product_is_empty_when_unmapped(
+        self
+    ) -> None:
+        """The bug this pins: an unmapped environment's card must say
+        "" (never omit the key, never guess), so the frontend's link
+        can send an empty ?product= -- "All products" -- instead of
+        silently inheriting whatever product this browser last had
+        selected, which could resolve the environment filter to an
+        empty allow-list under the WRONG product and render a blank
+        page."""
+        self.import_runs([record(environment="unmapped-env")])
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:unmapped-env"]}
+        )["cards"]
+        self.assertEqual(card["product"], "")
 
     def test_an_environment_cards_unassigned_failing_excludes_assigned(
         self
