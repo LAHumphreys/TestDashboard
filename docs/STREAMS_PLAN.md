@@ -871,6 +871,33 @@ recorded here rather than left implicit:
   wording, and a genuine zero-stream-param mainline load touching none
   of the new elements at all. See `docs/drops/2026-08-14.md` for the
   full account.
+- **F7 fix (usability sweep, found after first human use of the
+  branch dashboard): §5.2's "Timeline/Time pages accept `stream=`"
+  was true of the SERVER, not of the PAGES.** `/api/time` and
+  `/api/timeline` gained `stream=` when this section was written, but
+  `time.js`/`timeline.js` never read the param from their own URL nor
+  forwarded it — a long-running branch's own time breakdown and
+  running order were unreachable from the UI at all, only from `curl`.
+  Fixed: both pages read `?stream=` at load, forward it to every
+  request they make (not only the top-level page load — Timeline's
+  row-expansion fetch and its test-search suggestions fetch hit
+  DIFFERENT endpoints and would otherwise have silently read
+  MAINLINE's data while the page itself read as branch-scoped), and
+  render the shared branch band (`compare.js:renderBranchBand`) the
+  same way `index.html`/`test.html` already do — both pages gained the
+  `#branch-band` mount point to match. `/api/time` and `/api/timeline`
+  both gained a `stream_identity` field (mirroring test detail's own
+  `stream_identity`) so the pages have a kind/name to render the band
+  from without an extra fetch. A deeper gap found in the same pass:
+  `/api/scripts/{env}/{script}/runs` (the Timeline's row-expansion read
+  of the raw `runs` table) had stayed hardcoded to mainline since WP-21
+  even after migration 10 made the TOP-level blocks/rows stream-aware —
+  expanding a row on a branch-scoped Timeline would have silently shown
+  mainline's runs from the same time window instead of the branch's
+  own. Fixed the same way, `stream=` accepted (default mainline, zero
+  visible change when absent). Neither page has an in-page stream
+  switcher of its own — the scope is fixed at load from the URL, the
+  same way a Watch card's link or a shared deep link sets it.
 
 ---
 

@@ -1533,6 +1533,29 @@ class TimeStreamScopingTest(ApiCase):
         self.assertEqual(data["test_count"], 1)
         self.assertEqual(data["total_seconds"], 99.0)
 
+    def test_stream_param_echoes_the_streams_identity(self) -> None:
+        """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): the Time page
+        needs a stream's kind/name to render the branch band, the same
+        field test detail already echoes as "stream_identity"."""
+        self.import_runs([
+            record(environment="linux", script="a.py",
+                   test_name="branch_only", branch="feat/x",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=99))),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        data = self.call(
+            "GET", "/api/time", query={"stream": [str(stream_id)]})
+        self.assertEqual(data["stream_identity"]["id"], stream_id)
+        self.assertEqual(data["stream_identity"]["kind"], "branch")
+        self.assertEqual(data["stream_identity"]["name"], "feat/x")
+
+    def test_mainline_has_no_stream_identity(self) -> None:
+        data = self.call("GET", "/api/time")
+        self.assertIsNone(data["stream_identity"])
+
 
 class TestUsers(ApiCase):
     """GET/POST /api/users: listing, idempotent creation, validation."""
@@ -4291,6 +4314,27 @@ class TimelineStreamScopingTest(ApiCase):
         self.assertEqual(mainline["blocks"], [])
         self.assertEqual(mainline["rows"], [])
 
+    def test_stream_param_echoes_the_streams_identity(self) -> None:
+        """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): the Timeline page
+        needs a stream's kind/name to render the branch band, the same
+        field test detail already echoes as "stream_identity"."""
+        self._night(1, branch="feat/x")
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"],
+                   "stream": [str(stream_id)]})
+        self.assertEqual(data["stream_identity"]["id"], stream_id)
+        self.assertEqual(data["stream_identity"]["kind"], "branch")
+        self.assertEqual(data["stream_identity"]["name"], "feat/x")
+
+    def test_mainline_has_no_stream_identity(self) -> None:
+        self._night(1)
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self.assertIsNone(data["stream_identity"])
+
 
 class ScriptWindowRunsTest(ApiCase):
     """GET /api/scripts/{env}/{script}/runs: the Timeline row expansion."""
@@ -4357,6 +4401,46 @@ class ScriptWindowRunsTest(ApiCase):
     def test_wrong_method_is_405(self) -> None:
         self._seed()
         self.assert_405("PUT", self.PATH, "GET")
+
+    def test_stream_param_reads_the_branch_own_runs(self) -> None:
+        """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): this row-expansion
+        read had fallen behind /api/timeline's own stream-scoping —
+        always mainline, regardless of which stream's block a caller
+        expanded. Two DIFFERENT tests in the SAME window, one on
+        mainline and one on a branch, prove `stream=` actually selects
+        between them rather than merging or ignoring it."""
+        base = datetime.datetime(2026, 7, 25, 2, 0, 0)
+        self.import_runs([
+            record(test_name="mainline_only",
+                   start_time=format_iso(base),
+                   end_time=format_iso(base + datetime.timedelta(seconds=3))),
+        ])
+        self.import_runs([
+            record(test_name="branch_only", branch="feat/x",
+                   start_time=format_iso(base),
+                   end_time=format_iso(base + datetime.timedelta(seconds=3))),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+
+        mainline = self.call(
+            "GET", self.PATH,
+            query={"from": ["2026-07-25T02:00:00.000000"],
+                   "to": ["2026-07-25T03:00:00.000000"]})
+        self.assertEqual(mainline["stream"], 1)
+        self.assertEqual(
+            [run["test_name"] for run in mainline["runs"]],
+            ["mainline_only"])
+
+        branch = self.call(
+            "GET", self.PATH,
+            query={"from": ["2026-07-25T02:00:00.000000"],
+                   "to": ["2026-07-25T03:00:00.000000"],
+                   "stream": [str(stream_id)]})
+        self.assertEqual(branch["stream"], stream_id)
+        self.assertEqual(
+            [run["test_name"] for run in branch["runs"]],
+            ["branch_only"])
 
 
 class TestImportStreamsContract(ApiCase):

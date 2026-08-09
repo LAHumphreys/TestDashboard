@@ -25,6 +25,15 @@
   <main class="wide">
     <div id="error-banner" class="error-banner" role="alert" hidden></div>
 
+    <!-- F7 (docs/STREAMS_PLAN.md §5.2 "as built"): "you are scoped to a
+         branch" -- same mount/markup as index.html/test.html, rendered
+         by the shared compare.js:renderBranchBand(). Absent from the
+         DOM's visible state on every mainline visit. -->
+    <div id="branch-band" class="branch-band" hidden>
+      <span id="branch-band-text"></span>
+      <a id="branch-band-back" href="time.html">Back to mainline</a>
+    </div>
+
     <section class="section-head">
       <h2 class="eyebrow">Where the time goes</h2>
       <span id="time-meta" class="muted"></span>

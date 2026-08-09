@@ -1976,6 +1976,14 @@ def _handle_timeline(
             ),
         )
     stream_id = _resolve_stream_id(storage, request)
+    # F7 (docs/STREAMS_PLAN.md §5.2 "as built"): the Timeline page needs
+    # a stream's kind/name to render the branch band, same reason test
+    # detail fetches this — only paid when scoped away from mainline,
+    # so the hot unscoped path costs no extra query.
+    stream = (
+        None if stream_id == MAINLINE_STREAM_ID
+        else storage.get_stream(stream_id)
+    )
     days = _parse_int_param(
         request, "days", _TIMELINE_DEFAULT_DAYS, 1, _TIMELINE_MAX_DAYS
     )
@@ -2055,6 +2063,8 @@ def _handle_timeline(
             "environment": environment,
             "product": product,
             "stream": stream_id,
+            "stream_identity": None if stream is None else _stream_json(
+                stream),
             "days": days,
             "gap_minutes": _EXECUTION_GAP_MINUTES,
             # Newest block first: that is the one being looked at.
@@ -2101,6 +2111,12 @@ def _handle_script_window_runs(
     outputs. Bounded by the script's index range and capped at
     ``_TIMELINE_MAX_RUNS`` — the same cost profile as the executions
     endpoint, paid one script at a time on demand.
+
+    ``stream=`` (F7, default mainline): the window edges themselves
+    come from a `/api/timeline` block, which has been stream-scoped
+    since migration 10 — this sub-endpoint had fallen behind it,
+    always reading mainline's own ``runs`` regardless of which
+    stream's block the caller expanded.
     """
     if not storage.script_exists(environment, script):
         raise _HttpError(
@@ -2109,19 +2125,21 @@ def _handle_script_window_runs(
                 environment, script
             ),
         )
+    stream_id = _resolve_stream_id(storage, request)
     window_from = _parse_iso_param(request, "from")
     window_to = _parse_iso_param(request, "to")
     if window_to < window_from:
         raise _HttpError(400, "from/to: the window ends before it starts")
     runs = storage.script_runs(
         environment, script, window_from, _TIMELINE_MAX_RUNS,
-        until=window_to,
+        until=window_to, stream_id=stream_id,
     )
     return _json_response(
         200,
         {
             "environment": environment,
             "script": script,
+            "stream": stream_id,
             "from": model.format_iso(window_from),
             "to": model.format_iso(window_to),
             "truncated": len(runs) >= _TIMELINE_MAX_RUNS,
@@ -2221,6 +2239,14 @@ def _handle_time(
     product = _query_single(request.query, "product")
     environments = _resolve_product_environments(storage, product)
     stream_id = _resolve_stream_id(storage, request)
+    # F7 (docs/STREAMS_PLAN.md §5.2 "as built"): same reason
+    # _handle_timeline fetches this — the Time page needs a stream's
+    # kind/name to render the branch band; only paid when scoped away
+    # from mainline.
+    stream = (
+        None if stream_id == MAINLINE_STREAM_ID
+        else storage.get_stream(stream_id)
+    )
     # Off by default: counting a test that last ran three weeks ago as
     # part of "where the time went" claims time that was not spent. But
     # an all-or-nothing cutoff empties the page after any quiet day, so
@@ -2246,6 +2272,8 @@ def _handle_time(
             "script": script,
             "product": product,
             "stream": stream_id,
+            "stream_identity": None if stream is None else _stream_json(
+                stream),
             "items": [
                 {
                     "key": item.key,

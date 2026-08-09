@@ -5177,6 +5177,7 @@ class Storage:
         since: datetime.datetime,
         limit: int,
         until: Optional[datetime.datetime] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
     ) -> List[StoredRun]:
         """Every run of one script since *since*, OLDEST FIRST, no ``output``.
 
@@ -5196,8 +5197,16 @@ class Storage:
         execution, and without a ceiling it would drag in every run
         from the block to now.
 
-        Mainline only (WP-21): the Timeline stays mainline-only in this
-        drop (docs/STREAMS_PLAN.md §3.10).
+        *stream_id* (F7, default mainline): the Timeline's TOP-level
+        blocks/rows have been stream-aware since migration 10
+        (``script_hours`` carries ``stream_id``), but this row-EXPANSION
+        read of the raw ``runs`` table stayed hardcoded to mainline
+        until now — a real gap: a branch-scoped Timeline page expanding
+        a row would otherwise have silently shown MAINLINE's runs from
+        the same time window instead of the branch's own (or nothing,
+        if mainline happened to be quiet then), which is exactly the
+        "wrong and looks right" shape this project's house rules warn
+        against.
         """
         sql = (
             "SELECT {} FROM runs WHERE environment = ? AND script = ? "
@@ -5205,7 +5214,7 @@ class Storage:
         )
         params = [
             environment, script, model.format_iso(since),
-            MAINLINE_STREAM_ID,
+            stream_id,
         ]  # type: List[Any]
         if until is not None:
             sql += " AND start_time <= ?"

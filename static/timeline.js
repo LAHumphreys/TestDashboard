@@ -44,6 +44,7 @@ import {
   showError,
 } from "./api.js";
 import { getSelectedProduct } from "./products.js";
+import { renderBranchBand } from "./compare.js";
 
 /* How far back "Earlier runs…" reaches: the server's own cap, which
  * matches retention — so it means "any recorded run", not a teaser. */
@@ -62,6 +63,11 @@ const state = {
   days: null,
   rows: [],
   seq: 0,
+  // F7 (docs/STREAMS_PLAN.md §5.2 "as built"): a long-running branch's
+  // OWN running order, read the same way mainline's is -- absent means
+  // mainline, zero visible change. Fixed at load, same as the rest of
+  // this page's scope (there is no in-page stream switcher here).
+  streamId: null,
 };
 
 function timelineUrl() {
@@ -74,14 +80,19 @@ function timelineUrl() {
     qs.append("from", state.from);
     qs.append("to", state.to);
   }
+  if (state.streamId !== null) {
+    qs.append("stream", String(state.streamId));
+  }
   return "/api/timeline?" + qs.toString();
 }
 
 function runsUrl(row) {
+  const qs = new URLSearchParams({ from: row.started, to: row.ended });
+  if (state.streamId !== null) {
+    qs.append("stream", String(state.streamId));
+  }
   return "/api/scripts/" + encodeURIComponent(state.environment)
-    + "/" + encodeURIComponent(row.script)
-    + "/runs?" + new URLSearchParams(
-      { from: row.started, to: row.ended }).toString();
+    + "/" + encodeURIComponent(row.script) + "/runs?" + qs.toString();
 }
 
 /** Keep the address bar shareable: environment always, window when
@@ -99,6 +110,9 @@ function syncUrl() {
   if (state.from !== null && state.to !== null) {
     url.searchParams.set("from", state.from);
     url.searchParams.set("to", state.to);
+  }
+  if (state.streamId !== null) {
+    url.searchParams.set("stream", String(state.streamId));
   }
   window.history.replaceState(null, "", url.toString());
 }
@@ -170,6 +184,13 @@ function renderBlockPicker() {
 }
 
 function render(data) {
+  // F7: only when this page was actually asked to scope to a stream
+  // AND the server named one back -- a mainline load (streamId ===
+  // null) never touches renderBranchBand at all, same guard test.js's
+  // and time.js's own call sites use.
+  if (state.streamId !== null && data.stream_identity) {
+    renderBranchBand(data.stream_identity);
+  }
   renderBlockPicker();
 
   const rowsHost = document.getElementById("timeline-rows");
@@ -721,6 +742,9 @@ async function fetchSearchMatches(query) {
   qs.append("environment", state.environment);
   qs.append("q", query);
   qs.append("limit", "20");
+  if (state.streamId !== null) {
+    qs.append("stream", String(state.streamId));
+  }
   const data = await fetchJson("/api/dashboard?" + qs.toString());
   return data.tests.map((test) => ({
     script: test.script, test_name: test.test_name,
@@ -970,6 +994,8 @@ async function init() {
   if (params.get("days")) {
     state.days = Number(params.get("days")) || null;
   }
+  const rawStream = params.get("stream");
+  state.streamId = rawStream ? parseInt(rawStream, 10) : null;
   if (params.get("test") && params.get("script")) {
     pendingLocate = {
       script: params.get("script"),

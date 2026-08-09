@@ -1964,6 +1964,74 @@ class TimeAndTimelineProductTest(unittest.TestCase):
         self.assertIn("scoped.length ? scoped : data.environments", body)
 
 
+class TimeAndTimelineStreamScopingTest(unittest.TestCase):
+    """F7: time.js and timeline.js never read ?stream= from their own
+    URL nor forwarded it to their APIs — WP-23 added `stream=` to
+    `/api/time`/`/api/timeline` server-side, but the PAGES could not
+    use it, so a branch's own time/timeline was unreachable from the
+    UI (docs/STREAMS_PLAN.md §5.2 "as built")."""
+
+    def test_both_pages_read_stream_from_the_url(self) -> None:
+        for name, signature in (
+            ("time.js", "function init()"),
+            ("timeline.js", "async function init()"),
+        ):
+            body = _function_body(read(name), signature)
+            self.assertIn('params.get("stream")', body, name)
+            self.assertIn("state.streamId", body, name)
+
+    def test_time_forwards_stream_to_its_request(self) -> None:
+        body = _function_body(read("time.js"), "function url()")
+        self.assertIn('qs.append("stream", String(state.streamId))', body)
+
+    def test_timeline_forwards_stream_to_every_one_of_its_requests(
+        self
+    ) -> None:
+        """Not just the top-level page load: the row-expansion fetch
+        (runsUrl) and the test-search suggestions fetch
+        (fetchSearchMatches) both hit different endpoints and would
+        otherwise silently read MAINLINE's data while the page itself
+        is scoped to a branch."""
+        code = read("timeline.js")
+        for signature in (
+            "function timelineUrl()",
+            "function runsUrl(",
+            "async function fetchSearchMatches(",
+        ):
+            body = _function_body(code, signature)
+            self.assertIn(
+                'qs.append("stream", String(state.streamId))', body,
+                signature)
+
+    def test_both_pages_render_the_branch_band_when_scoped(self) -> None:
+        for name in ("time.js", "timeline.js"):
+            code = _strip_comments(read(name))
+            self.assertIn(
+                "renderBranchBand", _imported_names(read(name)), name)
+            self.assertIn("renderBranchBand(data.stream_identity)", code,
+                           name)
+            # Same guard test.js's own call site uses: never call it on
+            # a mainline load, even if the server ever sent identity
+            # data unprompted.
+            self.assertIn("state.streamId !== null && data.stream_identity",
+                           code, name)
+
+    def test_both_pages_carry_a_branch_band_mount_point(self) -> None:
+        for name in ("time.html", "timeline.html"):
+            html = read_text(name)
+            mount_at = html.index('id="branch-band"')
+            self.assertIn("hidden", html[mount_at:mount_at + 60], name)
+
+    def test_timeline_preserves_stream_across_a_replaced_url(self) -> None:
+        """syncUrl() rewrites the address bar on every block/day
+        change — an omission here would silently drop the scope from
+        a reload or a copied link even though in-memory state still
+        had it right for the NEXT fetch."""
+        body = _function_body(read("timeline.js"), "function syncUrl()")
+        self.assertIn(
+            'url.searchParams.set("stream", String(state.streamId))', body)
+
+
 class WatchPageTest(unittest.TestCase):
     """watch.js / watch.html (WP-20, docs/STREAMS_PLAN.md §2.4).
 

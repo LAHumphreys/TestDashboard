@@ -64,6 +64,14 @@
           page adopts it — the switcher updates to match, and that
           becomes your new default from then on, exactly as if you'd
           picked it yourself.</li>
+        <li><strong>The Time and Timeline pages can now actually show a
+          branch's own data</strong> — the pages could already be asked
+          for it on the wire, but neither one knew how to read that
+          request from its own URL, so there was no way to get there.
+          Both now carry the same "you are scoped to a branch" band the
+          dashboard already shows, and expanding a row on a branch's
+          Timeline (or using its test-search box) now correctly reads
+          that branch's own runs, not mainline's.</li>
       </ul>
 
       <h3>New: branches and builds, compared to mainline</h3>

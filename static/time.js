@@ -50,6 +50,7 @@ import {
 import { treemapBoxes } from "./charts.js";
 import { attachSorting, sortRows } from "./sorting.js";
 import { getSelectedProduct } from "./products.js";
+import { renderBranchBand } from "./compare.js";
 
 const LEVELS = ["environment", "script", "test_name"];
 
@@ -61,6 +62,11 @@ const state = {
   sortKey: "total_seconds",
   sortDescending: true,
   seq: 0,
+  // F7 (docs/STREAMS_PLAN.md §5.2 "as built"): a long-running branch's
+  // OWN time breakdown, read the same way mainline's is -- absent
+  // means mainline, zero visible change (WP-23 added `stream=` to
+  // /api/time server-side; this page could not read it until now).
+  streamId: null,
 };
 
 let sorter = null;
@@ -84,6 +90,9 @@ function url() {
   }
   if (state.includeStale) {
     qs.append("include_stale", "1");
+  }
+  if (state.streamId !== null) {
+    qs.append("stream", String(state.streamId));
   }
   // WP-20: scope the drill-down to a declared product's environments —
   // resolved server-side, same as every other product= filter
@@ -128,6 +137,13 @@ function unitWord() {
 }
 
 function render(data) {
+  // F7: the band only ever draws when this page was actually asked to
+  // scope to a stream AND the server named one back -- a mainline load
+  // (streamId === null) never touches renderBranchBand at all, same
+  // guard test.js's own call site uses.
+  if (state.streamId !== null && data.stream_identity) {
+    renderBranchBand(data.stream_identity);
+  }
   renderBreadcrumb();
 
   const chart = document.getElementById("time-chart");
@@ -308,6 +324,8 @@ function init() {
   const params = new URL(window.location.href).searchParams;
   state.environment = params.get("environment");
   state.script = params.get("script");
+  const rawStream = params.get("stream");
+  state.streamId = rawStream ? parseInt(rawStream, 10) : null;
 
   document.getElementById("stale-toggle")
     .addEventListener("click", () => {

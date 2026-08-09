@@ -3780,6 +3780,27 @@ class ScriptRunsUntilTest(StorageTestBase):
         runs = self.store.script_runs("linux-sim", "suite.py", BASE, 100)
         self.assertEqual(len(runs), 1)
 
+    def test_defaults_to_mainline(self) -> None:
+        """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): a branch run in
+        the SAME window as a mainline one must not appear in the
+        default (unscoped) read."""
+        self.store.upsert_runs([make_record(
+            test_name="mainline_only", start=BASE)])
+        self.store.upsert_runs([make_record(
+            test_name="branch_only", branch="feat/x", start=BASE)])
+        runs = self.store.script_runs("linux-sim", "suite.py", BASE, 100)
+        self.assertEqual([run.test_name for run in runs], ["mainline_only"])
+
+    def test_stream_id_selects_the_branch_own_runs(self) -> None:
+        self.store.upsert_runs([make_record(
+            test_name="mainline_only", start=BASE)])
+        self.store.upsert_runs([make_record(
+            test_name="branch_only", branch="feat/x", start=BASE)])
+        stream_id = self.store.list_streams("")[0].stream_id
+        runs = self.store.script_runs(
+            "linux-sim", "suite.py", BASE, 100, stream_id=stream_id)
+        self.assertEqual([run.test_name for run in runs], ["branch_only"])
+
 
 class ReimportSkipTest(StorageTestBase):
     """What counts as "unchanged", and what the skip must NOT skip."""
