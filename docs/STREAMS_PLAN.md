@@ -1101,6 +1101,37 @@ recorded here rather than left implicit:
   a stream-scoped test page rendered both the annotated title and the
   visible note; a mainline visit rendered neither.
 
+  **Superseded by script-page parity, PART B of this same later
+  round** (below) — once `script.html` honours `stream=`, the link
+  simply carries it through instead of needing an honesty label. Noted
+  here now, ahead of that entry, so a reader mid-PART-A does not
+  wonder why F3's hack is still live: it is, in this commit, and stops
+  being true in the next one.
+- **Link-matrix audit follow-up, PART A (FINAL ROUND): three more
+  scope-carriage gaps into `test.html`**, found by a full audit of
+  every link in the app against every surface that became reachable
+  under stream scope across the F1–F7 sweep. All three are the
+  identical pattern already established (append `stream=` from data
+  already on hand, a no-op on mainline):
+  - **`app.js`'s triage queue rows** (`queueColumns()`'s test column) —
+    on a long-running branch's "Its own results" tab, a queue row is
+    the branch's own, and its link must land back on that same stream's
+    test page.
+  - **`app.js`'s browse table rows** (`buildRow()`) — the same gap, the
+    dashboard's own test list.
+  - **`timeline.js`'s expanded run rows** — a stream-scoped Timeline's
+    run rows (revealed by expanding a block) still linked to mainline's
+    test page; their `test.html` links now carry `stream=` too. (The
+    same audit found the block row's OWN `script.html` link still
+    unscoped as well — that is PART B, below, since a `stream=` on
+    that link is only useful once `script.html` actually reads it.)
+
+  Verified live via the DOM-shim harness against a scratch server: a
+  long-running branch (4 covered passes, defaulting to "Its own
+  results") — its browse table's, and its "Still failing" queue's,
+  test links both carried `stream=2`; a stream-scoped Timeline's
+  expanded run row's test link carried it too.
+
 ---
 
 ## 6. Cross-cutting notes

@@ -1529,6 +1529,45 @@ class BuildVerdictLineTest(unittest.TestCase):
         self.assertNotIn("innerHTML", _strip_comments(read("compare.js")))
 
 
+class ScopeCarriageLinkMatrixTest(unittest.TestCase):
+    """PART A of a follow-up link-matrix audit (after the F1-F7
+    usability sweep): three more test.html links that only became
+    reachable under stream scope in recent rounds, but still silently
+    dropped it — the same DeltaViewTest link-carriage style, applied to
+    app.js's triage queue, app.js's browse table, and timeline.js's
+    expanded run rows. (PART B of the same audit — the app's
+    script.html links, and script-page parity itself — is covered
+    separately, in ScriptPageParityTest and friends.)"""
+
+    def test_queue_rows_carry_the_stream_into_the_test_link(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function queueColumns("))
+        self.assertIn("appendStream(params)", body)
+        stream_at = body.index("appendStream(params)")
+        self.assertLess(
+            stream_at, body.index('"test.html?"'),
+            "the stream param must be appended BEFORE the href is built")
+
+    def test_browse_rows_carry_the_stream_into_the_test_link(self) -> None:
+        body = _strip_comments(_function_body(read("app.js"), "function buildRow("))
+        self.assertIn("appendStream(params)", body)
+        stream_at = body.index("appendStream(params)")
+        self.assertLess(
+            stream_at, body.index('"test.html?"'),
+            "the stream param must be appended BEFORE the href is built")
+
+    def test_timeline_run_rows_carry_the_stream_into_the_test_link(
+        self
+    ) -> None:
+        body = _strip_comments(_function_body(
+            read("timeline.js"), "function renderDetail("))
+        self.assertIn("if (state.streamId !== null) {", body)
+        stream_at = body.index("state.streamId !== null")
+        self.assertLess(
+            stream_at, body.rindex('"test.html?"'),
+            "the stream param must be appended BEFORE the href is built")
+
+
 class BuildBaselineWordingTest(unittest.TestCase):
     """WP-22 (docs/STREAMS_PLAN.md §4.1): every place that used to say
     the literal word "mainline" now reads it from the baseline's own
@@ -1740,6 +1779,11 @@ class SuiteLinkHonestyTest(unittest.TestCase):
     own title AND visibly beside it (never hover-only — the same
     "never the only signal" rule the rest of this project follows),
     that the link goes to mainline regardless of the page's own scope.
+
+    Superseded by script-page parity, PART B of the same audit this
+    file's ScopeCarriageLinkMatrixTest covers PART A of — see
+    ScriptPageParityTest once that lands; this class is pinned exactly
+    as committed for F3 until then.
     """
 
     def test_the_title_is_conditional_on_stream_identity(self) -> None:

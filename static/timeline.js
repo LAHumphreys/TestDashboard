@@ -618,6 +618,13 @@ function renderDetail(detail, data) {
     params.append("environment", data.environment);
     params.append("script", data.script);
     params.append("test_name", run.test_name);
+    // Scope-carriage (F1-F7 sweep follow-up): a run row expanded on a
+    // branch's Timeline must link to that SAME stream's test page --
+    // the same state.streamId this file's other outbound requests
+    // already carry (runsUrl() above). No-op on mainline.
+    if (state.streamId !== null) {
+      params.append("stream", String(state.streamId));
+    }
     const link = el("a", "", run.test_name);
     link.href = "test.html?" + params.toString();
     cell.appendChild(link);

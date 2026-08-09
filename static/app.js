@@ -936,6 +936,12 @@ function queueColumns(queueId) {
       params.append("environment", entry.environment);
       params.append("script", entry.script);
       params.append("test_name", entry.test_name);
+      // Scope-carriage (found by the F1-F7 sweep's follow-up link-matrix
+      // audit): on a long-running branch's "Its own results" tab, these
+      // rows are the branch's own -- the link must land back on that
+      // SAME stream's test page, not mainline's. appendStream() is a
+      // no-op (state.streamId === null) on every mainline page.
+      appendStream(params);
       link.href = "test.html?" + params.toString();
       link.textContent = entry.test_name;
       cell.appendChild(link);
@@ -1361,6 +1367,11 @@ function buildRow(row) {
   params.append("environment", row.environment);
   params.append("script", row.script);
   params.append("test_name", row.test_name);
+  // Scope-carriage (F1-F7 sweep follow-up): the browse table on a
+  // branch's "Its own results" tab shows that branch's own rows -- the
+  // link must land back on that SAME stream's test page. No-op on
+  // mainline.
+  appendStream(params);
   link.href = "test.html?" + params.toString();
   link.textContent = row.test_name;
   testCell.appendChild(link);
