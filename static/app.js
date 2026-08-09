@@ -902,14 +902,20 @@ function queueColumns(queueId) {
       // Scope-carriage (found by the F1-F7 sweep's follow-up link-matrix
       // audit): on a long-running branch's "Its own results" tab, these
       // rows are the branch's own -- the link must land back on that
-      // SAME stream's test page, not mainline's. pageUrl()'s default
-      // scope carriage supplies `stream` (a no-op, state.streamId ===
-      // null, on every mainline page); product/baseline are explicitly
+      // SAME stream's test page, not mainline's. Naming `product` in the
+      // overrides object below resets the levels it contains (stream)
+      // unless that same object also names them, so `stream` is named
+      // explicitly here (state.streamId, null on mainline) rather than
+      // left to pageUrl()'s default carriage -- naming `product` already
+      // suppresses that default for stream (coordinator fix round: this
+      // and three sibling sites silently dropped `stream=` by relying on
+      // default carriage after nulling product, reintroducing historical
+      // bug classes #1 and #5). product/baseline are still explicitly
       // nulled -- this link never carried either.
       link.href = pageUrl("test", {
         environment: entry.environment, script: entry.script,
         test_name: entry.test_name,
-      }, { product: null, baseline: null });
+      }, { product: null, baseline: null, stream: state.streamId });
       link.textContent = entry.test_name;
       cell.appendChild(link);
       cell.appendChild(el("span", "row-sub",
@@ -1246,12 +1252,16 @@ function populateScriptOptions() {
 /**
  * A link to one suite's execution history — script.html, now stream-
  * scoped the same way the rest of the app is (script-page parity,
- * FINAL ROUND). No-op on mainline (state.streamId === null).
+ * FINAL ROUND). `stream` is named explicitly (state.streamId, null on
+ * mainline) rather than left to pageUrl()'s default carriage: naming
+ * `product` below resets the levels it contains, stream included, unless
+ * this same overrides object also names them (coordinator fix round —
+ * this site silently dropped `stream=` before the fix).
  */
 function scriptLink(environment, script, text) {
   const link = document.createElement("a");
   link.href = pageUrl("script", { environment: environment, script: script },
-    { product: null, baseline: null });
+    { product: null, baseline: null, stream: state.streamId });
   link.textContent = text || script;
   link.title = "Execution history for this suite";
   return link;
@@ -1334,12 +1344,16 @@ function buildRow(row) {
   const link = document.createElement("a");
   // Scope-carriage (F1-F7 sweep follow-up): the browse table on a
   // branch's "Its own results" tab shows that branch's own rows -- the
-  // link must land back on that SAME stream's test page. pageUrl()'s
-  // default scope carriage is a no-op (state.streamId === null) on
-  // mainline.
+  // link must land back on that SAME stream's test page. `stream` is
+  // named explicitly (state.streamId, null on mainline): naming `product`
+  // below resets the levels it contains, stream included, unless this
+  // same overrides object also names them, so pageUrl()'s default
+  // carriage alone (unnamed stream) is not enough once product is nulled
+  // (coordinator fix round -- this site silently dropped `stream=`
+  // before the fix).
   link.href = pageUrl("test", {
     environment: row.environment, script: row.script, test_name: row.test_name,
-  }, { product: null, baseline: null });
+  }, { product: null, baseline: null, stream: state.streamId });
   link.textContent = row.test_name;
   testCell.appendChild(link);
   tr.appendChild(testCell);

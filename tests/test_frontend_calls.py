@@ -176,6 +176,58 @@ class UrlsModuleTest(unittest.TestCase):
         self.assertIn('if (!names(overrides, "stream")) {', body)
         self.assertIn('if (!names(overrides, "environment")) {', body)
 
+    def test_naming_product_without_stream_drops_stream_even_when_present(
+        self
+    ) -> None:
+        """THE TRAP a coordinator fix round found live across four call
+        sites (app.js's queue rows, app.js's browse rows, app.js's
+        scriptLink(), compare.js's delta rows): each passed
+        `{ product: null, baseline: null }` to pageUrl() INTENDING
+        "suppress product and baseline, let stream carry by pageUrl()'s
+        DEFAULT carriage" -- but the hierarchy rule keys off whether
+        `product` is NAMED, not what its value is, so naming it (even as
+        null) resets `stream` to null right alongside it, unless that
+        SAME overrides object also names `stream`. All four sites
+        silently dropped `stream=` on every stream-scoped page as a
+        result (historical bug classes #1 and #5, reintroduced; found
+        live 2026-08-08).
+
+        There is no JS runtime in this suite (see the module docstring
+        above) to literally call pageUrl() and inspect the query string,
+        so this pins the same two composed steps a real call takes:
+        resolveScope({product: null, baseline: null}) resets `stream` to
+        null (test_product_resets_stream_baseline_and_environment above
+        pins that reset in isolation, in a call that never names
+        `stream`) -- and appendPlainScopeParam(), the function that
+        turns a resolved scope into query-string bytes, treats a null
+        value exactly like an absent one and writes nothing
+        (test_stream_baseline_environment_never_write_empty above pins
+        the "" branch of the same guard; null takes the same branch).
+        Composed: a resolved stream of null can never surface as
+        `?stream=...`, regardless of what the CURRENT page's own stream
+        actually was -- the "let stream carry by default" the four
+        broken sites relied on was never reachable once `product` was
+        named without `stream` alongside it."""
+        resolve_body = _function_body(read("urls.js"), "function resolveScope(")
+        append_body = _function_body(
+            read("urls.js"), "function appendPlainScopeParam(")
+        product_at = resolve_body.index('if (names(overrides, "product")) {')
+        stream_if_at = resolve_body.index(
+            'if (names(overrides, "stream")) {', product_at)
+        product_block = resolve_body[product_at:stream_if_at]
+        # The reset is INSIDE the product block, guarded by "unless this
+        # SAME overrides object also names stream" -- and it precedes
+        # the separate `stream` block below, so a bare
+        # {product: null, baseline: null} call never reaches a branch
+        # that could put `stream` back.
+        self.assertIn("result.stream = null", product_block)
+        self.assertIn('if (!names(overrides, "stream")) {', product_block)
+        # And once resolved to null, appendPlainScopeParam refuses to
+        # write it -- the second half of the trap.
+        self.assertIn(
+            'value === null || value === undefined || value === ""',
+            append_body)
+
     def test_product_empty_string_is_written_explicitly(self) -> None:
         body = _function_body(
             read("urls.js"), "function appendProductParam(")
@@ -1569,18 +1621,27 @@ class DeltaViewTest(unittest.TestCase):
         human to use the branch dashboard, 2026-08-08 — the DOM-shim
         checks rendered rows, not where their links lead.
 
-        WP-24: the hand-rolled params/href pair became one pageUrl()
-        call, whose DEFAULT scope carriage is what now supplies
-        `stream` (this page's own — read the same way
-        getSelectedStreamId() already does). Same assertion intent
-        (the link is built off this page's own selected stream, via
-        pageUrl -- not a hand-rolled "test.html?" concatenation
-        anywhere in this file, which the enforcement test polices
-        globally), now checking the pageUrl() call site."""
+        WP-24, corrected by the coordinator fix round: the original
+        conversion computed `streamId` but never passed it to pageUrl(),
+        relying instead on pageUrl()'s DEFAULT scope carriage to supply
+        `stream` -- but naming `product` in the overrides object resets
+        every level it contains (stream included) unless that same
+        object also names them, so the default never fired and this link
+        silently dropped `stream=` (historical bug classes #1 and #5,
+        reintroduced; found live, 2026-08-08 — the DOM-shim checks
+        rendered rows, not where their links lead). The fix names
+        `stream: streamId` explicitly in the overrides object, so this
+        pins that literal object whole rather than merely checking that
+        getSelectedStreamId() is called somewhere above the pageUrl()
+        call -- a call reading streamId without ever handing it to
+        pageUrl() must fail here again."""
         body = _function_body(read("compare.js"), "function buildDeltaRow(")
         self.assertIn("getSelectedStreamId()", body)
         stream_at = body.index("getSelectedStreamId()")
-        self.assertIn('link.href = pageUrl("test"', body[stream_at:])
+        rest = body[stream_at:]
+        self.assertIn('link.href = pageUrl("test"', rest)
+        self.assertIn(
+            "{ product: null, baseline: null, stream: streamId }", rest)
         self.assertIn(
             "pageUrl", _imported_names(read("compare.js")),
             "compare.js calls pageUrl() without importing it")
@@ -1613,24 +1674,30 @@ class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     separately, in ScriptPageParityTest and friends.)"""
 
     def test_queue_rows_carry_the_stream_into_the_test_link(self) -> None:
-        """WP-24: appendStream(params)+"test.html?"+params.toString()
-        became one pageUrl("test", ..., {product: null, baseline: null})
-        call -- `stream` is supplied by pageUrl()'s DEFAULT scope
-        carriage (this page's own, a no-op on mainline exactly as
-        appendStream() was), so there is no separate "appended before
-        the href" ordering left to check; the assertion that matters
-        now is that product/baseline are explicitly excluded (this link
-        never carried either) rather than silently inherited."""
+        """WP-24, corrected by the coordinator fix round: the original
+        conversion nulled product/baseline and left `stream` to pageUrl()'s
+        DEFAULT carriage -- but naming `product` in an overrides object
+        resets every level it contains (stream included) UNLESS that same
+        object also names them, so the default never fired and this link
+        silently dropped `stream=` (historical bug classes #1 and #5,
+        reintroduced). The fix names `stream: state.streamId` explicitly
+        in the SAME overrides object as product/baseline, so this pins the
+        literal overrides object whole -- a future edit that nulls product
+        without naming stream alongside it fails here again, rather than
+        passing because product/baseline alone were checked."""
         body = _strip_comments(_function_body(
             read("app.js"), "function queueColumns("))
         self.assertIn('link.href = pageUrl("test"', body)
-        self.assertIn("{ product: null, baseline: null }", body)
+        self.assertIn(
+            "{ product: null, baseline: null, stream: state.streamId }", body)
 
     def test_browse_rows_carry_the_stream_into_the_test_link(self) -> None:
-        """WP-24: same conversion as the queue rows above."""
+        """WP-24, corrected by the coordinator fix round: same trap and
+        same fix as the queue rows above -- see that test's docstring."""
         body = _strip_comments(_function_body(read("app.js"), "function buildRow("))
         self.assertIn('link.href = pageUrl("test"', body)
-        self.assertIn("{ product: null, baseline: null }", body)
+        self.assertIn(
+            "{ product: null, baseline: null, stream: state.streamId }", body)
 
     def test_timeline_run_rows_carry_the_stream_into_the_test_link(
         self
@@ -2271,14 +2338,20 @@ class ScriptPageParityTest(unittest.TestCase):
         self.assertNotIn("innerHTML", _strip_comments(read("script.js")))
 
     def test_app_js_scriptLink_carries_the_stream(self) -> None:
-        """WP-24: appendStream(params)+"script.html?" became one
-        pageUrl("script", ..., {product: null, baseline: null}) call --
-        `stream` comes from pageUrl()'s default scope carriage, same as
-        every other converted row link in this file."""
+        """WP-24, corrected by the coordinator fix round: the original
+        conversion nulled product/baseline and left `stream` to pageUrl()'s
+        default carriage -- but naming `product` resets every level it
+        contains (stream included) unless that same overrides object also
+        names them, so the default never fired and this link silently
+        dropped `stream=` (historical bug classes #1 and #5, reintroduced).
+        The fix names `stream: state.streamId` explicitly alongside
+        product/baseline, so this pins the overrides object whole rather
+        than product/baseline alone."""
         body = _strip_comments(_function_body(
             read("app.js"), "function scriptLink("))
         self.assertIn('link.href = pageUrl("script"', body)
-        self.assertIn("{ product: null, baseline: null }", body)
+        self.assertIn(
+            "{ product: null, baseline: null, stream: state.streamId }", body)
 
     def test_timeline_js_block_link_carries_the_stream(self) -> None:
         """The audit's PART A note: the block row's own script.html

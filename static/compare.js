@@ -253,15 +253,19 @@ function buildDeltaRow(row) {
   // test, and test.html only shows that when ?stream= arrives with it.
   // Without this line the stream-scoped test page is unreachable by
   // clicking — found by the first human to use the branch dashboard.
-  // pageUrl()'s default scope carriage supplies `stream` (this page's
-  // own — the same value getSelectedStreamId() reads); `product` and
-  // `baseline` are explicitly nulled because this link never carried
-  // either (test.html has no product concept, and a baseline belongs to
-  // the scope it was chosen in, not to a linked-to test page).
+  // `stream` is named explicitly (this page's own, the same value
+  // getSelectedStreamId() reads) rather than left to pageUrl()'s default
+  // carriage: naming `product` below resets the levels it contains,
+  // stream included, unless this same overrides object also names them
+  // (coordinator fix round -- this site computed streamId but never
+  // passed it, silently dropping `stream=`). `product` and `baseline`
+  // are still explicitly nulled because this link never carried either
+  // (test.html has no product concept, and a baseline belongs to the
+  // scope it was chosen in, not to a linked-to test page).
   const streamId = getSelectedStreamId();
   link.href = pageUrl("test", {
     environment: row.environment, script: row.script, test_name: row.test_name,
-  }, { product: null, baseline: null });
+  }, { product: null, baseline: null, stream: streamId });
   link.textContent = row.test_name;
   testCell.appendChild(link);
   testCell.appendChild(el("span", "row-sub",
