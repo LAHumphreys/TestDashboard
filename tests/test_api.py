@@ -29,7 +29,8 @@ from typing import Any, Dict, List, Optional, Union
 from testboard import api
 from testboard.model import format_iso
 from testboard.storage import (
-    DASHBOARD_SORTS, MAINLINE_STREAM_ID, QUEUE_KINDS, Storage,
+    COMPARE_CATEGORIES, DASHBOARD_SORTS, MAINLINE_STREAM_ID, QUEUE_KINDS,
+    Storage,
 )
 
 #: Fixed clock injected into handle_api for deterministic timestamps.
@@ -2114,6 +2115,79 @@ class TestSummary(ApiCase):
     def test_queue_cap_is_reported(self) -> None:
         data = self.call("GET", "/api/summary")
         self.assertEqual(data["queue_cap"], api._SUMMARY_QUEUE_CAP)
+
+    def test_the_full_payload_counts_every_queue_in_one_grouped_query(
+        self
+    ) -> None:
+        """WP-23 perf pass: the full payload used to run
+        2*(len(QUEUE_KINDS)+1) separate status_queue_count-shaped
+        queries (12 on this project's own 6-kind QUEUE_KINDS) --
+        Storage.queue_counts's grouped SUM(CASE...) replaces every one
+        of them with a SINGLE query, reused for both queue_totals and
+        every queue's own "total" field. "SUM(CASE WHEN" is unique to
+        that one query shape; nothing else in this request builds a
+        statement that way."""
+        self.seed()
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", "/api/summary")
+        finally:
+            conn.set_trace_callback(None)
+        grouped = [s for s in seen if "SUM(CASE WHEN" in s]
+        self.assertEqual(
+            len(grouped), 1,
+            "expected exactly 1 grouped queue-counts query, got "
+            "{0}:\n{1}".format(len(grouped), "\n---\n".join(grouped)),
+        )
+        # _queue_clause (status_queue_count's WHERE builder) always
+        # opens with "WHERE lr.stream_id = ..." -- distinct from
+        # assigned_open_count's unrelated, pre-existing COUNT(*) query
+        # (same join, same predicate, but stream_id is its LAST AND,
+        # not its WHERE) that legitimately still runs once, for the
+        # headline's status.assigned_open field, not a queue total.
+        per_kind_counts = [
+            s for s in seen
+            if s.strip().upper().startswith("SELECT COUNT(*)")
+            and "WHERE lr.stream_id = " in s
+        ]
+        self.assertEqual(
+            per_kind_counts, [],
+            "a per-kind COUNT(*) query survived batching: {0}".format(
+                per_kind_counts),
+        )
+
+    def test_batched_streak_lookups_still_agree_with_the_single_row_form(
+        self
+    ) -> None:
+        """WP-23 perf pass: still_failing's failing_since/last_pass_time
+        now come from Storage.failure_streak_bounds_many rather than one
+        call per row -- the existing test_status_and_queues-style
+        assertions already cover the VALUES; this pins that the queue
+        page's own rows are the source, not a coincidence, by cross-
+        checking against the single-row method directly for the one
+        FAIL row this fixture produces from a real streak (test_still_fail
+        has been failing since day 24, per seed())."""
+        self.seed()
+        data = self.call("GET", "/api/summary")
+        [row] = [
+            entry for entry in data["queues"]["still_failing"]["tests"]
+            if entry["test_name"] == "test_still_fail"
+        ]
+        expected = self.storage.failure_streak_bounds(
+            "linux-sim", "suite/alpha.py", "test_still_fail",
+            self.storage.latest_run(
+                "linux-sim", "suite/alpha.py", "test_still_fail"
+            ).start_time,
+        )
+        self.assertEqual(
+            row["failing_since"], format_iso(expected.failing_since))
+        self.assertEqual(
+            row["last_pass_time"],
+            None if expected.last_pass_before is None
+            else format_iso(expected.last_pass_before),
+        )
 
     def test_wrong_method_405(self) -> None:
         self.assert_405("POST", "/api/summary", "GET")
@@ -4820,6 +4894,60 @@ class TestCompareEndpoint(ApiCase):
                    "category": ["not_a_thing"]},
             expect=400)
         self.assertIn("category", error["error"])
+
+    def test_a_category_request_runs_the_pairs_sql_twice_not_thrice(
+        self
+    ) -> None:
+        """WP-23 perf pass: a category request used to run the expensive
+        pairs SQL (_compare_pairs_sql) three times -- compare_counts,
+        compare_category's page, and compare_category_count recomputing
+        a total compare_counts already had. ``total`` is now
+        getattr(counts, category) -- see _handle_compare's comment.
+        "stream_result" is a column alias unique to the pairs SQL (every
+        query built from it selects it, directly or through the
+        categorized/counted wrapper), so counting its occurrences across
+        the traced statements counts pairs-SQL executions specifically,
+        not every query the request happens to run."""
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call(
+                "GET", "/api/compare",
+                query={"stream": [str(self.stream_id)],
+                       "category": ["new_failures"]})
+        finally:
+            conn.set_trace_callback(None)
+        pairs_runs = [s for s in seen if "stream_result" in s]
+        self.assertEqual(
+            len(pairs_runs), 2,
+            "expected exactly 2 pairs-SQL executions (counts + page), "
+            "got {0}:\n{1}".format(len(pairs_runs), "\n---\n".join(
+                pairs_runs)),
+        )
+
+    def test_the_category_total_still_matches_the_headline_count(
+        self
+    ) -> None:
+        """The value itself, not just the query count: total must be
+        EXACTLY counts[category] for every category, the same agreement
+        compare_category_count used to prove by independently
+        recomputing it -- tests/test_storage.py's own tests are the
+        oracle that compare_counts and compare_category_count still
+        agree; this is the API-level half of that same guarantee."""
+        counts = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)]})["counts"]
+        for category in COMPARE_CATEGORIES:
+            data = self.call(
+                "GET", "/api/compare",
+                query={"stream": [str(self.stream_id)],
+                       "category": [category]})
+            self.assertEqual(
+                data["total"], counts[category],
+                "category {!r} total disagrees with the headline "
+                "count".format(category),
+            )
 
 
 class TestDashboardStreamParam(ApiCase):

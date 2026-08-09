@@ -2191,6 +2191,113 @@ class TestStatusQueues(EstateTestBase):
                           [("other.py", 1)])
 
 
+class TestQueueCounts(EstateTestBase):
+    """Storage.queue_counts: the batched, one-query form of
+    status_queue_count (WP-23 perf pass — see its own docstring for the
+    measured before/after). Every assertion here mirrors an existing
+    TestStatusQueues one, proving the two AGREE — the same discipline
+    test_counts_match_the_pure_classifier already applies between the
+    SQL predicates and the pure classifier.
+    """
+
+    def test_every_kind_agrees_with_status_queue_count(self) -> None:
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(stale_before=cutoff)
+        for kind in storage.QUEUE_KINDS:
+            self.assertEqual(
+                counts[kind],
+                self.store.status_queue_count(kind, stale_before=cutoff),
+                "queue_counts disagrees with status_queue_count for "
+                "{!r}".format(kind),
+            )
+
+    def test_mine_agrees_with_the_assignee_filtered_query(self) -> None:
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_still_fail", "alice", "bob",
+            CREATED,
+        )
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_new_fail", "carol", "bob",
+            CREATED,
+        )
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(
+            assignee="alice", stale_before=cutoff)
+        self.assertEqual(counts["mine"], 1)
+        self.assertEqual(
+            counts["mine"],
+            self.store.status_queue_count(
+                "assigned", assignee="alice", stale_before=cutoff),
+        )
+
+    def test_mine_is_zero_without_an_assignee(self) -> None:
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(stale_before=cutoff)
+        self.assertEqual(counts["mine"], 0)
+
+    def test_environment_scoping_agrees(self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(
+            environment="win-sim", stale_before=cutoff)
+        self.assertEqual(counts["new_failures"], 1)
+        self.assertEqual(
+            counts["new_failures"],
+            self.store.status_queue_count(
+                "new_failures", environment="win-sim",
+                stale_before=cutoff),
+        )
+
+    def test_retired_tests_are_excluded_from_every_kind(self) -> None:
+        """test_deleted is failing AND stale; must not inflate any count,
+        the same NOT_RETIRED guarantee status_queue_count already has."""
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(stale_before=cutoff)
+        self.assertEqual(
+            counts["not_run"],
+            self.store.status_queue_count("not_run", stale_before=cutoff),
+        )
+        self.assertNotIn(
+            "test_deleted",
+            [r.test_name for r in
+             self.store.status_queue("not_run", stale_before=cutoff)],
+        )
+
+    def test_an_unmatched_scope_returns_zeros_not_none(self) -> None:
+        """SUM(CASE...) over zero WHERE-matched rows is SQL NULL in both
+        backends, not 0 -- the ``or 0`` guard is what keeps this from
+        crashing int(None)."""
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(
+            environment="does-not-exist", stale_before=cutoff)
+        for kind in storage.QUEUE_KINDS:
+            self.assertEqual(counts[kind], 0, kind)
+
+    def test_stale_before_is_required(self) -> None:
+        """not_run is always one of QUEUE_KINDS, so unlike
+        status_queue_count (only needed when THAT kind is requested)
+        this needs it unconditionally."""
+        with self.assertRaises(ValueError):
+            self.store.queue_counts()
+
+    def test_one_query_regardless_of_assignee(self) -> None:
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            self.store.queue_counts(assignee="alice", stale_before=cutoff)
+        finally:
+            conn.set_trace_callback(None)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(len(selects), 1, selects)
+
+
 class TestFailureStreakBounds(StorageTestBase):
     """failing_since / last_pass_before, via index seeks over the history."""
 
@@ -2252,6 +2359,156 @@ class TestFailureStreakBounds(StorageTestBase):
             streak.failing_since, BASE + datetime.timedelta(days=1)
         )
         self.assertEqual(streak.last_pass_before, BASE)
+
+
+class TestFailureStreakBoundsMany(StorageTestBase):
+    """The batched form of failure_streak_bounds (WP-23 perf pass — see
+    its own docstring). Every scenario mirrors one of
+    TestFailureStreakBounds's above, proving the batch AGREES with the
+    single-row method row for row rather than merely "looking
+    plausible" — the same discipline TestQueueCounts applies.
+    """
+
+    def seed_triple(
+        self, test_name: str, results: List[Result]
+    ) -> datetime.datetime:
+        """One run per day, oldest first, for ONE named test; returns the
+        latest start."""
+        records = []  # type: List[RunRecord]
+        for offset, result in enumerate(results):
+            records.append(make_record(
+                test_name=test_name, result=result,
+                start=BASE + datetime.timedelta(days=offset),
+            ))
+        self.store.upsert_runs(records)
+        return BASE + datetime.timedelta(days=len(results) - 1)
+
+    def test_agrees_with_the_single_row_method_for_a_batch(self) -> None:
+        latest_a = self.seed_triple(
+            "test_a", [Result.PASS, Result.PASS, Result.FAIL, Result.FAIL])
+        latest_b = self.seed_triple("test_b", [Result.PASS, Result.FAIL])
+        latest_c = self.seed_triple("test_c", [Result.FAIL, Result.FAIL])
+        latest_d = self.seed_triple(
+            "test_d",
+            [Result.PASS, Result.FAILED_AS_EXPECTED, Result.FAIL])
+        entries = [
+            ("linux-sim", "suite.py", "test_a", latest_a),
+            ("linux-sim", "suite.py", "test_b", latest_b),
+            ("linux-sim", "suite.py", "test_c", latest_c),
+            ("linux-sim", "suite.py", "test_d", latest_d),
+        ]
+        batched = self.store.failure_streak_bounds_many(entries)
+        for environment, script, test_name, latest in entries:
+            expected = self.store.failure_streak_bounds(
+                environment, script, test_name, latest)
+            self.assertEqual(
+                batched[(environment, script, test_name)], expected,
+                "batched result disagrees for {!r}".format(test_name),
+            )
+        # And the actual VALUES are right, not just self-consistent with
+        # the single-row method (which could share the same bug):
+        self.assertEqual(
+            batched[("linux-sim", "suite.py", "test_a")].failing_since,
+            BASE + datetime.timedelta(days=2),
+        )
+        self.assertIsNone(
+            batched[("linux-sim", "suite.py", "test_c")].last_pass_before
+        )
+
+    def test_streak_is_not_truncated_by_history_length(self) -> None:
+        """Mirrors TestFailureStreakBounds's test of the same name — a
+        long-broken test's true start must survive batching too."""
+        latest = self.seed_triple(
+            "test_a", [Result.PASS] + [Result.FAIL] * 300)
+        batched = self.store.failure_streak_bounds_many(
+            [("linux-sim", "suite.py", "test_a", latest)])
+        streak = batched[("linux-sim", "suite.py", "test_a")]
+        self.assertEqual(
+            streak.failing_since, BASE + datetime.timedelta(days=1))
+        self.assertEqual(streak.last_pass_before, BASE)
+
+    def test_an_unknown_triple_resolves_to_no_streak_and_skips_step_three(
+        self
+    ) -> None:
+        """A triple with no runs on this stream at all -- defensive:
+        production always calls this with a row's OWN latest_runs
+        start_time, which by construction matches a real run, so
+        failing_since is never actually None in practice (the row's own
+        run always satisfies step 2's own start_time <= latest). Still
+        resolves cleanly rather than crashing, and step 3 (the pass
+        lookup) is skipped for it since there is no failing_since to
+        look a pass up against -- 2 queries, not 3."""
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            batched = self.store.failure_streak_bounds_many([
+                ("linux-sim", "suite.py", "test_ghost", BASE),
+            ])
+        finally:
+            conn.set_trace_callback(None)
+        streak = batched[("linux-sim", "suite.py", "test_ghost")]
+        self.assertIsNone(streak.failing_since)
+        self.assertIsNone(streak.last_pass_before)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(len(selects), 2, selects)
+
+    def test_duplicate_triples_are_resolved_once(self) -> None:
+        latest = self.seed_triple("test_a", [Result.PASS, Result.FAIL])
+        entry = ("linux-sim", "suite.py", "test_a", latest)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            batched = self.store.failure_streak_bounds_many(
+                [entry, entry, entry])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(batched), 1)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(len(selects), 3, selects)
+
+    def test_query_count_is_bounded_by_chunks_not_rows(self) -> None:
+        """250 FAIL triples must not mean 250*3 queries. Chunked at
+        _RECENT_CHUNK (100, the same batch size recent_results uses):
+        ceil(250/100)*3 = 9, and every one of the 250 has a real
+        failing_since (each has a PASS then a FAIL), so step 3 runs for
+        every chunk too -- this is the worst case, not a lucky one."""
+        entries = []  # type: List[Tuple[str, str, str, datetime.datetime]]
+        for i in range(250):
+            name = "test_{:03d}".format(i)
+            latest = self.seed_triple(name, [Result.PASS, Result.FAIL])
+            entries.append(("linux-sim", "suite.py", name, latest))
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            batched = self.store.failure_streak_bounds_many(entries)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(batched), 250)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(
+            len(selects), 9,
+            "expected ceil(250/100)*3 queries, got {0}".format(
+                len(selects)))
+
+    def test_empty_input_issues_no_query(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            result = self.store.failure_streak_bounds_many([])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(result, {})
+        self.assertEqual(seen, [])
 
 
 class TestDashboardPaging(StorageTestBase):

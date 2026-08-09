@@ -119,6 +119,24 @@ EXCLUDED_TESTS = {
         "equivalent 'fresh empty database' to point at without "
         "dropping the sacrificial one mid-suite, same reasoning as "
         "TestLatestRunDuration above.",
+    "TestQueueCounts.test_one_query_regardless_of_assignee":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestFailureStreakBoundsMany."
+    "test_an_unknown_triple_resolves_to_no_streak_and_skips_step_three":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestFailureStreakBoundsMany.test_duplicate_triples_are_resolved_once":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestFailureStreakBoundsMany."
+    "test_query_count_is_bounded_by_chunks_not_rows":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestFailureStreakBoundsMany.test_empty_input_issues_no_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestCompareEndpoint."
+    "test_a_category_request_runs_the_pairs_sql_twice_not_thrice":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestSummary."
+    "test_the_full_payload_counts_every_queue_in_one_grouped_query":
+        "counts queries via sqlite3's set_trace_callback.",
 }  # type: Dict[str, str]
 
 if backends.MARIADB_AVAILABLE:

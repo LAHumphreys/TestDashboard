@@ -4834,6 +4834,86 @@ class Storage:
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN + where
         return int(self._conn().execute(sql, params).fetchone()[0])
 
+    def queue_counts(
+        self,
+        environment: Optional[str] = None,
+        assignee: Optional[str] = None,
+        stale_before: Optional[datetime.datetime] = None,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+    ) -> Dict[str, int]:
+        """Exact size of EVERY triage queue, in one grouped pass.
+
+        WP-23 perf pass: ``/api/summary``'s full payload used to call
+        :meth:`status_queue_count` once per :data:`QUEUE_KINDS` entry for
+        the tab-badge totals, and AGAIN once per kind for each queue's
+        own ``"total"`` field — 2x(len(QUEUE_KINDS)+1) separate queries
+        (12 on this project's own 6-kind QUEUE_KINDS) every request, each
+        one scanning the SAME ``latest_runs``/``current_assignments``/
+        ``test_retirements`` join with only the CASE predicate differing.
+        This is the same join, once, with every kind's predicate as its
+        own ``SUM(CASE WHEN ... THEN 1 ELSE 0 END)`` column — semantically
+        identical to calling :meth:`status_queue_count` once per kind
+        (``tests/test_storage.py`` pins the two agreeing), but one round
+        trip instead of up to seven.
+
+        Returns a dict keyed by every :data:`QUEUE_KINDS` entry plus
+        ``"mine"`` (the ``assigned`` predicate further filtered to
+        *assignee* — 0, not a KeyError, when *assignee* is falsy, the
+        same contract :func:`testboard.api._summary_queue_totals` already
+        had). *environment*/*environments*/*stream_id* — see
+        :meth:`_queue_clause`; applied ONCE, in the shared WHERE, since
+        every kind reads the same scoped partition. *stale_before* is
+        required (as it is for :meth:`status_queue_count`) because
+        ``not_run`` is always one of :data:`QUEUE_KINDS`.
+        """
+        if stale_before is None:
+            raise ValueError("queue_counts needs stale_before")
+        # not_run's predicate carries the one parameterised placeholder
+        # among QUEUE_KINDS (`lr.start_time < ?`) -- its bind value is
+        # appended in the same left-to-right order the columns
+        # themselves are built in, so select_params ends up matching
+        # the SELECT-list's ?s positionally.
+        select_params = []  # type: List[Any]
+        ordered_columns = []  # type: List[str]
+        for kind in QUEUE_KINDS:
+            ordered_columns.append(
+                "SUM(CASE WHEN {} THEN 1 ELSE 0 END)".format(
+                    _QUEUE_PREDICATES[kind]))
+            if kind in _STALE_QUEUES:
+                select_params.append(model.format_iso(stale_before))
+        include_mine = bool(assignee)
+        if include_mine:
+            ordered_columns.append(
+                "SUM(CASE WHEN {} AND ca.assignee = ? "
+                "THEN 1 ELSE 0 END)".format(_QUEUE_PREDICATES["assigned"])
+            )
+            select_params.append(assignee)
+        sql = (
+            "SELECT " + ", ".join(ordered_columns) + " "
+            + self._LATEST_COUNT_JOIN
+        )
+        where = ["lr.stream_id = ?", self._NOT_RETIRED]
+        where_params = [stream_id]  # type: List[Any]
+        if environment is not None:
+            where.append("lr.environment = ?")
+            where_params.append(environment)
+        envs_clause, envs_params = self._environments_clause(environments)
+        if envs_clause is not None:
+            where.append(envs_clause)
+            where_params.extend(envs_params)
+        sql += " WHERE " + " AND ".join(where)
+        row = self._conn().execute(
+            sql, select_params + where_params
+        ).fetchone()
+        counts = {
+            kind: int(row[i] or 0) for i, kind in enumerate(QUEUE_KINDS)
+        }
+        counts["mine"] = (
+            int(row[len(QUEUE_KINDS)] or 0) if include_mine else 0
+        )
+        return counts
+
     def recent_results(
         self,
         triples: Sequence[Tuple[str, str, str]],
@@ -4960,6 +5040,211 @@ class Storage:
                 None if pass_row is None else model.parse_iso(pass_row[0])
             ),
         )
+
+    def failure_streak_bounds_many(
+        self,
+        entries: Sequence[Tuple[str, str, str, datetime.datetime]],
+        stream_id: int = MAINLINE_STREAM_ID,
+    ) -> Dict[Tuple[str, str, str], FailureStreak]:
+        """Batched form of :meth:`failure_streak_bounds` for a PAGE of rows.
+
+        WP-23 perf pass: a triage queue's ``still_failing``/``mine`` rows
+        called :meth:`failure_streak_bounds` once per FAIL row — three
+        queries each, 127 calls measured on one request at dev scale.
+        This does the SAME three-step computation (newest non-FAIL
+        before the row's own latest run; the oldest run after that bound
+        i.e. where the streak began; the newest PASS before that) for a
+        whole PAGE in three round trips total (per chunk — see below),
+        never one per row.
+
+        *entries* is ``(environment, script, test_name, latest_start)``
+        — the caller has already established each row is a FAIL, exactly
+        as :meth:`failure_streak_bounds` requires of its own caller.
+        Duplicate triples (the same test showing up in two queues, e.g.
+        ``still_failing`` and ``mine``) are computed once. *stream_id*
+        (WP-21, default mainline) scopes every seek to one stream, same
+        as the single-row method.
+
+        Each of the three steps is one query per chunk: a "driving"
+        table of the chunk's own triples (built as a UNION ALL of
+        literal SELECTs — no VALUES-table-constructor syntax, which
+        this project's dual-backend translation does not need to know
+        about) joined to a correlated subquery that reproduces exactly
+        one step of :meth:`failure_streak_bounds`'s SQL, with the
+        SHARED params (*stream_id*, the FAIL/PASS literals) bound once
+        per query rather than once per row. Chunked at
+        :data:`_RECENT_CHUNK` (the same batch size
+        :meth:`recent_results` uses) to stay well under SQLite's
+        999-bound-parameter ceiling — each row costs 4-5 params here,
+        against :meth:`recent_results`'s 3, so the same chunk size still
+        leaves headroom. Steps 2 and 3 are skipped entirely for rows a
+        prior step already resolved to "no streak" (no non-FAIL run at
+        all before the FAIL streak, in the whole history) or dropped
+        (nothing to look up), so an all-still-failing-since-the-first-run
+        page never runs step 3 at all.
+
+        Returns a dict keyed by triple — never by triple *and*
+        start_time — matching :meth:`failure_streak_bounds`'s own
+        single-triple contract (a stream's ``latest_runs`` has at most
+        one current start_time per triple, so this is not a loss of
+        information).
+        """
+        unique = list(dict.fromkeys(
+            (env, script, test, model.format_iso(latest))
+            for env, script, test, latest in entries
+        ))  # type: List[Tuple[str, str, str, str]]
+        result = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
+        if not unique:
+            return result
+        conn = self._conn()
+        for start in range(0, len(unique), _RECENT_CHUNK):
+            chunk = unique[start:start + _RECENT_CHUNK]
+            bounds = self._streak_bound_many(conn, chunk, stream_id)
+            since_inputs = [
+                (env, script, test, start_iso, bounds[(env, script, test)])
+                for (env, script, test, start_iso) in chunk
+            ]
+            since_map = self._streak_since_many(
+                conn, since_inputs, stream_id)
+            pass_inputs = [
+                (env, script, test, since_map[(env, script, test)])
+                for (env, script, test, _start_iso) in chunk
+                if since_map[(env, script, test)] is not None
+            ]
+            pass_map = (
+                self._streak_pass_many(conn, pass_inputs, stream_id)
+                if pass_inputs else {}
+            )  # type: Dict[Tuple[str, str, str], Optional[str]]
+            for (env, script, test, _start_iso) in chunk:
+                key = (env, script, test)
+                failing_since_iso = since_map[key]
+                if failing_since_iso is None:
+                    result[key] = FailureStreak(
+                        failing_since=None, last_pass_before=None)
+                    continue
+                pass_iso = pass_map.get(key)
+                result[key] = FailureStreak(
+                    failing_since=model.parse_iso(failing_since_iso),
+                    last_pass_before=(
+                        None if pass_iso is None
+                        else model.parse_iso(pass_iso)
+                    ),
+                )
+        return result
+
+    @staticmethod
+    def _driving_table(column_names: Sequence[str], rows: int) -> str:
+        """A UNION ALL of *rows* literal SELECTs naming *column_names*.
+
+        The portable stand-in for a VALUES-as-table constructor: every
+        branch is a plain ``SELECT ? AS col, ? AS col2, ...`` with no
+        FROM, each naming its own columns via ``AS`` — the same style
+        :meth:`_compare_pairs_sql` already uses for its UNION ALL, and
+        deliberately NOT the ``FROM (...) AS v(col1, col2, ...)``
+        derived-table column-list form, which is not something this
+        project's dual-backend translation (a plain ``?`` -> ``%s``
+        text substitution, nothing SQL-shape-aware) has ever had to
+        vouch for. Both SQLite and MariaDB accept the per-branch ``AS``
+        form identically.
+        """
+        row_sql = "SELECT " + ", ".join(
+            "? AS {}".format(name) for name in column_names
+        )
+        return " UNION ALL ".join([row_sql] * rows)
+
+    def _streak_bound_many(
+        self,
+        conn: Any,
+        chunk: Sequence[Tuple[str, str, str, str]],
+        stream_id: int,
+    ) -> Dict[Tuple[str, str, str], Optional[str]]:
+        """Step 1 for a chunk: newest non-FAIL run before each row's own
+        latest start, batched. See :meth:`failure_streak_bounds_many`."""
+        driving = self._driving_table(
+            ("environment", "script", "test_name", "start_time"),
+            len(chunk),
+        )
+        sql = (
+            "SELECT v.environment, v.script, v.test_name, "
+            "(SELECT r.start_time FROM runs r "
+            " WHERE r.environment = v.environment "
+            " AND r.script = v.script AND r.test_name = v.test_name "
+            " AND r.stream_id = ? AND r.start_time < v.start_time "
+            " AND r.result <> ? "
+            " ORDER BY r.start_time DESC LIMIT 1) AS bound "
+            "FROM (" + driving + ") AS v"
+        )
+        params = [stream_id, Result.FAIL.value]  # type: List[Any]
+        for env, script, test, start_iso in chunk:
+            params.extend([env, script, test, start_iso])
+        rows = conn.execute(sql, params).fetchall()
+        return {(row[0], row[1], row[2]): row[3] for row in rows}
+
+    def _streak_since_many(
+        self,
+        conn: Any,
+        chunk: Sequence[Tuple[str, str, str, str, Optional[str]]],
+        stream_id: int,
+    ) -> Dict[Tuple[str, str, str], Optional[str]]:
+        """Step 2 for a chunk: where each row's current streak began,
+        given step 1's bound (nullable). See
+        :meth:`failure_streak_bounds_many`.
+
+        Unifies :meth:`failure_streak_bounds`'s two branches (a bound
+        found, or not) into one condition, since both are now driven by
+        the SAME batched query: ``bound IS NULL`` reproduces the
+        no-bound branch's ``start_time <= latest`` exactly (no lower
+        bound at all); a real bound adds ``start_time > bound``.
+        """
+        driving = self._driving_table(
+            ("environment", "script", "test_name", "start_time", "bound"),
+            len(chunk),
+        )
+        sql = (
+            "SELECT v.environment, v.script, v.test_name, "
+            "(SELECT MIN(r.start_time) FROM runs r "
+            " WHERE r.environment = v.environment "
+            " AND r.script = v.script AND r.test_name = v.test_name "
+            " AND r.stream_id = ? AND r.start_time <= v.start_time "
+            " AND (v.bound IS NULL OR r.start_time > v.bound)"
+            ") AS failing_since "
+            "FROM (" + driving + ") AS v"
+        )
+        params = [stream_id]  # type: List[Any]
+        for env, script, test, start_iso, bound_iso in chunk:
+            params.extend([env, script, test, start_iso, bound_iso])
+        rows = conn.execute(sql, params).fetchall()
+        return {(row[0], row[1], row[2]): row[3] for row in rows}
+
+    def _streak_pass_many(
+        self,
+        conn: Any,
+        chunk: Sequence[Tuple[str, str, str, str]],
+        stream_id: int,
+    ) -> Dict[Tuple[str, str, str], Optional[str]]:
+        """Step 3 for a chunk: the newest PASS before each row's own
+        failing_since (step 2's result). See
+        :meth:`failure_streak_bounds_many`. Only called with rows that
+        HAVE a failing_since — a row with none needs no lookup."""
+        driving = self._driving_table(
+            ("environment", "script", "test_name", "failing_since"),
+            len(chunk),
+        )
+        sql = (
+            "SELECT v.environment, v.script, v.test_name, "
+            "(SELECT r.start_time FROM runs r "
+            " WHERE r.environment = v.environment "
+            " AND r.script = v.script AND r.test_name = v.test_name "
+            " AND r.stream_id = ? AND r.start_time < v.failing_since "
+            " AND r.result = ? "
+            " ORDER BY r.start_time DESC LIMIT 1) AS last_pass "
+            "FROM (" + driving + ") AS v"
+        )
+        params = [stream_id, Result.PASS.value]  # type: List[Any]
+        for env, script, test, failing_since_iso in chunk:
+            params.extend([env, script, test, failing_since_iso])
+        rows = conn.execute(sql, params).fetchall()
+        return {(row[0], row[1], row[2]): row[3] for row in rows}
 
     def daily_result_counts(
         self,

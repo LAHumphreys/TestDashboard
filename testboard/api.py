@@ -57,6 +57,7 @@ from testboard.storage import (
     CompareCounts,
     CompareRow,
     FailureStreak,
+    RollupCount,
     Storage,
     Stream,
     TestStatusRow,
@@ -1071,6 +1072,7 @@ def _summary_queue_json(
     environments: Optional[Sequence[str]] = None,
     env_to_product: Optional[Dict[str, str]] = None,
     stream_id: int = MAINLINE_STREAM_ID,
+    queue_counts: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Serialize one triage queue: exact total plus capped, enriched entries.
 
@@ -1080,10 +1082,14 @@ def _summary_queue_json(
     queue would hide their work behind other people's) and is empty
     without an assignee.
 
-    Streak bounds cost three index seeks per row, so they are computed
-    only for the queues that report ``failing_since``/``last_pass_time``
-    (``still_failing`` and ``mine``). A test can sit in both; *streaks*
-    is the caller's cache so one request looks each test up once.
+    Streak bounds cost three index seeks per row; computed for the
+    queues that report ``failing_since``/``last_pass_time``
+    (``still_failing`` and ``mine``) in ONE batched call
+    (:meth:`Storage.failure_streak_bounds_many`, WP-23 perf pass) rather
+    than one round trip per FAIL row — a queue page is capped at
+    ``_SUMMARY_QUEUE_CAP`` rows, so the batch is bounded the same way. A
+    test can sit in both queues; *streaks* is the caller's cache so one
+    request looks each test up once.
 
     *env_to_product* — the caller's own :meth:`Storage.environment_products_map`
     call, threaded through rather than re-fetched per queue (there are up
@@ -1094,6 +1100,16 @@ def _summary_queue_json(
     never merged with mainline's (docs/STREAMS_PLAN.md §5.2). Streak
     bounds are scoped the same way, so a branch's failing-since is never
     inherited from mainline's history of the same triple.
+
+    *queue_counts* (WP-23 perf pass): the caller's own precomputed
+    :meth:`Storage.queue_counts` result, when it already has one —
+    ``_handle_summary``'s full/headline payload fetches every kind's
+    total in ONE grouped query and threads it through here instead of a
+    second, per-kind :meth:`Storage.status_queue_count` call for the
+    ``"total"`` field. Absent (the single-queue ``parts=queue`` path,
+    which only ever wants ONE kind's total), this falls back to the
+    original single-kind query — computing all six kinds' counts there
+    would cost MORE than the one count actually needed.
     """
     products = env_to_product or {}
     queue_assignee = None  # type: Optional[str]
@@ -1105,27 +1121,30 @@ def _summary_queue_json(
         queue_assignee = assignee
     with_streaks = kind in _STREAK_QUEUES or kind == "mine"
 
-    def streak_for(row: TestStatusRow) -> Optional[FailureStreak]:
-        """Streak info for a FAIL row (cached); None for non-FAIL rows."""
-        if row.result is not Result.FAIL:
-            return None
-        key = (row.environment, row.script, row.test_name)
-        if key not in streaks:
-            streaks[key] = storage.failure_streak_bounds(
-                row.environment, row.script, row.test_name, row.start_time,
-                stream_id,
-            )
-        return streaks[key]
-
     rows = storage.status_queue(
         storage_kind, environment, limit=_SUMMARY_QUEUE_CAP,
         assignee=queue_assignee, stale_before=recent_cutoff,
         with_latest_comment=True, environments=environments,
         stream_id=stream_id,
     )
+    if with_streaks:
+        needed = [
+            (row.environment, row.script, row.test_name, row.start_time)
+            for row in rows
+            if row.result is Result.FAIL
+            and (row.environment, row.script, row.test_name) not in streaks
+        ]
+        if needed:
+            streaks.update(
+                storage.failure_streak_bounds_many(needed, stream_id)
+            )
     entries = [
         _status_row_json(
-            row, streak_for(row) if with_streaks else None,
+            row,
+            (
+                streaks.get((row.environment, row.script, row.test_name))
+                if with_streaks and row.result is Result.FAIL else None
+            ),
             products.get(row.environment, ""),
         )
         for row in rows
@@ -1133,12 +1152,16 @@ def _summary_queue_json(
     if kind == "still_failing":
         # Oldest neglected regression first — the point of the queue.
         entries.sort(key=lambda entry: entry["failing_since"] or "")
-    return {
-        "total": storage.status_queue_count(
+    total = (
+        queue_counts[kind] if queue_counts is not None
+        else storage.status_queue_count(
             storage_kind, environment, assignee=queue_assignee,
             stale_before=recent_cutoff, environments=environments,
             stream_id=stream_id,
-        ),
+        )
+    )
+    return {
+        "total": total,
         "tests": entries,
     }
 
@@ -1154,27 +1177,16 @@ def _summary_queue_totals(
     """Exact size of every queue, without fetching a single row.
 
     This is what lets the headline part paint the triage tab counts
-    while the row payloads are still loading: seven indexed COUNT
-    queries over ``latest_runs``, each a few milliseconds however large
-    the estate. *stream_id* (WP-23, default mainline) — see
-    :func:`_summary_queue_json`.
+    while the row payloads are still loading. WP-23 perf pass: used to
+    be seven separate indexed COUNT queries over ``latest_runs``; now
+    one grouped pass (:meth:`Storage.queue_counts`) — see its docstring
+    for the measured before/after. *stream_id* (WP-23, default
+    mainline) — see :func:`_summary_queue_json`.
     """
-    totals = {
-        kind: storage.status_queue_count(
-            kind, environment, stale_before=recent_cutoff,
-            environments=environments, stream_id=stream_id,
-        )
-        for kind in QUEUE_KINDS
-    }
-    totals["mine"] = (
-        storage.status_queue_count(
-            "assigned", environment, assignee=assignee,
-            stale_before=recent_cutoff, environments=environments,
-            stream_id=stream_id,
-        )
-        if assignee else 0
+    return storage.queue_counts(
+        environment, assignee, stale_before=recent_cutoff,
+        environments=environments, stream_id=stream_id,
     )
-    return totals
 
 
 #: Valid values of /api/summary's ``parts`` parameter.
@@ -1182,7 +1194,9 @@ _SUMMARY_PARTS = ("headline", "queue")
 
 
 def _products_summary(
-    storage: Storage, recent_cutoff: datetime.datetime
+    storage: Storage,
+    recent_cutoff: datetime.datetime,
+    rollup_rows: Optional[List[RollupCount]] = None,
 ) -> List[Dict[str, Any]]:
     """The ``products[]`` breakdown of ``/api/summary`` (WP-20 §2.2).
 
@@ -1196,15 +1210,31 @@ def _products_summary(
     *recent_cutoff* only affects a column :func:`analytics.summarize_by_product`
     ignores (none of its four counts is recency-gated), so the caller's
     own cutoff is fine to reuse here — no second cutoff computation.
+
+    *rollup_rows* (WP-23 perf pass): this needs the estate-wide MAINLINE
+    rollup — unconditionally, regardless of the request's own scope. The
+    caller's own ``summary_rollup`` call already fetched exactly that
+    same, byte-identical row set whenever the REQUEST is itself unscoped
+    (no ``environment=``, no ``product=``, mainline ``stream=`` — the
+    common case, and what a plain ``GET /api/summary`` load actually is);
+    threading those rows through here avoids a second, redundant query
+    that measured as literally the same SQL statement with the same
+    parameters. A scoped request's own rollup is NOT the same data (a
+    different environment/stream partition), so the caller passes
+    ``None`` there and this fetches its own, exactly as before — see
+    ``_handle_summary``'s call site for which case is which.
     """
     products = storage.distinct_products()
     if not products:
         return []
+    rows = (
+        rollup_rows if rollup_rows is not None
+        else storage.summary_rollup(recent_cutoff)
+    )
     by_product = {
         row.product: row
         for row in analytics.summarize_by_product(
-            storage.summary_rollup(recent_cutoff),
-            storage.environment_products_map(),
+            rows, storage.environment_products_map(),
         )
     }
     zero = analytics.ProductRollup(
@@ -1366,14 +1396,29 @@ def _handle_summary(
     # rather than as every test in the estate quietly going stale — the
     # failure mode a data-derived cutoff would otherwise hide.
     latest_run = storage.latest_run_time(stream_id)
+    estate_rollup = storage.summary_rollup(
+        recent_cutoff, environment, environments=environments,
+        stream_id=stream_id,
+    )
     estate = analytics.summarize_rollup(
-        storage.summary_rollup(
-            recent_cutoff, environment, environments=environments,
-            stream_id=stream_id,
-        ),
+        estate_rollup,
         storage.assigned_open_count(
             environment, environments=environments, stream_id=stream_id,
         ),
+    )
+    # WP-23 perf pass: _products_summary always needs the estate-wide
+    # MAINLINE rollup, regardless of this request's own scope. When the
+    # request itself IS that exact scope (no environment=, no product=,
+    # mainline stream=) -- the common, unscoped home-screen load --
+    # estate_rollup above IS that same query, so it is threaded through
+    # rather than fetched a second time. A genuinely scoped request
+    # (environment=/product=/stream=) reads different data here, so
+    # _products_summary fetches its own (pass None -- see its docstring).
+    products_rollup = (
+        estate_rollup
+        if environment is None and environments is None
+        and stream_id == MAINLINE_STREAM_ID
+        else None
     )
 
     # Trend: per-night result counts, zero-filled over the window so the
@@ -1412,6 +1457,16 @@ def _handle_summary(
         for sid in assignment_stream_ids
         if sid in assignment_streams_by_id
     ]
+    # WP-23 perf pass: every queue's exact total, ONE grouped query
+    # (Storage.queue_counts) — reused below for both the headline
+    # tab-badge field and, in the full-payload branch, every queue's own
+    # "total" (queue_counts= on _summary_queue_json) instead of each one
+    # re-querying its count a second time. See _summary_queue_totals's
+    # and Storage.queue_counts's docstrings for the measured before/after.
+    queue_totals = _summary_queue_totals(
+        storage, environment, assignee, recent_cutoff,
+        environments=environments, stream_id=stream_id,
+    )
     payload = {
             "generated_at": model.format_iso(current),
             "environment": environment,
@@ -1434,7 +1489,8 @@ def _handle_summary(
             # switcher's way back to "All products". Empty list = no
             # products declared, the frontend's signal to show nothing
             # product-shaped at all.
-            "products": _products_summary(storage, recent_cutoff),
+            "products": _products_summary(
+                storage, recent_cutoff, products_rollup),
             "environments": storage.environments(
                 environments=catalog_environments),
             "scripts": storage.scripts(
@@ -1512,11 +1568,11 @@ def _handle_summary(
             ],
             # Every queue's exact size, row payloads not included. The
             # headline part's reason to exist: tab badges paint from
-            # these while the rows are still being fetched.
-            "queue_totals": _summary_queue_totals(
-                storage, environment, assignee, recent_cutoff,
-                environments=environments, stream_id=stream_id,
-            ),
+            # these while the rows are still being fetched. WP-23 perf
+            # pass: this SAME dict is threaded into the full payload's
+            # per-queue "total" fields below too (queue_counts=), rather
+            # than each one re-querying its own count a second time.
+            "queue_totals": queue_totals,
         }  # type: Dict[str, Any]
     if part == "headline":
         return _json_response(200, payload)
@@ -1529,14 +1585,14 @@ def _handle_summary(
         kind: _summary_queue_json(
             storage, kind, environment, None, recent_cutoff, streaks,
             environments=environments, env_to_product=env_to_product,
-            stream_id=stream_id,
+            stream_id=stream_id, queue_counts=queue_totals,
         )
         for kind in QUEUE_KINDS
     }
     queues["mine"] = _summary_queue_json(
         storage, "mine", environment, assignee, recent_cutoff, streaks,
         environments=environments, env_to_product=env_to_product,
-        stream_id=stream_id,
+        stream_id=stream_id, queue_counts=queue_totals,
     )
     payload["queues"] = queues
     return _json_response(200, payload)
@@ -2693,9 +2749,22 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
             stream_id, category, baseline_id=baseline_id, limit=limit,
             offset=offset,
         )
-        total = storage.compare_category_count(
-            stream_id, category, baseline_id=baseline_id
-        )
+        # WP-23 perf pass: every /api/compare?category= request used to
+        # run the expensive pairs SQL (_compare_pairs_sql) THREE times —
+        # once each for compare_counts above, compare_category's page
+        # just fetched, and compare_category_count here recomputing the
+        # very count compare_counts already returned. `counts` above and
+        # `storage.compare_category_count` both derive from the SAME
+        # pairs SQL with the SAME stream_id/baseline_id/environments (see
+        # both methods' docstrings) and `category` is validated against
+        # COMPARE_CATEGORIES a few lines up, which is EXACTLY
+        # CompareCounts's five per-category field names — so
+        # getattr(counts, category) IS that count, not an approximation
+        # of it. compare_category_count itself is unchanged and kept for
+        # any caller that wants a total without also paying for a page
+        # (tests/test_storage.py's own tests are the oracle that it still
+        # agrees with compare_counts).
+        total = getattr(counts, category)
         tests = [
             {
                 "environment": row.environment,
