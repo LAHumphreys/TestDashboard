@@ -462,6 +462,83 @@ function renderBuildFraming(streamMeta, nowMs) {
   line.hidden = false;
 }
 
+/** "1 new failure"/"2 new failures" — the one pluralisation rule this
+ * file's counts share, factored out once F5 needed it a second time. */
+function countWord(n, noun) {
+  return n + " " + noun + (n === 1 ? "" : "s");
+}
+
+/**
+ * F5 (docs/STREAMS_PLAN.md §5.2 "as built"): a build's delta view only
+ * ever answers "is this RC good?" against ONE baseline at a time — this
+ * line names the OTHER canonical baseline too, so a reader comparing
+ * against the previous build still sees mainline's own verdict (or vice
+ * versa) without a second navigation. Hidden outright for anything that
+ * is not kind 'build' (a branch has no "previous build" concept), or a
+ * build with no predecessor to name (the first build of a product).
+ *
+ * LAZY: called fire-and-forget from initDeltaView, AFTER first paint —
+ * this function's own fetch(es) must never be awaited on the critical
+ * path (measured cost is in the F5 commit message). One of the two
+ * legs is usually already on hand (whichever baseline this page was
+ * actually opened with), so the common case costs exactly ONE extra
+ * counts-only /api/compare call; only an explicit ?baseline= naming a
+ * THIRD build (neither the predecessor nor mainline) costs two.
+ *
+ * Guards against a stale render the same way a page-wide requestSeq
+ * would: initDeltaView only ever calls this once per build page load
+ * (a build has no own-results/diff tab switch to re-enter it, and
+ * changing the "Compare to" baseline is a full navigation, not an
+ * in-place re-render — so deltaState.streamId cannot legitimately
+ * change out from under this call), but the check costs nothing and
+ * makes that invariant load-bearing rather than assumed.
+ */
+async function renderBuildVerdict(streamId, data, productStreams) {
+  const line = document.getElementById("delta-verdict");
+  if (!line) {
+    return;
+  }
+  if (data.stream.kind !== "build") {
+    line.hidden = true;
+    return;
+  }
+  const predecessor = pickDefaultBuildBaseline(data.stream, productStreams);
+  if (predecessor === null) {
+    line.hidden = true;
+    return;
+  }
+  const currentBaselineId =
+    data.baseline.kind === "mainline" ? null : data.baseline.id;
+  let predecessorCounts =
+    currentBaselineId === predecessor.id ? data.counts : null;
+  let mainlineCounts = currentBaselineId === null ? data.counts : null;
+  try {
+    if (predecessorCounts === null) {
+      const page = await fetchCompare(streamId, null, 0, predecessor.id);
+      predecessorCounts = page.counts;
+    }
+    if (mainlineCounts === null) {
+      const page = await fetchCompare(streamId, null, 0, null);
+      mainlineCounts = page.counts;
+    }
+  } catch (err) {
+    // Enrichment only — a failed extra fetch must not show an error
+    // banner over a delta view that otherwise loaded fine.
+    line.hidden = true;
+    return;
+  }
+  if (deltaState.streamId !== streamId) {
+    return;   // the page moved on while this was in flight
+  }
+  line.textContent =
+    "vs " + streamLabel(predecessor) + ": "
+    + countWord(predecessorCounts.new_failures, "new failure")
+    + " · " + predecessorCounts.new_passes + " fixed"
+    + " — vs mainline: "
+    + countWord(mainlineCounts.new_failures, "new failure");
+  line.hidden = false;
+}
+
 /**
  * The sticky "you are scoped to a branch" band — shared by the
  * dashboard's delta view and the test-detail page (WP-21
@@ -688,6 +765,12 @@ export async function initDeltaView(streamId) {
     renderTiles(document.getElementById("delta-tiles"), data.counts);
     renderBaselineCard(data.stream, data.baseline, data.counts, Date.now());
     renderTabs();
+    // F5: fire-and-forget, deliberately NOT awaited — its own fetch(es)
+    // must never hold up the section becoming visible on the next line.
+    // The .catch() here is a pure safety net (the function's own
+    // try/catch already turns a failed fetch into "stay hidden", never
+    // a throw) against any future change making that no longer true.
+    renderBuildVerdict(streamId, data, productStreams).catch(() => {});
     document.getElementById("delta-section").hidden = false;
     loading.hidden = true;
     await loadCategory(true);

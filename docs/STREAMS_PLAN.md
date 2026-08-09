@@ -1004,6 +1004,69 @@ recorded here rather than left implicit:
     environment and stream card each showing "Unassigned failing" — the
     product/environment stat links carried `result=FAIL&unassigned=1`
     beside their own scope, the stream stat link carried neither.
+- **F5 (same usability sweep): a build's delta view names BOTH
+  canonical baselines, not just the one currently selected.**
+  - **`compare.js`.** New `renderBuildVerdict(streamId, data,
+    productStreams)`, fired FIRE-AND-FORGET (not awaited) from
+    `initDeltaView()` right before `delta-section` becomes visible —
+    its own fetch(es) never sit on the critical path between the main
+    comparison landing and first paint. Renders "vs `<previous
+    build>`: N new failures · M fixed — vs mainline: K new failures"
+    under the section header (`#delta-verdict`, new mount next to
+    `#delta-build-framing`), hidden outright for a branch (no
+    "previous build" concept) or a product's first build (nothing to
+    name as the predecessor). Whichever of the two canonical baselines
+    (previous build, mainline) the page was actually opened against is
+    already loaded — `data.counts` — so the common case costs exactly
+    ONE extra counts-only `/api/compare` call for the other one; an
+    explicit `?baseline=` naming a THIRD build costs two (both legs
+    need fetching). A failed extra fetch hides the line rather than
+    raising an error banner over a delta view that otherwise loaded
+    fine — enrichment only. Guards against a stale render
+    (`deltaState.streamId !== streamId`) the same way a page-wide
+    `requestSeq` would, though in practice `initDeltaView` only ever
+    calls this once per build page load (changing baselines via the
+    "Compare to" control is a full navigation, not an in-place
+    re-render).
+  - **MEASURED COST (the coordinator's explicit ask — the "~15ms"
+    figure in the usability-batch message was an assumption, not a
+    measurement, and turned out to be off by roughly 10x at estate
+    scale):** a synthetic ~12,000-test, 3-environment product (the
+    same scale CLAUDE.md's "~12,000 tests a night" names), two builds
+    each carrying the full set. Storage-layer `compare_counts`, 30
+    samples after warmup:
+    - Against a copy of the repo-root dev db (migrated up from a
+      pre-streams schema, so it also carries that file's accumulated
+      layout from months of history): **median 141–158 ms**.
+    - Against a database built fresh at the identical scale (rules out
+      the migrated file's layout as the explanation): **median
+      115–125 ms** comparing against a REAL (non-empty) baseline
+      partition — confirmed twice, since a first attempt at this
+      measurement silently compared against an EMPTY partition (a
+      seeding bug: two streams sharing one `start_time` collide on
+      `upsert_runs`'s legacy-key check and the second is rejected,
+      caught by row-count exactly 0 where 12,000 was expected) and
+      returned a bogus ~45 ms.
+    - End-to-end (HTTP + JSON) on the fresh db: **median ~125 ms** for
+      the counts-only call, **~347–404 ms** for a full page (counts
+      plus one category's rows) — for scale, the number CLAUDE.md's
+      historical "15ms end-to-end" note was measuring on a smaller
+      dataset than the full nightly estate.
+    - Live end-to-end via the DOM-shim harness: delta-section's own
+      render completed at +742ms from module load, the verdict line
+      filled in at +870ms — a +128ms delay, matching the standalone
+      measurement, confirmed to land AFTER first paint every time.
+    All figures **dev-tier hardware, dev-scale data** — never
+    production numbers. The design (fire-and-forget, no await on the
+    critical path) was correct regardless of the true cost, but the
+    real number is materially higher than the assumption behind the
+    request, worth a look before a much larger product makes this
+    verdict line the slowest thing on a build page.
+  - **Verified live**, same DOM-shim method: a build's delta view
+    (default baseline: its predecessor) filled in "vs build 1.0.0: 300
+    new failures · 257 fixed — vs mainline: 342 new failures" —
+    exact-template match — strictly after the delta section's own
+    render completed, never before.
 
 ---
 

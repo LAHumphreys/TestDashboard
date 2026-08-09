@@ -142,6 +142,15 @@
         <li>A build's page now says when it was built and whether anything
           has run since — "Built 2 days ago — nothing has run since" if it
           hasn't been re-cut, or its last run time if it has.</li>
+        <li><strong>A build's page now names both baselines at once.</strong>
+          Right under the header, a line reads "vs build 1.0.0: 4 new
+          failures · 2 fixed — vs mainline: 6 new failures" — whichever
+          baseline you're currently looking at plus the other one, so you
+          don't have to switch the <em>Compare to</em> box back and forth
+          to ask "but is it good against mainline too?" It fills in a
+          moment after the rest of the page (a second lookup), and stays
+          hidden entirely for the very first build of a product, which has
+          no earlier build to name.</li>
         <li><strong>A test's own page can now show its result on every
           build and branch of its product at once.</strong> Open the new
           "Every build" section below Analytics: one row per stream that
