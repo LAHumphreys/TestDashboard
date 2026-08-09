@@ -3540,5 +3540,188 @@ class PlantedWatchRegressionTest(unittest.TestCase):
         self.assertNotIn("lastIndexOf(\"@\")", planted)
 
 
+#: Matches a hand-built page-URL literal: '"test.html?"', '"watch.html?"',
+#: etc. — the shape every converted call site used to write before
+#: calling pageUrl()/apiUrl() instead (WP-24, docs/SCOPED_URLS_PLAN.md §4
+#: rule 1).
+_HTML_CONCAT_RE = re.compile(r'"[\w-]*\.html\?"')
+
+#: Matches `.append("product", ...)` / `.set('stream', ...)` / etc. — a
+#: scoped param appended to a URLSearchParams by hand (rule 2). Only the
+#: three levels that are NEVER a legitimate page-owned data param anywhere
+#: in this app; `environment` is handled separately (also a plain filter
+#: on some pages, so it is individually allowlisted rather than banned).
+_SCOPE_PARAM_RE = re.compile(
+    r'\.(?:append|set)\(\s*["\'](product|stream|baseline)["\']')
+
+_ENVIRONMENT_PARAM_RE = re.compile(
+    r'\.(?:append|set)\(\s*["\']environment["\']')
+
+
+class ScopedUrlConstructionTest(unittest.TestCase):
+    """WP-24 (docs/SCOPED_URLS_PLAN.md §4): the guard that ends the
+    seven-plus-incident family in that document's §1 — a scoped URL
+    (a page-navigation href, or an /api/... fetch's query string) built
+    by hand anywhere outside static/urls.js, silently dropping
+    stream=/product=/baseline= (or, on the one page it matters,
+    carrying a stale one across a scope change). Every hand-built site
+    that existed at the start of this work package has been converted;
+    this class is what keeps the NEXT one from landing unnoticed.
+    """
+
+    #: Files exempt from the ".html?" concatenation check (rule 1), and
+    #: why — checked individually below, not by a blanket skip.
+    _HTML_CONCAT_EXEMPT = frozenset(["urls.js", "watch.js"])
+
+    def test_no_hand_built_html_concatenation_outside_urls_js(self) -> None:
+        """Every OTHER file must build a page-navigation href through
+        pageUrl(). watch.js is exempt for exactly one reason —
+        buildUrl(), the Watch page's OWN `c=` grammar
+        (docs/STREAMS_PLAN.md §2.4), which has nothing to do with the
+        product/stream/baseline/environment scope model this module
+        owns and round-trips through its own dedicated tests
+        (WatchPageTest, WatchStalenessGrammarTest) — checked
+        separately, and NOT a licence for a second hand-built site to
+        hide in the same file (the next test pins that)."""
+        offenders = {}  # type: Dict[str, List[int]]
+        for name, source in scripts().items():
+            if name in self._HTML_CONCAT_EXEMPT:
+                continue
+            hits = [
+                number for number, line in enumerate(
+                    _strip_comments(source).split("\n"), 1)
+                if _HTML_CONCAT_RE.search(line)
+            ]
+            if hits:
+                offenders[name] = hits
+        self.assertEqual(
+            offenders, {},
+            "hand-built page-URL literal(s) outside urls.js/watch.js -- "
+            "every page-navigation href must be built through "
+            "pageUrl(): " + repr(offenders))
+
+    def test_watch_js_has_exactly_one_html_concat_site(self) -> None:
+        """The exemption above is a file-wide skip; this is what keeps
+        it from quietly covering a SECOND hand-built site in the same
+        file — only buildUrl()'s own `"watch.html?" + qs` may remain."""
+        hits = [
+            number for number, line in enumerate(
+                _strip_comments(read("watch.js")).split("\n"), 1)
+            if _HTML_CONCAT_RE.search(line)
+        ]
+        self.assertEqual(len(hits), 1, hits)
+        body = _function_body(read("watch.js"), "export function buildUrl(")
+        self.assertIn('"watch.html?"', body)
+
+    def test_watch_js_cardLink_still_composes_through_pageUrl(self) -> None:
+        """The Watch exemption is the likeliest place for the next bug
+        to hide (docs/SCOPED_URLS_PLAN.md §7): cardLink() builds the
+        NON-`c=` part of a card's link (index.html?product=/
+        environment=/stream=) and must call pageUrl() for it, same as
+        every other page's row links — only buildUrl()'s `c=` grammar
+        itself is exempt from rule 1, not the whole file."""
+        body = _function_body(read("watch.js"), "function cardLink(")
+        self.assertIn("pageUrl(", body)
+        self.assertNotIn(".html?", body)
+
+    def test_no_hand_built_product_stream_or_baseline_params(self) -> None:
+        """`product`/`stream`/`baseline` are NEVER a legitimate
+        page-owned data param anywhere in this app (unlike
+        `environment`, see below) — a literal first argument naming
+        one of them to `.append(`/`.set(` on a URLSearchParams outside
+        urls.js is always the regression this module exists to end."""
+        offenders = {}  # type: Dict[str, List[Tuple[int, str]]]
+        for name, source in scripts().items():
+            if name == "urls.js":
+                continue
+            hits = []
+            for number, line in enumerate(
+                    _strip_comments(source).split("\n"), 1):
+                match = _SCOPE_PARAM_RE.search(line)
+                if match:
+                    hits.append((number, match.group(1)))
+            if hits:
+                offenders[name] = hits
+        self.assertEqual(
+            offenders, {},
+            "hand-built product=/stream=/baseline= param(s) outside "
+            "urls.js: " + repr(offenders))
+
+    #: (file, function signature) -> why this ONE hand-built
+    #: `environment=` site is grandfathered rather than converted. A
+    #: NEW site anywhere else still fails (see the test below) --
+    #: `environment` is also a plain page-owned filter on some pages
+    #: (unlike product/stream/baseline, which are only ever cross-page
+    #: SCOPE), so it is individually allowlisted rather than banned
+    #: outright, per docs/SCOPED_URLS_PLAN.md §4 rule 2.
+    _ENVIRONMENT_ALLOWLIST = {
+        ("app.js", "function setEnvironment("):
+            "the dashboard's OWN filter toggle, echoed to the address "
+            "bar via history.replaceState -- must preserve every OTHER "
+            "existing param verbatim (result=/unassigned=/stale=, "
+            "F4/F4a's deep-link filters), which none of pageUrl() "
+            "(builds fresh) or withStream()/withBaseline()/withProduct() "
+            "(reset their own sibling levels by design) are shaped to "
+            "do. See the comment at the call site.",
+    }
+
+    def test_environment_literal_sites_are_individually_allowlisted(
+        self
+    ) -> None:
+        allowlisted_files = frozenset(
+            name for name, _ in self._ENVIRONMENT_ALLOWLIST)
+        offenders = {}  # type: Dict[str, List[int]]
+        for name, source in scripts().items():
+            if name == "urls.js":
+                continue
+            hits = [
+                number for number, line in enumerate(
+                    _strip_comments(source).split("\n"), 1)
+                if _ENVIRONMENT_PARAM_RE.search(line)
+            ]
+            if hits:
+                offenders[name] = hits
+        self.assertEqual(
+            set(offenders) - allowlisted_files, set(),
+            "a NEW hand-built environment= site appeared outside the "
+            "allowlist -- convert it through pageUrl()/apiUrl(), or "
+            "add it to _ENVIRONMENT_ALLOWLIST with a reason if it "
+            "genuinely cannot be: " + repr(offenders))
+
+    def test_the_environment_allowlist_stays_accurate(self) -> None:
+        """The other half of the test above: an allowlisted site that
+        stopped hand-appending environment= (converted, or deleted)
+        must have its entry removed, or the allowlist silently stops
+        proving anything."""
+        for name, signature in self._ENVIRONMENT_ALLOWLIST:
+            body = _function_body(read(name), signature)
+            self.assertTrue(
+                _ENVIRONMENT_PARAM_RE.search(_strip_comments(body)),
+                name + "'s " + signature + " is allowlisted for a "
+                "hand-built environment= site that no longer exists -- "
+                "remove the entry")
+
+    def test_a_planted_html_concat_would_be_caught(self) -> None:
+        """Detectors must be SHOWN able to fail (the compat-gate
+        pattern used throughout this repo, e.g.
+        test_python36_compat.py's planted-regression tests) -- this is
+        rule 1's literal, applied directly to the exact shape a
+        reintroduced hand-built link would take."""
+        planted = 'link.href = "test.html?" + params.toString();'
+        self.assertTrue(_HTML_CONCAT_RE.search(planted))
+
+    def test_a_planted_scope_param_would_be_caught(self) -> None:
+        """Rule 2's literal, for all three banned keys."""
+        for key in ("product", "stream", "baseline"):
+            planted = 'params.append("{0}", String(streamId));'.format(key)
+            match = _SCOPE_PARAM_RE.search(planted)
+            self.assertIsNotNone(match, planted)
+            self.assertEqual(match.group(1), key)
+
+    def test_a_planted_environment_param_would_be_caught(self) -> None:
+        planted = 'qs.append("environment", state.environment);'
+        self.assertTrue(_ENVIRONMENT_PARAM_RE.search(planted))
+
+
 if __name__ == "__main__":
     unittest.main()

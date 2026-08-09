@@ -465,6 +465,17 @@ function setEnvironment(environment, keepScript) {
   if (!keepScript) {
     state.script = "";
   }
+  // WP-24 enforcement allowlist (tests/test_frontend_calls.py's
+  // ScopedUrlConstructionTest): `environment` here is this DASHBOARD's
+  // OWN filter toggle, echoed to the address bar for shareability —
+  // not a cross-page scope pointer, and this touch must preserve
+  // every OTHER param already on the URL (result=/unassigned=/stale=,
+  // F4/F4a's deep-link filters) verbatim. None of pageUrl()/apiUrl()
+  // (build a query FRESH from the params/scope given) or
+  // withStream()/withBaseline()/withProduct() (rebuild the scope
+  // levels, resetting siblings by design) fit "touch exactly one
+  // non-hierarchy filter, leave literally everything else alone" —
+  // so this stays a direct, narrowly-scoped searchParams edit.
   const url = new URL(window.location.href);
   if (environment) {
     url.searchParams.set("environment", environment);
