@@ -438,14 +438,23 @@ class TestDashboardAssignmentOrigin(ApiCase):
             "GET", "/api/dashboard", query={"q": ["test_b"]})
         self.assertEqual(data["streams"], {})
 
-    def test_origin_branch_filters_to_the_branch_made_assignment(
+    def test_origin_build_filters_to_the_build_made_assignment(
             self) -> None:
         rows = self.call(
-            "GET", "/api/dashboard", query={"origin": ["branch"]}
+            "GET", "/api/dashboard", query={"origin": ["build"]}
         )["tests"]
         self.assertEqual([r["test_name"] for r in rows], ["test_a"])
 
-    def test_origin_mainline_excludes_the_branch_made_assignment(
+    def test_the_dead_branch_spelling_is_rejected(self) -> None:
+        """WP-25 renamed the origin value branch->build before anything
+        shipped; the old spelling must 400 like any other unknown value,
+        not silently match nothing."""
+        data = self.call(
+            "GET", "/api/dashboard", query={"origin": ["branch"]},
+            expect=400)
+        self.assertIn("origin", data["error"])
+
+    def test_origin_mainline_excludes_the_build_made_assignment(
             self) -> None:
         rows = self.call(
             "GET", "/api/dashboard", query={"origin": ["mainline"]}
@@ -2560,7 +2569,7 @@ class TestSummaryAssignmentStreams(ApiCase):
     origin filter) — the same "available values, empty means nothing to
     filter" shape as ``assignees``."""
 
-    def test_empty_with_no_branch_originated_assignments(self) -> None:
+    def test_empty_with_no_build_originated_assignments(self) -> None:
         self.import_runs([record(test_name="test_a")])
         self.call(
             "PUT",

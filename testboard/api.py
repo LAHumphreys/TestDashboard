@@ -861,15 +861,18 @@ def _handle_dashboard(
     include_unassigned = _query_single(
         request.query, "unassigned") in ("1", "true")
     assignees = request.query.get("assignee") or []
-    # WP-21, Open Actions' branch/mainline origin filter — WHERE the
+    # WP-21, Open Actions' build/mainline origin filter — WHERE the
     # current assignment was made from, an axis entirely separate from
-    # `stream=` above (which scopes the test's own result).
+    # `stream=` above (which scopes the test's own result). The value
+    # was spelled "branch" until WP-25 collapsed the stream kinds
+    # (docs/ONE_KIND_PLAN.md); renamed before anything shipped, so no
+    # deployed client ever sent the old spelling.
     assignment_origin = _query_single(request.query, "origin")
     if assignment_origin is not None and assignment_origin not in (
-            "branch", "mainline"):
+            "build", "mainline"):
         raise _HttpError(
             400,
-            "origin: must be 'branch' or 'mainline', got '{}'".format(
+            "origin: must be 'build' or 'mainline', got '{}'".format(
                 assignment_origin),
         )
 

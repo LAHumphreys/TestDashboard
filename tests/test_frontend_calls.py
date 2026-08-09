@@ -2560,13 +2560,17 @@ class OpenActionsSummaryScopeTest(unittest.TestCase):
 
 
 class OpenActionsOriginFilterTest(unittest.TestCase):
-    """Open Actions' branch/mainline origin filter and per-row tag
-    (WP-21, docs/STREAMS_PLAN.md §3.6, found in first human use)."""
+    """Open Actions' build/mainline origin filter and per-row tag
+    (WP-21, docs/STREAMS_PLAN.md §3.6, found in first human use; the
+    non-mainline value was spelled "branch" until WP-25 collapsed the
+    stream kinds — the 2026-08-09 sanity net caught this filter still
+    speaking the dead spelling AFTER the collapse, hence the chip-value
+    pin below)."""
 
     def test_the_filter_is_server_side_not_a_client_reshuffle(self) -> None:
         """The same rule SortingTest pins for this page's sort: a paged
-        table filtered in the browser shows "branch items that happen
-        to be on this page", not every branch item.
+        table filtered in the browser shows "build items that happen
+        to be on this page", not every build item.
 
         WP-24: `qs.append("origin", state.origin)` became `origin:
         state.origin` in the params object passed to apiUrl() -- same
@@ -2581,6 +2585,20 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
             read("actions.js"), "function renderOriginFilter(")
         self.assertIn("state.assignmentStreams.length === 0", body)
         self.assertIn("container.hidden = true", body)
+
+    def test_the_chips_speak_the_one_kind_dialect(self) -> None:
+        """The 2026-08-09 sanity-net finding, pinned: after WP-25 there
+        is no 'branch' anywhere — the chip's wire value is "build", its
+        label "Build-originated", and the dead spelling may not appear
+        in the filter at all (a chip value the server 400s would be a
+        filter that silently breaks)."""
+        body = _function_body(
+            read("actions.js"), "function renderOriginFilter(")
+        self.assertIn('{ value: "build", label: "Build-originated" }',
+                      body)
+        stripped = _strip_comments(body)
+        self.assertNotIn('"branch"', stripped)
+        self.assertNotIn("Branch-originated", stripped)
 
     def test_the_mount_ships_hidden_in_the_markup(self) -> None:
         html = read_text("actions.html")
@@ -2605,7 +2623,7 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
         self.assertIn("summary.assignment_streams", code)
         self.assertIn("page.streams", code)
 
-    def test_a_branch_originated_row_links_to_the_streams_own_test_page(
+    def test_a_build_originated_row_links_to_the_streams_own_test_page(
         self
     ) -> None:
         """F1: a row whose CURRENT assignment carries a non-mainline

@@ -2969,14 +2969,16 @@ class Storage:
         stream's partition of ``latest_runs`` — the leading column of
         every WP-21 index (see migration 9), so this equality predicate
         is what keeps the sort indexes usable rather than forcing a
-        TEMP B-TREE. *assignment_origin* (WP-21, ``"branch"`` or
-        ``"mainline"``, default no filter) is Open Actions' origin
+        TEMP B-TREE. *assignment_origin* (WP-21, ``"build"`` or
+        ``"mainline"``, default no filter; the non-mainline value was
+        spelled ``"branch"`` until WP-25 collapsed the stream kinds —
+        renamed before anything shipped) is Open Actions' origin
         filter — WHERE the CURRENT assignment was made from, an
         entirely different axis from *stream_id* above (which scopes
         the test's OWN result, not who assigned it or from where) —
         server-side by the same rule the *assignees* filter already
         follows (a client-side filter over one paged fetch would turn
-        "every branch-originated item" into "the branch-originated ones
+        "every build-originated item" into "the build-originated ones
         that happen to be on this page").
         """
         clauses = ["lr.stream_id = ?"]  # type: List[str]
@@ -3019,7 +3021,7 @@ class Storage:
         if owner_clauses:
             clauses.append("({})".format(" OR ".join(owner_clauses)))
 
-        if assignment_origin == "branch":
+        if assignment_origin == "build":
             clauses.append("(ca.stream_id IS NOT NULL AND ca.stream_id != ?)")
             params.append(MAINLINE_STREAM_ID)
         elif assignment_origin == "mainline":
@@ -3027,7 +3029,7 @@ class Storage:
             params.append(MAINLINE_STREAM_ID)
         elif assignment_origin is not None:
             raise ValueError(
-                "assignment_origin must be 'branch', 'mainline' or None, "
+                "assignment_origin must be 'build', 'mainline' or None, "
                 "got {!r}".format(assignment_origin)
             )
         return clauses, params
@@ -3259,7 +3261,7 @@ class Storage:
         """Every DISTINCT non-mainline stream currently annotating an
         assignment (WP-21, docs/STREAMS_PLAN.md §3.6), sorted.
 
-        Open Actions' branch/mainline origin filter needs a real,
+        Open Actions' build/mainline origin filter needs a real,
         estate-wide existence check to honour "zero visible change when
         no assignment carries a stream" — a check built only from
         whichever page of rows happened to be fetched would flicker the

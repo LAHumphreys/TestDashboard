@@ -5295,7 +5295,7 @@ class AssignmentOriginFilterTest(StorageTestBase):
         # test_a: assigned from mainline (no stream_id)
         self.store.set_assignee(
             "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
-        # test_b: assigned from the branch
+        # test_b: assigned from the build
         self.store.set_assignee(
             "linux-sim", "suite.py", "test_b", "alice", "bob", CREATED,
             stream_id=self.stream_id)
@@ -5304,16 +5304,23 @@ class AssignmentOriginFilterTest(StorageTestBase):
     def test_no_filter_returns_everything(self) -> None:
         self.assertEqual(self.store.dashboard_count(), 3)
 
-    def test_branch_origin_returns_only_the_branch_made_assignment(
+    def test_build_origin_returns_only_the_build_made_assignment(
             self) -> None:
-        rows = self.store.dashboard(assignment_origin="branch")
+        rows = self.store.dashboard(assignment_origin="build")
         self.assertEqual([r.test_name for r in rows], ["test_b"])
         self.assertEqual(
-            self.store.dashboard_count(assignment_origin="branch"), 1)
+            self.store.dashboard_count(assignment_origin="build"), 1)
+
+    def test_the_dead_branch_spelling_raises(self) -> None:
+        """WP-25 renamed the origin value branch->build before anything
+        shipped; the old spelling must raise like any unknown value,
+        never silently filter to nothing."""
+        with self.assertRaises(ValueError):
+            self.store.dashboard(assignment_origin="branch")
 
     def test_mainline_origin_includes_unassigned_and_mainline_made(
             self) -> None:
-        """"mainline" reads as "not from a branch" — an unassigned test
+        """"mainline" reads as "not from a build" — an unassigned test
         was not made from anywhere, so it counts as mainline too, the
         same way it counts as mainline for un-retirement (§3.4)."""
         rows = self.store.dashboard(assignment_origin="mainline")
@@ -5333,7 +5340,7 @@ class AssignmentOriginFilterTest(StorageTestBase):
 
 
 class AssignmentStreamIdsEmptyTest(StorageTestBase):
-    """assignment_stream_ids() on a database with no branch-originated
+    """assignment_stream_ids() on a database with no build-originated
     assignment at all — the signal Open Actions' filter reads to honour
     "zero visible change when no assignment carries a stream"."""
 
