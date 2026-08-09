@@ -2579,3 +2579,129 @@ back to the 36-hour wall-clock window, that specific cutoff-keyed cache
 stops helping (a documented, correct property, not a defect) until the
 estate is active again. That transition was not separately measured
 live. No frontend files changed, so nothing new to render.
+
+## WP-25 — one stream kind (2026-08-09, `wp-25-one-kind`, Phase 1 of `NIGHT_RUN_2026-08-09.md`)
+
+User decision, same evening: the branch/build distinction added
+confusion and was not worth its weight in the initial streams drop —
+collapse `streams.kind` to `{mainline, build}`. Because nothing
+kind-shaped had shipped anywhere (the whole streams package was still
+unreviewed/unpushed at spec time), this is deletion before first
+contact, not a migration. Full spec is `docs/ONE_KIND_PLAN.md`; this
+entry is the chronological record.
+
+**Migration 9 amended in place** — the established pre-ship fold
+precedent, same as the assignments fold it is modelled on. `kind` was
+never CHECK-constrained, so the DDL is byte-identical; only the
+migration's own comment and the Python-side validation moved. The
+`UPGRADE_PLAN.md` §1 registry row for version 9 is re-annotated the
+same way.
+
+**Import contract narrows to `build` only.** `parse_run_record` rejects
+a record carrying the `branch` key outright — checked by key PRESENCE,
+not value, before `build` is even read — with "branch: removed before
+this contract ever shipped — use build:". The old branch/build
+mutual-exclusion error dies with the field it guarded; the rest of a
+mixed batch still imports (per-record rejection, not batch-fatal).
+Tested through the real `/api/import` path, not just `parse_run_record`
+directly.
+
+**Default baseline is mainline, always** (explicit user decision).
+`pickDefaultBuildBaseline` and its tests are deleted; the Compare-to
+picker, now shown for every non-mainline stream, is how a predecessor
+is chosen. Happy consequence recorded here per the spec's own
+instruction: the choosing-mainline sentinel bug's precondition
+(`89012d4`) is gone with the function — absence means mainline
+everywhere again. The explicit `baseline=1` encoding and its guard test
+are KEPT anyway (harmless, and it keeps the collision impossible rather
+than merely absent).
+
+**Every kind-gate became a data-gate.** The two-tab dashboard
+("its own results" / "difference from…") now gates on the same
+covered-passes threshold regardless of how the stream was uploaded —
+`initBranchDashboard`'s kind check is gone, replaced by the
+`covered_passes >= OWN_RESULTS_DEFAULT_PASSES` check the WP-23 caption
+already computed. The Watch `s:` card carries one wording for every
+stream (current build wording, verdict vs mainline) — its
+`baseline_kind`/`baseline_name`/`baseline_last_seen` fields are now
+unconditionally mainline's, so `Storage.previous_builds` and
+`compare_counts_many`'s `baselines` argument have no caller left in
+`_handle_watch`. Both are KEPT rather than deleted (correct, tested,
+generic infrastructure, not specific to the deleted kind) — a judgment
+call, flagged in the commit for reconsideration if nothing claims them
+by the next round. The picker (`streams.js`) collapses to one flat
+group, newest-first by `last_seen`; the branches/builds split is
+deleted along with its test. The band keeps its existing single
+"Build" label — nothing there was kind-conditional to begin with.
+
+**Deliberately unchanged:** `assignment_origin`
+(`origin=branch`/`origin=mainline` on `/api/dashboard`, Open Actions'
+filter) predates `build` as a stream kind — it means "made from any
+non-mainline page", not the name of a kind — and is not in the plan's
+file list, so it was left alone rather than swept in by name
+similarity.
+
+**§2b item 1 — stream-scoped Time/Timeline empty states now say where
+the data is.** New `Storage.environments_for_stream(stream_id)`: one
+grouped `SELECT DISTINCT environment FROM latest_runs WHERE stream_id
+= ?`, O(partition), no new endpoint. `_handle_time`/`_handle_timeline`
+attach `stream_environments` to the response only when the view is
+already empty and a non-mainline stream is in scope (never computed on
+a page that has data). `static/compare.js` gained
+`renderStreamEnvironmentHint`, shared by `time.js` and `timeline.js`,
+each with its own `environmentSwitchUrl` that preserves the stream
+while dropping only the params specific to that page (`script` on
+Time, `days`/`from`/`to` on Timeline). Guard tests added on both the
+storage method and both pages' empty-state rendering.
+
+**Feeder:** `--branch` removed entirely (argparse, validation,
+mutual-exclusion, logging, state-file naming, `Submitter` constructor);
+`--build` unchanged. Per-stream state files keep their existing
+`build-` filename prefix — one naming scheme, no migration needed since
+no branch-kind state file has ever existed outside this unshipped
+work. `tools/drop_stream.py` loses `--kind`; product+name identify a
+stream, and the lookup still checks `kind == "build"` defensively so
+mainline can never be selected by name collision.
+
+**Docs:** `STREAMS_PLAN.md` gained an as-built blockquote at the top of
+§3 pointing at `ONE_KIND_PLAN.md` (history in §3 itself untouched, per
+the spec's own "do not rewrite history" instruction). `README.md`'s
+transport contract, streams section, and Watch card docs updated for
+build-only. `static/whatsnew.html`'s 2026-08-14 section rewritten
+per §2b item 2 — one `<h3>What's new</h3>` with one short capability
+bullet each, `data-drop-date="2026-08-14"` kept in lockstep with the
+heading. `docs/drops/2026-08-14.md` gained a WP-25 subsection (suite
+count, deviations, verification) and its top-of-file counts updated.
+Seed scripts under `.scratch/seeds/` (gitignored, not part of any
+commit) switched `branch:`/`branch=`→`build:`/`build=` throughout, per
+the spec's explicit instruction not to run them against any repo-root
+database.
+
+**Test suite:** merged/renamed the branch-kind halves of the storage
+and API stream suites; deleted tests whose entire premise died with
+the removed kind (branch/build name-collision distinctness, "a branch
+is never given a predecessor", `BuildVerdictLineTest`); added
+`TestImportBranchFieldRejected` (loud rejection through the real
+import path), `EnvironmentsForStreamTest`,
+`TimeStreamEnvironmentHintTest`, `TimelineStreamEnvironmentHintTest`,
+`StreamEnvironmentEmptyStateTest`; widened (not weakened)
+`CompareToControlTest`, `BuildPickerGroupingTest`, and the two
+`test_storage.py` literal-message assertions that hard-coded
+`"branch:feat/x"` in a rejection message now that fixtures use
+`build=`.
+
+Suite: **1980 OK (skipped=1)**, SQLite-only, up from the 1978 OK
+(skipped=1) baseline recorded in `ONE_KIND_PLAN.md` at spec time — net
++2 despite substantial deletion, since §2b's new empty-state guard
+tests and the branch-rejection class outweigh what was removed.
+
+**Not run this session:** the dual-backend suite (`TESTBOARD_TEST_DB_CNF`
+was not set) and CI's `python36-mariadb` leg — neither exercised by this
+round; the next phase or the coordinator's pre-push review should run
+at least the local dual-backend variant before `wp-24-scoped-urls`
+builds on this tip. `docs/SESSION_HANDOVER.md` was intentionally left
+unrewritten — `NIGHT_RUN_2026-08-09.md` §4 assigns that rewrite to
+Phase 5 (consolidation), after WP-24 lands on top of this tip, not to
+this package. No browser has rendered any of this session's frontend
+changes; the sanity net and persona walks in `NIGHT_RUN_2026-08-09.md`
+Phases 3–4 are where that gets covered.
