@@ -463,6 +463,128 @@ function renderBuildFraming(streamMeta, nowMs) {
   line.hidden = false;
 }
 
+/** "1 new failure"/"2 new failures" — the one pluralisation rule this
+ * file's counts share, factored out once F5 needed it a second time. */
+function countWord(n, noun) {
+  return n + " " + noun + (n === 1 ? "" : "s");
+}
+
+/**
+ * The nearest earlier same-product BUILD by `last_seen` (id as
+ * tiebreak) — used ONLY to label the verdict line below, never to
+ * choose the actual comparison baseline (that choice is always
+ * mainline unless the Compare-to control names something else, per
+ * WP-25, docs/ONE_KIND_PLAN.md §1.3). `candidate.kind !== "build"`
+ * excludes mainline — the only other kind that exists — from ever
+ * being named as a "predecessor build"; it is not a reintroduced
+ * kind-gate, just the one remaining way to say "not mainline" now
+ * that there is nothing else to check against. Mirrors
+ * Storage.previous_builds' own ordering rule exactly: the backend
+ * needs its own copy for the O(1) Watchlist card path (still used
+ * there, WP-25 §1.4 aside — see that method's docstring); this is the
+ * frontend's for a page that already has the full stream list in hand
+ * and gains nothing from a second round trip to ask the server the
+ * same question.
+ */
+function findPredecessorBuild(streamMeta, streams) {
+  let best = null;
+  for (const candidate of streams) {
+    if (candidate.kind !== "build" || candidate.id === streamMeta.id) {
+      continue;
+    }
+    // Same tie-break as Storage.previous_builds: a candidate qualifies
+    // when it is strictly earlier, or exactly as recent with a
+    // smaller id (never "==", which excluding with `>=` would
+    // silently disagree with the backend's `<` on the id side for two
+    // builds sharing a last_seen).
+    if (candidate.last_seen > streamMeta.last_seen
+        || (candidate.last_seen === streamMeta.last_seen
+            && candidate.id >= streamMeta.id)) {
+      continue;   // ISO strings: lexical compare is chronological.
+    }
+    if (best === null || candidate.last_seen > best.last_seen
+        || (candidate.last_seen === best.last_seen
+            && candidate.id > best.id)) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
+ * F5 (docs/STREAMS_PLAN.md §5.2 "as built"; restored after a WP-25
+ * over-deletion, docs/ONE_KIND_PLAN.md fix round): a delta view only
+ * ever answers "is this RC good?" against ONE baseline at a time —
+ * this line names the OTHER canonical baseline too, so a reader
+ * comparing against the previous build still sees mainline's own
+ * verdict (or vice versa) without a second navigation. Hidden outright
+ * for mainline scope (no delta view at all), or a build with no
+ * predecessor to name (the first build of a product) — the predecessor
+ * is looked up unconditionally, regardless of which side the page was
+ * actually opened against, because BOTH names are always shown.
+ *
+ * LAZY: called fire-and-forget from initDeltaView, AFTER first paint —
+ * this function's own fetch(es) must never be awaited on the critical
+ * path (measured cost is in the F5 commit message). One of the two
+ * legs is usually already on hand (whichever baseline this page was
+ * actually opened with — mainline by WP-25's default, or whatever the
+ * Compare-to control was explicitly set to), so the common case costs
+ * exactly ONE extra counts-only /api/compare call; only an explicit
+ * ?baseline= naming a THIRD build (neither the predecessor nor
+ * mainline) costs two.
+ *
+ * Guards against a stale render the same way a page-wide requestSeq
+ * would: initDeltaView only ever calls this once per non-mainline page
+ * load (changing the "Compare to" baseline is a full navigation, not
+ * an in-place re-render — so deltaState.streamId cannot legitimately
+ * change out from under this call), but the check costs nothing and
+ * makes that invariant load-bearing rather than assumed.
+ */
+async function renderBuildVerdict(streamId, data, productStreams) {
+  const line = document.getElementById("delta-verdict");
+  if (!line) {
+    return;
+  }
+  if (data.stream.kind === "mainline") {
+    line.hidden = true;
+    return;
+  }
+  const predecessor = findPredecessorBuild(data.stream, productStreams);
+  if (predecessor === null) {
+    line.hidden = true;
+    return;
+  }
+  const currentBaselineId =
+    data.baseline.kind === "mainline" ? null : data.baseline.id;
+  let predecessorCounts =
+    currentBaselineId === predecessor.id ? data.counts : null;
+  let mainlineCounts = currentBaselineId === null ? data.counts : null;
+  try {
+    if (predecessorCounts === null) {
+      const page = await fetchCompare(streamId, null, 0, predecessor.id);
+      predecessorCounts = page.counts;
+    }
+    if (mainlineCounts === null) {
+      const page = await fetchCompare(streamId, null, 0, null);
+      mainlineCounts = page.counts;
+    }
+  } catch (err) {
+    // Enrichment only — a failed extra fetch must not show an error
+    // banner over a delta view that otherwise loaded fine.
+    line.hidden = true;
+    return;
+  }
+  if (deltaState.streamId !== streamId) {
+    return;   // the page moved on while this was in flight
+  }
+  line.textContent =
+    "vs " + streamLabel(predecessor) + ": "
+    + countWord(predecessorCounts.new_failures, "new failure")
+    + " · " + predecessorCounts.new_passes + " fixed"
+    + " — vs mainline: "
+    + countWord(mainlineCounts.new_failures, "new failure");
+  line.hidden = false;
+}
 
 /**
  * The sticky "you are scoped to a branch" band — shared by the
@@ -698,6 +820,12 @@ export async function initDeltaView(streamId) {
     renderTiles(document.getElementById("delta-tiles"), data.counts);
     renderBaselineCard(data.stream, data.baseline, data.counts, Date.now());
     renderTabs();
+    // F5: fire-and-forget, deliberately NOT awaited — its own fetch(es)
+    // must never hold up the section becoming visible on the next line.
+    // The .catch() here is a pure safety net (the function's own
+    // try/catch already turns a failed fetch into "stay hidden", never
+    // a throw) against any future change making that no longer true.
+    renderBuildVerdict(streamId, data, productStreams).catch(() => {});
     document.getElementById("delta-section").hidden = false;
     loading.hidden = true;
     await loadCategory(true);

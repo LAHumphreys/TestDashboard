@@ -1633,6 +1633,134 @@ class BuildBaselineWordingTest(unittest.TestCase):
         self.assertIn("card.baseline_name", label_body)
 
 
+class BuildVerdictLineTest(unittest.TestCase):
+    """F5 (docs/STREAMS_PLAN.md §5.2 "as built"); restored after a WP-25
+    fix-round finding that the kind collapse over-deleted a user-visible
+    feature instead of data-gating it (docs/ONE_KIND_PLAN.md §1.4 asks
+    for kind-GATES to become data-gates, not for kind-gated BEHAVIOR to
+    be deleted). A delta view compared against only one baseline at a
+    time answers "is this RC good?" incompletely. The verdict line names
+    BOTH canonical baselines -- the previous build and mainline -- built
+    from one extra counts-only /api/compare call for whichever of the
+    two is not already loaded, fired lazily so it never delays first
+    paint. The predecessor lookup mirrors Storage.previous_builds'
+    ordering rule via a dedicated helper (findPredecessorBuild) rather
+    than the deleted default-baseline picker -- that function stays gone
+    per WP-25 (default baseline is mainline, always); this one only ever
+    LABELS the verdict line, never chooses what the page actually
+    compares against."""
+
+    def test_the_mount_ships_hidden_in_the_markup(self) -> None:
+        html = read_text("index.html")
+        mount_at = html.index('id="delta-verdict"')
+        self.assertIn("hidden", html[mount_at:mount_at + 60])
+
+    def test_hidden_for_mainline_scope(self) -> None:
+        """WP-25 collapsed 'not a build' to 'is mainline' -- the only
+        other kind there is now -- so this is the same hide-gate as
+        before, worded for the one-kind world."""
+        body = _function_body(
+            read("compare.js"), "async function renderBuildVerdict(")
+        kind_at = body.index('data.stream.kind === "mainline"')
+        self.assertIn("line.hidden = true", body[kind_at:kind_at + 80])
+
+    def test_hidden_with_no_predecessor_build(self) -> None:
+        """A product's first build has nothing to name as "the previous
+        build" — the line stays hidden rather than half-naming one
+        side of a two-sided sentence."""
+        body = _function_body(
+            read("compare.js"), "async function renderBuildVerdict(")
+        pred_at = body.index("predecessor === null")
+        self.assertIn("line.hidden = true", body[pred_at:pred_at + 80])
+
+    def test_the_predecessor_helper_is_not_the_deleted_default_picker(
+        self
+    ) -> None:
+        """WP-25 (docs/ONE_KIND_PLAN.md §1.3): the default baseline is
+        mainline, always -- there is no default-baseline picker left to
+        drive the actual comparison. This helper is a DIFFERENT function
+        with a different job (labeling only); it must not have come
+        back under the old name."""
+        self.assertIn("function findPredecessorBuild(", read("compare.js"))
+        self.assertNotIn("pickDefaultBuildBaseline", read("compare.js"))
+
+    def test_viewing_vs_a_picked_build_baseline_names_mainline(
+        self
+    ) -> None:
+        """The direction that is now the UNCOMMON one under WP-25 (the
+        default is mainline; a picked build baseline only happens via
+        the Compare-to control) still names mainline's own verdict --
+        the same branch of the original two-sided logic, worth pinning
+        in its own right now that it is no longer the default path."""
+        body = _function_body(
+            read("compare.js"), "async function renderBuildVerdict(")
+        self.assertIn(
+            "currentBaselineId === null ? data.counts : null", body)
+        fetch_at = body.index("if (mainlineCounts === null) {")
+        self.assertIn(
+            "fetchCompare(streamId, null, 0, null)",
+            body[fetch_at:fetch_at + 120])
+
+    def test_reuses_already_loaded_counts_instead_of_refetching(
+        self
+    ) -> None:
+        """Whichever baseline this page was actually opened with must
+        NOT be fetched a second time — that is the whole "ONE extra
+        call" saving."""
+        body = _function_body(
+            read("compare.js"), "async function renderBuildVerdict(")
+        self.assertIn(
+            "currentBaselineId === predecessor.id ? data.counts : null",
+            body)
+        self.assertIn(
+            "currentBaselineId === null ? data.counts : null", body)
+
+    def test_a_failed_extra_fetch_hides_rather_than_shows_an_error(
+        self
+    ) -> None:
+        """Enrichment only — a failure here must not put an error
+        banner over a delta view that otherwise loaded fine."""
+        body = _function_body(
+            read("compare.js"), "async function renderBuildVerdict(")
+        catch_at = body.index("} catch (err) {")
+        catch_block = body[catch_at:body.index("}", catch_at + 20) + 1]
+        self.assertIn("line.hidden = true", catch_block)
+        self.assertNotIn("showError", catch_block)
+
+    def test_guards_against_a_stale_render(self) -> None:
+        body = _function_body(
+            read("compare.js"), "async function renderBuildVerdict(")
+        self.assertIn("deltaState.streamId !== streamId", body)
+
+    def test_wording_names_both_baselines_and_both_counts(self) -> None:
+        body = _function_body(
+            read("compare.js"), "async function renderBuildVerdict(")
+        self.assertIn('"vs " + streamLabel(predecessor)', body)
+        self.assertIn("predecessorCounts.new_failures", body)
+        self.assertIn("predecessorCounts.new_passes", body)
+        self.assertIn('" fixed"', body)
+        self.assertIn('" — vs mainline: "', body)
+        self.assertIn("mainlineCounts.new_failures", body)
+
+    def test_initDeltaView_calls_it_without_awaiting(self) -> None:
+        """The whole point: this call must not sit on the critical path
+        between the main fetch resolving and delta-section becoming
+        visible."""
+        body = _strip_comments(
+            _function_body(
+                read("compare.js"), "export async function initDeltaView("))
+        call_at = body.index("renderBuildVerdict(streamId, data, productStreams)")
+        self.assertNotIn(
+            "await renderBuildVerdict",
+            body[max(0, call_at - 10):call_at + 10])
+        visible_at = body.index('document.getElementById("delta-section").hidden = false')
+        self.assertLess(call_at, visible_at,
+                         "fired before the section is shown, not after")
+
+    def test_no_innerHTML(self) -> None:
+        self.assertNotIn("innerHTML", _strip_comments(read("compare.js")))
+
+
 class CompareToControlTest(unittest.TestCase):
     """The dashboard's "Compare to" datalist combo (WP-22,
     docs/STREAMS_PLAN.md §4.1; un-gated by WP-25, docs/ONE_KIND_PLAN.md
