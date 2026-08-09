@@ -1218,6 +1218,140 @@ recorded here rather than left implicit:
     confirmed to carry `stream=2` into `script.html`, and `test.js`'s
     link confirmed to show the plain title with no visible "(mainline)"
     note any more.
+- **PERF ROUND (2026-08-09, still `wp-23-longrunning`): the streams work's
+  own N+1s, found by a clean perf-log on a reseeded 5-environment dev
+  estate** (`/api/summary` median 250.8 ms, up from ~65 ms on the smaller
+  3-environment estate this same session measured earlier that day —
+  scale, not a regression introduced by this drop, but real cost worth
+  fixing regardless). Per-request attribution: `summary_rollup` ×2,
+  `status_queue_count` ×12, `status_queue` ×6, `failure_streak_bounds`
+  ×127 (an N+1 per FAIL row in a triage queue page), plus every
+  `/api/compare?category=` request running the pairs SQL three times.
+  Four fixes, no behaviour change anywhere — every existing test is the
+  oracle, response shapes unchanged:
+  1. **`summary_rollup` ×2, root cause confirmed as suspected.**
+     `_handle_summary` composed the headline (its OWN scoped rollup) and
+     `products[]` (`_products_summary`, which needs the ESTATE-WIDE
+     mainline rollup regardless of the request's own scope) from TWO
+     separate calls. For a plain, unscoped `GET /api/summary` — no
+     `environment=`, no `product=`, mainline `stream=` — those two calls
+     are BYTE-IDENTICAL: same `recent_cutoff`, no environment filter, no
+     stream filter. `_products_summary` gained an optional `rollup_rows`
+     parameter; `_handle_summary` threads its own already-fetched rows
+     through whenever its own scope IS that exact estate-wide-mainline
+     case, calling `summary_rollup` a second time only when the request
+     is genuinely scoped (a different environment/product/stream, hence
+     genuinely different data). `analytics.summarize_by_product` already
+     did the Python-side per-product derivation from rollup rows +
+     `environment_products_map()` — no new logic, only correct wiring.
+  2. **`status_queue_count` ×12, `status_queue` ×6.** The headline's
+     `queue_totals` called `status_queue_count` once per
+     `QUEUE_KINDS` entry (6); the full payload's per-queue `"total"`
+     field called it AGAIN per kind (6 more) — the SAME
+     `latest_runs`/`current_assignments`/`test_retirements` join, only
+     the `CASE` predicate differing. New `Storage.queue_counts`: one
+     query, every kind's count as its own `SUM(CASE WHEN ... THEN 1
+     ELSE 0 END)` column (no `GROUP BY` needed — one aggregate row over
+     the whole scoped partition), `"mine"` folded in as one more column
+     when an assignee is given. Computed ONCE in `_handle_summary` and
+     threaded into both `_summary_queue_totals` (now a thin wrapper) and
+     every `_summary_queue_json` call's `queue_counts=` parameter — the
+     single-queue `parts=queue&queue=X` path (which only ever wants ONE
+     kind) keeps calling `status_queue_count` directly, since computing
+     all six SUM columns there would cost MORE than the one count
+     actually needed. `SUM(...)` returns SQL `NULL` over zero matched
+     rows in both backends (unlike `COUNT(*)`, which returns 0) — guarded
+     with `int(row[i] or 0)`, pinned by a scoped-to-nothing test.
+  3. **`failure_streak_bounds` ×127.** A triage queue page's
+     `still_failing`/`mine` rows each cost 3 index-seek queries (newest
+     non-FAIL before latest; the streak's start; the newest PASS before
+     that) — bounded by the page cap but still 1 round trip per FAIL row.
+     New `Storage.failure_streak_bounds_many`: the SAME three-step
+     computation, chunked at `_RECENT_CHUNK` (100, matching
+     `recent_results`'s own chunk size), each step ONE query per chunk
+     via a "driving" table of that chunk's own triples (a `UNION ALL` of
+     literal `SELECT ? AS col, ...` branches — the portable stand-in for
+     a VALUES-as-table constructor, deliberately NOT the
+     `FROM (...) AS v(col1, col2)` derived-table column-list form, which
+     this project's dual-backend translation (a plain `?` → `%s` text
+     substitution) has never had to vouch for) joined to a correlated
+     subquery reproducing exactly one step, with the SHARED params
+     (`stream_id`, the FAIL/PASS literals) bound once per query rather
+     than once per row. Step 3 (the pass lookup) is skipped for a whole
+     chunk when nothing in it needs it. `_summary_queue_json` batches
+     every FAIL row's lookup upfront (deduplicated via the existing
+     `streaks` cache) instead of the old per-row lazy closure.
+  4. **`/api/compare?category=` ran the pairs SQL three times.**
+     `compare_counts` (the six headline counts, always run),
+     `compare_category` (the paginated page, run when `category=` is
+     given) and `compare_category_count` (recomputing the SAME category's
+     total from the SAME pairs SQL) — but `compare_counts`'s per-category
+     counts and `compare_category_count`'s recomputed one are the SAME
+     number by construction (both derive from `_compare_pairs_sql` with
+     identical `stream_id`/`baseline_id`/`environments`), and `category`
+     is validated against `COMPARE_CATEGORIES` a few lines up, which is
+     EXACTLY `CompareCounts`'s five per-category field names. `total` is
+     now `getattr(counts, category)` — `compare_category_count` itself is
+     unchanged and kept (its own tests are still the oracle that it
+     agrees with `compare_counts`; nothing else calls it from the API
+     layer any more).
+  - **Measured, dev-tier hardware, dev-scale data (a copy of the
+    repo-root dev db shape, ~12k tests/540k runs/3 environments — NOT the
+    coordinator's own 5-environment reseeded estate, which was not
+    available to reproduce exactly; the qualitative shape — same N+1s,
+    same fix — carries over, the absolute numbers do not claim to match
+    theirs).** End-to-end HTTP, 30 samples after warmup, no product
+    declared (the common case): `/api/summary` median **154.0 ms → 137.0
+    ms**; `/api/compare?category=` (mainline vs itself — a degenerate
+    RESULT but the pairs SQL still scans the full partition, so the
+    QUERY COST is representative) median **120.5 ms → 91.4 ms**.
+    Storage-layer micro-attribution (20 samples after warmup, isolating
+    each item from everything else `/api/summary` does that this round
+    does NOT touch): `summary_rollup` once **11.77 ms** vs twice **32.74
+    ms** (item 1, ~21 ms — only realised when a product IS declared and
+    the request is estate-wide-unscoped, which is why it does not show
+    in the no-product end-to-end number above); `queue_counts` **10.25
+    ms** vs the old 12-call pattern **20.77 ms** (item 2, ~10.5 ms);
+    `failure_streak_bounds_many` **2.10 ms** vs 93 individual calls **3.14
+    ms** (item 3, ~1 ms at this estate's actual still_failing count — real
+    but modest here, since a single indexed seek is already sub-0.05 ms
+    in-process; the win scales with how many FAIL rows a page actually
+    has, and the coordinator's own 127-row estate would show more);
+    compare category total, page+recompute **2.39 ms** vs page+`getattr`
+    **1.26 ms** (item 4, ~47% of the marginal cost eliminated — close to
+    the ≈2/3-of-current target for the whole category request once
+    `compare_counts`'s own always-kept pass is counted in).
+  - **Target honesty: `/api/summary` did NOT reach the <100 ms target on
+    this measurement** (137.0 ms, against a 154.0 ms baseline on the
+    SAME dev-scale copy). The four fixes above are real, correct, and
+    their savings are genuinely measured — but they only ever addressed
+    the SPECIFIC redundant/duplicated work the coordinator's perf-log
+    named. The remaining ~130 ms is spent in code this round did not
+    touch: `status_queue`'s six ROW fetches (item 2 only batched the
+    COUNTS, not the row payloads), `daily_result_counts` (the trend),
+    `top_failing_scripts`, `assignment_stream_ids` +
+    `stream_identities`, and the catalog reads (`environments`,
+    `scripts`, `assignees`, `environment_products_map`,
+    `distinct_products`) — none of which were found to be duplicated or
+    N+1-shaped, so none were touched. Reaching <100 ms, if that is still
+    the bar, needs a second pass over THAT list with its own
+    measurements, not a claim built on this round's numbers.
+  - **EXPLAIN QUERY PLAN**: not required for this round — every new
+    query is either a single-row aggregate over an already-indexed
+    partition (`queue_counts`) or an indexed seek per driving-table row
+    (`failure_streak_bounds_many`'s three helpers), the same index shapes
+    the single-row methods already used; no join topology changed.
+  - **Dual-backend**: the full suite (SQLite-only and combined with
+    `TESTBOARD_TEST_DB_CNF` against local MariaDB 10.3) passes unchanged;
+    every new SQL shape (`SUM(CASE WHEN...)`, the `UNION ALL`
+    driving-table pattern) was run for real against MariaDB, not only
+    SQLite, by this session's own dual-backend suite — proving the
+    portability claim rather than asserting it.
+  - **Not verified**: no browser has rendered anything (this round is
+    backend-only, no frontend files touched); production timing (dev-scale
+    only, per CLAUDE.md); the coordinator's own 5-environment/127-row
+    estate was not reproduced exactly, so the absolute ms figures above
+    are this session's own dev-scale numbers, not a replication of theirs.
 
 ---
 
