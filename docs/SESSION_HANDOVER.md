@@ -77,6 +77,19 @@ person" below.
   guard), and the test page gained the review panel's scoped "View in
   timeline →" link. Judgment calls went to the decision list, not code.
 
+## Decided in morning testing, 2026-08-10 — post-drop work, not in this drop
+
+Open Actions gains **bulk unassign** and **bulk assign-with-comment**
+(user decision, 2026-08-10, while exploring abandoned-build cleanup:
+assignments from a dead build persist until cleared, and today that is
+per-row). Related finding to fold into the same work: `delete_stream`
+nulls `comments.stream_id` but NOT `current_assignments.stream_id`, so
+a dropped stream's assignments keep their origin-filter grouping while
+losing their tag. Assignments stay estate-level one-owner-per-triple
+(§0.4) — bulk operations act on the current filter, never introduce
+per-stream ownership. Not specced yet; task #8 in the session task
+list carries the design notes.
+
 ## The morning decision list (needs the user, not a commit)
 
 New from the persona walks: watch-card accents don't rank cards when
