@@ -1573,3 +1573,1234 @@ confirms the catch-up passed it).
 
 Suite: 1385 OK (skipped=1) — the account-restore touched three tool advice
 strings and one pinned assertion; the review fixes are doc-only.
+
+## WP-21 — branches and builds beside mainline (2026-08-08)
+
+Built on `wp-21-streams`, cut from `wp-20-products`: the whole of
+`docs/STREAMS_PLAN.md` §3, migration 9. Streams (`(product, kind, name)`,
+mainline the un-droppable id 1) resolved lazily inside the import
+transaction; `runs.stream_id`/`comments.stream_id` added, `latest_runs`
+rebuilt with `stream_id` leading its key (SQLite cannot widen a PRIMARY KEY
+in place — CREATE new / INSERT..SELECT / DROP / RENAME, five indexes
+recreated); the legacy `(environment, script, test_name, start_time)`
+UNIQUE on `runs` predates streams and cannot hold two streams' runs at the
+identical instant, so that collision is a per-record REJECTION, never a
+silent overwrite or misfile. Mainline provably unaffected:
+`activity_hours`/`script_hours` and un-retirement both mainline-only by
+construction, every estate-wide read hardcoded to mainline with no override
+parameter. `streams_seen` in the import response — its ABSENCE (not `[]`)
+is how a new feeder detects a server that has never heard of streams and
+aborts loudly rather than filing everything into mainline silently.
+Frontend: the Build picker, the branch band, the delta view (five tiles,
+tabbed paginated tables, an agree/coverage line pair, both sides'
+freshness), the test-detail compare strip, comment "posted from" tags, and
+a Watchlist `s:` verdict card — all through a shared `compare.js`, all
+zero-visible-change on a mainline page (a single guarded, early-returning
+branch in `app.js`'s `init()`; nothing below it runs when unscoped).
+`tools/drop_stream.py` is the `drop_environment.py` analogue, refusing
+mainline unconditionally. Migration 9 measured on the 220 MB dev copy
+(NOT production): 0.883 s alone (v8→v9), 0.6 s of it the `latest_runs`
+rebuild (12,008 rows); combined with WP-20's migration 8, v7→v9 (the actual
+production upgrade path) measured at 0.806 s.
+
+Two real defects were caught only by driving the actual frontend JS
+against a live server through the project's node DOM-shim harness (not by
+unit tests, which all declare a product before touching a stream — exactly
+the case that was broken): a comment's "posted from" tag was never wired
+into `test.js` despite the backend already returning the data; and the
+Watchlist's `s:` card was silently all-zero for any stream whose product
+is `""` (the common case on a site that has never declared a product) —
+`_handle_watch` resolved environment scope through a dict that is ALWAYS
+empty for `""`, fixed to special-case it the way
+`Storage.environments_for_product("")` already did on the single-stream
+path.
+
+Suite: 1645 OK (skipped=1) SQLite-only; 2152 OK (skipped=16) dual-backend
+(this dev machine's local MariaDB, `.scratch/mariadb-test.cnf`) — both
+re-run after every backend change and after the two fixes above.
+
+## First human use of the branch dashboard finds four gaps (2026-08-08, later)
+
+Found on the same day the branch dashboard was first opened in a real
+browser (still the only page of this project ever to receive that):
+clicking a delta-table row landed on the MAINLINE test page (`eb05c7a`,
+one line — `buildDeltaRow()` built its link without the page's own stream
+id, fixed and guard-tested). Then, working with the user, four more:
+
+1. **The branch band was dashboard-only.** A reader who followed a delta
+   row to a test's own page lost every indication they were scoped to a
+   branch — the compare strip alone was not loud enough. `renderBranchBand`
+   is now exported and shared between `index.html` and `test.html`, and
+   "Back to mainline" generalised to "the current URL with only `stream`
+   removed" (preserves `environment`/`script`/`test_name` on the test page,
+   where a fixed `index.html` target would have landed on the wrong page).
+2. **Triage from a branch didn't actually work.** The delta table shipped
+   chips-only. Added the same assignee select and inline Review expander
+   (output, "View in timeline", a comment box) every other list in the app
+   already has — assigning from a branch row assigns the SAME
+   (environment, script, test_name), never a stream-scoped copy of
+   ownership. Retirement is refused by construction (the shared panel is
+   simply never given a staleness cutoff on a branch row, so its own gate
+   never opens) — retirement stays mainline-only per §3.4.
+   `/api/compare`'s paginated rows gained `stream_run_id`/
+   `stream_start_time` (the branch's own run, null exactly when there is
+   nothing to review) and the triple's current, unpartitioned `assignee` —
+   both already live on `latest_runs`/`current_assignments`, no new query
+   shape.
+3. **Assignment origin folded into migration 9**, still unshipped when
+   found, rather than spent on a migration 10: `assignments`/
+   `current_assignments` both gained a nullable `stream_id`, the exact
+   shape `comments.stream_id` already established — an annotation of WHERE
+   an assignment was made, never a partition of WHO it targets. `PUT
+   .../assignee` accepts it optionally; every existing caller that never
+   sends it is unaffected.
+4. **Open actions shows the origin**: a "branch feat/x" tag (batch-resolved
+   per page, the comments-endpoint pattern) and a server-side
+   `origin=branch`/`origin=mainline` filter next to the existing owner
+   chips — the same "server-side, not a client reshuffle" rule the
+   existing owner filter already follows, and the same "absent, not just
+   empty, when nothing needs it" rule every WP-20/WP-21 addition follows
+   (`/api/summary`'s `assignment_streams`, empty list is the signal).
+
+Verified beyond the source-level guard tests by driving all four against a
+live scratch server through the DOM-shim harness — extended further this
+pass (`insertBefore`/`nextSibling`/`remove()`, `document
+.createDocumentFragment()`, a `find()` guard against text-node leaves;
+`actions.js` had never been driven through row-rendering before, only
+checked for its product-switcher mount). Confirmed the assignee select
+showed a REAL pre-existing value rather than defaulting to "Unassigned"
+(the specific wrong-payload failure the coordinator's own review flagged
+as the likeliest bug), the Review panel opened onto the branch's own
+captured output, no retire control appeared anywhere, both branch bands
+and their back-links were correct, and the Open actions filter/tag
+round-tripped a real assignment including the server-side re-fetch on a
+filter click.
+
+`docs/STREAMS_PLAN.md` §3.6 updated to record all four as part of WP-21's
+actual shipped scope (found in first use, not deferred); §4 gained an
+explicit note that the user has asked for the test-page per-stream
+("Every build") dropdown, so WP-22 planning does not drop it.
+
+Suite: 1688 OK (skipped=1) SQLite-only. Dual-backend re-run on the final
+tree; see `docs/drops/2026-08-14.md` for the count captured there rather
+than duplicated here.
+
+## WP-22 — release builds + compare-any-two (2026-08-08, same day, `wp-22-builds`)
+
+Cut from `wp-21-streams`'s tip. `docs/STREAMS_PLAN.md` §4. **No migration**
+— every piece reads WP-21's `streams` table and the
+`(environment, script, test_name)` index migration 9 already created.
+
+**Backend.** `/api/compare?baseline=` loses the "must be mainline"
+restriction: any stream of the SAME product as `stream=` is now accepted
+(mainline stays the one universal exception on either side, since its
+`product` is `''` by construction). A cross-product pairing 400s naming
+both products — the environments filter both sides of the SQL join share
+is resolved from `stream='s` own product alone, so an unchecked mismatch
+would not have errored, it would have silently compared against the wrong
+(empty) environments on the baseline side. `Storage.compare_counts_many`
+gained an optional per-stream `baselines` argument so a build-kind
+Watchlist card can default to its predecessor build without paying one
+query per card — every distinct baseline id folds into the SAME
+`IN`-clause query the method already ran, keeping
+`test_query_count_does_not_grow_with_s_card_count` green for a real reason.
+`Storage.previous_builds` resolves "the nearest earlier same-product build
+by `last_seen`" in ONE query bounded to the distinct products among the
+requested builds. New `Storage.stream_results_for_triple` +
+`GET /api/tests/{env}/{script}/{test}/streams` (plus a small
+`Storage.product_for_environment` single-row lookup so the frontend can
+resolve which product's FULL stream list to union against): a triple's
+latest result on every stream that has one, newest first — deliberately
+NOT product-filtered at the query level, since the triple's `environment`
+is already the discriminator and filtering again by the CURRENT
+`environment_products` mapping would silently drop a row after a remap.
+Widened the WP-21 guard test that pinned "non-mainline baseline is
+refused" into same-product-allowed / cross-product-refused /
+mainline-always-exempt cases — that restriction was WP-21's own stated
+scope boundary, not a production finding, and lifting it was WP-22's job.
+
+**Frontend.** Every place that built its wording from the literal word
+"mainline" — the delta view's heading, column headers, freshness lines,
+the branch band, the Watchlist's stream card — now reads it from the
+baseline's own identity (new `compare.js` export `streamLabel()`), because
+a build's baseline is routinely a PREDECESSOR BUILD once this ships, not
+mainline. The build-scoped dashboard gained a "Compare to" box (a plain
+datalist combo, visible only for a `kind='build'` stream — a branch
+dashboard's cost and appearance stay exactly what WP-21 shipped) defaulting
+to the previous build by `last_seen` where one exists, else mainline, plus
+a build-only framing line ("Built … — nothing has run since." / "…last
+ran …"). The Build picker gained a Builds `<optgroup>`, newest first by
+`last_seen` (branches keep their own group, unchanged order) — "searchable"
+was judged satisfied by native `<select>` type-ahead at realistic stream
+counts rather than converting the picker to a second datalist combo, to
+avoid churn against `StreamPickerTest` for a nice-to-have. The test page
+gained the "Every build" disclosure (this triple's latest result on every
+stream of its product, newest first, unioned by stream id against the full
+`/api/streams` list so absent streams render NO RESULT rather than being
+silently dropped or omitted) and the stream switcher near the top of the
+page — the SPECIFIC thing the user asked for after WP-21's first human use,
+recorded in `docs/STREAMS_PLAN.md` §4.1 so it would not be dropped when
+this drop was planned. Watchlist `s:` cards gained a "N tests failing in
+`<name>`" headline (§4.1's literal wording) ahead of the existing five-tile
+stat grid.
+
+**Item 7 (superseded-run ghosting) was verification, not new code**: a
+build rebuild (second import under the same `build` name) was checked end
+to end — same stream, no duplicate, newer run wins as `latest`, older run
+still shows in history. Correction to the plan's own wording, found by
+checking rather than assuming: "superseded runs render as ghosts" is not
+literally true — the history table draws every row solid, with no
+ghost/outline distinction. Said plainly in the operator note rather than
+left for someone to discover later.
+
+**Live verification, this session** (the second time this project has
+driven real frontend JS against a real running server, after WP-21's first
+human use): a scratch server seeded with two products, one feature branch,
+and TWO builds of the same product (older + newer, an
+overlapping-but-changed test set) so previous-build defaulting was actually
+exercised. Confirmed via the node DOM-shim harness (`.scratch/`,
+gitignored): the Builds group and its ordering; the newer build's delta
+view defaulting to the older build (band text, heading, column header, the
+Compare-to box's preset value, and the tile counts all checked against the
+real numbers); the older build (no predecessor) falling back to mainline;
+a branch-scoped dashboard showing ZERO of the WP-22 additions; the
+Watchlist `s:` card's wording naming the real predecessor, never falling
+back to "mainline"; the test page's "Every build" table (4 rows, newest
+first, current scope marked "you are here") and stream switcher; and the
+cross-product refusal, live, both directions via `curl`.
+
+**This caught one real defect before it shipped**: a JSDoc comment in
+`compare.js` read "built from `*streamMeta*/*baselineMeta*'s` own
+kind/name" — the literal `*/` mid-sentence closed the block comment early,
+turning the rest of it into code and producing a syntax error. `node
+--check` on the same file, run earlier in the same session, did NOT catch
+it (it does not fully parse the module the way a real ES module loader
+does); only the DOM shim's actual dynamic `import()` — which loads the
+real module graph, the way `<script type="module">` does in a browser —
+failed on it. This would have broken `index.html` AND `test.html` outright
+(both import `compare.js`), and no unit test in this project (all
+static-analysis, no JS runtime) could have caught it. Fixed same-session,
+before the rest of the verification pass ran; the checks above are
+POST-fix. This is now the concrete case for why this project's frontend
+verification method insists on a real dynamic import over a syntax-only
+pass, beside the two defects WP-21's first human use already found.
+
+Suite: 1736 OK (skipped=1) SQLite-only; 2303 OK (skipped=18) dual-backend
+(this dev machine's local MariaDB, `.scratch/mariadb-test.cnf` — two new
+query-count tests needed the same `EXCLUDED_TESTS` treatment every other
+`sqlite3.set_trace_callback`-based test already gets). CI's own
+`python36-mariadb` leg has not been observed against this branch.
+`docs/drops/2026-08-14.md` rewritten to cover WP-20+21+22 as one coherent
+combined drop, per house rule.
+
+## WP-22 — three fixes from a second-pass review (2026-08-08, same day)
+
+A review pass of the WP-22 work above found three real issues before
+they shipped, none caught by the first DOM-shim pass:
+
+1. **`pickDefaultBuildBaseline` (frontend) disagreed with
+   `Storage.previous_builds` (backend) on a same-`last_seen` tie**,
+   despite the JS docstring claiming an exact mirror — the frontend
+   excluded a same-timestamp candidate outright where the backend's
+   `ORDER BY last_seen, id` includes the smaller-id one as the
+   predecessor. For two builds sharing a `last_seen` (reachable with
+   fixture data or a CI that stamps a whole batch identically), the
+   dashboard's default and the Watchlist card's default could name two
+   different predecessors for the same build. Fixed the JS exclusion to
+   match the SQL's `<` / `= and <` rule exactly; a synthetic-data
+   DOM-shim check (pure function logic, no server needed) pins both
+   directions.
+2. **`/api/compare`'s cross-product refusal was one-sided**: it only
+   fired when NEITHER side was mainline, so `stream=<mainline id>&
+   baseline=<a real product's stream>` passed through and silently
+   compared against mainline's own product (`''`, matching nothing the
+   baseline actually ran) — the exact "wrong environments, no error"
+   failure the guard exists to prevent, reachable from the direction
+   nobody checked. No shipped frontend constructs this
+   (`getSelectedStreamId()` is null for mainline, never the literal id),
+   but the endpoint is documented as symmetric in the README regardless.
+   Simplified the guard to drop the one-sided clause — "baseline is
+   non-mainline and its product differs from stream's" is symmetric by
+   construction and costs no new query. New regression test drives the
+   previously-broken direction.
+3. **Neither new control's `change` handler had ever actually been
+   fired** in the first DOM-shim pass — every check read rendered DOM
+   state (option text, preset values) but none dispatched the event
+   that navigates. This is the EXACT class of bug WP-21's first human
+   use found (`eb05c7a`: a control that rendered correctly and linked
+   to the wrong place). Added real `change` dispatches to the Build
+   picker, the "Compare to" control, and the test page's stream
+   switcher, asserting on the resulting `window.location.href` — all
+   three confirmed to navigate correctly, not merely render correctly.
+
+Also converted the Build picker from a `<select>` to the same
+input+datalist combo pattern the "Compare to" control uses: a native
+`<select>`'s type-ahead only prefix-matches, so §4.1's own "searchable
+(substring on the name as written)" was not actually satisfied — a
+release manager typing `rc2` against `2026.9.1-rc2` would have found
+nothing. This reverses the §4.4 "as built" note's earlier judgement call
+(kept native `<select>`) after a review pass showed the cited reason
+(test churn against `StreamPickerTest`) did not hold: none of that
+class's five assertions touch `<select>` mechanics.
+
+Suite: 1739 OK (skipped=1) SQLite-only; 2307 OK (skipped=18) dual-backend
+— both re-run after every fix in this entry.
+
+## WP-23 — long-running branch streams (2026-08-09, `wp-23-longrunning`)
+
+Drop 4 of `docs/STREAMS_PLAN.md`, built on `wp-22-builds`'s tip. A
+months-long feature branch with its own nightly CI is a second mainline
+in all but name; this gives it its own trend/staleness/triage instead of
+only the WP-21/22 delta view. Full account of decisions made during
+implementation is `docs/STREAMS_PLAN.md` §5.4 ("as built") — this entry
+is the chronological record, that one is the reference.
+
+**Migration 10** claims the version WP-15's parked reservation was
+sitting on (moves to 11 — fifth such swap, see `UPGRADE_PLAN.md` §1).
+`activity_hours`/`script_hours` rebuilt with `stream_id` in their PRIMARY
+KEY, the migration-9 `latest_runs` precedent exactly (existing rows
+copied with a literal `stream_id = 1`, not re-aggregated from `runs` —
+both tables had been mainline-only since migrations 6/7). MEASURED on a
+copy of the dev database (220 MB, 540,192 runs, 12,008 tests) THIS
+session: entry 10 alone **0.038–0.041s** (from v9); entries 8+9+10
+combined from v7 (production's current version) **~0.17–0.18s** — both
+numbers reproduced across repeated runs. This differs from the
+2026-08-14 note's earlier v7→v9 figure (0.806s) recorded in the WP-21
+session; no attempt was made to reconcile the two beyond noting the
+difference here, per CLAUDE.md's "measure, do not estimate" — what is
+reported is what was actually measured this session, on this machine, at
+this time.
+
+**The writer's WP-21 skip is deleted.** `activity_hours`/`script_hours`
+are now maintained for every stream inside the import transaction, keyed
+by its own `stream_id` — `_apply_activity_deltas`/
+`_apply_script_hour_changes`'s dict keys gained a leading `stream_id`,
+and the two `if stream_id == MAINLINE_STREAM_ID` guards in
+`upsert_runs` are gone. The guard test this touches
+(`DerivedTablePartitionIsolationTest`, "branch import leaves the tables
+unchanged") is WIDENED, not weakened, per CLAUDE.md's rule — its old
+assertion is now false BY DESIGN (a branch gains its own rows; that is
+the entire point of this drop), so it now asserts PARTITION ISOLATION
+instead, checked in both directions (branch-after-mainline,
+mainline-after-branch) plus sibling branches against each other.
+`ActivityHoursTest`/`ScriptHoursTest`'s own invariant comparisons were
+separately widened to include `stream_id` in their GROUP BY, so a
+stream_id bug would fail those too, not only the dedicated isolation
+class.
+
+**A sweep for WP-21-era cross-stream leaks**, prompted by an advisor
+review before writing production code (write the failing guard first,
+watch it fail, then sweep every unfiltered `FROM latest_runs`/
+`FROM activity_hours`/`FROM script_hours`): `test_counts_by_environment`,
+`script_test_counts`, `daily_result_counts` (plus its trend-memo cache
+key), and `prune_runs_before`'s `prev_result` recomputation all read
+without a stream filter. Each was correct before this drop only because
+the tables held nothing but mainline's rows; once every stream is
+maintained, an unfiltered read silently mixes a branch's numbers into
+mainline's own coverage denominator, trend, or `prev_result` the moment
+a branch reports into the SAME environment mainline uses. All four
+closed in the migration-10 commit, plus `summary_rollup`/
+`assigned_open_count`/`status_queue`/`status_queue_count`/
+`duration_rollup`/`latest_run_time`/`latest_run_time_by_environment`/
+`top_failing_scripts` gained a `stream_id` parameter (default mainline,
+so no existing caller's behaviour changes) as the mechanism the "own
+results" tab reads.
+
+**Per-stream pass detection needed no change to `analytics.find_passes`/
+`recent_cutoff`** — both are pure functions over whatever buckets/test
+counts they are handed; scoping to a stream is the exact mechanism
+`_pass_view`'s own docstring already documented for WP-20's `product=`
+filter (restrict the inputs). The two clamps (36h fallback floor,
+14-day ceiling) are therefore unchanged code, applying per stream
+automatically — pinned by a test that a branch too sparse to have one
+covered pass falls back to the same 36h window mainline would use in
+the same spot. `/api/summary`, `/api/time`, `/api/timeline` all gained
+an optional `stream=` (default mainline); guard tests import a branch
+into a shared environment and assert the UNSCOPED response is
+byte-identical before/after, closing the exact scenario the sweep
+above found.
+
+**The branch dashboard's two-tab header** (`static/app.js`): `init()` no
+longer calls `initDeltaView()` directly — it calls
+`initBranchDashboard(streamId)`, which shows a `#branch-tabs` header for
+`kind='branch'` streams only (builds keep the unchanged WP-21/22
+delta-only view). "Its own results" re-enters the mainline dashboard
+body scoped via a new `appendStream()` helper (mirrors `appendProduct`,
+threaded into `summaryUrl`/`queueUrl`/`browseUrl`); one-time listener
+wiring was factored out of `init()` into `wireMainlineControls()`,
+guarded by a module flag, so switching tabs repeatedly never stacks
+duplicate listeners. Default tab: `/api/summary` gained `covered_passes`
+(the count `_pass_view` already computes); `>=2` shows "Its own results"
+first, and the caption states the actual count AND the threshold in its
+own sentence, never a hidden constant. The frontend guard test
+`DeltaViewTest::test_a_mainline_page_load_never_reaches_the_delta_view`
+was WIDENED (not weakened, per CLAUDE.md) to check the new two-hop call
+chain (`init()` → `initBranchDashboard()` → `activateDiffTab()` →
+`initDeltaView()`) instead of the old direct call.
+
+**Drift framing**: one new line in the delta view — "of N failing here,
+M fail on `<baseline>` too" (N = `new_failures + both_failing`, both
+guaranteed FAIL on the stream by `CompareCounts`' own definition; M =
+`both_failing`). "Behind by N commits" stays void — not knowable, not
+built, confirmed again rather than silently reconsidered.
+
+**The Watchlist `s:` card decision**: kept as the vs-mainline verdict
+only, per §5.2's own escape hatch, for two reasons recorded in
+`static/watch.js`'s comment — the card is already full, and
+`/api/watch` is architecturally O(cards) in Python but O(1) in queries
+(`compare_counts_many` batches every requested stream's comparison in
+one query, pinned flat by a dedicated test); a per-branch own-results
+number needs its own per-stream pass-detection cutoff with no batched
+multi-stream form here, and adding it would make N branch cards cost N
+times that work.
+
+**Live verification, this session** (third time this project has driven
+real frontend JS against a real running server): a scratch database
+(`.scratch/wp23verify.db`, gitignored) seeded with two products, a
+short-lived one-off branch (1 covered pass) and a long-running branch (8
+nightly covered passes over 8 nights: a standing regression on the
+branch alone, plus one failure that also hits mainline from night 7),
+served by `run_server.py`, driven by the node DOM-shim harness
+(`.scratch/drive_branch_tabs.mjs`, gitignored) with real `click()`
+dispatches on both tab buttons. Confirmed: band text, tab visibility,
+caption wording (the exact covered-pass count and the "2 or more"
+threshold, both literally in the sentence), the default tab selection
+for BOTH branches (own for the regular one, diff for the sparse one),
+the branch's own FAIL count (2) differing correctly from mainline's
+whole-estate count, both tab-switch directions toggling the right
+sections, the drift line's exact wording ("Of 2 tests failing here, 1
+also fails on mainline too" — matching `/api/compare`'s own
+`new_failures=1, both_failing=1` for that stream), and a genuine
+zero-`stream=`-param mainline load touching none of the new elements —
+seeded with the shim's `hidden` state matching the real shipped markup
+first (the shim builds bare `<div>`s with `hidden=false` by default; it
+does not parse index.html), a setup detail worth recording since it
+produced four false failures before being caught.
+
+**Not run this session**: CI's own `python36-mariadb` leg (mariadb:10.3,
+production's stream) — only the dual-backend suite against this dev
+machine's local MariaDB (12.3.2, functional evidence only, never a perf
+number). Production-scale migration timing (dev copy only, ~4x smaller
+than production per CLAUDE.md). No human has looked at the two-tab
+header, the drift line, or the caption's wording in a real browser —
+the DOM-shim harness proves wiring and DOM shape, not legibility,
+layout, or whether two tabs plus a caption plus the existing toolbar is
+too much for one screen.
+
+Suite: 1750 OK (skipped=1) SQLite-only; 2329 OK (skipped=18) dual-backend
+(this dev machine's local MariaDB) — both on the final tree, after every
+commit in this entry.
+
+## 2026-08-09 — overnight perf pass over the streams work (dev copy, 220MB)
+
+Method: EXPLAIN QUERY PLAN audit of every new read path (32 distinct
+SELECTs), a request storm through --perf-log/perf_report.py, and import
+re-push timing. All numbers DEV data (~1/4 production size).
+
+- Zero request-time scans of `runs` anywhere. One bounded scan
+  (`assignment_stream_ids` over current_assignments — O(currently
+  assigned), acceptable and noted).
+- THE finding: /api/compare at 490ms-1.5s — the pairs SQL joined two
+  MATERIALIZED partition subqueries, un-indexable, nested-loop
+  ~2k x 2k. Reshaped to a latest_runs self-join on the PRIMARY KEY
+  (commit 3ebd5f7): full compare page 1942.5ms -> 12.2ms at the storage
+  layer, 15ms end-to-end. ComparePairsQueryPlanTest pins the plan shape
+  (proved by reversion); MariaDB confirmed eq_ref by hand.
+- Byte-identical re-push of 26,320 records across four streams: all
+  recognised unchanged, ~2.4s wall including client fetches — the
+  10-minute feeder path is unharmed by stream resolution.
+- Queue waits across 385 connections: median 0.03ms, worst 0.98ms — no
+  pool pressure; every cost above was SQL, not starvation.
+- Remaining dev-only numbers needing production confirmation are listed
+  in docs/drops/2026-08-14.md's not-verified section.
+
+## 2026-08-09 — usability sweep (F1-F7) and the branch-parity closeout
+
+Continuation of the streams work: seven small usability fixes (F1-F7)
+plus a link-matrix audit that found the remaining places a stream-scoped
+page's own links silently dropped back to mainline, closed in two final
+commits. This entry is the permanent measurement record; per-feature
+detail lives in docs/STREAMS_PLAN.md Sec5.4 "as built", the drop-facing
+summary in docs/drops/2026-08-14.md.
+
+**F5's verdict line — measured cost, not the ~15ms assumed at the ask.**
+A build's delta view previously named only one baseline at a time; the
+new line names both (previous build and mainline) via one extra
+counts-only /api/compare call, fired fire-and-forget so it never sits
+on the critical path. Measured storage-layer compare_counts, synthetic
+~12,000-test/3-environment product (CLAUDE.md's own nightly scale), 30
+samples after warmup:
+  - Migrated copy of the repo-root dev db: median 141-158ms.
+  - A database built FRESH at the identical scale (rules out the
+    migrated file's accumulated layout as the explanation): median
+    115-125ms against a real baseline partition. This run caught a
+    seeding bug on the way there: two streams sharing one start_time
+    collide on upsert_runs's legacy-key check (the runs table's UNIQUE
+    on (environment, script, test_name, start_time) has no stream
+    column), and the second silently writes zero rows — a first
+    attempt compared against an empty partition and returned a bogus
+    ~45ms. Worth remembering for any future seeding across streams.
+  - End-to-end (HTTP+JSON) on the fresh db: ~125ms counts-only,
+    ~347-404ms for a full page (counts plus one category's rows).
+  - Live via the DOM-shim harness: delta-section's own render completed
+    at +742ms from module load, the verdict line filled in at +870ms —
+    a +128ms delay, matching the standalone measurement, landing
+    strictly after first paint.
+  - Framing: the "15ms end-to-end" figure already in this log (the
+    2026-08-09 overnight perf pass entry above) was measured on a
+    smaller dataset than the full nightly estate — this is a scale
+    difference between two honest measurements, not a regression
+    between them.
+  All figures dev-tier hardware, dev-scale data, never production.
+
+**PART B's EXPLAIN QUERY PLAN verdict for
+GET /api/scripts/{env}/{script}/executions?stream=: BYTE-IDENTICAL, not
+degraded.** storage.script_runs()'s SQL already carried a stream_id
+predicate in its WHERE clause for every caller since F7 (WP-streams
+work); this change only changes which VALUE gets bound to it here, not
+the query's shape. Ran the plan for stream_id=1 (mainline) and
+stream_id=3 (a build) against the same real script: both give SEARCH
+runs USING INDEX sqlite_autoindex_runs_1 (environment=? AND script=?)
+then USE TEMP B-TREE FOR ORDER BY. Worth recording plainly, since it
+generalises beyond this one endpoint: the runs UNIQUE index's third
+column is test_name, ahead of start_time, so start_time and stream_id
+are both row-level filters over the whole (environment, script)
+prefix, never further index-narrowed — a PRE-EXISTING characteristic
+of this query since before F7, not introduced or worsened by adding
+stream= here. Anyone adding another predicate to script_runs() later
+should expect the same shape, not a new index seek.
+
+Measured, dev-tier hardware, ~12k-test/540k-run dev-scale data (a copy
+of the repo-root dev db): a busy real script (1,350 mainline runs), 40
+samples after warmup — unscoped (the pre-existing behaviour) median
+38.35ms, p95 40.55ms; explicit stream=1 (same value, the new code
+path) median 38.16ms, p95 39.37ms — statistically indistinguishable,
+confirming _resolve_stream_id() costs nothing measurable on the hot
+mainline path (it returns immediately without a query when stream= is
+absent). A build stream with far fewer runs for the same script
+answered in median 5.19ms, p95 5.50ms — faster, never slower.
+analytics.group_executions needed no change: confirmed by reading it,
+a pure function over whatever runs it is handed, with no
+environment/script/stream awareness of its own.
+
+**Decisions recorded because they will look like oversights otherwise:**
+  - storage.script_exists() stays UNSCOPED by stream, matching /runs's
+    own precedent — a script's identity is not partitioned by stream,
+    only its runs are.
+  - F3's "(mainline)" honesty label on test.js's suite link is
+    SUPERSEDED, not kept alongside the fix: once script.html itself
+    honours stream=, the label's premise (the link always lands on
+    mainline) no longer holds, so the link now carries stream= through
+    instead and the title/text revert to their plain pre-F3 constants.
+  - The Watch card's unassigned-failing stat link applies the
+    result=FAIL&unassigned=1 filter to every card kind, not only
+    branches — the original stream-card special case was wrong for
+    long-running branches, caught and fixed after committing F4.
+  - script.html gained no product switcher — environment= already
+    fully disambiguates the page, so product= would be inert there.
+
+Suite, final tree after every commit in this entry: 1906 OK (skipped=1)
+SQLite-only; 2528 OK (skipped=21) combined SQLite+MariaDB 10.3
+dual-backend leg (TESTBOARD_TEST_DB_CNF set, CI's own
+python36-mariadb leg's stream).
+
+No browser has rendered any of this — the branch band's layout above
+script.html's executions chart, the suite-history table scoped to a
+branch, screen size and contrast are all unverified, same standing
+caveat as every prior round. Listed in docs/drops/2026-08-14.md's
+not-verified section.
+
+## 2026-08-09 — PERF ROUND: the streams work's own N+1s
+
+Found by a clean perf-log on a reseeded 5-environment dev estate:
+`/api/summary` median 250.8ms (up from ~65ms on a smaller 3-environment
+estate measured earlier the same session — scale, not a regression from
+this drop). Attribution: `summary_rollup` x2 per request,
+`status_queue_count` x12, `status_queue` x6, `failure_streak_bounds`
+x127 (an N+1 per FAIL row in a triage queue page), plus every
+`/api/compare?category=` request running the pairs SQL three times. No
+behaviour change anywhere; every existing test is the oracle, response
+shapes unchanged.
+
+- **`summary_rollup` x2, root cause confirmed as suspected**:
+  `_handle_summary` composed the headline (its own scoped rollup) and
+  `products[]` (always the estate-wide MAINLINE rollup, regardless of
+  the request's own scope) from two separate calls -- byte-identical
+  for a plain unscoped `GET /api/summary`. `_products_summary` gained
+  an optional `rollup_rows` parameter; threaded through whenever the
+  request's own scope IS that exact estate-wide-mainline case, fetched
+  fresh only when genuinely scoped (different data).
+- **`status_queue_count` x12 / `status_queue` x6**: the headline's
+  `queue_totals` and the full payload's per-queue `"total"` field each
+  called `status_queue_count` once per `QUEUE_KINDS` entry -- same join,
+  only the CASE predicate differing. New `Storage.queue_counts`: one
+  query, every kind's count as its own `SUM(CASE WHEN...THEN 1 ELSE 0
+  END)` column, `"mine"` folded in as one more column when an assignee
+  is given. `SUM(...)` returns SQL NULL over zero matched rows in both
+  backends (unlike `COUNT(*)`, which returns 0) -- guarded with
+  `int(row[i] or 0)`, pinned by a scoped-to-nothing test. The
+  single-kind `parts=queue&queue=X` path keeps calling
+  `status_queue_count` directly -- computing all six SUM columns there
+  would cost MORE than the one count actually needed.
+- **`failure_streak_bounds` x127**: new
+  `Storage.failure_streak_bounds_many`, the same three-step computation
+  (newest non-FAIL before latest; the streak's start; the newest PASS
+  before that) chunked at `_RECENT_CHUNK` (100, matching
+  `recent_results`'s own chunk size), each step ONE query per chunk via
+  a "driving" table of that chunk's own triples built as a UNION ALL of
+  literal `SELECT ? AS col, ...` branches -- the portable stand-in for a
+  VALUES-as-table constructor, deliberately NOT the `FROM (...) AS
+  v(col1, col2)` derived-table column-list form, which this project's
+  dual-backend translation (a plain `?` -> `%s` text substitution,
+  nothing SQL-shape-aware) has never had to vouch for. Step 3 (the pass
+  lookup) is skipped for a whole chunk when nothing in it needs one.
+- **compare's triple pass**: `compare_category_count`'s recomputed total
+  is provably the same number `compare_counts` already returned for
+  that category (`getattr(counts, category)` -- `category` is validated
+  against `COMPARE_CATEGORIES`, which is exactly `CompareCounts`'s five
+  per-category field names, and both derive from the identical
+  `_compare_pairs_sql(stream_id, baseline_id, environments)` call).
+  `compare_category_count` itself is unchanged and kept (its own tests
+  in `tests/test_storage.py` are still the oracle that it agrees with
+  `compare_counts`); nothing else in the API layer calls it any more.
+
+**Measured, dev-tier hardware, dev-scale data (a copy of the repo-root
+dev db shape, ~12k tests/540k runs/3 environments -- this session's own
+dev-scale copy, NOT a reproduction of the coordinator's exact
+5-environment reseeded estate, which was not available here; the
+qualitative shape -- same N+1s, same fix -- carries over, the absolute
+numbers do not claim to match theirs):**
+
+- End-to-end HTTP, 30 samples after warmup, no product declared (the
+  common case): `/api/summary` median **154.0ms -> 137.0ms**;
+  `/api/compare?category=` (mainline vs itself -- a degenerate RESULT
+  but the pairs SQL still scans the full partition, so the QUERY COST
+  is representative) median **120.5ms -> 91.4ms**.
+- Storage-layer micro-attribution (20 samples after warmup, isolating
+  each item from everything else `/api/summary` does that this round
+  does NOT touch): `summary_rollup` once **11.77ms** vs twice
+  **32.74ms** (item 1, ~21ms -- only realised when a product IS declared
+  and the request is estate-wide-unscoped, which is why it does not
+  show in the no-product end-to-end number above); `queue_counts`
+  **10.25ms** vs the old 12-call pattern **20.77ms** (item 2, ~10.5ms);
+  `failure_streak_bounds_many` **2.10ms** vs 93 individual calls
+  **3.14ms** (item 3, ~1ms at this estate's actual still_failing count
+  -- real but modest here, since a single indexed seek is already
+  sub-0.05ms in-process; the win scales with how many FAIL rows a page
+  actually has, and the coordinator's own 127-row estate would show
+  more); compare category total, page+recompute **2.39ms** vs
+  page+`getattr` **1.26ms** (item 4, ~47% of the marginal cost
+  eliminated).
+
+**Target honesty: `/api/summary` did NOT reach the <100ms target on this
+measurement** (137.0ms against a 154.0ms baseline on the SAME dev-scale
+copy). The four fixes are real, correct, and their savings are
+genuinely measured -- but they only ever addressed the SPECIFIC
+redundant/duplicated work the coordinator's perf-log named. The
+remaining ~130ms is spent in code this round did not touch:
+`status_queue`'s six ROW fetches (item 2 only batched the COUNTS, not
+the row payloads), `daily_result_counts` (the trend),
+`top_failing_scripts`, `assignment_stream_ids` + `stream_identities`,
+and the catalog reads (`environments`, `scripts`, `assignees`,
+`environment_products_map`, `distinct_products`) -- none of which were
+found to be duplicated or N+1-shaped, so none were touched. Reaching
+<100ms, if that is still the bar, needs a second pass over that list
+with its own measurements, not a claim built on this round's numbers.
+
+**EXPLAIN QUERY PLAN**: not required for this round -- every new query
+is either a single-row aggregate over an already-indexed partition
+(`queue_counts`) or an indexed seek per driving-table row
+(`failure_streak_bounds_many`'s three helpers), the same index shapes
+the single-row methods already used; no join topology changed.
+
+**Dual-backend**: the full suite (SQLite-only and combined with
+`TESTBOARD_TEST_DB_CNF` against local MariaDB 10.3) passes unchanged;
+every new SQL shape (`SUM(CASE WHEN...)`, the UNION ALL driving-table
+pattern) was run for real against MariaDB, not only SQLite.
+
+Suite, final tree after every commit in this entry: 1924 OK (skipped=1)
+SQLite-only; 2564 OK (skipped=28) combined SQLite+MariaDB 10.3
+dual-backend leg.
+
+Not verified: production timing (dev-scale only, per CLAUDE.md); the
+coordinator's own 5-environment/127-row estate was not reproduced
+exactly. Backend-only change -- no frontend files touched, nothing new
+to render.
+
+## 2026-08-09 — addendum: the last two scope-entry gaps
+
+User-reported, live: "how do I select a build when on the Timeline
+view?" Two gaps, both frontend-only, no migration:
+
+1. The Build picker (`streams.js`) was mounted only on `index.html`.
+   `renderPicker()` was always page-agnostic (its own docstring already
+   said so); `time.html` and `timeline.html` gain the identical
+   `#stream-picker` mount and `streams.js` import. Verified LIVE (node
+   DOM-shim harness against a scratch server) that the picker's
+   `new URL(window.location.href)`-based rewrite preserves each page's
+   OTHER params -- `environment=` on timeline.html, `environment=`/
+   `script=` on time.html -- in both directions (picking a build, and
+   switching back to mainline). Widened (not weakened) the guard test
+   that used to pin "mounted only on the dashboard" to pin the new,
+   larger set of pages instead, and to keep pinning the pages that
+   still correctly do NOT get it.
+2. The nav bar itself dropped scope: every page's header links were
+   bare hrefs (`<a href="timeline.html">Timeline</a>`), so
+   Dashboard -> Timeline from a build-scoped page silently landed on
+   mainline -- the exact bug family the whole link-matrix audit sweep
+   fixed everywhere else, sitting in the one piece of markup every page
+   shares. New `nav.js:carryScopeIntoNav(nav, currentSearch)`: when the
+   CURRENT page's own URL carries `stream=`/`product=`/`environment=`,
+   those (and only those present) are appended to the nav's links
+   targeting `index.html`/`time.html`/`timeline.html` --
+   deliberately excluding `actions.html` (assignments stay
+   one-owner-per-test and estate-level, never stream-scoped -- decided
+   and recorded in docs/STREAMS_PLAN.md), `watch.html` (its own `c=`
+   URL grammar is untouched), and `whatsnew.html` (never scoped). Reads
+   the CURRENT URL directly, never `getSelectedProduct()`'s
+   localStorage -- the same "the URL is the whole configuration" rule
+   stream scoping already follows. Runs independently of the
+   What's-new date fetch, so a flaky `whatsnew.html` fetch cannot also
+   silently break the nav bar. Zero change on an unscoped page.
+
+Live-verified, node DOM-shim harness against a scratch server (own
+port, own throwaway db, never the shared 8791 instance), the exact
+walk asked for: a build-scoped dashboard's rewritten nav carries
+`stream=`/`environment=` into Dashboard/Time/Timeline while leaving
+Open actions/Watch/What's new untouched; following the rewritten
+Timeline link lands on that SAME branch's Timeline, its band and Build
+picker both showing it; a plain unscoped page load leaves every nav
+href byte-identical to the shipped markup.
+
+Suite, final tree after this entry: 1933 OK (skipped=1) SQLite-only;
+2573 OK (skipped=28) combined SQLite+MariaDB 10.3 dual-backend leg.
+
+Not verified: layout/legibility of the picker on time.html/
+timeline.html's toolbar, and of the nav bar's rewritten links, at a
+real screen size -- no browser has rendered any of this.
+
+## 2026-08-09 -- addendum 2: the Watch page wrongly behaved product-scoped
+
+User-reported live. Watch is cross-product by definition (a manager
+composes cards across products in one view; the URL is the whole
+configuration, docs/STREAMS_PLAN.md Sec0.9) -- watch.html mounted the
+global product switcher the same way every other header-nav page did,
+boilerplate left over from WP-20's original rollout; nobody had asked
+whether scoping the WHOLE page to one product made sense there. It
+does not.
+
+Two reported symptoms, one investigation, one real bug found (not the
+one first suspected), plus a justified removal:
+
+- Symptom 1 (the composer looked product-filtered): INVESTIGATED, does
+  NOT reproduce. populatePicker() already fetches every known
+  product's streams in parallel ([""].concat(productNames), one
+  /api/streams request per product, Promise.all) and watch.js has zero
+  references to getSelectedProduct() anywhere. Verified live (node
+  DOM-shim harness, two products seeded, localStorage pinned to one)
+  before writing this down as correct rather than "fixed" -- a future
+  reader should not go looking for a filter that was never there. New
+  guard test (WatchHasNoProductSwitcherTest.
+  test_the_composer_fetches_every_products_streams_in_parallel /
+  test_watch_js_never_reads_the_global_product) pins it stays this
+  way.
+- Symptom 2 (switching the product wiped a saved default): REAL, but
+  not where first suspected. A first-pass investigation tested the
+  switcher's own URL rewrite in isolation and found it correctly
+  preserves c= params (same new URL(window.location.href) pattern the
+  streams.js picker uses) -- an advisor review caught the actual bug
+  before this shipped: watch.js's init() decided whether to read c=
+  from the URL, or fall back to the saved default, by checking whether
+  location.search was non-empty AT ALL, not whether it specifically
+  had a c= param. watch.html?product=Atlas (no c= at all -- exactly
+  what the switcher's own navigation produces, or any other stray
+  param arriving from a stale link) took the "the URL has cards"
+  branch, found none, and silently discarded the saved default: a
+  shareable Watchlist saved as "my default" rendered COMPLETELY EMPTY
+  the moment an unrelated param showed up beside it. Fixed with one
+  condition: new URLSearchParams(search).has("c"). Live-reproduced
+  BEFORE the fix (2 cards on a bare visit, 0 after ?product=Atlas was
+  added with the identical saved default) and confirmed AFTER (2 cards
+  in both cases), same scratch server, file changes alone -- no
+  restart needed, static files are read fresh per request.
+- The #product-switcher mount is REMOVED from watch.html entirely,
+  independent of the bug above and justified on its own terms: the
+  page has no honest job for a control that scopes the WHOLE page to
+  one product. <script src="products.js"> stays loaded, kept for
+  adoptProductFromUrl()'s site-wide "the URL wins" behaviour; its own
+  init() already guards a missing mount (the WP-20 null-deref fix,
+  verified live rather than assumed: watch.js and products.js both
+  loaded against markup with genuinely no #product-switcher element
+  anywhere in the DOM -- not merely unregistered in the test harness --
+  no exception thrown, the page's own card rendering normally).
+
+This is the second time in one session an advisor review caught a real
+bug a first-pass live verification missed by testing the SUSPECTED
+mechanism in isolation rather than the actual reported symptom
+end-to-end (the switcher's URL rewrite alone looked correct; the bug
+was in a DIFFERENT function's branch condition, only visible testing
+the full saved-default-plus-stray-param path). Worth remembering: a
+symptom description names what the USER saw, not necessarily which
+function is at fault.
+
+Suite, final tree after this entry: 1939 OK (skipped=1) SQLite-only;
+2579 OK (skipped=28) combined SQLite+MariaDB 10.3 dual-backend leg.
+
+Not verified: layout/legibility of the header without the switcher, at
+a real screen size -- no browser has rendered it.
+
+## 2026-08-09 -- addendum 3: Open Actions' truthful display, §0.4 reconfirmed
+
+User decision, direct: assignment stays one owner per triple
+(docs/STREAMS_PLAN.md Sec0 item 4, reconfirmed and recorded there) --
+this addendum is a DISPLAY fix, not a data-model change. The seam it
+closes, previously flagged as an accepted limitation and no longer
+accepted: a row's result chip in Open Actions is always mainline's
+(the page's own /api/dashboard call never carries stream= --
+assignments are estate-level), but the row's CURRENT assignment can
+have been made from a non-mainline stream whose own result for the
+same triple disagrees -- an "assigned from the RC" row could read
+mainline's PASS while the RC failure it represents was still live, a
+contradiction on its face.
+
+Fix: for a row with a non-mainline origin, the result cell now shows
+BOTH sides, reusing the EXACT compare-strip visual language
+compare.js:renderCompareStrip() already built for the test-detail
+page's own mainline-vs-branch strip -- imported directly into
+actions.js rather than reinvented: ghost mainline chip, solid
+origin-stream chip, "no result" text (never a colour) when either side
+is absent. A mainline-origin row is byte-for-byte unchanged -- the
+plain single resultChip() it always had.
+
+Mechanics: new Storage.latest_results_for_streams(keys) -- batched by
+(stream_id, environment, script, test_name), latest_runs's own PRIMARY
+KEY, so every key is an index seek. ONE query for the whole page's
+non-mainline-origin rows (chunked at _RECENT_CHUNK, the same 100-key
+batch size failure_streak_bounds_many/recent_results use -- this
+session's own PERF ROUND discipline applied to its own addendum),
+never a lookup per row; skipped entirely when nothing on the page has
+a non-mainline origin, which is every existing /api/dashboard caller
+including the plain index.html dashboard -- zero new queries for them.
+_handle_dashboard extends the existing per-row payload with
+origin_result (present, possibly null, only for rows that have
+assignment_stream_id -- ABSENT, not merely null, for every
+mainline-origin row, so an existing caller's payload is byte-identical
+to before this addendum) rather than reshaping the endpoint.
+
+Measured: the batched query costs exactly ONE extra round trip
+regardless of how many origin rows are on the page (1 row or several,
+both pinned by test) -- no per-row cost.
+
+Live-verified, node DOM-shim harness against a scratch server (own
+port, own throwaway db, never the shared 8791 instance), two real
+assignments through the actual API (not synthetic JSON): a row
+assigned from a branch where mainline FAILS and the branch PASSES
+rendered both chips (ghost FAIL, solid PASS) labelled "mainline" and
+the branch's own name; a row assigned from the same branch for a test
+it never ran rendered mainline's ghost chip plus literal "no result"
+text carrying no result-colour class. First attempt at the live
+verification used an unreachable fixture (mainline PASS/branch FAIL --
+Open Actions' own result filter has no "all results" or "PASS" option,
+only "open" (FAIL + UNEXPECTED_PASS), "FAIL", or "UNEXPECTED_PASS", so
+a mainline-PASS row can never appear on this page at all); caught by
+running the driver against the real page rather than trusting the
+scenario, and re-seeded to a reachable contradiction (mainline FAIL,
+branch already PASSING) before re-verifying.
+
+Incidental finding, out of scope, not fixed: static/actions.js has
+carried a literal U+0000 (NUL) byte inside the UNASSIGNED sentinel
+string literal (const UNASSIGNED = "\x00unassigned";) since the file's
+very FIRST commit (ed4a59a6, 2026-07-28) -- valid JavaScript, and
+harmless in practice because every read and write of the sentinel goes
+through the SAME constant reference, never compared against a literal
+"unassigned" typed elsewhere. Left alone -- unrelated to this
+addendum's scope.
+
+Suite, final tree after this entry: 1954 OK (skipped=1) SQLite-only;
+2605 OK (skipped=33) combined SQLite+MariaDB 10.3 dual-backend leg.
+
+Not verified: layout/legibility of the two-chip strip inside Open
+Actions' existing result column at a real screen size -- the column
+may need to be wider than it is today. No browser has rendered it.
+
+## 2026-08-09 -- addendum 4: summary/watch memoization, one more perf slice
+
+User calibration: the real production estate is 12k tests over 5
+environments (largest env ~8k) -- this session's own dev-scale copies
+ARE production scale for size, so the PERF ROUND entry above's
+"/api/summary at ~205ms, /api/watch at ~250ms" is day-one experience,
+not dev noise. That entry closed the redundant/duplicated work the
+coordinator's perf-log named but said explicitly the remaining ~130ms
+was in code it did not touch. This addendum lands memoization for that
+remainder before the drop ships.
+
+Design: component-level memoization at the Storage composition level,
+copying _trend_cache's exact TTL-bounded, write-invalidated pattern
+(_TREND_CACHE_TTL_SECONDS, 60s, reused not duplicated) into a new
+shared _summary_cache dict keyed (method_name, *scope). Chosen over
+caching _handle_summary's whole composed response because
+_handle_watch has no equivalent composed call to hook -- it calls
+summary_rollup/test_counts_by_environment/latest_run_time_by_environment
+directly, so only a memo living below both handlers can serve both.
+Eight methods memoized: summary_rollup, queue_counts, status_queue (all
+6 kinds), test_counts_by_environment, latest_run_time_by_environment,
+environments, scripts -- widened from the coordinator's originally-named
+five (summary_rollup/queue_counts/failure_streak_bounds_many/
+latest_run_time_by_environment/test_counts_by_environment) once
+attribution showed those five alone would land around 76ms warm, short
+of the 30ms target; status_queue's six row-fetches (34ms measured, the
+single biggest remaining uncached cost) and the two cheap catalog reads
+made up the difference. failure_streak_bounds_many is memoized PER
+ENTRY, in a SEPARATE cache dict (_streak_cache) -- see the bug below.
+
+/api/watch reuses the memo per the coordinator's explicit instruction
+NOT to build it a second cache layer of its own: _handle_watch now
+computes its estate-wide rollup cutoff via _pass_view (the SAME
+function /api/summary already uses) instead of now() -- the existing
+code already documented "any value works" for that argument, so
+switching costs nothing and lets both endpoints' summary_rollup calls
+land on the same cache key for the common unscoped load. Verified
+directly: a warm /api/watch call issued right after a warm /api/summary
+call adds ZERO new cache entries and costs 4.8ms, against 24.2ms cold.
+
+Bug found and fixed BEFORE measuring, not after: the first version
+shared ONE 128-entry cache between the ~20 request-composition keys and
+failure_streak_bounds_many's per-triple keys. Profiling a "warm" repeat
+/api/summary call that was still costing 28 raw SQL statements found
+why -- one unscoped request on the production-shape estate touches 139
+distinct keys once every queue kind and every FAIL row's streak entry
+is counted, over the 128 cap on its own, so the cap-then-clear policy
+fired MID-request and wiped summary_rollup/queue_counts/the
+earlier-processed queue kinds before the SAME request finished using
+them. Fixed by giving failure_streak_bounds_many its own dict
+(_streak_cache, cap 4096, sized to the estate's plausible
+simultaneously-failing-test count rather than to one request's key
+count) -- confirmed by re-profiling: all 6 status_queue kinds and
+summary_rollup now persist across repeat calls.
+
+Measured, HTTP end-to-end, a COPY of the shared server's actual
+production-shape database (5 environments, ~65k runs, ~12.8k mainline
+tests -- the live estate this session's own calibration refers to),
+15 samples after 3 warmup, as a genuine paired A/B: a git worktree at
+this branch's pre-change tip (0a44ea0) against the working tree, both
+serving the SAME db file, on their own scratch ports (never the shared
+8791 instance), benchmarked back-to-back in one session. This mattered:
+an EARLIER same-session measurement of the "before" code alone, taken
+~35 minutes after a cold copy of the 260MB db file, read 188.0ms/
+128.5ms/168.6ms for the three rows below -- 2-3x this paired
+measurement's "before" column, purely from OS file-cache warmth on the
+first-ever read of that file, nothing to do with this change. Caught by
+re-running "before" against HEAD in a worktree immediately before
+"after", rather than trusting a number measured earlier in the session;
+the figures below are the trustworthy ones and supersede the numbers
+this entry originally recorded.
+
+  /api/summary (full):                        62.8ms -> 4.5ms warm
+  /api/summary?parts=headline:                39.4ms -> 3.2ms warm
+  /api/watch, 8 mixed cards:                  107.8ms -> 68.6ms warm
+  /api/watch, same 7 e:/p: cards, no s: card:  26.3ms -> 11.9ms warm
+
+  cold (one request, just-started process), three paired samples:
+    before {98.9, 131.3, 115.5} ms   after {148.8, 185.6, 115.7} ms
+
+Warm /api/summary beats the 30ms target by an order of magnitude once
+the cache-thrashing bug above was fixed -- the SAME paired methodology
+against the pre-fix code measured ~61ms warm, a real improvement over
+the 62.8ms baseline but barely, and the wrong number to have shipped.
+Cold is the same order of magnitude either way, with "after" running
+somewhat higher on 2 of 3 samples -- plausibly the small fixed cost of
+cache-key construction and a lock/dict lookup that now runs on every
+cached call whether it hits or not; not resolved further with three
+single-request samples. /api/watch's remaining 68.6ms is mostly
+attributed via profiling to compare_counts_many (39ms) plus
+known_environments (4ms), both driven by the s: (stream comparison)
+card -- a pre-existing, already-flat-per-request cost, deliberately NOT
+memoized here per the coordinator's instruction; dropping the one s:
+card from the same 8-card mix lands at 11.9ms (down from 26.3ms
+before), confirming the s: card, not the memo, is most of the
+remaining cost, and that the memo helps the parts it was built for.
+
+Side effect worth naming: status_queue's ORDER BY environment with a
+LIMIT and no unique tiebreak means two identical executions of the same
+query could previously return different subsets of a capped queue
+(observed directly while debugging the cache-thrashing bug -- two calls
+with byte-identical arguments returned rows from different
+environments). Pre-existing, unrelated to this change, deliberately not
+fixed here -- but the memo now means a repeat load inside the TTL
+returns the same rows each time, where before it could silently
+shuffle.
+
+Invalidator audit (the trend cache's clear list was the checklist):
+upsert_runs/delete_stream/prune_runs_before/delete_environment (already
+invalidated the trend cache; extended to this memo too, at the same
+four call sites) plus THREE newly-identified sites the trend cache
+never needed: set_assignee (queue_counts'/status_queue's assigned/mine
+predicates read current_assignments), set_retired
+(summary_rollup/queue_counts/status_queue/test_counts_by_environment
+all read test_retirements, and set_retired also posts a comment),
+add_comment (status_queue(with_latest_comment=True) caches the comment
+TEXT itself, not just a row count). Audited and confirmed NOT needed:
+set_environment_product/clear_environment_product -- every cached
+method takes its product/environment scope as an explicit environments
+allow-list argument rather than joining environment_products itself,
+so a remap changes which KEY a request computes, never makes an
+existing entry wrong.
+
+Tests: tests/test_storage.py::SummaryCacheTest, 21 new tests -- a
+query-count (not value) hit test per memoized shape, one invalidation
+test per mutator above, scope-key isolation (a product/environment
+allow-list and a branch stream never serve another scope's entry), TTL
+expiry (and a "still hits within the TTL" control so the expiry test
+is not vacuous), and the audited "no invalidation needed" case proven
+directly rather than merely asserted. Two existing guard tests
+(TestWatch.test_query_count_does_not_grow_with_card_count,
+TestWatchStreamCards.test_query_count_does_not_grow_with_s_card_count)
+started failing once the memo made a second identical request cheaper
+than the first -- WIDENED per house rules (never weakened): each now
+primes an identical untraced warm-up call before tracing, holding cache
+STATE equal between the comparison's two sides so the original
+card-count invariant is still enforced, at the new lower warm-cache
+cost. SummaryCacheTest's 11 query-count tests are excluded on the
+MariaDB leg (same sqlite3.set_trace_callback-is-SQLite-only reason
+every other query-count test there carries); the memo's correctness
+itself is backend-agnostic and the other 10 value-based tests in the
+class run and pass on both backends.
+
+Suite, final tree after this entry: 1975 OK (skipped=1) SQLite-only;
+2647 OK (skipped=44) combined SQLite+MariaDB 10.3 dual-backend leg.
+
+Not verified: the production-shape database used for measurement is a
+static COPY, never re-fed during this session. On a live server being
+fed every 10 minutes, summary_rollup/queue_counts/status_queue's cutoff
+argument is usually DATA-derived and stable across nearby requests (a
+covered pass's start time), giving the same warm-cache behaviour
+measured here; on an estate that has gone quiet long enough to fall
+back to the 36-hour wall-clock window, that specific cutoff-keyed cache
+stops helping (a documented, correct property, not a defect) until the
+estate is active again. That transition was not separately measured
+live. No frontend files changed, so nothing new to render.
+
+## WP-25 — one stream kind (2026-08-09, `wp-25-one-kind`, Phase 1 of `NIGHT_RUN_2026-08-09.md`)
+
+User decision, same evening: the branch/build distinction added
+confusion and was not worth its weight in the initial streams drop —
+collapse `streams.kind` to `{mainline, build}`. Because nothing
+kind-shaped had shipped anywhere (the whole streams package was still
+unreviewed/unpushed at spec time), this is deletion before first
+contact, not a migration. Full spec is `docs/ONE_KIND_PLAN.md`; this
+entry is the chronological record.
+
+**Migration 9 amended in place** — the established pre-ship fold
+precedent, same as the assignments fold it is modelled on. `kind` was
+never CHECK-constrained, so the DDL is byte-identical; only the
+migration's own comment and the Python-side validation moved. The
+`UPGRADE_PLAN.md` §1 registry row for version 9 is re-annotated the
+same way.
+
+**Import contract narrows to `build` only.** `parse_run_record` rejects
+a record carrying the `branch` key outright — checked by key PRESENCE,
+not value, before `build` is even read — with "branch: removed before
+this contract ever shipped — use build:". The old branch/build
+mutual-exclusion error dies with the field it guarded; the rest of a
+mixed batch still imports (per-record rejection, not batch-fatal).
+Tested through the real `/api/import` path, not just `parse_run_record`
+directly.
+
+**Default baseline is mainline, always** (explicit user decision).
+`pickDefaultBuildBaseline` and its tests are deleted; the Compare-to
+picker, now shown for every non-mainline stream, is how a predecessor
+is chosen. Happy consequence recorded here per the spec's own
+instruction: the choosing-mainline sentinel bug's precondition
+(`89012d4`) is gone with the function — absence means mainline
+everywhere again. The explicit `baseline=1` encoding and its guard test
+are KEPT anyway (harmless, and it keeps the collision impossible rather
+than merely absent).
+
+**Every kind-gate became a data-gate.** The two-tab dashboard
+("its own results" / "difference from…") now gates on the same
+covered-passes threshold regardless of how the stream was uploaded —
+`initBranchDashboard`'s kind check is gone, replaced by the
+`covered_passes >= OWN_RESULTS_DEFAULT_PASSES` check the WP-23 caption
+already computed. The Watch `s:` card carries one wording for every
+stream (current build wording, verdict vs mainline) — its
+`baseline_kind`/`baseline_name`/`baseline_last_seen` fields are now
+unconditionally mainline's, so `Storage.previous_builds` and
+`compare_counts_many`'s `baselines` argument have no caller left in
+`_handle_watch`. Both are KEPT rather than deleted (correct, tested,
+generic infrastructure, not specific to the deleted kind) — a judgment
+call, flagged in the commit for reconsideration if nothing claims them
+by the next round. The picker (`streams.js`) collapses to one flat
+group, newest-first by `last_seen`; the branches/builds split is
+deleted along with its test. The band keeps its existing single
+"Build" label — nothing there was kind-conditional to begin with.
+
+**Deliberately unchanged:** `assignment_origin`
+(`origin=branch`/`origin=mainline` on `/api/dashboard`, Open Actions'
+filter) predates `build` as a stream kind — it means "made from any
+non-mainline page", not the name of a kind — and is not in the plan's
+file list, so it was left alone rather than swept in by name
+similarity.
+
+**§2b item 1 — stream-scoped Time/Timeline empty states now say where
+the data is.** New `Storage.environments_for_stream(stream_id)`: one
+grouped `SELECT DISTINCT environment FROM latest_runs WHERE stream_id
+= ?`, O(partition), no new endpoint. `_handle_time`/`_handle_timeline`
+attach `stream_environments` to the response only when the view is
+already empty and a non-mainline stream is in scope (never computed on
+a page that has data). `static/compare.js` gained
+`renderStreamEnvironmentHint`, shared by `time.js` and `timeline.js`,
+each with its own `environmentSwitchUrl` that preserves the stream
+while dropping only the params specific to that page (`script` on
+Time, `days`/`from`/`to` on Timeline). Guard tests added on both the
+storage method and both pages' empty-state rendering.
+
+**Feeder:** `--branch` removed entirely (argparse, validation,
+mutual-exclusion, logging, state-file naming, `Submitter` constructor);
+`--build` unchanged. Per-stream state files keep their existing
+`build-` filename prefix — one naming scheme, no migration needed since
+no branch-kind state file has ever existed outside this unshipped
+work. `tools/drop_stream.py` loses `--kind`; product+name identify a
+stream, and the lookup still checks `kind == "build"` defensively so
+mainline can never be selected by name collision.
+
+**Docs:** `STREAMS_PLAN.md` gained an as-built blockquote at the top of
+§3 pointing at `ONE_KIND_PLAN.md` (history in §3 itself untouched, per
+the spec's own "do not rewrite history" instruction). `README.md`'s
+transport contract, streams section, and Watch card docs updated for
+build-only. `static/whatsnew.html`'s 2026-08-14 section rewritten
+per §2b item 2 — one `<h3>What's new</h3>` with one short capability
+bullet each, `data-drop-date="2026-08-14"` kept in lockstep with the
+heading. `docs/drops/2026-08-14.md` gained a WP-25 subsection (suite
+count, deviations, verification) and its top-of-file counts updated.
+Seed scripts under `.scratch/seeds/` (gitignored, not part of any
+commit) switched `branch:`/`branch=`→`build:`/`build=` throughout, per
+the spec's explicit instruction not to run them against any repo-root
+database.
+
+**Test suite:** merged/renamed the branch-kind halves of the storage
+and API stream suites; deleted tests whose entire premise died with
+the removed kind (branch/build name-collision distinctness, "a branch
+is never given a predecessor", `BuildVerdictLineTest`); added
+`TestImportBranchFieldRejected` (loud rejection through the real
+import path), `EnvironmentsForStreamTest`,
+`TimeStreamEnvironmentHintTest`, `TimelineStreamEnvironmentHintTest`,
+`StreamEnvironmentEmptyStateTest`; widened (not weakened)
+`CompareToControlTest`, `BuildPickerGroupingTest`, and the two
+`test_storage.py` literal-message assertions that hard-coded
+`"branch:feat/x"` in a rejection message now that fixtures use
+`build=`.
+
+Suite: **1980 OK (skipped=1)**, SQLite-only, up from the 1978 OK
+(skipped=1) baseline recorded in `ONE_KIND_PLAN.md` at spec time — net
++2 despite substantial deletion, since §2b's new empty-state guard
+tests and the branch-rejection class outweigh what was removed.
+
+**Not run this session:** the dual-backend suite (`TESTBOARD_TEST_DB_CNF`
+was not set) and CI's `python36-mariadb` leg — neither exercised by this
+round; the next phase or the coordinator's pre-push review should run
+at least the local dual-backend variant before `wp-24-scoped-urls`
+builds on this tip. `docs/SESSION_HANDOVER.md` was intentionally left
+unrewritten — `NIGHT_RUN_2026-08-09.md` §4 assigns that rewrite to
+Phase 5 (consolidation), after WP-24 lands on top of this tip, not to
+this package. No browser has rendered any of this session's frontend
+changes; the sanity net and persona walks in `NIGHT_RUN_2026-08-09.md`
+Phases 3–4 are where that gets covered.
+
+---
+
+## 2026-08-09→10 — the overnight round: WP-25 review fix, WP-24, the sanity net, the persona walks (branch `wp-24-scoped-urls`, ship branch `streams-upgrade`)
+
+One coordinated overnight session (`docs/NIGHT_RUN_2026-08-09.md` was
+the score; Sonnet implementers built, the coordinator reviewed every
+diff, ran every gate, and pushed). Chain: `wp-23-longrunning` →
+`wp-25-one-kind` → `wp-24-scoped-urls`, consolidated as
+**`streams-upgrade`** — the single morning-merge candidate.
+
+**Correction to the WP-25 entry above:** `BuildVerdictLineTest` did not
+stay deleted. Coordinator review ruled the F5 verdict line's deletion
+an over-deletion (a kind-GATED feature, which §1.4 says becomes
+data-gated, not deleted — and the RC-owner journey depends on it);
+restored in `96af20a`, adapted to the one-kind world (hidden for
+mainline scope or no predecessor; 11 tests, up from 9). The restore
+does NOT un-orphan `previous_builds`/`compare_counts_many(baselines=)`
+— checked against the call graph, their one caller was always the
+Watch `s:` card, which WP-25 deliberately fixed to verdict-vs-mainline.
+Keep-or-delete is on the morning decision list.
+
+**WP-24 (scoped URLs)** landed per `docs/SCOPED_URLS_PLAN.md`: one
+module (`static/urls.js`) owns every scoped URL; every construction
+site converted in nine reviewable commits; `ScopedUrlConstructionTest`
++ planted-regression proof; Watch `c=` grammar exempt by name;
+`actions.js`/`test.js` NUL sentinels byte-checked after every touch.
+Two deviations accepted on review: explicit empty `product=` for "All
+products" (the spec's own encoding — absence never encodes a choice)
+and scope params trailing page-specific params (nothing observes
+ordering). A `withEnvironment()` was deliberately NOT added —
+`setEnvironment()` preserves an open-ended bag of other params, a
+shape none of the fixed builders fit; the site is allowlisted in the
+guard with a companion test that fails if the exemption stops being
+needed.
+
+**The sanity net** (`.scratch/net/run_net.py`, ~17s, unattended) now
+automates the six gotcha classes of the pre-drop rounds and is the
+repeatable "fix then re-verify" loop the morning will use. It earned
+its keep twice in one night:
+
+1. `origin=branch` terminology leak — the Open Actions origin filter
+   never learned the one-kind dialect (API 400'd `origin=build`; chip
+   said "Branch-originated"). Renamed value + label, dead spelling now
+   a loud 400/ValueError, chip value/label pinned by a new guard
+   (`91fe0bd`).
+2. **The night's biggest catch:** WP-24's conversion dropped `stream=`
+   from four row-link sites (app.js queue/browse/scriptLink,
+   compare.js delta rows) — 517 failing links, one root cause: naming
+   `product: null` in a `pageUrl()` override suppresses default
+   carriage for the levels product contains, so `stream` was reset
+   unless ALSO named. The full unit suite stayed green through it
+   (the converted guards grepped for the builder call, which passes
+   with or without stream) — the DOM-shim walk was the only thing
+   that saw it. Fixed by naming `stream` explicitly at each site
+   (the F6 quick-links pattern, which is why those were never broken);
+   the four guards now pin the full override literals (`36c9ddf`).
+   Fourth consecutive session the DOM-shim method caught what static
+   checks could not.
+
+**The persona walks** (manager / delver / RC owner, from cold,
+transcribed mechanically, judged by the coordinator) produced three
+fixes in one commit (`2adc1d2`): the test page's assignee PUT now
+sends `stream_id` like the review panel and the page's own comment
+form always did (the RC owner's Open-Actions-origin step was silently
+broken without it); three visible dead-kind strings renamed (Watch
+composer "Branch/build"→"Build", the two-tab `aria-label`, the delta
+table's static "This branch" header) with a new
+`OneKindVisibleWordingTest` sweeping rendered text/aria-label/title
+for the word; and the test page's latest-run line gained the review
+panel's scoped "View in timeline →" link (the delver journey
+dead-ended without any route to Timeline from `test.html`).
+Judgment calls deliberately NOT coded went to the morning decision
+list (in the morning summary and `SESSION_HANDOVER.md`).
+
+**Measurements (dev copy, 540k runs / 12k tests, tip `91fe0bd`,
+port-8955 scratch server — NOT production):** endpoint storm after the
+WP-24 refactor — `/api/summary` median 78.7ms (p95 89.7),
+`?parts=headline` 16.0ms, `/api/dashboard?limit=250` 6.4ms,
+`/api/time` 1.8ms, `/api/environments` 1.3ms, `/api/watch` single
+`e:` card 12.0ms; summary cold-vs-warm 105.7 vs 80.6ms (~25ms residual
+cold cost — carried decision item, now with a number). In family with
+the perf round's recorded values; WP-24 is server-untouched by
+construction and measured as a no-op.
+
+**Gates, all green on the final tip `2adc1d2`:** suite 2022 OK
+(skipped=1) SQLite / 2705 OK (skipped=44) dual-backend (every skip
+per-test-reasoned; 36 of 44 are `set_trace_callback` query-count
+instruments with no MariaDB equivalent — the O(N)-query guards are
+SQLite-enforced only, a known asymmetry); all four CI legs green on
+every push (runs 31333569214, 31336413657, 31336591743, 31337219319,
+31338682000); sanity net fully green (18.1s); legacy walks: deeplink
+and timeline pass, branch-tabs' 3 short-lived-branch failures are the
+expected WP-25 §1.4 behavior change (tab header existence now
+threshold-gated), not a regression.
+
+Suite counts by commit: 1978 (baseline) → 1991 (WP-25 + verdict-line
+restore) → 2013 (WP-24) → 2016 (origin rename) → 2017 (four-site fix)
+→ 2022 (persona fixes). Every increase is guards, none is weakening.

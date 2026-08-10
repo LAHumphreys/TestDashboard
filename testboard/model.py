@@ -137,7 +137,19 @@ def duration_seconds(start: datetime.datetime, end: datetime.datetime) -> float:
 
 
 class RunRecord(NamedTuple):
-    """A validated incoming test run (transport shape; no DB id yet)."""
+    """A validated incoming test run (transport shape; no DB id yet).
+
+    ``build`` is a WP-21 addition (docs/STREAMS_PLAN.md §3.3), narrowed
+    to the only surviving non-mainline kind by WP-25 (docs/ONE_KIND_PLAN.md
+    — the ``branch`` kind died before it ever shipped anywhere, so this
+    is a deletion, not a migration): optional, non-empty-after-strip.
+    ``None`` (every record from every feeder ever deployed) means
+    mainline — the identity of the stream this run belongs to is
+    resolved from this field plus the record's ``environment``, not
+    carried as a separate id on the wire. A raw transport dict carrying
+    a ``branch`` key is REJECTED by :func:`parse_run_record` before it
+    ever reaches here — see that function.
+    """
 
     environment: str
     script: str
@@ -148,6 +160,7 @@ class RunRecord(NamedTuple):
     output: str
     source_link: str
     known_failure_reason: Optional[str]
+    build: Optional[str]
 
 
 class StoredRun(NamedTuple):
@@ -215,7 +228,21 @@ def parse_run_record(obj: Any) -> RunRecord:
       without one imports exactly as before. Blank/whitespace-only is
       normalised to ``None``.
       or ``None``.
-    - Unknown extra keys are ignored (forward compatibility).
+    - ``build``: optional, defaults to ``None``; must be str or null if
+      present. Blank/whitespace-only is normalised to ``None`` — the
+      same rule as ``known_failure_reason``, so a feeder that sends
+      ``build: ""`` imports as mainline rather than as a stream named
+      the empty string.
+    - ``branch``: REJECTED outright, present or not, whatever its value
+      (docs/ONE_KIND_PLAN.md §1.2) — the ``branch`` kind died before it
+      ever shipped anywhere, so tolerating the key would silently file a
+      stale script's runs into mainline once ``branch``'s handling was
+      removed, the exact "old-server trap" §3.3 documents for an
+      unknown-key-tolerant server. A loud per-record rejection costs
+      nothing: ``"branch: removed before this contract ever shipped —
+      use build:"``.
+    - Unknown extra keys (other than ``branch``) are ignored (forward
+      compatibility).
     """
     if not isinstance(obj, dict):
         raise ValidationError(
@@ -284,6 +311,27 @@ def parse_run_record(obj: Any) -> RunRecord:
     if known_failure_reason is not None and not known_failure_reason.strip():
         known_failure_reason = None
 
+    # WP-25 (docs/ONE_KIND_PLAN.md §1.2): checked by PRESENCE, not value —
+    # {"branch": null} still carries the field, and a type/value dance
+    # here would just be extra code protecting a key that must never be
+    # accepted at all. Deliberately before "build" is even read: the
+    # rejection reads the same regardless of what else the record carries.
+    if "branch" in obj:
+        raise ValidationError(
+            "branch: removed before this contract ever shipped — use "
+            "build:"
+        )
+
+    build = obj.get("build", None)
+    if build is not None:
+        if not isinstance(build, str):
+            raise ValidationError(
+                "build: must be a string or null, got {}".format(
+                    type(build).__name__
+                )
+            )
+        build = build.strip() or None
+
     return RunRecord(
         environment=environment,
         script=script,
@@ -294,15 +342,19 @@ def parse_run_record(obj: Any) -> RunRecord:
         output=output,
         source_link=source_link,
         known_failure_reason=known_failure_reason,
+        build=build,
     )
 
 
 def run_record_to_dict(rec: RunRecord) -> Dict[str, Any]:
     """Serialize a :class:`RunRecord` to the exact transport dict shape.
 
-    Round-trips with :func:`parse_run_record`.
+    Round-trips with :func:`parse_run_record`. ``build`` is included
+    only when set, so a mainline record serializes to exactly the shape
+    every feeder deployed before WP-21 already sends — back compat is
+    free (docs/STREAMS_PLAN.md §0.2).
     """
-    return {
+    out = {
         "environment": rec.environment,
         "script": rec.script,
         "test_name": rec.test_name,
@@ -312,4 +364,7 @@ def run_record_to_dict(rec: RunRecord) -> Dict[str, Any]:
         "output": rec.output,
         "source_link": rec.source_link,
         "known_failure_reason": rec.known_failure_reason,
-    }
+    }  # type: Dict[str, Any]
+    if rec.build is not None:
+        out["build"] = rec.build
+    return out

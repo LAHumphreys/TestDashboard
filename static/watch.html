@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>testboard — watch</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="home">
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html">Dashboard</a>
+      <a href="actions.html">Open actions</a>
+      <a href="time.html">Time</a>
+      <a href="timeline.html">Timeline</a>
+      <a href="watch.html" aria-current="page">Watch</a>
+      <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
+    </nav>
+    <!-- ADDENDUM to the perf round: no product switcher here, deliberately.
+         Watch is cross-product BY DEFINITION (docs/STREAMS_PLAN.md §0.9 --
+         a manager composes cards across products; the URL is the whole
+         configuration) -- the switcher would scope nothing on this page
+         (every card already carries its own scope) and its action was
+         actively destructive (switching it navigated to a URL that used
+         to silently wipe a saved default's cards -- fixed separately in
+         watch.js's init(), but the control's presence was still a lie
+         regardless). products.js is still loaded (below) for
+         adoptProductFromUrl()'s site-wide "the URL wins" behaviour; its
+         own init() already guards a missing #product-switcher mount and
+         simply does nothing here. -->
+    <div id="user-widget" class="user-widget"></div>
+  </header>
+
+  <main class="wide">
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <!-- The morning view (docs/STREAMS_PLAN.md §0.9/§2.4): a manager
+         responsible for some set of products/environments composes ONE
+         page and hands the URL to a colleague. THE URL IS THE WHOLE
+         CONFIGURATION -- there is no account and no server-side saved
+         view, only this browser's own "default" in localStorage, the
+         same mechanism the What's-new unread dot uses. -->
+    <section class="toolbar watch-toolbar" aria-label="Watchlist controls">
+      <label class="toolbar-field">Add
+        <select id="add-kind" aria-label="Card kind">
+          <option value="e">Environment</option>
+          <option value="p">Product</option>
+          <option value="s">Build</option>
+        </select>
+      </label>
+      <label class="toolbar-field">
+        <select id="add-name" aria-label="Name"></select>
+      </label>
+      <label class="toolbar-field">Expect within
+        <select id="add-cadence" aria-label="Declared cadence">
+          <option value="">no expectation</option>
+          <option value="1d">1 day</option>
+          <option value="7d">7 days</option>
+          <option value="custom">custom hours…</option>
+        </select>
+      </label>
+      <label class="toolbar-field" id="add-cadence-hours-label" hidden>
+        <input id="add-cadence-hours" type="text" inputmode="numeric"
+               placeholder="hours" aria-label="Custom hours" size="4">
+      </label>
+      <button id="add-card-btn" type="button" class="btn-primary">Add card</button>
+      <span class="toolbar-spacer"></span>
+      <button id="save-default-btn" type="button">Save as my default</button>
+      <span id="save-status" class="muted" role="status"></span>
+    </section>
+
+    <section class="watch-link-row" aria-label="Share this Watchlist">
+      <label class="watch-link-label" for="watch-link">Copy link</label>
+      <input id="watch-link" class="watch-link-input" type="text" readonly
+             aria-label="This Watchlist's URL">
+    </section>
+
+    <div id="empty-state" class="empty-state watch-empty-state" hidden>
+      <h2 class="watch-empty-heading">No cards yet</h2>
+      <p class="watch-empty-lead">A Watchlist is a page you build once.</p>
+      <ol class="watch-empty-steps">
+        <li>Add an environment, product, or build above.</li>
+        <li>Click <strong>"Save as my default"</strong> so a bare visit to
+          this page opens straight to it.</li>
+        <li>Click <strong>"Copy link"</strong> to turn whatever's on screen
+          into a URL you can hand to anyone — no account needed.</li>
+      </ol>
+    </div>
+
+    <div id="watch-grid" class="watch-grid"></div>
+  </main>
+
+  <script type="module" src="watch.js"></script>
+  <script type="module" src="products.js"></script>
+  <script type="module" src="nav.js"></script>
+</body>
+</html>

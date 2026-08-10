@@ -15,8 +15,11 @@
       <a href="actions.html" aria-current="page">Open actions</a>
       <a href="time.html">Time</a>
       <a href="timeline.html">Timeline</a>
+      <a href="watch.html">Watch</a>
       <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
     </nav>
+    <span id="product-switcher" class="product-switcher" data-host-managed
+          hidden></span>
     <div id="user-widget" class="user-widget"></div>
   </header>
 
@@ -29,7 +32,7 @@
       </label>
       <label>Result
         <select id="filter-result">
-          <option value="open">Needs action (failing or stale annotation)</option>
+          <option value="open">Needs action (failing, stale annotation, or assigned)</option>
           <option value="FAIL">Failing only</option>
           <option value="UNEXPECTED_PASS">Stale annotations only</option>
         </select>
@@ -47,6 +50,13 @@
            everything nobody has picked up yet. -->
       <div id="owner-filters" class="owner-filters" role="group"
            aria-label="Filter by assignee"></div>
+      <!-- Only shown once at least one CURRENT assignment carries a
+           non-mainline stream (WP-21, docs/STREAMS_PLAN.md §3.6) --
+           zero visible change on every install that has never fed a
+           branch/build in. Populated and toggled entirely by
+           actions.js; see renderOriginFilter(). -->
+      <div id="origin-filters" class="owner-filters" role="group"
+           aria-label="Filter by assignment origin" hidden></div>
     </section>
 
     <section id="actions-section" aria-labelledby="actions-heading">
@@ -54,11 +64,48 @@
         <h2 id="actions-heading" class="eyebrow">Open actions</h2>
         <span id="actions-meta" class="muted"></span>
       </div>
+      <!-- Bulk assign/unassign every test the CURRENT filters match
+           (2026-08-10, found the same morning as the origin filter:
+           assignments from a dead build persist and cleanup was
+           per-row). Hidden until there is something to act on
+           (state.total === 0) -- zero visible change on an empty
+           queue. No confirm() -- nothing in this codebase uses one
+           (checked: review.js's retirement gate is a required
+           free-text reason box, not a popup); the gate here is the
+           same required-explicit-input idiom the bulk product-assign
+           control above (envs-bulk-assign) already uses: a required
+           username input for assign, and the exact count stated in
+           both sentences so neither click is blind. -->
+      <div id="bulk-actions" class="envs-bulk-assign" hidden>
+        <label class="toolbar-field">
+          Assign all <span id="bulk-actions-count">0</span> filtered
+          test(s) to
+          <!-- Populated at init() with the standard user dropdown
+               (api.js's userPickerSelect(), the SAME pattern every
+               other assignee control in this app uses) -- was a
+               free-text input ("just lazy", the user's words,
+               2026-08-10): a typo here silently assigned work to a
+               name nobody could act on, with no active-user check and
+               no autocomplete. -->
+          <span id="bulk-assign-username-slot"></span>
+        </label>
+        <input id="bulk-assign-comment" type="text"
+               placeholder="note (optional)"
+               aria-label="Optional comment to post on every filtered test">
+        <button id="bulk-assign-btn" type="button" disabled>Assign</button>
+        <span class="toolbar-spacer"></span>
+        <span class="muted">
+          Unassign all <span id="bulk-unassign-count">0</span> filtered
+          test(s)
+        </span>
+        <button id="bulk-unassign-btn" type="button">Unassign all</button>
+      </div>
       <div class="table-wrap">
         <table class="data-table" id="actions-table">
           <thead>
             <tr>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="test_name">Test<span class="sort-arrow"></span></button></th>
+              <th id="product-col-head" class="product-col" hidden>Product</th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="result">Result<span class="sort-arrow"></span></button></th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="assignee">Assignee<span class="sort-arrow"></span></button></th>
               <!-- Latest comment has no sort: ordering by comment time
@@ -80,6 +127,7 @@
       <p id="empty-state" class="empty-state" hidden>Nothing matches these filters.</p>
       <div class="browse-footer">
         <span id="actions-count" class="muted"></span>
+        <span id="actions-product-note" class="muted" hidden></span>
         <button id="show-more" type="button" hidden>Show more</button>
       </div>
     </section>
@@ -134,11 +182,34 @@
           passes below are not counting.
         </p>
         <p id="envs-cutoff" class="muted"></p>
+        <!-- Upgrade-day bulk assign (WP-23 addendum): before any product
+             is declared, every environment is implicitly product "" —
+             this turns "declare N environments one at a time" into one
+             action. Hidden whenever nothing is unmapped: zero visible
+             change on an estate that has already been fully declared, or
+             that has never used products at all. Deliberately NOT a
+             standing default applied automatically on import — see
+             docs/STREAMS_PLAN.md §2 for why. -->
+        <div id="envs-bulk-assign" class="envs-bulk-assign" hidden>
+          <label class="toolbar-field">
+            Assign <span id="envs-bulk-count">0</span> unmapped
+            environment(s) to
+            <input id="envs-bulk-product" type="text"
+                   placeholder="product name"
+                   aria-label="Product to bulk-assign unmapped environments to">
+          </label>
+          <button id="envs-bulk-btn" type="button">Assign</button>
+        </div>
         <div class="table-wrap">
           <table class="data-table" id="envs-table">
             <thead>
               <tr>
                 <th>Environment</th>
+                <!-- Which product this environment belongs to (WP-20).
+                     Editable here, not hidden behind a details toggle of
+                     its own: this section is already the "administrative,
+                     rare" home for per-environment declarations. -->
+                <th>Product</th>
                 <th>Tests seen</th>
                 <th>Expected</th>
                 <th>Recent passes</th>
@@ -157,6 +228,7 @@
   </main>
 
   <script type="module" src="actions.js"></script>
+  <script type="module" src="products.js"></script>
   <script type="module" src="nav.js"></script>
 </body>
 </html>

@@ -39,8 +39,8 @@ from feeder.identity import (
 from testboard import model
 
 __all__ = [
-    "DEFAULT_TIMEOUT_SECONDS", "Opener", "SubmitStats", "Submitter",
-    "describe_connection_error", "group_reason", "identity_of",
+    "DEFAULT_TIMEOUT_SECONDS", "Opener", "StreamsAckMissing", "SubmitStats",
+    "Submitter", "describe_connection_error", "group_reason", "identity_of",
     "IMPORT_PATH", "normalize_url", "render_reasons",
     "urllib_opener",
 ]
@@ -104,6 +104,25 @@ def _format_duration(seconds: float) -> str:
     if minutes:
         return "{0}m {1:02d}s".format(minutes, secs)
     return "{0}s".format(secs)
+
+
+class StreamsAckMissing(Exception):
+    """Raised when a ``--build`` run gets a 200 with no ``streams_seen``
+    key at all (WP-21, docs/STREAMS_PLAN.md §3.3/§3.7; ``--branch``
+    removed by WP-25, docs/ONE_KIND_PLAN.md, before it ever shipped).
+
+    Every deployed server before this drop ignores unknown JSON keys, so
+    a feeder sending ``build`` at a pre-WP-21 server would silently
+    import those runs into MAINLINE — the same class of danger
+    as the schema-version refusal, and handled the same way: refuse
+    loudly instead of corrupting quietly. Raised from inside
+    :meth:`Submitter._handle_success` on the FIRST batch that exhibits
+    it, so it propagates out of :meth:`Submitter.submit` immediately —
+    the caller must not save a high-water mark or declare success once
+    this fires, and the batch that triggered it already got a real 200
+    (the data IS stored, just possibly in the wrong place), so no replay
+    file is written for it.
+    """
 
 
 class SubmitStats(NamedTuple):
@@ -276,7 +295,8 @@ class Submitter:
                  replay_dir: str = ".",
                  max_consecutive_failures: int = 3,
                  max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 build: Optional[str] = None) -> None:
         """Configure the submitter.
 
         ``url`` may be the dashboard base (e.g. ``http://host:8000``) or the
@@ -299,6 +319,14 @@ class Submitter:
         replay file — for every remaining batch, which at a year of
         history means thousands of files and hours of retry backoff for
         an import that cannot succeed.
+
+        ``build`` (WP-21, validated by the CLI before this is
+        constructed; ``--branch`` removed by WP-25 before it ever
+        shipped) does NOT stamp records here — that happens in
+        run_feeder.py, on the raw dicts, before they ever reach
+        :meth:`submit`. Its only job in this class is to say "this run
+        expects the streams_seen acknowledgment"; see
+        :class:`StreamsAckMissing`.
         """
         self._url = normalize_url(url)
         self._batch_size = max(1, int(batch_size))
@@ -311,6 +339,7 @@ class Submitter:
         self._max_batch_bytes = max(1, int(max_batch_bytes))
         self._clock = clock
         self._max_accepted = None  # type: Optional[datetime.datetime]
+        self._expect_streams_ack = build is not None
 
     def submit(self, records: Iterable[Dict[str, Any]],
                dry_run: bool = False,
@@ -564,6 +593,19 @@ class Submitter:
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        if self._expect_streams_ack and "streams_seen" not in payload:
+            raise StreamsAckMissing(
+                "batch {0}: this run was given --build, but the "
+                "server's response to POST {1} has no 'streams_seen' key "
+                "at all. That key was added in WP-21; a server without it "
+                "does not know about build runs and would silently "
+                "file them into MAINLINE. Batch {0} itself DID get a real "
+                "200 (its data is stored, most likely in mainline) — "
+                "aborting before any further batch does the same. Update "
+                "the dashboard server to a build that includes WP-21, or "
+                "drop --build to import as mainline "
+                "deliberately.".format(batch_number, self._url)
+            )
         inserted = int(payload.get("inserted", 0) or 0)
         updated = int(payload.get("updated", 0) or 0)
         rejected = int(payload.get("rejected", 0) or 0)

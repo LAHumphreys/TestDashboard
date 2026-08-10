@@ -105,11 +105,27 @@ button.linkish {
 
 button.linkish:hover { background: none; color: #0d3f7c; }
 
-select, input[type="search"], textarea {
+/* The app's one primary-action button (Watchlist's "Add card" — the
+   control that decides what gets added, not one that acts on
+   something already on screen). Generic on purpose, same radius/
+   padding as the plain `button` rule above, only the fill changes —
+   but used on that one toolbar for now; a page full of blue buttons
+   would drown the one that matters. */
+button.btn-primary {
+  background: var(--accent-link);
+  border-color: var(--accent-link);
+  color: #fff;
+  font-weight: 600;
+}
+
+button.btn-primary:hover { background: #124a86; border-color: #124a86; }
+
+select, input[type="search"], input[type="text"], textarea {
   background: var(--card);
   border: 1px solid #c9c9c4;
   border-radius: 6px;
   padding: 5px 8px;
+  font: inherit;
 }
 
 textarea {
@@ -1266,6 +1282,17 @@ button.bar-row:focus-visible {
   line-height: 1.5;
 }
 
+.envs-bulk-assign {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 14px;
+  font-size: 13px;
+}
+
+.envs-bulk-assign input[type="text"] { width: 160px; }
+
 #people-table tr.is-inactive td:first-child {
   color: var(--muted);
   text-decoration: line-through;
@@ -1848,4 +1875,477 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 3px;
+}
+
+/* ---------------- product switcher (WP-20) ---------------- */
+
+/* Hidden by default (see products.js) — a deployment with fewer than two
+   declared products must see no visible change at all. */
+.product-switcher { display: flex; align-items: center; }
+
+.product-switcher-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.product-switcher-label select { font: inherit; }
+
+/* ---------------- Watchlist (WP-20, docs/STREAMS_PLAN.md §2.4) ----------------
+ *
+ * 2026-08-10 style pass (user verdict: this is a landing page managers
+ * read every morning, and it needs to look like the rest of the app --
+ * the polish pass below matches the eyebrow/hairline/tabular-nums
+ * language the home screen and Open Actions already use, rather than
+ * inventing a second one). Card DOM structure/class names are
+ * unchanged (guard tests + the accent classes are pinned); this section
+ * is a restyle, not a rebuild.
+ */
+
+.watch-toolbar { flex-wrap: wrap; }
+
+.watch-toolbar select { min-width: 150px; }
+
+.watch-link-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 18px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.watch-link-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.watch-link-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--muted);   /* readonly and reads that way -- a reference, not a field to edit */
+}
+
+/* Bounded panel, not a stray italic line -- "no cards yet" is the
+   FIRST thing a manager following a bare link to this page sees, so
+   it gets the same card treatment as the cards it is standing in
+   for, with the three steps as a short list rather than one dense
+   paragraph. Overrides the sitewide .empty-state (italic, unboxed)
+   deliberately; that default still serves every other page's small
+   inline "nothing here" lines untouched. */
+.watch-empty-state {
+  max-width: 520px;
+  margin: 8px auto 20px;
+  padding: 28px 32px 30px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-style: normal;
+  color: var(--ink);
+  text-align: left;
+}
+
+.watch-empty-heading {
+  margin: 0 0 8px;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.watch-empty-lead {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.watch-empty-steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+
+.watch-empty-steps li { margin-bottom: 6px; }
+.watch-empty-steps li:last-child { margin-bottom: 0; }
+
+/* Equal-height cards: minmax(280px, 1fr) reads well down to a single
+   column, align-items: stretch is what makes every card in a row the
+   same height so buildCardFooter's margin-top: auto below can pin the
+   footer to the bottom of the shortest as well as the tallest card. */
+.watch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+  align-items: stretch;
+}
+
+.watch-card { display: flex; flex-direction: column; }
+
+/* This card's own data failed to resolve (unknown name, etc.) -- a
+   fact about the card, not about anything it watches, so it gets the
+   same 3px-left-bar treatment as the accent classes below rather than
+   a full tinted border. */
+.watch-card-error { border-left: 3px solid var(--c-fail); }
+
+/* Header band: the kind as a small bordered eyebrow pill, the name at
+   ~15px semibold ink, a hairline below separating the identity of the
+   card from what it reports. */
+.watch-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 10px;
+  padding: 0 0 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.watch-card-kind {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+
+.watch-card-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+/* A stream card's product line, directly under the head band. */
+.watch-card-head + .row-sub { margin: -6px 0 10px; }
+
+/* The morning-scan hero (2026-08-10 redesign): the two numbers a
+   board scan reads — unowned failures and freshness — lead every ok
+   card, sized down from the original draft (32px) to sit comfortably
+   as the second-loudest thing on the page after the KPI tiles on the
+   home screen, which use the same size for the same reason. The alarm
+   color is the result palette's fail on purpose (an unowned failure
+   IS a failure fact); the zero state and the freshness value stay
+   neutral. Labels use the same eyebrow idiom as the card's own kind
+   badge and the rest of the app's section headers. */
+.watch-card-hero {
+  display: flex;
+  gap: 28px;
+  align-items: baseline;
+  margin: 0 0 12px;
+}
+
+.watch-hero-stat { display: flex; flex-direction: column; gap: 2px; }
+
+.watch-hero-value {
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+a.watch-hero-value { text-decoration: underline; }
+
+.watch-hero-alarm { color: var(--c-fail); }
+
+.watch-hero-ok { color: var(--muted); }
+
+.watch-hero-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+/* Supporting stats: quieted relative to the hero above them -- same
+   information, smaller type, so the hero is unambiguously what a scan
+   reads first. */
+.watch-card-verdict {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 0 0 8px;
+}
+
+.watch-stat { display: flex; flex-direction: column; gap: 1px; }
+
+.watch-stat-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.watch-stat-label { font-size: 11px; color: var(--muted); }
+
+/* A stream card's "N failing in <name>" headline, between the hero
+   and the supporting stats. */
+.watch-card-headline {
+  margin: 0 0 2px;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+/* Freshness/staleness detail: a quiet hairline above separates it
+   from the stats block, same idiom as the review panel's own
+   actions-row divider. */
+.watch-card-fresh {
+  margin: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.watch-card-stale {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: #8a6d00;
+}
+
+.watch-card-error-text {
+  font-size: 13px;
+  color: var(--c-fail);
+  margin: 0;
+}
+
+/* Footer row: the way into the dashboard on the left, the editing
+   controls on the right -- pinned to the bottom of the card via
+   margin-top: auto (the card is a flex column; see .watch-card and
+   .watch-grid's align-items: stretch above) so every card in a row
+   ends at the same baseline whatever its content above adds up to. */
+.watch-card-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.watch-card-open {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-link);
+}
+
+/* Move up / Move down / Remove: hover- or focus-revealed (user
+   decision) -- a resting card should read as calm as its neighbours,
+   but the controls stay in normal flow (opacity, never display:none)
+   so revealing them never reflows the grid and Tab order is
+   untouched. margin-left: auto keeps them pinned right whether or not
+   the card has an "Open in dashboard" link beside them (an error card
+   has none). */
+.watch-card-controls {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+
+.watch-card:hover .watch-card-controls,
+.watch-card:focus-within .watch-card-controls {
+  opacity: 1;
+}
+
+.watch-card-control-btn {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--card);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.watch-card-control-btn:hover {
+  background: var(--surface);
+  color: var(--ink);
+  border-color: #c9c9c4;
+}
+
+.watch-card-control-btn:disabled { opacity: 0.45; cursor: default; }
+
+.watch-card-remove:hover { color: var(--c-fail); border-color: #e39a9a; }
+
+/* Unassigned-failure highlight (WP-23, docs/STREAMS_PLAN.md §2.4): a
+   card whose scope has at least one currently-failing test nobody
+   owns. Colour is never the only carrier -- the "unassigned failures"
+   hero stat says the same thing in text. unassigned_failing === 0
+   means this class is never added: zero visible change.
+   Accent = a 3px left bar (user decision), not a full tinted border:
+   cards without an accent keep the standard hairline all round: this
+   only overrides the left edge, so the other three sides stay
+   whatever .card already drew. */
+.watch-card-accent-fail { border-left: 3px solid var(--c-fail); }
+
+/* Declared-staleness accent (WP-23): the SAME non-result amber
+   .tl-partial uses for "ran fewer tests than known" -- staleness is a
+   timing/coverage fact, not a failure, so it must never borrow the
+   red/green result palette (not --c-fail, not --c-fae). Only applied
+   when there is no unassigned-failure accent to show instead (see
+   applyWatchAccent() in watch.js) -- the staleness TEXT LINE above
+   still renders either way. */
+.watch-card-accent-stale { border-left: 3px solid #8a6d00; }
+
+/* ---------------- Streams / branch-vs-mainline delta (WP-21, docs/STREAMS_PLAN.md §3.6) ---------------- */
+
+.stream-picker { display: flex; align-items: center; }
+
+.stream-picker-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* WP-22 swapped the picker from <select> to <input type="text" list=…>
+   (a combo box, so a branch name can be typed/filtered rather than
+   only picked); this box is what makes "branch:feature/checkout-rewrite"
+   readable rather than clipped to a default text-input width. Same
+   combo-box idiom, same width need, for the delta view's "Compare to"
+   input (compare.js) — "build:2026.9.1" / "Mainline nightlies" are no
+   shorter. */
+#stream-picker-input, #compare-to-input { min-width: 220px; }
+
+/* A result cell with no data on that side at all — never a chip, so it
+   can never be mistaken for a real pass/fail/etc. value. */
+.chip-none {
+  font-size: 12px;
+  font-style: italic;
+}
+
+.branch-band {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  margin: 0 0 16px;
+  background: #fff3e0;
+  border: 1px solid #e0a95c;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.branch-band a { font-weight: 600; }
+
+.compare-strip {
+  display: inline-flex;
+  align-items: center;
+  margin: 6px 0 0;
+}
+
+/* Open Actions: a small "made from a branch" tag beside the assignee
+   select (WP-21, docs/STREAMS_PLAN.md §3.6). Text-only, no colour-alone
+   signal, matching the rest of this file's chip/tag language. */
+.origin-tag {
+  font-size: 11px;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+/* ---------------- multi-select (2026-08-10, selection.js) ----------------
+   Tick boxes on every table where a test can be assigned, plus the one
+   shared sticky-bottom action bar. Appended here (end of file, owner
+   selection.js) rather than interleaved with an existing section, since
+   this stylesheet is also being edited concurrently for the Watch page
+   restyle -- new rules for a new component belong at the end, not woven
+   into a section someone else is mid-edit on. */
+
+/* Narrow leading column, every selectable table -- the box is the only
+   content, so it should not fight the columns that carry data for
+   width. */
+.select-col {
+  width: 1%;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.select-col input[type="checkbox"],
+.select-all-checkbox,
+.row-select-checkbox {
+  cursor: pointer;
+}
+
+/* FIXED to the viewport bottom, the same idiom style.css's .failure-nav
+   pill already uses for "a control that scrolls away is used once" --
+   card-styled, visible only while the selection is non-empty (JS sets
+   [hidden]; body.has-selection-bar reserves room for it so it does not
+   sit over the last table row). z-index below .failure-nav's 40: the
+   stepper is a per-page navigation aid and should still win if the two
+   ever occupy the same corner. */
+.selection-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 39;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.14);
+}
+
+.selection-bar[hidden] { display: none; }
+
+body.has-selection-bar { padding-bottom: 60px; }
+
+.selection-count { font-weight: 650; }
+
+.selection-user-select {
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid var(--grid);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.selection-note-input {
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 8px;
+  min-width: 200px;
+  border: 1px solid var(--grid);
+  border-radius: 5px;
+}
+
+.selection-sep { color: var(--muted); }
+
+.selection-assign-btn:disabled,
+.selection-unassign-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }

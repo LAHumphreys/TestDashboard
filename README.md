@@ -124,14 +124,28 @@ Validation rules per record:
 - `output`: required key, must be a string (may be `""`).
 - `source_link`: optional string, defaults to `""`.
 - `known_failure_reason`: optional, string or null, defaults to null.
-- Unknown extra keys are ignored (forward compatibility).
+- `build` (added WP-21): optional, string or null. Present and non-empty (after
+  stripping) means this run belongs to a STREAM beside the mainline nightlies — a
+  release build's results, or an RC's, kept off mainline's trend, triage and
+  staleness entirely (see "Streams" below). Absent (null, or absent) means
+  mainline, exactly what every feeder sent before this field existed — back compat
+  is free.
+- `branch` (WP-21 originally added it as a second stream kind; **removed by WP-25,
+  `docs/ONE_KIND_PLAN.md`, before it ever shipped anywhere** — the branch/build
+  distinction never earned its weight, so it was deleted, not migrated): a record
+  carrying this key is **REJECTED**, present or not, whatever its value —
+  `"branch: removed before this contract ever shipped — use build:"`. Checked by
+  key PRESENCE, not value, so `"branch": null` is rejected too; a client sending
+  it must switch to `build`. One bad record never aborts the batch.
+- Unknown extra keys (other than `branch`) are ignored (forward compatibility).
 
 **Idempotency:** a run is uniquely keyed by
-`(environment, script, test_name, start_time)`. Re-importing the same run updates it
-in place — re-running an import is always safe and never duplicates data. A record
-that is **byte-identical** to what is stored (all fields, output included) writes
-nothing at all: feeders that re-push their whole recent window on a schedule cost
-the server nothing but reads.
+`(environment, script, test_name, start_time)` **on its stream** — see "Streams"
+below for the one edge case where the underlying table-level key (without the
+stream) collides. Re-importing the same run updates it in place — re-running an
+import is always safe and never duplicates data. A record that is **byte-identical**
+to what is stored (all fields, output included) writes nothing at all: feeders that
+re-push their whole recent window on a schedule cost the server nothing but reads.
 
 Response — `200` even when some records are rejected; one bad record never aborts the
 batch (valid records are still upserted):
@@ -151,7 +165,8 @@ batch (valid records are still upserted):
       "test_name": "test_bar",
       "start_time": "2026-07-25T02:14:07.123456"
     }
-  ]
+  ],
+  "streams_seen": ["build:2026.9.1-rc2"]
 }
 ```
 
@@ -166,6 +181,137 @@ byte-identical ones — its meaning on the wire has not changed, so a feeder sum
 (added 2026-07-31) refines it: the subset that required no write. A push whose
 records are all `unchanged` is the healthy steady state for a scheduled re-push,
 not a stall.
+
+`streams_seen` (added WP-21): the sorted `"build:{name}"` of every non-mainline
+stream this batch NAMED (whether or not every individual record on it was stored —
+see the collision case below), `[]` for a batch with no `build` records.
+**This is the key a `--build` feeder invocation checks for.** Every
+server before WP-21 ignores unknown JSON keys, so it would accept a `build`-
+carrying batch and silently file the runs into mainline; a response with
+this key **absent entirely** (not present-and-empty) is the only signal that
+distinguishes that from a real WP-21 server answering a mainline-only batch, and
+the feeder treats it as fatal — see "Feeding in your own results" below.
+
+#### Streams (build runs beside mainline)
+
+Added WP-21 (`docs/STREAMS_PLAN.md`); narrowed from two non-mainline kinds
+(`branch`, `build`) to one (`build`) by WP-25 (`docs/ONE_KIND_PLAN.md`) — the
+`branch` kind never shipped anywhere, so this was a deletion, not a migration.
+A record carrying `build` is attributed to a STREAM — `(product, kind, name)`,
+`kind` always `'mainline'` or `'build'`, where `product` is resolved from the
+record's `environment` (via the declared environment→product mapping, WP-20)
+**at the moment the stream is first seen**, then fixed for that stream's
+lifetime even if the mapping changes later. There is no registry to maintain: the
+first record naming a stream creates it, inside the same transaction as the
+import, the same way an unrecognised `environment` has always worked.
+
+**Mainline is provably unaffected.** A stream's un-retirement never fires (a
+build run reporting against a mainline-retired test does not un-retire it —
+the build may predate the decision). `activity_hours`/`script_hours` (the
+trend, the staleness cutoff, the Timeline's running order) are maintained
+for EVERY stream (WP-23) — each stream's rows are a disjoint partition
+(`stream_id` leads both tables' PRIMARY KEY), so a build's own activity can
+never change a byte of mainline's. `/api/summary`, `/api/time` and
+`/api/timeline` all accept an optional `stream=<id>` (default: mainline —
+every caller from before WP-23 sees no change); a long-running build's
+"own results" dashboard tab reads its own status/trend/triage/running-order
+through the exact same endpoints, scoped.
+
+**The one collision case.** Run identity is `(stream, environment, script,
+test_name, start_time)`, but the underlying `runs` table's UNIQUE constraint
+predates streams and is frozen at `(environment, script, test_name, start_time)`
+alone — no stream column. If a record's exact key is already claimed by a
+**different** stream (in practice: a build run microsecond-identical to a
+mainline run of the same test — vanishingly unlikely, but the constraint makes it
+impossible to store either way), that record is **rejected**, not silently
+overwritten and not silently misfiled onto the other stream: it appears in
+`errors[]` naming both streams (e.g. `"...already recorded on stream 'mainline';
+this record targets stream 'build:feature/x'..."`), and the rest of the batch is
+unaffected.
+
+`GET /api/streams?product=<name>` lists a product's non-mainline streams (id,
+kind, name, first_seen, last_seen, a current failing count) — `product` defaults
+to `""`, the implicit grouping for environments with no declared product; an
+unknown product is an empty list, never 404. `GET /api/compare?stream=<id>` (with
+an optional `category=` for one paginated slice, `limit`/`offset`) returns the
+SIX-way classification of that stream's tests against mainline
+(`new_failures`/`new_passes`/`both_failing`/`new_tests`/`no_result`, plus
+`agree` — both sides have a result and it is not FAIL on either — a real
+field rather than something the caller re-derives, since it is what the "N
+tests agree and are not listed" and coverage lines on the dashboard need)
+plus both sides' identity and `last_seen`; `baseline=` (WP-22) accepts any
+stream id of the SAME product as `stream=`, not only mainline — a build
+judged against the build before it, or one build against another — and
+defaults to mainline when omitted (always, per WP-25's "default baseline is
+mainline" decision — see `docs/ONE_KIND_PLAN.md` §1.3; nothing picks a
+predecessor build automatically any more). Mainline is the one universal exception
+to the product check on either side (its own `product` is `""` by
+construction, shared by every product). A baseline naming a DIFFERENT
+product than `stream=` is refused with `400`, naming both products — the
+comparison's environments are resolved from `stream='s` own product, so a
+mismatched baseline would otherwise silently compare against the wrong
+environments instead of erroring. Each row of a `category=` page is
+`{environment, script, test_name, stream_result, baseline_result,
+stream_run_id, stream_start_time, assignee}` — `stream_run_id`/
+`stream_start_time` (WP-21) are the STREAM's own run (never the baseline's),
+both `null` exactly when `stream_result` is (nothing to review on that side);
+`assignee` is the triple's current, UNPARTITIONED assignee (the same value a
+mainline view of the same test would show — assigning is never scoped to a
+stream, only annotated with where it was made, see the assignee endpoint
+below).
+`GET /api/dashboard`, test detail and test history all accept an optional
+`stream=<id>` (default: mainline).
+
+`GET /api/tests/{env}/{script}/{test}/streams` (WP-22) returns this triple's
+latest result on every stream that HAS one, newest first by that stream's
+own run: `{environment, script, test_name, product, results: [{stream,
+result, run_id, start_time}, ...]}`. `product` is the ENVIRONMENT's own
+declared product (not necessarily any entry in `results` — the mainline
+stream's own `product` is always `""`, which would otherwise give the
+frontend no way to ask `GET /api/streams?product=` for the full stream list
+it needs to render NO RESULT rows for streams absent here). A stream with
+no result for the triple is simply absent from `results` — never
+fabricated. `404` if the triple has never run anywhere.
+
+#### What upgrading means for clients
+
+Nothing here breaks an existing feeder, and nothing here requires one to change
+anything, but it is worth stating plainly what each generation of client sees:
+
+- **A feeder that has never heard of `build`/products:** zero changes.
+  It sends the same transport schema it always has; absent `build`
+  means mainline, exactly as before that field existed; `product` is never on
+  the wire at all — it is a **server-side declaration**
+  (`PUT /api/environments/{env}/product`), made by a human against an
+  environment name, never sent or read by the feeder. A server upgraded under
+  a feeder that has not changed looks, to that feeder, identical to the one
+  before the upgrade.
+- **Declaring a new product: ordering matters.** A stream's `product` is
+  resolved from its environment's declared product **once, the moment the
+  stream is first seen, then fixed for that stream's lifetime** (see
+  "Streams" above). If a new product's CI starts pushing build results
+  under an environment BEFORE that environment's product mapping is declared,
+  the stream is created with product `""` and stays there permanently — there
+  is no admin action that moves an existing stream to a different product
+  after the fact. **Declare the environment→product mapping before that
+  product's build CI first pushes**, not after. (This is also why the
+  Open Actions page's bulk "assign every unmapped environment to product X"
+  control — a one-time upgrade-day convenience, see `docs/STREAMS_PLAN.md`
+  §2 — is an explicit action a human runs deliberately, never a standing
+  default applied automatically to new environments: a standing default would
+  silently mislabel a future product's environments if its first push beat
+  its mapping, and that mistake would be permanent for any stream born under
+  it.)
+- **A build client** (`docs/STREAMS_PLAN.md` §3; narrowed to build-only by
+  WP-25, `docs/ONE_KIND_PLAN.md` — `branch` was never a working option on any
+  shipped server): set `"build": "<name>"` on each record, or use the
+  feeder's `--build NAME` flag, which also requires the
+  import response's `streams_seen` acknowledgment and aborts loudly (exit 1, no
+  high-water-mark saved) if it is absent — the one signal that tells a WP-21+
+  server apart from an older one that would otherwise silently file everything
+  into mainline (see `streams_seen` above). Each stream gets its own feeder
+  state file (`feeder_state.build.<name>.json`), so a build's catch-up run
+  never shares — or fights over — mainline's high-water mark.
 
 ### GET /api/dashboard — latest run per test (paginated)
 
@@ -187,11 +333,15 @@ Query parameters (all optional):
 | `retired` | `1`/`true` — include tests retired as no longer in the suite (hidden by default) |
 | `assignee` | repeatable — only tests owned by these people |
 | `unassigned` | `1`/`true` — include tests nobody owns (ORed with `assignee`) |
+| `assigned` | `1`/`true` — only tests somebody owns, whatever their result (ANDed with the owner filters, so `assignee=` narrows it; contradicts `unassigned=1`, which then matches nothing). Added 2026-08-10; no page sends it today (Open Actions' default uses `open=` below) — kept for scripted queries and for `POST /api/assignments/bulk` below, which reads these SAME filters |
+| `open` | `1`/`true` — "needs action": failing, stale annotation, OR currently assigned to someone, whatever the result (an OR across the result and owner axes that the other params cannot compose). Open Actions' default view since 2026-08-10 — before it, an assignment on a passing test was reachable through no filter combination |
+| `origin` | `build` or `mainline` (WP-21; the non-mainline value was spelled `branch` until WP-25 renamed it before anything shipped) — only tests whose CURRENT assignment was made from a non-mainline stream, or made from mainline/never assigned, respectively; anything else → 400 |
 | `with_comment` | `1`/`true` — add `latest_comment` to each row (one index seek per returned row, so it is opt-in) |
 | `sort` | one of `environment` (default), `script`, `test_name`, `result`, `start_time`, `duration`, `assignee`; anything else → 400 |
 | `order` | `asc` (default) or `desc`; anything else → 400 |
 | `limit` | 1..1000, default 250 |
 | `offset` | ≥ 0, default 0 |
+| `stream` | stream id (WP-21) — which partition of `latest_runs` the row's own result comes from; default mainline |
 
 Response:
 
@@ -203,16 +353,25 @@ Response:
       "run_id": 7, "result": "FAIL",
       "start_time": "...", "end_time": "...", "duration_seconds": 1.234,
       "known_failure_reason": null, "source_link": "...", "assignee": null,
+      "assignment_stream_id": null,
       "retired_at": null, "retired_by": null
     }
   ],
-  "total": 12376, "limit": 250, "offset": 0
+  "total": 12376, "limit": 250, "offset": 0,
+  "streams": {}
 }
 ```
 
 With `with_comment=1` each row also carries
 `"latest_comment": {"author": "...", "created_at": "...", "text": "..."}`
 (absent when the test has no comments).
+
+`assignment_stream_id` (WP-21) is WHERE the row's current assignment was made
+from — `null` for mainline, unassigned, or a pre-WP-21 assignment. `streams`
+batch-resolves every DISTINCT non-null `assignment_stream_id` on the RETURNED
+PAGE to its identity (same shape as the comments endpoint's `streams` map,
+same reason: a "build 2026.9.1" tag needs a name, not just an id, and a lookup
+per row does not scale).
 
 `total` counts every test matching the filters, not the rows returned. Every
 ordering ends with the full test identity, so paging with `limit`/`offset` can
@@ -226,7 +385,27 @@ neither repeat nor skip a row.
 Everything the triage home screen needs in one request. Query parameters (all
 optional): `environment` (exact match; scopes every number below), `days`
 (integer 1..90, default 14; the trend window — invalid values → 400), `assignee`
-(adds the `mine` queue for that user).
+(adds the `mine` queue for that user), `stream=<id>` (WP-23, default: mainline
+— scopes `status`, `trend`, every queue, `queue_totals`, `top_failing_scripts`
+and `covered_passes` to one stream's own partition; `products`/`environments`/
+`scripts`/`assignees`/`assignment_streams` stay estate-wide regardless, since
+they answer "what exists" rather than one stream's results).
+
+`assignment_streams` (WP-21) lists every non-mainline stream currently
+annotating an assignment, resolved to its identity — Open actions' origin
+filter reads this the same way it reads `assignees`: the available values,
+and (empty list) the signal that no assignment carries a stream anywhere in
+the estate, so the filter does not render at all.
+
+`covered_passes` (WP-23) is the count of COVERED passes (a block of activity
+that ran at least half the stream's own tests — the same inference the
+staleness cutoff is derived from) the requested stream completed in its own
+14-day lookback — the number a long-running stream's two-tab header reads to
+decide whether it exists at all, and whether "Its own results" or "Difference
+from mainline" opens by default (WP-25, `docs/ONE_KIND_PLAN.md` §1.4: the
+same threshold now gates both, replacing the old kind-based gate — a
+stream meeting it gets both tabs, however it was uploaded), stated alongside
+the threshold in the caption rather than hidden.
 
 None of this is proportional to the size of the estate: the headline counts come
 from a single `GROUP BY` (a few dozen rows however many tests exist), and each
@@ -253,6 +432,9 @@ waiting for its slowest piece (this is what the home screen does):
   "environments": ["linux-prod-sim", "linux-uat-sim"],
   "scripts": ["regression/user_lifecycle.py", "smoke/login.py"],
   "assignees": ["alice", "luke"],
+  "assignment_streams": [{"id": 2, "product": "", "kind": "build",
+                          "name": "feat/x", "first_seen": "...",
+                          "last_seen": "...", "failing": 0}],
   "recent_hours": 36,
   "queue_cap": 500,
   "status": {
@@ -316,6 +498,40 @@ Definitions (matching the analytics semantics above):
   and are null elsewhere, including for every entry whose latest run is not a
   FAIL. Within the slice it returns, `still_failing` is ordered
   oldest-regression-first.
+
+### GET /api/watch — the Watchlist page's data, one request per page load
+
+`?c=` is repeated, one per card, in request order: `c=p:<product>`,
+`c=e:<environment>` or `c=s:<stream id>` (added WP-21). `p`/`e` cards come
+back as `{spec, kind, name, ok, failing, new_failures, fixed,
+unexpected_passes, stale_before, last_reported}` (product cards carry
+`last_reported: null` — there is no single truthful "last reported" for a
+card spanning several environments). `s` cards come back as `{spec,
+kind: "stream", name, ok, id, stream_kind, product, new_failures,
+new_passes, both_failing, new_tests, no_result, last_seen,
+baseline_kind, baseline_name, baseline_last_seen}` — the same five-way
+classification as `GET /api/compare` for that stream against its baseline,
+plus both sides' identity and freshness so the card can name what it was
+actually compared against and show its own staleness warning.
+`baseline_kind`/`baseline_name` are always `"mainline"`/`""` (WP-25,
+`docs/ONE_KIND_PLAN.md` §1.4: "one wording for all streams" — WP-22 had this
+card default to the nearest earlier same-product build by `last_seen` when
+one existed; WP-25 removed that, the same "default baseline is mainline,
+always" decision applied to the dashboard's own delta view, so a card's
+verdict and the dashboard it links to never disagree about what they are
+comparing against). A name/id that resolves to nothing (including `s:1`, the
+mainline stream —
+it is never a Watchlist entry, the same rule `GET /api/streams` applies)
+is instead `{spec, kind, name, ok: false, error}`. The page still answers
+200 around a mix of good and bad cards.
+
+**Cards per request are capped at 50.** A request naming more answers 413
+with the count and the limit in the message; a URL that long is treated as
+a mistake, not a use case. Every card kind, including `s:`, answers in O(1)
+queries regardless of how many cards of that kind are requested — one
+extra query total resolves every `s:` card's identity, and one more its
+compare counts, batched (`Storage.stream_identities`,
+`Storage.compare_counts_many`), the same shape `p:`/`e:` cards already used.
 
 ### GET /api/scripts/{environment}/{script}/executions — suite history
 
@@ -394,19 +610,140 @@ useful as recording why it fails. The full thread is on the test page; the
 newest comment is shown in the triage queues and the open-actions view.
 
 - `GET /api/tests/{env}/{script}/{test}/comments` — 404 unknown triple. Response:
-  `{"comments": [{"id": 1, "author": "alice", "created_at": "...", "text": "..."}]}`
-  oldest first.
-- `POST` same path — body `{"username": "...", "text": "..."}`. `username` non-empty,
-  max 100 chars (stripped); `text` non-empty, max 10000 chars. The user is created
-  implicitly if unknown. Returns `201` with `{"comment": {...}}`.
+  `{"comments": [{"id": 1, "author": "alice", "created_at": "...", "text": "...",
+  "stream_id": 1}], "streams": {"1": {"id": 1, "kind": "mainline", "name": "", ...}}}`
+  oldest first. The thread is **never filtered by the page's current `stream=`
+  scope** (WP-21) — one conversation, regardless of which stream someone was
+  looking at when they wrote a line of it. `streams` batch-resolves every
+  *distinct* non-null `stream_id` on the thread to its identity, in one extra
+  query — this is what lets the UI show a "posted from mainline" / "posted
+  from build 2026.9.1" tag on each comment without a lookup per comment. A
+  comment with `stream_id: null` (posted before WP-21, or with no declared
+  context) has no entry in `streams` and the UI shows it with no tag at all.
+- `POST` same path — body `{"username": "...", "text": "...", "stream_id":
+  1}`. `username` non-empty, max 100 chars (stripped); `text` non-empty, max
+  10000 chars. The user is created implicitly if unknown. `stream_id`
+  (WP-21) is optional — omitted or `null` means no declared context, the
+  same as every comment posted before this feature; when given it must
+  reference an existing stream (`404` otherwise) and is stored as the
+  comment's "posted from", not part of its identity. Returns `201` with
+  `{"comment": {...}}`.
 
 ### PUT /api/tests/{env}/{script}/{test}/assignee
 
-Body `{"username": "bob-or-null", "assigned_by": "alice"}`. The `"username"` key is
-**required**; pass `null` to clear the assignment. `assigned_by` must be a non-empty
-string. Both users are created implicitly if unknown. Assignment history is kept for
-audit; the current assignee is the most recent entry. Returns `200`
+Body `{"username": "bob-or-null", "assigned_by": "alice", "stream_id": 2}`. The
+`"username"` key is **required**; pass `null` to clear the assignment. `assigned_by`
+must be a non-empty string. Both users are created implicitly if unknown. Assignment
+history is kept for audit; the current assignee is the most recent entry. Returns `200`
 `{"assignee": "bob"}` (or null).
+
+`stream_id` (WP-21) is optional and is an **annotation**, not a scope: it records
+WHERE the assignment was made from, never who or what it targets — the assignee
+itself is the same value seen from mainline or from any build's view of the same
+test. Omitted or `null` means mainline, or a client that predates this field —
+every assignment ever made before WP-21. When given it must reference an existing
+stream (`404` otherwise). Both `GET /api/dashboard` rows and `GET /api/compare`'s
+paginated rows echo the current assignee; dashboard rows additionally carry
+`"assignment_stream_id"`.
+
+### POST /api/assignments/bulk — assign or clear a whole filtered set
+
+Added 2026-08-11, for Open Actions' bulk assign/unassign: assignments left
+behind by an abandoned build used to be cleared one row at a time. This acts
+on the SAME set of tests `GET /api/dashboard` would return for an identical
+query string — filter parsing is one shared function
+(`testboard.api._parse_dashboard_filters`), never a second hand-rolled copy
+that could drift from what the page above shows. Every `GET /api/dashboard`
+filter param in the table above is accepted here (`environment`, `script`,
+`result`, `q`, `stale`, `retired`, `assignee`, `unassigned`, `assigned`,
+`open`, `origin`, plus the product/`stream` scoping every other endpoint
+takes) — `sort`/`order`/`limit`/`offset`/`with_comment`/`with_streak` are not,
+since a bulk op acts on the whole matched set, not one page of it.
+
+Body:
+
+```json
+{"username": "alice-or-null", "assigned_by": "bob", "comment": "optional note"}
+```
+
+- `"username"` is **required**. A string sets every matched test's current
+  assignee to that one owner (bulk assign); `null` clears every matched
+  test's current assignment (bulk unassign). Validation matches
+  `PUT .../assignee` exactly: non-empty, max 100 chars, and a non-null
+  `username` naming a deactivated user is a `400`.
+- `"assigned_by"` is **required**, same validation as `PUT .../assignee`.
+- `"comment"`, if given and **non-empty after trimming whitespace**, is
+  posted as a comment on EVERY matched test, authored by `assigned_by`, in
+  the SAME transaction as the assignment change. Absent, `null`, or
+  whitespace-only all mean "no comment" — unlike `POST .../comments`' `text`,
+  which is required and 400s on empty, `comment` here is optional and its
+  non-emptiness gates whether it is used at all. A non-string value or one
+  over the shared 10000-character comment cap is still a `400`.
+
+Response: `{"updated": 12}` — the count of matched triples acted on, always
+equal to what `GET /api/dashboard` with the identical query string reports
+as `total`.
+
+Assignments stay **estate-level, one owner per (environment, script,
+test_name) triple** (`docs/STREAMS_PLAN.md` §0.4) — this endpoint never
+introduces per-stream ownership, and it never accepts or records a
+`stream_id` origin: unlike `PUT .../assignee`, there is no `stream_id` body
+field at all. Open Actions is unscoped, and an assignment origin is only
+ever recorded when the assignment was made FROM a stream-scoped page, which
+a bulk action from Open Actions is not — every row this endpoint touches
+gets `stream_id: NULL`, the same as a row-level assignment made from this
+page today. A matched row that WAS build-originated therefore leaves that
+origin-filter group the same way a row-level re-assign from Open Actions
+already does; re-running an identical `origin=build` bulk request finds
+nothing left to match.
+
+#### List mode — an explicit set of triples
+
+Added 2026-08-10, for the multi-select action bar (tick boxes on every
+table where a test can be assigned, `static/selection.js`): the SAME
+endpoint, a different way of saying which tests to act on. Body carries
+`"tests"` instead of relying on the query string:
+
+```json
+{
+  "username": "alice-or-null", "assigned_by": "bob", "comment": "optional",
+  "tests": [
+    {"environment": "linux-sim", "script": "suite/alpha.py",
+     "test_name": "test_x"},
+    {"environment": "win-uat", "script": "other.py",
+     "test_name": "test_y", "stream_id": 7}
+  ]
+}
+```
+
+- **Mutually exclusive with every filter-mode query param** above
+  (`environment`, `script`, `result`, `q`, `stale`, `retired`, `assignee`,
+  `unassigned`, `assigned`, `open`, `origin`, `product`, `stream`) — a
+  request naming `tests` alongside any of them is `400`, asking two
+  different, possibly contradictory questions ("these exact rows" vs
+  "whatever currently matches this filter") at once.
+- Each entry is `{"environment", "script", "test_name"}` (all three
+  required, non-empty strings) plus an **optional** `"stream_id"` — WHERE
+  that ONE entry's selection was made from (a build's delta table row
+  carries its stream; a mainline table's rows carry none), exactly the
+  same annotation `PUT .../assignee`'s own `stream_id` body field records,
+  just per-entry. A malformed entry is a loud `400` naming the entry's
+  index (`"tests[2].test_name: ..."`) — unlike `POST /api/import`, these
+  records are built by this app's own selection UI a moment earlier, so a
+  bad shape is a bug worth surfacing immediately rather than skipping the
+  row silently. An unknown `stream_id` is a `404`, same index-naming.
+- `"username"`/`"assigned_by"`/`"comment"` follow the identical rules
+  filter mode uses above.
+- A triple absent from `latest_runs` (on ANY stream) is **not** a failure
+  — the page that built the selection may be stale (a retirement, or the
+  test simply never having reported) — it is counted in the response
+  instead. A triple repeated in `"tests"` counts once (last `stream_id`
+  wins).
+
+Response: `{"updated": 3, "unknown": 1}` — a **different shape** from
+filter mode's `{"updated": N}` (filter mode has no "unknown": a match is
+always current, read in the same transaction it acts on).
+`updated + unknown` is the count of DISTINCT triples named in `"tests"`.
 
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 
@@ -615,6 +952,43 @@ python run_feeder.py --url http://127.0.0.1:8000 --mode catchup \
     --reader jsonl --source 'results/*.jsonl' \
     --state-file /var/lib/testboard/feeder_state.json
 ```
+
+### Feeding a build (WP-21; narrowed to build-only by WP-25)
+
+`--build NAME` stamps every record of the run as belonging to that stream
+instead of mainline — see "Streams" above for what that means server-side.
+(WP-21 originally shipped this alongside a second, `--branch`, flag; WP-25,
+`docs/ONE_KIND_PLAN.md`, removed `--branch` before it ever reached a server —
+the distinction never earned its weight.) Local validation mirrors the
+server's (non-empty after stripping).
+
+```
+python run_feeder.py --url http://127.0.0.1:8000 --mode catchup \
+    --reader jsonl --source 'ci-results/*.jsonl' \
+    --build 2026.9.1-rc2 \
+    --state-file /var/lib/testboard/feeder_state.json
+```
+
+Two things are different from a mainline run, both there to stop a build
+invocation from ever silently landing in mainline or clobbering mainline's
+own progress:
+
+- **The response is checked for the `streams_seen` acknowledgment.** A
+  server that predates WP-21 ignores the unknown `build` key and
+  would file the runs into mainline without complaint — its response also
+  lacks `streams_seen` entirely, which is the only signal that tells a new
+  feeder it is talking to an old server. When that happens the run aborts
+  (exit 1) **before** saving a high-water mark, with a message naming the
+  batch and the server. This can only be caught at runtime, not by
+  `--check-reader` — it needs a real response from the real server.
+- **The high-water-mark file is a DIFFERENT path**, derived from
+  `--state-file`: `feeder_state.json` becomes
+  `feeder_state.build.2026.9.1-rc2.json` (build names are
+  sanitized to filesystem-safe characters — they commonly contain `/`).
+  Without this, a build's catchup run would read and advance the *same*
+  mark as the mainline nightly, fast-forwarding one past runs it has never
+  actually seen. `--status` and `--forget-state` resolve the same derived
+  path when given the same `--build`.
 
 ### Importing a long history a slice at a time
 

@@ -42,8 +42,9 @@ EXPECTED = {
     # Delete-and-reinsert upsert. See RewriteSemanticsTest for what that
     # means and why these two sites are safe.
     "INSERT OR REPLACE": 2,
-    # SQLite spelling; MariaDB wants AUTO_INCREMENT.
-    "AUTOINCREMENT": 3,
+    # SQLite spelling; MariaDB wants AUTO_INCREMENT. WP-21 adds one:
+    # streams.id (migration 9).
+    "AUTOINCREMENT": 4,
     # Date functions: removed by migration 3 and must stay removed.
     "julianday": 0,
     "strftime": 0,
@@ -224,6 +225,7 @@ class RunIdStabilityTest(unittest.TestCase):
             result=result, start_time=start,
             end_time=start + self.datetime.timedelta(seconds=2),
             output=output, source_link="", known_failure_reason=None,
+            build=None,
         )
 
     def _run_id(self):

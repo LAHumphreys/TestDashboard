@@ -15,6 +15,7 @@
       <a href="actions.html">Open actions</a>
       <a href="time.html">Time</a>
       <a href="timeline.html">Timeline</a>
+      <a href="watch.html">Watch</a>
       <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
@@ -22,6 +23,16 @@
 
   <main class="wide">
     <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <!-- Script-page parity (FINAL ROUND, docs/STREAMS_PLAN.md §5.2 "as
+         built") -- same mount/markup as index.html/test.html/time.html/
+         timeline.html, rendered by the shared
+         compare.js:renderBranchBand(). Absent from the DOM's visible
+         state on every mainline visit. -->
+    <div id="branch-band" class="branch-band" hidden>
+      <span id="branch-band-text"></span>
+      <a id="branch-band-back" href="script.html">Back to mainline</a>
+    </div>
 
     <section id="script-header">
       <h1 id="script-title">Suite history</h1>

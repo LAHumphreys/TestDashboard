@@ -15,6 +15,7 @@
       <a href="actions.html">Open actions</a>
       <a href="time.html">Time</a>
       <a href="timeline.html">Timeline</a>
+      <a href="watch.html">Watch</a>
       <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
@@ -23,9 +24,30 @@
   <main>
     <div id="error-banner" class="error-banner" role="alert" hidden></div>
 
+    <!-- Only visible when this page was opened ?stream=<id> (WP-21,
+         docs/STREAMS_PLAN.md §3.6) -- absent from the DOM's visible
+         state on every mainline visit. Same band, same markup shape as
+         the dashboard's (compare.js's renderBranchBand renders both) --
+         found missing here in first human use: a reader deep in a
+         test's history/analytics/compare strip had no indication they
+         were scoped to a branch at all. -->
+    <div id="branch-band" class="branch-band" hidden>
+      <span id="branch-band-text"></span>
+      <a id="branch-band-back" href="test.html">Back to mainline</a>
+    </div>
+
     <section id="test-header">
       <h1 id="test-title">Test detail</h1>
       <p id="test-identity" class="muted identity-line"></p>
+      <!-- WP-22 (docs/STREAMS_PLAN.md §4.1, explicitly asked for during
+           first human use of WP-21): jump to this triple's result on any
+           OTHER stream that has one. Hidden when there is nothing to
+           switch to (mainline-only, no branch/build has ever run this
+           test) — a one-option "switcher" is not one. -->
+      <p id="stream-switcher-field" class="muted" hidden>
+        <label for="stream-switcher-select">Viewing on</label>
+        <select id="stream-switcher-select" aria-label="Switch to another stream's result for this test"></select>
+      </p>
       <p id="source-line" hidden>Source: <a id="source-link" rel="noopener" hidden></a><span id="source-text" hidden></span></p>
       <div class="assignee-box">
         <label for="assignee-select">Assignee</label>
@@ -35,6 +57,11 @@
       <div id="latest-run" class="latest-run"></div>
       <!-- Why this failure is expected, when the import says so. -->
       <div id="known-failure" class="known-failure" hidden></div>
+      <!-- Only shown when this page was opened with ?stream=<id> (WP-21,
+           docs/STREAMS_PLAN.md §3.6): mainline's own result beside this
+           branch's, for the SAME test. Absent entirely on every mainline
+           visit — zero visible change there. -->
+      <p id="compare-strip" class="compare-strip" hidden></p>
     </section>
 
     <section id="analytics-section" hidden>
@@ -100,6 +127,29 @@
               </table>
             </details>
           </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- WP-22 (docs/STREAMS_PLAN.md §4.1): this triple's latest result
+         on every stream of its product, newest first. Collapsed by
+         default, the same "dig deeper" treatment as the charts above —
+         and, on a page with no non-mainline streams, this whole section
+         stays hidden rather than opening onto a one-row table. -->
+    <section id="every-build-section" hidden>
+      <details id="every-build-details" class="charts-details">
+        <summary class="charts-summary">Every build — this test's latest result on each stream</summary>
+        <div class="table-wrap">
+          <table class="data-table small">
+            <thead>
+              <tr>
+                <th>Stream</th>
+                <th>Result</th>
+                <th>When</th>
+              </tr>
+            </thead>
+            <tbody id="every-build-body"></tbody>
+          </table>
         </div>
       </details>
     </section>

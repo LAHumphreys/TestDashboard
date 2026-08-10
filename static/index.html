@@ -15,19 +15,55 @@
       <a href="actions.html">Open actions</a>
       <a href="time.html">Time</a>
       <a href="timeline.html">Timeline</a>
+      <a href="watch.html">Watch</a>
       <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
     </nav>
+    <span id="product-switcher" class="product-switcher" data-host-managed
+          hidden></span>
     <div id="user-widget" class="user-widget"></div>
   </header>
 
   <main class="wide">
     <div id="error-banner" class="error-banner" role="alert" hidden></div>
 
+    <!-- Only visible when this page was opened ?stream=<id> (WP-21,
+         docs/STREAMS_PLAN.md §3.6) -- absent from the DOM's visible state
+         on every mainline visit. -->
+    <div id="branch-band" class="branch-band" hidden>
+      <span id="branch-band-text"></span>
+      <a id="branch-band-back" href="index.html">Back to mainline</a>
+    </div>
+
+    <!-- WP-23 (docs/STREAMS_PLAN.md §5.2): the two-tab header for a
+         long-running BRANCH stream only -- app.js's initBranchDashboard()
+         hides this outright for a build stream, or when this page is
+         not stream-scoped at all. Both tabs always exist; only the
+         DEFAULT selection depends on the branch's own cadence, and that
+         heuristic is stated in the caption below it, from data. -->
+    <div id="branch-tabs" class="tab-row" role="tablist"
+         aria-label="Build dashboard view" hidden>
+      <button id="branch-tab-own" class="tab" type="button" role="tab">Its own results</button>
+      <button id="branch-tab-diff" class="tab" type="button" role="tab">Difference from mainline</button>
+    </div>
+    <p id="branch-tab-caption" class="muted" hidden></p>
+
+    <!-- F6 (docs/STREAMS_PLAN.md §5.2 "as built"): "Its own results" quick
+         links into this branch's own Time/Timeline, populated by
+         app.js's activateOwnResultsTab() — needs F7 (those pages could
+         not read `stream=` before it). Hidden outright on mainline and
+         on the "Difference from …" tab. -->
+    <p id="branch-quick-links" class="muted" hidden></p>
+
     <!-- The one filter row: scopes every section below it. -->
     <section class="toolbar" aria-label="Scope">
-      <label class="toolbar-field">Environment
+      <label id="env-filter-field" class="toolbar-field">Environment
         <select id="filter-environment" aria-label="Environment filter"></select>
       </label>
+      <!-- The Build picker (WP-21): hidden by streams.js itself unless
+           the current product has at least one branch/build stream --
+           the same "container.hidden = true" rule products.js follows
+           for a single-product deployment. -->
+      <span id="stream-picker" class="stream-picker" hidden></span>
       <span id="refreshed-at" class="muted toolbar-meta"></span>
       <button id="reload-btn" type="button">Refresh</button>
     </section>
@@ -129,6 +165,12 @@
         <div id="result-toggles" class="result-toggles" role="group" aria-label="Filter by result"></div>
         <button id="stale-toggle" class="toggle" type="button" aria-pressed="false">Not run recently</button>
         <button id="retired-toggle" class="toggle" type="button" aria-pressed="false">Include retired</button>
+        <!-- F4 (docs/STREAMS_PLAN.md §5.2 "as built"): wired to the
+             API's existing include_unassigned/assignee=  filters
+             (unassigned=1 on the wire) -- no new endpoint. Doubles as
+             the landing spot for a Watch card's "N unassigned failing"
+             stat, via ?unassigned=1 read at load. -->
+        <button id="unassigned-toggle" class="toggle" type="button" aria-pressed="false">Unassigned only</button>
         <input id="filter-q" type="search" placeholder="Search test name…" autocomplete="off" aria-label="Search test name">
       </div>
       <div class="table-wrap">
@@ -136,6 +178,7 @@
           <thead>
             <tr>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="environment">Environment<span class="sort-arrow"></span></button></th>
+              <th id="product-col-head" class="product-col" hidden>Product</th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="script">Script<span class="sort-arrow"></span></button></th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="test_name">Test<span class="sort-arrow"></span></button></th>
               <th aria-sort="none"><button type="button" class="sort-btn" data-key="result">Result<span class="sort-arrow"></span></button></th>
@@ -151,12 +194,78 @@
       <p id="empty-state" class="empty-state" hidden>No tests match the current filters.</p>
       <div class="browse-footer">
         <span id="browse-count" class="muted"></span>
+        <!-- A column of identical values is noise: when the page is
+             scoped to one product, the Product column is dropped and
+             this line says so, rather than the absence reading as an
+             oversight. -->
+        <span id="browse-product-note" class="muted" hidden></span>
         <button id="show-more" type="button" hidden>Show more</button>
       </div>
+    </section>
+
+    <!-- ============ Branch/build delta view (WP-21) ============
+         Swaps in for every section above when this page is opened
+         ?stream=<id>; the sections above are hidden outright, not
+         merely emptied — docs/STREAMS_PLAN.md §3.6 calls this a swap,
+         not an addition. Hidden (and never fetched) on every mainline
+         visit, which is what keeps this feature invisible there. -->
+    <section id="delta-section" aria-labelledby="delta-heading" hidden>
+      <div class="section-head">
+        <h2 id="delta-heading" class="eyebrow">Compare to mainline</h2>
+      </div>
+      <!-- WP-22 (docs/STREAMS_PLAN.md §4.1): only shown when the scoped
+           stream is kind 'build' -- a plain datalist combo, never a
+           second navigation control for branches. Hidden by default so
+           a branch-scoped page (or one predating this drop's code)
+           shows zero visible change. -->
+      <p id="compare-to-field" class="muted" hidden>
+        <label for="compare-to-input">Compare to</label>
+        <input id="compare-to-input" list="compare-to-options" type="text" />
+        <datalist id="compare-to-options"></datalist>
+      </p>
+      <p id="delta-build-framing" class="muted" hidden></p>
+      <!-- F5 (docs/STREAMS_PLAN.md §5.2 "as built"; restored WP-25,
+           docs/ONE_KIND_PLAN.md fix round): a delta view compared
+           against only ONE baseline at a time answers "is this RC
+           good" incompletely -- this line names the OTHER canonical
+           baseline too (predecessor build when viewing vs mainline,
+           mainline when viewing vs a picked build). Lazy: filled in by
+           a SECOND request after first paint, never blocks
+           delta-tiles/delta-agree/etc. from showing. Hidden outright
+           for mainline scope, or a build with no predecessor to name. -->
+      <p id="delta-verdict" class="muted" hidden></p>
+      <div id="delta-tiles" class="tile-row"></div>
+      <p id="delta-agree" class="muted"></p>
+      <p id="delta-coverage" class="muted"></p>
+      <p id="delta-baseline" class="muted"></p>
+      <!-- WP-23 (docs/STREAMS_PLAN.md §5.2): "of N failing here, M fail
+           on <baseline> too" -- drift framing built from data, never a
+           "commits behind" line (not knowable, not built). -->
+      <p id="delta-drift" class="muted" hidden></p>
+      <p id="delta-stale-warning" class="empty-state" hidden></p>
+      <div id="delta-tabs" class="tab-row" role="tablist" aria-label="Comparison categories"></div>
+      <div class="table-wrap">
+        <table class="data-table" id="delta-table">
+          <thead>
+            <tr>
+              <th>Test</th>
+              <th id="delta-col-baseline">Mainline</th>
+              <th id="delta-col-stream">This build</th>
+              <th>Assignee</th>
+              <th>Output</th>
+            </tr>
+          </thead>
+          <tbody id="delta-body"></tbody>
+        </table>
+      </div>
+      <p id="delta-empty" class="empty-state" hidden></p>
+      <button id="delta-show-more" type="button" hidden>Show more</button>
     </section>
   </main>
 
   <script type="module" src="app.js"></script>
+  <script type="module" src="products.js"></script>
+  <script type="module" src="streams.js"></script>
   <script type="module" src="nav.js"></script>
 </body>
 </html>

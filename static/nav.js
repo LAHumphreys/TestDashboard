@@ -26,6 +26,8 @@
 
 "use strict";
 
+import { NAV_SCOPE_PAGES, pageUrl } from "./urls.js";
+
 /** localStorage key holding the newest drop date this browser has read. */
 const SEEN_KEY = "testboard.whatsnew.seen";
 
@@ -72,6 +74,74 @@ function writeSeen(date) {
 }
 
 /**
+ * Query params carried onto the NAV_SCOPE_PAGES nav links (urls.js —
+ * the page-allowlist itself, and the reasoning for exactly those three
+ * pages and no others, now lives there as data every caller of
+ * pageUrl() shares; this is the SEPARATE question of which of the four
+ * scope levels a nav-bar link carries), read from the CURRENT page's
+ * own URL — never localStorage or any other standing preference, only
+ * what is literally in THIS address bar right now, the same "the URL
+ * is the whole configuration" rule docs/STREAMS_PLAN.md §0.9 already
+ * applies to a Watch card link, extended here to the nav bar itself.
+ * `environment` travels with `stream`/`product` because it is the same
+ * scoping family, and timeline.html needs one to be useful at all.
+ * `baseline` deliberately never travels — a baseline belongs to the
+ * scope it was chosen in, the same reasoning the pickers' own
+ * scope-reset follows (urls.js's hierarchy rule).
+ */
+const CARRIED_PARAMS = ["stream", "product", "environment"];
+
+/**
+ * Rewrite `nav`'s NAV_SCOPE_PAGES children's `href` to carry whichever
+ * of CARRIED_PARAMS are present in `currentSearch` — the bug this
+ * fixes: navigating Dashboard -> Timeline (or any of the three) from a
+ * scoped page silently landed on mainline, the bare
+ * `href="timeline.html"` in every page's markup never having heard of
+ * `?stream=`. `nav` is the element whose CHILDREN are the `<a>` tags
+ * (real markup: `<nav class="site-nav"><a href="index.html">…</a>…
+ * </nav>`) — sibling traversal from `#nav-whatsnew`'s own parent,
+ * chosen over `document.querySelectorAll(".site-nav a")` only because
+ * it needs no selector the id-only DOM-shim harness would have to grow
+ * support for; both walk the identical real markup in a real browser.
+ *
+ * ZERO CHANGE when unscoped: if the current URL carries none of the
+ * three params, nothing is touched at all — not even re-set to its own
+ * existing value — so a byte-diff of the DOM before/after is empty.
+ *
+ * Builds every new href through pageUrl() (WP-24) rather than hand-
+ * editing a URL's searchParams — but with an EXPLICIT scope object
+ * built from `currentSearch` (never pageUrl()'s own default carriage,
+ * which reads the real `window.location.search`): `currentSearch` is a
+ * plain string argument precisely so this function stays testable
+ * without a real `window.location`, and silently reading around it
+ * would make that argument a lie the moment the two disagreed.
+ */
+export function carryScopeIntoNav(nav, currentSearch) {
+  const params = new URLSearchParams(currentSearch);
+  const carry = CARRIED_PARAMS.filter((name) => params.has(name));
+  if (carry.length === 0 || !nav || !nav.children) {
+    return;
+  }
+  const scope = {
+    product: params.has("product") ? params.get("product") : null,
+    stream: params.has("stream") ? params.get("stream") : null,
+    baseline: null,
+    environment: params.has("environment") ? params.get("environment") : null,
+  };
+  for (const child of nav.children) {
+    if (!child.getAttribute || child.tagName !== "A") {
+      continue;
+    }
+    const href = child.getAttribute("href");
+    if (NAV_SCOPE_PAGES.indexOf(href) === -1) {
+      continue;
+    }
+    const page = href.slice(0, -".html".length);
+    child.setAttribute("href", pageUrl(page, {}, scope));
+  }
+}
+
+/**
  * Annotate `link` for a drop dated `date`.
  *
  * Exported for the same reason the date parser is: it is the part with
@@ -108,6 +178,11 @@ async function init() {
   if (!link) {
     return;
   }
+  // Independent of the What's new decoration below (and everything it
+  // can fail on) -- #nav-whatsnew's parent IS the nav bar itself, real
+  // markup: <nav class="site-nav"><a href="index.html">…</a> …
+  // <a id="nav-whatsnew" href="whatsnew.html">…</a></nav>.
+  carryScopeIntoNav(link.parentNode, window.location.search);
   // aria-current is already on the link of the page you are looking at,
   // so it is the honest answer to "am I reading this right now" without
   // matching on filenames or worrying about how the URL was written.

@@ -301,7 +301,8 @@ class InstrumentStorageTest(unittest.TestCase):
             environment="linux-sim", script="s.py", test_name="t",
             result=Result.PASS, start_time=NOW,
             end_time=NOW + datetime.timedelta(seconds=1),
-            output="out", source_link="", known_failure_reason=None)])
+            output="out", source_link="", known_failure_reason=None,
+            build=None)])
         self.assertEqual(counts.inserted, 1)            # behaviour preserved
         page = self.store.dashboard(limit=10, offset=0)
         self.assertEqual(len(page), 1)

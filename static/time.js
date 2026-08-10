@@ -49,6 +49,9 @@ import {
 } from "./api.js";
 import { treemapBoxes } from "./charts.js";
 import { attachSorting, sortRows } from "./sorting.js";
+import { getSelectedProduct } from "./products.js";
+import { renderBranchBand, renderStreamEnvironmentHint } from "./compare.js";
+import { apiUrl, pageUrl } from "./urls.js";
 
 const LEVELS = ["environment", "script", "test_name"];
 
@@ -60,6 +63,11 @@ const state = {
   sortKey: "total_seconds",
   sortDescending: true,
   seq: 0,
+  // F7 (docs/STREAMS_PLAN.md §5.2 "as built"): a long-running branch's
+  // OWN time breakdown, read the same way mainline's is -- absent
+  // means mainline, zero visible change (WP-23 added `stream=` to
+  // /api/time server-side; this page could not read it until now).
+  streamId: null,
 };
 
 let sorter = null;
@@ -73,18 +81,34 @@ function level() {
 }
 
 function url() {
-  const qs = new URLSearchParams();
-  qs.append("group_by", level());
-  if (state.environment !== null) {
-    qs.append("environment", state.environment);
-  }
-  if (state.script !== null) {
-    qs.append("script", state.script);
-  }
-  if (state.includeStale) {
-    qs.append("include_stale", "1");
-  }
-  return "/api/time?" + qs.toString();
+  // WP-20: scope the drill-down to a declared product's environments —
+  // resolved server-side, same as every other product= filter
+  // (docs/STREAMS_PLAN.md §2.2). Harmless to send alongside an explicit
+  // `environment` once drilled in; the server combines both.
+  return apiUrl("/api/time", {
+    group_by: level(),
+    environment: state.environment,
+    script: state.script,
+    include_stale: state.includeStale ? "1" : null,
+  }, { stream: state.streamId, product: getSelectedProduct() || null,
+    baseline: null });
+}
+
+/**
+ * A link to this SAME page scoped to a DIFFERENT environment (WP-25,
+ * docs/ONE_KIND_PLAN.md §2b.1) -- the stream-environment-hint's link
+ * target. Deliberately drops `script`: a script from the environment
+ * being LEFT may not exist under the new one, so the link lands one
+ * drill level up (the environment's own script breakdown) rather than
+ * risk a dead combination. `stream`/`product` carry through unchanged --
+ * switching environment never changes which stream or product scope is
+ * being read.
+ */
+function environmentSwitchUrl(environment) {
+  return pageUrl("time", { environment: environment }, {
+    stream: state.streamId, product: getSelectedProduct() || null,
+    baseline: null,
+  });
 }
 
 async function load() {
@@ -119,6 +143,13 @@ function unitWord() {
 }
 
 function render(data) {
+  // F7: the band only ever draws when this page was actually asked to
+  // scope to a stream AND the server named one back -- a mainline load
+  // (streamId === null) never touches renderBranchBand at all, same
+  // guard test.js's own call site uses.
+  if (state.streamId !== null && data.stream_identity) {
+    renderBranchBand(data.stream_identity);
+  }
   renderBreadcrumb();
 
   const chart = document.getElementById("time-chart");
@@ -156,15 +187,24 @@ function render(data) {
 
   if (state.items.length === 0) {
     clearNode(chart);
-    // An empty page here almost always means "the suite has not run
-    // lately", not "there is nothing to measure". Say which, and point
-    // at the way to see it anyway — an all-or-nothing recency cutoff
-    // otherwise blanks the page after any long weekend.
-    empty.textContent = data.excluded_tests
-      ? "Nothing has reported since " + formatTime(data.stale_before)
-        + ". Turn on “Include tests that have not run recently” to see "
-        + "the breakdown from their last run."
-      : "Nothing to show here.";
+    if (data.stream_environments) {
+      // WP-25 (docs/ONE_KIND_PLAN.md §2b.1): scoped to a stream, and
+      // THIS environment is empty for it -- say where the stream's data
+      // actually is, rather than a bare "nothing to show" that reads as
+      // a data problem when the data is simply elsewhere.
+      renderStreamEnvironmentHint(
+        empty, data.stream_environments, environmentSwitchUrl);
+    } else {
+      // An empty page here almost always means "the suite has not run
+      // lately", not "there is nothing to measure". Say which, and point
+      // at the way to see it anyway — an all-or-nothing recency cutoff
+      // otherwise blanks the page after any long weekend.
+      empty.textContent = data.excluded_tests
+        ? "Nothing has reported since " + formatTime(data.stale_before)
+          + ". Turn on “Include tests that have not run recently” to see "
+          + "the breakdown from their last run."
+        : "Nothing to show here.";
+    }
     empty.hidden = false;
     renderTable();
     return;
@@ -299,6 +339,8 @@ function init() {
   const params = new URL(window.location.href).searchParams;
   state.environment = params.get("environment");
   state.script = params.get("script");
+  const rawStream = params.get("stream");
+  state.streamId = rawStream ? parseInt(rawStream, 10) : null;
 
   document.getElementById("stale-toggle")
     .addEventListener("click", () => {

@@ -116,6 +116,7 @@ class ExportTest(unittest.TestCase):
                 output="line one\nline two\ttabbed\nback\\slash\ncafé 🙂",
                 source_link="",
                 known_failure_reason=None,
+                build=None,
             ),
             RunRecord(
                 environment="linux sim", script="suite/a b.py",
@@ -124,6 +125,7 @@ class ExportTest(unittest.TestCase):
                 end_time=start + datetime.timedelta(seconds=1),
                 output="", source_link="http://x/y",
                 known_failure_reason="known",
+                build=None,
             ),
         ])
         store.add_comment(

@@ -60,12 +60,43 @@ import {
   toggleReview,
 } from "./review.js";
 import { attachSorting, sortRows } from "./sorting.js";
+import { mountSelectableTable } from "./selection.js";
+import { getSelectedProduct, renderSwitcher } from "./products.js";
+import {
+  fetchCompare,
+  getSelectedBaselineId,
+  getSelectedStreamId,
+  initDeltaView,
+  renderBranchBand,
+  streamLabel,
+} from "./compare.js";
+import { apiUrl, pageUrl } from "./urls.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
 
+/** Covered passes (docs/STREAMS_PLAN.md §5.2) a branch needs in the
+ * 14-day lookback before its dashboard defaults to "Its own results"
+ * rather than "Difference from mainline". Not hidden: the caption this
+ * feeds (see selectBranchTab()) states the number and this threshold in
+ * plain words, built from data, never silently assumed. */
+const OWN_RESULTS_DEFAULT_PASSES = 2;
+
 const state = {
   environment: "",        // "" = all environments
+  // WP-23: non-null while viewing a branch stream's "Its own results"
+  // tab (docs/STREAMS_PLAN.md §5.2) -- summaryUrl/queueUrl/browseUrl
+  // append it as stream=, and a page that never opens a branch's own
+  // tab (every mainline visit, and a build/delta-only branch visit)
+  // leaves this null forever, which is what keeps those paths at zero
+  // visible change.
+  streamId: null,
+  // F6 (docs/STREAMS_PLAN.md §5.2 "as built"): the SCOPED STREAM's own
+  // product, stashed by initBranchDashboard() from data.stream.product
+  // so renderBranchQuickLinks() can make its Time/Timeline links scope-
+  // self-sufficient (the jump-fix principle, commit 4725bbc) rather
+  // than relying on whatever this browser's switcher last stored.
+  streamProduct: "",
   summary: null,          // last headline payload (no queue rows)
   // Queue rows by kind, fetched per tab on demand. Absent = not landed
   // yet for the current filters; renderQueueTable shows a loading line.
@@ -80,6 +111,11 @@ const state = {
   sortAsc: true,
   activeResults: new Set(),
   staleOnly: false,
+  // F4 (docs/STREAMS_PLAN.md §5.2 "as built"): the browse filter row's
+  // "Unassigned only" chip -- wired to /api/dashboard's existing
+  // include_unassigned param (unassigned=1 on the wire), the same
+  // filter Open Actions has always been able to apply server-side.
+  unassignedOnly: false,
   qText: "",
   qTimer: null,
   requestSeq: 0,
@@ -96,69 +132,104 @@ const scriptSelect = document.getElementById("filter-script");
 const qInput = document.getElementById("filter-q");
 const tbody = document.getElementById("dashboard-body");
 
+// Tick boxes on both the triage queue and the browse table (2026-08-10,
+// multi-select) -- one shared action bar, so a selection can span rows
+// from both at once. Row entries here already carry `stream_id` when
+// this page is showing a branch's own-results tab (tagStream(), above)
+// -- the SAME field the row-level assignee picker reads for origin --
+// so a mainline visit's rows simply have none and a selection there
+// carries none, by construction. Only ONE mount registers onChanged: a
+// bulk action can touch rows from either table, so one full refreshAll()
+// covers both without a duplicate fetch from a second registration.
+//
+// registerRefresh is FALSE on a branch-scoped load (`?stream=`):
+// init() below takes the initBranchDashboard() branch and returns
+// before wireMainlineControls() -- this table stays hidden and never
+// fetched (docs/STREAMS_PLAN.md §3.6's "no unscoped /api/summary
+// fetch, no queues, no browse table" on that path). Module-level
+// consts run before init() decides which branch it is taking, so this
+// has to read the URL directly (getSelectedStreamId(), the same
+// module-load-time read compare.js's own scope functions make) rather
+// than state.streamId, which is not set yet.
+const registerRefresh = getSelectedStreamId() === null;
+const queueSelectionMount = mountSelectableTable(
+  document.getElementById("queue-table"));
+const browseSelectionMount = mountSelectableTable(
+  document.getElementById("dashboard-table"),
+  registerRefresh ? { onChanged: () => refreshAll() } : {});
+
 const SECTIONS = ["status-section", "charts-section", "triage-section",
   "browse-section"];
 
 /* ================= data loading ================= */
 
-function summaryUrl() {
-  const qs = new URLSearchParams();
-  qs.append("parts", "headline");
-  if (state.environment) {
-    qs.append("environment", state.environment);
+/**
+ * Stamp `stream_id` onto a page of dashboard/queue rows fetched while
+ * showing a branch's own-results tab -- assigneeSelect()/toggleReview()
+ * already read `entry.stream_id` generically (WP-21, api.js/review.js)
+ * to record WHERE an assignment/comment was made from, an annotation
+ * never a partition (docs/STREAMS_PLAN.md §0.4). A mainline page never
+ * calls this with a stream set, so those rows are untouched -- zero
+ * visible change there.
+ */
+function tagStream(rows) {
+  if (state.streamId !== null) {
+    for (const row of rows) {
+      row.stream_id = state.streamId;
+    }
   }
+  return rows;
+}
+
+/**
+ * The scope every one of this page's own /api/... fetches carries:
+ * `product` (WP-20) IF this browser has one selected -- the server
+ * resolves it to an environment allow-list, exactly as if the
+ * environment filter had been set to every environment in it, see
+ * docs/STREAMS_PLAN.md §2.2 -- and `stream` (WP-23) IF this page is
+ * showing a branch's OWN results tab (state.streamId, set by
+ * initBranchDashboard()). `product` is normalised to null rather than
+ * ""  so apiUrl() OMITS it when nothing is selected, matching this
+ * page's fetches from before WP-24 -- an explicit empty `product=`
+ * belongs to a NAVIGATION link (a standing choice worth restating),
+ * not one of these fetches, which have no such distinction to make.
+ */
+function apiScope() {
+  return { environment: state.environment, product: getSelectedProduct() || null,
+    stream: state.streamId };
+}
+
+function summaryUrl() {
   // The "my actions" queue is filtered server-side: picking a user's
   // tests out of an already-capped queue would hide their own work.
   // The headline needs the assignee too — the "mine" tab count.
-  const me = getUsername();
-  if (me) {
-    qs.append("assignee", me);
-  }
-  return "/api/summary?" + qs.toString();
+  return apiUrl(
+    "/api/summary", { parts: "headline", assignee: getUsername() },
+    apiScope());
 }
 
 /** URL for one triage queue's rows. */
 function queueUrl(kind) {
-  const qs = new URLSearchParams();
-  qs.append("parts", "queue");
-  qs.append("queue", kind);
-  if (state.environment) {
-    qs.append("environment", state.environment);
-  }
-  const me = getUsername();
-  if (me) {
-    qs.append("assignee", me);
-  }
-  return "/api/summary?" + qs.toString();
+  return apiUrl(
+    "/api/summary",
+    { parts: "queue", queue: kind, assignee: getUsername() },
+    apiScope());
 }
 
 /** URL for one page of the test list under the current filters. */
 function browseUrl(offset) {
-  const qs = new URLSearchParams();
-  if (state.environment) {
-    qs.append("environment", state.environment);
-  }
-  if (state.script) {
-    qs.append("script", state.script);
-  }
-  for (const result of state.activeResults) {
-    qs.append("result", result);
-  }
-  if (state.staleOnly) {
-    qs.append("stale", "1");
-  }
-  if (state.showRetired) {
-    qs.append("retired", "1");
-  }
-  const query = state.qText.trim();
-  if (query) {
-    qs.append("q", query);
-  }
-  qs.append("sort", state.sortKey);
-  qs.append("order", state.sortAsc ? "asc" : "desc");
-  qs.append("limit", String(CHUNK));
-  qs.append("offset", String(offset));
-  return "/api/dashboard?" + qs.toString();
+  return apiUrl("/api/dashboard", {
+    script: state.script,
+    result: state.activeResults,
+    stale: state.staleOnly ? "1" : null,
+    retired: state.showRetired ? "1" : null,
+    unassigned: state.unassignedOnly ? "1" : null,
+    q: state.qText.trim(),
+    sort: state.sortKey,
+    order: state.sortAsc ? "asc" : "desc",
+    limit: CHUNK,
+    offset: offset,
+  }, apiScope());
 }
 
 /**
@@ -204,9 +275,9 @@ async function refreshAll() {
       if (seq !== state.requestSeq) {
         return;
       }
-      state.browseRows = page.tests;
+      state.browseRows = tagStream(page.tests);
       state.browseTotal = page.total;
-      renderBrowse(page.tests, false);
+      renderBrowse(state.browseRows, false);
     } catch (err) {
       if (seq === state.requestSeq) {
         showError(err.message);
@@ -234,6 +305,7 @@ async function loadQueue(kind, seq) {
     if (seq !== state.requestSeq) {
       return;
     }
+    tagStream(payload.queue.tests);
     state.queues[kind] = payload.queue;
     if (state.summary) {
       renderQueueTabs();
@@ -262,6 +334,7 @@ async function loadBrowse(append) {
     if (seq !== state.browseSeq) {
       return;  // a newer filter change already superseded this request
     }
+    tagStream(page.tests);
     state.browseRows = append
       ? state.browseRows.concat(page.tests) : page.tests;
     state.browseTotal = page.total;
@@ -316,6 +389,7 @@ async function fetchSummary() {
       const results = await summaryInFlight;
       state.summary = results[0];
       state.queues = {};
+      tagStream(results[1].queue.tests);
       state.queues[kind] = results[1].queue;
     } finally {
       summaryInFlight = null;
@@ -353,6 +427,11 @@ function renderHeadline() {
   renderCharts();
   renderQueues();
   populateScriptOptions();
+  updateProductColumn();
+  const switcherMount = document.getElementById("product-switcher");
+  if (switcherMount) {
+    renderSwitcher(switcherMount, state.summary.products || []);
+  }
 }
 
 /* ================= toolbar ================= */
@@ -364,6 +443,28 @@ function renderToolbar() {
   const at = summary.generated_at;
   document.getElementById("refreshed-at").textContent =
     "Updated " + String(at).slice(11, 16) + " UTC";
+}
+
+/**
+ * Show the Product column exactly when the page SPANS products (two or
+ * more declared, and no product selected); when scoped to one, the
+ * footer says so instead — a column of identical values is noise
+ * (docs/STREAMS_PLAN.md §2.3, an established finding from the same
+ * project). A deployment with fewer than two declared products shows
+ * neither: zero visible change, the same rule the switcher follows.
+ */
+function updateProductColumn() {
+  const products = (state.summary && state.summary.products) || [];
+  const selected = getSelectedProduct();
+  const spans = products.length >= 2 && !selected;
+  const scoped = products.length >= 2 && Boolean(selected);
+  document.getElementById("product-col-head").hidden = !spans;
+  document.querySelectorAll("#dashboard-body .product-col")
+    .forEach((cell) => { cell.hidden = !spans; });
+  const note = document.getElementById("browse-product-note");
+  note.hidden = !scoped;
+  note.textContent = scoped
+    ? "Scoped to " + selected + " — no product column needed." : "";
 }
 
 function fillSelect(select, values, allLabel, selected) {
@@ -391,6 +492,17 @@ function setEnvironment(environment, keepScript) {
   if (!keepScript) {
     state.script = "";
   }
+  // WP-24 enforcement allowlist (tests/test_frontend_calls.py's
+  // ScopedUrlConstructionTest): `environment` here is this DASHBOARD's
+  // OWN filter toggle, echoed to the address bar for shareability —
+  // not a cross-page scope pointer, and this touch must preserve
+  // every OTHER param already on the URL (result=/unassigned=/stale=,
+  // F4/F4a's deep-link filters) verbatim. None of pageUrl()/apiUrl()
+  // (build a query FRESH from the params/scope given) or
+  // withStream()/withBaseline()/withProduct() (rebuild the scope
+  // levels, resetting siblings by design) fit "touch exactly one
+  // non-hierarchy filter, leave literally everything else alone" —
+  // so this stays a direct, narrowly-scoped searchParams edit.
   const url = new URL(window.location.href);
   if (environment) {
     url.searchParams.set("environment", environment);
@@ -398,6 +510,11 @@ function setEnvironment(environment, keepScript) {
     url.searchParams.delete("environment");
   }
   window.history.replaceState(null, "", url.toString());
+  // F6: the quick links' Timeline target names the CURRENT environment
+  // filter — keep them in step with it, own-results tab only.
+  if (state.streamId !== null) {
+    renderBranchQuickLinks(state.streamId);
+  }
   refreshAll();
 }
 
@@ -809,11 +926,23 @@ function queueColumns(queueId) {
     cell: (entry) => {
       const cell = el("td", "wrap");
       const link = document.createElement("a");
-      const params = new URLSearchParams();
-      params.append("environment", entry.environment);
-      params.append("script", entry.script);
-      params.append("test_name", entry.test_name);
-      link.href = "test.html?" + params.toString();
+      // Scope-carriage (found by the F1-F7 sweep's follow-up link-matrix
+      // audit): on a long-running branch's "Its own results" tab, these
+      // rows are the branch's own -- the link must land back on that
+      // SAME stream's test page, not mainline's. Naming `product` in the
+      // overrides object below resets the levels it contains (stream)
+      // unless that same object also names them, so `stream` is named
+      // explicitly here (state.streamId, null on mainline) rather than
+      // left to pageUrl()'s default carriage -- naming `product` already
+      // suppresses that default for stream (coordinator fix round: this
+      // and three sibling sites silently dropped `stream=` by relying on
+      // default carriage after nulling product, reintroducing historical
+      // bug classes #1 and #5). product/baseline are still explicitly
+      // nulled -- this link never carried either.
+      link.href = pageUrl("test", {
+        environment: entry.environment, script: entry.script,
+        test_name: entry.test_name,
+      }, { product: null, baseline: null, stream: state.streamId });
       link.textContent = entry.test_name;
       cell.appendChild(link);
       cell.appendChild(el("span", "row-sub",
@@ -997,6 +1126,10 @@ function renderQueueTable() {
   clearNode(headRow);
   clearNode(body);
   clearNode(resultNote);
+  // The queue table is rebuilt WHOLESALE on every call (no append mode
+  // here, unlike the browse table) -- so every render is a fresh view,
+  // and the selection made on the PREVIOUS render is cleared every time.
+  queueSelectionMount.reset();
 
   const invariant = QUEUE_INVARIANT_RESULT[queueId];
   resultNote.hidden = !invariant;
@@ -1046,6 +1179,7 @@ function renderQueueTable() {
     ? allEntries
     : sortRows(allEntries, state.queueSortKey || "", state.queueSortDesc);
 
+  headRow.appendChild(queueSelectionMount.headerCell());
   for (const column of columns) {
     const th = el("th");
     if (column.sortKey) {
@@ -1070,6 +1204,7 @@ function renderQueueTable() {
     if (marker) {
       tr.className = marker;
     }
+    tr.appendChild(queueSelectionMount.rowCell(entry));
     for (const column of columns) {
       tr.appendChild(column.cell(entry));
     }
@@ -1147,13 +1282,19 @@ function populateScriptOptions() {
   fillSelect(scriptSelect, scripts, "All scripts", state.script);
 }
 
-/** A link to one suite's execution history. */
+/**
+ * A link to one suite's execution history — script.html, now stream-
+ * scoped the same way the rest of the app is (script-page parity,
+ * FINAL ROUND). `stream` is named explicitly (state.streamId, null on
+ * mainline) rather than left to pageUrl()'s default carriage: naming
+ * `product` below resets the levels it contains, stream included, unless
+ * this same overrides object also names them (coordinator fix round —
+ * this site silently dropped `stream=` before the fix).
+ */
 function scriptLink(environment, script, text) {
-  const params = new URLSearchParams();
-  params.append("environment", environment);
-  params.append("script", script);
   const link = document.createElement("a");
-  link.href = "script.html?" + params.toString();
+  link.href = pageUrl("script", { environment: environment, script: script },
+    { product: null, baseline: null, stream: state.streamId });
   link.textContent = text || script;
   link.title = "Execution history for this suite";
   return link;
@@ -1178,11 +1319,19 @@ function refilterBrowse() {
 function renderBrowse(rows, append) {
   if (!append) {
     clearNode(tbody);
+    // A fresh render (a new filter/sort/reload) is a NEW view; "Show
+    // more" (append) joins the SAME view and must not clear it -- see
+    // selection.js's own module docstring.
+    browseSelectionMount.reset();
   }
   for (const row of rows) {
     tbody.appendChild(buildRow(row));
   }
   updateSortIndicators();
+  // Newly appended rows (e.g. "Show more") start with their Product cell
+  // hidden — bring them into line with whatever the headline already
+  // decided, rather than waiting for the next full refresh.
+  updateProductColumn();
 
   const shown = state.browseRows.length;
   const total = state.browseTotal;
@@ -1212,7 +1361,15 @@ function buildRow(row) {
   if (marker) {
     tr.className = marker;
   }
+  tr.appendChild(browseSelectionMount.rowCell(row));
   tr.appendChild(el("td", "", row.environment));
+
+  // Hidden by default; updateProductColumn() shows it once the headline
+  // (products.length, the current scope) has landed — which may arrive
+  // before or after this row does.
+  const productCell = el("td", "product-col", row.product);
+  productCell.hidden = true;
+  tr.appendChild(productCell);
 
   // The script is a link to that suite's execution history — the way to
   // answer "how did the whole suite do last night?".
@@ -1223,11 +1380,18 @@ function buildRow(row) {
   const testCell = document.createElement("td");
   testCell.className = "wrap";
   const link = document.createElement("a");
-  const params = new URLSearchParams();
-  params.append("environment", row.environment);
-  params.append("script", row.script);
-  params.append("test_name", row.test_name);
-  link.href = "test.html?" + params.toString();
+  // Scope-carriage (F1-F7 sweep follow-up): the browse table on a
+  // branch's "Its own results" tab shows that branch's own rows -- the
+  // link must land back on that SAME stream's test page. `stream` is
+  // named explicitly (state.streamId, null on mainline): naming `product`
+  // below resets the levels it contains, stream included, unless this
+  // same overrides object also names them, so pageUrl()'s default
+  // carriage alone (unnamed stream) is not enough once product is nulled
+  // (coordinator fix round -- this site silently dropped `stream=`
+  // before the fix).
+  link.href = pageUrl("test", {
+    environment: row.environment, script: row.script, test_name: row.test_name,
+  }, { product: null, baseline: null, stream: state.streamId });
   link.textContent = row.test_name;
   testCell.appendChild(link);
   tr.appendChild(testCell);
@@ -1319,6 +1483,11 @@ function syncRetiredToggle() {
     .setAttribute("aria-pressed", state.showRetired ? "true" : "false");
 }
 
+function syncUnassignedToggle() {
+  document.getElementById("unassigned-toggle")
+    .setAttribute("aria-pressed", state.unassignedOnly ? "true" : "false");
+}
+
 function scrollTo(sectionId) {
   document.getElementById(sectionId)
     .scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1326,15 +1495,54 @@ function scrollTo(sectionId) {
 
 /* ================= init ================= */
 
-function init() {
-  // "My actions" is scoped server-side to the signed-in user, so a
-  // username change has to go back to the server for it.
-  renderUserWidget(document.getElementById("user-widget"),
-    () => { if (state.summary) { refreshSummary(); } });
-  buildResultToggles();
+/** Sections that only mean something scoped to a real dashboard body
+ * (mainline, or a branch's "own results" tab) — the same set
+ * compare.js's MAINLINE_SECTIONS names, kept here too because app.js
+ * is what shows them again when switching back from the diff tab. */
+const DASHBOARD_SECTIONS = SECTIONS;
+
+let mainlineControlsWired = false;
+
+/**
+ * Wire every one-time event listener the dashboard body needs
+ * (environment/script filters, search, toggles, sort headers, refresh,
+ * show-more). Idempotent — called once whether the page starts on a
+ * genuine mainline load or on a branch's "Its own results" tab, and
+ * NEVER again after that: switching between "Its own results" and
+ * "Difference from …" (see selectBranchTab()) must not pile up a
+ * second copy of every listener.
+ */
+function wireMainlineControls() {
+  if (mainlineControlsWired) {
+    return;
+  }
+  mainlineControlsWired = true;
 
   const url = new URL(window.location.href);
   state.environment = url.searchParams.get("environment") || "";
+
+  // F4 (docs/STREAMS_PLAN.md §5.2 "as built"): URL-driven filter state,
+  // so a deep link (a Watch card's "N unassigned failing" stat, or any
+  // other) can land pre-filtered rather than only naming a number.
+  // Read BEFORE buildResultToggles()/the sync calls below paint the
+  // controls, so their initial aria-pressed state already matches —
+  // reading it after would need a second render pass.
+  for (const raw of url.searchParams.getAll("result")) {
+    if (RESULTS.indexOf(raw) !== -1) {
+      state.activeResults.add(raw);
+    }
+  }
+  if (url.searchParams.get("unassigned") === "1") {
+    state.unassignedOnly = true;
+  }
+  if (url.searchParams.get("stale") === "1") {
+    state.staleOnly = true;
+  }
+
+  buildResultToggles();
+  syncResultToggles();
+  syncStaleToggle();
+  syncUnassignedToggle();
 
   envSelect.addEventListener("change",
     () => setEnvironment(envSelect.value));
@@ -1364,6 +1572,12 @@ function init() {
       syncRetiredToggle();
       refilterBrowse();
     });
+  document.getElementById("unassigned-toggle")
+    .addEventListener("click", () => {
+      state.unassignedOnly = !state.unassignedOnly;
+      syncUnassignedToggle();
+      refilterBrowse();
+    });
   document.getElementById("reload-btn")
     .addEventListener("click", () => refreshAll());
   document.getElementById("show-more").addEventListener("click", () => {
@@ -1385,7 +1599,221 @@ function init() {
       refilterBrowse();
     });
   }
+}
 
+/**
+ * F6 (docs/STREAMS_PLAN.md §5.2 "as built"): quick links from a
+ * branch's "Its own results" tab into that SAME branch's own Time and
+ * Timeline pages — needs F7 (those pages could not read `stream=`
+ * before it). `environment=` is included only when the dashboard's own
+ * environment filter is currently set to one; Timeline still works
+ * without it (it picks a sensible default itself), Time never needed
+ * one. Hidden outright when leaving the tab (mainline, or "Difference
+ * from …") — this is an "own results" concept only.
+ *
+ * Both links also carry `product=` (state.streamProduct, stashed by
+ * initBranchDashboard from data.stream.product — empty string included
+ * when the estate has no products). Without it these links are exactly
+ * the bug commit 4725bbc fixed: Time/Timeline load products.js, which
+ * adopts `?product=` into localStorage, but absent the param they keep
+ * whatever this browser last had — Timeline's environment picker is
+ * filtered by that stored product, so a wrong-product browser opening
+ * this link can find a picker that does not even list the branch's own
+ * environment.
+ */
+function renderBranchQuickLinks(streamId) {
+  const mount = document.getElementById("branch-quick-links");
+  if (!mount) {
+    return;
+  }
+  clearNode(mount);
+  if (streamId === null) {
+    mount.hidden = true;
+    return;
+  }
+  const timeLink = document.createElement("a");
+  timeLink.href = pageUrl("time", {}, {
+    stream: streamId, product: state.streamProduct || "", environment: null,
+    baseline: null,
+  });
+  timeLink.textContent = "This build's Time →";
+  const timelineLink = document.createElement("a");
+  timelineLink.href = pageUrl("timeline", {}, {
+    stream: streamId, product: state.streamProduct || "",
+    environment: state.environment, baseline: null,
+  });
+  timelineLink.textContent = "This build's Timeline →";
+
+  mount.appendChild(timeLink);
+  mount.appendChild(document.createTextNode("  ·  "));
+  mount.appendChild(timelineLink);
+  mount.hidden = false;
+}
+
+/**
+ * Show the dashboard body (status/charts/triage/browse), scoped to
+ * *streamId* if the "Its own results" tab is active — WP-23,
+ * docs/STREAMS_PLAN.md §5.2. Hides the delta section, wires the
+ * mainline controls exactly once, and reloads.
+ */
+function activateOwnResultsTab() {
+  document.getElementById("delta-section").hidden = true;
+  const envField = document.getElementById("env-filter-field");
+  if (envField) {
+    envField.hidden = false;
+  }
+  wireMainlineControls();
+  renderBranchQuickLinks(state.streamId);
+  document.getElementById("loading-state").hidden = false;
+  refreshAll();
+}
+
+/** Swap to the delta ("Difference from …") view — hides the dashboard
+ * body outright, the same swap compare.js's own initDeltaView() has
+ * always done for a branch-scoped page. */
+function activateDiffTab(streamId) {
+  for (const id of DASHBOARD_SECTIONS) {
+    document.getElementById(id).hidden = true;
+  }
+  renderBranchQuickLinks(null);   // F6: "own results" concept only
+  initDeltaView(streamId);
+}
+
+/**
+ * The two-tab header for a long-running stream (WP-23,
+ * docs/STREAMS_PLAN.md §5.2; DATA-gated by WP-25, docs/ONE_KIND_PLAN.md
+ * §1.4): "Its own results" (this same dashboard, scoped to the stream's
+ * own stream_id) and "Difference from <baseline>" (the WP-21/22 delta
+ * view, unchanged). Both tabs exist together, or not at all — see
+ * initBranchDashboard(), which decides that from the SAME covered-pass
+ * threshold that used to decide only the default selection: a stream
+ * meeting it is exactly what "long-running enough for its own dashboard"
+ * means, however it was uploaded. A one-shot upload stays delta-only,
+ * the same behaviour every stream had before WP-23.
+ */
+function selectBranchTab(which, streamId) {
+  const ownBtn = document.getElementById("branch-tab-own");
+  const diffBtn = document.getElementById("branch-tab-diff");
+  ownBtn.setAttribute("aria-selected", which === "own" ? "true" : "false");
+  diffBtn.setAttribute("aria-selected", which === "diff" ? "true" : "false");
+  if (which === "own") {
+    state.streamId = streamId;
+    activateOwnResultsTab();
+  } else {
+    state.streamId = null;
+    activateDiffTab(streamId);
+  }
+}
+
+async function initBranchDashboard(streamId) {
+  let data;
+  let coveredPasses = 0;
+  try {
+    // Fired together (WP-25, docs/ONE_KIND_PLAN.md §1.4): the covered-
+    // pass count now decides whether the tab header exists AT ALL, not
+    // only which tab it defaults to, so it has to be on hand before
+    // that decision is made rather than fetched afterwards -- a build-
+    // scoped page therefore now pays this one extra counts-only request
+    // it did not pay before (a branch-scoped page always did).
+    const [compareData, headline] = await Promise.all([
+      fetchCompare(streamId, null, 0, getSelectedBaselineId()),
+      fetchJson("/api/summary?parts=headline&stream=" + streamId)
+        .catch(() => null),
+    ]);
+    data = compareData;
+    if (headline) {
+      coveredPasses = headline.covered_passes;
+    }
+    // A failed headline fetch leaves coveredPasses at 0 -- the tab
+    // header simply does not appear this load, the same safe fallback
+    // the old code used for the default-selection choice alone.
+  } catch (err) {
+    showError(err.message);
+    return;
+  }
+  renderBranchBand(data.stream, data.baseline);
+  // F6: stashed once here, before either tab renders, so
+  // renderBranchQuickLinks() can make its links scope-self-sufficient.
+  state.streamProduct = data.stream.product || "";
+
+  const tabs = document.getElementById("branch-tabs");
+  const caption = document.getElementById("branch-tab-caption");
+  // WP-25 (docs/ONE_KIND_PLAN.md §1.4): "any stream whose covered-passes
+  // count meets the existing threshold gets both tabs, however it was
+  // uploaded" -- meeting the threshold IS what "prefer its own results"
+  // means, so the same test now gates existence AND default together;
+  // below it, a stream stays delta-only, the WP-21/22 behaviour every
+  // stream had before WP-23 (and everything WP-25 collapsed the 'build'
+  // kind into keeps, unless it earns its own dashboard by cadence).
+  const meetsThreshold = coveredPasses >= OWN_RESULTS_DEFAULT_PASSES;
+  if (!meetsThreshold || !tabs) {
+    if (tabs) {
+      tabs.hidden = true;
+    }
+    if (caption) {
+      caption.hidden = true;
+    }
+    activateDiffTab(streamId);
+    return;
+  }
+
+  const ownBtn = document.getElementById("branch-tab-own");
+  const diffBtn = document.getElementById("branch-tab-diff");
+  diffBtn.textContent = "Difference from " + streamLabel(data.baseline);
+  ownBtn.onclick = () => selectBranchTab("own", streamId);
+  diffBtn.onclick = () => selectBranchTab("diff", streamId);
+  tabs.hidden = false;
+
+  // Stated in the caption FROM DATA -- the covered-pass count and the
+  // threshold are both literally in the sentence, never a silent
+  // constant (docs/STREAMS_PLAN.md §5.2's own wording: "must be stated
+  // in the UI caption, not buried" -- the same discipline
+  // WindowWordingTest holds every other recency line to). The "showing
+  // the difference by default" wording this caption used to carry for a
+  // below-threshold stream is gone WITH the case it described: that
+  // stream no longer reaches this branch of the code at all.
+  if (caption) {
+    const passWord = coveredPasses === 1 ? "pass" : "passes";
+    caption.hidden = false;
+    caption.textContent = "Showing its own results by default — this "
+      + "stream has completed " + coveredPasses + " " + passWord
+      + " in the last 14 days (" + OWN_RESULTS_DEFAULT_PASSES
+      + " or more shows its own dashboard first).";
+  }
+  selectBranchTab("own", streamId);
+}
+
+function init() {
+  // The browse table's checkbox column head -- static markup, so
+  // inserted once here rather than rebuilt every render (unlike the
+  // queue table's own dynamically-rebuilt head row, handled inside
+  // renderQueueTable() itself). Harmless to do even on a branch-scoped
+  // load below: that section stays hidden and unfetched, same as
+  // before this feature.
+  const dashboardHeadRow = document.querySelector(
+    "#dashboard-table thead tr");
+  dashboardHeadRow.insertBefore(
+    browseSelectionMount.headerCell(), dashboardHeadRow.firstChild);
+
+  // "My actions" is scoped server-side to the signed-in user, so a
+  // username change has to go back to the server for it. Rendered
+  // before the stream check below: the header is not a mainline-only
+  // concept, so a branch-scoped page keeps it too.
+  renderUserWidget(document.getElementById("user-widget"),
+    () => { if (state.summary) { refreshSummary(); } });
+
+  // WP-21/23 (docs/STREAMS_PLAN.md §3.6/§5.2): a branch-scoped page
+  // load never reaches the plain mainline path below this check — no
+  // unscoped /api/summary fetch, no queues, no browse table. That is
+  // what keeps every mainline page (this branch never taken) at zero
+  // visible change.
+  const streamId = getSelectedStreamId();
+  if (streamId !== null) {
+    initBranchDashboard(streamId);
+    return;
+  }
+
+  wireMainlineControls();
   refreshAll();
 }
 

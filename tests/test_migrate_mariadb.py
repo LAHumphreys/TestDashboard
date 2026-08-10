@@ -46,13 +46,13 @@ def seed(db_path: str) -> Storage:
             test_name="test_weird [1]\twith tab", result=Result.FAIL,
             start_time=START, end_time=START + datetime.timedelta(seconds=3),
             output="line one\nline two\ttabbed\ncafé 🙂", source_link="",
-            known_failure_reason=None),
+            known_failure_reason=None, build=None),
         RunRecord(
             environment="linux sim", script="suite/a b.py",
             test_name="plain", result=Result.PASS,
             start_time=START, end_time=START + datetime.timedelta(seconds=1),
             output="", source_link="http://x/y",
-            known_failure_reason="known"),
+            known_failure_reason="known", build=None),
     ])
     store.ensure_user("alice", START)
     store.add_comment("linux sim", "suite/a b.py", "plain", "alice",

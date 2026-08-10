@@ -42,6 +42,13 @@ EXCLUDED_CLASSES = {
         "asserts EXPLAIN QUERY PLAN output — SQLite's planner, "
         "SQLite's syntax. MariaDB index use is a different question "
         "for a different tool.",
+    "ComparePairsQueryPlanTest":
+        "asserts EXPLAIN QUERY PLAN output (WP-23 perf pass, the "
+        "compare pairs query) — SQLite's planner, SQLite's syntax, "
+        "same reason as TestSortIndexesAreUsed above. MariaDB's own "
+        "EXPLAIN was checked by hand against the local mariadbd "
+        "(eq_ref on the latest_runs PRIMARY KEY) — see the commit "
+        "message; there is no equivalent automated pin for it here.",
     "TestEnvironmentListingCost":
         "counts sqlite page reads to pin a query-shape regression; "
         "the instrument is engine-specific even though the shape "
@@ -80,6 +87,21 @@ EXCLUDED_TESTS = {
         "counts queries via sqlite3's set_trace_callback.",
     "TestLatestRunTimeByEnvironment.test_it_never_touches_the_runs_table":
         "counts queries via sqlite3's set_trace_callback.",
+    "TestWatch.test_query_count_does_not_grow_with_card_count":
+        "counts queries via sqlite3's set_trace_callback, and reaches "
+        "into self.storage._conn() directly to register it.",
+    "TestWatchStreamCards.test_query_count_does_not_grow_with_s_card_count":
+        "counts queries via sqlite3's set_trace_callback.",
+    "CompareCountsManyTest."
+    "test_query_count_does_not_grow_with_the_number_of_streams":
+        "counts queries via sqlite3's set_trace_callback.",
+    "StreamIdentitiesTest.test_query_count_is_one_regardless_of_id_count":
+        "counts queries via sqlite3's set_trace_callback.",
+    "CompareCountsManyBaselinesTest."
+    "test_query_count_does_not_grow_with_a_baseline_override":
+        "counts queries via sqlite3's set_trace_callback.",
+    "PreviousBuildsTest.test_query_count_is_one_regardless_of_build_count":
+        "counts queries via sqlite3's set_trace_callback.",
     "ScriptHoursTest.test_the_window_read_is_an_index_range_not_a_scan":
         "asserts the SQLite query plan; MariaDB's planner is a "
         "different instrument for a different day.",
@@ -87,6 +109,92 @@ EXCLUDED_TESTS = {
         "a perf pin calibrated on SQLite. On an emulated local server "
         "or a CI container the number measures the environment, not a "
         "regression; MariaDB perf comes from the real box (drop note).",
+    "UnassignedFailingTest.test_by_stream_batches_every_requested_id_in_one_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "UnassignedFailingTest.test_empty_stream_id_list_costs_no_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "UnassignedFailingTest.test_a_clean_estate_has_no_entries":
+        "constructs a second Storage(path) directly (a fresh SQLite "
+        "file) rather than through the backend hook; there is no "
+        "equivalent 'fresh empty database' to point at without "
+        "dropping the sacrificial one mid-suite, same reasoning as "
+        "TestLatestRunDuration above.",
+    "TestQueueCounts.test_one_query_regardless_of_assignee":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestFailureStreakBoundsMany."
+    "test_an_unknown_triple_resolves_to_no_streak_and_skips_step_three":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestFailureStreakBoundsMany.test_duplicate_triples_are_resolved_once":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestFailureStreakBoundsMany."
+    "test_query_count_is_bounded_by_chunks_not_rows":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestFailureStreakBoundsMany.test_empty_input_issues_no_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestCompareEndpoint."
+    "test_a_category_request_runs_the_pairs_sql_twice_not_thrice":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestSummary."
+    "test_the_full_payload_counts_every_queue_in_one_grouped_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestLatestResultsForStreams.test_empty_input_issues_no_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestLatestResultsForStreams."
+    "test_the_query_count_is_bounded_by_chunks_not_keys":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestLatestResultsForStreams.test_duplicate_keys_are_not_fetched_twice":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestOriginResultTruthfulDisplay."
+    "test_an_estate_with_no_stream_origin_assignments_costs_no_extra_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestOriginResultTruthfulDisplay."
+    "test_many_origin_rows_cost_exactly_one_extra_query":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_repeat_summary_rollup_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_repeat_queue_counts_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_repeat_status_queue_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest."
+    "test_repeat_test_counts_by_environment_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest."
+    "test_repeat_latest_run_time_by_environment_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_repeat_environments_and_scripts_are_cache_hits":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest."
+    "test_repeat_failure_streak_bounds_many_is_a_cache_hit":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_prune_runs_before_invalidates":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_a_different_cutoff_is_a_different_key":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_ttl_bound_expires_the_memo":
+        "counts queries via sqlite3's set_trace_callback.",
+    "SummaryCacheTest.test_within_ttl_still_hits":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssignee.test_the_query_count_is_bounded_not_per_row":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssignee.test_empty_input_issues_no_writes":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssigneeForTriples."
+    "test_the_query_count_is_flat_in_selected_row_count":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssigneeForTriples."
+    "test_500_triples_costs_five_chunks_not_five_hundred_selects":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssigneeForTriples.test_empty_input_issues_no_writes":
+        "counts queries via sqlite3's set_trace_callback.",
+    "DropStreamTest.test_sqlite_fk_cascade_clears_the_origin_on_delete":
+        "asserts SQLite's ON DELETE SET NULL foreign-key cascade on "
+        "current_assignments.stream_id -- the migrated MariaDB schema "
+        "declares no foreign keys at all (verified against "
+        "tools/migrate_to_mariadb.py), so the SAME assignment there "
+        "keeps a dangling stream_id instead of being nulled. That "
+        "divergence is the finding Storage.assignments_referencing_"
+        "stream's docstring records, not a bug to reconcile here.",
 }  # type: Dict[str, str]
 
 if backends.MARIADB_AVAILABLE:
@@ -157,7 +265,7 @@ if backends.MARIADB_AVAILABLE:
                 start_time=start,
                 end_time=start + datetime.timedelta(seconds=3),
                 output="line one\ncafé 🙂", source_link="",
-                known_failure_reason=None)
+                known_failure_reason=None, build=None)
 
         def test_reimport_updates_in_place_and_keeps_the_id(self) -> None:
             from testboard.model import Result
@@ -212,7 +320,8 @@ if backends.MARIADB_AVAILABLE:
                 environment="e", script="s", test_name="t",
                 result=Result.PASS, start_time=start,
                 end_time=start + datetime.timedelta(seconds=1),
-                output=text, source_link="", known_failure_reason=None)])
+                output=text, source_link="", known_failure_reason=None,
+                build=None)])
             run_id = self.raw("SELECT id FROM runs")[0][0]
             stored = self.store.get_run(int(run_id))
             self.assertIsNotNone(stored)
@@ -230,7 +339,7 @@ if backends.MARIADB_AVAILABLE:
                           result=Result.PASS, start_time=start,
                           end_time=start + datetime.timedelta(seconds=1),
                           output="", source_link="",
-                          known_failure_reason=None)
+                          known_failure_reason=None, build=None)
                 for name in names])
 
         def names_for(self, q: str) -> List[str]:
@@ -271,7 +380,7 @@ if backends.MARIADB_AVAILABLE:
                           result=Result.PASS, start_time=start,
                           end_time=start + datetime.timedelta(seconds=1),
                           output="", source_link="",
-                          known_failure_reason=None)
+                          known_failure_reason=None, build=None)
                 for index in range(5)])
 
     class SchemaGuardMariaDBTest(unittest.TestCase):

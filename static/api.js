@@ -228,6 +228,45 @@ export function rememberUser(name) {
 }
 
 /**
+ * Populate `select` with every known username, sorted, "(me)" tagged —
+ * the option-building half of the assignee dropdown, factored out so a
+ * PASSIVE picker (one that does not save on change — see
+ * `userPickerSelect()` below) can build the identical list rather than
+ * a second hand-rolled copy.
+ *
+ * `placeholder` is the empty option's label ("— unassigned —" for a
+ * control that can clear an assignment, "— choose a user —" for one
+ * that requires picking someone). `extra` is a name to keep in the
+ * list even when the fetched roster omits it — the current assignee,
+ * who may have been deactivated since (see the comment this used to
+ * carry, now here): `/api/users` returns active users only, so a test
+ * still owned by a deactivated account would otherwise render with an
+ * empty dropdown, silently looking unassigned. The current user (`me`)
+ * is always added too, covering you before the server has heard of
+ * you.
+ */
+function fillUserOptions(select, users, placeholder, extra) {
+  clearNode(select);
+  const me = getUsername();
+  const none = el("option", "", placeholder);
+  none.value = "";
+  select.appendChild(none);
+
+  const names = users.slice();
+  for (const name of [me, extra]) {
+    if (name && names.indexOf(name) === -1) {
+      names.push(name);
+    }
+  }
+  names.sort((a, b) => a.localeCompare(b));
+  for (const name of names) {
+    const opt = el("option", "", name === me ? name + " (me)" : name);
+    opt.value = name;
+    select.appendChild(opt);
+  }
+}
+
+/**
  * An assignee dropdown that saves as soon as it changes.
  *
  * Assigning is the single most common action in a triage queue, so it
@@ -240,34 +279,10 @@ export function assigneeSelect(entry, onSaved) {
   select.title = "Assign this test";
 
   const rebuild = (users) => {
-    clearNode(select);
-    const me = getUsername();
-    const none = el("option", "", "— unassigned —");
-    none.value = "";
-    select.appendChild(none);
-
     // The current assignee is added even when the fetched list omits
-    // them, and that is DELIBERATE — do not "fix" it.
-    //
-    // /api/users returns active users only, so a test still owned by a
-    // deactivated account would otherwise render with an empty
-    // dropdown, silently looking unassigned. Injecting the name keeps
-    // the row honest about who holds it, and reassigning away is the
-    // one action that has to keep working.
-    //
-    // The same line covers you before the server has heard of you.
-    const names = users.slice();
-    for (const extra of [me, entry.assignee]) {
-      if (extra && names.indexOf(extra) === -1) {
-        names.push(extra);
-      }
-    }
-    names.sort((a, b) => a.localeCompare(b));
-    for (const name of names) {
-      const opt = el("option", "", name === me ? name + " (me)" : name);
-      opt.value = name;
-      select.appendChild(opt);
-    }
+    // them, and that is DELIBERATE — do not "fix" it. See
+    // fillUserOptions()'s own docstring for why.
+    fillUserOptions(select, users, "— unassigned —", entry.assignee);
     select.value = entry.assignee || "";
     if (!entry.assignee) {
       select.classList.add("is-unassigned");
@@ -291,10 +306,20 @@ export function assigneeSelect(entry, onSaved) {
     }
     select.disabled = true;
     try {
+      const body = { username: target, assigned_by: me };
+      // WP-21: an entry built from a branch-scoped view (the delta
+      // table's rows) carries its own stream id, so the assignment
+      // records WHERE it was made from — an annotation, never a
+      // partition of who owns the test (docs/STREAMS_PLAN.md §3.4). An
+      // ordinary dashboard/queue entry never sets this, so the field is
+      // simply absent there, same as every assignment before WP-21.
+      if (entry.stream_id !== undefined && entry.stream_id !== null) {
+        body.stream_id = entry.stream_id;
+      }
       await putJson(
         testApiPath(entry.environment, entry.script, entry.test_name,
           "/assignee"),
-        { username: target, assigned_by: me });
+        body);
       entry.assignee = target;
       rememberUser(target);
       select.classList.toggle("is-unassigned", !target);
@@ -308,6 +333,40 @@ export function assigneeSelect(entry, onSaved) {
       select.disabled = false;
     }
   });
+  return select;
+}
+
+/**
+ * A PASSIVE user dropdown — the same sorted, "(me)"-tagged option list
+ * `assigneeSelect()` builds, but it does not save on change and starts
+ * on no selection (a caller who needs to clear/pre-fill sets `.value`
+ * itself). For a control that gathers a username as one field of a
+ * larger action rather than assigning immediately — the multi-select
+ * action bar (selection.js) and Open Actions' bulk-assign control,
+ * which used to be a free-text `<input>` ("just lazy" — the user's
+ * words, 2026-08-10): every OTHER assignee control in this app is this
+ * same dropdown, and a plain text box let a bulk assignment go to a
+ * name nobody could actually be assigned work under (no active-user
+ * check, no autocomplete, one keystroke from a typo estate-wide).
+ *
+ * `className` is applied to the `<select>` (styling only); the caller
+ * listens for `"change"` itself to gate its own submit control.
+ */
+export function userPickerSelect(className) {
+  const select = document.createElement("select");
+  select.className = className || "user-picker-select";
+
+  const rebuild = (users) => {
+    const current = select.value;
+    fillUserOptions(select, users, "— choose a user —", null);
+    // Keep whatever was already picked, including a name typed/assigned
+    // during THIS page's life that loadUsers()'s cached fetch does not
+    // know about yet (rememberUser() covers that — see loadUsers()).
+    select.value = current;
+  };
+
+  rebuild([]);
+  loadUsers().then(rebuild);
   return select;
 }
 

@@ -19,7 +19,9 @@ import unittest
 import urllib.error
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from feeder.submitter import SubmitStats, Submitter, describe_connection_error
+from feeder.submitter import (
+    StreamsAckMissing, SubmitStats, Submitter, describe_connection_error,
+)
 from testboard import model
 
 #: One outcome for the fake opener: an HTTP (status, body) or an exception.
@@ -50,8 +52,32 @@ def make_raw(index: int = 0, minutes: int = 0, **overrides: Any) -> Dict[str, An
 
 
 def ok_body(inserted: int = 0, updated: int = 0, rejected: int = 0,
-            errors: Optional[List[Dict[str, Any]]] = None) -> bytes:
-    """Serialize a well-formed /api/import 200 response body."""
+            errors: Optional[List[Dict[str, Any]]] = None,
+            streams_seen: Optional[List[str]] = None) -> bytes:
+    """Serialize a well-formed /api/import 200 response body.
+
+    ``streams_seen`` defaults to ``[]`` (a WP-21 server's mainline
+    shape). Pass ``streams_seen=None`` explicitly via
+    :func:`ok_body_without_streams_seen` to simulate a pre-WP-21 server,
+    whose response has no such key at all.
+    """
+    payload = {
+        "inserted": inserted,
+        "updated": updated,
+        "rejected": rejected,
+        "errors": errors if errors is not None else [],
+        "streams_seen": streams_seen if streams_seen is not None else [],
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def ok_body_without_streams_seen(
+    inserted: int = 0, updated: int = 0, rejected: int = 0,
+    errors: Optional[List[Dict[str, Any]]] = None,
+) -> bytes:
+    """A 200 response body shaped like a server that predates WP-21 —
+    no ``streams_seen`` key at all (unknown keys are simply absent, not
+    null)."""
     payload = {
         "inserted": inserted,
         "updated": updated,
@@ -131,7 +157,8 @@ class SubmitterTestBase(unittest.TestCase):
     def make_submitter(self, opener: Any, batch_size: int = 500,
                        max_retries: int = 3,
                        backoff_seconds: float = 2.0,
-                       url: str = URL) -> Submitter:
+                       url: str = URL,
+                       build: Optional[str] = None) -> Submitter:
         """Build a Submitter wired to the fakes and the temp replay dir."""
         return Submitter(
             url,
@@ -141,6 +168,7 @@ class SubmitterTestBase(unittest.TestCase):
             opener=opener,
             sleep=self.sleep,
             replay_dir=self.replay_dir,
+            build=build,
         )
 
     def replay_files_on_disk(self) -> List[str]:
@@ -536,6 +564,68 @@ class DescribeConnectionErrorTest(unittest.TestCase):
         self.assertIn(IMPORT_URL, message)
         self.assertIn("ValueError", message)
         self.assertIn("python3 run_server.py", message)
+
+
+class StreamsAckTest(SubmitterTestBase):
+    """WP-21 (docs/STREAMS_PLAN.md section 3.3/3.7): a --build submitter
+    must abort if the server's response has no streams_seen key at all —
+    the sign of a server that predates WP-21 and would silently file the
+    runs into mainline. (--branch died with WP-25, docs/ONE_KIND_PLAN.md,
+    before it ever shipped.)"""
+
+    def test_mainline_never_checks_for_the_key(self) -> None:
+        """No build given: an old-shaped response is fine."""
+        opener = FakeOpener([(200, ok_body_without_streams_seen())])
+        submitter = self.make_submitter(opener)
+        stats = submitter.submit([make_raw(0)])
+        self.assertEqual(stats.sent, 1)
+
+    def test_build_with_the_key_present_succeeds(self) -> None:
+        opener = FakeOpener([(200, ok_body(inserted=1,
+                                            streams_seen=["build:feat/x"]))])
+        submitter = self.make_submitter(opener, build="feat/x")
+        stats = submitter.submit([make_raw(0)])
+        self.assertEqual(stats.sent, 1)
+
+    def test_build_with_an_empty_list_still_succeeds(self) -> None:
+        """The key must be PRESENT; an empty list is a legitimate answer
+        (e.g. every record in this particular batch got rejected before
+        being counted, though the key itself was echoed back)."""
+        opener = FakeOpener([(200, ok_body(inserted=0, streams_seen=[]))])
+        submitter = self.make_submitter(opener, build="feat/x")
+        stats = submitter.submit([make_raw(0)])
+        self.assertEqual(stats.sent, 1)
+
+    def test_build_with_the_key_absent_raises(self) -> None:
+        opener = FakeOpener([(200, ok_body_without_streams_seen())])
+        submitter = self.make_submitter(opener, build="feat/x")
+        with self.assertRaises(StreamsAckMissing) as caught:
+            submitter.submit([make_raw(0)])
+        self.assertIn("streams_seen", str(caught.exception))
+        self.assertIn("--build", str(caught.exception))
+
+    def test_the_triggering_batch_still_counts_as_sent_not_replayed(
+            self) -> None:
+        """The batch DID get a real 200 - its data is stored server-side.
+        No replay file should be written for it; the exception is the
+        signal, not a batch failure."""
+        opener = FakeOpener([(200, ok_body_without_streams_seen())])
+        submitter = self.make_submitter(opener, build="feat/x")
+        with self.assertRaises(StreamsAckMissing):
+            submitter.submit([make_raw(0)])
+        self.assertEqual(self.replay_files_on_disk(), [])
+
+    def test_a_later_batch_missing_the_ack_aborts_mid_run(self) -> None:
+        """The first batch acks fine; the second does not (e.g. a
+        rolling deploy landed an old node mid-import) - still aborts."""
+        opener = FakeOpener([
+            (200, ok_body(inserted=1, streams_seen=["build:feat/x"])),
+            (200, ok_body_without_streams_seen()),
+        ])
+        submitter = self.make_submitter(
+            opener, batch_size=1, build="feat/x")
+        with self.assertRaises(StreamsAckMissing):
+            submitter.submit([make_raw(0, minutes=0), make_raw(1, minutes=1)])
 
 
 class StatsShapeTest(unittest.TestCase):

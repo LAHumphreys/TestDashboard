@@ -4,10 +4,24 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-08-07**, after building WP-19 (MariaDB backend),
-folding it with WP-18 into the **2026-08-07 drop** — and after that drop
-**went live the same day**: migration 7 completed on the production database
-(30 s–2 min, operator-reported) and the Timeline is accepted.
+Last rewritten: **2026-08-10, early morning**, at the end of the overnight
+run `docs/NIGHT_RUN_2026-08-09.md` executed. All six phases completed.
+**The streams upgrade is consolidated on ONE ship branch,
+`streams-upgrade`, pushed, all four CI legs green — waiting on the
+morning's manual testing and the user's merge/no-merge call.** Nothing
+was merged to `master` overnight, by instruction.
+
+> **The morning path:** (1) read the morning summary message in the
+> overnight session; (2) work through
+> [`MORNING_TESTING.md`](MORNING_TESTING.md) — a 15-minute per-persona
+> click checklist against the seeded server on **port 8791**; (3) fix
+> anything found (the re-verify loop is one command,
+> `python .scratch\net\run_net.py`); (4) your call: push the pending
+> `wp-18-timeline` → `master` first (keeps master's history honest),
+> then merge `streams-upgrade` → `master`; (5) re-date the drop note +
+> `whatsnew.html` to the actual ship day (`DropDateTest` holds them in
+> lockstep but cannot catch a date wrong the same way in both); (6)
+> deploy per [`drops/2026-08-11.md`](drops/2026-08-11.md).
 
 ---
 
@@ -15,116 +29,161 @@ folding it with WP-18 into the **2026-08-07 drop** — and after that drop
 
 | | |
 |---|---|
-| **production** | **live on the 2026-08-07 drop** (schema v7). Confirm the box runs the FINAL drop commit `310f1c0` — What's new saying "7 August 2026" is the tell; older says 4 August |
-| `origin/master` | `ea15ccc` — **stale**: push `wp-18-timeline` to `master` so the recorded state matches the deployed one |
-| `wp-18-timeline` | the 2026-08-07 drop, deployed. **All four CI legs green** including the new `python36-mariadb` |
-| `wp-14-in-run-progress` | parked WIP; **its migration is 8** — renumber before merging (registry §1) |
+| **production** | **live on the 2026-08-07 drop** (schema v7, commit `310f1c0`). Nothing below is deployed |
+| `origin/master` | `ea15ccc` — **stale**: push `wp-18-timeline` to `master` before the streams merge |
+| `wp-18-timeline` | the 2026-08-07 drop, deployed. All four CI legs green |
+| **`streams-upgrade`** | **THE ship candidate** — tip `2adc1d2`, identical to `wp-24-scoped-urls`'s tip. Contains WP-20+21+22+23 (from `wp-23-longrunning`) + WP-25 (one stream kind, `wp-25-one-kind`) + WP-24 (scoped URLs) + the overnight fixes (origin-filter rename, four-site stream carriage, three persona-walk fixes). Chain is linear; nothing ships without all of it |
+| `wp-25-one-kind` / `wp-24-scoped-urls` | the overnight work branches, both pushed, both contained in full by `streams-upgrade` — superseded as ship candidates |
+| `wp-20-products`…`wp-23-longrunning` | earlier stages of the same chain, superseded |
+| `wp-14-in-run-progress` | parked WIP; its migration renumbers to **11** before merging (registry §1) |
 
-Suite: **1385 green** (skipped 1) locally; **1749 OK (skipped 16)** on the CI
-MariaDB leg — 10.3, prod's stream. Schema moves to **migration 7** at deploy
-(the WP-18 half), so **the rollback is the database copy**, not `git
-checkout`. WP-19 consumed no version; 8 stays reserved for WP-15, 9 free.
+Suite on `streams-upgrade`: **2022 OK (skipped=1)** SQLite-only;
+**2705 OK (skipped=44)** dual-backend against the local MariaDB (port
+3307, `.scratch/mariadb-test.cnf` — functional evidence only, never a
+perf number). The 44 skips are all deliberate and per-test-reasoned —
+36 are query-count guards that need `sqlite3.set_trace_callback`, which
+the MariaDB backend has no equivalent for (so O(N)-query protections
+are SQLite-enforced only — known asymmetry, consistent with "MariaDB
+perf numbers come from the real box"). CI's four legs (3.6.8 ubi8,
+3.6.8+mariadb:10.3, 3.8, 3.14) green on every overnight push.
 
-**SQLite is a permanent first-class backend** (user requirement, 2026-08-07):
-`--db PATH` unchanged forever, zero-setup second instances, both backends
-gated in CI. MariaDB is opt-in per instance via
-`--db-config /etc/testboard/db.cnf --site-notes PATH`. The server never runs
-DDL on MariaDB — schema comes from the migration tooling only.
+**The drop:** migrations **8, 9, 10** run in sequence on one restart
+(WP-22/24/25 add none; WP-25 amended entry 9's comment in place, DDL
+byte-identical). Rollback **needs the database copy** — a v10 file is
+refused by v7 code. Combined v7→v10 measured ~0.17–0.18s on the 220MB
+dev copy; **never measured on a production copy** — item 2 of "needs a
+person" below.
 
-The repo-root `testboard.db` is generated dev data (218 MB, 540,192 runs,
-still v5 — current code migrates it on open, COPY FIRST). Production is
-~900 MB / ~4.4M runs at **v6** on a network mount. Say which one any number
-came from. **The dev machine also has MariaDB 12.3.2** (winget, x86_64 under
-emulation, port 3307, datadir `.scratch/mariadb-data`, root password in
-`.scratch/mariadb-test.cnf`): start with
-`& "C:\Program Files\MariaDB 12.3\bin\mariadbd.exe" --datadir=<repo>\.scratch\mariadb-data --port=3307 --console`,
-then `$env:TESTBOARD_TEST_DB_CNF=".scratch\mariadb-test.cnf"` activates the
-364 dual-backend tests. Functional evidence only — never quote a perf number
-from it.
+## What the overnight run did (detail: the status log's 2026-08-09→10 entry, and the drop note's "Overnight round" section)
 
-## The immediate thing
+- **WP-25** — one stream kind (`build`); `branch:` on the wire is a loud
+  per-record rejection; mainline-default baseline everywhere; data-gated
+  two-tab; Time/Timeline stream-scoped empty states name where the data
+  is; What's New rewritten for scannability. One review catch: the F5
+  verdict line was restored (data-gated) after being over-deleted.
+- **WP-24** — `static/urls.js` owns every scoped URL;
+  `ScopedUrlConstructionTest` ends the hand-built-URL bug family (eight
+  historical incidents). Invisible to testers; pure refactor, measured
+  perf no-op.
+- **The sanity net** — `.scratch/net/run_net.py` (~18s, unattended):
+  six gotcha classes, API + DOM-shim walks. Caught two real defects the
+  full unit suite could not see (the origin-filter dead spelling, and a
+  four-site `stream=` drop in WP-24's conversion — 517 links, one root
+  cause). Fully green at the ship tip. Runner scripts listed in the
+  morning summary.
+- **Persona walks** (manager/delver/RC-owner, from cold) — three fixes:
+  test-page assign now records stream origin (was silently
+  mainline-origin), three visible dead-kind strings renamed (+ a sweep
+  guard), and the test page gained the review panel's scoped "View in
+  timeline →" link. Judgment calls went to the decision list, not code.
 
-**The MariaDB migration itself — the drop is already live.** Steps 1 of the
-plan (deploy; migration 7; Timeline acceptance) happened 2026-08-07. What
-remains: (2) §A server prep on the new account (target server confirmed
-MariaDB 10.3.39 via client banner — re-confirm server-side with
-`SELECT VERSION()`); (3) §C preflight, §E.1 **dry run on a prod copy**, then
-the §E cutover with the freeze and feeder catch-up. Read
-[`docs/drops/2026-08-07.md`](drops/2026-08-07.md) for the whole procedure
-and the two small follow-ups (confirm the box is on `310f1c0`; push the
-branch to `master`).
+## Decided in morning testing, 2026-08-10 — landed the same morning (WP-26)
 
-**Before migration day:** the runbook was re-reviewed and corrected
-2026-08-07 (see the status log's entries of that date). §C's preamble
-matters most — UTF-8 locale, and the tool-must-match-database-version rule.
-Production is now at **v7**, so migrate with this branch's checkout, whose
-exporter knows `script_hours`. Never with an older one: an older tool
-silently skips tables it has never heard of and its own verification agrees
-with the omission.
+Open Actions gained **bulk assign** and **bulk unassign, with an
+optional comment posted on every affected test** (user decision,
+2026-08-10, while exploring abandoned-build cleanup: assignments from
+a dead build persisted and cleanup was per-row) — `POST
+/api/assignments/bulk`, reusing GET `/api/dashboard`'s own filter
+parser (`testboard.api._parse_dashboard_filters`) so the two can never
+mean two different things by "everything the current filters match".
+Storage does it in one SELECT (already LEFT JOINed to
+`current_assignments`) plus bounded `executemany` writes, one
+transaction, no per-row round trip. Assignments stay estate-level
+one-owner-per-triple (§0.4) — bulk operations act on the current
+filter, never introduce per-stream ownership, and never write a
+`stream_id` origin (Open Actions is unscoped).
 
-**Still open from earlier drops:** re-retire the tests the un-retire bug
-released (search comments for "Automatically un-retired");
-`tools/diagnose_db.py --compare-local` on the production server, never run.
-Performance Phase 2 remains parked; MariaDB perf is unmeasured everywhere
-and only the real box may produce numbers.
+The related finding — investigated while building the `drop_stream.py`
+visibility this decision also asked for — turned out **more
+interesting than the original note above claimed**: `delete_stream`
+nulls `comments.stream_id` with an explicit UPDATE, but
+`current_assignments.stream_id`/`assignments.stream_id` are left to
+the schema's declared `ON DELETE SET NULL` foreign key, and that FK is
+NOT equivalent on both backends (verified directly, see
+`Storage.assignments_referencing_stream`'s docstring). **SQLite**
+enforces it (`PRAGMA foreign_keys=ON` on every connection), so a
+stream delete auto-nulls the column — no dangling origin, ever, on
+today's production backend. **MariaDB**'s migrated schema declares no
+foreign keys at all, so there the id dangles exactly as the original
+note described. `tools/drop_stream.py` now prints the pre-delete count
+either way, worded for both outcomes rather than promising the
+MariaDB-only one. Not a regression to fix — `delete_stream`'s
+behavior is unchanged — but worth a look before the MariaDB cutover
+(Thread B below): the same divergence comments.stream_id was
+deliberately protected from was never closed for the two assignment
+tables.
+
+## The morning decision list (needs the user, not a commit)
+
+New from the persona walks: watch-card accents don't rank cards when
+all are failing (real-browser question); composer name-select
+pre-selects the first environment instead of a placeholder; the
+"Not run 12,009" tab dominates a naive worst-queue read; the empty
+"Every build" section shows on pure-mainline test pages; the Build
+picker is invisible on a bare multi-product dashboard (route is
+switcher-first, no on-screen hint); no explicit "back" from a Watch
+drill-down (nav + saved default is the mechanism). Carried: ghosting
+deferral; the `actions.js` NUL sentinel ruling; staleness client-clock
+wording; compare O(partition) numbers from a real box; summary
+residual cold cost (~25ms measured tonight, dev-labelled); callerless
+`previous_builds`/`compare_counts_many(baselines=)` — keep or delete.
+
+## Thread B — the MariaDB cutover (independent, unchanged tonight)
+
+Steps as before: §A server prep, §C preflight, §E.1 dry run on a prod
+copy, §E cutover with freeze + feeder catch-up — see
+[`drops/2026-08-07.md`](drops/2026-08-07.md). **If Thread A ships
+first, the schema is v10** — the migration tool and exporter DDL must
+come from a checkout that knows the WP-23 columns AND WP-25's one-kind
+world, same version-must-match rule as always.
+
+## Needs a person, not a commit
+
+1. **The morning manual pass → merge → deploy** (see "the morning path"
+   above).
+2. Migration-8+9+10 probe on a **production** copy — the dev number has
+   disagreed with itself across sessions; a production number has never
+   been taken.
+3. The morning decision list above.
+4. §A on the MariaDB server (root), §E.1 dry run, cutover decision.
+5. Re-retire the tests the un-retire bug released (search comments for
+   "Automatically un-retired"); `tools/diagnose_db.py --compare-local`
+   on the production server — both still open from earlier drops.
+6. **Decide whether to close the SQLite/MariaDB divergence WP-26
+   found** on `current_assignments.stream_id`/`assignments.stream_id`:
+   SQLite's declared `ON DELETE SET NULL` FK auto-clears the column
+   when `delete_stream` runs; MariaDB's migrated schema has no FK at
+   all, so there it dangles. `comments.stream_id` was already
+   protected from exactly this by an explicit UPDATE in
+   `delete_stream` — the same fix (an explicit `UPDATE ... SET
+   stream_id = NULL` for both tables, in the same transaction) would
+   close it for good on both backends, but WP-26's brief was to make
+   the finding visible, not to change `delete_stream`'s behavior, so
+   it is untouched. Relevant before Thread B's cutover, since
+   MariaDB is where the dangling id is real.
 
 ## First ten minutes of a new session
 
 ```bash
-git log --oneline -5                  # where am I
+git log --oneline -5                  # expect 2adc1d2 on streams-upgrade / wp-24-scoped-urls
 git status --short                    # should be clean
-python -m unittest discover           # expect 1385 OK (skipped=1)
+python -m unittest discover           # expect 2022 OK (skipped=1)
+python .scratch\net\run_net.py        # expect PASS, ~18s (the whole overnight gotcha net)
 ```
 
-**If the UI looks wrong, check you restarted the server.** Static files are
-read per request; the Python is whatever was imported at process start.
+**If the UI looks wrong, check you restarted the server.** Static files
+are read per request; the Python is whatever was imported at process
+start.
 
-There is no browser here. Frontend changes are verified by the node DOM-shim
-harness in `.scratch/` (see the 2026-08-04 handover text in git history for
-its pieces); it cannot catch layout, colour or contrast.
+There is still no browser here. The overnight run verified everything a
+DOM-shim and a unit suite can see — 528 rendered links' scope carriage,
+every empty state's wording, the whole import contract — and none of
+what they cannot: layout, colour, contrast, whether a page is too much
+for one screen. The morning checklist is organised around exactly that
+gap.
 
----
-
-## The work waiting, in the order it wants doing
-
-### 1. Ship the 2026-08-07 drop, migrate, cut over
-
-Acceptance list in the operator note. Deploy pushes `wp-18-timeline` to
-`master`. The cutover itself is §E of the runbook, gated on the dry run.
-
-### 2. Merge the deferred work back — `wp-14-in-run-progress`
-
-**Migration renumbers to 8 before merging** (registry §1). Now further
-behind: expect conflicts in `app.js`, `storage.py` (backend seam + the
-upsert maintaining `script_hours`), and the status log.
-
-### 3. WP-15 — progress pushes from a partial reader *(migration 8)*
-
-Fully specified in `UPGRADE_PLAN.md` §WP-15. Note for the MariaDB era: its
-migration entry is SQLite-only by definition; if the estate has cut over,
-its schema change ALSO needs adding to the exporter DDL + a §D reload (or
-hand-applied DDL via `testboard_migrate`) — decide when it lands.
-
-### 4. WP-16 — site-specific info tab
-
-Still noted, not specified.
-
-## Needs a person, not a commit
-
-1. **Acceptance-test and ship the 2026-08-07 drop.**
-2. Migration-7 probe on a prod copy (number into the drop note).
-3. §A on the server (root), §E.1 dry run, cutover decision.
-4. Re-retire the tests the un-retire bug released.
-5. `tools/diagnose_db.py --compare-local` on the production server.
-
-## Shipping a drop
-
-1. Branch, build, `python -m unittest discover` green.
-2. Dated section at the top of `static/whatsnew.html`, `data-drop-date`
-   matching the heading (`DropDateTest`).
-3. Operator note `docs/drops/YYYY-MM-DD.md` per `CLAUDE.md`; measure any
-   migration on a prod copy first (§1.2).
-4. Push the drop branch to `master` after acceptance.
-5. On the box: stop, copy `testboard.db` + `-wal` + `-shm`, pull, start —
-   when the feeder is not importing.
-6. Check the drop per the operator note.
+The repo-root `testboard.db` is generated dev data (220 MB, v5 — only
+ever copied, never opened with current code). The seeded manual-test
+server runs from a scratchpad COPY on **port 8791** with a fresh perf
+log; `.scratch/net/` and `.scratch/seeds/` hold the harness and seed
+scripts (gitignored tooling, listed in the morning summary).

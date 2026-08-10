@@ -96,8 +96,11 @@ after a merge.
 | 5 | WP-13 | `environment_expectations` table | No |
 | 6 | WP-17 | `activity_hours` table, `runs.output_fingerprint` | Yes — see §1.2 |
 | 7 | WP-18 | `script_hours` table *(took 7 from WP-15 — see below)* | Yes — see §1.2 |
-| 8 | WP-15 | `run_progress` table *(renumbered from 6, then from 7 — see below)* | No |
-| 9+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 8 | WP-20 | `environment_products` table *(took 8 from WP-15 — see below)* | No |
+| 9 | WP-21 | `streams` table, `runs.stream_id`, `comments.stream_id`, `assignments.stream_id`, `current_assignments.stream_id`, `latest_runs` rebuilt with `stream_id` *(took 9 from WP-15 — see below; the two `assignments`/`current_assignments` columns were folded in after this entry first landed but before this branch shipped anywhere; then WP-25 (docs/ONE_KIND_PLAN.md) amended it AGAIN IN PLACE, same precedent, to narrow `streams.kind` from {mainline, branch, build} to {mainline, build} — the `branch` kind died before it ever shipped anywhere, so this is deletion, not migration. `kind` was never CHECK-constrained, so the DDL is unchanged; only the comment and the application-level validation moved. See the entry's own comment in `storage.py`)* | Yes — see §1.2 (`latest_runs` rebuild; ~12k rows) |
+| 10 | WP-23 | `activity_hours`/`script_hours` rebuilt with `stream_id` in their PRIMARY KEY *(took 10 from WP-15 — see below)* | Yes — see §1.2 (both tables rebuilt; a straight copy, not a `runs` re-aggregate — ~1k + ~22k rows on the dev copy) |
+| 11 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8, then 9, then 10 — see below)* | No |
+| 12+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Why 6 and 7 swapped (2026-07-30).** Versions must ship contiguously —
 `tests/test_migrations.py` enforces it, and a database at version 7 with no 6
@@ -113,9 +116,36 @@ claim is a RESERVATION, not a number: whatever ships next takes the lowest
 unshipped version, and the reservation follows it up. WP-19 (the MariaDB
 backend, 2026-08-07) deliberately consumed **no** version: the SQLite schema
 is untouched, and the MariaDB schema is only ever created by the migration
-tooling, never by the app. **When the WIP branch
-comes back it must renumber its migration entry to 8 before merging** — the
-registry is the coordination point, and this note is the hand-off.
+tooling, never by the app. (This note originally said the WIP branch must
+renumber its migration entry to 8 before merging — **superseded by the next
+note**, which moved that target to 9. Left here rather than deleted so the
+history of the swap reads in order.)
+
+**And why 8 and 9 swapped too (2026-08-08).** The same situation a third
+time: WP-20 (products, drop 1 of `docs/STREAMS_PLAN.md`) shipped while
+`wp-14-in-run-progress` was still parked, so the ship-first package took the
+next contiguous number (8) and the parked claim moved back one (9). (This
+note originally said the WIP branch must renumber its migration entry to 9
+before merging — **superseded by the next note**, which moved that target
+to 10. Left here rather than deleted so the history of the swap reads in
+order.)
+
+**And why 9 and 10 swapped too (2026-08-08).** The same situation a fourth
+time, same day: WP-21 (streams, drop 2 of `docs/STREAMS_PLAN.md`) shipped
+while `wp-14-in-run-progress` was still parked, so the ship-first package
+took the next contiguous number (9) and the parked claim moved back one
+(10). (This note originally said the WIP branch must renumber its migration
+entry to 10 before merging — **superseded by the next note**, which moved
+that target to 11. Left here rather than deleted so the history of the swap
+reads in order.)
+
+**And why 10 and 11 swapped too (2026-08-08).** The same situation a fifth
+time, same day: WP-23 (long-running branch streams, drop 4 of
+`docs/STREAMS_PLAN.md`) shipped while `wp-14-in-run-progress` was still
+parked, so the ship-first package took the next contiguous number (10) and
+the parked claim moved back one (11). This is the CURRENT instruction:
+**when the WIP branch comes back it must renumber its migration entry to
+11 before merging.**
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry

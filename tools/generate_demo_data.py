@@ -270,6 +270,7 @@ def generate_runs(days=DEFAULT_DAYS, seed=DEFAULT_SEED, now=None):
                     ),
                     source_link=_fake_source_link(script, line),
                     known_failure_reason=reason,
+                    build=None,
                 )
             )
     runs.sort(key=lambda rec: (rec.start_time, rec.script, rec.test_name))
@@ -424,6 +425,7 @@ def generate_filler_batches(
                     source_link=_fake_source_link(
                         script, 10 + test_index * 12),
                     known_failure_reason=reason,
+                    build=None,
                 ))
         generated += in_script
         script_index += 1

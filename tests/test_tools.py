@@ -536,6 +536,7 @@ class TestPruneRunsCli(unittest.TestCase):
                 output="log line\n" * 20,
                 source_link="https://example.com/suite.py",
                 known_failure_reason=None,
+                build=None,
             )
             for day in range(40)
         ]
@@ -547,6 +548,7 @@ class TestPruneRunsCli(unittest.TestCase):
                       + datetime.timedelta(seconds=1)),
             output="log\n", source_link="https://example.com/suite.py",
             known_failure_reason=None,
+            build=None,
         ))
         storage.upsert_runs(records)
         storage.close()
@@ -637,7 +639,8 @@ class TestDropEnvironmentCLI(unittest.TestCase):
                 environment=environment, script="suite.py",
                 test_name="test_a", result=Result.PASS,
                 start_time=NOW, end_time=NOW + datetime.timedelta(seconds=1),
-                output="out", source_link="", known_failure_reason=None)
+                output="out", source_link="", known_failure_reason=None,
+                build=None)
             for environment in ("linux-sim", "UNKNOWN")
         ])
         store.close()

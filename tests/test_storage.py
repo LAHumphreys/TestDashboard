@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from testboard import analytics, model, storage
 from testboard.model import Result, RunRecord
@@ -53,6 +53,7 @@ def make_record(
     output: str = "all good\n",
     source_link: str = "https://example.com/suite.py#L1",
     known_failure_reason: Optional[str] = None,
+    build: Optional[str] = None,
 ) -> RunRecord:
     """Build a RunRecord with sensible defaults for tests."""
     if start is None:
@@ -69,6 +70,7 @@ def make_record(
         output=output,
         source_link=source_link,
         known_failure_reason=known_failure_reason,
+        build=build,
     )
 
 
@@ -152,7 +154,7 @@ class TestMigrations(StorageTestBase):
         counts = mem.upsert_runs([make_record()])
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=1, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=1, updated=0, unchanged=0, rejections=[]),
         )
         self.assertTrue(mem.test_exists("linux-sim", "suite.py", "test_a"))
 
@@ -169,7 +171,7 @@ class TestUpsertRuns(StorageTestBase):
         )
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=2, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=2, updated=0, unchanged=0, rejections=[]),
         )
 
     def test_mixed_insert_and_update_counts(self) -> None:
@@ -182,7 +184,7 @@ class TestUpsertRuns(StorageTestBase):
         )
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=1, updated=1, unchanged=0),
+            storage.UpsertCounts(inserted=1, updated=1, unchanged=0, rejections=[]),
         )
 
     def test_reimport_identical_batch_is_unchanged_no_duplicates(self) -> None:
@@ -204,11 +206,11 @@ class TestUpsertRuns(StorageTestBase):
         second = self.store.upsert_runs(batch)
         self.assertEqual(
             first,
-            storage.UpsertCounts(inserted=3, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=3, updated=0, unchanged=0, rejections=[]),
         )
         self.assertEqual(
             second,
-            storage.UpsertCounts(inserted=0, updated=0, unchanged=3),
+            storage.UpsertCounts(inserted=0, updated=0, unchanged=3, rejections=[]),
         )
         self.assertEqual(len(self.store.dashboard()), 3)
         history = self.store.run_history("linux-sim", "suite.py", "test_a")
@@ -228,7 +230,7 @@ class TestUpsertRuns(StorageTestBase):
         counts = self.store.upsert_runs([changed])
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=0, updated=1, unchanged=0),
+            storage.UpsertCounts(inserted=0, updated=1, unchanged=0, rejections=[]),
         )
         run = self.store.get_run(original.run_id)
         assert run is not None
@@ -250,7 +252,7 @@ class TestUpsertRuns(StorageTestBase):
         )
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=2, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=2, updated=0, unchanged=0, rejections=[]),
         )
         history = self.store.run_history("linux-sim", "suite.py", "test_a")
         self.assertEqual(len(history), 2)
@@ -259,7 +261,7 @@ class TestUpsertRuns(StorageTestBase):
         counts = self.store.upsert_runs([])
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=0, updated=0, unchanged=0),
+            storage.UpsertCounts(inserted=0, updated=0, unchanged=0, rejections=[]),
         )
 
 
@@ -314,6 +316,27 @@ class TestDashboard(StorageTestBase):
         rows = self.store.dashboard(environment="win-uat")
         self.assertEqual([r.test_name for r in rows], ["test_c"])
         self.assertEqual(self.store.dashboard(environment="nope"), [])
+
+    def test_filter_environments_list_is_an_or(self) -> None:
+        """The WP-20 product filter: an allow-list of environments,
+        resolved by the caller from ``environment_products``."""
+        rows = self.store.dashboard(environments=["linux-sim", "win-uat"])
+        self.assertEqual(
+            sorted(r.test_name for r in rows),
+            ["test_a", "test_b", "test_c"])
+        rows = self.store.dashboard(environments=["win-uat"])
+        self.assertEqual([r.test_name for r in rows], ["test_c"])
+
+    def test_filter_environments_empty_list_matches_nothing(self) -> None:
+        """A product that resolved to zero environments (unknown, or
+        declared with none) must filter out everything, not act as if
+        no filter were given."""
+        self.assertEqual(self.store.dashboard(environments=[]), [])
+        self.assertEqual(
+            self.store.dashboard_count(environments=[]), 0)
+
+    def test_filter_environments_none_means_unfiltered(self) -> None:
+        self.assertEqual(len(self.store.dashboard(environments=None)), 3)
 
     def test_filter_script(self) -> None:
         rows = self.store.dashboard(script="other.py")
@@ -913,6 +936,22 @@ class TestDurationRollup(StorageTestBase):
         self.assertEqual(rollup.total_seconds, 37.0)
         self.assertEqual(rollup.excluded_tests, 0)
 
+    def test_environments_list_filter(self) -> None:
+        """The WP-20 product filter: an allow-list rather than one exact
+        match, so a multi-environment product scopes the same way."""
+        rollup = self.store.duration_rollup(
+            "environment", self.cutoff, environments=["linux", "win"])
+        self.assertEqual(rollup.total_seconds, 37.0)
+        rollup = self.store.duration_rollup(
+            "environment", self.cutoff, environments=["win"])
+        self.assertEqual(
+            [(s.key, s.total_seconds) for s in rollup.slices],
+            [("win", 2.0)])
+        rollup = self.store.duration_rollup(
+            "environment", self.cutoff, environments=[])
+        self.assertEqual(rollup.slices, [])
+        self.assertEqual(rollup.test_count, 0)
+
     def test_an_unknown_group_by_is_refused(self) -> None:
         """GROUP BY cannot be parameterised, so the whitelist IS the
         security boundary — same rule as DASHBOARD_SORTS."""
@@ -1239,6 +1278,721 @@ class TestAssignments(StorageTestBase):
         )
 
 
+class TestAssignmentStreamId(StorageTestBase):
+    """``stream_id`` on set_assignee (WP-21, folded into migration 9):
+    WHERE an assignment was made from, an annotation on
+    assignments/current_assignments, never a partition of who owns the
+    test — the assignee itself is read the same way regardless
+    (docs/STREAMS_PLAN.md §3.4/§3.6)."""
+
+    TRIPLE = ("linux-sim", "suite.py", "test_a")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([make_record(build="feat/x")])
+        self.stream_id = self.store.list_streams("")[0].stream_id
+
+    def _current_stream_id(self) -> Optional[int]:
+        """Read ``current_assignments.stream_id`` directly — there is no
+        higher-level accessor for it alone (the dashboard/queue reads
+        return the whole row; a bare assignment needs no test to
+        exist)."""
+        row = self.store._conn().execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = ? AND script = ? AND test_name = ?",
+            self.TRIPLE,
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def test_defaults_to_none(self) -> None:
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="alice", assigned_by="bob",
+            assigned_at=CREATED,
+        )
+        self.assertIsNone(self._current_stream_id())
+
+    def test_round_trips_when_given(self) -> None:
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="alice", assigned_by="bob",
+            assigned_at=CREATED, stream_id=self.stream_id,
+        )
+        self.assertEqual(self._current_stream_id(), self.stream_id)
+        # The assignee itself is unaffected -- it is not partitioned by
+        # stream_id, only annotated with it.
+        self.assertEqual(self.store.current_assignee(*self.TRIPLE), "alice")
+
+    def test_reassignment_updates_the_stream_id_too(self) -> None:
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="alice", assigned_by="bob",
+            assigned_at=CREATED, stream_id=self.stream_id,
+        )
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="carol", assigned_by="bob",
+            assigned_at=CREATED + datetime.timedelta(minutes=1),
+        )
+        self.assertIsNone(self._current_stream_id())
+        self.assertEqual(self.store.current_assignee(*self.TRIPLE), "carol")
+
+    def test_clearing_can_still_carry_a_stream_id(self) -> None:
+        """Clearing FROM a branch's view is itself a decision made
+        there -- the annotation is not only for the positive case."""
+        self.store.set_assignee(
+            *self.TRIPLE, assignee=None, assigned_by="bob",
+            assigned_at=CREATED, stream_id=self.stream_id,
+        )
+        self.assertIsNone(self.store.current_assignee(*self.TRIPLE))
+        self.assertEqual(self._current_stream_id(), self.stream_id)
+
+    def test_the_history_row_also_carries_it(self) -> None:
+        self.store.set_assignee(
+            *self.TRIPLE, assignee="alice", assigned_by="bob",
+            assigned_at=CREATED, stream_id=self.stream_id,
+        )
+        row = self.store._conn().execute(
+            "SELECT stream_id FROM assignments WHERE "
+            "environment = ? AND script = ? AND test_name = ? "
+            "ORDER BY id DESC LIMIT 1",
+            self.TRIPLE,
+        ).fetchone()
+        self.assertEqual(row[0], self.stream_id)
+
+
+class TestBulkSetAssignee(StorageTestBase):
+    """Storage.bulk_set_assignee — Open Actions' bulk assign/unassign
+    (2026-08-10, found while cleaning up assignments a dead build left
+    behind): the SAME filters :meth:`Storage.dashboard`/
+    :meth:`Storage.dashboard_count` read, acting on the whole matched
+    set in one transaction instead of one row at a time.
+    """
+
+    def setUp(self) -> None:
+        super(TestBulkSetAssignee, self).setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE, result=Result.FAIL),
+            make_record(test_name="test_b", start=BASE, result=Result.PASS),
+            make_record(
+                environment="win-uat", script="other.py",
+                test_name="test_c", start=BASE,
+                result=Result.UNEXPECTED_PASS,
+            ),
+        ])
+        # A build stream, and test_b already carrying an assignment made
+        # FROM it -- proves a bulk op clears that origin the same way a
+        # row-level re-assign from Open Actions already does (it, too,
+        # sends no stream_id; assignments are estate-level,
+        # docs/STREAMS_PLAN.md §0.4).
+        self.store.upsert_runs([make_record(
+            test_name="test_b", start=BASE, result=Result.PASS,
+            build="feat/x")])
+        self.build_stream_id = self.store.list_streams("")[0].stream_id
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "carol", "dave", CREATED,
+            stream_id=self.build_stream_id,
+        )
+
+    def test_bulk_assign_only_touches_matched_rows(self) -> None:
+        updated = self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, results=[Result.FAIL])
+        self.assertEqual(updated, 1)
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"),
+            "alice")
+        # test_b was untouched by a FAIL-only filter -- still carol's.
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "carol")
+
+    def test_bulk_assign_returns_the_matched_count(self) -> None:
+        updated = self.store.bulk_set_assignee("alice", "bob", CREATED)
+        self.assertEqual(updated, 3)
+        self.assertEqual(updated, self.store.dashboard_count())
+
+    def test_bulk_unassign_clears_only_matched_rows(self) -> None:
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        updated = self.store.bulk_set_assignee(
+            None, "bob", CREATED + datetime.timedelta(minutes=1),
+            environment="linux-sim")
+        self.assertEqual(updated, 2)
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"))
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"))
+        # win-uat's test_c was outside the environment filter.
+        self.assertEqual(
+            self.store.current_assignee("win-uat", "other.py", "test_c"),
+            "alice")
+
+    def test_bulk_assign_over_a_never_assigned_row_inserts(self) -> None:
+        updated = self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="win-uat")
+        self.assertEqual(updated, 1)
+        self.assertEqual(
+            self.store.current_assignee("win-uat", "other.py", "test_c"),
+            "alice")
+
+    def test_bulk_assign_over_an_already_assigned_row_updates(self) -> None:
+        updated = self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="linux-sim",
+            script="suite.py", q="test_b")
+        self.assertEqual(updated, 1)
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "alice")
+
+    def test_bulk_assign_clears_the_stream_origin(self) -> None:
+        """test_b's assignment started build-originated; a bulk assign
+        writes NULL, matching a row-level re-assign from Open Actions
+        (which also sends no stream_id) — never a partition of who owns
+        the test, only an annotation of where it was made from."""
+        self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="linux-sim",
+            script="suite.py", q="test_b")
+        conn = self.store._conn()
+        current = conn.execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_b'"
+        ).fetchone()
+        self.assertIsNone(current[0])
+        history = conn.execute(
+            "SELECT stream_id FROM assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_b' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNone(history[0])
+
+    def test_bulk_unassign_over_a_build_originated_row_also_clears_origin(
+        self
+    ) -> None:
+        self.store.bulk_set_assignee(
+            None, "bob", CREATED, environment="linux-sim",
+            script="suite.py", q="test_b")
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"))
+        current = self.store._conn().execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_b'"
+        ).fetchone()
+        self.assertIsNone(current[0])
+
+    def test_comment_posted_on_every_matched_test(self) -> None:
+        self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, comment_text="build looked dead")
+        for triple in (
+            ("linux-sim", "suite.py", "test_a"),
+            ("linux-sim", "suite.py", "test_b"),
+            ("win-uat", "other.py", "test_c"),
+        ):
+            comments = self.store.comments(*triple)
+            self.assertEqual(len(comments), 1, triple)
+            self.assertEqual(comments[0].author, "bob")
+            self.assertEqual(comments[0].text, "build looked dead")
+            self.assertIsNone(comments[0].stream_id)
+
+    def test_no_comment_when_comment_text_is_none(self) -> None:
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        self.assertEqual(
+            self.store.comments("linux-sim", "suite.py", "test_a"), [])
+
+    def test_empty_comment_text_posts_nothing(self) -> None:
+        """Storage's own contract is plain truthiness — an empty string
+        is skipped exactly like None. Deciding that WHITESPACE-only
+        counts as empty too is the API layer's job
+        (testboard.api._handle_bulk_assignments), not storage's."""
+        self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, comment_text="")
+        self.assertEqual(
+            self.store.comments("linux-sim", "suite.py", "test_a"), [])
+
+    def test_zero_matches_returns_zero_and_writes_nothing(self) -> None:
+        # setUp's build-originated assignment already created carol/dave;
+        # the assertion is that a zero-match call creates no ONE else,
+        # not that the estate has no users at all.
+        before = self.store.list_users()
+        updated = self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="does-not-exist")
+        self.assertEqual(updated, 0)
+        self.assertEqual(self.store.list_users(), before)
+
+    def test_implicitly_creates_both_users(self) -> None:
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        self.assertEqual(
+            sorted(u.username for u in self.store.list_users()),
+            ["alice", "bob", "carol", "dave"])
+
+    def test_history_row_is_appended_for_every_matched_triple(self) -> None:
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        count = self.store._conn().execute(
+            "SELECT COUNT(*) FROM assignments WHERE assignee = 'alice'"
+        ).fetchone()[0]
+        self.assertEqual(count, 3)
+
+    def test_invalidates_the_summary_cache(self) -> None:
+        """queue_counts is memoized (_summary_cache) and its "mine"
+        column reads current_assignments — the same surface
+        set_assignee's own invalidation test
+        (test_set_assignee_invalidates_queue_counts) pins for a single
+        row. "mine" counts the ``assigned`` queue predicate (FAIL or
+        UNEXPECTED_PASS with a current assignee — see QUEUE_KINDS),
+        which is test_a (FAIL) and test_c (UNEXPECTED_PASS) here, not
+        test_b (PASS): the count below is 2, not "every matched row",
+        deliberately."""
+        stale_before = BASE + datetime.timedelta(hours=1)
+        before = self.store.queue_counts(
+            stale_before=stale_before, assignee="alice")
+        self.assertEqual(before["mine"], 0)
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        after = self.store.queue_counts(
+            stale_before=stale_before, assignee="alice")
+        self.assertEqual(
+            after["mine"], 2,
+            "the memo kept serving zero assigned tests")
+
+    def test_atomicity_a_failure_mid_transaction_writes_nothing(
+        self
+    ) -> None:
+        """A synthetic failure on the current_assignments write — AFTER
+        the assignments-history executemany has already run inside the
+        SAME transaction — must leave NEITHER applied: proof the whole
+        operation commits or rolls back as one unit, not table by
+        table. sqlite3.Connection does not allow monkeypatching its own
+        bound methods (a read-only attribute on the C type), so this
+        substitutes Storage._conn() with a thin proxy for the duration
+        of one call, restored in `finally`.
+        """
+        real_conn = self.store._conn()
+
+        class _FlakyConn(object):
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *a: object, **kw: object) -> object:
+                return self._real.execute(sql, *a, **kw)
+
+            def executemany(
+                self, sql: str, *a: object, **kw: object
+            ) -> object:
+                if "current_assignments" in sql:
+                    raise sqlite3.OperationalError("synthetic failure")
+                return self._real.executemany(sql, *a, **kw)
+
+        proxy = _FlakyConn(real_conn)
+        self.store._conn = lambda: proxy  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.bulk_set_assignee("alice", "bob", CREATED)
+        finally:
+            del self.store._conn  # restores the class's bound method
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"))
+        count = self.store._conn().execute(
+            "SELECT COUNT(*) FROM assignments WHERE assignee = 'alice'"
+        ).fetchone()[0]
+        self.assertEqual(
+            count, 0, "the history row survived a rolled-back transaction")
+
+    def test_the_query_count_is_bounded_not_per_row(self) -> None:
+        """500 matched tests must not mean 500 SELECTs: one SELECT for
+        the matched set (already LEFT JOINed to current_assignments, so
+        it doubles as the existence check for the upsert below it) plus
+        one each for ensure_user(bob)/ensure_user(alice) — bounded
+        regardless of how many rows match, the same "one SELECT plus
+        the executemany" shape ``_backfill_latest_durations`` and
+        :meth:`Storage.failure_streak_bounds_many` already use."""
+        records = [
+            make_record(
+                script="bulk.py", test_name="test_{:03d}".format(i),
+                start=BASE, result=Result.FAIL,
+            )
+            for i in range(500)
+        ]
+        self.store.upsert_runs(records)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated = self.store.bulk_set_assignee(
+                "alice", "bob", CREATED, script="bulk.py")
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(updated, 500)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(
+            len(selects), 3,
+            "expected a constant SELECT count regardless of matched "
+            "rows, got {0}: {1}".format(len(selects), selects))
+
+    def test_empty_input_issues_no_writes(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated = self.store.bulk_set_assignee(
+                "alice", "bob", CREATED, environment="does-not-exist")
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(updated, 0)
+        writes = [
+            s for s in seen
+            if s.strip().upper().startswith(("INSERT", "UPDATE"))
+        ]
+        self.assertEqual(writes, [])
+
+
+class TestBulkSetAssigneeForTriples(StorageTestBase):
+    """Storage.bulk_set_assignee_for_triples — the multi-select action
+    bar's "assign selected"/"unassign selected" (an EXPLICIT list of
+    triples, as opposed to :meth:`TestBulkSetAssignee`'s "everything
+    the current filters match"). Shares :meth:`Storage.bulk_set_assignee`'s
+    WRITE phase VERBATIM (:meth:`Storage._write_bulk_assignments`) — the
+    tests here that overlap with ``TestBulkSetAssignee`` above exist to
+    PROVE that sharing, not merely to re-cover the write mechanics.
+    """
+
+    def setUp(self) -> None:
+        super(TestBulkSetAssigneeForTriples, self).setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE, result=Result.FAIL),
+            make_record(test_name="test_b", start=BASE, result=Result.PASS),
+            make_record(
+                environment="win-uat", script="other.py",
+                test_name="test_c", start=BASE,
+                result=Result.UNEXPECTED_PASS,
+            ),
+        ])
+        self.store.upsert_runs([make_record(
+            test_name="test_b", start=BASE, result=Result.PASS,
+            build="feat/x")])
+        self.build_stream_id = self.store.list_streams("")[0].stream_id
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "carol", "dave", CREATED,
+            stream_id=self.build_stream_id,
+        )
+
+    def test_only_the_named_triples_are_touched(self) -> None:
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None)],
+        )
+        self.assertEqual((updated, unknown), (1, 0))
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"),
+            "alice")
+        # test_b was not named -- still carol's.
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "carol")
+
+    def test_unassign_over_named_triples(self) -> None:
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            None, "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "test_b", None)],
+        )
+        self.assertEqual((updated, unknown), (2, 0))
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"))
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"))
+
+    def test_insert_and_update_both_happen_in_one_call(self) -> None:
+        """test_a has never been assigned (insert path); test_b already
+        has a row (update path) -- both in the SAME call, same as a
+        mixed filter-mode match."""
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "test_b", None)],
+        )
+        self.assertEqual((updated, unknown), (2, 0))
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"),
+            "alice")
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "alice")
+
+    def test_a_stream_id_per_triple_is_written_as_its_origin(self) -> None:
+        """The BUILD delta table's own selection: this triple's row
+        carries the SAME stream_id a row-level assign from that page
+        would send (docs/STREAMS_PLAN.md §3.4/§3.6) — unlike filter
+        mode, which always writes NULL."""
+        self.store.upsert_runs([make_record(
+            environment="win-uat", script="other.py", test_name="test_c",
+            start=BASE, result=Result.UNEXPECTED_PASS, build="feat/y")])
+        other_stream_id = [
+            s.stream_id for s in self.store.list_streams("")
+            if s.name == "feat/y"
+        ][0]
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", self.build_stream_id),
+             ("win-uat", "other.py", "test_c", other_stream_id)],
+        )
+        self.assertEqual((updated, unknown), (2, 0))
+        conn = self.store._conn()
+        row = conn.execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a'"
+        ).fetchone()
+        self.assertEqual(row[0], self.build_stream_id)
+        row = conn.execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'win-uat' AND script = 'other.py' "
+            "AND test_name = 'test_c'"
+        ).fetchone()
+        self.assertEqual(row[0], other_stream_id)
+        history = conn.execute(
+            "SELECT stream_id FROM assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(history[0], self.build_stream_id)
+
+    def test_a_triple_with_no_origin_writes_null(self) -> None:
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None)],
+        )
+        self.assertEqual((updated, unknown), (1, 0))
+        current = self.store._conn().execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a'"
+        ).fetchone()
+        self.assertIsNone(current[0])
+
+    def test_unknown_triples_are_skipped_not_a_hard_failure(self) -> None:
+        """A page can be stale (a retirement, or a triple that never
+        reported) -- unknown triples are counted, never fail the call."""
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "no_such_test", None),
+             ("nowhere", "nothing.py", "ghost", None)],
+        )
+        self.assertEqual((updated, unknown), (1, 2))
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"),
+            "alice")
+
+    def test_every_triple_unknown_writes_nothing_and_creates_no_user(
+        self
+    ) -> None:
+        before = self.store.list_users()
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("nowhere", "nothing.py", "ghost", None)],
+        )
+        self.assertEqual((updated, unknown), (0, 1))
+        self.assertEqual(self.store.list_users(), before)
+
+    def test_a_duplicated_triple_counts_once(self) -> None:
+        """updated + unknown is the DISTINCT triple count, not
+        len(triples) -- a duplicate keeps its LAST origin."""
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "test_a", self.build_stream_id)],
+        )
+        self.assertEqual((updated, unknown), (1, 0))
+        current = self.store._conn().execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a'"
+        ).fetchone()
+        self.assertEqual(current[0], self.build_stream_id)
+
+    def test_comment_posted_on_every_named_triple(self) -> None:
+        self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("win-uat", "other.py", "test_c", None)],
+            comment_text="build looked dead",
+        )
+        for triple in (
+            ("linux-sim", "suite.py", "test_a"),
+            ("win-uat", "other.py", "test_c"),
+        ):
+            comments = self.store.comments(*triple)
+            self.assertEqual(len(comments), 1, triple)
+            self.assertEqual(comments[0].text, "build looked dead")
+        # Untouched (not in the list) -- no comment.
+        self.assertEqual(
+            self.store.comments("linux-sim", "suite.py", "test_b"), [])
+
+    def test_zero_triples_returns_zero_and_zero(self) -> None:
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED, [])
+        self.assertEqual((updated, unknown), (0, 0))
+
+    def test_filter_mode_and_triples_mode_leave_identical_table_states(
+        self
+    ) -> None:
+        """The SAME matched set, reached the two different ways, must
+        leave storage in the SAME state -- the proof the write phase is
+        genuinely shared, not two implementations that happen to agree
+        today."""
+        # A second, identically-seeded store for the filter-mode side --
+        # a fresh temp file rather than self.store, so the two writes
+        # below cannot see or interfere with each other.
+        second_dir = tempfile.mkdtemp(prefix="testboard_storage_cmp_")
+        self.addCleanup(shutil.rmtree, second_dir, True)
+        store_b = Storage(os.path.join(second_dir, "test.db"))
+        self.addCleanup(store_b.close)
+        store_b.upsert_runs([
+            make_record(test_name="test_a", start=BASE, result=Result.FAIL),
+            make_record(test_name="test_b", start=BASE, result=Result.PASS),
+        ])
+        store_a_env_only = self.store
+        store_a_env_only.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "test_b", None)],
+            comment_text="note",
+        )
+        store_b.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="linux-sim",
+            comment_text="note",
+        )
+        for triple in (
+            ("linux-sim", "suite.py", "test_a"),
+            ("linux-sim", "suite.py", "test_b"),
+        ):
+            self.assertEqual(
+                store_a_env_only.current_assignee(*triple),
+                store_b.current_assignee(*triple), triple)
+            comments_a = [c.text for c in store_a_env_only.comments(*triple)]
+            comments_b = [c.text for c in store_b.comments(*triple)]
+            self.assertEqual(comments_a, comments_b, triple)
+
+    def test_atomicity_a_failure_mid_transaction_writes_nothing(
+        self
+    ) -> None:
+        real_conn = self.store._conn()
+
+        class _FlakyConn(object):
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *a: object, **kw: object) -> object:
+                return self._real.execute(sql, *a, **kw)
+
+            def executemany(
+                self, sql: str, *a: object, **kw: object
+            ) -> object:
+                if "current_assignments" in sql:
+                    raise sqlite3.OperationalError("synthetic failure")
+                return self._real.executemany(sql, *a, **kw)
+
+        proxy = _FlakyConn(real_conn)
+        self.store._conn = lambda: proxy  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.bulk_set_assignee_for_triples(
+                    "alice", "bob", CREATED,
+                    [("linux-sim", "suite.py", "test_a", None)],
+                )
+        finally:
+            del self.store._conn
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"))
+        count = self.store._conn().execute(
+            "SELECT COUNT(*) FROM assignments WHERE assignee = 'alice'"
+        ).fetchone()[0]
+        self.assertEqual(
+            count, 0, "the history row survived a rolled-back transaction")
+
+    def test_the_query_count_is_flat_in_selected_row_count(self) -> None:
+        """250 selected triples (more than one _RECENT_CHUNK, WP-24's
+        list-mode-scale check) must not mean 250 SELECTs -- one SELECT
+        per chunk of 100 (ceil(250/100) = 3) plus two for
+        ensure_user(bob)/ensure_user(alice), each one SELECT
+        (:meth:`Storage.ensure_user`'s own existence check)."""
+        records = [
+            make_record(
+                script="bulk.py", test_name="test_{:03d}".format(i),
+                start=BASE, result=Result.FAIL,
+            )
+            for i in range(250)
+        ]
+        self.store.upsert_runs(records)
+        triples = [
+            ("linux-sim", "bulk.py", "test_{:03d}".format(i), None)
+            for i in range(250)
+        ]
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated, unknown = self.store.bulk_set_assignee_for_triples(
+                "alice", "bob", CREATED, triples)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual((updated, unknown), (250, 0))
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(
+            len(selects), 5,
+            "expected a chunk-bounded SELECT count (ceil(250/100)=3 "
+            "chunks + 2 ensure_user checks), got {0}: {1}".format(
+                len(selects), selects))
+
+    def test_500_triples_costs_five_chunks_not_five_hundred_selects(
+        self
+    ) -> None:
+        """A second point on the same line as the 250-row test above --
+        proves the count SCALES with chunks, not with a fixed constant
+        that happened to match one input size."""
+        records = [
+            make_record(
+                script="bulk.py", test_name="test_{:03d}".format(i),
+                start=BASE, result=Result.FAIL,
+            )
+            for i in range(500)
+        ]
+        self.store.upsert_runs(records)
+        triples = [
+            ("linux-sim", "bulk.py", "test_{:03d}".format(i), None)
+            for i in range(500)
+        ]
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated, unknown = self.store.bulk_set_assignee_for_triples(
+                "alice", "bob", CREATED, triples)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual((updated, unknown), (500, 0))
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        # ceil(500/100)=5 chunks + 2 ensure_user checks.
+        self.assertEqual(len(selects), 7, selects)
+
+    def test_empty_input_issues_no_writes(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated, unknown = self.store.bulk_set_assignee_for_triples(
+                "alice", "bob", CREATED, [])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual((updated, unknown), (0, 0))
+        writes = [
+            s for s in seen
+            if s.strip().upper().startswith(("INSERT", "UPDATE"))
+        ]
+        self.assertEqual(writes, [])
+
+
 class TestThreading(StorageTestBase):
     """Per-thread connections: writes in one thread visible in another."""
 
@@ -1295,7 +2049,7 @@ class TestLargeBatch(StorageTestBase):
         elapsed = time.monotonic() - started
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=5000, updated=0, unchanged=0)
+            storage.UpsertCounts(inserted=5000, updated=0, unchanged=0, rejections=[])
         )
         self.assertLess(
             elapsed,
@@ -1426,6 +2180,58 @@ class TestPreviousResult(StorageTestBase):
             self.store.scripts(environment="env-a"), ["a.py", "m.py"]
         )
 
+    def test_environments_narrowed_by_an_allow_list(self) -> None:
+        """WP-23 fix: environments() never took a product allow-list at
+        all, which is what let /api/summary?product=X return every
+        OTHER product's environments too — found live."""
+        self.store.upsert_runs([
+            make_record(environment="env-a"),
+            make_record(environment="env-b"),
+            make_record(environment="env-c"),
+        ])
+        self.assertEqual(
+            self.store.environments(environments=["env-a", "env-c"]),
+            ["env-a", "env-c"])
+
+    def test_environments_none_means_unfiltered(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-a"),
+            make_record(environment="env-b"),
+        ])
+        self.assertEqual(
+            self.store.environments(environments=None),
+            self.store.environments())
+
+    def test_environments_empty_allow_list_means_nothing(self) -> None:
+        """The established convention (_environments_clause): an
+        explicitly EMPTY sequence is "match nothing" (an unknown/
+        undeclared product), not "no filter"."""
+        self.store.upsert_runs([make_record(environment="env-a")])
+        self.assertEqual(self.store.environments(environments=[]), [])
+
+    def test_scripts_narrowed_by_an_allow_list(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-a", script="a.py"),
+            make_record(environment="env-b", script="b.py"),
+        ])
+        self.assertEqual(
+            self.store.scripts(environments=["env-a"]), ["a.py"])
+
+    def test_scripts_environment_and_allow_list_combine(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="env-a", script="a.py"),
+            make_record(environment="env-a", script="b.py",
+                        test_name="test_b"),
+        ])
+        self.assertEqual(
+            self.store.scripts(
+                environment="env-a", environments=["env-a", "env-c"]),
+            ["a.py", "b.py"])
+        self.assertEqual(
+            self.store.scripts(
+                environment="env-a", environments=["env-c"]),
+            [])
+
 
 class TestLatestRunsMaintenance(StorageTestBase):
     """latest_runs stays in lockstep with upserts, including backfills."""
@@ -1515,6 +2321,47 @@ class TestDailyResultCounts(StorageTestBase):
         )
         self.assertEqual([(c.day, c.count) for c in counts],
                          [(BASE.date(), 1)])
+
+    def test_environments_list_filter(self) -> None:
+        """The WP-20 product filter: an allow-list of environments."""
+        self.store.upsert_runs([
+            make_record(environment="env-a", start=BASE),
+            make_record(environment="env-b", start=BASE),
+            make_record(environment="env-c", start=BASE),
+        ])
+        counts = self.store.daily_result_counts(
+            BASE - datetime.timedelta(days=1),
+            environments=["env-a", "env-b"],
+        )
+        self.assertEqual([(c.day, c.count) for c in counts],
+                         [(BASE.date(), 2)])
+
+    def test_environments_list_is_a_distinct_cache_key(self) -> None:
+        """A scoped and an unscoped request for the same window must not
+        serve each other's memoized answer — the bug this guards is
+        silent, not an exception."""
+        self.store.upsert_runs([
+            make_record(environment="env-a", start=BASE),
+            make_record(environment="env-b", start=BASE),
+        ])
+        since = BASE - datetime.timedelta(days=1)
+        unscoped = self.store.daily_result_counts(since)
+        scoped = self.store.daily_result_counts(
+            since, environments=["env-a"])
+        self.assertEqual([(c.day, c.count) for c in unscoped],
+                         [(BASE.date(), 2)])
+        self.assertEqual([(c.day, c.count) for c in scoped],
+                         [(BASE.date(), 1)])
+        # Ask again, in reverse order, to prove neither call is serving
+        # the other's cached entry now that both are warm.
+        self.assertEqual(
+            [(c.day, c.count)
+             for c in self.store.daily_result_counts(
+                 since, environments=["env-a"])],
+            [(BASE.date(), 1)])
+        self.assertEqual(
+            [(c.day, c.count) for c in self.store.daily_result_counts(since)],
+            [(BASE.date(), 2)])
 
 
 class TestDescribeOpenError(unittest.TestCase):
@@ -1814,6 +2661,29 @@ class TestStatusQueues(EstateTestBase):
             ["test_win_fail"],
         )
 
+    def test_environments_list_scoping(self) -> None:
+        """The WP-20 product filter: an allow-list, not an exact match."""
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        self.assertEqual(
+            self.queue_names(
+                "new_failures", environments=["linux-sim", "win-sim"]),
+            sorted(["test_first_fail", "test_new_fail", "test_win_fail"]),
+        )
+        self.assertEqual(
+            self.store.status_queue_count(
+                "new_failures", environments=["win-sim"]),
+            1,
+        )
+        self.assertEqual(
+            self.store.status_queue_count(
+                "new_failures", environments=[]),
+            0,
+            "an empty allow-list (an unknown product) must match nothing",
+        )
+
     def test_limit_caps_rows_but_not_the_count(self) -> None:
         self.assertEqual(
             len(self.store.status_queue("new_failures", limit=1)), 1
@@ -1916,6 +2786,151 @@ class TestStatusQueues(EstateTestBase):
         )
         self.assertEqual(len(self.store.top_failing_scripts(limit=1)), 1)
 
+    def test_summary_rollup_environments_filter(self) -> None:
+        """The WP-20 product filter, on the query the estate headline
+        and the products[] breakdown are both built from."""
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        scoped = {
+            c.environment
+            for c in self.store.summary_rollup(
+                self.NIGHT_1, environments=["linux-sim"])
+        }
+        self.assertEqual(scoped, {"linux-sim"})
+        self.assertEqual(
+            self.store.summary_rollup(self.NIGHT_1, environments=[]), [])
+
+    def test_assigned_open_count_environments_filter(self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        self.store.set_assignee(
+            "win-sim", "suite.py", "test_win_fail", "alice", "bob", CREATED,
+        )
+        self.assertEqual(
+            self.store.assigned_open_count(environments=["win-sim"]), 1)
+        self.assertEqual(
+            self.store.assigned_open_count(environments=["linux-sim"]), 0)
+
+    def test_top_failing_scripts_environments_filter(self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="win-sim", script="other.py", test_name="test_o",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        top = self.store.top_failing_scripts(environments=["win-sim"])
+        self.assertEqual([(s.script, s.failing) for s in top],
+                          [("other.py", 1)])
+
+
+class TestQueueCounts(EstateTestBase):
+    """Storage.queue_counts: the batched, one-query form of
+    status_queue_count (WP-23 perf pass — see its own docstring for the
+    measured before/after). Every assertion here mirrors an existing
+    TestStatusQueues one, proving the two AGREE — the same discipline
+    test_counts_match_the_pure_classifier already applies between the
+    SQL predicates and the pure classifier.
+    """
+
+    def test_every_kind_agrees_with_status_queue_count(self) -> None:
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(stale_before=cutoff)
+        for kind in storage.QUEUE_KINDS:
+            self.assertEqual(
+                counts[kind],
+                self.store.status_queue_count(kind, stale_before=cutoff),
+                "queue_counts disagrees with status_queue_count for "
+                "{!r}".format(kind),
+            )
+
+    def test_mine_agrees_with_the_assignee_filtered_query(self) -> None:
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_still_fail", "alice", "bob",
+            CREATED,
+        )
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_new_fail", "carol", "bob",
+            CREATED,
+        )
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(
+            assignee="alice", stale_before=cutoff)
+        self.assertEqual(counts["mine"], 1)
+        self.assertEqual(
+            counts["mine"],
+            self.store.status_queue_count(
+                "assigned", assignee="alice", stale_before=cutoff),
+        )
+
+    def test_mine_is_zero_without_an_assignee(self) -> None:
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(stale_before=cutoff)
+        self.assertEqual(counts["mine"], 0)
+
+    def test_environment_scoping_agrees(self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_win_fail",
+            result=Result.FAIL, start=self.NIGHT_2,
+        )])
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(
+            environment="win-sim", stale_before=cutoff)
+        self.assertEqual(counts["new_failures"], 1)
+        self.assertEqual(
+            counts["new_failures"],
+            self.store.status_queue_count(
+                "new_failures", environment="win-sim",
+                stale_before=cutoff),
+        )
+
+    def test_retired_tests_are_excluded_from_every_kind(self) -> None:
+        """test_deleted is failing AND stale; must not inflate any count,
+        the same NOT_RETIRED guarantee status_queue_count already has."""
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(stale_before=cutoff)
+        self.assertEqual(
+            counts["not_run"],
+            self.store.status_queue_count("not_run", stale_before=cutoff),
+        )
+        self.assertNotIn(
+            "test_deleted",
+            [r.test_name for r in
+             self.store.status_queue("not_run", stale_before=cutoff)],
+        )
+
+    def test_an_unmatched_scope_returns_zeros_not_none(self) -> None:
+        """SUM(CASE...) over zero WHERE-matched rows is SQL NULL in both
+        backends, not 0 -- the ``or 0`` guard is what keeps this from
+        crashing int(None)."""
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        counts = self.store.queue_counts(
+            environment="does-not-exist", stale_before=cutoff)
+        for kind in storage.QUEUE_KINDS:
+            self.assertEqual(counts[kind], 0, kind)
+
+    def test_stale_before_is_required(self) -> None:
+        """not_run is always one of QUEUE_KINDS, so unlike
+        status_queue_count (only needed when THAT kind is requested)
+        this needs it unconditionally."""
+        with self.assertRaises(ValueError):
+            self.store.queue_counts()
+
+    def test_one_query_regardless_of_assignee(self) -> None:
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            self.store.queue_counts(assignee="alice", stale_before=cutoff)
+        finally:
+            conn.set_trace_callback(None)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(len(selects), 1, selects)
+
 
 class TestFailureStreakBounds(StorageTestBase):
     """failing_since / last_pass_before, via index seeks over the history."""
@@ -1978,6 +2993,156 @@ class TestFailureStreakBounds(StorageTestBase):
             streak.failing_since, BASE + datetime.timedelta(days=1)
         )
         self.assertEqual(streak.last_pass_before, BASE)
+
+
+class TestFailureStreakBoundsMany(StorageTestBase):
+    """The batched form of failure_streak_bounds (WP-23 perf pass — see
+    its own docstring). Every scenario mirrors one of
+    TestFailureStreakBounds's above, proving the batch AGREES with the
+    single-row method row for row rather than merely "looking
+    plausible" — the same discipline TestQueueCounts applies.
+    """
+
+    def seed_triple(
+        self, test_name: str, results: List[Result]
+    ) -> datetime.datetime:
+        """One run per day, oldest first, for ONE named test; returns the
+        latest start."""
+        records = []  # type: List[RunRecord]
+        for offset, result in enumerate(results):
+            records.append(make_record(
+                test_name=test_name, result=result,
+                start=BASE + datetime.timedelta(days=offset),
+            ))
+        self.store.upsert_runs(records)
+        return BASE + datetime.timedelta(days=len(results) - 1)
+
+    def test_agrees_with_the_single_row_method_for_a_batch(self) -> None:
+        latest_a = self.seed_triple(
+            "test_a", [Result.PASS, Result.PASS, Result.FAIL, Result.FAIL])
+        latest_b = self.seed_triple("test_b", [Result.PASS, Result.FAIL])
+        latest_c = self.seed_triple("test_c", [Result.FAIL, Result.FAIL])
+        latest_d = self.seed_triple(
+            "test_d",
+            [Result.PASS, Result.FAILED_AS_EXPECTED, Result.FAIL])
+        entries = [
+            ("linux-sim", "suite.py", "test_a", latest_a),
+            ("linux-sim", "suite.py", "test_b", latest_b),
+            ("linux-sim", "suite.py", "test_c", latest_c),
+            ("linux-sim", "suite.py", "test_d", latest_d),
+        ]
+        batched = self.store.failure_streak_bounds_many(entries)
+        for environment, script, test_name, latest in entries:
+            expected = self.store.failure_streak_bounds(
+                environment, script, test_name, latest)
+            self.assertEqual(
+                batched[(environment, script, test_name)], expected,
+                "batched result disagrees for {!r}".format(test_name),
+            )
+        # And the actual VALUES are right, not just self-consistent with
+        # the single-row method (which could share the same bug):
+        self.assertEqual(
+            batched[("linux-sim", "suite.py", "test_a")].failing_since,
+            BASE + datetime.timedelta(days=2),
+        )
+        self.assertIsNone(
+            batched[("linux-sim", "suite.py", "test_c")].last_pass_before
+        )
+
+    def test_streak_is_not_truncated_by_history_length(self) -> None:
+        """Mirrors TestFailureStreakBounds's test of the same name — a
+        long-broken test's true start must survive batching too."""
+        latest = self.seed_triple(
+            "test_a", [Result.PASS] + [Result.FAIL] * 300)
+        batched = self.store.failure_streak_bounds_many(
+            [("linux-sim", "suite.py", "test_a", latest)])
+        streak = batched[("linux-sim", "suite.py", "test_a")]
+        self.assertEqual(
+            streak.failing_since, BASE + datetime.timedelta(days=1))
+        self.assertEqual(streak.last_pass_before, BASE)
+
+    def test_an_unknown_triple_resolves_to_no_streak_and_skips_step_three(
+        self
+    ) -> None:
+        """A triple with no runs on this stream at all -- defensive:
+        production always calls this with a row's OWN latest_runs
+        start_time, which by construction matches a real run, so
+        failing_since is never actually None in practice (the row's own
+        run always satisfies step 2's own start_time <= latest). Still
+        resolves cleanly rather than crashing, and step 3 (the pass
+        lookup) is skipped for it since there is no failing_since to
+        look a pass up against -- 2 queries, not 3."""
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            batched = self.store.failure_streak_bounds_many([
+                ("linux-sim", "suite.py", "test_ghost", BASE),
+            ])
+        finally:
+            conn.set_trace_callback(None)
+        streak = batched[("linux-sim", "suite.py", "test_ghost")]
+        self.assertIsNone(streak.failing_since)
+        self.assertIsNone(streak.last_pass_before)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(len(selects), 2, selects)
+
+    def test_duplicate_triples_are_resolved_once(self) -> None:
+        latest = self.seed_triple("test_a", [Result.PASS, Result.FAIL])
+        entry = ("linux-sim", "suite.py", "test_a", latest)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            batched = self.store.failure_streak_bounds_many(
+                [entry, entry, entry])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(batched), 1)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(len(selects), 3, selects)
+
+    def test_query_count_is_bounded_by_chunks_not_rows(self) -> None:
+        """250 FAIL triples must not mean 250*3 queries. Chunked at
+        _RECENT_CHUNK (100, the same batch size recent_results uses):
+        ceil(250/100)*3 = 9, and every one of the 250 has a real
+        failing_since (each has a PASS then a FAIL), so step 3 runs for
+        every chunk too -- this is the worst case, not a lucky one."""
+        entries = []  # type: List[Tuple[str, str, str, datetime.datetime]]
+        for i in range(250):
+            name = "test_{:03d}".format(i)
+            latest = self.seed_triple(name, [Result.PASS, Result.FAIL])
+            entries.append(("linux-sim", "suite.py", name, latest))
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            batched = self.store.failure_streak_bounds_many(entries)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(batched), 250)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(
+            len(selects), 9,
+            "expected ceil(250/100)*3 queries, got {0}".format(
+                len(selects)))
+
+    def test_empty_input_issues_no_query(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            result = self.store.failure_streak_bounds_many([])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(result, {})
+        self.assertEqual(seen, [])
 
 
 class TestDashboardPaging(StorageTestBase):
@@ -2293,6 +3458,117 @@ class TestRecentResults(StorageTestBase):
         self.assertEqual(len(selects), 1)
 
 
+class TestLatestResultsForStreams(StorageTestBase):
+    """Storage.latest_results_for_streams -- ADDENDUM to the perf round
+    (Open Actions' truthful display, docs/STREAMS_PLAN.md §5.4). Same
+    batching discipline as TestRecentResults above: a page of rows
+    asking "what did THIS stream see for this test" one at a time is a
+    query per row, the exact shape this project's own guard tests exist
+    to catch.
+    """
+
+    def _seed_mainline_and_branch(
+        self,
+        test_name: str = "test_a",
+        mainline_result: Result = Result.PASS,
+        branch_result: Result = Result.FAIL,
+    ) -> int:
+        """Mainline's own result, then the SAME triple on a branch with
+        a DIFFERENT result -- the exact contradiction case this feature
+        exists for. Returns the branch's stream_id."""
+        self.store.upsert_runs([make_record(
+            test_name=test_name, result=mainline_result, start=BASE,
+        )])
+        self.store.upsert_runs([make_record(
+            test_name=test_name, result=branch_result,
+            start=BASE + datetime.timedelta(days=1), build="feat/x",
+        )])
+        streams = self.store.list_streams("")
+        return streams[0].stream_id
+
+    def test_the_origin_streams_own_result_is_returned(self) -> None:
+        branch_id = self._seed_mainline_and_branch()
+        found = self.store.latest_results_for_streams(
+            [(branch_id, "linux-sim", "suite.py", "test_a")])
+        self.assertEqual(
+            found[(branch_id, "linux-sim", "suite.py", "test_a")],
+            Result.FAIL,
+        )
+
+    def test_a_triple_the_stream_never_ran_is_simply_absent(self) -> None:
+        branch_id = self._seed_mainline_and_branch()
+        found = self.store.latest_results_for_streams(
+            [(branch_id, "linux-sim", "suite.py", "test_never_ran")])
+        self.assertEqual(found, {})
+
+    def test_mainline_and_branch_are_kept_separate_by_stream_id(
+        self
+    ) -> None:
+        """The same triple, two different stream_id keys, must not
+        collide -- proving the batched query keys on stream_id too, not
+        only the triple."""
+        branch_id = self._seed_mainline_and_branch()
+        found = self.store.latest_results_for_streams([
+            (1, "linux-sim", "suite.py", "test_a"),
+            (branch_id, "linux-sim", "suite.py", "test_a"),
+        ])
+        self.assertEqual(found[(1, "linux-sim", "suite.py", "test_a")],
+                          Result.PASS)
+        self.assertEqual(
+            found[(branch_id, "linux-sim", "suite.py", "test_a")],
+            Result.FAIL,
+        )
+
+    def test_empty_input_issues_no_query(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            found = self.store.latest_results_for_streams([])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(found, {})
+        self.assertEqual(seen, [])
+
+    def test_the_query_count_is_bounded_by_chunks_not_keys(self) -> None:
+        """250 keys must not mean 250 queries. Chunked at _RECENT_CHUNK
+        (100): ceil(250/100) = 3."""
+        records = []
+        for index in range(250):
+            records.append(make_record(
+                test_name="t%03d" % index, result=Result.PASS, start=BASE,
+            ))
+        self.store.upsert_runs(records)
+        keys = [
+            (1, "linux-sim", "suite.py", "t%03d" % i) for i in range(250)
+        ]
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            found = self.store.latest_results_for_streams(keys)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(found), 250)
+        selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
+        self.assertEqual(
+            len(selects), 3,
+            "expected ceil(250/100) queries, got {0}".format(len(selects)))
+
+    def test_duplicate_keys_are_not_fetched_twice(self) -> None:
+        branch_id = self._seed_mainline_and_branch()
+        key = (branch_id, "linux-sim", "suite.py", "test_a")
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            self.store.latest_results_for_streams([key, key, key])
+        finally:
+            conn.set_trace_callback(None)
+        selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
+        self.assertEqual(len(selects), 1)
+
+
 class TestSortIndexesAreUsed(StorageTestBase):
     """Migration 4: the descending sorts must not sort the whole table.
 
@@ -2482,6 +3758,156 @@ class TestEnvironmentExpectations(StorageTestBase):
             "INSERT OR REPLACE INTO environment_expectations", source)
 
 
+class TestEnvironmentProducts(StorageTestBase):
+    """Declared environment -> product mapping (migration 8, WP-20).
+
+    An environment absent from this table belongs to the implicit
+    product ``""`` — this is the read-time grouping the products
+    feature is built on, and it exists so a second product's
+    environments can be kept out of every estate view without touching
+    test identity.
+    """
+
+    def _declare(self, environment: str = "linux-sim",
+                 product: str = "Atlas") -> None:
+        self.store.set_environment_product(
+            environment, product, "alice", CREATED)
+
+    def test_nothing_is_declared_to_begin_with(self) -> None:
+        self.assertEqual(self.store.environment_products_map(), {})
+        self.assertEqual(self.store.list_environment_products(), [])
+        self.assertEqual(self.store.distinct_products(), [])
+
+    def test_declare_then_read_back(self) -> None:
+        self._declare()
+        self.assertEqual(
+            self.store.environment_products_map(), {"linux-sim": "Atlas"})
+        (row,) = self.store.list_environment_products()
+        self.assertEqual(row.environment, "linux-sim")
+        self.assertEqual(row.product, "Atlas")
+        self.assertEqual(row.updated_by, "alice")
+        self.assertEqual(row.updated_at, CREATED)
+
+    def test_redeclaring_replaces_rather_than_duplicates(self) -> None:
+        self._declare(product="Atlas")
+        later = CREATED + datetime.timedelta(days=1)
+        self.store.set_environment_product(
+            "linux-sim", "Borealis", "bob", later)
+        rows = self.store.list_environment_products()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].product, "Borealis")
+        self.assertEqual(rows[0].updated_by, "bob")
+        self.assertEqual(rows[0].updated_at, later)
+
+    def test_declaring_creates_the_user_that_did_it(self) -> None:
+        self._declare()
+        self.assertIsNotNone(self.store.get_user("alice"))
+
+    def test_clearing_returns_to_the_implicit_product(self) -> None:
+        self._declare()
+        self.assertTrue(self.store.clear_environment_product("linux-sim"))
+        self.assertEqual(self.store.environment_products_map(), {})
+
+    def test_clearing_what_was_never_declared_is_false_not_an_error(
+        self
+    ) -> None:
+        self.assertFalse(
+            self.store.clear_environment_product("never-existed"))
+
+    def test_product_for_environment_single_row_lookup(self) -> None:
+        """WP-22's single-environment lookup (used by the per-triple
+        streams endpoint) must agree with the whole-map read."""
+        self._declare("linux-sim", "Atlas")
+        self.assertEqual(
+            self.store.product_for_environment("linux-sim"), "Atlas")
+        self.assertEqual(
+            self.store.product_for_environment("never-declared"), "")
+
+    def test_environments_are_case_sensitive(self) -> None:
+        """Same reasoning, and the same test, as
+        TestEnvironmentExpectations.test_environments_are_case_sensitive:
+        a default MariaDB collation would fold these two together
+        (runbook B.3); this project's does not."""
+        self._declare("linux", "Atlas")
+        self._declare("Linux", "Borealis")
+        self.assertEqual(
+            self.store.environment_products_map(),
+            {"linux": "Atlas", "Linux": "Borealis"})
+
+    def test_known_environments_covers_run_and_declared_alike(
+        self
+    ) -> None:
+        """A product declared before the environment's first import, or
+        after it stopped reporting, must still be listed — the same
+        rule migration 5 established, so it can always be corrected."""
+        self.store.upsert_runs([make_record(environment="linux-sim")])
+        self._declare("retired-env", "Atlas")
+        self.assertEqual(
+            self.store.known_environments(), ["linux-sim", "retired-env"])
+
+    def test_environment_exists_is_true_once_a_product_is_declared(
+        self
+    ) -> None:
+        self.assertFalse(self.store.environment_exists("brand-new"))
+        self._declare("brand-new", "Atlas")
+        self.assertTrue(self.store.environment_exists("brand-new"))
+
+    def test_the_upsert_is_not_insert_or_replace(self) -> None:
+        """tests/test_sql_portability.py counts every OR REPLACE against
+        a committed expectation, because it deletes and re-inserts and
+        MariaDB's ON DUPLICATE KEY UPDATE does not."""
+        with open(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "testboard", "storage.py"),
+            "rb",
+        ) as handle:
+            source = handle.read().decode("utf-8")
+        self.assertNotIn(
+            "INSERT OR REPLACE INTO environment_products", source)
+
+
+class TestEnvironmentsForProduct(StorageTestBase):
+    """Resolving a product name to its member environments.
+
+    The read the WP-20 ``product=`` API filter is built on: it turns a
+    declared name into an allow-list of environments, which every
+    scoped endpoint then filters ``environment IN (...)`` on.
+    """
+
+    def test_the_implicit_product_is_every_unmapped_known_environment(
+        self
+    ) -> None:
+        self.store.upsert_runs([make_record(environment="linux-sim")])
+        self.store.upsert_runs([make_record(environment="win")])
+        self.store.set_environment_product(
+            "win", "Atlas", "alice", CREATED)
+        self.assertEqual(
+            self.store.environments_for_product(""), ["linux-sim"])
+
+    def test_a_named_product_returns_its_mapped_environments_sorted(
+        self
+    ) -> None:
+        self.store.set_environment_product(
+            "win", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "mac", "Borealis", "alice", CREATED)
+        self.assertEqual(
+            self.store.environments_for_product("Atlas"),
+            ["linux-sim", "win"])
+
+    def test_an_unknown_product_is_an_empty_list_not_an_error(self) -> None:
+        self.assertEqual(self.store.environments_for_product("Nope"), [])
+
+    def test_distinct_products_excludes_the_implicit_one(self) -> None:
+        self.store.set_environment_product(
+            "win", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([make_record(environment="linux-sim")])
+        self.assertEqual(self.store.distinct_products(), ["Atlas"])
+
+
 class TestInferredTestCounts(StorageTestBase):
     """The denominator a declaration overrides."""
 
@@ -2667,6 +4093,19 @@ class TestLatestRunTimeByEnvironment(StorageTestBase):
     def test_an_empty_estate_is_an_empty_map(self) -> None:
         self.assertEqual(self.store.latest_run_time_by_environment(), {})
 
+    def test_narrowed_by_an_allow_list(self) -> None:
+        """WP-23 fix: a product-scoped page's environment_updated pills
+        must not include another product's environments — found live
+        alongside the same gap in environments()/scripts()."""
+        self._seed()
+        self.assertEqual(
+            sorted(self.store.latest_run_time_by_environment(
+                environments=["linux-sim"])),
+            ["linux-sim"])
+        self.assertEqual(
+            self.store.latest_run_time_by_environment(environments=[]),
+            {})
+
     def test_a_re_import_of_an_older_run_does_not_move_it_back(
         self
     ) -> None:
@@ -2702,6 +4141,97 @@ class TestLatestRunTimeByEnvironment(StorageTestBase):
             "runs", plan.replace("latest_runs", ""),
             "must read the derived table, not history: " + plan)
         self.assertIn("INDEX", plan.upper(), plan)
+
+
+class UnassignedFailingTest(StorageTestBase):
+    """The Watchlist's unassigned-failure highlight (docs/STREAMS_PLAN.md
+    §2.4): currently-FAILING tests with no current assignee, batched
+    per environment and per stream so /api/watch pays no per-card
+    query for it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="a",
+                        result=Result.FAIL),
+            make_record(environment="linux-sim", test_name="b",
+                        result=Result.FAIL),
+            make_record(environment="linux-sim", test_name="c",
+                        result=Result.PASS),
+            make_record(environment="win-sim", test_name="d",
+                        result=Result.FAIL),
+        ])
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "a", "alice", "bob", CREATED)
+
+    def test_counts_only_failing_and_unassigned(self) -> None:
+        counts = self.store.unassigned_failing_by_environment()
+        # test_a is FAIL but assigned; test_b is FAIL and unassigned;
+        # test_c passes. linux-sim's count is exactly test_b.
+        self.assertEqual(counts, {"linux-sim": 1, "win-sim": 1})
+
+    def test_assignment_is_by_triple_not_by_stream(self) -> None:
+        """Assignments are stream-agnostic: assigning "a" from mainline
+        must also clear IT off a branch's own unassigned-failing count
+        for the same triple, because there is only ever one owner."""
+        self.store.upsert_runs([make_record(
+            environment="linux-sim", test_name="a", result=Result.FAIL,
+            build="feat/x", start=BASE + datetime.timedelta(hours=1))])
+        stream_id = self.store.list_streams("")[0].stream_id
+        counts = self.store.unassigned_failing_by_stream([stream_id])
+        # test_a fails on the branch too, but it is still assigned (the
+        # SAME assignment, made from mainline) -- zero, not one.
+        self.assertEqual(counts.get(stream_id, 0), 0)
+
+    def test_retired_tests_are_excluded(self) -> None:
+        self.store.set_retired(
+            "linux-sim", "suite.py", "b", True, "alice", "gone", CREATED)
+        counts = self.store.unassigned_failing_by_environment()
+        self.assertEqual(counts.get("linux-sim", 0), 0)
+
+    def test_a_clean_estate_has_no_entries(self) -> None:
+        empty_dir = tempfile.mkdtemp(prefix="testboard_storage_empty_")
+        self.addCleanup(shutil.rmtree, empty_dir, True)
+        store2 = Storage(os.path.join(empty_dir, "test.db"))
+        try:
+            self.assertEqual(store2.unassigned_failing_by_environment(), {})
+        finally:
+            store2.close()
+
+    def test_by_stream_batches_every_requested_id_in_one_query(
+        self
+    ) -> None:
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="e",
+                        result=Result.FAIL, build="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+            make_record(environment="linux-sim", test_name="f",
+                        result=Result.FAIL, build="feat/y",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        ids = [s.stream_id for s in self.store.list_streams("")]
+        conn = self.store._conn()
+        statements = []  # type: List[str]
+        trace_sql_into(conn, statements)
+        try:
+            counts = self.store.unassigned_failing_by_stream(ids)
+        finally:
+            conn.set_trace_callback(None)
+        selects = [s for s in statements if s.strip().upper().startswith(
+            "SELECT")]
+        self.assertEqual(len(selects), 1)
+        self.assertEqual(counts, {ids[0]: 1, ids[1]: 1})
+
+    def test_empty_stream_id_list_costs_no_query(self) -> None:
+        conn = self.store._conn()
+        statements = []  # type: List[str]
+        trace_sql_into(conn, statements)
+        try:
+            result = self.store.unassigned_failing_by_stream([])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(result, {})
+        self.assertEqual(statements, [])
 
 
 class EnvironmentDeleteTest(StorageTestBase):
@@ -2859,7 +4389,13 @@ class ActivityHoursTest(StorageTestBase):
     The invariant is exact equality with the GROUP BY that
     `_rebuild_activity_hours` runs; `_invariant_diff` compares in both
     directions, and `test_the_comparison_itself_can_fail` plants a skew
-    to prove the comparison is not vacuous.
+    to prove the comparison is not vacuous. WIDENED at migration 10
+    (WP-23) to include `stream_id` in both the SELECT and the GROUP BY —
+    every test in this class still uses `make_record()` (mainline only,
+    stream_id=1), so none of their expected values change, but the
+    comparison itself now also catches a stream_id mistake, not only an
+    environment/hour/result one. Branch-specific isolation has its own
+    dedicated class (`DerivedTablePartitionIsolationTest`).
     """
 
     def _invariant_diff(self) -> int:
@@ -2869,17 +4405,19 @@ class ActivityHoursTest(StorageTestBase):
         conn = self.store._conn()
         forward = conn.execute(
             "SELECT COUNT(*) FROM ("
-            "  SELECT environment, SUBSTR(start_time, 1, 13), result, "
-            "         COUNT(*) FROM runs GROUP BY 1, 2, 3"
+            "  SELECT stream_id, environment, SUBSTR(start_time, 1, 13), "
+            "         result, COUNT(*) FROM runs GROUP BY 1, 2, 3, 4"
             "  EXCEPT"
-            "  SELECT environment, hour, result, count FROM activity_hours"
+            "  SELECT stream_id, environment, hour, result, count "
+            "         FROM activity_hours"
             ") AS t").fetchone()[0]
         backward = conn.execute(
             "SELECT COUNT(*) FROM ("
-            "  SELECT environment, hour, result, count FROM activity_hours"
+            "  SELECT stream_id, environment, hour, result, count "
+            "         FROM activity_hours"
             "  EXCEPT"
-            "  SELECT environment, SUBSTR(start_time, 1, 13), result, "
-            "         COUNT(*) FROM runs GROUP BY 1, 2, 3"
+            "  SELECT stream_id, environment, SUBSTR(start_time, 1, 13), "
+            "         result, COUNT(*) FROM runs GROUP BY 1, 2, 3, 4"
             ") AS t").fetchone()[0]
         return int(forward) + int(backward)
 
@@ -2934,6 +4472,24 @@ class ActivityHoursTest(StorageTestBase):
         self.assertEqual(deleted, 1)
         self.assertEqual(self._invariant_diff(), 0)
 
+    def test_a_stream_drop_keeps_the_invariant(self) -> None:
+        """WP-23 (migration 10): tools/drop_stream.py deletes a stream's
+        runs AND its activity_hours rows -- if it only did the former,
+        the invariant would rot silently the moment the stream's runs
+        vanished but its hour buckets did not."""
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        branch_id = self.store.list_streams("")[0].stream_id
+        self.store.delete_stream(branch_id)
+        self.assertEqual(self._invariant_diff(), 0)
+        rows = self.store._conn().execute(
+            "SELECT COUNT(*) FROM activity_hours WHERE stream_id = ?",
+            (branch_id,)).fetchone()
+        self.assertEqual(rows[0], 0)
+
     def test_the_comparison_itself_can_fail(self) -> None:
         """Planted drift MUST be reported, or every pass above is noise."""
         self.store.upsert_runs([make_record()])
@@ -2967,15 +4523,17 @@ class ScriptHoursTest(StorageTestBase):
     MAX(end_time) per bucket, and a MIN/MAX cannot be decremented — so
     the shrink paths (an update changing a stored result or end time)
     go through exact recomputation and are what these tests lean on.
+    WIDENED at migration 10 (WP-23) to include `stream_id`, same
+    reasoning as `ActivityHoursTest`.
     """
 
     _GROUP_BY = (
-        "SELECT environment, SUBSTR(start_time, 1, 13), script, result, "
-        "COUNT(*), MIN(start_time), MAX(end_time) "
-        "FROM runs GROUP BY 1, 2, 3, 4"
+        "SELECT stream_id, environment, SUBSTR(start_time, 1, 13), "
+        "script, result, COUNT(*), MIN(start_time), MAX(end_time) "
+        "FROM runs GROUP BY 1, 2, 3, 4, 5"
     )
     _TABLE = (
-        "SELECT environment, hour, script, result, count, "
+        "SELECT stream_id, environment, hour, script, result, count, "
         "first_start, last_end FROM script_hours"
     )
 
@@ -3104,6 +4662,23 @@ class ScriptHoursTest(StorageTestBase):
         self.assertEqual(deleted, 1)
         self.assertEqual(self._invariant_diff(), 0)
 
+    def test_a_stream_drop_keeps_the_invariant(self) -> None:
+        """WP-23 (migration 10): tools/drop_stream.py deletes a stream's
+        runs AND its script_hours rows -- the script_hours twin of
+        ActivityHoursTest's version of this test."""
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        branch_id = self.store.list_streams("")[0].stream_id
+        self.store.delete_stream(branch_id)
+        self.assertEqual(self._invariant_diff(), 0)
+        rows = self.store._conn().execute(
+            "SELECT COUNT(*) FROM script_hours WHERE stream_id = ?",
+            (branch_id,)).fetchone()
+        self.assertEqual(rows[0], 0)
+
     def test_the_comparison_itself_can_fail(self) -> None:
         """Planted drift MUST be reported, or every pass above is noise."""
         self.store.upsert_runs([make_record()])
@@ -3127,7 +4702,10 @@ class ScriptHoursTest(StorageTestBase):
         self.assertEqual([b.count for b in buckets], [41])
 
     def test_the_window_read_is_an_index_range_not_a_scan(self) -> None:
-        """The PK leads (environment, hour) so one block is one seek.
+        """The PK leads (stream_id, environment, hour) so one block is
+        one seek — widened at migration 10 (WP-23) to include stream_id,
+        which is what lets a branch's own Timeline stay an index range
+        too, not merely mainline's.
 
         Pinned because the column order is the entire reason the table
         can be read at request time: keyed (environment, script, hour)
@@ -3139,9 +4717,10 @@ class ScriptHoursTest(StorageTestBase):
         plan = self.store._conn().execute(
             "EXPLAIN QUERY PLAN SELECT script, hour, result, count, "
             "first_start, last_end FROM script_hours "
-            "WHERE environment = ? AND hour >= ? AND hour <= ? "
-            "ORDER BY script, hour",
-            ("linux-sim", "2026-07-01T00", "2026-07-01T23"),
+            "WHERE stream_id = ? AND environment = ? AND hour >= ? "
+            "AND hour <= ? ORDER BY script, hour",
+            (storage.MAINLINE_STREAM_ID, "linux-sim", "2026-07-01T00",
+             "2026-07-01T23"),
         ).fetchall()
         detail = " ".join(str(row[-1]) for row in plan)
         self.assertIn("SEARCH", detail.upper(), detail)
@@ -3203,6 +4782,27 @@ class ScriptRunsUntilTest(StorageTestBase):
         runs = self.store.script_runs("linux-sim", "suite.py", BASE, 100)
         self.assertEqual(len(runs), 1)
 
+    def test_defaults_to_mainline(self) -> None:
+        """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): a branch run in
+        the SAME window as a mainline one must not appear in the
+        default (unscoped) read."""
+        self.store.upsert_runs([make_record(
+            test_name="mainline_only", start=BASE)])
+        self.store.upsert_runs([make_record(
+            test_name="branch_only", build="feat/x", start=BASE)])
+        runs = self.store.script_runs("linux-sim", "suite.py", BASE, 100)
+        self.assertEqual([run.test_name for run in runs], ["mainline_only"])
+
+    def test_stream_id_selects_the_branch_own_runs(self) -> None:
+        self.store.upsert_runs([make_record(
+            test_name="mainline_only", start=BASE)])
+        self.store.upsert_runs([make_record(
+            test_name="branch_only", build="feat/x", start=BASE)])
+        stream_id = self.store.list_streams("")[0].stream_id
+        runs = self.store.script_runs(
+            "linux-sim", "suite.py", BASE, 100, stream_id=stream_id)
+        self.assertEqual([run.test_name for run in runs], ["branch_only"])
+
 
 class ReimportSkipTest(StorageTestBase):
     """What counts as "unchanged", and what the skip must NOT skip."""
@@ -3213,7 +4813,7 @@ class ReimportSkipTest(StorageTestBase):
             [make_record(output="the parser found more log\n")])
         self.assertEqual(
             counts,
-            storage.UpsertCounts(inserted=0, updated=1, unchanged=0),
+            storage.UpsertCounts(inserted=0, updated=1, unchanged=0, rejections=[]),
         )
         run = self.store.latest_run("linux-sim", "suite.py", "test_a")
         assert run is not None
@@ -3253,11 +4853,1581 @@ class ReimportSkipTest(StorageTestBase):
             "an unchanged re-import cleared a human's retirement")
 
     def test_a_changed_reimport_still_unretires(self) -> None:
-        """Pinned so the skip is the ONLY thing the last test proves."""
+        """Pinned so the skip is the ONLY thing the last test proves.
+
+        WIDENED for WP-21 (docs/STREAMS_PLAN.md §3.4): un-retirement is
+        mainline-only, so this now also pins the branch case in the same
+        test — a branch run reporting against a mainline-retired test
+        must NOT clear the retirement, because the branch run may predate
+        the decision to retire it. Never weakened: the original mainline
+        assertion is untouched below.
+        """
         self.store.upsert_runs([make_record()])
         self.store.set_retired(
             "linux-sim", "suite.py", "test_a", True, "amy",
             "left the suite", BASE)
+        self.store.upsert_runs([
+            make_record(
+                result=Result.FAIL, build="feat/x",
+                start=BASE + datetime.timedelta(hours=1),
+            )
+        ])
+        self.assertTrue(
+            self.store.is_retired("linux-sim", "suite.py", "test_a"),
+            "a branch import must never un-retire a mainline test")
         self.store.upsert_runs([make_record(result=Result.FAIL)])
         self.assertFalse(
             self.store.is_retired("linux-sim", "suite.py", "test_a"))
+
+
+class TestStreams(StorageTestBase):
+    """WP-21: stream find-or-create, upsert scoping, migration 9 basics."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+
+    def test_mainline_row_is_seeded_by_migration(self) -> None:
+        stream = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        assert stream is not None
+        self.assertEqual((stream.product, stream.kind, stream.name),
+                          ("", "mainline", ""))
+
+    def test_mainline_records_default_to_stream_one(self) -> None:
+        self.store.upsert_runs([make_record()])
+        row = self.store._conn().execute(
+            "SELECT stream_id FROM runs").fetchone()
+        self.assertEqual(row[0], storage.MAINLINE_STREAM_ID)
+
+    def test_mainlines_own_last_seen_advances_too(self) -> None:
+        """Row 1 is not just a seeded constant: a mainline import widens
+        its own first_seen/last_seen the same way a branch import widens
+        its stream's -- otherwise "baseline last_seen" (the compare
+        endpoint, the Watchlist's s: cards) would read the migration
+        timestamp forever.
+
+        The record's start_time is set safely in the future (well past
+        the migration's real seed timestamp, whatever "now" happens to
+        be when this test runs) so widening it can only be an increase.
+        """
+        before = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        assert before is not None
+        later = datetime.datetime(2099, 1, 1)
+        self.store.upsert_runs([make_record(start=later)])
+        after = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        assert after is not None
+        self.assertEqual(after.last_seen, later)
+        self.assertGreater(after.last_seen, before.last_seen)
+
+    def test_a_build_record_creates_a_stream_of_kind_build(self) -> None:
+        self.store.upsert_runs([make_record(build="2026.9.1")])
+        streams = self.store.list_streams("Atlas")
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(
+            (streams[0].kind, streams[0].name), ("build", "2026.9.1"))
+
+    def test_reimporting_the_same_build_reuses_the_stream(self) -> None:
+        self.store.upsert_runs([make_record(build="feat/x")])
+        self.store.upsert_runs([make_record(
+            test_name="test_b", build="feat/x",
+            start=BASE + datetime.timedelta(hours=1))])
+        streams = self.store.list_streams("Atlas")
+        self.assertEqual(len(streams), 1, "a second push must not create "
+                          "a second stream for the same name")
+
+    def test_different_products_get_distinct_streams_of_the_same_name(
+            self) -> None:
+        self.store.set_environment_product(
+            "other-env", "Zephyr", "alice", CREATED)
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", build="feat/x"),
+            make_record(environment="other-env", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        self.assertEqual(len(self.store.list_streams("Atlas")), 1)
+        self.assertEqual(len(self.store.list_streams("Zephyr")), 1)
+
+    def test_stream_product_is_fixed_at_creation(self) -> None:
+        """Re-declaring the environment's product later must not move
+        an already-created stream — resolved at creation, then fixed
+        (docs/STREAMS_PLAN.md §3.3)."""
+        self.store.upsert_runs([make_record(build="feat/x")])
+        stream = self.store.list_streams("Atlas")[0]
+        self.store.set_environment_product(
+            "linux-sim", "Renamed", "alice", CREATED)
+        still_there = self.store.get_stream(stream.stream_id)
+        assert still_there is not None
+        self.assertEqual(still_there.product, "Atlas")
+        self.assertEqual(self.store.list_streams("Renamed"), [])
+
+    def test_an_environment_with_no_declared_product_uses_empty_string(
+            self) -> None:
+        self.store.upsert_runs([make_record(
+            environment="undeclared-env", build="feat/x")])
+        streams = self.store.list_streams("")
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0].product, "")
+
+    def test_last_seen_widens_across_a_batch(self) -> None:
+        self.store.upsert_runs([
+            make_record(build="feat/x", start=BASE),
+            make_record(test_name="test_b", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=3)),
+        ])
+        stream = self.store.list_streams("Atlas")[0]
+        self.assertEqual(stream.first_seen, BASE)
+        self.assertEqual(
+            stream.last_seen, BASE + datetime.timedelta(hours=3))
+
+    def test_last_seen_widens_on_a_later_push(self) -> None:
+        self.store.upsert_runs([make_record(build="feat/x", start=BASE)])
+        first = self.store.list_streams("Atlas")[0]
+        later = BASE + datetime.timedelta(days=1)
+        self.store.upsert_runs([make_record(
+            test_name="test_b", build="feat/x", start=later)])
+        second = self.store.list_streams("Atlas")[0]
+        self.assertEqual(second.stream_id, first.stream_id)
+        self.assertEqual(second.first_seen, BASE)
+        self.assertEqual(second.last_seen, later)
+
+
+class LegacyUniqueCollisionTest(StorageTestBase):
+    """docs/STREAMS_PLAN.md §3.2: the frozen v1 UNIQUE on ``runs``.
+
+    A branch run whose (environment, script, test_name, start_time) is
+    IDENTICAL to a run already stored on a DIFFERENT stream cannot be
+    stored (the table-level UNIQUE has no stream column). It must be
+    REJECTED, naming both streams, with the rest of the batch unaffected
+    — never a silent wrong-stream overwrite, never an aborted batch.
+    """
+
+    def test_a_same_instant_build_run_is_rejected_not_overwritten(
+            self) -> None:
+        self.store.upsert_runs([make_record()])
+        counts = self.store.upsert_runs(
+            [make_record(build="feat/x")])  # identical start_time
+        self.assertEqual(counts.inserted, 0)
+        self.assertEqual(len(counts.rejections), 1)
+        rejection = counts.rejections[0]
+        self.assertEqual(rejection.index, 0)
+        self.assertIn("mainline", rejection.message)
+        self.assertIn("build:feat/x", rejection.message)
+        self.assertEqual(rejection.environment, "linux-sim")
+        self.assertEqual(rejection.test_name, "test_a")
+        # The original mainline row must be untouched.
+        row = self.store._conn().execute(
+            "SELECT stream_id FROM runs").fetchone()
+        self.assertEqual(row[0], storage.MAINLINE_STREAM_ID)
+
+    def test_the_rest_of_the_batch_still_imports(self) -> None:
+        """One bad record must never abort the batch (project-wide rule)."""
+        self.store.upsert_runs([make_record()])
+        counts = self.store.upsert_runs([
+            make_record(build="feat/x"),          # collides, rejected
+            make_record(test_name="test_b", build="feat/x"),  # fine
+        ])
+        self.assertEqual(len(counts.rejections), 1)
+        self.assertEqual(counts.inserted, 1)
+        streams = self.store.list_streams("")
+        # test_b's stream was created even though test_a's record in the
+        # same batch collided.
+        self.assertEqual(len(streams), 1)
+
+    def test_the_message_is_identical_regardless_of_which_side_is_mainline(
+            self) -> None:
+        """A collision between two NON-mainline streams also rejects and
+        names both — the rule is about the legacy key, not about
+        mainline specifically."""
+        self.store.upsert_runs([make_record(build="feat/x")])
+        counts = self.store.upsert_runs([make_record(build="feat/y")])
+        self.assertEqual(len(counts.rejections), 1)
+        message = counts.rejections[0].message
+        self.assertIn("build:feat/x", message)
+        self.assertIn("build:feat/y", message)
+
+
+class DerivedTablePartitionIsolationTest(StorageTestBase):
+    """docs/STREAMS_PLAN.md §5.1/§5.2 (WP-23): ``activity_hours``/
+    ``script_hours`` are maintained for EVERY stream now (the WP-21 skip
+    that kept them mainline-only is gone — see :meth:`upsert_runs`), so
+    the invariant this class pins is no longer "a branch import touches
+    neither table" — it is PARTITION ISOLATION: a write to one stream's
+    partition (``stream_id`` leads both tables' PRIMARY KEY) can never
+    change so much as one row of another stream's partition, in either
+    direction. This is the guard test named in WP-23's spec, WIDENED
+    rather than weakened per CLAUDE.md's rule — the commit message says
+    so: the old assertion ("branch import leaves the tables unchanged")
+    is now FALSE by design (a branch's own trend needs its own rows);
+    what must still hold, and what these tests now check instead, is
+    that each stream's rows are exactly what that stream's own runs
+    would produce, and never leak into another stream's rows.
+    """
+
+    @staticmethod
+    def _partition(
+        conn: "sqlite3.Connection", stream_id: int
+    ) -> "Tuple[List[Tuple[Any, ...]], List[Tuple[Any, ...]]]":
+        activity = conn.execute(
+            "SELECT * FROM activity_hours WHERE stream_id = ? "
+            "ORDER BY 1, 2, 3, 4", (stream_id,)).fetchall()
+        script = conn.execute(
+            "SELECT * FROM script_hours WHERE stream_id = ? "
+            "ORDER BY 1, 2, 3, 4, 5", (stream_id,)).fetchall()
+        return activity, script
+
+    def test_a_branch_only_import_leaves_the_mainline_partition_untouched(
+            self) -> None:
+        """Mainline seeded first; a branch-only import must not add,
+        remove or alter a single mainline row — but the branch DOES gain
+        its own rows now (the point of WP-23), so this checks the
+        mainline partition specifically, not "the tables" as a whole."""
+        self.store.upsert_runs([make_record()])  # mainline seed
+        conn = self.store._conn()
+        before_mainline = self._partition(conn, storage.MAINLINE_STREAM_ID)
+        self.store.upsert_runs([
+            make_record(test_name="test_b", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=2)),
+            make_record(test_name="test_c", build="feat/x",
+                        result=Result.FAIL,
+                        start=BASE + datetime.timedelta(hours=3)),
+        ])
+        after_mainline = self._partition(conn, storage.MAINLINE_STREAM_ID)
+        self.assertEqual(before_mainline, after_mainline)
+        # And the branch's own partition is NOT empty -- WP-23 deleted
+        # the skip specifically so this would be true.
+        branch_id = self.store.list_streams("")[0].stream_id
+        branch_activity, branch_script = self._partition(conn, branch_id)
+        self.assertEqual(len(branch_activity), 2)  # two hours, two runs
+        self.assertEqual(len(branch_script), 2)
+
+    def test_a_mainline_import_leaves_an_existing_branch_partition_untouched(
+            self) -> None:
+        """The reverse direction: seed a branch first, then import more
+        mainline data. The branch's own rows must be untouched."""
+        self.store.upsert_runs([make_record(build="feat/x")])
+        branch_id = self.store.list_streams("")[0].stream_id
+        conn = self.store._conn()
+        before_branch = self._partition(conn, branch_id)
+        self.store.upsert_runs([
+            make_record(test_name="test_mainline",
+                        start=BASE + datetime.timedelta(hours=5)),
+        ])
+        after_branch = self._partition(conn, branch_id)
+        self.assertEqual(before_branch, after_branch)
+
+    def test_a_pure_branch_estate_has_an_empty_mainline_partition(
+            self) -> None:
+        """No mainline data at all: stream 1's partition of both tables
+        stays at its seeded (empty) state -- not merely "unchanged from
+        a snapshot" -- even though the branch's OWN partition is not
+        empty (WP-23's whole point: the branch gets its own rows)."""
+        self.store.upsert_runs([make_record(build="feat/x")])
+        conn = self.store._conn()
+        mainline_activity, mainline_script = self._partition(
+            conn, storage.MAINLINE_STREAM_ID)
+        self.assertEqual(mainline_activity, [])
+        self.assertEqual(mainline_script, [])
+        branch_id = self.store.list_streams("")[0].stream_id
+        branch_activity, branch_script = self._partition(conn, branch_id)
+        self.assertEqual(len(branch_activity), 1)
+        self.assertEqual(len(branch_script), 1)
+
+    def test_two_branches_do_not_leak_into_each_other(self) -> None:
+        """Not just mainline vs. one branch: two SIBLING branches must
+        stay isolated from each other too -- partition isolation is a
+        property of stream_id in general, not a mainline special case."""
+        self.store.upsert_runs([make_record(build="feat/x")])
+        self.store.upsert_runs([
+            make_record(test_name="test_b", build="feat/y",
+                        result=Result.FAIL,
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        conn = self.store._conn()
+        streams = {s.name: s.stream_id for s in self.store.list_streams("")}
+        x_activity, x_script = self._partition(conn, streams["feat/x"])
+        y_activity, y_script = self._partition(conn, streams["feat/y"])
+        self.assertEqual(len(x_activity), 1)
+        self.assertEqual(len(y_activity), 1)
+        self.assertNotEqual(x_activity, y_activity)
+        self.assertEqual(len(x_script), 1)
+        self.assertEqual(len(y_script), 1)
+
+
+class ComparePairsQueryPlanTest(StorageTestBase):
+    """WP-23 perf pass: the compare pairs query must join ``latest_runs``
+    to ITSELF on its PRIMARY KEY, never through a materialized
+    ``(SELECT ... FROM latest_runs WHERE ...)`` derived table.
+
+    A derived table has no index of its own, so SQLite could only
+    nested-loop the two partitions against each other — the ORIGINAL
+    shape, one ``(SELECT ...) s``/``(SELECT ...) m`` per side. MEASURED
+    on the dev-scale seeded copy (``.../scratchpad/testboard-wp23.db``,
+    NOT production — a copy was taken via ``sqlite3.Connection.backup``
+    so the live server on port 8791 was never touched; build 2026.9.1
+    vs build 2026.9.0, 2036 ``latest_runs`` rows each side), 15 samples
+    each:
+
+        compare_counts (headline)        622.8ms -> 4.4ms  median
+        compare_category (one page)      643.6ms -> 4.1ms  median
+        compare_category_count           643.0ms -> 3.7ms  median
+        full page request (all three)   1942.5ms -> 12.2ms median
+
+    Asserting on the PLAN rather than a duration, the same reasoning
+    ``TestSortIndexesAreUsed`` above gives: a timing test on a fast dev
+    machine proves nothing about a slower one, but the plan is the same
+    on both. Calls :meth:`Storage._compare_pairs_sql` directly rather
+    than tracing a public wrapper — it is the one method every public
+    entry point (``compare_counts``, ``compare_category``,
+    ``compare_category_count``) shares, so this is the real query, not
+    a hand-rebuilt lookalike that could drift from it.
+    """
+
+    #: The four join partition aliases the pairs query builds — each
+    #: must be a PRIMARY KEY SEARCH on ``latest_runs`` (or, for the two
+    #: which are the "anchor" side of their half and read a RANGE over
+    #: one stream_id rather than a single triple, a covering index
+    #: search — see ``m2``'s "USING COVERING INDEX idx_latest_runs_result"
+    #: below); none may ever be table-scanned.
+    _JOIN_ALIASES = ("S", "M", "M2", "S2")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([make_record(test_name="test_a")])
+        self.store.upsert_runs([make_record(
+            test_name="test_a", build="feat/x",
+            start=BASE + datetime.timedelta(hours=1))])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def _plan(self) -> List[str]:
+        environments = self.store.environments_for_product("Atlas")
+        sql, params = self.store._compare_pairs_sql(
+            self.stream_id, storage.MAINLINE_STREAM_ID, environments)
+        rows = self.store._conn().execute(
+            "EXPLAIN QUERY PLAN " + sql, params).fetchall()
+        return [str(row[-1]) for row in rows]
+
+    @staticmethod
+    def _alias_line(plan: List[str], alias: str) -> Optional[str]:
+        """The plan line for *alias*, across EQP dialects.
+
+        Modern SQLite prints ``SEARCH m USING ...``; the 3.26 bundled
+        with RHEL 8's Python 3.6 — the PRODUCTION interpreter, and the
+        two CI legs that caught this — prints
+        ``SEARCH TABLE latest_runs AS m USING ...``. The first CI run
+        of this test asserted the modern spelling only and failed on
+        both 3.6 legs while the underlying PLAN was correct (fully
+        indexed PK probes); this helper is the widening, matching the
+        ALIAS rather than one version's phrasing. SCAN lines are
+        matched the same two ways by the caller.
+        """
+        upper = alias.upper()
+        for row in plan:
+            text = row.strip().upper()
+            for verb in ("SEARCH", "SCAN"):
+                if (text.startswith("{0} {1} ".format(verb, upper))
+                        or (text.startswith(verb + " TABLE ")
+                            and " AS {0} ".format(upper) in text)):
+                    return text
+        return None
+
+    def test_every_join_side_is_indexed_never_scanned(self) -> None:
+        plan = self._plan()
+        plan_text = " | ".join(plan).upper()
+        for alias in self._JOIN_ALIASES:
+            line = self._alias_line(plan, alias)
+            self.assertIsNotNone(
+                line, "no SEARCH/SCAN line for {0} — plan: {1}".format(
+                    alias, plan_text))
+            self.assertTrue(
+                line.startswith("SEARCH") and "USING" in line,
+                "{0} is not an indexed SEARCH — the regression this "
+                "test exists to catch. Its line: {1}".format(
+                    alias, line))
+
+    def test_no_materialized_subquery_join(self) -> None:
+        """The specific pre-fix shape, confirmed by reverting this
+        commit's SQL change and re-running this exact test: each side
+        was a parenthesised ``(SELECT ...)`` per partition, which
+        SQLite ran by MATERIALIZING it, then joining the other side
+        against that materialization with no index of its own —
+        "MATERIALIZE m" / "MATERIALIZE s2" in the plan, followed by a
+        "SCAN"/"AUTOMATIC COVERING INDEX" (built on the fly, over the
+        already-materialized rows) rather than a SEARCH on the real
+        table's PRIMARY KEY."""
+        plan_text = " | ".join(self._plan()).upper()
+        self.assertNotIn(
+            "MATERIALIZE", plan_text,
+            "a join side is being materialized as a derived table "
+            "again — the exact pre-fix regression: " + plan_text)
+
+    def test_the_joined_side_uses_the_latest_runs_primary_key(
+        self
+    ) -> None:
+        """``m``/``s2`` (the LEFT JOIN target on each side) must probe
+        the exact PRIMARY KEY — stream_id, environment, script,
+        test_name — not a partial prefix of it."""
+        plan = self._plan()
+        for alias in ("m", "s2"):
+            line = self._alias_line(plan, alias)
+            self.assertIsNotNone(line, "no SEARCH line for " + alias)
+            for column in ("STREAM_ID=?", "ENVIRONMENT=?",
+                           "SCRIPT=?", "TEST_NAME=?"):
+                self.assertIn(
+                    column, line,
+                    "{0} does not probe the full PRIMARY KEY — its "
+                    "line: {1}".format(alias, line))
+
+
+class CompareStreamsTest(StorageTestBase):
+    """docs/STREAMS_PLAN.md §3.5: the five counts, and the paginated
+    per-category listing, of a stream-vs-mainline comparison."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        branch_start = BASE + datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.PASS),
+            make_record(test_name="test_b", result=Result.FAIL),
+            make_record(test_name="test_c", result=Result.PASS),
+            make_record(test_name="test_e", result=Result.FAIL),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="feat/x", start=branch_start),
+            make_record(test_name="test_b", result=Result.PASS,
+                        build="feat/x", start=branch_start),
+            make_record(test_name="test_d", result=Result.PASS,
+                        build="feat/x", start=branch_start),
+            make_record(test_name="test_e", result=Result.FAIL,
+                        build="feat/x", start=branch_start),
+        ])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_the_five_counts(self) -> None:
+        counts = self.store.compare_counts(self.stream_id)
+        self.assertEqual(counts, storage.CompareCounts(
+            new_failures=1,   # test_a: PASS on mainline, FAIL on branch
+            new_passes=1,     # test_b: FAIL on mainline, PASS on branch
+            both_failing=1,   # test_e: FAIL on both
+            new_tests=1,      # test_d: only on the branch
+            no_result=1,      # test_c: only on mainline
+            agree=0,          # no pair is a non-FAIL match on both sides
+        ))
+
+    def test_new_failures_direction(self) -> None:
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].test_name, "test_a")
+        self.assertEqual(rows[0].stream_result, Result.FAIL)
+        self.assertEqual(rows[0].baseline_result, Result.PASS)
+
+    def test_new_tests_direction_is_present_on_stream_absent_on_baseline(
+            self) -> None:
+        rows = self.store.compare_category(self.stream_id, "new_tests")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].test_name, "test_d")
+        self.assertEqual(rows[0].stream_result, Result.PASS)
+        self.assertIsNone(rows[0].baseline_result)
+
+    def test_no_result_direction_is_absent_on_stream_present_on_baseline(
+            self) -> None:
+        rows = self.store.compare_category(self.stream_id, "no_result")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].test_name, "test_c")
+        self.assertIsNone(rows[0].stream_result)
+        self.assertEqual(rows[0].baseline_result, Result.PASS)
+        # test_c has no run on the stream side at all -- nothing to
+        # review there, a fact rather than a gap (WP-21 §3.6).
+        self.assertIsNone(rows[0].stream_run_id)
+
+    def test_stream_run_id_is_the_streams_own_run_never_the_baselines(
+            self) -> None:
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        self.assertIsNotNone(rows[0].stream_run_id)
+        branch_run = self.store.latest_run(
+            "linux-sim", "suite.py", "test_a", stream_id=self.stream_id)
+        self.assertEqual(rows[0].stream_run_id, branch_run.run_id)
+        mainline_run = self.store.latest_run(
+            "linux-sim", "suite.py", "test_a")
+        self.assertNotEqual(rows[0].stream_run_id, mainline_run.run_id)
+        self.assertEqual(rows[0].stream_start_time, branch_run.start_time)
+
+    def test_assignee_is_the_triples_current_assignee_not_stream_scoped(
+            self) -> None:
+        """Assigning is not partitioned by stream — a delta row must
+        show the SAME assignee the mainline dashboard shows for the
+        same test (docs/STREAMS_PLAN.md §3.4)."""
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        self.assertEqual(rows[0].assignee, "alice")
+
+    def test_assignee_is_none_when_unassigned(self) -> None:
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        self.assertIsNone(rows[0].assignee)
+
+    def test_pagination_is_exact(self) -> None:
+        total = self.store.compare_category_count(
+            self.stream_id, "new_failures")
+        self.assertEqual(total, 1)
+        page = self.store.compare_category(
+            self.stream_id, "new_failures", limit=0, offset=0)
+        self.assertEqual(page, [])
+
+    def test_a_retired_test_is_excluded_from_every_category(self) -> None:
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "amy", "gone", BASE)
+        counts = self.store.compare_counts(self.stream_id)
+        self.assertEqual(counts.new_failures, 0)
+
+    def test_an_unknown_stream_raises_key_error(self) -> None:
+        with self.assertRaises(KeyError):
+            self.store.compare_counts(999999)
+
+    def test_an_unknown_category_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.compare_category(self.stream_id, "not_a_category")
+
+    def test_comparison_is_scoped_to_the_streams_own_product(self) -> None:
+        """An environment of a DIFFERENT product must never show up as a
+        spurious no_result/new_tests row."""
+        self.store.set_environment_product(
+            "other-product-env", "Zephyr", "alice", CREATED)
+        self.store.upsert_runs([make_record(
+            environment="other-product-env", test_name="unrelated")])
+        counts = self.store.compare_counts(self.stream_id)
+        self.assertEqual(counts, storage.CompareCounts(
+            new_failures=1, new_passes=1, both_failing=1, new_tests=1,
+            no_result=1, agree=0,
+        ))
+
+
+class CompareCountsManyTest(StorageTestBase):
+    """compare_counts_many: the Watchlist s: cards' batched path.
+
+    Cross-checks against compare_counts (the single-stream SQL path) so
+    the Python classification here cannot silently drift from it.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "win-sim", "Borealis", "alice", CREATED)
+        branch_start = BASE + datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="test_a",
+                        result=Result.PASS),
+            make_record(environment="linux-sim", test_name="test_b",
+                        result=Result.FAIL),
+            make_record(environment="win-sim", test_name="test_x",
+                        result=Result.PASS),
+        ])
+        self.store.upsert_runs([
+            make_record(environment="linux-sim", test_name="test_a",
+                        result=Result.FAIL, build="feat/x",
+                        start=branch_start),
+            make_record(environment="linux-sim", test_name="test_c",
+                        result=Result.PASS, build="feat/x",
+                        start=branch_start),
+        ])
+        self.store.upsert_runs([
+            make_record(environment="win-sim", test_name="test_x",
+                        result=Result.FAIL, build="feat/y",
+                        start=branch_start),
+        ])
+        self.stream_x = self.store.list_streams("Atlas")[0].stream_id
+        self.stream_y = self.store.list_streams("Borealis")[0].stream_id
+
+    def test_agrees_with_compare_counts_for_each_stream(self) -> None:
+        many = self.store.compare_counts_many({
+            self.stream_x: self.store.environments_for_product("Atlas"),
+            self.stream_y: self.store.environments_for_product("Borealis"),
+        })
+        self.assertEqual(
+            many[self.stream_x], self.store.compare_counts(self.stream_x))
+        self.assertEqual(
+            many[self.stream_y], self.store.compare_counts(self.stream_y))
+
+    def test_a_stream_from_a_different_product_does_not_leak_environments(
+            self) -> None:
+        """test_x (win-sim) must never appear as no_result under
+        stream_x (Atlas, linux-sim only), and vice versa."""
+        many = self.store.compare_counts_many({
+            self.stream_x: self.store.environments_for_product("Atlas"),
+        })
+        # Atlas has 2 mainline tests (test_a, test_b) and the branch has
+        # 2 (test_a changed, test_c new): no_result=1 (test_b),
+        # new_tests=1 (test_c), new_failures=1 (test_a) -- never touches
+        # win-sim's test_x.
+        self.assertEqual(many[self.stream_x].no_result, 1)
+        self.assertEqual(many[self.stream_x].new_tests, 1)
+
+    def test_empty_input_returns_empty_dict(self) -> None:
+        self.assertEqual(self.store.compare_counts_many({}), {})
+
+    def test_a_stream_with_no_declared_product_environments_is_all_zero(
+            self) -> None:
+        many = self.store.compare_counts_many({self.stream_x: []})
+        self.assertEqual(
+            many[self.stream_x],
+            storage.CompareCounts(0, 0, 0, 0, 0, 0),
+        )
+
+    def test_query_count_does_not_grow_with_the_number_of_streams(
+            self) -> None:
+        conn = self.store._conn()
+
+        def query_count(
+                stream_environments: Dict[int, Sequence[str]]) -> int:
+            statements = []  # type: List[str]
+            trace_sql_into(conn, statements)
+            try:
+                self.store.compare_counts_many(stream_environments)
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        one = query_count({
+            self.stream_x: self.store.environments_for_product("Atlas"),
+        })
+        both = query_count({
+            self.stream_x: self.store.environments_for_product("Atlas"),
+            self.stream_y: self.store.environments_for_product("Borealis"),
+        })
+        self.assertEqual(one, both)
+
+
+class CompareCountsManyBaselinesTest(StorageTestBase):
+    """compare_counts_many's WP-22 *baselines* argument (docs/STREAMS_PLAN.md
+    §4.1): a build compared against its predecessor build instead of
+    mainline, still in ONE query."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.PASS),
+            make_record(test_name="test_b", result=Result.FAIL),
+        ])
+        older = BASE + datetime.timedelta(hours=1)
+        newer = BASE + datetime.timedelta(hours=2)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="1.0", start=older),
+            make_record(test_name="test_b", result=Result.PASS,
+                        build="1.0", start=older),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="1.1", start=newer),
+            make_record(test_name="test_c", result=Result.PASS,
+                        build="1.1", start=newer),
+        ])
+        builds = {s.name: s.stream_id
+                  for s in self.store.list_streams("Atlas")}
+        self.build_1_0 = builds["1.0"]
+        self.build_1_1 = builds["1.1"]
+
+    def test_agrees_with_compare_counts_for_a_non_mainline_baseline(
+            self) -> None:
+        envs = self.store.environments_for_product("Atlas")
+        many = self.store.compare_counts_many(
+            {self.build_1_1: envs},
+            baselines={self.build_1_1: self.build_1_0},
+        )
+        self.assertEqual(
+            many[self.build_1_1],
+            self.store.compare_counts(
+                self.build_1_1, baseline_id=self.build_1_0),
+        )
+        # 1.0: test_a FAIL, test_b PASS. 1.1: test_a FAIL, test_c PASS.
+        # both_failing (test_a), no_result (test_b, absent from 1.1),
+        # new_tests (test_c, absent from 1.0).
+        counts = many[self.build_1_1]
+        self.assertEqual(counts.both_failing, 1)
+        self.assertEqual(counts.no_result, 1)
+        self.assertEqual(counts.new_tests, 1)
+
+    def test_a_stream_absent_from_baselines_still_compares_to_mainline(
+            self) -> None:
+        """Only streams NAMED in *baselines* change default -- everyone
+        else keeps comparing to mainline, unaffected by this drop."""
+        envs = self.store.environments_for_product("Atlas")
+        many = self.store.compare_counts_many(
+            {self.build_1_0: envs, self.build_1_1: envs},
+            baselines={self.build_1_1: self.build_1_0},
+        )
+        self.assertEqual(
+            many[self.build_1_0], self.store.compare_counts(self.build_1_0))
+
+    def test_query_count_does_not_grow_with_a_baseline_override(
+            self) -> None:
+        conn = self.store._conn()
+        envs = self.store.environments_for_product("Atlas")
+
+        def query_count(baselines: Optional[Dict[int, int]]) -> int:
+            statements = []  # type: List[str]
+            trace_sql_into(conn, statements)
+            try:
+                self.store.compare_counts_many(
+                    {self.build_1_1: envs}, baselines=baselines)
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        self.assertEqual(
+            query_count(None),
+            query_count({self.build_1_1: self.build_1_0}),
+        )
+
+
+class PreviousBuildsTest(StorageTestBase):
+    """Storage.previous_builds: the WP-22 default comparison baseline for
+    a build stream (docs/STREAMS_PLAN.md §4.1)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "win-sim", "Borealis", "alice", CREATED)
+        t0 = BASE
+        t1 = BASE + datetime.timedelta(hours=1)
+        t2 = BASE + datetime.timedelta(hours=2)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", build="1.0", start=t0),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", build="1.1", start=t1),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", build="1.2", start=t2),
+        ])
+        self.store.upsert_runs([
+            make_record(environment="win-sim", test_name="test_x",
+                        build="9.0", start=t0),
+        ])
+        atlas = {s.name: s for s in self.store.list_streams("Atlas")}
+        self.build_1_0 = atlas["1.0"]
+        self.build_1_1 = atlas["1.1"]
+        self.build_1_2 = atlas["1.2"]
+        self.build_9_0 = self.store.list_streams("Borealis")[0]
+
+    def test_the_newest_build_predecessor_is_the_one_just_before_it(
+            self) -> None:
+        result = self.store.previous_builds(
+            [self.build_1_0, self.build_1_1, self.build_1_2])
+        self.assertNotIn(self.build_1_0.stream_id, result)
+        self.assertEqual(
+            result[self.build_1_1.stream_id].name, "1.0")
+        self.assertEqual(
+            result[self.build_1_2.stream_id].name, "1.1")
+
+    def test_a_different_products_build_never_becomes_the_predecessor(
+            self) -> None:
+        """Atlas's oldest build has no predecessor even though Borealis
+        has an earlier one -- products never mix."""
+        result = self.store.previous_builds(
+            [self.build_1_0, self.build_9_0])
+        self.assertNotIn(self.build_1_0.stream_id, result)
+        self.assertNotIn(self.build_9_0.stream_id, result)
+
+    def test_empty_input_returns_empty_dict(self) -> None:
+        self.assertEqual(self.store.previous_builds([]), {})
+
+    def test_query_count_is_one_regardless_of_build_count(self) -> None:
+        conn = self.store._conn()
+
+        def query_count(streams: List["storage.Stream"]) -> int:
+            statements = []  # type: List[str]
+            trace_sql_into(conn, statements)
+            try:
+                self.store.previous_builds(streams)
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        self.assertEqual(
+            query_count([self.build_1_1]),
+            query_count([self.build_1_1, self.build_1_2]),
+        )
+
+
+class StreamResultsForTripleTest(StorageTestBase):
+    """Storage.stream_results_for_triple: this triple's latest result on
+    every stream that HAS one, newest first (docs/STREAMS_PLAN.md §4.1) —
+    the test page's "Every build" table and its stream dropdown."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        t0 = BASE
+        t1 = BASE + datetime.timedelta(hours=1)
+        t2 = BASE + datetime.timedelta(hours=2)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.PASS, start=t0),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="1.0", start=t1),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="feat/x", start=t2),
+        ])
+        # A stream that exists but never ran test_a -- must never appear.
+        self.store.upsert_runs([
+            make_record(test_name="test_b", build="9.9", start=t0),
+        ])
+
+    def test_newest_first_across_every_stream_that_ran_it(self) -> None:
+        results = self.store.stream_results_for_triple(
+            "linux-sim", "suite.py", "test_a")
+        self.assertEqual(
+            [(r.stream.kind, r.stream.name) for r in results],
+            [("build", "feat/x"), ("build", "1.0"), ("mainline", "")],
+        )
+        self.assertEqual(results[0].result, Result.FAIL)
+
+    def test_a_stream_with_no_result_for_the_triple_is_absent(self) -> None:
+        results = self.store.stream_results_for_triple(
+            "linux-sim", "suite.py", "test_a")
+        names = {r.stream.name for r in results}
+        self.assertNotIn("9.9", names)
+
+    def test_unknown_triple_returns_an_empty_list(self) -> None:
+        self.assertEqual(
+            self.store.stream_results_for_triple(
+                "linux-sim", "suite.py", "no_such_test"),
+            [],
+        )
+
+
+class StreamIdentitiesTest(StorageTestBase):
+    """Batch stream metadata lookup for the Watchlist's s: cards."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([make_record(build="feat/x")])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_returns_the_requested_streams(self) -> None:
+        result = self.store.stream_identities([self.stream_id])
+        self.assertEqual(set(result), {self.stream_id})
+        self.assertEqual(result[self.stream_id].kind, "build")
+        self.assertEqual(result[self.stream_id].name, "feat/x")
+
+    def test_unknown_ids_are_simply_absent(self) -> None:
+        result = self.store.stream_identities([self.stream_id, 999999])
+        self.assertEqual(set(result), {self.stream_id})
+
+    def test_empty_input_returns_empty_dict(self) -> None:
+        self.assertEqual(self.store.stream_identities([]), {})
+
+    def test_query_count_is_one_regardless_of_id_count(self) -> None:
+        second_id = self.store._find_or_create_stream(
+            self.store._conn(), "Atlas", "build", "rc1",
+            "2026-07-01T00:00:00.000000")
+        conn = self.store._conn()
+
+        def query_count(ids: List[int]) -> int:
+            statements = []  # type: List[str]
+            trace_sql_into(conn, statements)
+            try:
+                self.store.stream_identities(ids)
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        self.assertEqual(
+            query_count([self.stream_id]),
+            query_count([self.stream_id, second_id]))
+
+
+class EnvironmentsForStreamTest(StorageTestBase):
+    """Storage.environments_for_stream (docs/ONE_KIND_PLAN.md §2b.1,
+    WP-25): every environment a stream has at least one run on, sourced
+    from its own latest_runs partition -- what the Time/Timeline empty
+    state uses to say WHERE a stream's data actually is, rather than
+    showing a bare empty page on an environment it never touched."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.set_environment_product(
+            "win-sim", "Atlas", "alice", CREATED)
+
+    def test_lists_every_environment_the_stream_ran_on(self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="win-sim", build="feat/x"),
+            make_record(environment="linux-sim", test_name="test_b",
+                        build="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        stream_id = self.store.list_streams("Atlas")[0].stream_id
+        self.assertEqual(
+            self.store.environments_for_stream(stream_id),
+            ["linux-sim", "win-sim"])
+
+    def test_an_environment_the_stream_never_ran_on_is_absent(
+            self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="win-sim", build="feat/x")])
+        stream_id = self.store.list_streams("Atlas")[0].stream_id
+        self.assertEqual(
+            self.store.environments_for_stream(stream_id), ["win-sim"])
+        self.assertNotIn(
+            "linux-sim", self.store.environments_for_stream(stream_id))
+
+    def test_mainline_is_scoped_the_same_way(self) -> None:
+        """No special case: mainline is just stream id 1."""
+        self.store.upsert_runs([make_record(environment="linux-sim")])
+        self.assertEqual(
+            self.store.environments_for_stream(storage.MAINLINE_STREAM_ID),
+            ["linux-sim"])
+
+    def test_an_unknown_stream_id_is_an_empty_list(self) -> None:
+        self.assertEqual(self.store.environments_for_stream(999999), [])
+
+
+class DropStreamTest(StorageTestBase):
+    """count_stream_rows / delete_stream — the storage half of
+    tools/drop_stream.py."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_refuses_to_delete_mainline(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.delete_stream(storage.MAINLINE_STREAM_ID)
+
+    def test_count_matches_delete(self) -> None:
+        counts = self.store.count_stream_rows(self.stream_id)
+        deleted = self.store.delete_stream(self.stream_id)
+        self.assertEqual(counts["runs"], deleted["runs"])
+        self.assertEqual(counts["latest_runs"], deleted["latest_runs"])
+        self.assertEqual(counts["run_outputs"], deleted["run_outputs"])
+
+    def test_deletes_runs_outputs_and_the_latest_runs_partition(
+            self) -> None:
+        self.store.delete_stream(self.stream_id)
+        conn = self.store._conn()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE stream_id = ?",
+            (self.stream_id,)).fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM latest_runs WHERE stream_id = ?",
+            (self.stream_id,)).fetchone()[0], 0)
+        self.assertIsNone(self.store.get_stream(self.stream_id))
+        # Mainline is untouched.
+        self.assertIsNotNone(
+            self.store.latest_run("linux-sim", "suite.py", "test_a"))
+
+    def test_a_comment_posted_from_the_stream_survives_with_its_tag_cleared(
+            self) -> None:
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_b", "amy", "looks fine", BASE,
+            stream_id=self.stream_id)
+        self.store.delete_stream(self.stream_id)
+        comments = self.store.comments("linux-sim", "suite.py", "test_b")
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].text, "looks fine")
+        self.assertIsNone(comments[0].stream_id)
+
+    def test_assignments_referencing_stream_is_zero_with_none_made(
+            self) -> None:
+        self.assertEqual(
+            self.store.assignments_referencing_stream(self.stream_id), 0)
+
+    def test_assignments_referencing_stream_counts_current_assignments(
+            self) -> None:
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "alice", "bob", CREATED,
+            stream_id=self.stream_id)
+        self.assertEqual(
+            self.store.assignments_referencing_stream(self.stream_id), 1)
+
+    def test_sqlite_fk_cascade_clears_the_origin_on_delete(self) -> None:
+        """The finding this method exists to surface, and the reason it
+        must be read BEFORE :meth:`Storage.delete_stream`, not after:
+        current_assignments.stream_id has an ``ON DELETE SET NULL`` FK
+        (same as comments.stream_id, same as assignments.stream_id),
+        and every connection this module opens runs with
+        ``PRAGMA foreign_keys=ON`` -- so on SQLite, deleting the
+        stream row CASCADES the column to NULL automatically. The
+        assignment survives (assignments are never deleted by a stream
+        drop), but its origin tag is gone the instant the stream is --
+        there is no dangling id to report AFTER the fact on this
+        backend; only tools/drop_stream.py's PRE-delete read ever sees
+        the real count. (The MariaDB schema declares no FKs at all, so
+        the same column dangles there instead -- see
+        Storage.assignments_referencing_stream's docstring; there is no
+        automated pin for that half without a live server.)"""
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "alice", "bob", CREATED,
+            stream_id=self.stream_id)
+        before = self.store.assignments_referencing_stream(self.stream_id)
+        self.assertEqual(before, 1)
+        self.store.delete_stream(self.stream_id)
+        after = self.store.assignments_referencing_stream(self.stream_id)
+        self.assertEqual(
+            after, 0,
+            "SQLite's declared ON DELETE SET NULL FK did not cascade "
+            "-- either PRAGMA foreign_keys regressed to OFF, or the "
+            "column's FK declaration changed")
+        # The assignment itself survives the stream's deletion --
+        # only the origin annotation is gone, not the assignee.
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "alice")
+        self.assertIsNone(self.store.get_stream(self.stream_id))
+
+
+class CommentStreamTagTest(StorageTestBase):
+    """comments.stream_id — "posted from" (docs/STREAMS_PLAN.md §1)."""
+
+    def test_defaults_to_none(self) -> None:
+        self.store.upsert_runs([make_record()])
+        comment = self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "hi", BASE)
+        self.assertIsNone(comment.stream_id)
+        [stored] = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertIsNone(stored.stream_id)
+
+    def test_round_trips_when_given(self) -> None:
+        self.store.upsert_runs([make_record(build="feat/x")])
+        stream_id = self.store.list_streams("")[0].stream_id
+        comment = self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "from ci", BASE,
+            stream_id=stream_id)
+        self.assertEqual(comment.stream_id, stream_id)
+        [stored] = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertEqual(stored.stream_id, stream_id)
+
+
+class DashboardStreamScopingTest(StorageTestBase):
+    """dashboard()/dashboard_count() default to mainline and can be
+    scoped to any stream — mainline must be provably unaffected by a
+    branch import (docs/STREAMS_PLAN.md §3.5)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([make_record()])
+        self.store.upsert_runs([make_record(
+            test_name="test_b", build="feat/x",
+            start=BASE + datetime.timedelta(hours=1))])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_default_dashboard_is_mainline_only(self) -> None:
+        rows = self.store.dashboard()
+        self.assertEqual([r.test_name for r in rows], ["test_a"])
+        self.assertEqual(self.store.dashboard_count(), 1)
+
+    def test_scoped_dashboard_sees_only_that_stream(self) -> None:
+        rows = self.store.dashboard(stream_id=self.stream_id)
+        self.assertEqual([r.test_name for r in rows], ["test_b"])
+        self.assertEqual(
+            self.store.dashboard_count(stream_id=self.stream_id), 1)
+
+    def test_a_branch_import_does_not_change_the_mainline_count(
+            self) -> None:
+        before = self.store.dashboard_count()
+        self.store.upsert_runs([make_record(
+            test_name="test_c", build="feat/x",
+            start=BASE + datetime.timedelta(hours=2))])
+        after = self.store.dashboard_count()
+        self.assertEqual(before, after)
+
+
+class AssignmentOriginFilterTest(StorageTestBase):
+    """dashboard()/dashboard_count()'s ``assignment_origin`` filter
+    (WP-21, Open Actions §3.6) — WHERE the CURRENT assignment was made
+    from, an axis entirely separate from ``stream_id`` (which scopes
+    the test's own result, not who assigned it)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_a"),
+            make_record(test_name="test_b"),
+            make_record(test_name="test_c"),
+        ])
+        self.store.upsert_runs([make_record(build="feat/x")])
+        self.stream_id = self.store.list_streams("")[0].stream_id
+        # test_a: assigned from mainline (no stream_id)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        # test_b: assigned from the build
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "alice", "bob", CREATED,
+            stream_id=self.stream_id)
+        # test_c: never assigned at all
+
+    def test_no_filter_returns_everything(self) -> None:
+        self.assertEqual(self.store.dashboard_count(), 3)
+
+    def test_build_origin_returns_only_the_build_made_assignment(
+            self) -> None:
+        rows = self.store.dashboard(assignment_origin="build")
+        self.assertEqual([r.test_name for r in rows], ["test_b"])
+        self.assertEqual(
+            self.store.dashboard_count(assignment_origin="build"), 1)
+
+    def test_the_dead_branch_spelling_raises(self) -> None:
+        """WP-25 renamed the origin value branch->build before anything
+        shipped; the old spelling must raise like any unknown value,
+        never silently filter to nothing."""
+        with self.assertRaises(ValueError):
+            self.store.dashboard(assignment_origin="branch")
+
+    def test_mainline_origin_includes_unassigned_and_mainline_made(
+            self) -> None:
+        """"mainline" reads as "not from a build" — an unassigned test
+        was not made from anywhere, so it counts as mainline too, the
+        same way it counts as mainline for un-retirement (§3.4)."""
+        rows = self.store.dashboard(assignment_origin="mainline")
+        self.assertEqual(
+            sorted(r.test_name for r in rows), ["test_a", "test_c"])
+        self.assertEqual(
+            self.store.dashboard_count(assignment_origin="mainline"), 2)
+
+    def test_an_unknown_origin_value_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.dashboard(assignment_origin="nonsense")
+
+    def test_assignment_stream_ids_lists_only_non_mainline_ones(
+            self) -> None:
+        self.assertEqual(
+            self.store.assignment_stream_ids(), [self.stream_id])
+
+
+class AssignedOnlyFilterTest(StorageTestBase):
+    """dashboard()/dashboard_count()'s ``assigned_only`` filter
+    (2026-08-10, found in the first morning of build-verify manual
+    testing): every row with a current assignee, whatever its result.
+    Before it, an assignment on a mainline-PASSING test was visible
+    NOWHERE — the three Open Actions result options and the
+    "assigned"/"mine" queue predicates all gate on
+    FAIL/UNEXPECTED_PASS, a mainline-triage assumption ("assigned"
+    implied "because it is failing") that the build-verify flow broke:
+    a test assigned to investigate why it did not run on an RC passes
+    happily on mainline."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_passing_assigned"),
+            make_record(test_name="test_failing_assigned",
+                        result=Result.FAIL),
+            make_record(test_name="test_passing_unassigned"),
+        ])
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_passing_assigned",
+            "alice", "bob", CREATED)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_failing_assigned",
+            "carol", "bob", CREATED)
+
+    def test_includes_a_passing_assigned_test(self) -> None:
+        rows = self.store.dashboard(assigned_only=True)
+        self.assertEqual(
+            sorted(r.test_name for r in rows),
+            ["test_failing_assigned", "test_passing_assigned"])
+        self.assertEqual(
+            self.store.dashboard_count(assigned_only=True), 2)
+
+    def test_combines_with_assignees_by_narrowing(self) -> None:
+        """AND-level with the owner OR-group: "Alice's assignments,
+        any result" — never widened to assigned-to-anyone."""
+        rows = self.store.dashboard(
+            assigned_only=True, assignees=["alice"])
+        self.assertEqual(
+            [r.test_name for r in rows], ["test_passing_assigned"])
+
+    def test_contradiction_with_unassigned_matches_nothing(self) -> None:
+        """assigned AND unowned is empty by construction — never a
+        silent reinterpretation of either filter (the frontend does not
+        offer the combination; the storage layer must still be honest
+        about what it would mean)."""
+        self.assertEqual(
+            self.store.dashboard_count(
+                assigned_only=True, include_unassigned=True), 0)
+
+    def test_off_by_default(self) -> None:
+        self.assertEqual(self.store.dashboard_count(), 3)
+
+
+class OpenItemsFilterTest(StorageTestBase):
+    """dashboard()/dashboard_count()'s ``open_items`` composite
+    (2026-08-10, the user's same-morning refinement of
+    ``assigned_only`` above): "needs action" = failing, stale
+    annotation, OR currently assigned — an assignment IS an open
+    action whatever its result, which is what Open Actions' name
+    always claimed. Server-side because the OR spans the result axis
+    and the owner axis, which the AND-composed params cannot
+    express."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_failing", result=Result.FAIL),
+            make_record(test_name="test_stale_annotation",
+                        result=Result.UNEXPECTED_PASS),
+            make_record(test_name="test_passing_assigned"),
+            make_record(test_name="test_passing_unassigned"),
+        ])
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_passing_assigned",
+            "alice", "bob", CREATED)
+
+    def test_includes_all_three_kinds_of_open_item(self) -> None:
+        rows = self.store.dashboard(open_items=True)
+        self.assertEqual(
+            sorted(r.test_name for r in rows),
+            ["test_failing", "test_passing_assigned",
+             "test_stale_annotation"])
+        self.assertEqual(self.store.dashboard_count(open_items=True), 3)
+
+    def test_a_plain_passing_unassigned_test_is_not_an_open_item(
+            self) -> None:
+        rows = self.store.dashboard(open_items=True)
+        self.assertNotIn(
+            "test_passing_unassigned", [r.test_name for r in rows])
+
+    def test_off_by_default(self) -> None:
+        self.assertEqual(self.store.dashboard_count(), 4)
+
+
+class AssignmentStreamIdsEmptyTest(StorageTestBase):
+    """assignment_stream_ids() on a database with no build-originated
+    assignment at all — the signal Open Actions' filter reads to honour
+    "zero visible change when no assignment carries a stream"."""
+
+    def test_empty_with_only_mainline_assignments(self) -> None:
+        self.store.upsert_runs([make_record(test_name="test_a")])
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        self.assertEqual(self.store.assignment_stream_ids(), [])
+
+    def test_empty_with_no_assignments_at_all(self) -> None:
+        self.assertEqual(self.store.assignment_stream_ids(), [])
+
+
+class SummaryCacheTest(StorageTestBase):
+    """WP-23 "ONE MORE PERF SLICE": the shared summary/watch memo
+    (``Storage._summary_cache``) -- same TTL-bounded, write-invalidated
+    discipline as ``_trend_cache`` (:class:`EnvironmentDeleteTest`'s
+    ``test_the_trend_cache_is_invalidated``, :class:`ActivityHoursTest`'s
+    ``test_reads_come_from_the_derived_table_not_from_runs``), but one
+    dict shared by several methods (``summary_rollup``, ``queue_counts``,
+    ``status_queue``, ``test_counts_by_environment``,
+    ``latest_run_time_by_environment``, ``environments``, ``scripts``,
+    the per-entry ``failure_streak_bounds_many``) rather than one dict
+    per method.
+
+    Every "is a cache hit" assertion is a QUERY COUNT, not a value
+    comparison -- a memo that silently recomputes every time would pass
+    a value-only test while giving back none of the measured saving.
+    """
+
+    def _query_count(self, action: Callable[[], None]) -> int:
+        statements = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, statements)
+        try:
+            action()
+        finally:
+            conn.set_trace_callback(None)
+        return len(statements)
+
+    def _expire_the_summary_cache(self) -> None:
+        """Simulate every entry ageing past the TTL -- a write made by a
+        DIFFERENT process, which this process's own invalidation calls
+        cannot see, so only the TTL bound catches it."""
+        too_old = storage._TREND_CACHE_TTL_SECONDS + 1.0
+        for key, (stored_at, value) in list(self.store._summary_cache.items()):
+            self.store._summary_cache[key] = (stored_at - too_old, value)
+
+    # -- repeat call is a genuine cache hit (no new SQL) -----------------
+
+    def test_repeat_summary_rollup_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        first = self.store.summary_rollup(cutoff)
+        self.assertGreater(sum(c.count for c in first), 0)
+        cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
+        self.assertEqual(
+            cost, 0, "a repeat call for the SAME cutoff touched SQL")
+
+    def test_repeat_queue_counts_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        stale_before = BASE + datetime.timedelta(hours=1)
+        self.store.queue_counts(stale_before=stale_before)
+        cost = self._query_count(
+            lambda: self.store.queue_counts(stale_before=stale_before))
+        self.assertEqual(cost, 0)
+
+    def test_repeat_status_queue_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        self.store.status_queue("still_failing")
+        cost = self._query_count(
+            lambda: self.store.status_queue("still_failing"))
+        self.assertEqual(cost, 0)
+
+    def test_repeat_test_counts_by_environment_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record()])
+        self.store.test_counts_by_environment()
+        cost = self._query_count(
+            lambda: self.store.test_counts_by_environment())
+        self.assertEqual(cost, 0)
+
+    def test_repeat_latest_run_time_by_environment_is_a_cache_hit(
+        self,
+    ) -> None:
+        self.store.upsert_runs([make_record()])
+        self.store.latest_run_time_by_environment()
+        cost = self._query_count(
+            lambda: self.store.latest_run_time_by_environment())
+        self.assertEqual(cost, 0)
+
+    def test_repeat_environments_and_scripts_are_cache_hits(self) -> None:
+        self.store.upsert_runs([make_record()])
+        self.store.environments()
+        self.store.scripts()
+        cost = self._query_count(lambda: (
+            self.store.environments(), self.store.scripts()))
+        self.assertEqual(cost, 0)
+
+    def test_repeat_failure_streak_bounds_many_is_a_cache_hit(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        entry = ("linux-sim", "suite.py", "test_a", BASE)
+        self.store.failure_streak_bounds_many([entry])
+        cost = self._query_count(
+            lambda: self.store.failure_streak_bounds_many([entry]))
+        self.assertEqual(cost, 0)
+
+    # -- every listed mutator invalidates ---------------------------------
+
+    def test_upsert_runs_invalidates(self) -> None:
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        before = self.store.summary_rollup(cutoff)
+        self.assertEqual(sum(c.count for c in before), 1)
+        self.store.upsert_runs([make_record(test_name="test_b")])
+        after = self.store.summary_rollup(cutoff)
+        self.assertEqual(
+            sum(c.count for c in after), 2,
+            "the memo kept serving the pre-import rollup")
+
+    def test_delete_stream_invalidates(self) -> None:
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        branch_id = self.store.list_streams("")[0].stream_id
+        before = self.store.test_counts_by_environment(branch_id)
+        self.assertEqual(before.get("linux-sim"), 1)
+        self.store.delete_stream(branch_id)
+        after = self.store.test_counts_by_environment(branch_id)
+        self.assertEqual(
+            after.get("linux-sim", 0), 0,
+            "the memo kept serving the deleted stream's counts")
+
+    def test_prune_runs_before_invalidates(self) -> None:
+        """prune_runs_before only ever deletes NON-latest runs (see its
+        own docstring), so a single-run estate has nothing observable
+        for it to change -- this checks the memo is torn down (a fresh
+        query, not a served value) rather than a rollup NUMBER, which
+        would be the same before and after regardless of whether
+        invalidation fired at all."""
+        day = datetime.timedelta(days=1)
+        self.store.upsert_runs([make_record(start=BASE - 400 * day)])
+        cutoff = BASE
+        self.store.summary_rollup(cutoff)
+        self.store.prune_runs_before(BASE - 300 * day)
+        cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
+        self.assertGreater(
+            cost, 0, "the memo survived a prune untouched")
+
+    def test_delete_environment_invalidates(self) -> None:
+        self.store.upsert_runs([make_record(environment="UNKNOWN")])
+        before = self.store.environments()
+        self.assertIn("UNKNOWN", before)
+        self.store.delete_environment("UNKNOWN")
+        after = self.store.environments()
+        self.assertNotIn(
+            "UNKNOWN", after,
+            "the memo kept serving a deleted environment")
+
+    def test_set_assignee_invalidates_queue_counts(self) -> None:
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        stale_before = BASE + datetime.timedelta(hours=1)
+        before = self.store.queue_counts(
+            stale_before=stale_before, assignee="alice")
+        self.assertEqual(before["mine"], 0)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        after = self.store.queue_counts(
+            stale_before=stale_before, assignee="alice")
+        self.assertEqual(
+            after["mine"], 1,
+            "the memo kept serving zero assigned tests")
+
+    def test_set_retired_invalidates_summary_rollup(self) -> None:
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        before = self.store.summary_rollup(cutoff)
+        self.assertFalse(any(c.retired for c in before))
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "amy", "gone",
+            CREATED)
+        after = self.store.summary_rollup(cutoff)
+        self.assertTrue(
+            any(c.retired for c in after),
+            "the memo kept serving the pre-retirement rollup")
+
+    def test_set_retired_invalidates_test_counts(self) -> None:
+        """test_counts_by_environment excludes retired tests -- the
+        SAME rollup a retirement comment write must also invalidate."""
+        self.store.upsert_runs([make_record()])
+        before = self.store.test_counts_by_environment()
+        self.assertEqual(before.get("linux-sim"), 1)
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "amy", "gone",
+            CREATED)
+        after = self.store.test_counts_by_environment()
+        self.assertEqual(
+            after.get("linux-sim", 0), 0,
+            "the memo kept counting a just-retired test")
+
+    def test_add_comment_invalidates_status_queue_comment_payload(
+        self,
+    ) -> None:
+        # Two FAILs, so prev_result is FAIL too and the row lands in
+        # "still_failing" rather than "new_failures".
+        self.store.upsert_runs([make_record(result=Result.FAIL)])
+        self.store.upsert_runs([make_record(
+            result=Result.FAIL,
+            start=BASE + datetime.timedelta(hours=1),
+            end=BASE + datetime.timedelta(hours=1, seconds=3))])
+        (row_before,) = self.store.status_queue(
+            "still_failing", with_latest_comment=True)
+        self.assertIsNone(row_before.latest_comment)
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "note", CREATED)
+        (row_after,) = self.store.status_queue(
+            "still_failing", with_latest_comment=True)
+        self.assertIsNotNone(
+            row_after.latest_comment,
+            "the memo kept serving the comment-less row")
+
+    def test_environment_products_write_needs_no_invalidation(self) -> None:
+        """Audited, not merely untested: every cached method takes its
+        product/environment scope as an explicit `environments`
+        allow-list argument rather than joining `environment_products`
+        itself, so a remap changes which KEY a request computes rather
+        than making an existing entry wrong. Proof: an environment's
+        estate-wide (unscoped) `environments()` entry, cached BEFORE a
+        product declaration, must still list it AFTER -- an unscoped
+        read was never keyed by product in the first place."""
+        self.store.upsert_runs([make_record()])
+        before = self.store.environments()
+        self.assertIn("linux-sim", before)
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "amy", CREATED)
+        after = self.store.environments()
+        self.assertIn("linux-sim", after)
+
+    # -- scope-key isolation ----------------------------------------------
+
+    def test_scope_key_isolation_by_environments_allow_list(self) -> None:
+        """Product A's memo entry must never answer for product B."""
+        self.store.upsert_runs([
+            make_record(environment="linux-sim"),
+            make_record(environment="win-sim"),
+        ])
+        only_linux = self.store.latest_run_time_by_environment(
+            environments=["linux-sim"])
+        only_win = self.store.latest_run_time_by_environment(
+            environments=["win-sim"])
+        self.assertEqual(sorted(only_linux), ["linux-sim"])
+        self.assertEqual(sorted(only_win), ["win-sim"])
+
+    def test_scope_key_isolation_by_stream(self) -> None:
+        """A branch's memo entry must never answer for mainline's."""
+        self.store.upsert_runs([
+            make_record(),
+            make_record(test_name="test_b", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=1)),
+        ])
+        branch_id = self.store.list_streams("")[0].stream_id
+        mainline_counts = self.store.test_counts_by_environment()
+        branch_counts = self.store.test_counts_by_environment(branch_id)
+        self.assertEqual(mainline_counts.get("linux-sim"), 1)
+        self.assertEqual(branch_counts.get("linux-sim"), 1)
+        # Both counts happen to be 1 (one test each) -- the isolation
+        # that matters is that a SUBSEQUENT write to only one stream
+        # cannot leak into the other's still-cached entry.
+        self.store.upsert_runs([
+            make_record(test_name="test_c", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=2)),
+        ])
+        mainline_after = self.store.test_counts_by_environment()
+        self.assertEqual(
+            mainline_after.get("linux-sim"), 1,
+            "a branch-only import changed mainline's cached count")
+
+    def test_a_different_cutoff_is_a_different_key(self) -> None:
+        """summary_rollup must never round/truncate the cutoff for
+        caching purposes -- two distinct real cutoffs sharing one slot
+        would serve counts computed for the wrong window."""
+        self.store.upsert_runs([make_record()])
+        self.store.summary_rollup(BASE - datetime.timedelta(hours=1))
+        cost = self._query_count(
+            lambda: self.store.summary_rollup(BASE))
+        self.assertGreater(
+            cost, 0,
+            "a different cutoff reused another cutoff's cached rows")
+
+    # -- TTL bound ----------------------------------------------------------
+
+    def test_ttl_bound_expires_the_memo(self) -> None:
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        self.store.summary_rollup(cutoff)
+        self._expire_the_summary_cache()
+        cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
+        self.assertGreater(
+            cost, 0, "an entry older than the TTL was still served")
+
+    def test_within_ttl_still_hits(self) -> None:
+        """The expiry helper itself must be capable of NOT expiring --
+        otherwise test_ttl_bound_expires_the_memo above is vacuous."""
+        self.store.upsert_runs([make_record()])
+        cutoff = BASE - datetime.timedelta(hours=1)
+        self.store.summary_rollup(cutoff)
+        cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
+        self.assertEqual(cost, 0)

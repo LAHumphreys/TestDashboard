@@ -44,6 +44,7 @@ NULL = "\\N"
 #: orphans — see the runbook §C.1).
 TABLE_ORDER = (
     "users",
+    "streams",
     "runs",
     "run_outputs",
     "latest_runs",
@@ -52,6 +53,7 @@ TABLE_ORDER = (
     "current_assignments",
     "test_retirements",
     "environment_expectations",
+    "environment_products",
     "activity_hours",
     "script_hours",
     "schema_version",
@@ -75,6 +77,9 @@ VERIFY_QUERIES = (
     ("retirements_total", "SELECT COUNT(*) FROM test_retirements"),
     ("expectations_total",
      "SELECT COUNT(*) FROM environment_expectations"),
+    ("products_total",
+     "SELECT COUNT(*) FROM environment_products"),
+    ("streams_total", "SELECT COUNT(*) FROM streams"),
     ("activity_total",
      "SELECT COUNT(*), SUM(count) FROM activity_hours"),
     ("script_activity_total",
@@ -140,6 +145,17 @@ CREATE TABLE users (
   PRIMARY KEY (username)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
+CREATE TABLE streams (
+  id         BIGINT NOT NULL AUTO_INCREMENT,
+  product    VARCHAR(255) NOT NULL,
+  kind       VARCHAR(20) NOT NULL,
+  name       VARCHAR(255) NOT NULL,
+  first_seen {stamp} NOT NULL,
+  last_seen  {stamp} NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_streams_identity (product, kind, name)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
 CREATE TABLE runs (
   id                   BIGINT NOT NULL AUTO_INCREMENT,
   environment          {env} NOT NULL,
@@ -151,6 +167,7 @@ CREATE TABLE runs (
   source_link          VARCHAR(1024) NOT NULL,
   known_failure_reason TEXT NULL,
   output_fingerprint   VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  stream_id            BIGINT NOT NULL DEFAULT 1,
   PRIMARY KEY (id),
   UNIQUE KEY uq_runs_identity (environment, script, test_name, start_time)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
@@ -162,6 +179,7 @@ CREATE TABLE run_outputs (
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE latest_runs (
+  stream_id        BIGINT NOT NULL DEFAULT 1,
   environment      {env} NOT NULL,
   script           {script} NOT NULL,
   test_name        {name} NOT NULL,
@@ -170,7 +188,7 @@ CREATE TABLE latest_runs (
   result           {result} NOT NULL,
   prev_result      {result} NULL,
   duration_seconds DOUBLE NOT NULL DEFAULT 0,
-  PRIMARY KEY (environment, script, test_name)
+  PRIMARY KEY (stream_id, environment, script, test_name)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE comments (
@@ -181,6 +199,7 @@ CREATE TABLE comments (
   author      {user} NOT NULL,
   created_at  {stamp} NOT NULL,
   text        TEXT NOT NULL,
+  stream_id   BIGINT NULL,
   PRIMARY KEY (id)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
@@ -192,6 +211,7 @@ CREATE TABLE assignments (
   assignee    {user} NULL,
   assigned_by {user} NOT NULL,
   assigned_at {stamp} NOT NULL,
+  stream_id   BIGINT NULL,
   PRIMARY KEY (id)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
@@ -200,6 +220,7 @@ CREATE TABLE current_assignments (
   script      {script} NOT NULL,
   test_name   {name} NOT NULL,
   assignee    {user} NULL,
+  stream_id   BIGINT NULL,
   PRIMARY KEY (environment, script, test_name)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
@@ -220,15 +241,25 @@ CREATE TABLE environment_expectations (
   PRIMARY KEY (environment)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
+CREATE TABLE environment_products (
+  environment {env} NOT NULL,
+  product     VARCHAR(255) NOT NULL,
+  updated_at  {stamp} NOT NULL,
+  updated_by  {user} NOT NULL,
+  PRIMARY KEY (environment)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
 CREATE TABLE activity_hours (
+  stream_id   BIGINT NOT NULL DEFAULT 1,
   environment {env} NOT NULL,
   hour        VARCHAR(13) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   result      {result} NOT NULL,
   count       INT NOT NULL,
-  PRIMARY KEY (environment, hour, result)
+  PRIMARY KEY (stream_id, environment, hour, result)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE script_hours (
+  stream_id   BIGINT NOT NULL DEFAULT 1,
   environment {env} NOT NULL,
   hour        VARCHAR(13) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   script      {script} NOT NULL,
@@ -236,7 +267,7 @@ CREATE TABLE script_hours (
   count       INT NOT NULL,
   first_start {stamp} NOT NULL,
   last_end    {stamp} NOT NULL,
-  PRIMARY KEY (environment, hour, script, result)
+  PRIMARY KEY (stream_id, environment, hour, script, result)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE schema_version (
@@ -252,12 +283,16 @@ INDEXES = """-- Created after loading: building an index once beats
 -- maintaining it per row.
 CREATE INDEX idx_runs_start_time_result ON runs (start_time, result);
 CREATE INDEX idx_latest_runs_result
-  ON latest_runs (result, environment, script, test_name);
-CREATE INDEX idx_latest_runs_start_time ON latest_runs (start_time);
+  ON latest_runs (stream_id, result, environment, script, test_name);
+CREATE INDEX idx_latest_runs_start_time
+  ON latest_runs (stream_id, start_time);
 CREATE INDEX idx_latest_runs_start_sort
-  ON latest_runs (start_time, environment, script, test_name);
+  ON latest_runs (stream_id, start_time, environment, script, test_name);
 CREATE INDEX idx_latest_runs_duration_sort
-  ON latest_runs (duration_seconds, environment, script, test_name);
+  ON latest_runs (stream_id, duration_seconds, environment, script,
+                   test_name);
+CREATE INDEX idx_latest_runs_triple
+  ON latest_runs (environment, script, test_name);
 CREATE INDEX idx_comments_triple
   ON comments (environment, script, test_name, id);
 CREATE INDEX idx_assignments_triple

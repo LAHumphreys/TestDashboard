@@ -209,6 +209,7 @@ def records_to_runs(records):
                 output=rec["output"],
                 source_link="",
                 known_failure_reason=reason,
+                build=None,
             )
         )
     return runs

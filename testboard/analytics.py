@@ -78,6 +78,8 @@ __all__ = [
     "EnvironmentRollup",
     "EstateSummary",
     "summarize_rollup",
+    "ProductRollup",
+    "summarize_by_product",
     "Execution",
     "group_executions",
     "ScriptExecution",
@@ -469,6 +471,72 @@ class EnvironmentRollup(NamedTuple):
     new_failures: int
     unexpected_passes: int
     not_run: int
+
+
+class ProductRollup(NamedTuple):
+    """Per-DECLARED-product slice of the headline counts (WP-20).
+
+    Deliberately narrower than :class:`EnvironmentRollup`: no
+    ``total_tests``/``not_run`` (those are recency-gated and
+    docs/STREAMS_PLAN.md §2.3 asks for a per-product breakdown with no
+    window phrase — "never one wall-clock phrase across products" — so
+    only the four counts that are NOT recency-gated appear here), plus
+    ``fixed``, which the environment rollup does not carry per-row.
+    """
+
+    product: str
+    failing: int
+    new_failures: int
+    fixed: int
+    unexpected_passes: int
+
+
+def summarize_by_product(
+    counts: Sequence[RollupCount], env_to_product: Dict[str, str]
+) -> List[ProductRollup]:
+    """Aggregate rollup cells into one row per DECLARED product.
+
+    *env_to_product* is :meth:`Storage.environment_products_map` — an
+    environment absent from it belongs to the implicit product ``""``
+    and contributes to NO row here. This is a breakdown of declared
+    products, not an "everything else" total; the estate headline
+    (:func:`summarize_rollup`) already covers the whole estate
+    regardless of product, so there is nothing this function needs to
+    say about unmapped environments.
+
+    Retired tests are excluded, consistent with every other estate
+    view. None of the four counts is recency-gated — matching
+    :func:`summarize_rollup`'s own ``failed``/``new_failures``/
+    ``unexpected_passes`` fields, which are not either — so one
+    estate-wide rollup (any *recent_cutoff* works; it only affects a
+    column this function ignores) serves every product with no window
+    to mislabel.
+    """
+    buckets = {}  # type: Dict[str, List[int]]
+    for cell in counts:
+        if cell.retired:
+            continue
+        product = env_to_product.get(cell.environment)
+        if product is None:
+            continue
+        bucket = buckets.setdefault(product, [0, 0, 0, 0])
+        is_fail = cell.result is Result.FAIL
+        was_fail = cell.prev_result is Result.FAIL
+        if is_fail:
+            bucket[0] += cell.count
+            if not was_fail:
+                bucket[1] += cell.count
+        elif was_fail:
+            bucket[2] += cell.count
+        if cell.result is Result.UNEXPECTED_PASS:
+            bucket[3] += cell.count
+    return [
+        ProductRollup(
+            product=product, failing=bucket[0], new_failures=bucket[1],
+            fixed=bucket[2], unexpected_passes=bucket[3],
+        )
+        for product, bucket in sorted(buckets.items())
+    ]
 
 
 class Execution(NamedTuple):

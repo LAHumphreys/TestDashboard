@@ -28,6 +28,8 @@ import {
   showError,
 } from "./api.js";
 import { stackedColumnChart } from "./charts.js";
+import { renderBranchBand } from "./compare.js";
+import { apiUrl, pageUrl } from "./urls.js";
 
 /** Tests listed per page in the lower table. */
 const CHUNK = 100;
@@ -38,6 +40,11 @@ const state = {
   days: 14,
   tests: [],
   total: 0,
+  // Script-page parity (FINAL ROUND, docs/STREAMS_PLAN.md §5.2 "as
+  // built"): this page had no stream support of its own before this --
+  // absent means mainline, the same "zero visible change" rule every
+  // other stream-aware page follows (WP-23's `?stream=` grammar).
+  streamId: null,
 };
 
 /* The same status colours the rest of the dashboard uses. */
@@ -58,8 +65,16 @@ function scriptApiPath(suffix) {
 async function loadExecutions() {
   clearError();
   try {
-    const data = await fetchJson(
-      scriptApiPath("/executions") + "?days=" + state.days);
+    // scriptApiPath already encodes environment/script into the PATH,
+    // so product/baseline/environment are all explicitly nulled here
+    // rather than left to pageUrl()'s default carriage -- this page's
+    // own URL carries `environment=` too (as identity, per init()
+    // below), and a duplicate query-string copy of it was never part
+    // of this fetch's shape.
+    const data = await fetchJson(apiUrl(
+      scriptApiPath("/executions"), { days: state.days },
+      { stream: state.streamId, product: null, baseline: null,
+        environment: null }));
     renderExecutions(data);
   } catch (err) {
     showError(err.message);
@@ -69,15 +84,18 @@ async function loadExecutions() {
 }
 
 async function loadTests(append) {
-  const qs = new URLSearchParams();
-  qs.append("environment", state.environment);
-  qs.append("script", state.script);
-  qs.append("retired", "1");
-  qs.append("sort", "test_name");
-  qs.append("limit", String(CHUNK));
-  qs.append("offset", String(append ? state.tests.length : 0));
   try {
-    const page = await fetchJson("/api/dashboard?" + qs.toString());
+    // Script-page parity: the "tests in this suite" table must show THIS
+    // stream's own current results, not mainline's, when scoped -- the
+    // same /api/dashboard?stream= every other list in the app reads.
+    const page = await fetchJson(apiUrl("/api/dashboard", {
+      environment: state.environment,
+      script: state.script,
+      retired: "1",
+      sort: "test_name",
+      limit: CHUNK,
+      offset: append ? state.tests.length : 0,
+    }, { stream: state.streamId, product: null, baseline: null }));
     state.tests = append ? state.tests.concat(page.tests) : page.tests;
     state.total = page.total;
     renderTests(page.tests, append);
@@ -89,6 +107,13 @@ async function loadTests(append) {
 /* ================= executions ================= */
 
 function renderExecutions(data) {
+  // Script-page parity: the same guard time.js/timeline.js/test.js use
+  // -- the band only ever draws when this page was actually asked to
+  // scope to a stream AND the server named one back. A mainline load
+  // (state.streamId === null) never touches renderBranchBand at all.
+  if (state.streamId !== null && data.stream_identity) {
+    renderBranchBand(data.stream_identity);
+  }
   const executions = data.executions;
   document.getElementById("empty-state").hidden = executions.length !== 0;
   document.getElementById("executions-meta").textContent =
@@ -194,11 +219,12 @@ function renderTests(rows, append) {
 
     const cell = el("td", "wrap");
     const link = document.createElement("a");
-    const params = new URLSearchParams();
-    params.append("environment", row.environment);
-    params.append("script", row.script);
-    params.append("test_name", row.test_name);
-    link.href = "test.html?" + params.toString();
+    // Scope-carriage: this page's own scope, so the test opened from
+    // it lands on that SAME stream, not mainline's.
+    link.href = pageUrl("test", {
+      environment: row.environment, script: row.script,
+      test_name: row.test_name,
+    }, { stream: state.streamId, product: null, baseline: null });
     link.textContent = row.test_name;
     cell.appendChild(link);
     if (row.retired_at) {
@@ -240,6 +266,8 @@ function init() {
   const url = new URL(window.location.href);
   state.environment = url.searchParams.get("environment") || "";
   state.script = url.searchParams.get("script") || "";
+  const rawStream = url.searchParams.get("stream");
+  state.streamId = rawStream ? parseInt(rawStream, 10) : null;
   if (!state.environment || !state.script) {
     showError("This page needs an environment and a script in the URL.");
     document.getElementById("loading-state").hidden = true;

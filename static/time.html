@@ -15,13 +15,24 @@
       <a href="actions.html">Open actions</a>
       <a href="time.html" aria-current="page">Time</a>
       <a href="timeline.html">Timeline</a>
+      <a href="watch.html">Watch</a>
       <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
     </nav>
+    <span id="product-switcher" class="product-switcher" hidden></span>
     <div id="user-widget" class="user-widget"></div>
   </header>
 
   <main class="wide">
     <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <!-- F7 (docs/STREAMS_PLAN.md §5.2 "as built"): "you are scoped to a
+         branch" -- same mount/markup as index.html/test.html, rendered
+         by the shared compare.js:renderBranchBand(). Absent from the
+         DOM's visible state on every mainline visit. -->
+    <div id="branch-band" class="branch-band" hidden>
+      <span id="branch-band-text"></span>
+      <a id="branch-band-back" href="time.html">Back to mainline</a>
+    </div>
 
     <section class="section-head">
       <h2 class="eyebrow">Where the time goes</h2>
@@ -40,6 +51,12 @@
     <nav id="breadcrumb" class="breadcrumb" aria-label="Drill-down"></nav>
 
     <div class="filter-row" aria-label="Scope">
+      <!-- The Build picker (WP-21/WP-23 nav-scope addendum): same mount
+           point and same streams.js:renderPicker() as index.html --
+           hidden unless the current product has a branch/build stream.
+           Lets a branch/build be selected straight from this page,
+           without a round trip through the dashboard first. -->
+      <span id="stream-picker" class="stream-picker" hidden></span>
       <button id="stale-toggle" class="toggle" type="button" aria-pressed="false">
         Include tests that have not run recently
       </button>
@@ -71,6 +88,8 @@
   </main>
 
   <script type="module" src="time.js"></script>
+  <script type="module" src="products.js"></script>
+  <script type="module" src="streams.js"></script>
   <script type="module" src="nav.js"></script>
 </body>
 </html>

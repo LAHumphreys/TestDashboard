@@ -21,13 +21,17 @@ import datetime
 import json
 import os
 import re
+import sqlite3
 import unittest
 import urllib.parse
 from typing import Any, Dict, List, Optional, Union
 
 from testboard import api
 from testboard.model import format_iso
-from testboard.storage import DASHBOARD_SORTS, QUEUE_KINDS, Storage
+from testboard.storage import (
+    COMPARE_CATEGORIES, DASHBOARD_SORTS, MAINLINE_STREAM_ID, QUEUE_KINDS,
+    Storage,
+)
 
 #: Fixed clock injected into handle_api for deterministic timestamps.
 NOW = datetime.datetime(2026, 7, 26, 12, 0, 0)
@@ -44,6 +48,7 @@ RUN_OUT_KEYS = {
 }
 DASHBOARD_ROW_KEYS = {
     "environment",
+    "product",
     "script",
     "test_name",
     "run_id",
@@ -54,6 +59,7 @@ DASHBOARD_ROW_KEYS = {
     "known_failure_reason",
     "source_link",
     "assignee",
+    "assignment_stream_id",
     "retired_at",
     "retired_by",
 }
@@ -191,7 +197,7 @@ class TestImport(ApiCase):
             data,
             {
                 "inserted": 2, "updated": 0, "unchanged": 0,
-                "rejected": 0, "errors": [],
+                "rejected": 0, "errors": [], "streams_seen": [],
             },
         )
 
@@ -214,7 +220,7 @@ class TestImport(ApiCase):
             data,
             {
                 "inserted": 0, "updated": 0, "unchanged": 0,
-                "rejected": 0, "errors": [],
+                "rejected": 0, "errors": [], "streams_seen": [],
             },
         )
 
@@ -391,6 +397,84 @@ class TestDashboard(ApiCase):
         self.assert_405("POST", "/api/dashboard", "GET")
 
 
+class TestDashboardAssignmentOrigin(ApiCase):
+    """``/api/dashboard``'s ``origin=`` filter and ``streams`` map
+    (WP-21, Open Actions §3.6)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a"),
+            record(test_name="test_b"),
+        ])
+        self.import_runs([record(
+            test_name="test_c", build="feat/x",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.call(
+            "PUT", test_path("linux-sim", "suite/alpha.py", "test_a",
+                              "/assignee"),
+            body={"username": "alice", "assigned_by": "bob",
+                  "stream_id": self.stream_id})
+        self.call(
+            "PUT", test_path("linux-sim", "suite/alpha.py", "test_b",
+                              "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+
+    def test_no_filter_returns_the_streams_map_for_the_page(self) -> None:
+        data = self.call("GET", "/api/dashboard")
+        self.assertEqual(
+            data["streams"][str(self.stream_id)]["kind"], "build")
+        self.assertEqual(
+            data["streams"][str(self.stream_id)]["name"], "feat/x")
+
+    def test_no_page_streams_no_map_entries(self) -> None:
+        """A test with no non-mainline-originated assignment on the
+        returned page must not spuriously carry a streams entry."""
+        data = self.call(
+            "GET", "/api/dashboard", query={"q": ["test_b"]})
+        self.assertEqual(data["streams"], {})
+
+    def test_origin_build_filters_to_the_build_made_assignment(
+            self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"origin": ["build"]}
+        )["tests"]
+        self.assertEqual([r["test_name"] for r in rows], ["test_a"])
+
+    def test_the_dead_branch_spelling_is_rejected(self) -> None:
+        """WP-25 renamed the origin value branch->build before anything
+        shipped; the old spelling must 400 like any other unknown value,
+        not silently match nothing."""
+        data = self.call(
+            "GET", "/api/dashboard", query={"origin": ["branch"]},
+            expect=400)
+        self.assertIn("origin", data["error"])
+
+    def test_origin_mainline_excludes_the_build_made_assignment(
+            self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"origin": ["mainline"]}
+        )["tests"]
+        self.assertNotIn(
+            "test_a", [r["test_name"] for r in rows])
+
+    def test_an_invalid_origin_value_is_400(self) -> None:
+        data = self.call(
+            "GET", "/api/dashboard", query={"origin": ["nonsense"]},
+            expect=400)
+        self.assertIn("origin", data["error"])
+
+    def test_row_carries_the_assignment_stream_id(self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"q": ["test_a"]}
+        )["tests"]
+        self.assertEqual(rows[0]["assignment_stream_id"], self.stream_id)
+
+
 class TestDashboardPaging(ApiCase):
     """GET /api/dashboard paging, sorting and their validation."""
 
@@ -547,6 +631,8 @@ class TestDetail(ApiCase):
                 "assignee",
                 "latest",
                 "analytics",
+                "stream",
+                "stream_identity",
             },
         )
         self.assertEqual(data["environment"], self.ENV)
@@ -695,6 +781,157 @@ class TestHistory(ApiCase):
         self.assert_405("POST", self.path, "GET")
 
 
+class TestBuildRebuildHistory(ApiCase):
+    """WP-22 (docs/STREAMS_PLAN.md §4.1): a rebuild is just a second
+    import under the same `build` name -- verifies that the WP-21
+    history table (unchanged code) already reads a build's rebuild
+    correctly rather than assuming it without checking (item 7 of the
+    WP-22 work order)."""
+
+    ENV = "linux-sim"
+    SCRIPT = "suite/alpha.py"
+    NAME = "test_flow"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="FAIL", build="1.0",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        # The rebuild: same build name, a LATER run of the same test.
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="PASS", build="1.0",
+                   start_time="2026-07-25T05:00:00.000000",
+                   end_time="2026-07-25T05:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def test_the_rebuild_creates_no_second_stream(self) -> None:
+        """Re-importing under the SAME name is the same stream, not a
+        new one -- docs/STREAMS_PLAN.md §3.3's find-or-create rule."""
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0]["name"], "1.0")
+
+    def test_the_newer_run_wins_as_latest(self) -> None:
+        data = self.call(
+            "GET", test_path(self.ENV, self.SCRIPT, self.NAME),
+            query={"stream": [str(self.stream_id)]})
+        self.assertEqual(data["latest"]["result"], "PASS")
+        self.assertEqual(
+            data["latest"]["start_time"], "2026-07-25T05:00:00.000000")
+
+    def test_history_still_shows_both_runs_newest_first(self) -> None:
+        """The older (superseded) run is not lost -- it is a real row
+        in `runs`, just no longer the one `latest_runs` points to."""
+        data = self.call(
+            "GET",
+            test_path(self.ENV, self.SCRIPT, self.NAME, "/history"),
+            query={"stream": [str(self.stream_id)]})
+        results = [run["result"] for run in data["runs"]]
+        starts = [run["start_time"] for run in data["runs"]]
+        self.assertEqual(results, ["PASS", "FAIL"])
+        self.assertEqual(starts, sorted(starts, reverse=True))
+
+    def test_the_every_build_endpoint_also_reflects_the_newer_run(
+            self) -> None:
+        data = self.call(
+            "GET",
+            test_path(self.ENV, self.SCRIPT, self.NAME, "/streams"))
+        (row,) = data["results"]
+        self.assertEqual(row["result"], "PASS")
+        self.assertEqual(row["start_time"], "2026-07-25T05:00:00.000000")
+
+
+class TestStreamResults(ApiCase):
+    """GET .../streams (WP-22, docs/STREAMS_PLAN.md §4.1): a triple's
+    latest result on every stream that HAS one, newest first -- the test
+    page's "Every build" table and its stream dropdown."""
+
+    ENV = "linux-sim"
+    SCRIPT = "suite/alpha.py"
+    NAME = "test_flow"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="PASS"),
+        ])
+        self.call(
+            "PUT", "/api/environments/{}/product".format(self.ENV),
+            body={"product": "Atlas", "username": "amy"})
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="FAIL", build="1.0",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name=self.NAME, result="FAIL", build="feat/x",
+                   start_time="2026-07-25T04:00:00.000000",
+                   end_time="2026-07-25T04:00:03.000000"),
+        ])
+        # A stream that never ran THIS test -- must never appear.
+        self.import_runs([
+            record(environment=self.ENV, script=self.SCRIPT,
+                   test_name="test_other", build="9.9",
+                   start_time="2026-07-25T02:30:00.000000",
+                   end_time="2026-07-25T02:30:03.000000"),
+        ])
+        self.path = test_path(self.ENV, self.SCRIPT, self.NAME, "/streams")
+
+    def test_newest_first_and_identity_shape(self) -> None:
+        data = self.call("GET", self.path)
+        self.assertEqual(data["environment"], self.ENV)
+        self.assertEqual(data["script"], self.SCRIPT)
+        self.assertEqual(data["test_name"], self.NAME)
+        self.assertEqual(data["product"], "Atlas")
+        kinds = [row["stream"]["kind"] for row in data["results"]]
+        self.assertEqual(kinds, ["build", "build", "mainline"])
+        self.assertEqual(data["results"][0]["result"], "FAIL")
+        self.assertIn("run_id", data["results"][0])
+        self.assertIn("start_time", data["results"][0])
+
+    def test_product_is_empty_string_when_undeclared(self) -> None:
+        """The mainline row's own `stream.product` is always "" (it is
+        universal), which must never be mistaken for THIS environment's
+        declared product -- exercised on an environment nobody has
+        mapped, where both happen to agree by coincidence, and again
+        implicitly by test_newest_first_and_identity_shape above where
+        they must NOT agree."""
+        self.import_runs([
+            record(environment="unmapped-env", test_name="lonely",
+                   result="PASS"),
+        ])
+        data = self.call(
+            "GET",
+            test_path("unmapped-env", self.SCRIPT, "lonely", "/streams"))
+        self.assertEqual(data["product"], "")
+
+    def test_a_stream_that_never_ran_this_test_is_absent(self) -> None:
+        data = self.call("GET", self.path)
+        names = {row["stream"]["name"] for row in data["results"]}
+        self.assertNotIn("9.9", names)
+
+    def test_unknown_triple_404(self) -> None:
+        self.call(
+            "GET",
+            test_path(self.ENV, self.SCRIPT, "no_such", "/streams"),
+            expect=404,
+        )
+
+    def test_wrong_method(self) -> None:
+        self.assert_405("POST", self.path, "GET")
+
+
 class TestRunEndpoint(ApiCase):
     """GET /api/runs/{run_id}: the only place output is returned."""
 
@@ -759,7 +996,7 @@ class TestComments(ApiCase):
 
     def test_empty_thread(self) -> None:
         data = self.call("GET", self.path)
-        self.assertEqual(data, {"comments": []})
+        self.assertEqual(data, {"comments": [], "streams": {}})
 
     def test_post_and_get_oldest_first(self) -> None:
         first = self.call(
@@ -775,7 +1012,8 @@ class TestComments(ApiCase):
             expect=201,
         )["comment"]
         self.assertEqual(
-            set(first.keys()), {"id", "author", "created_at", "text"}
+            set(first.keys()),
+            {"id", "author", "created_at", "text", "stream_id"},
         )
         self.assertEqual(first["author"], "alice")
         self.assertEqual(first["text"], "first comment")
@@ -1029,6 +1267,685 @@ class TestAssignee(ApiCase):
                   body={"active": False, "changed_by": "bob"})
 
 
+class TestAssigneeStreamId(ApiCase):
+    """PUT .../assignee's optional ``stream_id`` (WP-21, folded into
+    migration 9): WHERE the assignment was made from — the frontend
+    sends the page's current stream scope when set."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_a")])
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_a", build="feat/x",
+            result="FAIL",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.path = test_path(
+            "linux-sim", "suite/alpha.py", "test_a", "/assignee")
+
+    def test_defaults_to_null(self) -> None:
+        self.call("PUT", self.path,
+                   body={"username": "alice", "assigned_by": "bob"})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertIsNone(rows[0]["assignment_stream_id"])
+
+    def test_round_trips_when_given(self) -> None:
+        self.call("PUT", self.path, body={
+            "username": "alice", "assigned_by": "bob",
+            "stream_id": self.stream_id,
+        })
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(rows[0]["assignment_stream_id"], self.stream_id)
+        self.assertEqual(rows[0]["assignee"], "alice")
+
+    def test_unknown_stream_id_is_404(self) -> None:
+        self.call("PUT", self.path, body={
+            "username": "alice", "assigned_by": "bob",
+            "stream_id": 999999,
+        }, expect=404)
+
+    def test_non_integer_stream_id_is_400(self) -> None:
+        self.call("PUT", self.path, body={
+            "username": "alice", "assigned_by": "bob",
+            "stream_id": "nope",
+        }, expect=400)
+
+
+class TestBulkAssignments(ApiCase):
+    """POST /api/assignments/bulk — Open Actions' bulk assign/unassign
+    (2026-08-10, found while cleaning up assignments a dead build left
+    behind: cleanup was per row until this). Acts on the SAME filters
+    GET /api/dashboard would return, reusing
+    testboard.api._parse_dashboard_filters — these tests are what
+    proves the two endpoints can never quietly mean two different
+    things by "everything the current filters match".
+    """
+
+    PATH = "/api/assignments/bulk"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a", result="FAIL"),
+            record(test_name="test_b", result="PASS"),
+            record(test_name="test_c", result="UNEXPECTED_PASS"),
+        ])
+        self.import_runs([record(
+            test_name="test_b", build="feat/x", result="PASS",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        # test_b starts BUILD-originated -- proves a bulk op clears
+        # that origin the same way a row-level re-assign from this
+        # page already does (it, too, sends no stream_id).
+        self.call(
+            "PUT", test_path("linux-sim", "suite/alpha.py", "test_b",
+                              "/assignee"),
+            body={"username": "carol", "assigned_by": "dave",
+                  "stream_id": self.stream_id})
+
+    def test_bulk_assign_returns_the_matched_count(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"})
+        self.assertEqual(data, {"updated": 3})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertTrue(all(r["assignee"] == "alice" for r in rows))
+
+    def test_bulk_unassign_clears_every_matched_test(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"})
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": None, "assigned_by": "bob"})
+        self.assertEqual(data, {"updated": 3})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertTrue(all(r["assignee"] is None for r in rows))
+
+    def test_a_filtered_bulk_op_only_touches_matched_rows(self) -> None:
+        """origin=build must clear ONLY the build-originated
+        assignment — the discriminating check that filter parsing is
+        genuinely shared, not a second hand-rolled copy that can
+        drift."""
+        data = self.call(
+            "POST", self.PATH, query={"origin": ["build"]},
+            body={"username": None, "assigned_by": "bob"})
+        self.assertEqual(data, {"updated": 1})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertIsNone(rows["test_b"]["assignee"])
+        self.assertEqual(rows["test_a"]["assignee"], None)
+
+    def test_updated_matches_dashboard_total_for_a_combined_filter(
+        self
+    ) -> None:
+        """open=1 + origin=build + assignee=carol together: a filter
+        combination no single param could express alone. Proof the
+        bulk endpoint and GET /api/dashboard agree on what it means —
+        the single most important check in this class."""
+        query = {
+            "open": ["1"], "origin": ["build"], "assignee": ["carol"],
+        }
+        expected_total = self.call(
+            "GET", "/api/dashboard", query=query)["total"]
+        self.assertEqual(expected_total, 1)
+        data = self.call(
+            "POST", self.PATH, query=query,
+            body={"username": None, "assigned_by": "bob"})
+        self.assertEqual(data["updated"], expected_total)
+        self.assertIsNone(
+            self.call(
+                "GET", test_path("linux-sim", "suite/alpha.py", "test_b")
+            )["assignee"])
+
+    def test_reapplying_over_origin_build_after_clearing_returns_zero(
+        self
+    ) -> None:
+        """A bulk op writes stream_id=NULL on every matched row (Open
+        Actions never records an origin) — so a bulk action filtered
+        by origin=build clears the very origin it matched on.
+        Re-running the identical request finds nothing left to match.
+        Correct, not a regression: the same thing already happens to a
+        single row reassigned from this page today."""
+        body = {"username": "alice", "assigned_by": "bob"}
+        first = self.call(
+            "POST", self.PATH, query={"origin": ["build"]}, body=body)
+        self.assertEqual(first["updated"], 1)
+        second = self.call(
+            "POST", self.PATH, query={"origin": ["build"]}, body=body)
+        self.assertEqual(second["updated"], 0)
+
+    def test_no_origin_is_ever_written_even_for_a_build_scoped_filter(
+        self
+    ) -> None:
+        """Filtering BY origin=build (which stream) selects rows, but
+        never becomes an origin WRITTEN: every row this endpoint
+        touches ends up with assignment_stream_id null, the same as a
+        row-level re-assign made from this page (docs/STREAMS_PLAN.md
+        §0.4 — Open Actions is unscoped)."""
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertTrue(
+            all(r["assignment_stream_id"] is None for r in rows))
+
+    def test_username_key_required_400(self) -> None:
+        data = self.call(
+            "POST", self.PATH, body={"assigned_by": "bob"}, expect=400)
+        self.assertIn("username", data["error"])
+
+    def test_assigned_by_required_and_non_empty_400(self) -> None:
+        for body in (
+            {"username": "alice"},
+            {"username": "alice", "assigned_by": "   "},
+            {"username": "alice", "assigned_by": 9},
+        ):
+            with self.subTest(body=body):
+                data = self.call(
+                    "POST", self.PATH, body=body, expect=400)
+                self.assertIn("assigned_by", data["error"])
+
+    def test_username_wrong_type_400(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": 42, "assigned_by": "bob"}, expect=400)
+        self.assertIn("username", data["error"])
+
+    def test_a_deactivated_user_cannot_be_bulk_assigned_work(
+        self
+    ) -> None:
+        """Same boundary PUT .../assignee enforces, same reason: the
+        picker will not offer a deactivated user, but the picker is
+        not the boundary."""
+        self.call(
+            "POST", "/api/users", body={"username": "alice"}, expect=201)
+        self.call(
+            "PUT", "/api/users/alice/active",
+            body={"active": False, "changed_by": "bob"})
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"}, expect=400)
+        self.assertIn("deactivated", data["error"])
+        self.assertIn("alice", data["error"])
+
+    def test_comment_posted_on_every_matched_test(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": "build looked dead"})
+        for name in ("test_a", "test_b", "test_c"):
+            comments = self.call(
+                "GET", test_path("linux-sim", "suite/alpha.py", name,
+                                  "/comments"))["comments"]
+            self.assertEqual(len(comments), 1, name)
+            self.assertEqual(comments[0]["author"], "bob")
+            self.assertEqual(comments[0]["text"], "build looked dead")
+            self.assertIsNone(comments[0]["stream_id"])
+
+    def test_absent_comment_posts_nothing(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"})
+        comments = self.call(
+            "GET", test_path("linux-sim", "suite/alpha.py", "test_a",
+                              "/comments"))["comments"]
+        self.assertEqual(comments, [])
+
+    def test_null_comment_posts_nothing(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": None})
+        comments = self.call(
+            "GET", test_path("linux-sim", "suite/alpha.py", "test_a",
+                              "/comments"))["comments"]
+        self.assertEqual(comments, [])
+
+    def test_whitespace_only_comment_posts_nothing(self) -> None:
+        """"comment" is OPTIONAL, unlike POST .../comments' "text",
+        which 400s on empty — its non-emptiness gates whether it is
+        used at all, so whitespace-only is silently "no comment", not
+        a 400."""
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": "   "})
+        comments = self.call(
+            "GET", test_path("linux-sim", "suite/alpha.py", "test_a",
+                              "/comments"))["comments"]
+        self.assertEqual(comments, [])
+
+    def test_comment_wrong_type_400(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": 9},
+            expect=400)
+        self.assertIn("comment", data["error"])
+
+    def test_comment_too_long_400(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": "x" * 10001},
+            expect=400)
+        self.assertIn("comment", data["error"])
+
+    def test_wrong_method(self) -> None:
+        self.assert_405("GET", self.PATH, "POST")
+
+    def test_non_object_body_400(self) -> None:
+        self.call("POST", self.PATH, body=[1, 2, 3], expect=400)
+
+    def test_zero_matches_updates_nothing(self) -> None:
+        data = self.call(
+            "POST", self.PATH, query={"environment": ["does-not-exist"]},
+            body={"username": "alice", "assigned_by": "bob"})
+        self.assertEqual(data, {"updated": 0})
+
+
+class BulkAssignmentsFilterParamCoverageTest(unittest.TestCase):
+    """testboard.api._DASHBOARD_FILTER_QUERY_PARAMS (list mode's
+    mutual-exclusion check) must name every query-string key
+    _parse_dashboard_filters actually reads, or a NEW filter param
+    added there silently fails to trip the mutual-exclusion 400 --
+    "tests" plus the new param would be silently accepted as if they
+    were compatible. This scans the function's own source rather than
+    re-deriving the list by hand a second time, which is exactly the
+    kind of copy this check exists to keep honest.
+    """
+
+    def test_every_query_key_is_accounted_for(self) -> None:
+        import inspect
+        source = inspect.getsource(api._parse_dashboard_filters)
+        # `_query_single(request.query, "name")` and
+        # `request.query.get("name")` are the two access shapes that
+        # function uses.
+        found = set(re.findall(
+            r'(?:_query_single\(\s*request\.query,|request\.query\.get)'
+            r'\s*"([a-z_]+)"', source))
+        self.assertTrue(found, "the scan matched nothing -- regex drifted")
+        accounted = (
+            set(api._DASHBOARD_FILTER_QUERY_PARAMS)
+            | set(api._DASHBOARD_NON_FILTER_QUERY_PARAMS)
+        )
+        self.assertEqual(
+            found - accounted, set(),
+            "a query param _parse_dashboard_filters reads is neither in "
+            "_DASHBOARD_FILTER_QUERY_PARAMS nor "
+            "_DASHBOARD_NON_FILTER_QUERY_PARAMS: " + repr(found - accounted))
+
+    def test_the_two_lists_do_not_overlap(self) -> None:
+        self.assertEqual(
+            set(api._DASHBOARD_FILTER_QUERY_PARAMS)
+            & set(api._DASHBOARD_NON_FILTER_QUERY_PARAMS),
+            set())
+
+
+class TestBulkAssignmentsListMode(ApiCase):
+    """POST /api/assignments/bulk's LIST mode — an explicit ``"tests"``
+    selection (the multi-select action bar, static/selection.js), as
+    opposed to :class:`TestBulkAssignments`' filter mode. Same
+    fixture/PATH.
+    """
+
+    PATH = "/api/assignments/bulk"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a", result="FAIL"),
+            record(test_name="test_b", result="PASS"),
+            record(test_name="test_c", result="UNEXPECTED_PASS"),
+        ])
+        self.import_runs([record(
+            test_name="test_b", build="feat/x", result="PASS",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def _entry(self, test_name: str, **overrides: Any) -> Dict[str, Any]:
+        entry = {
+            "environment": "linux-sim", "script": "suite/alpha.py",
+            "test_name": test_name,
+        }  # type: Dict[str, Any]
+        entry.update(overrides)
+        return entry
+
+    def test_only_the_named_tests_are_updated(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a")]})
+        self.assertEqual(data, {"updated": 1, "unknown": 0})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertEqual(rows["test_a"]["assignee"], "alice")
+        self.assertIsNone(rows["test_b"]["assignee"])
+
+    def test_unassign_over_named_tests(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a"), self._entry("test_b")]})
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": None, "assigned_by": "bob",
+                  "tests": [self._entry("test_a"), self._entry("test_b")]})
+        self.assertEqual(data, {"updated": 2, "unknown": 0})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertIsNone(rows["test_a"]["assignee"])
+        self.assertIsNone(rows["test_b"]["assignee"])
+
+    def test_an_unknown_triple_is_counted_not_a_hard_failure(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [
+                      self._entry("test_a"),
+                      self._entry("no_such_test"),
+                  ]})
+        self.assertEqual(data, {"updated": 1, "unknown": 1})
+
+    def test_a_per_entry_stream_id_lands_as_that_rows_origin(self) -> None:
+        """The build delta table's own selection -- one entry carries
+        its stream_id, matching what a row-level PUT .../assignee with
+        the same body field would write."""
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [
+                      self._entry("test_a", stream_id=self.stream_id),
+                  ]})
+        self.assertEqual(data, {"updated": 1, "unknown": 0})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertEqual(rows["test_a"]["assignment_stream_id"],
+                          self.stream_id)
+
+    def test_an_entry_with_no_stream_id_writes_null_origin(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a")]})
+        self.assertEqual(data, {"updated": 1, "unknown": 0})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertIsNone(rows["test_a"]["assignment_stream_id"])
+
+    def test_comment_posted_on_every_updated_test(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": "seen in the build",
+                  "tests": [self._entry("test_a"), self._entry("test_c")]})
+        for name in ("test_a", "test_c"):
+            comments = self.call(
+                "GET", test_path("linux-sim", "suite/alpha.py", name,
+                                  "/comments"))["comments"]
+            self.assertEqual(len(comments), 1, name)
+            self.assertEqual(comments[0]["text"], "seen in the build")
+        self.assertEqual(
+            self.call(
+                "GET", test_path("linux-sim", "suite/alpha.py", "test_b",
+                                  "/comments"))["comments"],
+            [])
+
+    def test_mutually_exclusive_with_a_dashboard_filter_param(self) -> None:
+        data = self.call(
+            "POST", self.PATH, query={"environment": ["linux-sim"]},
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a")]},
+            expect=400)
+        self.assertIn("tests", data["error"])
+        self.assertIn("environment", data["error"])
+
+    def test_mutually_exclusive_with_each_filter_param_in_turn(self) -> None:
+        """Every name in _DASHBOARD_FILTER_QUERY_PARAMS actually trips
+        the 400 -- not just the one param the test above happens to
+        use."""
+        for name in api._DASHBOARD_FILTER_QUERY_PARAMS:
+            with self.subTest(param=name):
+                data = self.call(
+                    "POST", self.PATH, query={name: ["1"]},
+                    body={"username": "alice", "assigned_by": "bob",
+                          "tests": [self._entry("test_a")]},
+                    expect=400)
+                self.assertIn("tests", data["error"])
+
+    def test_tests_must_be_a_list(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": "test_a"},
+            expect=400)
+        self.assertIn("tests", data["error"])
+
+    def test_entry_must_be_an_object(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": ["test_a"]},
+            expect=400)
+        self.assertIn("tests[0]", data["error"])
+
+    def test_missing_field_names_the_index(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [
+                      self._entry("test_a"),
+                      {"environment": "linux-sim",
+                       "script": "suite/alpha.py"},
+                  ]},
+            expect=400)
+        self.assertIn("tests[1]", data["error"])
+        self.assertIn("test_name", data["error"])
+
+    def test_wrong_type_field_names_the_index(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a", environment=9)]},
+            expect=400)
+        self.assertIn("tests[0]", data["error"])
+        self.assertIn("environment", data["error"])
+
+    def test_empty_string_field_is_rejected(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a", script="")]},
+            expect=400)
+        self.assertIn("tests[0]", data["error"])
+
+    def test_unknown_stream_id_names_the_index(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a", stream_id=999999)]},
+            expect=404)
+        self.assertIn("tests[0]", data["error"])
+
+    def test_bad_stream_id_type_names_the_index(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a", stream_id="x")]},
+            expect=400)
+        self.assertIn("tests[0]", data["error"])
+        self.assertIn("stream_id", data["error"])
+
+    def test_username_assigned_by_validation_matches_filter_mode(
+        self
+    ) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"assigned_by": "bob",
+                  "tests": [self._entry("test_a")]},
+            expect=400)
+        self.assertIn("username", data["error"])
+
+    def test_a_deactivated_user_cannot_be_assigned_work(self) -> None:
+        self.call(
+            "POST", "/api/users", body={"username": "eve"}, expect=201)
+        self.call(
+            "PUT", "/api/users/eve/active",
+            body={"active": False, "changed_by": "bob"})
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "eve", "assigned_by": "bob",
+                  "tests": [self._entry("test_a")]},
+            expect=400)
+        self.assertIn("deactivated", data["error"])
+
+    def test_a_duplicated_entry_counts_once(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a"), self._entry("test_a")]})
+        self.assertEqual(data, {"updated": 1, "unknown": 0})
+
+    def test_zero_tests_updates_nothing(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob", "tests": []})
+        self.assertEqual(data, {"updated": 0, "unknown": 0})
+
+
+class TestOriginResultTruthfulDisplay(ApiCase):
+    """ADDENDUM to the perf round: a row whose assignment origin is a
+    non-mainline stream must not show only mainline's result -- that
+    read as a contradiction on its face ("assigned from the RC" showing
+    PASS while the RC failure it represents is live). ``origin_result``
+    (docs/STREAMS_PLAN.md §5.4) is the batched fix.
+
+    Fixture, deliberately the exact contradiction case: mainline's
+    test_a PASSES, the branch feat/x's test_a FAILS -- the same shape
+    TestAssigneeStreamId already seeds, reused here.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_a", result="PASS")])
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_a", build="feat/x",
+            result="FAIL",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.path = test_path(
+            "linux-sim", "suite/alpha.py", "test_a", "/assignee")
+
+    def test_non_mainline_origin_carries_its_own_result(self) -> None:
+        self.call("PUT", self.path, body={
+            "username": "alice", "assigned_by": "bob",
+            "stream_id": self.stream_id,
+        })
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(rows[0]["result"], "PASS")   # mainline, unchanged
+        self.assertEqual(rows[0]["origin_result"], "FAIL")   # the branch
+
+    def test_mainline_origin_has_no_origin_result_field_at_all(
+        self
+    ) -> None:
+        """Not merely null -- ABSENT, so a mainline-origin row's payload
+        is byte-identical to before this addendum (zero visible
+        change)."""
+        self.call("PUT", self.path,
+                   body={"username": "alice", "assigned_by": "bob"})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertNotIn("origin_result", rows[0])
+
+    def test_the_origin_stream_never_ran_the_test_gives_none(self) -> None:
+        """Never a fabricated result, never a colour for absence --
+        None (rendered client-side as "no result")."""
+        self.import_runs([record(
+            environment="linux-sim", test_name="test_never_on_branch",
+            result="PASS")])
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py",
+                      "test_never_on_branch", "/assignee"),
+            body={"username": "alice", "assigned_by": "bob",
+                  "stream_id": self.stream_id})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertIsNone(rows["test_never_on_branch"]["origin_result"])
+
+    def test_an_estate_with_no_stream_origin_assignments_costs_no_extra_query(
+        self
+    ) -> None:
+        """The common case -- no row on the page has a non-mainline
+        origin -- must not run the batched lookup at all."""
+        self.call("PUT", self.path,
+                   body={"username": "alice", "assigned_by": "bob"})
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", "/api/dashboard")
+        finally:
+            conn.set_trace_callback(None)
+        origin_queries = [s for s in seen if "FROM latest_runs WHERE (" in s]
+        self.assertEqual(origin_queries, [])
+
+    def test_many_origin_rows_cost_exactly_one_extra_query(self) -> None:
+        """Batched, not per-row -- several rows with a non-mainline
+        origin on one page must still cost ONE extra query total."""
+        names = ["test_a", "test_b", "test_c"]
+        for name in names[1:]:
+            self.import_runs([record(
+                environment="linux-sim", test_name=name, result="PASS")])
+            self.import_runs([record(
+                environment="linux-sim", test_name=name, build="feat/x",
+                result="FAIL",
+                start_time="2026-07-25T03:00:00.000000",
+                end_time="2026-07-25T03:00:03.000000")])
+        for name in names:
+            self.call(
+                "PUT",
+                test_path("linux-sim", "suite/alpha.py", name, "/assignee"),
+                body={"username": "alice", "assigned_by": "bob",
+                      "stream_id": self.stream_id})
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            data = self.call("GET", "/api/dashboard")
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(data["tests"]), 3)
+        origin_queries = [s for s in seen if "FROM latest_runs WHERE (" in s]
+        self.assertEqual(len(origin_queries), 1, origin_queries)
+
+
 class TestSortingIsStable(ApiCase):
     """Every sort key must page without repeating or skipping a row.
 
@@ -1213,6 +2130,115 @@ class TestTimeEndpoint(ApiCase):
 
     def test_wrong_method(self) -> None:
         self.assert_405("POST", "/api/time", "GET", body={})
+
+
+class TimeStreamScopingTest(ApiCase):
+    """WP-23 (docs/STREAMS_PLAN.md §5.2): ``/api/time`` accepts
+    ``stream=`` (default mainline) so a branch's "own results" tab can
+    read WHERE ITS OWN suite spent its time."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux", script="a.py", test_name="one",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=10))),
+        ])
+
+    def test_a_branch_import_leaves_mainline_unaffected(self) -> None:
+        before = self.call("GET", "/api/time")
+        self.import_runs([
+            record(environment="linux", script="a.py",
+                   test_name="branch_only", build="feat/x",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=99))),
+        ])
+        after = self.call("GET", "/api/time")
+        self.assertEqual(before, after)
+
+    def test_stream_param_reads_the_branch_own_time(self) -> None:
+        self.import_runs([
+            record(environment="linux", script="a.py",
+                   test_name="branch_only", build="feat/x",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=99))),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        data = self.call(
+            "GET", "/api/time", query={"stream": [str(stream_id)]})
+        self.assertEqual(data["stream"], stream_id)
+        self.assertEqual(data["test_count"], 1)
+        self.assertEqual(data["total_seconds"], 99.0)
+
+    def test_stream_param_echoes_the_streams_identity(self) -> None:
+        """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): the Time page
+        needs a stream's kind/name to render the branch band, the same
+        field test detail already echoes as "stream_identity"."""
+        self.import_runs([
+            record(environment="linux", script="a.py",
+                   test_name="branch_only", build="feat/x",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=99))),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        data = self.call(
+            "GET", "/api/time", query={"stream": [str(stream_id)]})
+        self.assertEqual(data["stream_identity"]["id"], stream_id)
+        self.assertEqual(data["stream_identity"]["kind"], "build")
+        self.assertEqual(data["stream_identity"]["name"], "feat/x")
+
+    def test_mainline_has_no_stream_identity(self) -> None:
+        data = self.call("GET", "/api/time")
+        self.assertIsNone(data["stream_identity"])
+
+
+class TimeStreamEnvironmentHintTest(ApiCase):
+    """WP-25 (docs/ONE_KIND_PLAN.md §2b.1, user-reported 2026-08-09): a
+    build that ran on one environment showed a bare empty page on every
+    OTHER environment — the data was honest, the page was not.
+    ``stream_environments`` names where the stream's data actually is."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="atlas-lab-bravo", script="a.py",
+                   test_name="t", build="2026.9.1",
+                   start_time=format_iso(NOW - datetime.timedelta(hours=1)),
+                   end_time=format_iso(NOW - datetime.timedelta(hours=1)
+                                       + datetime.timedelta(seconds=10))),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        self.stream_id = streams["streams"][0]["id"]
+
+    def test_empty_on_a_different_environment_names_the_real_one(
+            self) -> None:
+        data = self.call(
+            "GET", "/api/time",
+            query={"stream": [str(self.stream_id)],
+                   "environment": ["atlas-lab-alpha"], "group_by": ["script"]})
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["stream_environments"], ["atlas-lab-bravo"])
+
+    def test_present_and_populated_costs_nothing_extra(self) -> None:
+        data = self.call(
+            "GET", "/api/time",
+            query={"stream": [str(self.stream_id)],
+                   "environment": ["atlas-lab-bravo"], "group_by": ["script"]})
+        self.assertNotEqual(data["items"], [])
+        self.assertIsNone(data["stream_environments"])
+
+    def test_mainline_never_carries_the_field(self) -> None:
+        data = self.call(
+            "GET", "/api/time", query={"environment": ["nope-at-all"],
+                                        "group_by": ["script"]})
+        self.assertEqual(data["items"], [])
+        self.assertIsNone(data["stream_environments"])
 
 
 class TestUsers(ApiCase):
@@ -1456,6 +2482,7 @@ class TestRoutingAndEncoding(ApiCase):
 
 SUMMARY_QUEUE_ENTRY_KEYS = {
     "environment",
+    "product",
     "script",
     "test_name",
     "run_id",
@@ -1772,6 +2799,79 @@ class TestSummary(ApiCase):
         data = self.call("GET", "/api/summary")
         self.assertEqual(data["queue_cap"], api._SUMMARY_QUEUE_CAP)
 
+    def test_the_full_payload_counts_every_queue_in_one_grouped_query(
+        self
+    ) -> None:
+        """WP-23 perf pass: the full payload used to run
+        2*(len(QUEUE_KINDS)+1) separate status_queue_count-shaped
+        queries (12 on this project's own 6-kind QUEUE_KINDS) --
+        Storage.queue_counts's grouped SUM(CASE...) replaces every one
+        of them with a SINGLE query, reused for both queue_totals and
+        every queue's own "total" field. "SUM(CASE WHEN" is unique to
+        that one query shape; nothing else in this request builds a
+        statement that way."""
+        self.seed()
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", "/api/summary")
+        finally:
+            conn.set_trace_callback(None)
+        grouped = [s for s in seen if "SUM(CASE WHEN" in s]
+        self.assertEqual(
+            len(grouped), 1,
+            "expected exactly 1 grouped queue-counts query, got "
+            "{0}:\n{1}".format(len(grouped), "\n---\n".join(grouped)),
+        )
+        # _queue_clause (status_queue_count's WHERE builder) always
+        # opens with "WHERE lr.stream_id = ..." -- distinct from
+        # assigned_open_count's unrelated, pre-existing COUNT(*) query
+        # (same join, same predicate, but stream_id is its LAST AND,
+        # not its WHERE) that legitimately still runs once, for the
+        # headline's status.assigned_open field, not a queue total.
+        per_kind_counts = [
+            s for s in seen
+            if s.strip().upper().startswith("SELECT COUNT(*)")
+            and "WHERE lr.stream_id = " in s
+        ]
+        self.assertEqual(
+            per_kind_counts, [],
+            "a per-kind COUNT(*) query survived batching: {0}".format(
+                per_kind_counts),
+        )
+
+    def test_batched_streak_lookups_still_agree_with_the_single_row_form(
+        self
+    ) -> None:
+        """WP-23 perf pass: still_failing's failing_since/last_pass_time
+        now come from Storage.failure_streak_bounds_many rather than one
+        call per row -- the existing test_status_and_queues-style
+        assertions already cover the VALUES; this pins that the queue
+        page's own rows are the source, not a coincidence, by cross-
+        checking against the single-row method directly for the one
+        FAIL row this fixture produces from a real streak (test_still_fail
+        has been failing since day 24, per seed())."""
+        self.seed()
+        data = self.call("GET", "/api/summary")
+        [row] = [
+            entry for entry in data["queues"]["still_failing"]["tests"]
+            if entry["test_name"] == "test_still_fail"
+        ]
+        expected = self.storage.failure_streak_bounds(
+            "linux-sim", "suite/alpha.py", "test_still_fail",
+            self.storage.latest_run(
+                "linux-sim", "suite/alpha.py", "test_still_fail"
+            ).start_time,
+        )
+        self.assertEqual(
+            row["failing_since"], format_iso(expected.failing_since))
+        self.assertEqual(
+            row["last_pass_time"],
+            None if expected.last_pass_before is None
+            else format_iso(expected.last_pass_before),
+        )
+
     def test_wrong_method_405(self) -> None:
         self.assert_405("POST", "/api/summary", "GET")
 
@@ -1983,6 +3083,128 @@ class TestActionsFilters(ApiCase):
         )
 
 
+class TestDashboardAssignedFilter(ApiCase):
+    """``/api/dashboard``'s ``assigned=1`` (2026-08-10, found in the
+    first morning of build-verify manual testing): every row with a
+    current assignee, whatever its result — the Open Actions
+    "All assigned (any result)" view. Before it, an assignment on a
+    mainline-passing test was reachable through no filter combination
+    at all."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_passing_assigned"),
+            record(test_name="test_passing_unassigned"),
+        ])
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py",
+                      "test_passing_assigned", "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+
+    def test_lists_a_passing_assigned_test_with_no_result_filter(
+            self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"assigned": ["1"]})["tests"]
+        self.assertEqual(
+            [r["test_name"] for r in rows], ["test_passing_assigned"])
+
+    def test_absent_means_no_assignment_filter(self) -> None:
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(len(rows), 2)
+
+    def test_contradiction_with_unassigned_is_empty_not_reinterpreted(
+            self) -> None:
+        data = self.call(
+            "GET", "/api/dashboard",
+            query={"assigned": ["1"], "unassigned": ["1"]})
+        self.assertEqual(data["tests"], [])
+        self.assertEqual(data["total"], 0)
+
+
+class TestDashboardOpenFilter(ApiCase):
+    """``/api/dashboard``'s ``open=1`` (2026-08-10): Open Actions'
+    default "needs action" view — failing, stale annotation, OR
+    assigned to someone, whatever the result. The user's same-morning
+    refinement of ``assigned=1`` above: an assignment IS an open
+    action, so the default view includes it rather than hiding it
+    behind a fourth mode."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_failing", result="FAIL"),
+            record(test_name="test_passing_assigned"),
+            record(test_name="test_passing_unassigned"),
+        ])
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py",
+                      "test_passing_assigned", "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+
+    def test_open_lists_failing_and_assigned_but_not_plain_passing(
+            self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"open": ["1"]})["tests"]
+        self.assertEqual(
+            sorted(r["test_name"] for r in rows),
+            ["test_failing", "test_passing_assigned"])
+
+    def test_open_composes_with_the_origin_filter(self) -> None:
+        """The build-verify re-check: "everything assigned from a
+        build, whatever its state" is open=1&origin=build."""
+        rows = self.call(
+            "GET", "/api/dashboard",
+            query={"open": ["1"], "origin": ["mainline"]})["tests"]
+        self.assertEqual(
+            sorted(r["test_name"] for r in rows),
+            ["test_failing", "test_passing_assigned"])
+
+    def test_absent_means_no_composite(self) -> None:
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(len(rows), 3)
+
+
+class TestSummaryAssignmentStreams(ApiCase):
+    """``/api/summary``'s ``assignment_streams`` (WP-21, Open Actions'
+    origin filter) — the same "available values, empty means nothing to
+    filter" shape as ``assignees``."""
+
+    def test_empty_with_no_build_originated_assignments(self) -> None:
+        self.import_runs([record(test_name="test_a")])
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_a",
+                      "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+        self.assertEqual(
+            self.call("GET", "/api/summary")["assignment_streams"], [])
+
+    def test_lists_every_stream_with_a_current_branch_assignment(
+            self) -> None:
+        self.import_runs([record(test_name="test_a")])
+        self.import_runs([record(
+            test_name="test_a", build="feat/x",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        stream_id = streams[0]["id"]
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_a",
+                      "/assignee"),
+            body={"username": "alice", "assigned_by": "bob",
+                  "stream_id": stream_id})
+        result = self.call("GET", "/api/summary")["assignment_streams"]
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["id"], stream_id)
+        self.assertEqual(result[0]["kind"], "build")
+        self.assertEqual(result[0]["name"], "feat/x")
+
+
 class TestScriptExecutions(ApiCase):
     """GET /api/scripts/{env}/{script}/executions — history of a suite."""
 
@@ -2063,6 +3285,51 @@ class TestScriptExecutions(ApiCase):
     def test_wrong_method(self) -> None:
         self.seed()
         self.assert_405("POST", self.path(), "GET")
+
+    def test_mainline_has_no_stream_identity(self) -> None:
+        self.seed()
+        data = self.call("GET", self.path(), query={"days": ["30"]})
+        self.assertEqual(data["stream"], 1)
+        self.assertIsNone(data["stream_identity"])
+
+    def test_stream_param_reads_the_branch_own_executions(self) -> None:
+        """Script-page parity (FINAL ROUND, docs/STREAMS_PLAN.md §5.2
+        "as built"): storage.script_runs() already carries a stream_id
+        predicate for every caller (F7); this endpoint just did not
+        pass one through yet. group_executions() aggregates away test
+        names, so the proof here is EXECUTION SIZE: mainline gets one
+        run, the branch gets two runs in the SAME window -- if either
+        side leaked the other's data the totals would disagree with
+        this."""
+        base = "2026-07-25T02:00:00.000000"
+        self.import_runs([record(
+            script=self.SCRIPT, test_name="mainline_only",
+            start_time=base, end_time=base,
+        )])
+        self.import_runs([
+            record(script=self.SCRIPT, test_name="branch_a", build="feat/x",
+                   start_time=base, end_time=base),
+            record(script=self.SCRIPT, test_name="branch_b", build="feat/x",
+                   start_time=base, end_time=base),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+
+        mainline = self.call(
+            "GET", self.path(), query={"days": ["30"]})
+        self.assertEqual(mainline["stream"], 1)
+        self.assertIsNone(mainline["stream_identity"])
+        self.assertEqual(len(mainline["executions"]), 1)
+        self.assertEqual(mainline["executions"][0]["total"], 1)
+
+        branch = self.call(
+            "GET", self.path(),
+            query={"days": ["30"], "stream": [str(stream_id)]})
+        self.assertEqual(branch["stream"], stream_id)
+        self.assertEqual(branch["stream_identity"]["kind"], "build")
+        self.assertEqual(branch["stream_identity"]["name"], "feat/x")
+        self.assertEqual(len(branch["executions"]), 1)
+        self.assertEqual(branch["executions"][0]["total"], 2)
 
 
 class TestFrontendSortContract(unittest.TestCase):
@@ -2387,6 +3654,1012 @@ class TestEnvironments(ApiCase):
             "GET", "/api/environments/linux-sim/expectation", "PUT")
 
 
+class TestEnvironmentProduct(ApiCase):
+    """PUT /api/environments/{env}/product, and the "product" field of
+    GET /api/environments (WP-20, docs/STREAMS_PLAN.md §2.1/§2.2)."""
+
+    def _nightly(self, environment: str, tests: int = 2) -> None:
+        self.import_runs([
+            record(environment=environment, test_name="t%d" % i)
+            for i in range(tests)
+        ])
+
+    def test_an_environment_with_no_declaration_reads_as_the_implicit_product(
+        self
+    ) -> None:
+        self._nightly("linux-sim")
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertEqual(item["product"], "")
+
+    def test_declare_then_read_back(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        self.assertEqual(data["product"], "Atlas")
+        self.assertFalse(data["cleared"])
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertEqual(item["product"], "Atlas")
+
+    def test_empty_string_clears_the_mapping(self) -> None:
+        self._nightly("linux-sim")
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "", "username": "amy"})
+        self.assertEqual(data["product"], "")
+        self.assertTrue(data["cleared"])
+        (item,) = self.call("GET", "/api/environments")["environments"]
+        self.assertEqual(item["product"], "")
+
+    def test_clearing_what_was_never_declared_is_not_an_error(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "", "username": "amy"})
+        self.assertFalse(data["cleared"])
+
+    def test_an_unknown_environment_is_404(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/typo/product",
+            body={"product": "Atlas", "username": "amy"}, expect=404)
+        self.assertIn("typo", data["error"])
+
+    def test_the_product_field_is_required(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"username": "amy"}, expect=400)
+        self.assertIn("required", data["error"])
+
+    def test_the_username_field_is_required(self) -> None:
+        self._nightly("linux-sim")
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas"}, expect=400)
+
+    def test_a_non_string_product_is_rejected(self) -> None:
+        self._nightly("linux-sim")
+        data = self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": 5, "username": "amy"}, expect=400)
+        self.assertIn("product", data["error"])
+
+    def test_the_declaring_user_is_recorded(self) -> None:
+        self._nightly("linux-sim")
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        names = [u["username"]
+                 for u in self.call("GET", "/api/users")["users"]]
+        self.assertIn("amy", names)
+
+    def test_wrong_methods(self) -> None:
+        self.assert_405(
+            "GET", "/api/environments/linux-sim/product", "PUT")
+
+
+class TestProductFiltering(ApiCase):
+    """``product=`` on dashboard/summary/time/timeline, and the
+    ``products[]`` breakdown on /api/summary (WP-20, §2.2)."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def _seed(self) -> None:
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1",
+                   result="FAIL"),
+            record(environment="win-sim", test_name="t2", result="FAIL"),
+            record(environment="mac-sim", test_name="t3"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        self._declare("mac-sim", "Borealis")
+
+    def test_products_empty_when_nothing_declared(self) -> None:
+        self.import_runs([record(environment="linux-sim")])
+        data = self.call("GET", "/api/summary")
+        self.assertEqual(data["products"], [])
+
+    def test_products_breakdown_groups_by_declared_product(self) -> None:
+        self._seed()
+        data = self.call("GET", "/api/summary")
+        by_product = {p["product"]: p for p in data["products"]}
+        self.assertEqual(sorted(by_product), ["Atlas", "Borealis"])
+        self.assertEqual(by_product["Atlas"]["failing"], 2)
+        self.assertEqual(by_product["Borealis"]["failing"], 0)
+
+    def test_products_breakdown_is_estate_wide_regardless_of_scope(
+        self
+    ) -> None:
+        """A request scoped to one product must still see the others, or
+        the switcher has no way back to "All products"."""
+        self._seed()
+        scoped = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        self.assertEqual(
+            sorted(p["product"] for p in scoped["products"]),
+            ["Atlas", "Borealis"])
+
+    def test_dashboard_product_filter_is_an_environment_allow_list(
+        self
+    ) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/dashboard", query={"product": ["Atlas"]})
+        environments = {t["environment"] for t in data["tests"]}
+        self.assertEqual(environments, {"linux-sim", "win-sim"})
+        self.assertEqual(data["product"], "Atlas")
+
+    def test_dashboard_rows_carry_their_own_product(self) -> None:
+        """A cheap per-row join, so the Product column can render without
+        a second request for the environment -> product mapping."""
+        self._seed()
+        data = self.call("GET", "/api/dashboard")
+        by_env = {t["environment"]: t["product"] for t in data["tests"]}
+        self.assertEqual(by_env["linux-sim"], "Atlas")
+        self.assertEqual(by_env["win-sim"], "Atlas")
+        self.assertEqual(by_env["mac-sim"], "Borealis")
+
+    def test_dashboard_unmapped_environment_has_the_implicit_product(
+        self
+    ) -> None:
+        self.import_runs([record(environment="unmapped")])
+        (row,) = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(row["product"], "")
+
+    def test_summary_queue_rows_carry_their_own_product(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/summary",
+            query={"parts": ["queue"], "queue": ["new_failures"]})
+        by_env = {
+            t["environment"]: t["product"] for t in data["queue"]["tests"]
+        }
+        self.assertEqual(by_env["linux-sim"], "Atlas")
+        self.assertEqual(by_env["win-sim"], "Atlas")
+
+    def test_dashboard_unknown_product_is_empty_not_404(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/dashboard", query={"product": ["Nope"]})
+        self.assertEqual(data["tests"], [])
+        self.assertEqual(data["total"], 0)
+
+    def test_summary_product_filter_scopes_the_headline(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        self.assertEqual(data["status"]["total_tests"], 2)
+        self.assertEqual(data["product"], "Atlas")
+
+    def test_summary_product_filter_scopes_the_stale_before(self) -> None:
+        """Each product's own window -- never one wall-clock phrase
+        across products (docs/STREAMS_PLAN.md §2.3)."""
+        self._seed()
+        scoped = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        unscoped = self.call("GET", "/api/summary")
+        # Both are legitimate cutoffs; the point under test is that the
+        # scoped call actually goes through the scoped code path and
+        # both answer without error -- exact equality is not asserted
+        # because with this little history both may legitimately fall
+        # back to the same wall-clock default.
+        self.assertIn("stale_before", scoped)
+        self.assertIn("stale_before", unscoped)
+
+    def test_summary_unknown_product_is_empty_not_404(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/summary", query={"product": ["Nope"]})
+        self.assertEqual(data["status"]["total_tests"], 0)
+
+    def test_summary_environments_are_scoped_to_the_product(self) -> None:
+        """The bug found live: product=Atlas and product=Beacon returned
+        the IDENTICAL environments list, offering each other's
+        environments in the picker — environments()/scripts()/
+        latest_run_time_by_environment() never looked at product scope
+        at all."""
+        self._seed()
+        atlas = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        borealis = self.call(
+            "GET", "/api/summary", query={"product": ["Borealis"]})
+        self.assertEqual(
+            sorted(atlas["environments"]), ["linux-sim", "win-sim"])
+        self.assertEqual(borealis["environments"], ["mac-sim"])
+
+    def test_summary_environment_updated_is_scoped_to_the_product(
+        self
+    ) -> None:
+        self._seed()
+        atlas = self.call(
+            "GET", "/api/summary", query={"product": ["Atlas"]})
+        self.assertEqual(
+            sorted(atlas["environment_updated"]), ["linux-sim", "win-sim"])
+        self.assertNotIn("mac-sim", atlas["environment_updated"])
+
+    def test_summary_scripts_are_scoped_to_the_product(self) -> None:
+        self._seed()
+        borealis = self.call(
+            "GET", "/api/summary", query={"product": ["Borealis"]})
+        # t3 is mac-sim's only script/test in _seed(); t1/t2 belong to
+        # Atlas's environments and must not leak into Borealis's list.
+        self.assertNotIn("t1", borealis["scripts"])
+        self.assertNotIn("t2", borealis["scripts"])
+
+    def test_summary_environments_unscoped_is_unchanged(self) -> None:
+        """Zero visible change: no product= means every environment,
+        exactly as before this fix."""
+        self._seed()
+        data = self.call("GET", "/api/summary")
+        self.assertEqual(
+            sorted(data["environments"]),
+            ["linux-sim", "mac-sim", "win-sim"])
+
+    def test_summary_environments_unknown_product_is_empty(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/summary", query={"product": ["Nope"]})
+        self.assertEqual(data["environments"], [])
+        self.assertEqual(data["environment_updated"], {})
+
+    def test_time_unknown_product_is_empty_not_404(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/time",
+            query={"product": ["Nope"], "include_stale": ["1"]})
+        self.assertEqual(data["items"], [])
+
+    def test_time_product_filter(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/time",
+            query={"group_by": ["environment"], "product": ["Atlas"],
+                   "include_stale": ["1"]})
+        keys = {item["key"] for item in data["items"]}
+        self.assertEqual(keys, {"linux-sim", "win-sim"})
+        self.assertEqual(data["product"], "Atlas")
+
+    def test_timeline_product_resolving_to_one_environment_is_used(
+        self
+    ) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/timeline", query={"product": ["Borealis"]})
+        self.assertEqual(data["environment"], "mac-sim")
+
+    def test_timeline_product_resolving_to_many_still_needs_environment(
+        self
+    ) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/timeline", query={"product": ["Atlas"]},
+            expect=400)
+        self.assertIn("environment", data["error"])
+
+    def test_timeline_explicit_environment_wins_over_product(self) -> None:
+        """No 400 for "environment does not belong to product" -- an
+        explicit environment always wins (docs/STREAMS_PLAN.md §2.6's
+        only stated product-error rule is unknown product = empty
+        result, not this)."""
+        self._seed()
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["mac-sim"], "product": ["Atlas"]})
+        self.assertEqual(data["environment"], "mac-sim")
+
+
+def _trace_sql_into(conn: sqlite3.Connection, into: List[str]) -> None:
+    """Register a trace callback that appends each statement to *into*.
+
+    Not ``conn.set_trace_callback(into.append)``: 3.6's sqlite3 keeps
+    registered callbacks in an internal dict, so the callable must be
+    hashable, and a bound ``list.append`` hashes via the list -- a
+    TypeError on the deployment interpreter. The lambda is the fix.
+    Same helper as tests/test_storage.py's, kept local rather than
+    imported so the two test modules stay independent.
+    """
+    conn.set_trace_callback(lambda statement: into.append(statement))
+
+
+class ParseWatchSpecTest(unittest.TestCase):
+    """:func:`api._parse_watch_spec` — the ``kind:name@expected``
+    grammar, pure and offline (docs/STREAMS_PLAN.md §2.4)."""
+
+    def test_no_colon_is_kind_with_empty_name_and_no_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("garbage"),
+                          ("garbage", "", None))
+
+    def test_plain_kind_name_has_no_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:linux-sim"),
+                          ("e", "linux-sim", None))
+
+    def test_day_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("p:Atlas@7d"),
+                          ("p", "Atlas", "7d"))
+
+    def test_hour_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:win-sim@36h"),
+                          ("e", "win-sim", "36h"))
+
+    def test_numeric_stream_id_with_suffix(self) -> None:
+        self.assertEqual(api._parse_watch_spec("s:2@1d"),
+                          ("s", "2", "1d"))
+
+    def test_a_name_containing_at_with_no_valid_tail_is_not_split(
+        self
+    ) -> None:
+        """A build/branch name is free text and may itself contain
+        "@" — "release@2026" has no digit+unit tail, so it is not a
+        suffix at all, and the WHOLE thing is the name."""
+        self.assertEqual(api._parse_watch_spec("p:release@2026"),
+                          ("p", "release@2026", None))
+
+    def test_an_invalid_unit_is_part_of_the_name(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:foo@3w"),
+                          ("e", "foo@3w", None))
+
+    def test_a_non_digit_count_is_part_of_the_name(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:foo@d"),
+                          ("e", "foo@d", None))
+
+    def test_double_at_splits_at_the_last_one_only(self) -> None:
+        """"release@2026@1d" -- the name legitimately contains an "@",
+        and the suffix is still found, at the LAST "@"."""
+        self.assertEqual(api._parse_watch_spec("p:release@2026@1d"),
+                          ("p", "release@2026", "1d"))
+
+    def test_at_with_empty_tail_is_part_of_the_name(self) -> None:
+        self.assertEqual(api._parse_watch_spec("e:foo@"),
+                          ("e", "foo@", None))
+
+
+class ParseExpectedAgeTest(unittest.TestCase):
+    """:func:`api._parse_expected_age` — the two units the grammar
+    allows, days and hours."""
+
+    def test_days(self) -> None:
+        self.assertEqual(
+            api._parse_expected_age("7d"), datetime.timedelta(days=7))
+
+    def test_hours(self) -> None:
+        self.assertEqual(
+            api._parse_expected_age("36h"), datetime.timedelta(hours=36))
+
+
+class ApplyStalenessTest(unittest.TestCase):
+    """:func:`api._apply_staleness` — the pure comparison, offline."""
+
+    NOW = datetime.datetime(2026, 8, 9, 12, 0, 0)
+
+    def test_no_expected_adds_nothing_at_all(self) -> None:
+        card = {}  # type: Dict[str, Any]
+        api._apply_staleness(card, None, self.NOW, self.NOW)
+        self.assertEqual(card, {})
+
+    def test_never_reported_is_stale_regardless_of_age(self) -> None:
+        card = {}  # type: Dict[str, Any]
+        api._apply_staleness(card, "7d", None, self.NOW)
+        self.assertEqual(card["expected"], "7d")
+        self.assertTrue(card["stale"])
+
+    def test_within_the_declared_age_is_not_stale(self) -> None:
+        card = {}  # type: Dict[str, Any]
+        recent = self.NOW - datetime.timedelta(hours=1)
+        api._apply_staleness(card, "1d", recent, self.NOW)
+        self.assertFalse(card["stale"])
+
+    def test_older_than_the_declared_age_is_stale(self) -> None:
+        card = {}  # type: Dict[str, Any]
+        old = self.NOW - datetime.timedelta(days=3)
+        api._apply_staleness(card, "1d", old, self.NOW)
+        self.assertTrue(card["stale"])
+
+
+class TestWatch(ApiCase):
+    """GET /api/watch (WP-20, docs/STREAMS_PLAN.md §2.4): the whole
+    Watchlist page in one request, cards in request order."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def _seed(self) -> None:
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1",
+                   result="FAIL"),
+            record(environment="win-sim", test_name="t2", result="FAIL"),
+            record(environment="mac-sim", test_name="t3"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        self._declare("mac-sim", "Borealis")
+
+    def test_cards_come_back_in_request_order(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:mac-sim", "p:Atlas", "e:linux-sim"]})
+        self.assertEqual(
+            [c["spec"] for c in data["cards"]],
+            ["e:mac-sim", "p:Atlas", "e:linux-sim"])
+
+    def test_an_environment_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:linux-sim"]}
+        )["cards"]
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["kind"], "environment")
+        self.assertEqual(card["name"], "linux-sim")
+        self.assertEqual(card["failing"], 1)
+        self.assertEqual(card["new_failures"], 1)
+        self.assertIsNotNone(card["last_reported"])
+        self.assertIsNotNone(card["stale_before"])
+        # WP-23: t1 fails and nobody owns it.
+        self.assertEqual(card["unassigned_failing"], 1)
+        # No "@" suffix in the spec -- no staleness judgment at all.
+        self.assertNotIn("stale", card)
+        self.assertNotIn("expected", card)
+        # WP-23 bugfix: the card names its OWN product, so the frontend
+        # link is scope-self-sufficient rather than trusting whatever
+        # product this browser's switcher happens to have stored.
+        self.assertEqual(card["product"], "Atlas")
+
+    def test_an_environment_cards_product_is_empty_when_unmapped(
+        self
+    ) -> None:
+        """The bug this pins: an unmapped environment's card must say
+        "" (never omit the key, never guess), so the frontend's link
+        can send an empty ?product= -- "All products" -- instead of
+        silently inheriting whatever product this browser last had
+        selected, which could resolve the environment filter to an
+        empty allow-list under the WRONG product and render a blank
+        page."""
+        self.import_runs([record(environment="unmapped-env")])
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:unmapped-env"]}
+        )["cards"]
+        self.assertEqual(card["product"], "")
+
+    def test_an_environment_cards_unassigned_failing_excludes_assigned(
+        self
+    ) -> None:
+        self._seed()
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "t1") + "/assignee",
+            body={"username": "alice", "assigned_by": "bob"})
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:linux-sim"]}
+        )["cards"]
+        self.assertEqual(card["failing"], 1)  # still failing
+        self.assertEqual(card["unassigned_failing"], 0)  # but owned
+
+    def test_an_environment_card_declares_staleness_fresh(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:linux-sim@7d"]}
+        )["cards"]
+        self.assertEqual(card["expected"], "7d")
+        self.assertFalse(card["stale"])
+
+    def test_an_environment_card_declares_staleness_stale(self) -> None:
+        self.import_runs([record(
+            environment="linux-sim", test_name="t1", result="FAIL",
+            start_time="2026-07-01T00:00:00.000000",
+            end_time="2026-07-01T00:00:01.000000")])
+        self._declare("linux-sim", "Atlas")
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["e:linux-sim@1h"]}
+        )["cards"]
+        self.assertEqual(card["expected"], "1h")
+        self.assertTrue(card["stale"])
+
+    def test_a_product_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Atlas"]}
+        )["cards"]
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["kind"], "product")
+        self.assertEqual(card["failing"], 2)
+        self.assertIsNone(card["last_reported"])
+        self.assertIsNotNone(card["stale_before"])
+        # WP-23: t1 (linux-sim) and t2 (win-sim) both fail, unowned.
+        self.assertEqual(card["unassigned_failing"], 2)
+        self.assertNotIn("stale", card)
+        self.assertNotIn("expected", card)
+
+    def test_a_product_cards_unassigned_failing_sums_its_environments(
+        self
+    ) -> None:
+        self._seed()
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "t1") + "/assignee",
+            body={"username": "alice", "assigned_by": "bob"})
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Atlas"]}
+        )["cards"]
+        self.assertEqual(card["failing"], 2)
+        self.assertEqual(card["unassigned_failing"], 1)  # only t2 now
+
+    def test_a_product_cards_staleness_is_judged_by_its_laggard(
+        self
+    ) -> None:
+        """docs/STREAMS_PLAN.md §2.4: the product's freshness timestamp
+        is deliberately its OLDEST-reporting environment, not its
+        newest -- "everything reported" is the bar, not "something
+        did"."""
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1",
+                   start_time="2026-07-26T10:00:00.000000",
+                   end_time="2026-07-26T10:00:01.000000"),
+            record(environment="win-sim", test_name="t2",
+                   start_time="2026-07-01T00:00:00.000000",
+                   end_time="2026-07-01T00:00:01.000000"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Atlas@1d"]}
+        )["cards"]
+        # linux-sim reported 2h ago (fresh); win-sim reported 25 days
+        # ago -- the laggard -- so the CARD is stale even though its
+        # newest environment is not.
+        self.assertEqual(card["laggard"]["environment"], "win-sim")
+        self.assertTrue(card["stale"])
+
+    def test_a_product_card_names_its_laggard_environment(self) -> None:
+        """A product spans environments reporting hours apart, so its
+        card carries no single timestamp (pinned above) — what it
+        carries instead is the furthest-behind environment BY NAME,
+        because "which one am I waiting on" is the morning question and
+        a newest-of-several figure is exactly the trap the handover
+        documents. Found in the 2026-08-09 manager-persona review."""
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1",
+                   start_time="2026-08-08T06:00:00.000000",
+                   end_time="2026-08-08T06:00:01.000000"),
+            record(environment="win-sim", test_name="t2",
+                   start_time="2026-08-05T04:30:00.000000",
+                   end_time="2026-08-05T04:30:01.000000"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Atlas"]}
+        )["cards"]
+        self.assertEqual(card["laggard"]["environment"], "win-sim")
+        self.assertEqual(card["laggard"]["last_reported"],
+                         "2026-08-05T04:30:00.000000")
+
+    def test_a_silent_environment_is_the_worst_laggard(self) -> None:
+        """An environment with NO recorded run outranks any old one —
+        absence of data must never hide behind stale data. Unreachable
+        through the API today (the product PUT refuses an unknown
+        environment, and dropping an environment takes its mapping with
+        it — environment_products is in _ENVIRONMENT_TABLES), so this
+        pins the DEFENSIVE branch of the pure helper directly: if some
+        future path ever leaves a mapping without data, the card must
+        point at the silence, not average over it."""
+        laggard = api._product_laggard(
+            ["linux-sim", "ghost-sim"],
+            {"linux-sim": datetime.datetime(2026, 8, 5, 4, 30)},
+        )
+        self.assertEqual(laggard["environment"], "ghost-sim")
+        self.assertIsNone(laggard["last_reported"])
+
+    def test_the_laggard_of_no_environments_is_none(self) -> None:
+        self.assertIsNone(api._product_laggard([], {}))
+
+    def test_an_unknown_environment_is_an_error_card_not_404(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch", query={"c": ["e:typo"]})
+        (card,) = data["cards"]
+        self.assertFalse(card["ok"])
+        self.assertIn("error", card)
+
+    def test_an_unknown_environment_page_is_still_200(self) -> None:
+        self._seed()
+        response = self.request(
+            "GET", "/api/watch", query={"c": ["e:typo"]})
+        self.assertEqual(response.status, 200)
+
+    def test_an_unknown_product_is_an_error_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["p:Nope"]}
+        )["cards"]
+        self.assertFalse(card["ok"])
+
+    def test_error_card_kind_matches_the_ok_cards_spelling(self) -> None:
+        """A recognised kind's error card must say "environment"/
+        "product", the same word an ok card of that kind uses -- so the
+        frontend never has to special-case error cards to know what
+        they were trying to be."""
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:typo", "p:Nope", "e:linux-sim"]})
+        env_card, product_card, ok_card = data["cards"]
+        self.assertEqual(env_card["kind"], "environment")
+        self.assertEqual(product_card["kind"], "product")
+        self.assertEqual(ok_card["kind"], "environment")
+
+    def test_an_unknown_kind_is_an_error_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["x:whatever"]}
+        )["cards"]
+        self.assertFalse(card["ok"])
+        self.assertIn("unknown", card["error"])
+
+    def test_a_malformed_spec_with_no_colon_is_an_error_card(self) -> None:
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["garbage"]}
+        )["cards"]
+        self.assertFalse(card["ok"])
+
+    def test_a_mix_of_good_and_bad_cards_is_still_200(self) -> None:
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:linux-sim", "e:typo", "p:Atlas"]})
+        oks = [c["ok"] for c in data["cards"]]
+        self.assertEqual(oks, [True, False, True])
+
+    def test_the_mainline_stream_id_is_never_a_valid_s_card(self) -> None:
+        """Mainline is not a Build picker entry (list_streams excludes
+        it too) -- a card comparing it to itself would be trivially
+        all-zero, not a useful verdict."""
+        self._seed()
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["s:1"]})["cards"]
+        self.assertFalse(card["ok"])
+
+    def test_an_s_card_mixed_with_good_cards_all_render(self) -> None:
+        """Streams work like every other card kind -- a mix of good and
+        (here, deliberately bad) cards is still one 200 page."""
+        self._seed()
+        data = self.call(
+            "GET", "/api/watch",
+            query={"c": ["p:Atlas", "e:linux-sim", "s:1"]})
+        oks = [c["ok"] for c in data["cards"]]
+        self.assertEqual(oks, [True, True, False])
+
+    def test_the_cap_refuses_clearly(self) -> None:
+        self._seed()
+        specs = ["e:linux-sim"] * (api._WATCH_MAX_CARDS + 1)
+        data = self.call(
+            "GET", "/api/watch", query={"c": specs}, expect=413)
+        self.assertIn(str(api._WATCH_MAX_CARDS), data["error"])
+
+    def test_the_cap_boundary_is_accepted(self) -> None:
+        self._seed()
+        specs = ["e:linux-sim"] * api._WATCH_MAX_CARDS
+        data = self.call("GET", "/api/watch", query={"c": specs})
+        self.assertEqual(len(data["cards"]), api._WATCH_MAX_CARDS)
+        self.assertEqual(data["cap"], api._WATCH_MAX_CARDS)
+
+    def test_no_cards_is_an_empty_page_not_an_error(self) -> None:
+        data = self.call("GET", "/api/watch")
+        self.assertEqual(data["cards"], [])
+
+    def test_query_count_does_not_grow_with_card_count(self) -> None:
+        """§0.4: no new list query may cost more the more cards are
+        asked for. One card and fifty must cost the SAME number of
+        queries -- every card after the first fetch is a Python-side
+        slice of data already in memory.
+
+        WP-23 "ONE MORE PERF SLICE" widened this: each measured call is
+        now preceded by an identical untraced warm-up call, so both
+        measurements start from the SAME (warm) summary/watch memo
+        state. Without it a bare comparison of a cold call against a
+        warm one would fail for a reason unrelated to card count --
+        exactly the false positive this guard must not produce. The
+        original finding -- card count must not change query count --
+        is unchanged and still enforced; only cache STATE is now held
+        equal between the two sides of the comparison, matching the
+        steady-state repeat-load traffic the memo targets."""
+        self._seed()
+        conn = self.storage._conn()
+
+        def query_count(specs: List[str]) -> int:
+            self.call("GET", "/api/watch", query={"c": specs})
+            statements = []  # type: List[str]
+            _trace_sql_into(conn, statements)
+            try:
+                self.call("GET", "/api/watch", query={"c": specs})
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        one = query_count(["e:linux-sim"])
+        fifty = query_count(["e:linux-sim"] * api._WATCH_MAX_CARDS)
+        self.assertEqual(one, fifty)
+
+    def test_wrong_methods(self) -> None:
+        self.assert_405("POST", "/api/watch", "GET", body={})
+
+
+class TestWatchStreamCards(ApiCase):
+    """s: cards (WP-21, docs/STREAMS_PLAN.md §3.6): branch/build verdicts
+    on the Watchlist, resolved through the same storage reads as
+    /api/compare, still O(1) queries regardless of card count."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="PASS"),
+            record(environment="linux-sim", test_name="test_b",
+                   result="FAIL"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="FAIL", build="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": ["Atlas"]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def test_an_ok_stream_card(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.stream_id)]})["cards"]
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["kind"], "stream")
+        self.assertEqual(card["name"], "feat/x")
+        self.assertEqual(card["stream_kind"], "build")
+        self.assertEqual(card["product"], "Atlas")
+        self.assertEqual(card["new_failures"], 1)   # test_a
+        self.assertEqual(card["no_result"], 1)      # test_b
+        self.assertEqual(card["agree"], 0)
+        self.assertIsNotNone(card["last_seen"])
+        self.assertIsNotNone(card["baseline_last_seen"])
+        # WP-25 (docs/ONE_KIND_PLAN.md §1.4): one wording for every
+        # stream -- the baseline is always mainline, named explicitly,
+        # never assumed by the frontend from a hardcoded word.
+        self.assertEqual(card["baseline_kind"], "mainline")
+        self.assertEqual(card["baseline_name"], "")
+        # WP-23: test_a fails on the branch and is unassigned.
+        self.assertEqual(card["unassigned_failing"], 1)
+        self.assertNotIn("stale", card)
+        self.assertNotIn("expected", card)
+
+    def test_a_stream_cards_unassigned_failing_excludes_assigned(
+        self
+    ) -> None:
+        """Assignments are stream-agnostic (docs/STREAMS_PLAN.md §3.6):
+        assigning test_a — from mainline, no stream_id at all — still
+        clears it off the BRANCH card's unassigned-failing count,
+        because there is only ever one owner for a triple."""
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_a")
+            + "/assignee",
+            body={"username": "alice", "assigned_by": "bob"})
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.stream_id)]})["cards"]
+        self.assertEqual(card["unassigned_failing"], 0)
+
+    def test_a_stream_cards_staleness_uses_last_seen(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}@1d".format(self.stream_id)]})["cards"]
+        self.assertEqual(card["expected"], "1d")
+        # The branch's only run is 2026-07-25T03:00, NOW is
+        # 2026-07-26T12:00 -- about 33h, older than the declared 1d.
+        self.assertTrue(card["stale"])
+
+    def test_a_stream_cards_staleness_when_fresh(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}@7d".format(self.stream_id)]})["cards"]
+        self.assertFalse(card["stale"])
+
+    def test_both_unassigned_failing_and_stale_can_show_on_one_card(
+        self
+    ) -> None:
+        """The two are independent facts about the same card — both
+        keys are present together when both are true."""
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}@1h".format(self.stream_id)]})["cards"]
+        self.assertEqual(card["unassigned_failing"], 1)
+        self.assertTrue(card["stale"])
+
+    def test_an_unknown_stream_id_is_an_error_card(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["s:999999"]})["cards"]
+        self.assertFalse(card["ok"])
+        self.assertEqual(card["kind"], "stream")
+
+    def test_a_non_integer_s_value_is_an_error_card(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch", query={"c": ["s:not-a-number"]})["cards"]
+        self.assertFalse(card["ok"])
+
+    def test_the_click_through_id_is_present(self) -> None:
+        """The frontend opens the branch-scoped dashboard from this."""
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.stream_id)]})["cards"]
+        self.assertEqual(card["id"], self.stream_id)
+
+    def test_query_count_does_not_grow_with_s_card_count(self) -> None:
+        """The same §0.4 flat-cost property TestWatch pins for e:/p:
+        cards, extended here to s: cards -- a SEPARATE assertion rather
+        than editing TestWatch's, since that one is specifically about
+        the pre-existing card kinds and must keep passing unchanged.
+
+        WP-23 "ONE MORE PERF SLICE": same warm-up-before-each-measurement
+        widening as ``TestWatch.test_query_count_does_not_grow_with_card_
+        count`` -- see its docstring for why."""
+        conn = self.storage._conn()
+
+        def query_count(specs: List[str]) -> int:
+            self.call("GET", "/api/watch", query={"c": specs})
+            statements = []  # type: List[str]
+            _trace_sql_into(conn, statements)
+            try:
+                self.call("GET", "/api/watch", query={"c": specs})
+            finally:
+                conn.set_trace_callback(None)
+            return len(statements)
+
+        spec = "s:{}".format(self.stream_id)
+        one = query_count([spec])
+        many = query_count([spec] * api._WATCH_MAX_CARDS)
+        self.assertEqual(one, many)
+
+
+class TestWatchStreamCardImplicitProduct(ApiCase):
+    """A stream whose product is "" (WP-21) -- the common case on a
+    deployment that has never declared any products (WP-20's default).
+
+    Regression: found by driving /api/watch against a real server with
+    NO declared products at all (never exercised by TestWatchStreamCards
+    above, which always calls `set_environment_product` first). Every
+    s: card came back all-zero, silently wrong -- `_handle_watch` built
+    the stream's environment scope from `product_to_envs.get("", [])`,
+    which is ALWAYS empty (`environment_products_map()` only ever
+    contains environments that HAVE a declared product), instead of
+    resolving "" the way `Storage.environments_for_product("")` does
+    (every KNOWN environment nobody has mapped). Fixed by special-casing
+    "" in `_handle_watch` to that same set, computed once, still O(1).
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="PASS"),
+            record(environment="linux-sim", test_name="test_b",
+                   result="FAIL"),
+        ])
+        # Deliberately NO set_environment_product call -- linux-sim stays
+        # in the implicit "" product, same as a fresh install.
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="FAIL", build="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def test_the_card_is_not_all_zero(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.stream_id)]})["cards"]
+        self.assertTrue(card["ok"])
+        self.assertEqual(card["product"], "")
+        self.assertEqual(card["new_failures"], 1)   # test_a
+        self.assertEqual(card["no_result"], 1)      # test_b
+        self.assertEqual(
+            card["new_failures"], self.call(
+                "GET", "/api/compare",
+                query={"stream": [str(self.stream_id)]}
+            )["counts"]["new_failures"],
+            "the card must agree with /api/compare for the same stream")
+
+
+class TestWatchBuildStreamCards(ApiCase):
+    """WP-25 (docs/ONE_KIND_PLAN.md §1.4, user decision, explicit): the
+    s: card's verdict is ALWAYS against mainline -- one wording for every
+    stream. WP-22 had a build-kind card default to its predecessor build
+    when one existed (see git history for that behaviour); WP-25 removed
+    it, the same "default baseline is mainline, always" decision applied
+    to the dashboard's own delta view. A card reading "vs build 1.0"
+    that clicked through to a dashboard reading "vs mainline" would be
+    exactly the two-surfaces-disagree bug this decision avoids."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="PASS"),
+        ])
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="FAIL", build="1.0",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        self.import_runs([
+            record(environment="linux-sim", test_name="test_a",
+                   result="FAIL", build="1.1",
+                   start_time="2026-07-25T04:00:00.000000",
+                   end_time="2026-07-25T04:00:03.000000"),
+            record(environment="linux-sim", test_name="test_b",
+                   result="PASS", build="1.1",
+                   start_time="2026-07-25T04:00:00.000000",
+                   end_time="2026-07-25T04:00:03.000000"),
+        ])
+        builds = {
+            s["name"]: s["id"] for s in self.call(
+                "GET", "/api/streams", query={"product": ["Atlas"]}
+            )["streams"]
+        }
+        self.build_1_0 = builds["1.0"]
+        self.build_1_1 = builds["1.1"]
+
+    def test_a_later_builds_verdict_is_still_against_mainline(self) -> None:
+        """Even though 1.0 (an earlier same-product build) exists, the
+        card must NOT default to it -- mainline only."""
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.build_1_1)]})["cards"]
+        self.assertEqual(card["baseline_kind"], "mainline")
+        self.assertEqual(card["baseline_name"], "")
+        # mainline: test_a PASS only. 1.1: test_a FAIL, test_b PASS (new).
+        self.assertEqual(card["new_failures"], 1)
+        self.assertEqual(card["new_tests"], 1)
+        self.assertEqual(card["both_failing"], 0)
+
+    def test_the_oldest_builds_baseline_is_also_mainline(self) -> None:
+        (card,) = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.build_1_0)]})["cards"]
+        self.assertEqual(card["baseline_kind"], "mainline")
+
+    def test_agrees_with_compare_using_the_default_baseline(self) -> None:
+        card = self.call(
+            "GET", "/api/watch",
+            query={"c": ["s:{}".format(self.build_1_1)]})["cards"][0]
+        compared = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.build_1_1)]})
+        self.assertEqual(card["both_failing"], compared["counts"]["both_failing"])
+        self.assertEqual(card["new_tests"], compared["counts"]["new_tests"])
+
+
 class TestEnvironmentUpdated(ApiCase):
     """/api/summary says when each environment last reported."""
 
@@ -2539,6 +4812,185 @@ class SummaryPartsTest(ApiCase):
         error = self.call(
             "GET", "/api/summary", query={"parts": ["queue"]}, expect=400)
         self.assertIn("queue", error["error"])
+
+
+class SummaryStreamScopingTest(ApiCase):
+    """WP-23 (docs/STREAMS_PLAN.md §5.2): ``/api/summary`` accepts an
+    optional ``stream=`` so a long-running branch's "own results" tab
+    reads its own headline/trend/queues from this same endpoint.
+
+    The load-bearing guard here is the one the advisor flagged: a branch
+    reporting into the SAME environment as mainline must leave every
+    field of a MAINLINE (unscoped) ``/api/summary`` response
+    byte-identical. This was NOT true of the code as found —
+    ``test_counts_by_environment``/``daily_result_counts`` read
+    ``latest_runs``/``activity_hours`` with no stream filter, so a
+    branch import into ``linux-sim`` silently changed mainline's own
+    coverage denominator and trend sums. Closed in the migration-10
+    commit; this test is the record of it, written to fail against the
+    pre-fix code (moving it here, after the fix already landed, still
+    proves the invariant going forward).
+    """
+
+    seed = TestSummary.seed
+
+    def test_a_branch_import_into_the_same_environment_leaves_mainline_unchanged(
+            self) -> None:
+        self.seed()
+        before = self.call("GET", "/api/summary")
+        self.import_runs([
+            record(test_name="test_new_fail", build="feat/x",
+                   result="FAIL",
+                   start_time="2026-07-26T04:00:00.000000",
+                   end_time="2026-07-26T04:00:03.000000"),
+            record(test_name="test_branch_only", build="feat/x",
+                   result="PASS",
+                   start_time="2026-07-26T04:01:00.000000",
+                   end_time="2026-07-26T04:01:03.000000"),
+        ])
+        after = self.call("GET", "/api/summary")
+        self.assertEqual(before, after)
+
+    def test_a_branch_import_leaves_the_mainline_trend_unchanged(
+            self) -> None:
+        self.seed()
+        before = self.call(
+            "GET", "/api/summary", query={"days": ["7"]})["trend"]
+        self.import_runs([
+            record(test_name="test_trend_branch", build="feat/y",
+                   result="FAIL",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T05:00:03.000000"),
+        ])
+        after = self.call(
+            "GET", "/api/summary", query={"days": ["7"]})["trend"]
+        self.assertEqual(before, after)
+
+    def test_stream_param_scopes_status_to_the_branch_own_results(
+            self) -> None:
+        """The other half of the guarantee: the branch's OWN request
+        (stream=<id>) reads ITS OWN numbers, not mainline's — this is
+        what makes "own results" a real second dashboard rather than a
+        copy of mainline's."""
+        self.seed()
+        self.import_runs([
+            record(test_name="test_branch_only", build="feat/x",
+                   result="FAIL",
+                   start_time="2026-07-26T04:00:00.000000",
+                   end_time="2026-07-26T04:00:03.000000"),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        scoped = self.call(
+            "GET", "/api/summary", query={"stream": [str(stream_id)]})
+        self.assertEqual(scoped["stream"], stream_id)
+        self.assertEqual(scoped["status"]["total_tests"], 1)
+        self.assertEqual(scoped["status"]["results"]["FAIL"], 1)
+
+    def test_the_36h_fallback_clamp_applies_to_a_sparse_branch_too(
+            self) -> None:
+        """The two clamps inside analytics.recent_cutoff (36h fallback
+        floor, 14-day ceiling) are UNCHANGED -- CLAUDE.md is explicit
+        that they must not be removed or loosened. A branch too sparse
+        to have a single COVERED pass must fall back to the exact same
+        36-hour wall-clock window mainline would use in the same spot,
+        never something looser."""
+        self.seed()
+        self.import_runs([
+            record(test_name="test_branch_only", build="feat/z",
+                   result="PASS",
+                   start_time="2026-07-26T04:00:00.000000",
+                   end_time="2026-07-26T04:00:03.000000"),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = [s["id"] for s in streams["streams"]
+                     if s["name"] == "feat/z"][0]
+        scoped = self.call(
+            "GET", "/api/summary", query={"stream": [str(stream_id)]})
+        expected = format_iso(NOW - datetime.timedelta(hours=36))
+        self.assertEqual(scoped["stale_before"], expected)
+        # This is the number the branch dashboard's default-tab caption
+        # is built from. A single run against a stream whose own
+        # inferred test count is 1 clears the 50% coverage bar
+        # trivially (find_passes' denominator is THIS stream's own
+        # inferred count, not mainline's) -- one tiny, technically
+        # "covered" pass, nowhere near the "regular cadence" the
+        # caption's own >= 2 threshold is checking for.
+        self.assertEqual(scoped["covered_passes"], 1)
+
+    def test_unknown_stream_is_a_404(self) -> None:
+        self.seed()
+        error = self.call(
+            "GET", "/api/summary", query={"stream": ["9999"]}, expect=404)
+        self.assertIn("stream", error["error"])
+
+
+class SummaryStreamProductEnvironmentsTest(ApiCase):
+    """A stream scoped with no explicit ``product=`` must still offer
+    only ITS OWN product's environments (WP-23 fix, found alongside the
+    ``product=`` bug above) — the branch dashboard's own tab must not
+    mix every product's environments into its pills either."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def test_a_streams_own_environments_only(self) -> None:
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1"),
+            record(environment="win-sim", test_name="t2"),
+            record(environment="mac-sim", test_name="t3"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("win-sim", "Atlas")
+        self._declare("mac-sim", "Borealis")
+        # The stream's product is fixed at creation from the FIRST
+        # record's environment (linux-sim -> Atlas), per WP-21.
+        self.import_runs([record(
+            environment="linux-sim", test_name="t1", build="feat/x",
+            result="FAIL",
+            start_time="2026-07-26T04:00:00.000000",
+            end_time="2026-07-26T04:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": ["Atlas"]})
+        stream_id = streams["streams"][0]["id"]
+
+        scoped = self.call(
+            "GET", "/api/summary", query={"stream": [str(stream_id)]})
+        self.assertEqual(
+            sorted(scoped["environments"]), ["linux-sim", "win-sim"])
+        self.assertNotIn("mac-sim", scoped["environments"])
+        self.assertNotIn("mac-sim", scoped["environment_updated"])
+
+    def test_an_explicit_product_still_wins_over_the_streams_own(
+        self
+    ) -> None:
+        """product= is an explicit request; it must not be silently
+        overridden by the stream's own declared product."""
+        self.import_runs([
+            record(environment="linux-sim", test_name="t1"),
+            record(environment="mac-sim", test_name="t3"),
+        ])
+        self._declare("linux-sim", "Atlas")
+        self._declare("mac-sim", "Borealis")
+        self.import_runs([record(
+            environment="linux-sim", test_name="t1", build="feat/x",
+            result="FAIL",
+            start_time="2026-07-26T04:00:00.000000",
+            end_time="2026-07-26T04:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": ["Atlas"]})
+        stream_id = streams["streams"][0]["id"]
+
+        data = self.call(
+            "GET", "/api/summary",
+            query={"stream": [str(stream_id)], "product": ["Borealis"]})
+        self.assertEqual(data["environments"], ["mac-sim"])
+        # Mainline's own count is untouched -- proof the two are not
+        # secretly sharing a query.
+        mainline = self.call("GET", "/api/summary")
+        self.assertEqual(mainline["status"]["total_tests"], 2)
 
 
 class TimelineTest(ApiCase):
@@ -2719,6 +5171,131 @@ class TimelineTest(ApiCase):
         self.assert_405("POST", "/api/timeline", "GET")
 
 
+class TimelineStreamScopingTest(ApiCase):
+    """WP-23 (docs/STREAMS_PLAN.md §5.2): ``/api/timeline`` accepts
+    ``stream=`` (default mainline) so a long-running stream's running
+    order reads from its OWN ``script_hours`` partition."""
+
+    def _night(
+        self, days_ago: int, environment: str = "linux-sim",
+        build: Optional[str] = None,
+    ) -> None:
+        base = (NOW - datetime.timedelta(days=days_ago)).replace(
+            hour=2, minute=0, second=0, microsecond=0)
+        rec = record(
+            environment=environment, script="a.py", test_name="t0",
+            start_time=format_iso(base),
+            end_time=format_iso(base + datetime.timedelta(seconds=30)),
+        )
+        if build:
+            rec["build"] = build
+        self.import_runs([rec])
+
+    def test_a_build_import_leaves_the_mainline_timeline_unaffected(
+            self) -> None:
+        self._night(1)
+        before = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self._night(1, build="feat/x")
+        after = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self.assertEqual(before, after)
+
+    def test_stream_param_reads_the_streams_own_running_order(self) -> None:
+        self._night(1, build="feat/x")
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"],
+                   "stream": [str(stream_id)]})
+        self.assertEqual(data["stream"], stream_id)
+        self.assertEqual(len(data["rows"]), 1)
+        self.assertEqual(data["rows"][0]["script"], "a.py")
+        # And the UNSCOPED (mainline) request sees no blocks at all --
+        # proof the branch's activity never reached mainline's own
+        # activity_hours/script_hours partition.
+        mainline = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self.assertEqual(mainline["blocks"], [])
+        self.assertEqual(mainline["rows"], [])
+
+    def test_stream_param_echoes_the_streams_identity(self) -> None:
+        """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): the Timeline page
+        needs a stream's kind/name to render the branch band, the same
+        field test detail already echoes as "stream_identity"."""
+        self._night(1, build="feat/x")
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["linux-sim"],
+                   "stream": [str(stream_id)]})
+        self.assertEqual(data["stream_identity"]["id"], stream_id)
+        self.assertEqual(data["stream_identity"]["kind"], "build")
+        self.assertEqual(data["stream_identity"]["name"], "feat/x")
+
+    def test_mainline_has_no_stream_identity(self) -> None:
+        self._night(1)
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["linux-sim"]})
+        self.assertIsNone(data["stream_identity"])
+
+
+class TimelineStreamEnvironmentHintTest(ApiCase):
+    """WP-25 (docs/ONE_KIND_PLAN.md §2b.1, user-reported 2026-08-09): a
+    build that ran on one environment showed a bare empty page on every
+    OTHER environment — verified live: 2026.9.1 = 0 rows on
+    atlas-lab-alpha, 69 on atlas-lab-bravo. ``stream_environments``
+    names where the stream's data actually is."""
+
+    def _night(
+        self, days_ago: int, environment: str, build: Optional[str] = None,
+    ) -> None:
+        base = (NOW - datetime.timedelta(days=days_ago)).replace(
+            hour=2, minute=0, second=0, microsecond=0)
+        rec = record(
+            environment=environment, script="a.py", test_name="t0",
+            start_time=format_iso(base),
+            end_time=format_iso(base + datetime.timedelta(seconds=30)),
+        )
+        if build:
+            rec["build"] = build
+        self.import_runs([rec])
+
+    def setUp(self) -> None:
+        super().setUp()
+        # atlas-lab-alpha is a KNOWN environment (mainline only) so the
+        # scoped request below 404s for the right reason (empty) rather
+        # than the wrong one (unknown environment).
+        self._night(1, "atlas-lab-alpha")
+        self._night(1, "atlas-lab-bravo", build="2026.9.1")
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        self.stream_id = streams["streams"][0]["id"]
+
+    def test_empty_on_a_different_environment_names_the_real_one(
+            self) -> None:
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["atlas-lab-alpha"],
+                   "stream": [str(self.stream_id)]})
+        self.assertEqual(data["rows"], [])
+        self.assertEqual(data["stream_environments"], ["atlas-lab-bravo"])
+
+    def test_present_and_populated_costs_nothing_extra(self) -> None:
+        data = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["atlas-lab-bravo"],
+                   "stream": [str(self.stream_id)]})
+        self.assertNotEqual(data["rows"], [])
+        self.assertIsNone(data["stream_environments"])
+
+    def test_mainline_never_carries_the_field(self) -> None:
+        data = self.call(
+            "GET", "/api/timeline", query={"environment": ["atlas-lab-alpha"]})
+        self.assertIsNone(data["stream_environments"])
+
+
 class ScriptWindowRunsTest(ApiCase):
     """GET /api/scripts/{env}/{script}/runs: the Timeline row expansion."""
 
@@ -2784,3 +5361,627 @@ class ScriptWindowRunsTest(ApiCase):
     def test_wrong_method_is_405(self) -> None:
         self._seed()
         self.assert_405("PUT", self.PATH, "GET")
+
+    def test_stream_param_reads_the_branch_own_runs(self) -> None:
+        """F7 (docs/STREAMS_PLAN.md §5.2 "as built"): this row-expansion
+        read had fallen behind /api/timeline's own stream-scoping —
+        always mainline, regardless of which stream's block a caller
+        expanded. Two DIFFERENT tests in the SAME window, one on
+        mainline and one on a branch, prove `stream=` actually selects
+        between them rather than merging or ignoring it."""
+        base = datetime.datetime(2026, 7, 25, 2, 0, 0)
+        self.import_runs([
+            record(test_name="mainline_only",
+                   start_time=format_iso(base),
+                   end_time=format_iso(base + datetime.timedelta(seconds=3))),
+        ])
+        self.import_runs([
+            record(test_name="branch_only", build="feat/x",
+                   start_time=format_iso(base),
+                   end_time=format_iso(base + datetime.timedelta(seconds=3))),
+        ])
+        streams = self.call("GET", "/api/streams", query={"product": [""]})
+        stream_id = streams["streams"][0]["id"]
+
+        mainline = self.call(
+            "GET", self.PATH,
+            query={"from": ["2026-07-25T02:00:00.000000"],
+                   "to": ["2026-07-25T03:00:00.000000"]})
+        self.assertEqual(mainline["stream"], 1)
+        self.assertEqual(
+            [run["test_name"] for run in mainline["runs"]],
+            ["mainline_only"])
+
+        branch = self.call(
+            "GET", self.PATH,
+            query={"from": ["2026-07-25T02:00:00.000000"],
+                   "to": ["2026-07-25T03:00:00.000000"],
+                   "stream": [str(stream_id)]})
+        self.assertEqual(branch["stream"], stream_id)
+        self.assertEqual(
+            [run["test_name"] for run in branch["runs"]],
+            ["branch_only"])
+
+
+class TestImportStreamsContract(ApiCase):
+    """WP-21 (docs/STREAMS_PLAN.md §3.3): build on /api/import. Narrowed
+    to build-only by WP-25 (docs/ONE_KIND_PLAN.md §1.2): the `branch`
+    kind died before it ever shipped, so a record carrying `branch` is
+    now a loud per-record rejection, not a second stream kind — see
+    TestImportBranchFieldRejected below for that half."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def test_mainline_batch_has_an_empty_streams_seen(self) -> None:
+        data = self.import_runs([record(test_name="t1")])
+        self.assertEqual(data["streams_seen"], [])
+
+    def test_a_build_record_is_named_in_streams_seen(self) -> None:
+        data = self.import_runs(
+            [record(test_name="t1", build="2026.9.1")])
+        self.assertEqual(data["streams_seen"], ["build:2026.9.1"])
+
+    def test_streams_seen_is_sorted_and_deduplicated(self) -> None:
+        data = self.import_runs([
+            record(test_name="t1", build="feat/y",
+                   start_time="2026-07-25T02:00:00.000000",
+                   end_time="2026-07-25T02:00:03.000000"),
+            record(test_name="t2", build="feat/x",
+                   start_time="2026-07-25T02:01:00.000000",
+                   end_time="2026-07-25T02:01:03.000000"),
+            record(test_name="t3", build="feat/x",
+                   start_time="2026-07-25T02:02:00.000000",
+                   end_time="2026-07-25T02:02:03.000000"),
+        ])
+        self.assertEqual(
+            data["streams_seen"], ["build:feat/x", "build:feat/y"])
+
+    def test_blank_build_is_mainline(self) -> None:
+        data = self.import_runs(
+            [record(test_name="t1", build="   ")])
+        self.assertEqual(data["streams_seen"], [])
+        self.assertEqual(data["inserted"], 1)
+
+    def test_a_legacy_key_collision_is_rejected_and_names_both_streams(
+            self) -> None:
+        self.import_runs([record(test_name="t1")])
+        data = self.import_runs(
+            [record(test_name="t1", build="feat/x")])
+        self.assertEqual(data["inserted"], 0)
+        self.assertEqual(data["rejected"], 1)
+        error = data["errors"][0]
+        self.assertIn("mainline", error["error"])
+        self.assertIn("build:feat/x", error["error"])
+        self.assertEqual(error["test_name"], "t1")
+
+    def test_the_rest_of_a_mixed_batch_still_imports(self) -> None:
+        self.import_runs([record(test_name="t1")])
+        data = self.import_runs([
+            record(test_name="t1", build="feat/x"),  # collides
+            record(test_name="t2", build="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),  # fine
+        ])
+        self.assertEqual(data["inserted"], 1)
+        self.assertEqual(data["rejected"], 1)
+
+
+class TestImportBranchFieldRejected(ApiCase):
+    """WP-25 (docs/ONE_KIND_PLAN.md §1.2): the `branch` kind died before
+    it ever shipped anywhere -- a record carrying `branch` is REJECTED
+    loudly, per-record, through the REAL import path (not just
+    :func:`testboard.model.parse_run_record` in isolation), because
+    unknown-key tolerance would otherwise file a stale script's runs
+    into mainline silently the moment `branch`'s handling was removed --
+    the same "old-server trap" class of danger §3.3 documents."""
+
+    def test_branch_is_rejected_with_the_documented_message(self) -> None:
+        data = self.import_runs(
+            [record(test_name="t1", branch="feat/x")])
+        self.assertEqual(data["inserted"], 0)
+        self.assertEqual(data["rejected"], 1)
+        self.assertEqual(
+            data["errors"][0]["error"],
+            "branch: removed before this contract ever shipped — use "
+            "build:")
+        self.assertEqual(data["streams_seen"], [])
+
+    def test_rejected_by_presence_not_value(self) -> None:
+        """A blank/null branch is still a `branch` key on the wire --
+        rejected the same as any other value, never quietly read as
+        mainline the way a blank `build` is."""
+        data = self.import_runs(
+            [record(test_name="t1", branch=None)])
+        self.assertEqual(data["rejected"], 1)
+        self.assertIn("branch:", data["errors"][0]["error"])
+
+    def test_branch_and_build_together_is_still_rejected(self) -> None:
+        """Both present used to be its own "mutually exclusive" error;
+        now `branch`'s own rejection fires first regardless, since it is
+        checked before `build` is even read."""
+        data = self.import_runs([
+            {**record(test_name="t1"), "branch": "x", "build": "y"},
+        ])
+        self.assertEqual(data["rejected"], 1)
+        self.assertIn("branch:", data["errors"][0]["error"])
+        self.assertEqual(data["streams_seen"], [])
+
+    def test_the_rest_of_a_mixed_batch_still_imports(self) -> None:
+        data = self.import_runs([
+            record(test_name="t1", branch="feat/x"),   # rejected
+            record(test_name="t2", build="feat/x"),    # fine
+        ])
+        self.assertEqual(data["inserted"], 1)
+        self.assertEqual(data["rejected"], 1)
+        self.assertEqual(data["streams_seen"], ["build:feat/x"])
+
+
+class TestStreamsEndpoint(ApiCase):
+    """GET /api/streams?product= — the Build picker's data."""
+
+    def _declare(self, environment: str, product: str) -> None:
+        self.call(
+            "PUT", "/api/environments/{}/product".format(environment),
+            body={"product": product, "username": "amy"})
+
+    def test_empty_when_no_build_reported(self) -> None:
+        self.import_runs([record()])
+        data = self.call("GET", "/api/streams", query={"product": [""]})
+        self.assertEqual(data["streams"], [])
+
+    def test_mainline_is_never_listed(self) -> None:
+        self.import_runs([record(build="feat/x")])
+        data = self.call("GET", "/api/streams", query={"product": [""]})
+        names = [(s["kind"], s["name"]) for s in data["streams"]]
+        self.assertNotIn(("mainline", ""), names)
+        self.assertIn(("build", "feat/x"), names)
+
+    def test_streams_carry_id_timestamps_and_failing_count(self) -> None:
+        self.import_runs([
+            record(test_name="t1", result="FAIL", build="feat/x"),
+            record(test_name="t2", result="PASS", build="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        [stream] = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.assertEqual(stream["kind"], "build")
+        self.assertEqual(stream["name"], "feat/x")
+        self.assertEqual(stream["failing"], 1)
+        self.assertIn("first_seen", stream)
+        self.assertIn("last_seen", stream)
+        self.assertIsInstance(stream["id"], int)
+
+    def test_scoped_to_the_declared_product(self) -> None:
+        self.import_runs([record(environment="linux-sim")])
+        self._declare("linux-sim", "Atlas")
+        self.import_runs([record(
+            environment="linux-sim", test_name="t2", build="feat/x",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        self.assertEqual(
+            len(self.call(
+                "GET", "/api/streams", query={"product": ["Atlas"]}
+            )["streams"]), 1)
+        self.assertEqual(
+            self.call(
+                "GET", "/api/streams", query={"product": [""]}
+            )["streams"], [])
+
+    def test_an_unknown_product_is_empty_not_404(self) -> None:
+        data = self.call(
+            "GET", "/api/streams", query={"product": ["Nope"]})
+        self.assertEqual(data["streams"], [])
+
+    def test_missing_product_defaults_to_the_implicit_one(self) -> None:
+        self.import_runs([record(build="feat/x")])
+        without = self.call("GET", "/api/streams")["streams"]
+        withempty = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.assertEqual(without, withempty)
+
+
+class TestCompareEndpoint(ApiCase):
+    """GET /api/compare — the six counts plus one paginated category."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a", result="PASS"),
+            record(test_name="test_b", result="FAIL"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+            record(test_name="test_c", result="PASS", build="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def test_missing_stream_is_400(self) -> None:
+        error = self.call("GET", "/api/compare", expect=400)
+        self.assertIn("stream", error["error"])
+
+    def test_unknown_stream_is_404(self) -> None:
+        self.call(
+            "GET", "/api/compare", query={"stream": ["999999"]},
+            expect=404)
+
+    def test_same_product_non_mainline_baseline_is_allowed(self) -> None:
+        """WP-22 (docs/STREAMS_PLAN.md §4.1) lifts the WP-21-era
+        restriction: baseline= now accepts any stream of the SAME
+        product as stream=, not only mainline. Comparing a stream
+        against itself is a degenerate case (every test agrees with
+        itself) rather than an error -- the point of this test is that
+        it is no longer REFUSED."""
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "baseline": [str(self.stream_id)]})
+        self.assertEqual(data["baseline"]["id"], self.stream_id)
+        self.assertEqual(data["counts"]["new_failures"], 0)
+        self.assertEqual(data["counts"]["new_tests"], 0)
+        self.assertEqual(data["counts"]["no_result"], 0)
+
+    def _make_other_product_stream(self) -> int:
+        """A second stream, in a DIFFERENT product, product fixed at
+        stream-creation time (declared before the BRANCH import,
+        matching docs/STREAMS_PLAN.md §3.3). The environment has to
+        exist (a mainline import) before /api/environments/{env}/product
+        will accept a declaration for it -- same rule as every other
+        expectation-style endpoint."""
+        self.import_runs([
+            record(environment="other-env", test_name="test_z",
+                   result="PASS"),
+        ])
+        self.call(
+            "PUT", "/api/environments/other-env/product",
+            body={"product": "Borealis", "username": "amy"})
+        self.import_runs([
+            record(environment="other-env", test_name="test_z",
+                   result="PASS", build="feat/y",
+                   start_time="2026-07-25T04:00:00.000000",
+                   end_time="2026-07-25T04:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": ["Borealis"]}
+        )["streams"]
+        return int(streams[0]["id"])
+
+    def test_cross_product_baseline_is_refused(self) -> None:
+        """A baseline from a DIFFERENT product is refused with a clear
+        400 naming both products -- the environments filter is
+        resolved from stream='s own product alone, so a mismatched
+        baseline would otherwise silently compare against the wrong
+        environments instead of erroring."""
+        other_stream_id = self._make_other_product_stream()
+        error = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "baseline": [str(other_stream_id)]},
+            expect=400)
+        self.assertIn("Borealis", error["error"])
+
+    def test_cross_product_refusal_is_symmetric(self) -> None:
+        """The refusal fires however stream=/baseline= are assigned to
+        the two streams, not only in one direction."""
+        other_stream_id = self._make_other_product_stream()
+        error = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(other_stream_id)],
+                   "baseline": [str(self.stream_id)]},
+            expect=400)
+        self.assertIn("Borealis", error["error"])
+
+    def test_mainline_baseline_never_triggers_the_product_check(
+        self
+    ) -> None:
+        """Mainline is the one universal exception -- comparing any
+        stream against mainline must keep working regardless of the
+        stream's own product, exactly as it did before this drop."""
+        other_stream_id = self._make_other_product_stream()
+        data = self.call(
+            "GET", "/api/compare", query={"stream": [str(other_stream_id)]})
+        self.assertEqual(data["baseline"]["kind"], "mainline")
+
+    def test_mainline_used_explicitly_as_stream_is_checked_too(self) -> None:
+        """The product check is not one-sided: `stream=<mainline id>`
+        paired with a REAL other product's baseline must be refused just
+        like the reverse, not silently allowed through to compare
+        against the wrong environments (mainline's own resolved
+        environments are the IMPLICIT '' product's, which has nothing to
+        do with the baseline's real product). No shipped frontend
+        constructs this (getSelectedStreamId() is null for mainline,
+        never the numeric id), but the endpoint is a documented contract
+        regardless."""
+        other_stream_id = self._make_other_product_stream()
+        mainline_id = self.call(
+            "GET", "/api/compare", query={"stream": [str(self.stream_id)]}
+        )["baseline"]["id"]
+        error = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(mainline_id)],
+                   "baseline": [str(other_stream_id)]},
+            expect=400)
+        self.assertIn("Borealis", error["error"])
+
+    def test_the_six_counts_and_both_sides_identity(self) -> None:
+        data = self.call(
+            "GET", "/api/compare", query={"stream": [str(self.stream_id)]})
+        self.assertEqual(
+            data["counts"],
+            {
+                "new_failures": 1,   # test_a
+                "new_passes": 0,
+                "both_failing": 0,
+                "new_tests": 1,      # test_c
+                "no_result": 1,      # test_b
+                "agree": 0,          # no pair matches, not-FAIL, both sides
+            },
+        )
+        self.assertEqual(data["stream"]["id"], self.stream_id)
+        self.assertEqual(data["baseline"]["kind"], "mainline")
+        self.assertIn("last_seen", data["stream"])
+        self.assertIn("last_seen", data["baseline"])
+        self.assertEqual(data["tests"], [])
+        self.assertEqual(data["category"], None)
+
+    def test_a_category_returns_a_paginated_list(self) -> None:
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "category": ["new_failures"]})
+        self.assertEqual(data["total"], 1)
+        [row] = data["tests"]
+        self.assertEqual(row["test_name"], "test_a")
+        self.assertEqual(row["stream_result"], "FAIL")
+        self.assertEqual(row["baseline_result"], "PASS")
+        # WP-21: what the delta view's Review expander/assignee select
+        # need — the branch's own run id, and the (unpartitioned)
+        # current assignee.
+        self.assertIsNotNone(row["stream_run_id"])
+        self.assertIsNone(row["assignee"])
+
+    def test_no_result_row_carries_no_run_to_review(self) -> None:
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "category": ["no_result"]})
+        [row] = data["tests"]
+        self.assertIsNone(row["stream_run_id"])
+
+    def test_the_row_shows_the_unpartitioned_current_assignee(self) -> None:
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_a", "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "category": ["new_failures"]})
+        [row] = data["tests"]
+        self.assertEqual(row["assignee"], "alice")
+
+    def test_an_unknown_category_is_400(self) -> None:
+        error = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "category": ["not_a_thing"]},
+            expect=400)
+        self.assertIn("category", error["error"])
+
+    def test_a_category_request_runs_the_pairs_sql_twice_not_thrice(
+        self
+    ) -> None:
+        """WP-23 perf pass: a category request used to run the expensive
+        pairs SQL (_compare_pairs_sql) three times -- compare_counts,
+        compare_category's page, and compare_category_count recomputing
+        a total compare_counts already had. ``total`` is now
+        getattr(counts, category) -- see _handle_compare's comment.
+        "stream_result" is a column alias unique to the pairs SQL (every
+        query built from it selects it, directly or through the
+        categorized/counted wrapper), so counting its occurrences across
+        the traced statements counts pairs-SQL executions specifically,
+        not every query the request happens to run."""
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call(
+                "GET", "/api/compare",
+                query={"stream": [str(self.stream_id)],
+                       "category": ["new_failures"]})
+        finally:
+            conn.set_trace_callback(None)
+        pairs_runs = [s for s in seen if "stream_result" in s]
+        self.assertEqual(
+            len(pairs_runs), 2,
+            "expected exactly 2 pairs-SQL executions (counts + page), "
+            "got {0}:\n{1}".format(len(pairs_runs), "\n---\n".join(
+                pairs_runs)),
+        )
+
+    def test_the_category_total_still_matches_the_headline_count(
+        self
+    ) -> None:
+        """The value itself, not just the query count: total must be
+        EXACTLY counts[category] for every category, the same agreement
+        compare_category_count used to prove by independently
+        recomputing it -- tests/test_storage.py's own tests are the
+        oracle that compare_counts and compare_category_count still
+        agree; this is the API-level half of that same guarantee."""
+        counts = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)]})["counts"]
+        for category in COMPARE_CATEGORIES:
+            data = self.call(
+                "GET", "/api/compare",
+                query={"stream": [str(self.stream_id)],
+                       "category": [category]})
+            self.assertEqual(
+                data["total"], counts[category],
+                "category {!r} total disagrees with the headline "
+                "count".format(category),
+            )
+
+
+class TestDashboardStreamParam(ApiCase):
+    """``stream=`` on /api/dashboard (WP-21, default mainline)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(test_name="test_a")])
+        self.import_runs([
+            record(test_name="test_b", build="feat/x",
+                   start_time="2026-07-25T03:00:00.000000",
+                   end_time="2026-07-25T03:00:03.000000"),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def test_default_is_mainline(self) -> None:
+        data = self.call("GET", "/api/dashboard")
+        self.assertEqual([t["test_name"] for t in data["tests"]],
+                          ["test_a"])
+        self.assertEqual(data["stream"], 1)
+
+    def test_scoped_to_a_branch(self) -> None:
+        data = self.call(
+            "GET", "/api/dashboard",
+            query={"stream": [str(self.stream_id)]})
+        self.assertEqual([t["test_name"] for t in data["tests"]],
+                          ["test_b"])
+        self.assertEqual(data["stream"], self.stream_id)
+
+    def test_unknown_stream_is_404(self) -> None:
+        self.call(
+            "GET", "/api/dashboard", query={"stream": ["999999"]},
+            expect=404)
+
+    def test_non_integer_stream_is_400(self) -> None:
+        self.call(
+            "GET", "/api/dashboard", query={"stream": ["nope"]},
+            expect=400)
+
+
+class TestDetailAndHistoryStreamParam(ApiCase):
+    """``stream=`` on test detail and history (WP-21, default mainline)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(
+            environment="linux-sim", script="suite/alpha.py",
+            test_name="shared_name", result="PASS")])
+        self.import_runs([record(
+            environment="linux-sim", script="suite/alpha.py",
+            test_name="shared_name", result="FAIL", build="feat/x",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.path = test_path(
+            "linux-sim", "suite/alpha.py", "shared_name")
+
+    def test_detail_default_is_mainline(self) -> None:
+        data = self.call("GET", self.path)
+        self.assertEqual(data["latest"]["result"], "PASS")
+        self.assertEqual(data["stream"], 1)
+        self.assertIsNone(data["stream_identity"])
+
+    def test_detail_scoped_to_a_branch(self) -> None:
+        data = self.call(
+            "GET", self.path, query={"stream": [str(self.stream_id)]})
+        self.assertEqual(data["latest"]["result"], "FAIL")
+        self.assertEqual(data["stream"], self.stream_id)
+        self.assertEqual(data["stream_identity"]["kind"], "build")
+        self.assertEqual(data["stream_identity"]["name"], "feat/x")
+
+    def test_history_default_is_mainline(self) -> None:
+        data = self.call("GET", self.path + "/history")
+        self.assertEqual(len(data["runs"]), 1)
+        self.assertEqual(data["runs"][0]["result"], "PASS")
+
+    def test_history_scoped_to_a_branch(self) -> None:
+        data = self.call(
+            "GET", self.path + "/history",
+            query={"stream": [str(self.stream_id)]})
+        self.assertEqual(len(data["runs"]), 1)
+        self.assertEqual(data["runs"][0]["result"], "FAIL")
+
+
+class TestCommentStreamId(ApiCase):
+    """``stream_id`` on comment POST/GET (WP-21, "posted from")."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(test_name="test_a")])
+        self.import_runs([record(
+            test_name="test_a", build="feat/x", result="FAIL",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.path = test_path("linux-sim", "suite/alpha.py", "test_a")
+
+    def test_defaults_to_null(self) -> None:
+        data = self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "hi"}, expect=201)
+        self.assertIsNone(data["comment"]["stream_id"])
+
+    def test_round_trips_when_given(self) -> None:
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "from ci",
+                  "stream_id": self.stream_id},
+            expect=201)
+        [comment] = self.call(
+            "GET", self.path + "/comments")["comments"]
+        self.assertEqual(comment["stream_id"], self.stream_id)
+
+    def test_the_list_resolves_referenced_streams(self) -> None:
+        """The "posted from" tag needs a name, not just an id — the list
+        endpoint batch-resolves every distinct stream_id on the thread,
+        mainline included, in the SAME response (no per-comment fetch)."""
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "from mainline",
+                  "stream_id": MAINLINE_STREAM_ID}, expect=201)
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "from ci",
+                  "stream_id": self.stream_id}, expect=201)
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "no context at all"},
+            expect=201)
+        data = self.call("GET", self.path + "/comments")
+        streams = data["streams"]
+        self.assertEqual(
+            sorted(streams), sorted([str(MAINLINE_STREAM_ID),
+                                      str(self.stream_id)]))
+        self.assertEqual(streams[str(MAINLINE_STREAM_ID)]["kind"], "mainline")
+        self.assertEqual(streams[str(self.stream_id)]["kind"], "build")
+        self.assertEqual(streams[str(self.stream_id)]["name"], "feat/x")
+
+    def test_unknown_stream_id_is_404(self) -> None:
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "hi", "stream_id": 999999},
+            expect=404)
+
+    def test_non_integer_stream_id_is_400(self) -> None:
+        self.call(
+            "POST", self.path + "/comments",
+            body={"username": "amy", "text": "hi", "stream_id": "nope"},
+            expect=400)

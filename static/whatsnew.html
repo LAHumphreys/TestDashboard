@@ -15,6 +15,7 @@
       <a href="actions.html">Open actions</a>
       <a href="time.html">Time</a>
       <a href="timeline.html">Timeline</a>
+      <a href="watch.html">Watch</a>
       <a id="nav-whatsnew" href="whatsnew.html" aria-current="page">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
@@ -34,6 +35,62 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-08-11">
+      <div class="section-head">
+        <h2 class="eyebrow">11 August 2026</h2>
+        <span class="muted">New: products, the Watch page, and uploaded builds compared against mainline or each other</span>
+      </div>
+
+      <h3>What's new</h3>
+      <ul>
+        <li><strong>Products.</strong> If your site runs more than one
+          product, a <strong>Product</strong> switcher now appears at the
+          top of every page, scoping everything on it to the one you pick
+          — declared in the "Environment expectations" section of Open
+          actions. Nothing changes if your site only runs one.</li>
+        <li><strong>A new Watch page.</strong> Build a grid of cards for
+          the environments, products and builds you personally check, and
+          share it by copying the URL — no login, nothing saved on the
+          server. Each card leads with the two numbers a morning scan
+          needs: unassigned failures (red — click it to open them) and
+          how long ago the last result arrived; add <code>@1d</code>,
+          <code>@7d</code> or custom hours to a card to have it flag
+          itself when overdue. In the nav, labelled Watch.</li>
+        <li><strong>Uploading builds and comparing them.</strong> A CI
+          build or a one-off upload can show up beside your nightly
+          results without touching them. Once one exists, a
+          <strong>Build</strong> picker appears next to the Environment
+          filter (dashboard, Time and Timeline) — pick one to compare
+          against mainline, or use <strong>Compare to</strong> on its
+          page to compare against any other build of the same
+          product.</li>
+        <li><strong>Assigning from a build's failures.</strong> Every row
+          in a build's comparison table can be assigned, taken, or
+          reviewed right there — the same triage you already do on the
+          home screen. A build's failure never offers to retire the
+          test; that stays a mainline call.</li>
+        <li><strong>Per-build test history and suite pages.</strong> A
+          test's own page has an "Every build" section showing its
+          result on every build of its product at once; a suite's
+          execution history page works for any build too.</li>
+        <li><strong>A long-running build gets its own dashboard.</strong>
+          Open one that's been running for weeks and you'll see two
+          tabs: <strong>Its own results</strong> (the same tiles, trend
+          and triage queues as the home screen, scoped to it alone) and
+          <strong>Difference from mainline</strong> — which one opens
+          first, and why, is stated under the tabs.</li>
+        <li><strong>Open actions covers everything that needs a
+          person.</strong> "Needs action" lists failing tests, stale
+          annotations, and every assigned test whatever its result. Act
+          in bulk from there: assign or clear everything your filters
+          match in one go, with an optional note posted on each test —
+          or tick individual rows anywhere tests are listed and assign
+          just those from the bar that appears.</li>
+        <li>The test page's "Latest run" line links straight into the
+          Timeline — the same jump the dashboard's review panel
+          offers.</li>
+      </ul>
+    </section>
     <section class="release" data-drop-date="2026-08-07">
       <div class="section-head">
         <h2 class="eyebrow">7 August 2026</h2>

@@ -1062,6 +1062,218 @@ class ForgetStateTest(CliTestBase):
                 ["--forget-state", "--state-file", self.state_file]), 0)
 
 
+class StreamStatePathTest(unittest.TestCase):
+    """run_feeder.stream_state_path — WP-21 docs/STREAMS_PLAN.md section
+    3.7; narrowed to --build only by WP-25 (docs/ONE_KIND_PLAN.md) --
+    --branch died before it ever shipped."""
+
+    def test_mainline_is_unchanged(self) -> None:
+        self.assertEqual(
+            run_feeder.stream_state_path("feeder_state.json", None),
+            "feeder_state.json",
+        )
+
+    def test_build_gets_its_own_file(self) -> None:
+        path = run_feeder.stream_state_path(
+            "feeder_state.json", "2026.9.1")
+        self.assertNotEqual(path, "feeder_state.json")
+        self.assertIn("build", path)
+        self.assertIn("2026.9.1", path)
+
+    def test_slashes_are_sanitized(self) -> None:
+        """A build name like feature/foo must not create a directory."""
+        path = run_feeder.stream_state_path(
+            "feeder_state.json", "feature/foo")
+        self.assertNotIn("/", path)
+        self.assertNotIn("\\", path)
+
+    def test_two_different_builds_are_distinct_files(self) -> None:
+        a = run_feeder.stream_state_path("feeder_state.json", "feat/x")
+        b = run_feeder.stream_state_path("feeder_state.json", "feat/y")
+        self.assertNotEqual(a, b)
+
+    def test_preserves_a_custom_base_path_and_directory(self) -> None:
+        path = run_feeder.stream_state_path(
+            "/etc/testboard/feeder_state.json", "feat/x")
+        self.assertTrue(path.startswith("/etc/testboard/"))
+
+
+class StampedTest(unittest.TestCase):
+    """run_feeder.stamped — applies build to every raw record."""
+
+    def test_mainline_passes_through_unchanged(self) -> None:
+        records = [{"test_name": "a"}, {"test_name": "b"}]
+        result = list(run_feeder.stamped(iter(records), None))
+        self.assertEqual(result, records)
+
+    def test_build_is_stamped_onto_every_record(self) -> None:
+        records = [{"test_name": "a"}]
+        result = list(run_feeder.stamped(iter(records), "2026.9.1"))
+        self.assertEqual(result[0]["build"], "2026.9.1")
+
+    def test_the_original_dict_is_not_mutated(self) -> None:
+        original = {"test_name": "a"}
+        records = [original]
+        list(run_feeder.stamped(iter(records), "feat/x"))
+        self.assertNotIn("build", original)
+
+    def test_non_dict_records_pass_through_for_validation_to_reject(
+            self) -> None:
+        records = ["not a dict"]
+        result = list(run_feeder.stamped(iter(records), "feat/x"))
+        self.assertEqual(result, ["not a dict"])
+
+
+class BuildArgumentTest(CliTestBase):
+    """--build validation: non-empty. WP-25 (docs/ONE_KIND_PLAN.md)
+    removed --branch and, with it, the mutual-exclusion check."""
+
+    def test_blank_build_exit_2(self) -> None:
+        code = run_feeder.main(self.base_args() + ["--build", "   "])
+        self.assertEqual(code, 2)
+
+    def test_no_branch_flag_exists(self) -> None:
+        """--branch was removed, not merely deprecated -- an old
+        invocation still spelling it must fail argument parsing."""
+        code = run_feeder.main(self.base_args() + ["--branch", "feat/x"])
+        self.assertEqual(code, 2)
+
+
+class BuildWiringTest(CliTestBase):
+    """--build reaches the Submitter, the records, and the state file
+    that gets read/written."""
+
+    def test_build_reaches_the_submitter_constructor(self) -> None:
+        code, created = self.run_main_with_fake(
+            self.base_args() + ["--build", "feat/x"], make_stats(), hwm=HWM,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(created[0].options.get("build"), "feat/x")
+
+    def test_records_are_stamped_before_reaching_submit(self) -> None:
+        source = self.write_jsonl([
+            {
+                "environment": "e", "script": "s.py", "test_name": "t",
+                "result": "PASS",
+                "start_time": "2026-07-20T02:00:00.000000",
+                "end_time": "2026-07-20T02:00:01.000000",
+                "output": "", "source_link": "",
+            },
+        ])
+        code, created = self.run_main_with_fake(
+            self.base_args() + ["--build", "feat/x", "--source", source],
+            make_stats(), hwm=HWM,
+        )
+        self.assertEqual(code, 0)
+        [call] = created[0].submit_calls
+        self.assertEqual(len(call["records"]), 1)
+        self.assertEqual(call["records"][0]["build"], "feat/x")
+
+    def test_a_build_run_uses_its_own_state_file_not_mainlines(
+            self) -> None:
+        """A mainline hwm and a build hwm must not collide or share."""
+        feeder.state.save_high_water_mark(self.state_file, HWM)
+        older = HWM - datetime.timedelta(days=30)
+        code, created = self.run_main_with_fake(
+            self.base_args() + ["--build", "feat/x"],
+            make_stats(), hwm=older,
+        )
+        self.assertEqual(code, 0)
+        # Mainline's own mark is untouched.
+        self.assertEqual(
+            feeder.state.load_high_water_mark(self.state_file), HWM)
+        # The build invocation read from (and will save to) a DIFFERENT
+        # file - it must not have seen mainline's hwm as its own "since".
+        build_state = run_feeder.stream_state_path(
+            self.state_file, "feat/x")
+        self.assertNotEqual(build_state, self.state_file)
+        self.assertEqual(
+            feeder.state.load_high_water_mark(build_state), older)
+
+    def test_two_different_builds_do_not_share_state(self) -> None:
+        code_x, _ = self.run_main_with_fake(
+            self.base_args() + ["--build", "feat/x"],
+            make_stats(), hwm=HWM,
+        )
+        code_y, _ = self.run_main_with_fake(
+            self.base_args() + ["--build", "feat/y"],
+            make_stats(), hwm=HWM - datetime.timedelta(days=5),
+        )
+        self.assertEqual((code_x, code_y), (0, 0))
+        x_state = run_feeder.stream_state_path(
+            self.state_file, "feat/x")
+        y_state = run_feeder.stream_state_path(
+            self.state_file, "feat/y")
+        self.assertEqual(
+            feeder.state.load_high_water_mark(x_state), HWM)
+        self.assertEqual(
+            feeder.state.load_high_water_mark(y_state),
+            HWM - datetime.timedelta(days=5))
+
+
+class StreamsAckTest(CliTestBase):
+    """--build aborts loudly against a server that never sends
+    streams_seen (WP-21 docs/STREAMS_PLAN.md section 3.3/3.7's old-server
+    trap)."""
+
+    def _make_raising_submitter(
+        self, message: str = "no streams_seen"
+    ) -> Any:
+        """A fake Submitter whose submit() raises StreamsAckMissing."""
+        created = []  # type: List[Any]
+
+        class RaisingSubmitter:
+            def __init__(self, url: str, batch_size: int = 500,
+                         replay_dir: str = ".", **options: Any) -> None:
+                self.options = options
+                created.append(self)
+
+            def submit(self, records: Iterable[Dict[str, Any]],
+                       dry_run: bool = False, **kwargs: Any) -> SubmitStats:
+                list(records)  # the stream must still be consumed
+                raise feeder.submitter.StreamsAckMissing(message)
+
+            def max_accepted_start_time(
+                self,
+            ) -> Optional[datetime.datetime]:
+                return None
+
+        return RaisingSubmitter, created
+
+    def test_missing_ack_exits_1(self) -> None:
+        fake_cls, _ = self._make_raising_submitter()
+        with mock.patch("feeder.submitter.Submitter", fake_cls):
+            code = run_feeder.main(
+                self.base_args() + ["--build", "feat/x"])
+        self.assertEqual(code, 1)
+
+    def test_missing_ack_saves_no_high_water_mark(self) -> None:
+        fake_cls, _ = self._make_raising_submitter()
+        with mock.patch("feeder.submitter.Submitter", fake_cls):
+            run_feeder.main(self.base_args() + ["--build", "feat/x"])
+        build_state = run_feeder.stream_state_path(
+            self.state_file, "feat/x")
+        self.assertFalse(os.path.exists(build_state))
+
+    def test_missing_ack_is_logged_clearly(self) -> None:
+        fake_cls, _ = self._make_raising_submitter(
+            "batch 1: this run was given --build, but ...")
+        with mock.patch("feeder.submitter.Submitter", fake_cls):
+            with self.capture_logs() as caught:
+                run_feeder.main(self.base_args() + ["--build", "feat/x"])
+        self.assertTrue(
+            any("streams_seen" in message or "given --build" in message
+                for message in caught.output))
+
+    def test_a_mainline_run_never_constructs_a_streams_ack_check(
+            self) -> None:
+        """Sanity: a plain run is unaffected by the raising fake not being
+        used (it uses the normal fake and must succeed as before)."""
+        code, _ = self.run_main_with_fake(
+            self.base_args(), make_stats(), hwm=HWM)
+        self.assertEqual(code, 0)
+
+
 class SourceFileHygieneTest(unittest.TestCase):
     """run_feeder.py stays Python-2 parseable (no f-strings)."""
 
