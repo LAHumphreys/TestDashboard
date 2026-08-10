@@ -2675,8 +2675,12 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
 
         WP-24: `qs.append("origin", state.origin)` became `origin:
         state.origin` in the params object passed to apiUrl() -- same
-        intent, the origin filter still travels on every request."""
-        body = _function_body(read("actions.js"), "function listUrl(")
+        intent, the origin filter still travels on every request.
+        WP-26: that params object moved from listUrl() into the shared
+        filterParams() (also used by the bulk assign/unassign
+        control's own request) -- checked at its new home; listUrl()
+        itself now only composes filterParams()'s result in."""
+        body = _function_body(read("actions.js"), "function filterParams(")
         self.assertIn("origin: state.origin", body)
 
     def test_the_filter_hides_with_no_stream_originated_assignments(
@@ -2951,6 +2955,131 @@ class BulkAssignUnmappedTest(unittest.TestCase):
         window.confirm() anywhere, so this feature must not be the
         first — the required-input gate above is the established
         substitute."""
+        self.assertNotIn("confirm(", _strip_comments(read("actions.js")))
+
+
+class OpenActionsBulkAssignmentsTest(unittest.TestCase):
+    """The bulk assign/unassign control on Open Actions (2026-08-10,
+    found while cleaning up assignments a dead build left behind) —
+    static/actions.html + static/actions.js. Follows the SAME
+    required-explicit-input gate this file's bulk product-assign
+    control (BulkAssignUnmappedTest, envs-bulk-assign) already uses —
+    never window.confirm(), which nothing in this codebase uses
+    anywhere.
+    """
+
+    def test_the_control_ships_hidden_in_the_markup(self) -> None:
+        html = read_text("actions.html")
+        mount_at = html.index('id="bulk-actions"')
+        self.assertIn("hidden", html[mount_at:mount_at + 60])
+
+    def test_the_control_lives_inside_the_actions_section(self) -> None:
+        html = read_text("actions.html")
+        section_at = html.index('id="actions-section"')
+        bulk_at = html.index('id="bulk-actions"')
+        table_at = html.index('id="actions-table"')
+        self.assertLess(section_at, bulk_at)
+        self.assertLess(bulk_at, table_at)
+
+    def test_updateBulkActionsControl_hides_on_zero_total(self) -> None:
+        body = _function_body(
+            read("actions.js"), "function updateBulkActionsControl(")
+        self.assertIn("state.total === 0", body)
+        self.assertIn('container.hidden = state.total === 0', body)
+
+    def test_counts_come_from_state_total(self) -> None:
+        """The exact same total the page header already shows for the
+        current filters — not a second count derived independently."""
+        body = _function_body(
+            read("actions.js"), "function updateBulkActionsControl(")
+        self.assertIn("state.total.toLocaleString()", body)
+        self.assertIn('"bulk-actions-count"', body)
+        self.assertIn('"bulk-unassign-count"', body)
+
+    def test_the_assign_gate_is_a_required_username_input(self) -> None:
+        """Assign's analogue of bulkAssignUnmapped()'s required
+        product field — disabled until a name is present, checked both
+        at render time and on every keystroke (never only in the click
+        handler, which would let a stale disabled state linger)."""
+        render_body = _function_body(
+            read("actions.js"), "function updateBulkActionsControl(")
+        self.assertIn('"bulk-assign-btn"', render_body)
+        self.assertIn('.disabled = !username', render_body)
+        click_body = _function_body(
+            read("actions.js"), "async function bulkAssign(")
+        self.assertIn("if (!username)", click_body)
+
+    def test_the_unassign_gate_is_requireUsername_only(self) -> None:
+        """No second input to validate — the gate is who is doing this
+        (requireUsername()) plus the stated count and the hidden-at-
+        zero rule pinned above."""
+        body = _function_body(
+            read("actions.js"), "async function bulkUnassign(")
+        self.assertIn("requireUsername()", body)
+
+    def test_bulk_assign_requires_a_username(self) -> None:
+        body = _function_body(
+            read("actions.js"), "async function bulkAssign(")
+        self.assertIn("requireUsername()", body)
+
+    def test_bulkUrl_composes_through_apiUrl(self) -> None:
+        """WP-24: no hand-built URL anywhere — this is the one place a
+        new endpoint's request could have reintroduced one."""
+        body = _function_body(read("actions.js"), "function bulkUrl(")
+        self.assertIn('apiUrl("/api/assignments/bulk"', body)
+
+    def test_bulkUrl_shares_listUrls_filter_params(self) -> None:
+        """WP-26: the SAME filterParams() listUrl() uses — never a
+        second hand-rolled copy of the current filters that can drift
+        from what the page's own row fetch sends."""
+        body = _function_body(read("actions.js"), "function bulkUrl(")
+        self.assertIn("filterParams()", body)
+
+    def test_bulk_requests_use_postJson(self) -> None:
+        assign_body = _function_body(
+            read("actions.js"), "async function bulkAssign(")
+        self.assertIn("postJson(bulkUrl()", assign_body)
+        unassign_body = _function_body(
+            read("actions.js"), "async function bulkUnassign(")
+        self.assertIn("postJson(bulkUrl()", unassign_body)
+
+    def test_postJson_is_imported(self) -> None:
+        self.assertIn("postJson", _imported_names(read("actions.js")))
+
+    def test_bulk_unassign_sends_a_null_username(self) -> None:
+        body = _function_body(
+            read("actions.js"), "async function bulkUnassign(")
+        self.assertIn("username: null", body)
+
+    def test_neither_request_ever_sends_a_stream_id(self) -> None:
+        """Open Actions is unscoped (docs/STREAMS_PLAN.md §0.4): a bulk
+        action never records an assignment origin, so the body built
+        for either operation must not carry stream_id at all — the
+        server has no field to receive it either."""
+        assign_body = _strip_comments(
+            _function_body(read("actions.js"), "async function bulkAssign("))
+        unassign_body = _strip_comments(
+            _function_body(
+                read("actions.js"), "async function bulkUnassign("))
+        self.assertNotIn("stream_id", assign_body)
+        self.assertNotIn("stream_id", unassign_body)
+
+    def test_both_operations_refresh_on_success(self) -> None:
+        for fn in ("async function bulkAssign(",
+                   "async function bulkUnassign("):
+            body = _function_body(read("actions.js"), fn)
+            self.assertIn("await refresh(false)", body, fn)
+
+    def test_comment_is_only_sent_when_present(self) -> None:
+        """Optional field: bulkAssign's body only gains "comment" when
+        the input actually holds text, matching the API's own "if
+        non-empty, post it" reading."""
+        body = _function_body(
+            read("actions.js"), "async function bulkAssign(")
+        self.assertIn("if (comment) {", body)
+        self.assertIn("body.comment = comment", body)
+
+    def test_no_confirm_dialog_is_introduced(self) -> None:
         self.assertNotIn("confirm(", _strip_comments(read("actions.js")))
 
 
@@ -3872,16 +4001,24 @@ class OpenActionsNeedsActionIncludesAssignedTest(unittest.TestCase):
 
     def test_the_default_mode_sends_open_and_no_result_filter(
             self) -> None:
-        body = _function_body(read("actions.js"), "function listUrl(")
+        """WP-26: this logic moved from listUrl() into filterParams()
+        (shared with the bulk assign/unassign control's own request) —
+        same assertion, now against the function that actually builds
+        it; listUrl() composes filterParams()'s return value in
+        rather than duplicating it."""
+        body = _function_body(read("actions.js"), "function filterParams(")
         self.assertIn('const open = state.result === "open"', body)
         self.assertIn("const results = open ? null : [state.result]",
                       body)
         self.assertIn('open: open ? "1" : null', body)
+        list_body = _function_body(read("actions.js"), "function listUrl(")
+        self.assertIn("filterParams()", list_body)
 
     def test_the_narrow_modes_send_their_result_and_no_open(self) -> None:
         """FAIL/UNEXPECTED_PASS stay plain result filters — `open` is
-        the default mode's composite, never a standing param."""
-        body = _function_body(read("actions.js"), "function listUrl(")
+        the default mode's composite, never a standing param. WP-26:
+        checked against filterParams(), where this now lives."""
+        body = _function_body(read("actions.js"), "function filterParams(")
         self.assertNotIn('open: "1",', body)
 
 

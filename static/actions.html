@@ -64,6 +64,37 @@
         <h2 id="actions-heading" class="eyebrow">Open actions</h2>
         <span id="actions-meta" class="muted"></span>
       </div>
+      <!-- Bulk assign/unassign every test the CURRENT filters match
+           (2026-08-10, found the same morning as the origin filter:
+           assignments from a dead build persist and cleanup was
+           per-row). Hidden until there is something to act on
+           (state.total === 0) -- zero visible change on an empty
+           queue. No confirm() -- nothing in this codebase uses one
+           (checked: review.js's retirement gate is a required
+           free-text reason box, not a popup); the gate here is the
+           same required-explicit-input idiom the bulk product-assign
+           control above (envs-bulk-assign) already uses: a required
+           username input for assign, and the exact count stated in
+           both sentences so neither click is blind. -->
+      <div id="bulk-actions" class="envs-bulk-assign" hidden>
+        <label class="toolbar-field">
+          Assign all <span id="bulk-actions-count">0</span> filtered
+          test(s) to
+          <input id="bulk-assign-username" type="text"
+                 placeholder="username"
+                 aria-label="Username to bulk-assign the filtered tests to">
+        </label>
+        <input id="bulk-assign-comment" type="text"
+               placeholder="note (optional)"
+               aria-label="Optional comment to post on every filtered test">
+        <button id="bulk-assign-btn" type="button" disabled>Assign</button>
+        <span class="toolbar-spacer"></span>
+        <span class="muted">
+          Unassign all <span id="bulk-unassign-count">0</span> filtered
+          test(s)
+        </span>
+        <button id="bulk-unassign-btn" type="button">Unassign all</button>
+      </div>
       <div class="table-wrap">
         <table class="data-table" id="actions-table">
           <thead>
