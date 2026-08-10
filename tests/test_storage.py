@@ -1357,6 +1357,291 @@ class TestAssignmentStreamId(StorageTestBase):
         self.assertEqual(row[0], self.stream_id)
 
 
+class TestBulkSetAssignee(StorageTestBase):
+    """Storage.bulk_set_assignee — Open Actions' bulk assign/unassign
+    (2026-08-10, found while cleaning up assignments a dead build left
+    behind): the SAME filters :meth:`Storage.dashboard`/
+    :meth:`Storage.dashboard_count` read, acting on the whole matched
+    set in one transaction instead of one row at a time.
+    """
+
+    def setUp(self) -> None:
+        super(TestBulkSetAssignee, self).setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE, result=Result.FAIL),
+            make_record(test_name="test_b", start=BASE, result=Result.PASS),
+            make_record(
+                environment="win-uat", script="other.py",
+                test_name="test_c", start=BASE,
+                result=Result.UNEXPECTED_PASS,
+            ),
+        ])
+        # A build stream, and test_b already carrying an assignment made
+        # FROM it -- proves a bulk op clears that origin the same way a
+        # row-level re-assign from Open Actions already does (it, too,
+        # sends no stream_id; assignments are estate-level,
+        # docs/STREAMS_PLAN.md §0.4).
+        self.store.upsert_runs([make_record(
+            test_name="test_b", start=BASE, result=Result.PASS,
+            build="feat/x")])
+        self.build_stream_id = self.store.list_streams("")[0].stream_id
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "carol", "dave", CREATED,
+            stream_id=self.build_stream_id,
+        )
+
+    def test_bulk_assign_only_touches_matched_rows(self) -> None:
+        updated = self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, results=[Result.FAIL])
+        self.assertEqual(updated, 1)
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"),
+            "alice")
+        # test_b was untouched by a FAIL-only filter -- still carol's.
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "carol")
+
+    def test_bulk_assign_returns_the_matched_count(self) -> None:
+        updated = self.store.bulk_set_assignee("alice", "bob", CREATED)
+        self.assertEqual(updated, 3)
+        self.assertEqual(updated, self.store.dashboard_count())
+
+    def test_bulk_unassign_clears_only_matched_rows(self) -> None:
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        updated = self.store.bulk_set_assignee(
+            None, "bob", CREATED + datetime.timedelta(minutes=1),
+            environment="linux-sim")
+        self.assertEqual(updated, 2)
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"))
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"))
+        # win-uat's test_c was outside the environment filter.
+        self.assertEqual(
+            self.store.current_assignee("win-uat", "other.py", "test_c"),
+            "alice")
+
+    def test_bulk_assign_over_a_never_assigned_row_inserts(self) -> None:
+        updated = self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="win-uat")
+        self.assertEqual(updated, 1)
+        self.assertEqual(
+            self.store.current_assignee("win-uat", "other.py", "test_c"),
+            "alice")
+
+    def test_bulk_assign_over_an_already_assigned_row_updates(self) -> None:
+        updated = self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="linux-sim",
+            script="suite.py", q="test_b")
+        self.assertEqual(updated, 1)
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "alice")
+
+    def test_bulk_assign_clears_the_stream_origin(self) -> None:
+        """test_b's assignment started build-originated; a bulk assign
+        writes NULL, matching a row-level re-assign from Open Actions
+        (which also sends no stream_id) — never a partition of who owns
+        the test, only an annotation of where it was made from."""
+        self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="linux-sim",
+            script="suite.py", q="test_b")
+        conn = self.store._conn()
+        current = conn.execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_b'"
+        ).fetchone()
+        self.assertIsNone(current[0])
+        history = conn.execute(
+            "SELECT stream_id FROM assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_b' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNone(history[0])
+
+    def test_bulk_unassign_over_a_build_originated_row_also_clears_origin(
+        self
+    ) -> None:
+        self.store.bulk_set_assignee(
+            None, "bob", CREATED, environment="linux-sim",
+            script="suite.py", q="test_b")
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"))
+        current = self.store._conn().execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_b'"
+        ).fetchone()
+        self.assertIsNone(current[0])
+
+    def test_comment_posted_on_every_matched_test(self) -> None:
+        self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, comment_text="build looked dead")
+        for triple in (
+            ("linux-sim", "suite.py", "test_a"),
+            ("linux-sim", "suite.py", "test_b"),
+            ("win-uat", "other.py", "test_c"),
+        ):
+            comments = self.store.comments(*triple)
+            self.assertEqual(len(comments), 1, triple)
+            self.assertEqual(comments[0].author, "bob")
+            self.assertEqual(comments[0].text, "build looked dead")
+            self.assertIsNone(comments[0].stream_id)
+
+    def test_no_comment_when_comment_text_is_none(self) -> None:
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        self.assertEqual(
+            self.store.comments("linux-sim", "suite.py", "test_a"), [])
+
+    def test_empty_comment_text_posts_nothing(self) -> None:
+        """Storage's own contract is plain truthiness — an empty string
+        is skipped exactly like None. Deciding that WHITESPACE-only
+        counts as empty too is the API layer's job
+        (testboard.api._handle_bulk_assignments), not storage's."""
+        self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, comment_text="")
+        self.assertEqual(
+            self.store.comments("linux-sim", "suite.py", "test_a"), [])
+
+    def test_zero_matches_returns_zero_and_writes_nothing(self) -> None:
+        # setUp's build-originated assignment already created carol/dave;
+        # the assertion is that a zero-match call creates no ONE else,
+        # not that the estate has no users at all.
+        before = self.store.list_users()
+        updated = self.store.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="does-not-exist")
+        self.assertEqual(updated, 0)
+        self.assertEqual(self.store.list_users(), before)
+
+    def test_implicitly_creates_both_users(self) -> None:
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        self.assertEqual(
+            sorted(u.username for u in self.store.list_users()),
+            ["alice", "bob", "carol", "dave"])
+
+    def test_history_row_is_appended_for_every_matched_triple(self) -> None:
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        count = self.store._conn().execute(
+            "SELECT COUNT(*) FROM assignments WHERE assignee = 'alice'"
+        ).fetchone()[0]
+        self.assertEqual(count, 3)
+
+    def test_invalidates_the_summary_cache(self) -> None:
+        """queue_counts is memoized (_summary_cache) and its "mine"
+        column reads current_assignments — the same surface
+        set_assignee's own invalidation test
+        (test_set_assignee_invalidates_queue_counts) pins for a single
+        row. "mine" counts the ``assigned`` queue predicate (FAIL or
+        UNEXPECTED_PASS with a current assignee — see QUEUE_KINDS),
+        which is test_a (FAIL) and test_c (UNEXPECTED_PASS) here, not
+        test_b (PASS): the count below is 2, not "every matched row",
+        deliberately."""
+        stale_before = BASE + datetime.timedelta(hours=1)
+        before = self.store.queue_counts(
+            stale_before=stale_before, assignee="alice")
+        self.assertEqual(before["mine"], 0)
+        self.store.bulk_set_assignee("alice", "bob", CREATED)
+        after = self.store.queue_counts(
+            stale_before=stale_before, assignee="alice")
+        self.assertEqual(
+            after["mine"], 2,
+            "the memo kept serving zero assigned tests")
+
+    def test_atomicity_a_failure_mid_transaction_writes_nothing(
+        self
+    ) -> None:
+        """A synthetic failure on the current_assignments write — AFTER
+        the assignments-history executemany has already run inside the
+        SAME transaction — must leave NEITHER applied: proof the whole
+        operation commits or rolls back as one unit, not table by
+        table. sqlite3.Connection does not allow monkeypatching its own
+        bound methods (a read-only attribute on the C type), so this
+        substitutes Storage._conn() with a thin proxy for the duration
+        of one call, restored in `finally`.
+        """
+        real_conn = self.store._conn()
+
+        class _FlakyConn(object):
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *a: object, **kw: object) -> object:
+                return self._real.execute(sql, *a, **kw)
+
+            def executemany(
+                self, sql: str, *a: object, **kw: object
+            ) -> object:
+                if "current_assignments" in sql:
+                    raise sqlite3.OperationalError("synthetic failure")
+                return self._real.executemany(sql, *a, **kw)
+
+        proxy = _FlakyConn(real_conn)
+        self.store._conn = lambda: proxy  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.bulk_set_assignee("alice", "bob", CREATED)
+        finally:
+            del self.store._conn  # restores the class's bound method
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"))
+        count = self.store._conn().execute(
+            "SELECT COUNT(*) FROM assignments WHERE assignee = 'alice'"
+        ).fetchone()[0]
+        self.assertEqual(
+            count, 0, "the history row survived a rolled-back transaction")
+
+    def test_the_query_count_is_bounded_not_per_row(self) -> None:
+        """500 matched tests must not mean 500 SELECTs: one SELECT for
+        the matched set (already LEFT JOINed to current_assignments, so
+        it doubles as the existence check for the upsert below it) plus
+        one each for ensure_user(bob)/ensure_user(alice) — bounded
+        regardless of how many rows match, the same "one SELECT plus
+        the executemany" shape ``_backfill_latest_durations`` and
+        :meth:`Storage.failure_streak_bounds_many` already use."""
+        records = [
+            make_record(
+                script="bulk.py", test_name="test_{:03d}".format(i),
+                start=BASE, result=Result.FAIL,
+            )
+            for i in range(500)
+        ]
+        self.store.upsert_runs(records)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated = self.store.bulk_set_assignee(
+                "alice", "bob", CREATED, script="bulk.py")
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(updated, 500)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(
+            len(selects), 3,
+            "expected a constant SELECT count regardless of matched "
+            "rows, got {0}: {1}".format(len(selects), selects))
+
+    def test_empty_input_issues_no_writes(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated = self.store.bulk_set_assignee(
+                "alice", "bob", CREATED, environment="does-not-exist")
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(updated, 0)
+        writes = [
+            s for s in seen
+            if s.strip().upper().startswith(("INSERT", "UPDATE"))
+        ]
+        self.assertEqual(writes, [])
+
+
 class TestThreading(StorageTestBase):
     """Per-thread connections: writes in one thread visible in another."""
 
@@ -5217,6 +5502,54 @@ class DropStreamTest(StorageTestBase):
         self.assertEqual(len(comments), 1)
         self.assertEqual(comments[0].text, "looks fine")
         self.assertIsNone(comments[0].stream_id)
+
+    def test_assignments_referencing_stream_is_zero_with_none_made(
+            self) -> None:
+        self.assertEqual(
+            self.store.assignments_referencing_stream(self.stream_id), 0)
+
+    def test_assignments_referencing_stream_counts_current_assignments(
+            self) -> None:
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "alice", "bob", CREATED,
+            stream_id=self.stream_id)
+        self.assertEqual(
+            self.store.assignments_referencing_stream(self.stream_id), 1)
+
+    def test_sqlite_fk_cascade_clears_the_origin_on_delete(self) -> None:
+        """The finding this method exists to surface, and the reason it
+        must be read BEFORE :meth:`Storage.delete_stream`, not after:
+        current_assignments.stream_id has an ``ON DELETE SET NULL`` FK
+        (same as comments.stream_id, same as assignments.stream_id),
+        and every connection this module opens runs with
+        ``PRAGMA foreign_keys=ON`` -- so on SQLite, deleting the
+        stream row CASCADES the column to NULL automatically. The
+        assignment survives (assignments are never deleted by a stream
+        drop), but its origin tag is gone the instant the stream is --
+        there is no dangling id to report AFTER the fact on this
+        backend; only tools/drop_stream.py's PRE-delete read ever sees
+        the real count. (The MariaDB schema declares no FKs at all, so
+        the same column dangles there instead -- see
+        Storage.assignments_referencing_stream's docstring; there is no
+        automated pin for that half without a live server.)"""
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "alice", "bob", CREATED,
+            stream_id=self.stream_id)
+        before = self.store.assignments_referencing_stream(self.stream_id)
+        self.assertEqual(before, 1)
+        self.store.delete_stream(self.stream_id)
+        after = self.store.assignments_referencing_stream(self.stream_id)
+        self.assertEqual(
+            after, 0,
+            "SQLite's declared ON DELETE SET NULL FK did not cascade "
+            "-- either PRAGMA foreign_keys regressed to OFF, or the "
+            "column's FK declaration changed")
+        # The assignment itself survives the stream's deletion --
+        # only the origin annotation is gone, not the assignee.
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "alice")
+        self.assertIsNone(self.store.get_stream(self.stream_id))
 
 
 class CommentStreamTagTest(StorageTestBase):

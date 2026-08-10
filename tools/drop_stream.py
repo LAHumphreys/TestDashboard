@@ -237,6 +237,28 @@ def main(argv=None):
         print("\nRows belonging to this stream:")
         _report(counts)
 
+        # current_assignments.stream_id -- unlike comments.stream_id,
+        # which delete_stream clears with an explicit UPDATE precisely
+        # so the two backends cannot disagree -- is left to whatever
+        # the schema's declared ON DELETE SET NULL foreign key does,
+        # and that is NOT the same on both backends (verified directly,
+        # see Storage.assignments_referencing_stream's docstring):
+        # SQLite's FK is enforced and cascades this to NULL the moment
+        # the stream row goes; the migrated MariaDB schema declares no
+        # FKs at all, so there it dangles. Read BEFORE the delete --
+        # the only count that is true on both -- and worded for both
+        # outcomes rather than promising the MariaDB-only one.
+        referencing = storage.assignments_referencing_stream(
+            match.stream_id)
+        if referencing:
+            print(
+                "\n{0:,} assignment(s) were made from this stream. On "
+                "SQLite the origin tag clears automatically when it is "
+                "deleted; on MariaDB (no foreign keys in the migrated "
+                "schema) the id is left dangling and the assignment(s) "
+                "keep their Build-originated filter grouping but lose "
+                "their name tag.".format(referencing))
+
         if args.dry_run:
             print("\nDry run: nothing was changed.")
             return 0

@@ -4029,6 +4029,44 @@ class Storage:
         self._invalidate_summary_cache()
         return deleted
 
+    def assignments_referencing_stream(self, stream_id: int) -> int:
+        """How many CURRENT assignments carry *stream_id* as their origin,
+        RIGHT NOW — call this BEFORE :meth:`delete_stream`, not after.
+
+        Unlike ``comments.stream_id`` (cleared by an explicit UPDATE
+        inside :meth:`delete_stream`, specifically so the two backends
+        cannot disagree about it), ``current_assignments.stream_id``
+        and ``assignments.stream_id`` are left to whatever the schema's
+        declared ``ON DELETE SET NULL`` foreign key does — which is
+        NOT the same thing on both backends, a divergence this method
+        exists to make visible rather than to paper over:
+
+        - **SQLite** (``PRAGMA foreign_keys=ON`` on every connection
+          this module opens): deleting the stream row CASCADES the
+          column to ``NULL`` automatically. Read after the delete and
+          this always reports 0, whatever it was before — the
+          assignment silently drops out of the Build-originated filter
+          group with no dangling id ever visible.
+        - **MariaDB** (the migrated schema declares no foreign keys at
+          all, verified against ``tools/migrate_to_mariadb.py`` — one
+          more instance of the divergence :meth:`delete_stream`'s own
+          docstring already calls out for comments): nothing nulls it.
+          The id dangles, the row keeps its origin-filter grouping,
+          and it loses only its name tag, since
+          :meth:`stream_identities` can no longer resolve an id that
+          no longer names a row.
+
+        ``tools/drop_stream.py`` therefore reads this ONCE, before
+        calling :meth:`delete_stream`, and reports the pre-delete count
+        in both ``--dry-run`` and the real path — the only reading
+        that is true on both backends.
+        """
+        row = self._conn().execute(
+            "SELECT COUNT(*) FROM current_assignments WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()
+        return int(row[0])
+
     #: Categories a comparison classifies every test into — the "five
     #: See module-level :data:`COMPARE_CATEGORIES`.
     _COMPARE_CATEGORIES = COMPARE_CATEGORIES
@@ -6624,3 +6662,160 @@ class Storage:
         if row is None:
             return None
         return row[0]
+
+    def bulk_set_assignee(
+        self,
+        assignee: Optional[str],
+        assigned_by: str,
+        assigned_at: datetime.datetime,
+        comment_text: Optional[str] = None,
+        environment: Optional[str] = None,
+        script: Optional[str] = None,
+        results: Optional[Sequence[Result]] = None,
+        q: Optional[str] = None,
+        stale_before: Optional[datetime.datetime] = None,
+        include_retired: bool = False,
+        assignees: Optional[Sequence[str]] = None,
+        include_unassigned: bool = False,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+        assignment_origin: Optional[str] = None,
+        assigned_only: bool = False,
+        open_items: bool = False,
+    ) -> int:
+        """Assign or clear EVERY test matching the SAME filters
+        :meth:`dashboard` would return, in one transaction. Returns the
+        number of matched triples — always equal to
+        :meth:`dashboard_count` for the identical filters, since both
+        read :meth:`_dashboard_filters`'s clauses over the same join.
+
+        Open Actions' bulk assign/unassign (2026-08-10, found while
+        cleaning up assignments a dead build left behind — cleanup was
+        per row until this). ``assignee=None`` bulk-clears every
+        match's current assignment; a name sets all of them to that one
+        owner — the same ``assignments`` history row shape and
+        ``current_assignments`` upsert :meth:`set_assignee` writes for
+        one test, just for the whole matched set in one pass. The
+        filter parameters below are IDENTICAL to :meth:`dashboard`'s
+        own (down to the parameter names) so a caller can build both
+        calls from one filter dict without translation — see
+        ``testboard.api._parse_dashboard_filters``.
+
+        ``stream_id`` here is the FILTER's scope (which stream's
+        ``latest_runs`` partition to match against — the same parameter
+        :meth:`dashboard` takes), never the ORIGIN written to the rows
+        this method writes, which is always ``NULL`` (mainline/no
+        origin, matching a pre-WP-21 client): Open Actions is unscoped
+        (docs/STREAMS_PLAN.md §0.4), and an assignment origin is only
+        ever recorded when the assignment was made FROM a stream-scoped
+        page — a bulk action from Open Actions is not one, the same
+        reading row-level assignment from this page already gives (it
+        sends no ``stream_id`` either). A matched row that WAS
+        build-originated therefore leaves that origin-filter group the
+        same way a row-level re-assign from this page already does —
+        not a new behaviour, just the first bulk path that can do it to
+        many rows at once.
+
+        *comment_text*, when not ``None``, is posted on every matched
+        test, authored by *assigned_by*, in the SAME transaction as the
+        assignment change — one comment row per matched triple.
+
+        Cost: ONE SELECT beyond :meth:`ensure_user`'s own — already
+        LEFT JOINed to ``current_assignments`` (:attr:`_LATEST_COUNT_JOIN`,
+        the same join :meth:`dashboard_count` uses) so this method learns
+        in that SAME read which matched triples already have a row
+        there and which need one inserted, rather than a second query or
+        a per-row existence check. Every write below is ONE
+        ``executemany`` over the WHOLE matched set — never a query per
+        row, the same "one SELECT plus the executemany" shape
+        ``_backfill_latest_durations`` and
+        :meth:`failure_streak_bounds_many` already use for a
+        bounded-not-per-row query count.
+        """
+        result_values = (
+            None if results is None else [r.value for r in results]
+        )  # type: Optional[List[str]]
+        if result_values is not None and not result_values:
+            return 0
+        clauses, params = self._dashboard_filters(
+            environment, script, result_values, q, stale_before,
+            include_retired, assignees, include_unassigned, environments,
+            stream_id, assignment_origin, assigned_only, open_items,
+        )
+        sql = (
+            "SELECT lr.environment, lr.script, lr.test_name, "
+            "ca.environment IS NOT NULL " + self._LATEST_COUNT_JOIN
+        )
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            if not rows:
+                conn.execute("COMMIT")
+                return 0
+            self.ensure_user(assigned_by, assigned_at)
+            if assignee is not None:
+                self.ensure_user(assignee, assigned_at)
+            assigned_at_iso = model.format_iso(assigned_at)
+            triples = [
+                (row[0], row[1], row[2]) for row in rows
+            ]  # type: List[Tuple[str, str, str]]
+            conn.executemany(
+                "INSERT INTO assignments (environment, script, "
+                "test_name, assignee, assigned_by, assigned_at, "
+                "stream_id) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                [
+                    (env, scr, test, assignee, assigned_by, assigned_at_iso)
+                    for (env, scr, test) in triples
+                ],
+            )
+            to_update = [
+                triple for triple, row in zip(triples, rows) if row[3]
+            ]
+            to_insert = [
+                triple for triple, row in zip(triples, rows) if not row[3]
+            ]
+            if to_update:
+                conn.executemany(
+                    "UPDATE current_assignments SET assignee = ?, "
+                    "stream_id = NULL WHERE environment = ? "
+                    "AND script = ? AND test_name = ?",
+                    [
+                        (assignee, env, scr, test)
+                        for (env, scr, test) in to_update
+                    ],
+                )
+            if to_insert:
+                conn.executemany(
+                    "INSERT INTO current_assignments (environment, "
+                    "script, test_name, assignee, stream_id) "
+                    "VALUES (?, ?, ?, ?, NULL)",
+                    [
+                        (env, scr, test, assignee)
+                        for (env, scr, test) in to_insert
+                    ],
+                )
+            if comment_text:
+                conn.executemany(
+                    "INSERT INTO comments (environment, script, "
+                    "test_name, author, created_at, text, stream_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                    [
+                        (env, scr, test, assigned_by, assigned_at_iso,
+                         comment_text)
+                        for (env, scr, test) in triples
+                    ],
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        # Same single call set_assignee/add_comment each make -- this
+        # writes both current_assignments and comments in one
+        # transaction, but the cache has exactly one invalidation
+        # surface regardless of how many tables a mutator touched.
+        self._invalidate_summary_cache()
+        return len(triples)

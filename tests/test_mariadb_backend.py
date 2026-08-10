@@ -175,6 +175,18 @@ EXCLUDED_TESTS = {
         "counts queries via sqlite3's set_trace_callback.",
     "SummaryCacheTest.test_within_ttl_still_hits":
         "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssignee.test_the_query_count_is_bounded_not_per_row":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssignee.test_empty_input_issues_no_writes":
+        "counts queries via sqlite3's set_trace_callback.",
+    "DropStreamTest.test_sqlite_fk_cascade_clears_the_origin_on_delete":
+        "asserts SQLite's ON DELETE SET NULL foreign-key cascade on "
+        "current_assignments.stream_id -- the migrated MariaDB schema "
+        "declares no foreign keys at all (verified against "
+        "tools/migrate_to_mariadb.py), so the SAME assignment there "
+        "keeps a dangling stream_id instead of being nulled. That "
+        "divergence is the finding Storage.assignments_referencing_"
+        "stream's docstring records, not a bug to reconcile here.",
 }  # type: Dict[str, str]
 
 if backends.MARIADB_AVAILABLE:
