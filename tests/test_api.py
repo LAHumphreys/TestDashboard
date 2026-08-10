@@ -2564,6 +2564,46 @@ class TestActionsFilters(ApiCase):
         )
 
 
+class TestDashboardAssignedFilter(ApiCase):
+    """``/api/dashboard``'s ``assigned=1`` (2026-08-10, found in the
+    first morning of build-verify manual testing): every row with a
+    current assignee, whatever its result — the Open Actions
+    "All assigned (any result)" view. Before it, an assignment on a
+    mainline-passing test was reachable through no filter combination
+    at all."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_passing_assigned"),
+            record(test_name="test_passing_unassigned"),
+        ])
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py",
+                      "test_passing_assigned", "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+
+    def test_lists_a_passing_assigned_test_with_no_result_filter(
+            self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"assigned": ["1"]})["tests"]
+        self.assertEqual(
+            [r["test_name"] for r in rows], ["test_passing_assigned"])
+
+    def test_absent_means_no_assignment_filter(self) -> None:
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(len(rows), 2)
+
+    def test_contradiction_with_unassigned_is_empty_not_reinterpreted(
+            self) -> None:
+        data = self.call(
+            "GET", "/api/dashboard",
+            query={"assigned": ["1"], "unassigned": ["1"]})
+        self.assertEqual(data["tests"], [])
+        self.assertEqual(data["total"], 0)
+
+
 class TestSummaryAssignmentStreams(ApiCase):
     """``/api/summary``'s ``assignment_streams`` (WP-21, Open Actions'
     origin filter) — the same "available values, empty means nothing to

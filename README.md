@@ -333,7 +333,8 @@ Query parameters (all optional):
 | `retired` | `1`/`true` — include tests retired as no longer in the suite (hidden by default) |
 | `assignee` | repeatable — only tests owned by these people |
 | `unassigned` | `1`/`true` — include tests nobody owns (ORed with `assignee`) |
-| `origin` | `branch` or `mainline` (WP-21) — only tests whose CURRENT assignment was made from a non-mainline stream, or made from mainline/never assigned, respectively; anything else → 400 |
+| `assigned` | `1`/`true` — only tests somebody owns, whatever their result (ANDed with the owner filters, so `assignee=` narrows it; contradicts `unassigned=1`, which then matches nothing). Added 2026-08-10 for Open Actions' "All assigned (any result)" view |
+| `origin` | `build` or `mainline` (WP-21; the non-mainline value was spelled `branch` until WP-25 renamed it before anything shipped) — only tests whose CURRENT assignment was made from a non-mainline stream, or made from mainline/never assigned, respectively; anything else → 400 |
 | `with_comment` | `1`/`true` — add `latest_comment` to each row (one index seek per returned row, so it is opt-in) |
 | `sort` | one of `environment` (default), `script`, `test_name`, `result`, `start_time`, `duration`, `assignee`; anything else → 400 |
 | `order` | `asc` (default) or `desc`; anything else → 400 |

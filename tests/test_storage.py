@@ -5339,6 +5339,62 @@ class AssignmentOriginFilterTest(StorageTestBase):
             self.store.assignment_stream_ids(), [self.stream_id])
 
 
+class AssignedOnlyFilterTest(StorageTestBase):
+    """dashboard()/dashboard_count()'s ``assigned_only`` filter
+    (2026-08-10, found in the first morning of build-verify manual
+    testing): every row with a current assignee, whatever its result.
+    Before it, an assignment on a mainline-PASSING test was visible
+    NOWHERE — the three Open Actions result options and the
+    "assigned"/"mine" queue predicates all gate on
+    FAIL/UNEXPECTED_PASS, a mainline-triage assumption ("assigned"
+    implied "because it is failing") that the build-verify flow broke:
+    a test assigned to investigate why it did not run on an RC passes
+    happily on mainline."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_passing_assigned"),
+            make_record(test_name="test_failing_assigned",
+                        result=Result.FAIL),
+            make_record(test_name="test_passing_unassigned"),
+        ])
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_passing_assigned",
+            "alice", "bob", CREATED)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_failing_assigned",
+            "carol", "bob", CREATED)
+
+    def test_includes_a_passing_assigned_test(self) -> None:
+        rows = self.store.dashboard(assigned_only=True)
+        self.assertEqual(
+            sorted(r.test_name for r in rows),
+            ["test_failing_assigned", "test_passing_assigned"])
+        self.assertEqual(
+            self.store.dashboard_count(assigned_only=True), 2)
+
+    def test_combines_with_assignees_by_narrowing(self) -> None:
+        """AND-level with the owner OR-group: "Alice's assignments,
+        any result" — never widened to assigned-to-anyone."""
+        rows = self.store.dashboard(
+            assigned_only=True, assignees=["alice"])
+        self.assertEqual(
+            [r.test_name for r in rows], ["test_passing_assigned"])
+
+    def test_contradiction_with_unassigned_matches_nothing(self) -> None:
+        """assigned AND unowned is empty by construction — never a
+        silent reinterpretation of either filter (the frontend does not
+        offer the combination; the storage layer must still be honest
+        about what it would mean)."""
+        self.assertEqual(
+            self.store.dashboard_count(
+                assigned_only=True, include_unassigned=True), 0)
+
+    def test_off_by_default(self) -> None:
+        self.assertEqual(self.store.dashboard_count(), 3)
+
+
 class AssignmentStreamIdsEmptyTest(StorageTestBase):
     """assignment_stream_ids() on a database with no build-originated
     assignment at all — the signal Open Actions' filter reads to honour

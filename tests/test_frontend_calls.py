@@ -3834,6 +3834,38 @@ class ScopedUrlConstructionTest(unittest.TestCase):
         self.assertTrue(_ENVIRONMENT_PARAM_RE.search(planted))
 
 
+class OpenActionsAllAssignedViewTest(unittest.TestCase):
+    """The "All assigned (any result)" option (2026-08-10, found in the
+    first morning of build-verify manual testing): an assignment on a
+    mainline-passing test — routine once people assign from a build's
+    no-result/failure rows — was previously reachable through NO view:
+    all three of this page's result options and the dashboard's "My
+    actions" queue gate on FAIL/UNEXPECTED_PASS."""
+
+    def test_the_option_exists(self) -> None:
+        self.assertIn(
+            '<option value="assigned">All assigned (any result)</option>',
+            read("actions.html"))
+
+    def test_the_mode_sends_assigned_and_no_result_filter(self) -> None:
+        body = _function_body(read("actions.js"), "function listUrl(")
+        self.assertIn(
+            'state.result === "assigned" ? null : [state.result]', body)
+        self.assertIn(
+            'assigned: state.result === "assigned" ? "1" : null', body)
+
+    def test_the_unassigned_chip_is_not_offered_in_this_mode(self) -> None:
+        """assigned AND unowned matches nothing — the chip hides rather
+        than being offered and silently empty (the page's own
+        no-dishonest-empties rule), and a stale selection of it is
+        cleared when the mode is entered."""
+        body = _function_body(
+            read("actions.js"), "function renderOwnerFilters()")
+        self.assertIn('state.result === "assigned"', body)
+        self.assertIn("state.owners.delete(UNASSIGNED)",
+                      _strip_comments(read("actions.js")))
+
+
 class TestPageTimelineLinkTest(unittest.TestCase):
     """test.html's route to the Timeline (2026-08-09 persona walk): the
     delver journey reads "test page → history → timeline of that

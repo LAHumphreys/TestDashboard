@@ -860,6 +860,13 @@ def _handle_dashboard(
         request.query, "with_streak") in ("1", "true")
     include_unassigned = _query_single(
         request.query, "unassigned") in ("1", "true")
+    # 2026-08-10, found in the first morning of build-verify testing:
+    # "every row with a current assignee, whatever its result" — the
+    # filter behind Open Actions' "All assigned" view. Same truthy
+    # spelling as `unassigned` above; see Storage._dashboard_filters
+    # for why it is AND-level rather than part of the owner OR group.
+    assigned_only = _query_single(
+        request.query, "assigned") in ("1", "true")
     assignees = request.query.get("assignee") or []
     # WP-21, Open Actions' build/mainline origin filter — WHERE the
     # current assignment was made from, an axis entirely separate from
@@ -908,6 +915,7 @@ def _handle_dashboard(
         "environments": environments,
         "stream_id": stream_id,
         "assignment_origin": assignment_origin,
+        "assigned_only": assigned_only,
     }  # type: Dict[str, Any]
     rows = storage.dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,

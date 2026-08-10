@@ -2953,6 +2953,7 @@ class Storage:
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
         assignment_origin: Optional[str] = None,
+        assigned_only: bool = False,
     ) -> Tuple[List[str], List[Any]]:
         """Build the shared WHERE clauses for the dashboard list and count.
 
@@ -2960,6 +2961,20 @@ class Storage:
         by default they are hidden, which is the whole point of retiring
         one. *assignees* and *include_unassigned* combine as OR — "show
         me Alice's and Bob's open items, plus anything nobody owns".
+        *assigned_only* (2026-08-10, found in the first morning of
+        build-verify testing) is an AND-level "ca.assignee IS NOT NULL"
+        — the filter behind Open Actions' "All assigned" view. It exists
+        because an assignment on a mainline-PASSING test was previously
+        visible NOWHERE: every queue predicate and all three of the
+        page's result options gate on FAIL/UNEXPECTED_PASS, an
+        assumption from mainline triage ("assigned" implied "because it
+        is failing") that the build-verify flow broke — a test assigned
+        to investigate why it did not run on an RC passes happily on
+        mainline. AND-level deliberately, not part of the OR group:
+        combined with *assignees* it narrows ("Alice's assignments, any
+        result"); combined with *include_unassigned* it is contradictory
+        and correctly returns nothing (the frontend does not offer that
+        combination).
         *environments* is the WP-20 product filter, resolved by the
         caller to an allow-list — see :meth:`_environments_clause`. It
         combines with *environment* by AND, which is never contradictory
@@ -3021,6 +3036,9 @@ class Storage:
         if owner_clauses:
             clauses.append("({})".format(" OR ".join(owner_clauses)))
 
+        if assigned_only:
+            clauses.append("ca.assignee IS NOT NULL")
+
         if assignment_origin == "build":
             clauses.append("(ca.stream_id IS NOT NULL AND ca.stream_id != ?)")
             params.append(MAINLINE_STREAM_ID)
@@ -3069,6 +3087,7 @@ class Storage:
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
         assignment_origin: Optional[str] = None,
+        assigned_only: bool = False,
     ) -> List[TestSummaryRow]:
         """Return ONE PAGE of the latest run per test, never with ``output``.
 
@@ -3089,7 +3108,9 @@ class Storage:
         partition of ``latest_runs`` — the ``/api/dashboard`` ``stream=``
         param, resolved by the caller. *assignment_origin* (WP-21,
         Open Actions only) narrows by WHERE the current assignment was
-        made from — see :meth:`_dashboard_filters`.
+        made from — see :meth:`_dashboard_filters`. *assigned_only*
+        (2026-08-10) keeps only rows with a current assignee, whatever
+        their result — see :meth:`_dashboard_filters` for why it exists.
 
         *sort* is a key of :data:`DASHBOARD_SORTS`; every ordering ends
         with the full test identity, so *limit*/*offset* paging is stable
@@ -3108,7 +3129,7 @@ class Storage:
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
-            stream_id, assignment_origin,
+            stream_id, assignment_origin, assigned_only,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -3143,6 +3164,7 @@ class Storage:
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
         assignment_origin: Optional[str] = None,
+        assigned_only: bool = False,
     ) -> int:
         """Exact number of tests matching the same filters as :meth:`dashboard`."""
         result_values = (
@@ -3153,7 +3175,7 @@ class Storage:
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
-            stream_id, assignment_origin,
+            stream_id, assignment_origin, assigned_only,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
         if clauses:

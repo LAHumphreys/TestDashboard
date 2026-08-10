@@ -93,11 +93,18 @@ this before you; these two are where trouble is most likely):
       switcher dropdown lists Mainline / 2026.9.1 / 2026.9.0 each
       with its result.
 - [ ] **Assign from THIS page's own assignee dropdown** → "Saved." →
-      open Open Actions → the row shows an origin tag naming
-      2026.9.1, and the origin filter chips
-      ("Build-originated" / "Mainline") now appear — clicking
-      Build-originated filters to that row. (Fixed tonight: this page's
-      assign used to silently lose the origin.)
+      open Open Actions → switch the Result filter to
+      **"All assigned (any result)"** → the row appears (it passes on
+      mainline, so the default "Needs action" view correctly does NOT
+      list it) with an origin tag naming 2026.9.1 and the two-chip
+      result (ghost mainline PASS, solid build FAIL); the origin
+      filter chips ("Build-originated" / "Mainline") appear, and
+      Build-originated narrows to it. (Both halves are morning-of
+      fixes: this page's assign used to silently lose the origin, and
+      an assignment on a passing test used to be visible nowhere.)
+- [ ] Still in "All assigned (any result)": the Unassigned owner chip
+      is NOT offered (it would contradict the view); switch back to
+      "Needs action" and it returns.
 - [ ] Back on the build dashboard: Compare-to → `2026.9.0` → the
       comparison re-scopes, and the verdict line now names mainline
       as the OTHER side.
