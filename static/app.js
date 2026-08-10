@@ -141,11 +141,22 @@ const tbody = document.getElementById("dashboard-body");
 // carries none, by construction. Only ONE mount registers onChanged: a
 // bulk action can touch rows from either table, so one full refreshAll()
 // covers both without a duplicate fetch from a second registration.
+//
+// registerRefresh is FALSE on a branch-scoped load (`?stream=`):
+// init() below takes the initBranchDashboard() branch and returns
+// before wireMainlineControls() -- this table stays hidden and never
+// fetched (docs/STREAMS_PLAN.md §3.6's "no unscoped /api/summary
+// fetch, no queues, no browse table" on that path). Module-level
+// consts run before init() decides which branch it is taking, so this
+// has to read the URL directly (getSelectedStreamId(), the same
+// module-load-time read compare.js's own scope functions make) rather
+// than state.streamId, which is not set yet.
+const registerRefresh = getSelectedStreamId() === null;
 const queueSelectionMount = mountSelectableTable(
   document.getElementById("queue-table"));
 const browseSelectionMount = mountSelectableTable(
   document.getElementById("dashboard-table"),
-  { onChanged: () => refreshAll() });
+  registerRefresh ? { onChanged: () => refreshAll() } : {});
 
 const SECTIONS = ["status-section", "charts-section", "triage-section",
   "browse-section"];

@@ -4197,6 +4197,22 @@ class SelectionModuleTest(unittest.TestCase):
         body = _function_body(read("selection.js"), "function reset(")
         self.assertIn("namespace", body)
 
+    def test_select_all_snapshots_intent_before_the_loop(self) -> None:
+        """Found by review: each row's own "change" handler calls
+        updateHeaderCheckboxState(box) -- the SAME header checkbox node
+        the click handler's closure holds -- which recomputes and
+        overwrites box.checked from partial progress mid-loop. Reading
+        the live box.checked on every iteration (instead of a snapshot
+        taken once, before the loop starts) meant only the FIRST row
+        ever actually toggled on a "select all" click; every later row
+        compared against a header state its own predecessor's side
+        effect had already changed. The snapshot is what select-all
+        selecting more than one row depends on."""
+        body = _function_body(read("selection.js"), "function headerCell(")
+        self.assertIn("const target = box.checked", body)
+        self.assertIn("rowBox.checked !== target", body)
+        self.assertNotIn("rowBox.checked !== box.checked", body)
+
 
 class SelectionColumnExclusivityTest(unittest.TestCase):
     """selection.js is the ONLY place a checkbox table column may be
@@ -4312,6 +4328,25 @@ class SelectionMountSitesTest(unittest.TestCase):
         code = _strip_comments(read("app.js"))
         self.assertIn("browseSelectionMount.rowCell(row)", code)
         self.assertIn("queueSelectionMount.rowCell(entry)", code)
+
+    def test_the_browse_mounts_refresh_callback_is_not_registered_on_a_branch_page(
+        self
+    ) -> None:
+        """Found by review: a bulk action from the build delta table
+        (compare.js's OWN mount, a separate namespace) calls every
+        registered onChanged listener, not only its own -- registering
+        app.js's refreshAll() unconditionally at module load meant a
+        branch-scoped page (`?stream=`) fired an unscoped
+        /api/summary + queue + /api/dashboard fetch after a delta-table
+        bulk action, into sections init() itself documents must never
+        be fetched there ("no unscoped /api/summary fetch, no queues,
+        no browse table" -- what keeps a branch-scoped page at zero
+        visible change). The registration must be conditional on NOT
+        being stream-scoped, decided from the URL at module load time
+        (state.streamId is not set yet when this const is built)."""
+        code = _strip_comments(read("app.js"))
+        self.assertIn("getSelectedStreamId() === null", code)
+        self.assertIn("registerRefresh ? { onChanged:", code)
 
 
 class OpenActionsUsernameDropdownTest(unittest.TestCase):

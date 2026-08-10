@@ -313,11 +313,19 @@ export function mountSelectableTable(table, options) {
     box.className = "select-all-checkbox";
     box.title = "Select all rows shown";
     box.addEventListener("change", () => {
+      // Snapshot the intent BEFORE the loop: each row's own "change"
+      // handler below calls updateHeaderCheckboxState(box) -- the SAME
+      // node this closure holds -- which recomputes and overwrites
+      // box.checked/indeterminate from partial progress. Comparing
+      // against the live box.checked on every iteration meant only the
+      // FIRST row ever actually toggled; every later one read a header
+      // state the first row's own side effect had already changed.
+      const target = box.checked;
       const rowBoxes = table.querySelectorAll(
         "tbody input.row-select-checkbox");
       rowBoxes.forEach((rowBox) => {
-        if (rowBox.checked !== box.checked) {
-          rowBox.checked = box.checked;
+        if (rowBox.checked !== target) {
+          rowBox.checked = target;
           rowBox.dispatchEvent(new Event("change"));
         }
       });
