@@ -101,7 +101,7 @@ async function init() {
   }
   let notes = [];
   try {
-    const response = await fetch("/api/site-notes");
+    const response = await fetch("api/site-notes");
     if (!response.ok) {
       return;
     }

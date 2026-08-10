@@ -85,7 +85,7 @@ function url() {
   // resolved server-side, same as every other product= filter
   // (docs/STREAMS_PLAN.md §2.2). Harmless to send alongside an explicit
   // `environment` once drilled in; the server combines both.
-  return apiUrl("/api/time", {
+  return apiUrl("api/time", {
     group_by: level(),
     environment: state.environment,
     script: state.script,

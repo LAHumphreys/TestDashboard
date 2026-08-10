@@ -67,7 +67,7 @@ from testboard import api
 from testboard import perf as perf_module
 from testboard.storage import DEFAULT_MAX_CONNECTIONS, Storage
 
-__all__ = ["ThreadingHTTPServer", "create_server"]
+__all__ = ["ThreadingHTTPServer", "create_server", "DEFAULT_URL_PREFIX"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -216,6 +216,12 @@ class ThreadingHTTPServer(http.server.HTTPServer):
     #: Optional path to this site's own What's new notes; None disables
     #: them (the endpoint then reports an empty list, not a 404).
     site_notes_path = None  # type: Optional[str]
+    #: URL prefix stripped once at the top of routing (WP-28; see
+    #: _strip_prefix); "" disables prefix handling and every request is
+    #: routed exactly as before this flag existed. Injected by
+    #: create_server(); see DEFAULT_URL_PREFIX for the out-of-the-box
+    #: value.
+    url_prefix = ""  # type: str
 
     def __init__(self, server_address: Any, handler: Any,
                  workers: int = DEFAULT_WORKERS) -> None:
@@ -324,6 +330,63 @@ def _is_api_path(raw_path: str) -> bool:
     return raw_path == "/api" or raw_path.startswith("/api/")
 
 
+#: Default ``--url-prefix``: WP-28 (docs/NIGHT_RUN_2026-08-10.md §5).
+#: Prefixed paths (``/testboard/api/...``) work out of the box behind an
+#: nginx proxy that does NOT strip the prefix before forwarding (the
+#: confirmed shape); bare paths (``/api/...``) ALWAYS keep working too
+#: (see :func:`_strip_prefix`), which is what makes this default
+#: harmless everywhere nginx is absent (dev, staging, a feeder posting
+#: straight to the backend port). ``--url-prefix ""`` disables prefix
+#: handling entirely.
+DEFAULT_URL_PREFIX = "testboard"
+
+
+def _strip_prefix(raw_path: str, prefix: str) -> Tuple[str, Optional[str]]:
+    """Strip *prefix* from *raw_path*'s front, once, at a segment boundary.
+
+    Returns ``(path, redirect_to)``:
+
+    - *prefix* empty (``--url-prefix ""``) disables this entirely:
+      ``(raw_path, None)`` unconditionally, so a disabled prefix costs
+      nothing and changes nothing.
+    - *raw_path* exactly equal to ``/PREFIX`` (no trailing slash — a
+      browser reads this as "the file PREFIX in the root directory",
+      not "the PREFIX directory") returns ``(raw_path, "/PREFIX/")``:
+      the caller must answer a redirect rather than serve content
+      directly, because every relative href/fetch on the page served
+      at that URL would otherwise resolve one level too high and
+      silently drop the prefix — precisely the failure this flag
+      exists to avoid introducing.
+    - *raw_path* starting with ``/PREFIX/`` has that exact substring
+      removed, the remainder keeping its own leading ``/``:
+      ``/PREFIX/api/summary`` -> ``/api/summary``, ``/PREFIX/`` ->
+      ``/``.
+    - Anything else — including ``/PREFIXsuffix/...`` (not a full path
+      SEGMENT — the prefix must be bounded by ``/`` on both sides, so
+      an unrelated path that merely starts with the same characters is
+      never mistaken for it) and a percent-encoded attempt at the
+      prefix (matched against the RAW, still-encoded path, so an
+      encoded byte simply fails to match the literal marker and the
+      request is routed — and 404s — as an ordinary static path) — is
+      returned unchanged, unmatched.
+
+    This is deliberately a SINGLE pass: a path containing the prefix
+    TWICE (``/PREFIX/PREFIX/api/...``, e.g. a client that prepended it
+    by mistake) has it removed once, and the remainder
+    (``/PREFIX/api/...``) is routed as an ordinary — in this case,
+    404, since it is not ``/api/...`` and no such static file exists —
+    path, never stripped again.
+    """
+    if not prefix:
+        return raw_path, None
+    marker = "/" + prefix
+    if raw_path == marker:
+        return raw_path, marker + "/"
+    if raw_path.startswith(marker + "/"):
+        return raw_path[len(marker):], None
+    return raw_path, None
+
+
 class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
     """Thin HTTP shell: routes ``/api`` to handle_api, serves static files.
 
@@ -342,6 +405,16 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
     #: Status of the response just written, for the perf log. Set by
     #: :meth:`log_request`; None until a response has been sent.
     _perf_status = None  # type: Optional[int]
+
+    #: The request path AFTER prefix stripping (WP-28), set by
+    #: :meth:`_resolve_path`; None before it has run (or when it wrote a
+    #: redirect and no route was ever chosen). The perf log records this
+    #: rather than the raw ``self.path`` so a request arriving as
+    #: ``/testboard/api/summary`` is logged under the SAME route label
+    #: (``api/summary``) as the bare shape — prod traffic through nginx
+    #: would otherwise fragment every route label from pre-drop data the
+    #: moment the prefix is in front of it.
+    _resolved_path = None  # type: Optional[str]
 
     # ------------------------------------------------------------------
     # Connection lifetime
@@ -510,10 +583,19 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         status = getattr(self, "_perf_status", None)
         if status is not None:
             extra["s"] = status
-        # command/path are unset if the request line never parsed.
+        # command/path are unset if the request line never parsed. Prefer
+        # the prefix-STRIPPED path (WP-28) so route labels stay stable
+        # whether a request arrived bare or through nginx's prefix;
+        # _resolved_path is None only for a request _resolve_path never
+        # reached (an unparseable request line) or that it answered with
+        # a redirect (no route was ever chosen for it either way).
         method = getattr(self, "command", None) or "?"
-        raw_path = getattr(self, "path", None) or "/"
-        path = raw_path.split("?", 1)[0]
+        resolved = getattr(self, "_resolved_path", None)
+        if resolved is not None:
+            path = resolved
+        else:
+            raw_path = getattr(self, "path", None) or "/"
+            path = raw_path.split("?", 1)[0]
         log.record("request", perf_module.route_label(method, path),
                    time.time() - started, extra)
 
@@ -531,7 +613,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Serve a GET: API paths via handle_api, the rest as static files."""
-        raw_path, raw_query = self._split_target()
+        resolved = self._resolve_path()
+        if resolved is None:
+            return
+        raw_path, raw_query = resolved
         if _is_api_path(raw_path):
             self._handle_api(raw_path, raw_query)
         else:
@@ -551,7 +636,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_mutation(self) -> None:
         """Route a non-GET request: /api -> handler, static -> 405."""
-        raw_path, raw_query = self._split_target()
+        resolved = self._resolve_path()
+        if resolved is None:
+            return
+        raw_path, raw_query = resolved
         if _is_api_path(raw_path):
             self._handle_api(raw_path, raw_query)
         else:
@@ -580,6 +668,47 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         else:
             path, query = target, ""
         return path, query
+
+    def _resolve_path(self) -> Optional[Tuple[str, str]]:
+        """Split the request target and strip the server's URL prefix.
+
+        Returns ``(path, query)`` to route normally through the API/
+        static split and (for a static path) the traversal guard, or
+        ``None`` after already writing a redirect response — the
+        bare-prefix-no-trailing-slash case (see :func:`_strip_prefix`).
+
+        EVERY entry point (``do_GET``, and ``do_POST``/``do_PUT`` via
+        ``_handle_mutation``) goes through this ONE place, before
+        anything else runs, so prefix handling cannot diverge between
+        methods and cannot be bypassed by either — and it runs BEFORE
+        the traversal guard in ``_serve_static``, so a prefixed
+        traversal attempt (``/testboard/../etc/passwd``) reaches that
+        guard exactly as an unprefixed one does, just with the prefix
+        already removed from the front.
+        """
+        # Reset first: a worker serves many requests on one keep-alive
+        # connection, and a redirect below must not leave a PRIOR
+        # request's resolved path for _record_request to log against
+        # this one.
+        self._resolved_path = None
+        raw_path, raw_query = self._split_target()
+        server = cast(ThreadingHTTPServer, self.server)
+        prefix = getattr(server, "url_prefix", "")
+        path, redirect_to = _strip_prefix(raw_path, prefix)
+        if redirect_to is not None:
+            location = redirect_to + ("?" + raw_query if raw_query else "")
+            # 307 (Temporary Redirect), not 301/308: it preserves the
+            # request method exactly like 308 but — unlike 308, and
+            # unlike 301/302's browser-side method-downgrade-to-GET —
+            # is never cached as PERMANENT. A canonicalization redirect
+            # that a browser caches forever is a small piece of state a
+            # deploy cannot take back with a rollback; 307 costs
+            # nothing here (every real client re-requests it) and stays
+            # fully reversible.
+            self._write_response(307, [("Location", location)], b"")
+            return None
+        self._resolved_path = path
+        return path, raw_query
 
     def _handle_api(self, raw_path: str, raw_query: str) -> None:
         """Build an api.Request, delegate to handle_api, write the result."""
@@ -888,6 +1017,7 @@ def create_server(
     workers: Optional[int] = None,
     perf: Optional[perf_module.PerfLog] = None,
     site_notes_path: Optional[str] = None,
+    url_prefix: str = DEFAULT_URL_PREFIX,
 ) -> ThreadingHTTPServer:
     """Create (and bind) the dashboard HTTP server; caller serves/closes it.
 
@@ -904,6 +1034,16 @@ def create_server(
     *site_notes_path* points at this site's own What's new notes (see
     :mod:`testboard.site_notes`). It is read per request, so a note added
     by ``tools/add_site_note.py`` appears without a restart.
+
+    *url_prefix* (WP-28) is stripped once at the top of every request,
+    at a path-segment boundary, before the API/static split and before
+    the traversal guard — see :func:`_strip_prefix`. Bare paths
+    (``/api/...``, ``/index.html``) always keep working REGARDLESS of
+    this setting, which is what makes the default (:data:`DEFAULT_URL_PREFIX`)
+    harmless wherever nginx is absent. Leading/trailing slashes are
+    stripped so ``"testboard"``, ``"/testboard"``, ``"/testboard/"`` and
+    ``"testboard/"`` all mean the same thing; ``""`` disables prefix
+    handling entirely.
     """
     handler = cast(
         Type[http.server.BaseHTTPRequestHandler], _DashboardRequestHandler
@@ -920,4 +1060,5 @@ def create_server(
     server.static_cache_lock = threading.Lock()
     server.perf = perf
     server.site_notes_path = site_notes_path
+    server.url_prefix = url_prefix.strip("/")
     return server

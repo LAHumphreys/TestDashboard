@@ -176,7 +176,7 @@ async function init() {
               // be a second request for data the page already has
   }
   try {
-    const data = await fetchJson("/api/summary?parts=headline");
+    const data = await fetchJson("api/summary?parts=headline");
     renderSwitcher(container, data.products || []);
   } catch (err) {
     /* Decoration: a failed fetch leaves the page exactly as it shipped. */

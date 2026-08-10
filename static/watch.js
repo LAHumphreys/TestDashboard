@@ -547,7 +547,7 @@ async function refresh() {
   }
   empty.hidden = true;
   try {
-    const data = await fetchJson("/api/watch?" + currentQuery().toString());
+    const data = await fetchJson("api/watch?" + currentQuery().toString());
     clearNode(grid);
     const total = data.cards.length;
     data.cards.forEach((card, index) => {
@@ -633,8 +633,8 @@ async function populatePicker() {
   let entries = { p: [], e: [], s: [] };
   try {
     const [summary, environments] = await Promise.all([
-      fetchJson("/api/summary?parts=headline"),
-      fetchJson("/api/environments"),
+      fetchJson("api/summary?parts=headline"),
+      fetchJson("api/environments"),
     ]);
     const productNames = summary.products.map((entry) => entry.product);
     entries.p = productNames.map((name) => ({ value: name, label: name }));
@@ -643,7 +643,7 @@ async function populatePicker() {
     }));
     const streamLists = await Promise.all(
       [""].concat(productNames).map((product) =>
-        fetchJson("/api/streams?product=" + encodeURIComponent(product))
+        fetchJson("api/streams?product=" + encodeURIComponent(product))
           .catch(() => ({ streams: [] }))));
     for (const page of streamLists) {
       for (const stream of page.streams) {
