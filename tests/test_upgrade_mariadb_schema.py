@@ -554,6 +554,118 @@ if backends.MARIADB_AVAILABLE:
             self.assertIn("mysqldump", output)
             self.assertIn("streams table", output)
 
+    class InstantAddColumnTest(unittest.TestCase):
+        """Does THIS server accept ALGORITHM=INSTANT for the runs.stream_id
+        ADD COLUMN -- the single claim that decides whether tomorrow's
+        runs step (~4.4M rows in production) is ~0 seconds or a table
+        rebuild with a downtime window sized for it.
+
+        Deliberately NOT a timing assertion. On a fixture-sized table (a
+        handful of rows, same as every other test in this file) INSTANT
+        and a full COPY rebuild both finish in milliseconds -- a clock
+        cannot tell them apart at this scale, which is exactly the gap
+        this test closes. Forcing ALGORITHM=INSTANT explicitly asks the
+        SERVER to declare its own capability: it either accepts the
+        statement (instant IS available for this exact ADD COLUMN, on
+        this exact server version, full stop) or refuses it with an
+        error naming the reason (instant is NOT available, whatever the
+        row count). That is a statement about the server, not about how
+        long anything took here.
+
+        Session-local MariaDB proved this on 12.3.2 (this package's own
+        commit history: an explicit ALGORITHM=INSTANT force-succeeded at
+        500,000 synthetic rows). This test is what makes the SAME claim
+        true of whatever server actually runs it -- in particular CI's
+        `python36-mariadb`/`python36-mariadb-upgraded` legs, which run
+        against `mariadb:10.3`, production's actual stream. A failure
+        here on that leg is not a test bug to work around; it is the
+        finding the whole probe existed to surface, and the drop note's
+        timing expectation and the operator's downtime window both need
+        to change if it fires.
+        """
+
+        def setUp(self) -> None:
+            self.tmp = tempfile.mkdtemp(prefix="testboard_instant_")
+            self.addCleanup(shutil.rmtree, self.tmp, True)
+            _recreate_database()
+            self.settings = _derived_settings()
+            db = migrate.connect(self.settings)
+            try:
+                for statement in migrate.split_statements(v7.ddl(SIZES)):
+                    migrate.execute(db, statement)
+                # A handful of rows, not many: the point is the server's
+                # capability, not a timing comparison at scale (that
+                # comparison is exactly what this test replaces with a
+                # real yes/no from the server).
+                conn = _connect_derived()
+                try:
+                    cur = conn.cursor()
+                    cur.executemany(
+                        "INSERT INTO runs (environment, script, "
+                        "test_name, result, start_time, end_time, "
+                        "source_link, known_failure_reason, "
+                        "output_fingerprint) VALUES "
+                        "(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        [("linux-sim", "suite/a.py",
+                          "test_{0}".format(n), "PASS",
+                          model.format_iso(
+                              START + datetime.timedelta(seconds=n)),
+                          model.format_iso(
+                              START + datetime.timedelta(seconds=n + 1)),
+                          "", None, None)
+                         for n in range(20)])
+                    cur.close()
+                finally:
+                    conn.close()
+            finally:
+                db.close()
+
+        def test_algorithm_instant_is_accepted_for_the_runs_add_column(
+                self) -> None:
+            # The EXACT statement tools/upgrade_mariadb_schema.py's
+            # step_8_to_9() emits for runs -- found by the same
+            # predicate the tool itself uses to recognise it
+            # (upgrade._touches_runs_stream_id), not retyped by hand,
+            # so this test cannot silently drift from what a live
+            # upgrade actually runs.
+            now_iso = "2026-08-11T00:00:00.000000"
+            runs_statement = None
+            for statement in upgrade.step_8_to_9(now_iso):
+                if upgrade._touches_runs_stream_id(statement):
+                    runs_statement = statement
+                    break
+            self.assertIsNotNone(
+                runs_statement,
+                "step_8_to_9() no longer emits a statement "
+                "upgrade._touches_runs_stream_id recognises -- this "
+                "test cannot find what to probe; fix the mismatch "
+                "before trusting either side")
+
+            forced = runs_statement + ", ALGORITHM=INSTANT"
+            db = migrate.connect(self.settings)
+            try:
+                try:
+                    migrate.execute(db, forced)
+                except migrate.DatabaseError as exc:
+                    self.fail(
+                        "CRITICAL FINDING: this MariaDB server REFUSED "
+                        "ALGORITHM=INSTANT for the runs.stream_id ADD "
+                        "COLUMN -- {0!r}. This means the runs step of "
+                        "tools/upgrade_mariadb_schema.py's upgrade (~4.4M "
+                        "rows in production) will NOT complete in "
+                        "roughly zero seconds as this tool's DEV timing "
+                        "on a newer local server suggested. It will fall "
+                        "back to a table rebuild, and per "
+                        "docs/MARIADB_MIGRATION.md sections 0/E.1 "
+                        "('tens of minutes at best' for a full load of a "
+                        "table this size), the drop note's timing "
+                        "expectation and the operator's downtime window "
+                        "both need to change before this migration runs "
+                        "against production. Do not soften or retry "
+                        "this finding away.".format(exc))
+            finally:
+                db.close()
+
     def _ns(**kwargs: Any) -> Any:
         class _NS(object):
             pass
