@@ -6663,6 +6663,87 @@ class Storage:
             return None
         return row[0]
 
+    def _write_bulk_assignments(
+        self,
+        conn: sqlite3.Connection,
+        assignee: Optional[str],
+        assigned_by: str,
+        assigned_at_iso: str,
+        comment_text: Optional[str],
+        entries: Sequence[Tuple[str, str, str, Optional[int]]],
+        existing_current: Set[Tuple[str, str, str]],
+    ) -> None:
+        """The WRITE phase :meth:`bulk_set_assignee` and
+        :meth:`bulk_set_assignee_for_triples` share VERBATIM: one
+        ``assignments`` history ``executemany``, the
+        ``current_assignments`` update/insert split, and the optional
+        per-triple comment — all against the SAME already-open
+        transaction (*conn*, mid ``BEGIN IMMEDIATE`` — callers commit or
+        roll back). :meth:`ensure_user` and the transaction boundary
+        itself stay with each caller, since the two modes resolve their
+        matched set completely differently (a filter-mode SELECT vs. a
+        triples-mode existence chunk) before either can call this.
+
+        *entries* is ``(environment, script, test_name, origin_stream_id)``
+        — filter mode's origin is always ``None`` (Open Actions is
+        unscoped, docs/STREAMS_PLAN.md §0.4); triples mode carries each
+        entry's OWN origin, exactly what a row-level
+        :meth:`set_assignee` call would write for that one triple.
+        *existing_current* is the subset of *entries*' triples that
+        already have a ``current_assignments`` row — SELECT-then-
+        UPDATE-or-INSERT, never ``INSERT OR REPLACE``, same rule as
+        every other upsert in this module.
+        """
+        conn.executemany(
+            "INSERT INTO assignments (environment, script, "
+            "test_name, assignee, assigned_by, assigned_at, "
+            "stream_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (env, scr, test, assignee, assigned_by, assigned_at_iso,
+                 origin)
+                for (env, scr, test, origin) in entries
+            ],
+        )
+        to_update = [
+            entry for entry in entries
+            if (entry[0], entry[1], entry[2]) in existing_current
+        ]
+        to_insert = [
+            entry for entry in entries
+            if (entry[0], entry[1], entry[2]) not in existing_current
+        ]
+        if to_update:
+            conn.executemany(
+                "UPDATE current_assignments SET assignee = ?, "
+                "stream_id = ? WHERE environment = ? "
+                "AND script = ? AND test_name = ?",
+                [
+                    (assignee, origin, env, scr, test)
+                    for (env, scr, test, origin) in to_update
+                ],
+            )
+        if to_insert:
+            conn.executemany(
+                "INSERT INTO current_assignments (environment, "
+                "script, test_name, assignee, stream_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (env, scr, test, assignee, origin)
+                    for (env, scr, test, origin) in to_insert
+                ],
+            )
+        if comment_text:
+            conn.executemany(
+                "INSERT INTO comments (environment, script, "
+                "test_name, author, created_at, text, stream_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                [
+                    (env, scr, test, assigned_by, assigned_at_iso,
+                     comment_text)
+                    for (env, scr, test, _origin) in entries
+                ],
+            )
+
     def bulk_set_assignee(
         self,
         assignee: Optional[str],
@@ -6760,55 +6841,18 @@ class Storage:
             if assignee is not None:
                 self.ensure_user(assignee, assigned_at)
             assigned_at_iso = model.format_iso(assigned_at)
-            triples = [
-                (row[0], row[1], row[2]) for row in rows
-            ]  # type: List[Tuple[str, str, str]]
-            conn.executemany(
-                "INSERT INTO assignments (environment, script, "
-                "test_name, assignee, assigned_by, assigned_at, "
-                "stream_id) VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                [
-                    (env, scr, test, assignee, assigned_by, assigned_at_iso)
-                    for (env, scr, test) in triples
-                ],
+            # Filter mode's origin is always NULL (Open Actions is
+            # unscoped, §0.4) -- see _write_bulk_assignments' docstring.
+            entries = [
+                (row[0], row[1], row[2], None) for row in rows
+            ]  # type: List[Tuple[str, str, str, Optional[int]]]
+            existing_current = {
+                (row[0], row[1], row[2]) for row in rows if row[3]
+            }  # type: Set[Tuple[str, str, str]]
+            self._write_bulk_assignments(
+                conn, assignee, assigned_by, assigned_at_iso, comment_text,
+                entries, existing_current,
             )
-            to_update = [
-                triple for triple, row in zip(triples, rows) if row[3]
-            ]
-            to_insert = [
-                triple for triple, row in zip(triples, rows) if not row[3]
-            ]
-            if to_update:
-                conn.executemany(
-                    "UPDATE current_assignments SET assignee = ?, "
-                    "stream_id = NULL WHERE environment = ? "
-                    "AND script = ? AND test_name = ?",
-                    [
-                        (assignee, env, scr, test)
-                        for (env, scr, test) in to_update
-                    ],
-                )
-            if to_insert:
-                conn.executemany(
-                    "INSERT INTO current_assignments (environment, "
-                    "script, test_name, assignee, stream_id) "
-                    "VALUES (?, ?, ?, ?, NULL)",
-                    [
-                        (env, scr, test, assignee)
-                        for (env, scr, test) in to_insert
-                    ],
-                )
-            if comment_text:
-                conn.executemany(
-                    "INSERT INTO comments (environment, script, "
-                    "test_name, author, created_at, text, stream_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                    [
-                        (env, scr, test, assigned_by, assigned_at_iso,
-                         comment_text)
-                        for (env, scr, test) in triples
-                    ],
-                )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -6818,4 +6862,113 @@ class Storage:
         # transaction, but the cache has exactly one invalidation
         # surface regardless of how many tables a mutator touched.
         self._invalidate_summary_cache()
-        return len(triples)
+        return len(entries)
+
+    def bulk_set_assignee_for_triples(
+        self,
+        assignee: Optional[str],
+        assigned_by: str,
+        assigned_at: datetime.datetime,
+        triples: Sequence[Tuple[str, str, str, Optional[int]]],
+        comment_text: Optional[str] = None,
+    ) -> Tuple[int, int]:
+        """Assign or clear EXACTLY the given triples — the multi-select
+        action bar's "assign selected"/"unassign selected", as opposed
+        to :meth:`bulk_set_assignee`'s "assign everything the current
+        filters match". Shares that method's WRITE phase VERBATIM
+        (:meth:`_write_bulk_assignments`); the two differ only in how
+        they resolve which rows to act on.
+
+        *triples* is ``(environment, script, test_name, stream_id)`` —
+        *stream_id* (WP-21 shape, already validated by the API layer)
+        is carried into ``assignments``/``current_assignments`` as that
+        ONE triple's own origin, exactly what a row-level
+        :meth:`set_assignee` call with the same ``stream_id`` would
+        write — unlike :meth:`bulk_set_assignee`, which always writes
+        ``NULL`` (a filtered bulk op from Open Actions is never "made
+        from" a stream page). A triple named twice keeps its LAST
+        origin (dict overwrite on the triple key) — the caller
+        (a Set-keyed frontend selection) does not produce duplicates in
+        practice, so this is a defensive tie-break, not a validated rule.
+
+        Returns ``(updated, unknown)``: *unknown* counts triples with NO
+        row in ``latest_runs`` for ANY stream — the page that built the
+        selection may be stale (a retirement, or the test simply never
+        having reported) — skipped, never a hard failure. Both counts
+        are over the DE-DUPED triple set, so ``updated + unknown`` is
+        the number of DISTINCT triples requested, not ``len(triples)``.
+
+        Cost: existence is resolved with ONE query PER CHUNK of
+        :data:`_RECENT_CHUNK` triples (the same chunking
+        :meth:`recent_results`/:meth:`failure_streak_bounds_many` use,
+        for the same reason — SQLite's 999-bound-parameter ceiling), so
+        the query count is flat in chunks-of-100, never one query per
+        row. Each chunk's query is ONE statement: a ``latest_runs``
+        lookup (served by ``idx_latest_runs_triple``, an index seek per
+        triple regardless of which stream(s) it has rows on — confirmed
+        by EXPLAIN QUERY PLAN, never a table scan) LEFT JOINed to
+        ``current_assignments`` — the SAME "does it exist, does it
+        already have a row" shape :meth:`bulk_set_assignee`'s own
+        SELECT gets from one query, just resolved for an explicit list
+        instead of a WHERE-clause filter.
+        """
+        by_triple = {}  # type: Dict[Tuple[str, str, str], Optional[int]]
+        for env, scr, test, origin in triples:
+            by_triple[(env, scr, test)] = origin
+        unique_triples = list(by_triple.keys())
+        if not unique_triples:
+            return 0, 0
+
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            found = {}  # type: Dict[Tuple[str, str, str], bool]
+            for start in range(0, len(unique_triples), _RECENT_CHUNK):
+                chunk = unique_triples[start:start + _RECENT_CHUNK]
+                clause = " OR ".join(
+                    "(environment = ? AND script = ? AND test_name = ?)"
+                    for _ in chunk
+                )
+                params = []  # type: List[str]
+                for triple in chunk:
+                    params.extend(triple)
+                rows = conn.execute(
+                    "SELECT d.environment, d.script, d.test_name, "
+                    "ca.environment IS NOT NULL FROM "
+                    "(SELECT DISTINCT environment, script, test_name "
+                    "FROM latest_runs WHERE ({0})) AS d "
+                    "LEFT JOIN current_assignments AS ca "
+                    "ON ca.environment = d.environment "
+                    "AND ca.script = d.script "
+                    "AND ca.test_name = d.test_name".format(clause),
+                    tuple(params),
+                ).fetchall()
+                for row in rows:
+                    found[(row[0], row[1], row[2])] = bool(row[3])
+
+            if not found:
+                conn.execute("COMMIT")
+                return 0, len(unique_triples)
+
+            self.ensure_user(assigned_by, assigned_at)
+            if assignee is not None:
+                self.ensure_user(assignee, assigned_at)
+            assigned_at_iso = model.format_iso(assigned_at)
+            entries = [
+                (env, scr, test, by_triple[(env, scr, test)])
+                for (env, scr, test) in found
+            ]  # type: List[Tuple[str, str, str, Optional[int]]]
+            existing_current = {
+                triple for triple, has_current in found.items()
+                if has_current
+            }  # type: Set[Tuple[str, str, str]]
+            self._write_bulk_assignments(
+                conn, assignee, assigned_by, assigned_at_iso, comment_text,
+                entries, existing_current,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        self._invalidate_summary_cache()
+        return len(found), len(unique_triples) - len(found)

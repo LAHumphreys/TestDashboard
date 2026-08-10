@@ -1642,6 +1642,357 @@ class TestBulkSetAssignee(StorageTestBase):
         self.assertEqual(writes, [])
 
 
+class TestBulkSetAssigneeForTriples(StorageTestBase):
+    """Storage.bulk_set_assignee_for_triples — the multi-select action
+    bar's "assign selected"/"unassign selected" (an EXPLICIT list of
+    triples, as opposed to :meth:`TestBulkSetAssignee`'s "everything
+    the current filters match"). Shares :meth:`Storage.bulk_set_assignee`'s
+    WRITE phase VERBATIM (:meth:`Storage._write_bulk_assignments`) — the
+    tests here that overlap with ``TestBulkSetAssignee`` above exist to
+    PROVE that sharing, not merely to re-cover the write mechanics.
+    """
+
+    def setUp(self) -> None:
+        super(TestBulkSetAssigneeForTriples, self).setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_a", start=BASE, result=Result.FAIL),
+            make_record(test_name="test_b", start=BASE, result=Result.PASS),
+            make_record(
+                environment="win-uat", script="other.py",
+                test_name="test_c", start=BASE,
+                result=Result.UNEXPECTED_PASS,
+            ),
+        ])
+        self.store.upsert_runs([make_record(
+            test_name="test_b", start=BASE, result=Result.PASS,
+            build="feat/x")])
+        self.build_stream_id = self.store.list_streams("")[0].stream_id
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_b", "carol", "dave", CREATED,
+            stream_id=self.build_stream_id,
+        )
+
+    def test_only_the_named_triples_are_touched(self) -> None:
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None)],
+        )
+        self.assertEqual((updated, unknown), (1, 0))
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"),
+            "alice")
+        # test_b was not named -- still carol's.
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "carol")
+
+    def test_unassign_over_named_triples(self) -> None:
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            None, "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "test_b", None)],
+        )
+        self.assertEqual((updated, unknown), (2, 0))
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"))
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"))
+
+    def test_insert_and_update_both_happen_in_one_call(self) -> None:
+        """test_a has never been assigned (insert path); test_b already
+        has a row (update path) -- both in the SAME call, same as a
+        mixed filter-mode match."""
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "test_b", None)],
+        )
+        self.assertEqual((updated, unknown), (2, 0))
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"),
+            "alice")
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_b"),
+            "alice")
+
+    def test_a_stream_id_per_triple_is_written_as_its_origin(self) -> None:
+        """The BUILD delta table's own selection: this triple's row
+        carries the SAME stream_id a row-level assign from that page
+        would send (docs/STREAMS_PLAN.md §3.4/§3.6) — unlike filter
+        mode, which always writes NULL."""
+        self.store.upsert_runs([make_record(
+            environment="win-uat", script="other.py", test_name="test_c",
+            start=BASE, result=Result.UNEXPECTED_PASS, build="feat/y")])
+        other_stream_id = [
+            s.stream_id for s in self.store.list_streams("")
+            if s.name == "feat/y"
+        ][0]
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", self.build_stream_id),
+             ("win-uat", "other.py", "test_c", other_stream_id)],
+        )
+        self.assertEqual((updated, unknown), (2, 0))
+        conn = self.store._conn()
+        row = conn.execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a'"
+        ).fetchone()
+        self.assertEqual(row[0], self.build_stream_id)
+        row = conn.execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'win-uat' AND script = 'other.py' "
+            "AND test_name = 'test_c'"
+        ).fetchone()
+        self.assertEqual(row[0], other_stream_id)
+        history = conn.execute(
+            "SELECT stream_id FROM assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(history[0], self.build_stream_id)
+
+    def test_a_triple_with_no_origin_writes_null(self) -> None:
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None)],
+        )
+        self.assertEqual((updated, unknown), (1, 0))
+        current = self.store._conn().execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a'"
+        ).fetchone()
+        self.assertIsNone(current[0])
+
+    def test_unknown_triples_are_skipped_not_a_hard_failure(self) -> None:
+        """A page can be stale (a retirement, or a triple that never
+        reported) -- unknown triples are counted, never fail the call."""
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "no_such_test", None),
+             ("nowhere", "nothing.py", "ghost", None)],
+        )
+        self.assertEqual((updated, unknown), (1, 2))
+        self.assertEqual(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"),
+            "alice")
+
+    def test_every_triple_unknown_writes_nothing_and_creates_no_user(
+        self
+    ) -> None:
+        before = self.store.list_users()
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("nowhere", "nothing.py", "ghost", None)],
+        )
+        self.assertEqual((updated, unknown), (0, 1))
+        self.assertEqual(self.store.list_users(), before)
+
+    def test_a_duplicated_triple_counts_once(self) -> None:
+        """updated + unknown is the DISTINCT triple count, not
+        len(triples) -- a duplicate keeps its LAST origin."""
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "test_a", self.build_stream_id)],
+        )
+        self.assertEqual((updated, unknown), (1, 0))
+        current = self.store._conn().execute(
+            "SELECT stream_id FROM current_assignments WHERE "
+            "environment = 'linux-sim' AND script = 'suite.py' "
+            "AND test_name = 'test_a'"
+        ).fetchone()
+        self.assertEqual(current[0], self.build_stream_id)
+
+    def test_comment_posted_on_every_named_triple(self) -> None:
+        self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("win-uat", "other.py", "test_c", None)],
+            comment_text="build looked dead",
+        )
+        for triple in (
+            ("linux-sim", "suite.py", "test_a"),
+            ("win-uat", "other.py", "test_c"),
+        ):
+            comments = self.store.comments(*triple)
+            self.assertEqual(len(comments), 1, triple)
+            self.assertEqual(comments[0].text, "build looked dead")
+        # Untouched (not in the list) -- no comment.
+        self.assertEqual(
+            self.store.comments("linux-sim", "suite.py", "test_b"), [])
+
+    def test_zero_triples_returns_zero_and_zero(self) -> None:
+        updated, unknown = self.store.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED, [])
+        self.assertEqual((updated, unknown), (0, 0))
+
+    def test_filter_mode_and_triples_mode_leave_identical_table_states(
+        self
+    ) -> None:
+        """The SAME matched set, reached the two different ways, must
+        leave storage in the SAME state -- the proof the write phase is
+        genuinely shared, not two implementations that happen to agree
+        today."""
+        # A second, identically-seeded store for the filter-mode side --
+        # a fresh temp file rather than self.store, so the two writes
+        # below cannot see or interfere with each other.
+        second_dir = tempfile.mkdtemp(prefix="testboard_storage_cmp_")
+        self.addCleanup(shutil.rmtree, second_dir, True)
+        store_b = Storage(os.path.join(second_dir, "test.db"))
+        self.addCleanup(store_b.close)
+        store_b.upsert_runs([
+            make_record(test_name="test_a", start=BASE, result=Result.FAIL),
+            make_record(test_name="test_b", start=BASE, result=Result.PASS),
+        ])
+        store_a_env_only = self.store
+        store_a_env_only.bulk_set_assignee_for_triples(
+            "alice", "bob", CREATED,
+            [("linux-sim", "suite.py", "test_a", None),
+             ("linux-sim", "suite.py", "test_b", None)],
+            comment_text="note",
+        )
+        store_b.bulk_set_assignee(
+            "alice", "bob", CREATED, environment="linux-sim",
+            comment_text="note",
+        )
+        for triple in (
+            ("linux-sim", "suite.py", "test_a"),
+            ("linux-sim", "suite.py", "test_b"),
+        ):
+            self.assertEqual(
+                store_a_env_only.current_assignee(*triple),
+                store_b.current_assignee(*triple), triple)
+            comments_a = [c.text for c in store_a_env_only.comments(*triple)]
+            comments_b = [c.text for c in store_b.comments(*triple)]
+            self.assertEqual(comments_a, comments_b, triple)
+
+    def test_atomicity_a_failure_mid_transaction_writes_nothing(
+        self
+    ) -> None:
+        real_conn = self.store._conn()
+
+        class _FlakyConn(object):
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *a: object, **kw: object) -> object:
+                return self._real.execute(sql, *a, **kw)
+
+            def executemany(
+                self, sql: str, *a: object, **kw: object
+            ) -> object:
+                if "current_assignments" in sql:
+                    raise sqlite3.OperationalError("synthetic failure")
+                return self._real.executemany(sql, *a, **kw)
+
+        proxy = _FlakyConn(real_conn)
+        self.store._conn = lambda: proxy  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.bulk_set_assignee_for_triples(
+                    "alice", "bob", CREATED,
+                    [("linux-sim", "suite.py", "test_a", None)],
+                )
+        finally:
+            del self.store._conn
+        self.assertIsNone(
+            self.store.current_assignee("linux-sim", "suite.py", "test_a"))
+        count = self.store._conn().execute(
+            "SELECT COUNT(*) FROM assignments WHERE assignee = 'alice'"
+        ).fetchone()[0]
+        self.assertEqual(
+            count, 0, "the history row survived a rolled-back transaction")
+
+    def test_the_query_count_is_flat_in_selected_row_count(self) -> None:
+        """250 selected triples (more than one _RECENT_CHUNK, WP-24's
+        list-mode-scale check) must not mean 250 SELECTs -- one SELECT
+        per chunk of 100 (ceil(250/100) = 3) plus two for
+        ensure_user(bob)/ensure_user(alice), each one SELECT
+        (:meth:`Storage.ensure_user`'s own existence check)."""
+        records = [
+            make_record(
+                script="bulk.py", test_name="test_{:03d}".format(i),
+                start=BASE, result=Result.FAIL,
+            )
+            for i in range(250)
+        ]
+        self.store.upsert_runs(records)
+        triples = [
+            ("linux-sim", "bulk.py", "test_{:03d}".format(i), None)
+            for i in range(250)
+        ]
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated, unknown = self.store.bulk_set_assignee_for_triples(
+                "alice", "bob", CREATED, triples)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual((updated, unknown), (250, 0))
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(
+            len(selects), 5,
+            "expected a chunk-bounded SELECT count (ceil(250/100)=3 "
+            "chunks + 2 ensure_user checks), got {0}: {1}".format(
+                len(selects), selects))
+
+    def test_500_triples_costs_five_chunks_not_five_hundred_selects(
+        self
+    ) -> None:
+        """A second point on the same line as the 250-row test above --
+        proves the count SCALES with chunks, not with a fixed constant
+        that happened to match one input size."""
+        records = [
+            make_record(
+                script="bulk.py", test_name="test_{:03d}".format(i),
+                start=BASE, result=Result.FAIL,
+            )
+            for i in range(500)
+        ]
+        self.store.upsert_runs(records)
+        triples = [
+            ("linux-sim", "bulk.py", "test_{:03d}".format(i), None)
+            for i in range(500)
+        ]
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated, unknown = self.store.bulk_set_assignee_for_triples(
+                "alice", "bob", CREATED, triples)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual((updated, unknown), (500, 0))
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")
+        ]
+        # ceil(500/100)=5 chunks + 2 ensure_user checks.
+        self.assertEqual(len(selects), 7, selects)
+
+    def test_empty_input_issues_no_writes(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            updated, unknown = self.store.bulk_set_assignee_for_triples(
+                "alice", "bob", CREATED, [])
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual((updated, unknown), (0, 0))
+        writes = [
+            s for s in seen
+            if s.strip().upper().startswith(("INSERT", "UPDATE"))
+        ]
+        self.assertEqual(writes, [])
+
+
 class TestThreading(StorageTestBase):
     """Per-thread connections: writes in one thread visible in another."""
 
