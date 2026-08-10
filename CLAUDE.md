@@ -18,12 +18,15 @@ The other documents, and what each is for:
 | Document | What it is | How to treat it |
 |---|---|---|
 | `docs/SESSION_HANDOVER.md` | State of play, right now | **Rewrite** it when the state changes |
-| `docs/UPGRADE_PLAN.md` | Work orders, WP-0 … WP-16, plus the migration version registry | Claim a migration version here before writing one |
+| `docs/UPGRADE_PLAN.md` | Work orders WP-14 … WP-19 (still open, or still binding as shipped) plus the migration version registry (§1); WP-0 … WP-13 collapsed to one-line pointers now that they have all shipped | Claim a migration version here before writing one; §1 is load-bearing, keep it verbatim |
 | `docs/UPGRADE_PLAN_STATUS.md` | Running log: what was done, what was measured, what was decided and why | **Append only.** Never rewrite an entry |
 | `docs/drops/YYYY-MM-DD.md` | **Operator note for one drop** — what changed, how to deploy it, how to roll it back, what was not verified | One per drop, written before it ships. See below |
 | `docs/MARIADB_MIGRATION.md` | Runbook for the SQLite → MariaDB move | Fix it in the same commit if you find it wrong |
+| `docs/STREAMS_PLAN.md` | Products/streams design — decisions (§0), data model, cross-cutting rules (§6); WP-20 … WP-23's detailed specs are cut now that all four shipped | Keep §0/§6 and any decision still binding; the shipped code and status log are the record for the rest |
+| `docs/FEEDER_TEMPLATE.md` | Template for a **new** product's single-file feeder (`clients/feeder.py` / `clients/feeder.tcl`) — the wire contract, the one function to implement, worked examples | Treat as a frozen contract: additive changes only; update alongside the engine files it documents |
 | `static/whatsnew.html` | What the testers see | Every user-visible change goes in it |
 | `docs/BRIEF_dashboard.md`, `docs/BRIEF_feeder_copilot.md` | The original briefs | **Historical.** Useful for intent; the code and the log are the source of truth now, and both have moved on |
+| `docs/FEEDER_BRIEF.md` | Brief for the older, checkout-based feeder's (`run_feeder.py`) site-specific reader | **Superseded for new products** by `FEEDER_TEMPLATE.md`, but — unlike the two briefs above — still the accurate, tested reference for the one product still running that feeder unchanged; it has not "moved on" from the code |
 
 ## Working practice
 
