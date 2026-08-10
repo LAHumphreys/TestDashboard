@@ -65,7 +65,7 @@
         <input id="add-cadence-hours" type="text" inputmode="numeric"
                placeholder="hours" aria-label="Custom hours" size="4">
       </label>
-      <button id="add-card-btn" type="button">Add card</button>
+      <button id="add-card-btn" type="button" class="btn-primary">Add card</button>
       <span class="toolbar-spacer"></span>
       <button id="save-default-btn" type="button">Save as my default</button>
       <span id="save-status" class="muted" role="status"></span>
@@ -77,13 +77,17 @@
              aria-label="This Watchlist's URL">
     </section>
 
-    <p id="empty-state" class="empty-state" hidden>
-      No cards yet. A Watchlist is a page you build once: add an
-      environment or a product above, then "Save as my default" so a
-      bare visit to this page opens straight to it — and "Copy link"
-      turns whatever is on screen into a URL you can hand to anyone,
-      no account needed.
-    </p>
+    <div id="empty-state" class="empty-state watch-empty-state" hidden>
+      <h2 class="watch-empty-heading">No cards yet</h2>
+      <p class="watch-empty-lead">A Watchlist is a page you build once.</p>
+      <ol class="watch-empty-steps">
+        <li>Add an environment, product, or build above.</li>
+        <li>Click <strong>"Save as my default"</strong> so a bare visit to
+          this page opens straight to it.</li>
+        <li>Click <strong>"Copy link"</strong> to turn whatever's on screen
+          into a URL you can hand to anyone — no account needed.</li>
+      </ol>
+    </div>
 
     <div id="watch-grid" class="watch-grid"></div>
   </main>

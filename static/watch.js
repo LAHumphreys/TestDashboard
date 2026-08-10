@@ -366,16 +366,7 @@ function buildOkCard(card, index, total) {
     div.appendChild(el("p", "watch-card-stale", stale));
   }
 
-  const link = cardLink(card);
-  if (link) {
-    const a = document.createElement("a");
-    a.href = link;
-    a.className = "watch-card-open";
-    a.textContent = "Open in dashboard →";
-    div.appendChild(a);
-  }
-
-  div.appendChild(buildCardControls(index, total));
+  div.appendChild(buildCardFooter(card, index, total));
   return div;
 }
 
@@ -463,16 +454,7 @@ function buildStreamCard(card, index, total) {
     div.appendChild(el("p", "watch-card-stale", stale));
   }
 
-  const link = cardLink(card);
-  if (link) {
-    const a = document.createElement("a");
-    a.href = link;
-    a.className = "watch-card-open";
-    a.textContent = "Open in dashboard →";
-    div.appendChild(a);
-  }
-
-  div.appendChild(buildCardControls(index, total));
+  div.appendChild(buildCardFooter(card, index, total));
   return div;
 }
 
@@ -483,30 +465,58 @@ function buildErrorCard(card, index, total) {
   head.appendChild(el("span", "watch-card-name", card.name));
   div.appendChild(head);
   div.appendChild(el("p", "watch-card-error-text", card.error));
-  div.appendChild(buildCardControls(index, total));
+  const footer = el("div", "watch-card-footer");
+  footer.appendChild(buildCardControls(index, total));
+  div.appendChild(footer);
   return div;
 }
 
-/** Remove / up / down — drag-free reorder, keyboard-reachable. */
+/** Remove / up / down — drag-free reorder, keyboard-reachable. Hidden
+ * until hovered or focused (CSS opacity/focus-within on the parent
+ * `.watch-card`); stays in normal flow throughout so revealing them
+ * never reflows the card and Tab order is unaffected. */
 function buildCardControls(index, total) {
   const row = el("div", "watch-card-controls");
-  const up = el("button", "link-btn", "↑ Move up");
+  const up = el("button", "watch-card-control-btn", "↑ Move up");
   up.type = "button";
   up.disabled = index === 0;
   up.addEventListener("click", () => moveCard(index, -1));
   row.appendChild(up);
 
-  const down = el("button", "link-btn", "↓ Move down");
+  const down = el("button", "watch-card-control-btn", "↓ Move down");
   down.type = "button";
   down.disabled = index === total - 1;
   down.addEventListener("click", () => moveCard(index, 1));
   row.appendChild(down);
 
-  const remove = el("button", "link-btn watch-card-remove", "Remove");
+  const remove = el(
+    "button", "watch-card-control-btn watch-card-remove", "Remove");
   remove.type = "button";
   remove.addEventListener("click", () => removeCard(index));
   row.appendChild(remove);
   return row;
+}
+
+/**
+ * The card's bottom row: the "Open in dashboard" link on the left
+ * (when the card has one — an error card never does, cardLink() is
+ * simply not called for it) and the hover-reveal controls on the
+ * right, as ONE hairline-separated footer rather than two stacked
+ * elements — otherwise the controls fading in/out would shove the
+ * link up and down a line each time.
+ */
+function buildCardFooter(card, index, total) {
+  const footer = el("div", "watch-card-footer");
+  const link = cardLink(card);
+  if (link) {
+    const a = document.createElement("a");
+    a.href = link;
+    a.className = "watch-card-open";
+    a.textContent = "Open in dashboard →";
+    footer.appendChild(a);
+  }
+  footer.appendChild(buildCardControls(index, total));
+  return footer;
 }
 
 /* ================= data ================= */
