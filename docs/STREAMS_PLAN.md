@@ -814,7 +814,7 @@ recorded here rather than left implicit:
   tests): **0.038–0.041s** for entry 10 alone (brought to v9 first),
   **~0.17–0.18s** for entries 8+9+10 combined from v7 (production's
   current version) — both consistently reproduced across repeated runs
-  this session. Differs noticeably from the 2026-08-14 note's earlier
+  this session. Differs noticeably from the 2026-08-11 note's earlier
   v7→v9 number (0.806s, migration 9 alone 0.883s); the two sessions ran
   on the same machine at different times, and no attempt was made to
   reconcile the difference beyond noting it — see CLAUDE.md's "measure,
@@ -911,7 +911,7 @@ recorded here rather than left implicit:
   both branches, the branch's own FAIL count differing correctly from
   mainline's, tab-switching both directions, the drift line's exact
   wording, and a genuine zero-stream-param mainline load touching none
-  of the new elements at all. See `docs/drops/2026-08-14.md` for the
+  of the new elements at all. See `docs/drops/2026-08-11.md` for the
   full account.
 - **F7 fix (usability sweep, found after first human use of the
   branch dashboard): §5.2's "Timeline/Time pages accept `stream=`"
@@ -1700,7 +1700,7 @@ recorded here rather than left implicit:
     fall back to the 36-hour wall-clock window, that specific
     cutoff-keyed cache stops helping until the estate is active again —
     documented, correct, and not separately measured live. See
-    `docs/drops/2026-08-14.md`'s "Addendum 4" for the full account.
+    `docs/drops/2026-08-11.md`'s "Addendum 4" for the full account.
 
 ---
 

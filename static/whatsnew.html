@@ -35,9 +35,9 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
-    <section class="release" data-drop-date="2026-08-14">
+    <section class="release" data-drop-date="2026-08-11">
       <div class="section-head">
-        <h2 class="eyebrow">14 August 2026</h2>
+        <h2 class="eyebrow">11 August 2026</h2>
         <span class="muted">New: products, the Watch page, and uploaded builds compared against mainline or each other</span>
       </div>
 
@@ -45,70 +45,52 @@
       <ul>
         <li><strong>Products.</strong> If your site runs more than one
           product, a <strong>Product</strong> switcher now appears at the
-          top of every page, scoping everything on it to the one you pick —
-          declared in the "Environment expectations" section of Open
+          top of every page, scoping everything on it to the one you pick
+          — declared in the "Environment expectations" section of Open
           actions. Nothing changes if your site only runs one.</li>
         <li><strong>A new Watch page.</strong> Build a grid of cards for
           the environments, products and builds you personally check, and
-          share the page by copying its URL — there's no login and nothing
-          saved on the server. Find it in the nav, labelled Watch.</li>
+          share it by copying the URL — no login, nothing saved on the
+          server. Each card leads with the two numbers a morning scan
+          needs: unassigned failures (red — click it to open them) and
+          how long ago the last result arrived; add <code>@1d</code>,
+          <code>@7d</code> or custom hours to a card to have it flag
+          itself when overdue. In the nav, labelled Watch.</li>
         <li><strong>Uploading builds and comparing them.</strong> A CI
-          build or a one-off upload can now show up beside your nightly
+          build or a one-off upload can show up beside your nightly
           results without touching them. Once one exists, a
           <strong>Build</strong> picker appears next to the Environment
-          filter on the dashboard (and now on Time and Timeline too) — pick
-          one to compare it against mainline, or use the
-          <strong>Compare to</strong> box on its page to compare it against
-          any other build of the same product instead.</li>
+          filter (dashboard, Time and Timeline) — pick one to compare
+          against mainline, or use <strong>Compare to</strong> on its
+          page to compare against any other build of the same
+          product.</li>
         <li><strong>Assigning from a build's failures.</strong> Every row
           in a build's comparison table can be assigned, taken, or
           reviewed right there — the same triage you already do on the
-          home screen, one click closer. A build's failure never offers to
-          retire the test; that stays a mainline call.</li>
+          home screen. A build's failure never offers to retire the
+          test; that stays a mainline call.</li>
         <li><strong>Per-build test history and suite pages.</strong> A
-          test's own page now has an "Every build" section showing its
+          test's own page has an "Every build" section showing its
           result on every build of its product at once; a suite's
-          execution history page now works for any build too, not only
-          mainline.</li>
-        <li><strong>Highlights and staleness cadences.</strong> Every
-          Watch card leads with the two numbers a morning scan needs:
-          unassigned failures (red and clickable when there are any)
-          and how long ago the last result arrived. A card with a
-          failing, unowned test also gets a red-tinted border; add
-          <code>@1d</code>, <code>@7d</code>, or a custom hour count to
-          a card to have it flag itself when it's overdue.</li>
+          execution history page works for any build too.</li>
         <li><strong>A long-running build gets its own dashboard.</strong>
-          Open one that's been running for weeks and you'll see two tabs:
-          <strong>Its own results</strong> (the same tiles, trend and
-          triage queues as the home screen, scoped to it alone) and
+          Open one that's been running for weeks and you'll see two
+          tabs: <strong>Its own results</strong> (the same tiles, trend
+          and triage queues as the home screen, scoped to it alone) and
           <strong>Difference from mainline</strong> — which one opens
-          first, and why, is stated in a line under the tabs.</li>
-        <li>The test page's "Latest run" line now has its own
-          "View in timeline" link — the same jump the dashboard's
-          review panel already offered, so you no longer lose it by
-          opening the full test page first.</li>
-        <li><strong>Open actions now shows every assigned test,
-          whatever its result.</strong> "Needs action" means failing,
-          stale annotation, or assigned to someone — before, an
-          assignment on a passing test (say, someone asked to
-          investigate why a test didn't run on a build) simply
-          appeared nowhere.</li>
-        <li><strong>Assign or unassign everything you're looking at, in
-          one click.</strong> Open actions now has a bulk control:
-          assign every test matching your current filters to one
-          person (with an optional note posted on each of them), or
-          clear the lot — handy for cleaning up after an abandoned
-          build, where dozens of assignments used to need clearing one
-          row at a time. <strong>Now with tick boxes, everywhere tests
-          are listed</strong> — Open actions, the dashboard's triage
-          queues and All tests table, and a build's comparison table —
-          so you can hand-pick a handful of rows instead of filtering
-          down to exactly them: tick the ones you want, a bar appears
-          at the bottom of the screen, pick who to assign them to (a
-          dropdown, not a typing box) and click Assign.</li>
+          first, and why, is stated under the tabs.</li>
+        <li><strong>Open actions covers everything that needs a
+          person.</strong> "Needs action" lists failing tests, stale
+          annotations, and every assigned test whatever its result. Act
+          in bulk from there: assign or clear everything your filters
+          match in one go, with an optional note posted on each test —
+          or tick individual rows anywhere tests are listed and assign
+          just those from the bar that appears.</li>
+        <li>The test page's "Latest run" line links straight into the
+          Timeline — the same jump the dashboard's review panel
+          offers.</li>
       </ul>
     </section>
-
     <section class="release" data-drop-date="2026-08-07">
       <div class="section-head">
         <h2 class="eyebrow">7 August 2026</h2>

@@ -21,7 +21,7 @@ was merged to `master` overnight, by instruction.
 > then merge `streams-upgrade` → `master`; (5) re-date the drop note +
 > `whatsnew.html` to the actual ship day (`DropDateTest` holds them in
 > lockstep but cannot catch a date wrong the same way in both); (6)
-> deploy per [`drops/2026-08-14.md`](drops/2026-08-14.md).
+> deploy per [`drops/2026-08-11.md`](drops/2026-08-11.md).
 
 ---
 

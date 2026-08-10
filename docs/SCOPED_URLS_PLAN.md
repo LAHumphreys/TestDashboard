@@ -62,7 +62,7 @@ hand-built URL. That is what this package removes.
    documented URL language (`STREAMS_PLAN.md` §2.4) with its own
    round-trip tests. The exemption is stated in the guard test with
    this reasoning, not silently.
-5. Ship as part of the same pending drop (`docs/drops/2026-08-14.md`);
+5. Ship as part of the same pending drop (`docs/drops/2026-08-11.md`);
    no migration, no API change, no wire change.
 
 ## 3. The module — `static/urls.js`

@@ -98,7 +98,7 @@ review — smaller than WP-21, larger than a fix round.
 2. **Rewrite the combined drop's What's New section for scannability.**
    User verdict: "simply unreadable — no one will get past the first
    section... highlight the new functionality, not a work of
-   literature." Rewrite `static/whatsnew.html`'s 2026-08-14 section
+   literature." Rewrite `static/whatsnew.html`'s 2026-08-11 section
    AFTER the kind collapse (so wording matches the one-kind world):
    lead with what a tester can now DO, one short bullet per capability
    (products switcher and scoping; the Watch page and its URL-shared

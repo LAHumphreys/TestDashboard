@@ -12,7 +12,7 @@ re-verify loop after any fix is `python .scratch\net\run_net.py`
 `2026.9.0` → `2026.9.1`; `corvus-main` is the old-client, no-product,
 no-streams environment; `linux-sim`/`linux-uat-sim`/`win-sim` are the
 bulk mainline estate). Fresh perf log at the scratchpad's
-`morning-perf.log`. Code is `streams-upgrade` tip `df7c1d1`.
+`morning-perf.log`. Code is the `streams-upgrade` tip (git log --oneline -1).
 
 **Start URLs:** manager `http://127.0.0.1:8791/watch.html` ·
 delver `http://127.0.0.1:8791/index.html` ·
@@ -140,4 +140,4 @@ this before you; these two are where trouble is most likely):
 fix), then the ship path in `SESSION_HANDOVER.md` — `wp-18-timeline` →
 `master` first, `streams-upgrade` → `master` second, re-date the drop
 note + `whatsnew.html` to the real ship day, deploy per
-`docs/drops/2026-08-14.md`.
+`docs/drops/2026-08-11.md`.

@@ -648,7 +648,7 @@ paginated rows echo the current assignee; dashboard rows additionally carry
 
 ### POST /api/assignments/bulk — assign or clear a whole filtered set
 
-Added 2026-08-14, for Open Actions' bulk assign/unassign: assignments left
+Added 2026-08-11, for Open Actions' bulk assign/unassign: assignments left
 behind by an abandoned build used to be cleared one row at a time. This acts
 on the SAME set of tests `GET /api/dashboard` would return for an identical
 query string — filter parsing is one shared function
