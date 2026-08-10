@@ -106,6 +106,11 @@ this before you; these two are where trouble is most likely):
       and Build-originated narrows to it. (All morning-of fixes: this
       page's assign used to silently lose the origin, and an
       assignment on a passing test used to be visible nowhere.)
+- [ ] **NEW today: on Open Actions, filter to Build-originated** → the
+      new bulk control reads "Unassign all 1 filtered test(s)" → click
+      it → the row's assignee clears and it drops out of the
+      Build-originated filter (no `confirm()` — the count in the
+      button's own label is the only gate).
 - [ ] Back on the build dashboard: Compare-to → `2026.9.0` → the
       comparison re-scopes, and the verdict line now names mainline
       as the OTHER side.

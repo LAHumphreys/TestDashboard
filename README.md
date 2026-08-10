@@ -333,7 +333,7 @@ Query parameters (all optional):
 | `retired` | `1`/`true` — include tests retired as no longer in the suite (hidden by default) |
 | `assignee` | repeatable — only tests owned by these people |
 | `unassigned` | `1`/`true` — include tests nobody owns (ORed with `assignee`) |
-| `assigned` | `1`/`true` — only tests somebody owns, whatever their result (ANDed with the owner filters, so `assignee=` narrows it; contradicts `unassigned=1`, which then matches nothing). Added 2026-08-10; no page sends it today (Open Actions' default uses `open=` below) — kept for scripted queries and the planned bulk assignment operations |
+| `assigned` | `1`/`true` — only tests somebody owns, whatever their result (ANDed with the owner filters, so `assignee=` narrows it; contradicts `unassigned=1`, which then matches nothing). Added 2026-08-10; no page sends it today (Open Actions' default uses `open=` below) — kept for scripted queries and for `POST /api/assignments/bulk` below, which reads these SAME filters |
 | `open` | `1`/`true` — "needs action": failing, stale annotation, OR currently assigned to someone, whatever the result (an OR across the result and owner axes that the other params cannot compose). Open Actions' default view since 2026-08-10 — before it, an assignment on a passing test was reachable through no filter combination |
 | `origin` | `build` or `mainline` (WP-21; the non-mainline value was spelled `branch` until WP-25 renamed it before anything shipped) — only tests whose CURRENT assignment was made from a non-mainline stream, or made from mainline/never assigned, respectively; anything else → 400 |
 | `with_comment` | `1`/`true` — add `latest_comment` to each row (one index seek per returned row, so it is opt-in) |
@@ -645,6 +645,57 @@ every assignment ever made before WP-21. When given it must reference an existin
 stream (`404` otherwise). Both `GET /api/dashboard` rows and `GET /api/compare`'s
 paginated rows echo the current assignee; dashboard rows additionally carry
 `"assignment_stream_id"`.
+
+### POST /api/assignments/bulk — assign or clear a whole filtered set
+
+Added 2026-08-14, for Open Actions' bulk assign/unassign: assignments left
+behind by an abandoned build used to be cleared one row at a time. This acts
+on the SAME set of tests `GET /api/dashboard` would return for an identical
+query string — filter parsing is one shared function
+(`testboard.api._parse_dashboard_filters`), never a second hand-rolled copy
+that could drift from what the page above shows. Every `GET /api/dashboard`
+filter param in the table above is accepted here (`environment`, `script`,
+`result`, `q`, `stale`, `retired`, `assignee`, `unassigned`, `assigned`,
+`open`, `origin`, plus the product/`stream` scoping every other endpoint
+takes) — `sort`/`order`/`limit`/`offset`/`with_comment`/`with_streak` are not,
+since a bulk op acts on the whole matched set, not one page of it.
+
+Body:
+
+```json
+{"username": "alice-or-null", "assigned_by": "bob", "comment": "optional note"}
+```
+
+- `"username"` is **required**. A string sets every matched test's current
+  assignee to that one owner (bulk assign); `null` clears every matched
+  test's current assignment (bulk unassign). Validation matches
+  `PUT .../assignee` exactly: non-empty, max 100 chars, and a non-null
+  `username` naming a deactivated user is a `400`.
+- `"assigned_by"` is **required**, same validation as `PUT .../assignee`.
+- `"comment"`, if given and **non-empty after trimming whitespace**, is
+  posted as a comment on EVERY matched test, authored by `assigned_by`, in
+  the SAME transaction as the assignment change. Absent, `null`, or
+  whitespace-only all mean "no comment" — unlike `POST .../comments`' `text`,
+  which is required and 400s on empty, `comment` here is optional and its
+  non-emptiness gates whether it is used at all. A non-string value or one
+  over the shared 10000-character comment cap is still a `400`.
+
+Response: `{"updated": 12}` — the count of matched triples acted on, always
+equal to what `GET /api/dashboard` with the identical query string reports
+as `total`.
+
+Assignments stay **estate-level, one owner per (environment, script,
+test_name) triple** (`docs/STREAMS_PLAN.md` §0.4) — this endpoint never
+introduces per-stream ownership, and it never accepts or records a
+`stream_id` origin: unlike `PUT .../assignee`, there is no `stream_id` body
+field at all. Open Actions is unscoped, and an assignment origin is only
+ever recorded when the assignment was made FROM a stream-scoped page, which
+a bulk action from Open Actions is not — every row this endpoint touches
+gets `stream_id: NULL`, the same as a row-level assignment made from this
+page today. A matched row that WAS build-originated therefore leaves that
+origin-filter group the same way a row-level re-assign from Open Actions
+already does; re-running an identical `origin=build` bulk request finds
+nothing left to match.
 
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 

@@ -77,18 +77,41 @@ person" below.
   guard), and the test page gained the review panel's scoped "View in
   timeline →" link. Judgment calls went to the decision list, not code.
 
-## Decided in morning testing, 2026-08-10 — post-drop work, not in this drop
+## Decided in morning testing, 2026-08-10 — landed the same morning (WP-26)
 
-Open Actions gains **bulk unassign** and **bulk assign-with-comment**
-(user decision, 2026-08-10, while exploring abandoned-build cleanup:
-assignments from a dead build persist until cleared, and today that is
-per-row). Related finding to fold into the same work: `delete_stream`
-nulls `comments.stream_id` but NOT `current_assignments.stream_id`, so
-a dropped stream's assignments keep their origin-filter grouping while
-losing their tag. Assignments stay estate-level one-owner-per-triple
-(§0.4) — bulk operations act on the current filter, never introduce
-per-stream ownership. Not specced yet; task #8 in the session task
-list carries the design notes.
+Open Actions gained **bulk assign** and **bulk unassign, with an
+optional comment posted on every affected test** (user decision,
+2026-08-10, while exploring abandoned-build cleanup: assignments from
+a dead build persisted and cleanup was per-row) — `POST
+/api/assignments/bulk`, reusing GET `/api/dashboard`'s own filter
+parser (`testboard.api._parse_dashboard_filters`) so the two can never
+mean two different things by "everything the current filters match".
+Storage does it in one SELECT (already LEFT JOINed to
+`current_assignments`) plus bounded `executemany` writes, one
+transaction, no per-row round trip. Assignments stay estate-level
+one-owner-per-triple (§0.4) — bulk operations act on the current
+filter, never introduce per-stream ownership, and never write a
+`stream_id` origin (Open Actions is unscoped).
+
+The related finding — investigated while building the `drop_stream.py`
+visibility this decision also asked for — turned out **more
+interesting than the original note above claimed**: `delete_stream`
+nulls `comments.stream_id` with an explicit UPDATE, but
+`current_assignments.stream_id`/`assignments.stream_id` are left to
+the schema's declared `ON DELETE SET NULL` foreign key, and that FK is
+NOT equivalent on both backends (verified directly, see
+`Storage.assignments_referencing_stream`'s docstring). **SQLite**
+enforces it (`PRAGMA foreign_keys=ON` on every connection), so a
+stream delete auto-nulls the column — no dangling origin, ever, on
+today's production backend. **MariaDB**'s migrated schema declares no
+foreign keys at all, so there the id dangles exactly as the original
+note described. `tools/drop_stream.py` now prints the pre-delete count
+either way, worded for both outcomes rather than promising the
+MariaDB-only one. Not a regression to fix — `delete_stream`'s
+behavior is unchanged — but worth a look before the MariaDB cutover
+(Thread B below): the same divergence comments.stream_id was
+deliberately protected from was never closed for the two assignment
+tables.
 
 ## The morning decision list (needs the user, not a commit)
 
