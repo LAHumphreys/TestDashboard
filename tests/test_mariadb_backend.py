@@ -179,6 +179,14 @@ EXCLUDED_TESTS = {
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssignee.test_empty_input_issues_no_writes":
         "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssigneeForTriples."
+    "test_the_query_count_is_flat_in_selected_row_count":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssigneeForTriples."
+    "test_500_triples_costs_five_chunks_not_five_hundred_selects":
+        "counts queries via sqlite3's set_trace_callback.",
+    "TestBulkSetAssigneeForTriples.test_empty_input_issues_no_writes":
+        "counts queries via sqlite3's set_trace_callback.",
     "DropStreamTest.test_sqlite_fk_cascade_clears_the_origin_on_delete":
         "asserts SQLite's ON DELETE SET NULL foreign-key cascade on "
         "current_assignments.stream_id -- the migrated MariaDB schema "

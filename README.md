@@ -697,6 +697,54 @@ origin-filter group the same way a row-level re-assign from Open Actions
 already does; re-running an identical `origin=build` bulk request finds
 nothing left to match.
 
+#### List mode — an explicit set of triples
+
+Added 2026-08-10, for the multi-select action bar (tick boxes on every
+table where a test can be assigned, `static/selection.js`): the SAME
+endpoint, a different way of saying which tests to act on. Body carries
+`"tests"` instead of relying on the query string:
+
+```json
+{
+  "username": "alice-or-null", "assigned_by": "bob", "comment": "optional",
+  "tests": [
+    {"environment": "linux-sim", "script": "suite/alpha.py",
+     "test_name": "test_x"},
+    {"environment": "win-uat", "script": "other.py",
+     "test_name": "test_y", "stream_id": 7}
+  ]
+}
+```
+
+- **Mutually exclusive with every filter-mode query param** above
+  (`environment`, `script`, `result`, `q`, `stale`, `retired`, `assignee`,
+  `unassigned`, `assigned`, `open`, `origin`, `product`, `stream`) — a
+  request naming `tests` alongside any of them is `400`, asking two
+  different, possibly contradictory questions ("these exact rows" vs
+  "whatever currently matches this filter") at once.
+- Each entry is `{"environment", "script", "test_name"}` (all three
+  required, non-empty strings) plus an **optional** `"stream_id"` — WHERE
+  that ONE entry's selection was made from (a build's delta table row
+  carries its stream; a mainline table's rows carry none), exactly the
+  same annotation `PUT .../assignee`'s own `stream_id` body field records,
+  just per-entry. A malformed entry is a loud `400` naming the entry's
+  index (`"tests[2].test_name: ..."`) — unlike `POST /api/import`, these
+  records are built by this app's own selection UI a moment earlier, so a
+  bad shape is a bug worth surfacing immediately rather than skipping the
+  row silently. An unknown `stream_id` is a `404`, same index-naming.
+- `"username"`/`"assigned_by"`/`"comment"` follow the identical rules
+  filter mode uses above.
+- A triple absent from `latest_runs` (on ANY stream) is **not** a failure
+  — the page that built the selection may be stale (a retirement, or the
+  test simply never having reported) — it is counted in the response
+  instead. A triple repeated in `"tests"` counts once (last `stream_id`
+  wins).
+
+Response: `{"updated": 3, "unknown": 1}` — a **different shape** from
+filter mode's `{"updated": N}` (filter mode has no "unknown": a match is
+always current, read in the same transaction it acts on).
+`updated + unknown` is the count of DISTINCT triples named in `"tests"`.
+
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 
 A test that stops being reported shows up as "not run" forever. Retiring it is a

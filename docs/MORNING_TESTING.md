@@ -111,6 +111,15 @@ this before you; these two are where trouble is most likely):
       it → the row's assignee clears and it drops out of the
       Build-originated filter (no `confirm()` — the count in the
       button's own label is the only gate).
+- [ ] **NEW today: multi-select** — tick the leading checkbox on two
+      rows (any table: Open Actions, the dashboard's triage queue or
+      All tests, or a build's delta table) → a sticky bar appears at
+      the bottom of the screen reading "2 selected"; pick a user from
+      its dropdown (no free-text box — never a typo target), type an
+      optional note, click Assign → the bar hides itself and both rows
+      now show that assignee. Ticking a row on a build's delta table
+      should tag the assignment with that build's origin, same as its
+      own row-level assignee picker.
 - [ ] Back on the build dashboard: Compare-to → `2026.9.0` → the
       comparison re-scopes, and the verdict line now names mainline
       as the OTHER side.
