@@ -164,17 +164,13 @@ function cardLink(card) {
  * call site omits it and gets the exact unlinked stat this page has
  * always rendered.
  */
-function buildStat(label, value, href) {
+function buildStat(label, value) {
+  // The optional third (href) argument died with its one caller when
+  // the 2026-08-10 redesign moved the unassigned-failing count — and
+  // its F4 link — into the hero (buildHero above): the supporting
+  // stats below the hero are plain numbers again.
   const stat = el("div", "watch-stat");
-  if (href) {
-    const link = document.createElement("a");
-    link.href = href;
-    link.className = "watch-stat-value";
-    link.textContent = String(value);
-    stat.appendChild(link);
-  } else {
-    stat.appendChild(el("span", "watch-stat-value", String(value)));
-  }
+  stat.appendChild(el("span", "watch-stat-value", String(value)));
   stat.appendChild(el("span", "watch-stat-label", label));
   return stat;
 }
@@ -286,7 +282,68 @@ function applyWatchAccent(div, card) {
   }
 }
 
+/**
+ * The morning-scan hero (user redesign, 2026-08-10): the TWO numbers a
+ * manager scanning the board actually reads — how much is unowned, and
+ * how fresh the data is — promoted to the top of every ok card, big.
+ * Everything else (the category counts, the freshness detail line, the
+ * declared-staleness line) stays below as supporting detail.
+ *
+ * The unassigned count now shows even at ZERO — on a scan board,
+ * "0 unassigned failures" IS the good news being looked for. This
+ * deliberately supersedes §2.4's zero-adds-no-stat rule, which was
+ * about not changing pre-feature cards when the stat was introduced;
+ * the user's redesign makes the count the card's headline. The ACCENT
+ * border keeps its nonzero gate (applyWatchAccent, unchanged), and the
+ * F4 click-through link only renders when there is something to land
+ * on — a zero is a plain muted number, never a dead link.
+ *
+ * The freshness value is the SAME per-kind timestamp the card's
+ * declared-staleness judgment already uses (cardFreshnessIso:
+ * environment → last report, product → its laggard, stream →
+ * last_seen), phrased by ageText() from the two real values —
+ * WindowWordingTest's discipline — with the exact time in the title.
+ * A product card names its laggard in the label, so the big number is
+ * never read as "every environment is this fresh".
+ */
+function buildHero(card, nowMs) {
+  const hero = el("div", "watch-card-hero");
+
+  const unassigned = el("div", "watch-hero-stat");
+  const count = card.unassigned_failing || 0;
+  if (count > 0) {
+    const a = document.createElement("a");
+    a.href = unassignedStatLink(card);
+    a.className = "watch-hero-value watch-hero-alarm";
+    a.textContent = String(count);
+    unassigned.appendChild(a);
+  } else {
+    unassigned.appendChild(
+      el("span", "watch-hero-value watch-hero-ok", "0"));
+  }
+  unassigned.appendChild(el("span", "watch-hero-label",
+    count === 1 ? "unassigned failure" : "unassigned failures"));
+  hero.appendChild(unassigned);
+
+  const freshIso = cardFreshnessIso(card);
+  const fresh = el("div", "watch-hero-stat");
+  const value = el("span", "watch-hero-value",
+    ageText(freshIso, nowMs));
+  if (freshIso) {
+    value.title = formatTime(freshIso) + " (UTC)";
+  }
+  fresh.appendChild(value);
+  fresh.appendChild(el("span", "watch-hero-label",
+    card.kind === "product" && card.laggard
+      ? "last result (slowest: " + card.laggard.environment + ")"
+      : "last result"));
+  hero.appendChild(fresh);
+
+  return hero;
+}
+
 function buildOkCard(card, index, total) {
+  const nowMs = Date.now();
   const div = el("div", "card watch-card");
   applyWatchAccent(div, card);
   const head = el("div", "watch-card-head");
@@ -294,23 +351,17 @@ function buildOkCard(card, index, total) {
   head.appendChild(el("span", "watch-card-name", card.name));
   div.appendChild(head);
 
+  div.appendChild(buildHero(card, nowMs));
+
   const verdict = el("div", "watch-card-verdict");
   verdict.appendChild(buildStat("Failing", card.failing));
   verdict.appendChild(buildStat("New failures", card.new_failures));
   verdict.appendChild(buildStat("Fixed", card.fixed));
-  // Zero visible change (docs/STREAMS_PLAN.md §2.4): an
-  // unassigned-failure count of zero adds no stat and no accent — the
-  // card looks exactly as it did before this feature existed.
-  if (card.unassigned_failing) {
-    verdict.appendChild(buildStat(
-      "Unassigned failing", card.unassigned_failing,
-      unassignedStatLink(card)));
-  }
   div.appendChild(verdict);
 
   div.appendChild(el("p", "watch-card-fresh muted", freshnessLine(card)));
 
-  const stale = stalenessText(card, Date.now());
+  const stale = stalenessText(card, nowMs);
   if (stale) {
     div.appendChild(el("p", "watch-card-stale", stale));
   }
@@ -377,6 +428,7 @@ function baselineLabel(card) {
  * whole point is O(1) per card.
  */
 function buildStreamCard(card, index, total) {
+  const nowMs = Date.now();
   const div = el("div", "card watch-card");
   applyWatchAccent(div, card);
   const head = el("div", "watch-card-head");
@@ -384,6 +436,10 @@ function buildStreamCard(card, index, total) {
   head.appendChild(el("span", "watch-card-name", card.name));
   div.appendChild(head);
   div.appendChild(el("p", "row-sub", card.product));
+
+  // The same morning-scan hero every ok card gets (buildHero above) —
+  // cardFreshnessIso() picks last_seen for a stream card.
+  div.appendChild(buildHero(card, nowMs));
 
   const failing = card.both_failing + card.new_failures;
   div.appendChild(el("p", "watch-card-headline",
@@ -394,15 +450,8 @@ function buildStreamCard(card, index, total) {
   for (const key of CATEGORY_ORDER) {
     verdict.appendChild(buildStat(CATEGORY_LABELS[key], card[key]));
   }
-  // Zero visible change: see the identical comment in buildOkCard.
-  if (card.unassigned_failing) {
-    verdict.appendChild(buildStat(
-      "Unassigned failing", card.unassigned_failing,
-      unassignedStatLink(card)));
-  }
   div.appendChild(verdict);
 
-  const nowMs = Date.now();
   const fresh = el("p", "watch-card-fresh muted",
     "this " + card.stream_kind + " " + ageText(card.last_seen, nowMs)
     + " — " + baselineLabel(card) + " "

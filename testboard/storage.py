@@ -2954,6 +2954,7 @@ class Storage:
         stream_id: int = MAINLINE_STREAM_ID,
         assignment_origin: Optional[str] = None,
         assigned_only: bool = False,
+        open_items: bool = False,
     ) -> Tuple[List[str], List[Any]]:
         """Build the shared WHERE clauses for the dashboard list and count.
 
@@ -2975,6 +2976,17 @@ class Storage:
         result"); combined with *include_unassigned* it is contradictory
         and correctly returns nothing (the frontend does not offer that
         combination).
+        *open_items* (2026-08-10, same morning, the user's refinement
+        of the first cut) is Open Actions' DEFAULT view, "needs
+        action": failing, stale annotation, OR currently assigned to
+        someone — an assignment IS an open action whatever its result,
+        which is what the page's name always claimed. Server-side
+        because this OR spans the result axis and the owner axis,
+        which no combination of the AND-composed params here can
+        express. The first cut was a separate fourth Result option
+        ("All assigned"); the user's verdict — one more mode adds
+        confusion, the default should simply not lie — replaced it the
+        same morning, before anything shipped.
         *environments* is the WP-20 product filter, resolved by the
         caller to an allow-list — see :meth:`_environments_clause`. It
         combines with *environment* by AND, which is never contradictory
@@ -3039,6 +3051,13 @@ class Storage:
         if assigned_only:
             clauses.append("ca.assignee IS NOT NULL")
 
+        if open_items:
+            clauses.append(
+                "(lr.result IN (?, ?) OR ca.assignee IS NOT NULL)"
+            )
+            params.extend(
+                [Result.FAIL.value, Result.UNEXPECTED_PASS.value])
+
         if assignment_origin == "build":
             clauses.append("(ca.stream_id IS NOT NULL AND ca.stream_id != ?)")
             params.append(MAINLINE_STREAM_ID)
@@ -3088,6 +3107,7 @@ class Storage:
         stream_id: int = MAINLINE_STREAM_ID,
         assignment_origin: Optional[str] = None,
         assigned_only: bool = False,
+        open_items: bool = False,
     ) -> List[TestSummaryRow]:
         """Return ONE PAGE of the latest run per test, never with ``output``.
 
@@ -3110,7 +3130,9 @@ class Storage:
         Open Actions only) narrows by WHERE the current assignment was
         made from — see :meth:`_dashboard_filters`. *assigned_only*
         (2026-08-10) keeps only rows with a current assignee, whatever
-        their result — see :meth:`_dashboard_filters` for why it exists.
+        their result; *open_items* (same day) is the "needs action"
+        composite — failing, stale annotation, or assigned — see
+        :meth:`_dashboard_filters` for why both exist.
 
         *sort* is a key of :data:`DASHBOARD_SORTS`; every ordering ends
         with the full test identity, so *limit*/*offset* paging is stable
@@ -3129,7 +3151,7 @@ class Storage:
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
-            stream_id, assignment_origin, assigned_only,
+            stream_id, assignment_origin, assigned_only, open_items,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -3165,6 +3187,7 @@ class Storage:
         stream_id: int = MAINLINE_STREAM_ID,
         assignment_origin: Optional[str] = None,
         assigned_only: bool = False,
+        open_items: bool = False,
     ) -> int:
         """Exact number of tests matching the same filters as :meth:`dashboard`."""
         result_values = (
@@ -3175,7 +3198,7 @@ class Storage:
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
-            stream_id, assignment_origin, assigned_only,
+            stream_id, assignment_origin, assigned_only, open_items,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
         if clauses:

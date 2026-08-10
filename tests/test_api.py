@@ -2604,6 +2604,50 @@ class TestDashboardAssignedFilter(ApiCase):
         self.assertEqual(data["total"], 0)
 
 
+class TestDashboardOpenFilter(ApiCase):
+    """``/api/dashboard``'s ``open=1`` (2026-08-10): Open Actions'
+    default "needs action" view — failing, stale annotation, OR
+    assigned to someone, whatever the result. The user's same-morning
+    refinement of ``assigned=1`` above: an assignment IS an open
+    action, so the default view includes it rather than hiding it
+    behind a fourth mode."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_failing", result="FAIL"),
+            record(test_name="test_passing_assigned"),
+            record(test_name="test_passing_unassigned"),
+        ])
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py",
+                      "test_passing_assigned", "/assignee"),
+            body={"username": "alice", "assigned_by": "bob"})
+
+    def test_open_lists_failing_and_assigned_but_not_plain_passing(
+            self) -> None:
+        rows = self.call(
+            "GET", "/api/dashboard", query={"open": ["1"]})["tests"]
+        self.assertEqual(
+            sorted(r["test_name"] for r in rows),
+            ["test_failing", "test_passing_assigned"])
+
+    def test_open_composes_with_the_origin_filter(self) -> None:
+        """The build-verify re-check: "everything assigned from a
+        build, whatever its state" is open=1&origin=build."""
+        rows = self.call(
+            "GET", "/api/dashboard",
+            query={"open": ["1"], "origin": ["mainline"]})["tests"]
+        self.assertEqual(
+            sorted(r["test_name"] for r in rows),
+            ["test_failing", "test_passing_assigned"])
+
+    def test_absent_means_no_composite(self) -> None:
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertEqual(len(rows), 3)
+
+
 class TestSummaryAssignmentStreams(ApiCase):
     """``/api/summary``'s ``assignment_streams`` (WP-21, Open Actions'
     origin filter) — the same "available values, empty means nothing to

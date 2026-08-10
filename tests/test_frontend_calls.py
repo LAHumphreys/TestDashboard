@@ -2596,26 +2596,34 @@ class WatchUnassignedStatLinkTest(unittest.TestCase):
         self.assertIn('params.set("result", "FAIL")', body)
         self.assertIn('params.set("unassigned", "1")', body)
 
-    def test_both_call_sites_pass_the_link_only_when_nonzero(self) -> None:
-        """Zero visible change (the same rule the stat's own existence
-        already follows): a card with no unassigned failures gets
-        neither the stat nor a dead link."""
+    def test_the_hero_links_the_count_only_when_nonzero(self) -> None:
+        """The F4 link moved into the hero with the count (2026-08-10
+        redesign) and kept its one behavioral rule: a zero renders as a
+        plain muted number, never a dead link. The count itself now
+        ALWAYS shows — the redesign's point is that "0 unassigned" is
+        the good news a morning scan looks for — so the old
+        zero-adds-no-stat pin is superseded, not weakened: the
+        click-through gate is what it always protected, and it still
+        holds."""
+        body = _function_body(read("watch.js"), "function buildHero(")
+        gate_at = body.index("if (count > 0) {")
+        else_at = body.index("} else {", gate_at)
+        self.assertIn("unassignedStatLink(card)", body[gate_at:else_at])
+        self.assertNotIn(
+            "unassignedStatLink", body[else_at:])
+
+    def test_both_card_builders_render_the_hero(self) -> None:
         for fn in ("function buildOkCard(", "function buildStreamCard("):
             body = _function_body(read("watch.js"), fn)
-            guard_at = body.index("if (card.unassigned_failing) {")
-            block = body[guard_at:body.index("}", guard_at) + 1]
-            self.assertIn("unassignedStatLink(card)", block)
+            self.assertIn("buildHero(card, nowMs)", body, fn)
 
-    def test_the_linked_stat_reuses_the_shared_stat_markup(self) -> None:
-        """buildStat's existing (label, value) call sites must be
-        unaffected — this is an optional third argument, not a parallel
-        rendering path that could drift from the plain stat's markup."""
+    def test_the_supporting_stats_are_plain_numbers_again(self) -> None:
+        """buildStat's optional href argument died with its one caller
+        when the link moved to the hero — deleted with the feature, so
+        a second rendering path cannot drift back in."""
         body = _function_body(read("watch.js"), "function buildStat(")
-        self.assertIn("function buildStat(label, value, href)", body)
-        self.assertIn("if (href) {", body)
-        # The unlinked branch is the exact call the page always made.
-        self.assertIn(
-            'el("span", "watch-stat-value", String(value))', body)
+        self.assertIn("function buildStat(label, value)", body)
+        self.assertNotIn("href", _strip_comments(body))
     # No dedicated no-innerHTML check here — WatchPageTest already pins
     # that invariant for the whole file (correctly, via _strip_comments
     # — this file's own module docstring literally contains the word
@@ -3557,16 +3565,24 @@ class WatchStalenessGrammarTest(unittest.TestCase):
         body = _function_body(read("watch.js"), "function addCard(")
         self.assertIn("expected: readCadence()", body)
 
-    def test_unassigned_failing_is_a_stat_only_when_nonzero(self) -> None:
-        """Zero visible change: the established house rule, pinned for
-        both card builders — a zero count adds neither the stat nor
-        the accent class."""
-        code = _strip_comments(read("watch.js"))
-        for signature in (
-            "function buildOkCard(", "function buildStreamCard("
-        ):
-            body = _function_body(code, signature)
-            self.assertIn("if (card.unassigned_failing)", body, signature)
+    def test_the_hero_leads_with_unowned_and_freshness(self) -> None:
+        """The 2026-08-10 user redesign: the two numbers a morning scan
+        reads — unassigned failures and last-result age — lead every ok
+        card, from the SAME per-kind timestamp the staleness judgment
+        uses (cardFreshnessIso) and phrased from data (ageText — the
+        WindowWordingTest discipline), with a product card naming its
+        laggard so the big number is never read as "every environment
+        is this fresh". The count shows even at zero (that IS the good
+        news); the ACCENT keeps its nonzero gate in applyWatchAccent,
+        which is the zero-visible-change rule's surviving half."""
+        body = _function_body(read("watch.js"), "function buildHero(")
+        self.assertIn("cardFreshnessIso(card)", body)
+        self.assertIn("ageText(freshIso, nowMs)", body)
+        self.assertIn("card.laggard.environment", body)
+        self.assertIn('"unassigned failures"', body)
+        accent = _function_body(
+            read("watch.js"), "function applyWatchAccent(")
+        self.assertIn("card.unassigned_failing", accent)
 
     def test_accent_precedence_is_unassigned_failure_over_staleness(
         self
@@ -3834,36 +3850,39 @@ class ScopedUrlConstructionTest(unittest.TestCase):
         self.assertTrue(_ENVIRONMENT_PARAM_RE.search(planted))
 
 
-class OpenActionsAllAssignedViewTest(unittest.TestCase):
-    """The "All assigned (any result)" option (2026-08-10, found in the
-    first morning of build-verify manual testing): an assignment on a
-    mainline-passing test — routine once people assign from a build's
-    no-result/failure rows — was previously reachable through NO view:
-    all three of this page's result options and the dashboard's "My
-    actions" queue gate on FAIL/UNEXPECTED_PASS."""
+class OpenActionsNeedsActionIncludesAssignedTest(unittest.TestCase):
+    """"Needs action" includes every assigned test, whatever its result
+    (2026-08-10). Found in the first morning of build-verify manual
+    testing: an assignment on a mainline-passing test — routine once
+    people assign from a build's no-result/failure rows — was reachable
+    through NO view (every result option and the dashboard's "My
+    actions" queue gated on FAIL/UNEXPECTED_PASS). The first cut was a
+    separate fourth Result option, "All assigned (any result)"; the
+    user's verdict the same morning — one more mode adds confusion, the
+    default should simply not lie — folded it into "Needs action" as
+    the server-side `open=1` composite instead. That option must NOT
+    come back; the default view's label says what it now includes."""
 
-    def test_the_option_exists(self) -> None:
+    def test_the_default_option_says_what_it_includes(self) -> None:
+        html = read("actions.html")
         self.assertIn(
-            '<option value="assigned">All assigned (any result)</option>',
-            read("actions.html"))
+            '<option value="open">Needs action (failing, stale '
+            'annotation, or assigned)</option>', html)
+        self.assertNotIn("All assigned (any result)", html)
 
-    def test_the_mode_sends_assigned_and_no_result_filter(self) -> None:
+    def test_the_default_mode_sends_open_and_no_result_filter(
+            self) -> None:
         body = _function_body(read("actions.js"), "function listUrl(")
-        self.assertIn(
-            'state.result === "assigned" ? null : [state.result]', body)
-        self.assertIn(
-            'assigned: state.result === "assigned" ? "1" : null', body)
+        self.assertIn('const open = state.result === "open"', body)
+        self.assertIn("const results = open ? null : [state.result]",
+                      body)
+        self.assertIn('open: open ? "1" : null', body)
 
-    def test_the_unassigned_chip_is_not_offered_in_this_mode(self) -> None:
-        """assigned AND unowned matches nothing — the chip hides rather
-        than being offered and silently empty (the page's own
-        no-dishonest-empties rule), and a stale selection of it is
-        cleared when the mode is entered."""
-        body = _function_body(
-            read("actions.js"), "function renderOwnerFilters()")
-        self.assertIn('state.result === "assigned"', body)
-        self.assertIn("state.owners.delete(UNASSIGNED)",
-                      _strip_comments(read("actions.js")))
+    def test_the_narrow_modes_send_their_result_and_no_open(self) -> None:
+        """FAIL/UNEXPECTED_PASS stay plain result filters — `open` is
+        the default mode's composite, never a standing param."""
+        body = _function_body(read("actions.js"), "function listUrl(")
+        self.assertNotIn('open: "1",', body)
 
 
 class TestPageTimelineLinkTest(unittest.TestCase):

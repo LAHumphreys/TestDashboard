@@ -5395,6 +5395,47 @@ class AssignedOnlyFilterTest(StorageTestBase):
         self.assertEqual(self.store.dashboard_count(), 3)
 
 
+class OpenItemsFilterTest(StorageTestBase):
+    """dashboard()/dashboard_count()'s ``open_items`` composite
+    (2026-08-10, the user's same-morning refinement of
+    ``assigned_only`` above): "needs action" = failing, stale
+    annotation, OR currently assigned — an assignment IS an open
+    action whatever its result, which is what Open Actions' name
+    always claimed. Server-side because the OR spans the result axis
+    and the owner axis, which the AND-composed params cannot
+    express."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(test_name="test_failing", result=Result.FAIL),
+            make_record(test_name="test_stale_annotation",
+                        result=Result.UNEXPECTED_PASS),
+            make_record(test_name="test_passing_assigned"),
+            make_record(test_name="test_passing_unassigned"),
+        ])
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_passing_assigned",
+            "alice", "bob", CREATED)
+
+    def test_includes_all_three_kinds_of_open_item(self) -> None:
+        rows = self.store.dashboard(open_items=True)
+        self.assertEqual(
+            sorted(r.test_name for r in rows),
+            ["test_failing", "test_passing_assigned",
+             "test_stale_annotation"])
+        self.assertEqual(self.store.dashboard_count(open_items=True), 3)
+
+    def test_a_plain_passing_unassigned_test_is_not_an_open_item(
+            self) -> None:
+        rows = self.store.dashboard(open_items=True)
+        self.assertNotIn(
+            "test_passing_unassigned", [r.test_name for r in rows])
+
+    def test_off_by_default(self) -> None:
+        self.assertEqual(self.store.dashboard_count(), 4)
+
+
 class AssignmentStreamIdsEmptyTest(StorageTestBase):
     """assignment_stream_ids() on a database with no build-originated
     assignment at all — the signal Open Actions' filter reads to honour

@@ -70,11 +70,13 @@
           result on every build of its product at once; a suite's
           execution history page now works for any build too, not only
           mainline.</li>
-        <li><strong>Highlights and staleness cadences.</strong> A Watch
-          card with a failing, unowned test gets a red-tinted border and an
-          "Unassigned failing" count you can click straight into; add
-          <code>@1d</code>, <code>@7d</code>, or a custom hour count to a
-          card to have it flag itself when it's overdue.</li>
+        <li><strong>Highlights and staleness cadences.</strong> Every
+          Watch card leads with the two numbers a morning scan needs:
+          unassigned failures (red and clickable when there are any)
+          and how long ago the last result arrived. A card with a
+          failing, unowned test also gets a red-tinted border; add
+          <code>@1d</code>, <code>@7d</code>, or a custom hour count to
+          a card to have it flag itself when it's overdue.</li>
         <li><strong>A long-running build gets its own dashboard.</strong>
           Open one that's been running for weeks and you'll see two tabs:
           <strong>Its own results</strong> (the same tiles, trend and
@@ -85,11 +87,12 @@
           "View in timeline" link — the same jump the dashboard's
           review panel already offered, so you no longer lose it by
           opening the full test page first.</li>
-        <li><strong>Open actions can now show every assigned test,
-          whatever its result.</strong> Pick "All assigned (any
-          result)" in the Result filter — before, an assignment on a
-          passing test (say, someone asked to investigate why a test
-          didn't run on a build) simply appeared nowhere.</li>
+        <li><strong>Open actions now shows every assigned test,
+          whatever its result.</strong> "Needs action" means failing,
+          stale annotation, or assigned to someone — before, an
+          assignment on a passing test (say, someone asked to
+          investigate why a test didn't run on a build) simply
+          appeared nowhere.</li>
       </ul>
     </section>
 

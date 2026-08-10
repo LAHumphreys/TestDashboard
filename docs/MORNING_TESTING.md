@@ -47,8 +47,12 @@ this before you; these two are where trouble is most likely):
       default survives a bare visit).
 - [ ] "Copy link" → paste into a NEW tab → identical grid (the URL is
       the whole configuration).
-- [ ] The Atlas card (113 failing / 113 unassigned) draws the eye
-      first — caveat 1: judge the accents at your screen size.
+- [ ] **NEW (your redesign, this morning):** every card now leads with
+      two big numbers — unassigned failures (red, clickable when
+      nonzero; a muted 0 otherwise) and last-result age ("N hours
+      ago", exact time on hover; a product card names its slowest
+      environment there). The Atlas card's count should dominate the
+      board — caveat 1: judge size/crowding at your screen width.
 - [ ] Atlas card "Open in dashboard →" → lands on `?product=Atlas`,
       dashboard numbers match the card's.
 - [ ] Header nav "Watch" from there → your saved default renders
@@ -93,18 +97,15 @@ this before you; these two are where trouble is most likely):
       switcher dropdown lists Mainline / 2026.9.1 / 2026.9.0 each
       with its result.
 - [ ] **Assign from THIS page's own assignee dropdown** → "Saved." →
-      open Open Actions → switch the Result filter to
-      **"All assigned (any result)"** → the row appears (it passes on
-      mainline, so the default "Needs action" view correctly does NOT
-      list it) with an origin tag naming 2026.9.1 and the two-chip
-      result (ghost mainline PASS, solid build FAIL); the origin
-      filter chips ("Build-originated" / "Mainline") appear, and
-      Build-originated narrows to it. (Both halves are morning-of
-      fixes: this page's assign used to silently lose the origin, and
-      an assignment on a passing test used to be visible nowhere.)
-- [ ] Still in "All assigned (any result)": the Unassigned owner chip
-      is NOT offered (it would contradict the view); switch back to
-      "Needs action" and it returns.
+      open Open Actions → the row appears in the DEFAULT view (its
+      label now reads "Needs action (failing, stale annotation, or
+      assigned)" — an assignment is an open action even when the test
+      passes on mainline) with an origin tag naming 2026.9.1 and the
+      two-chip result (ghost mainline PASS, solid build FAIL); the
+      origin filter chips ("Build-originated" / "Mainline") appear,
+      and Build-originated narrows to it. (All morning-of fixes: this
+      page's assign used to silently lose the origin, and an
+      assignment on a passing test used to be visible nowhere.)
 - [ ] Back on the build dashboard: Compare-to → `2026.9.0` → the
       comparison re-scopes, and the verdict line now names mainline
       as the OTHER side.

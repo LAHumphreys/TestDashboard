@@ -1928,6 +1928,38 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
 
 .watch-card-name { font-weight: 600; word-break: break-word; }
 
+/* The morning-scan hero (2026-08-10 user redesign): the two numbers a
+   board scan reads — unowned failures and freshness — big and first,
+   everything else supporting detail below. The alarm color is the
+   result palette's fail on purpose (an unowned failure IS a failure
+   fact); the zero state and the freshness value stay neutral. */
+.watch-card-hero {
+  display: flex;
+  gap: 28px;
+  align-items: baseline;
+}
+
+.watch-hero-stat { display: flex; flex-direction: column; }
+
+.watch-hero-value {
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+a.watch-hero-value { text-decoration: underline; }
+
+.watch-hero-alarm { color: var(--c-fail); }
+
+.watch-hero-ok { color: var(--muted); }
+
+.watch-hero-label {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
 .watch-card-verdict {
   display: flex;
   flex-wrap: wrap;

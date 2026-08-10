@@ -867,6 +867,13 @@ def _handle_dashboard(
     # for why it is AND-level rather than part of the owner OR group.
     assigned_only = _query_single(
         request.query, "assigned") in ("1", "true")
+    # 2026-08-10, the user's refinement of the above the same morning:
+    # Open Actions' default view, "needs action" — failing, stale
+    # annotation, OR assigned to someone, an OR across the result and
+    # owner axes no combination of the other params can express. See
+    # Storage._dashboard_filters.
+    open_items = _query_single(
+        request.query, "open") in ("1", "true")
     assignees = request.query.get("assignee") or []
     # WP-21, Open Actions' build/mainline origin filter — WHERE the
     # current assignment was made from, an axis entirely separate from
@@ -916,6 +923,7 @@ def _handle_dashboard(
         "stream_id": stream_id,
         "assignment_origin": assignment_origin,
         "assigned_only": assigned_only,
+        "open_items": open_items,
     }  # type: Dict[str, Any]
     rows = storage.dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,
