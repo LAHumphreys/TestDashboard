@@ -80,9 +80,14 @@
         <label class="toolbar-field">
           Assign all <span id="bulk-actions-count">0</span> filtered
           test(s) to
-          <input id="bulk-assign-username" type="text"
-                 placeholder="username"
-                 aria-label="Username to bulk-assign the filtered tests to">
+          <!-- Populated at init() with the standard user dropdown
+               (api.js's userPickerSelect(), the SAME pattern every
+               other assignee control in this app uses) -- was a
+               free-text input ("just lazy", the user's words,
+               2026-08-10): a typo here silently assigned work to a
+               name nobody could act on, with no active-user check and
+               no autocomplete. -->
+          <span id="bulk-assign-username-slot"></span>
         </label>
         <input id="bulk-assign-comment" type="text"
                placeholder="note (optional)"
