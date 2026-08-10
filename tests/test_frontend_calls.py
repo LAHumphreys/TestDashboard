@@ -886,7 +886,7 @@ class PlantedWindowRegressionTest(unittest.TestCase):
 #: watch.js (and, in a later drop, other pages) calls its exports.
 _SHARED_MODULES = (
     "api.js", "charts.js", "sorting.js", "review.js", "products.js",
-    "compare.js",
+    "compare.js", "selection.js",
 )
 
 
@@ -4095,6 +4095,285 @@ class OneKindVisibleWordingTest(unittest.TestCase):
             ["Branch dashboard view"],
             self._visible_branch_hits(
                 '<div aria-label="Branch dashboard view"></div>'))
+
+
+class SelectionModuleTest(unittest.TestCase):
+    """selection.js (2026-08-10, multi-select): the one shared module
+    that owns every table's checkbox column and the one sticky bottom
+    action bar. Same "assert against the source" method every other
+    class in this file uses (no JS runtime here — see the module
+    docstring at the top of this file).
+    """
+
+    def test_the_public_surface_is_mountSelectableTable(self) -> None:
+        code = read("selection.js")
+        self.assertIn("export function mountSelectableTable(", code)
+
+    def test_the_mount_returns_header_row_and_reset(self) -> None:
+        body = _function_body(
+            read("selection.js"), "export function mountSelectableTable(")
+        for name in ("headerCell", "rowCell", "reset"):
+            self.assertIn(name, body, name)
+
+    def test_no_confirm_dialog_anywhere(self) -> None:
+        self.assertNotIn("confirm(", _strip_comments(read("selection.js")))
+
+    def test_both_bulk_actions_use_postJson(self) -> None:
+        code = _strip_comments(read("selection.js"))
+        assign_body = _function_body(code, "async function doAssign(")
+        unassign_body = _function_body(code, "async function doUnassign(")
+        self.assertIn("postJson(", assign_body)
+        self.assertIn("postJson(", unassign_body)
+
+    def test_postJson_and_apiUrl_are_imported(self) -> None:
+        imported = _imported_names(read("selection.js"))
+        self.assertIn("postJson", imported)
+        self.assertIn("apiUrl", imported)
+
+    def test_the_bulk_url_composes_through_apiUrl(self) -> None:
+        body = _function_body(
+            read("selection.js"), "function bulkAssignmentsUrl(")
+        self.assertIn('apiUrl(', body)
+        self.assertIn('"/api/assignments/bulk"', body)
+
+    def test_the_bulk_url_clears_every_scope_level_explicitly(self) -> None:
+        """apiUrl() with no scope argument CARRIES the current page's
+        own product/stream/baseline/environment (WP-24's whole point,
+        docs/SCOPED_URLS_PLAN.md) -- exactly wrong for a request that
+        must never pick up a stray `environment=`/`stream=` from
+        whatever page happens to have mounted this bar (list mode's
+        own mutual-exclusion 400 would trip on the former). Every one
+        of the four levels must be named null, not merely omitted."""
+        body = _function_body(
+            read("selection.js"), "function bulkAssignmentsUrl(")
+        for level in ("product", "stream", "baseline", "environment"):
+            self.assertIn(level + ": null", body, level)
+
+    def test_no_username_free_text_input_in_the_bar(self) -> None:
+        """The action bar's user field is the standard dropdown
+        (userPickerSelect(), api.js) -- never a typed username, which
+        is exactly the bug the Open Actions fix (below) also removes.
+        The note field is DELIBERATELY still a plain text input (an
+        optional free-text comment, never an identity) -- this checks
+        the variable the bar assigns from userPickerSelect() is never
+        ALSO given `.type = "text"`, rather than banning text inputs
+        outright."""
+        code = _strip_comments(read("selection.js"))
+        self.assertIn("userSelectEl = userPickerSelect(", code)
+        self.assertNotIn('userSelectEl.type = "text"', code)
+
+    def test_userPickerSelect_is_imported(self) -> None:
+        self.assertIn(
+            "userPickerSelect", _imported_names(read("selection.js")))
+
+    def test_entryKey_is_reused_not_reimplemented(self) -> None:
+        """The NUL-composite row-identity key already has one owner
+        (review.js's entryKey, which moved there from app.js — see
+        CoverageTest's own docstring on this file). A second
+        hand-rolled `environment + "\\0" + script + ...` here is
+        exactly what test_sorting_is_implemented_once punishes for
+        sorting, one file over."""
+        code = _strip_comments(read("selection.js"))
+        self.assertIn("entryKey", _imported_names(read("selection.js")))
+        self.assertIn("entryKey(", code)
+        self.assertNotIn('"\\0"', code)
+        self.assertNotIn('"\\x00"', code)
+
+    def test_assign_is_gated_on_a_chosen_user_and_a_nonempty_selection(
+        self
+    ) -> None:
+        body = _function_body(
+            read("selection.js"), "function updateAssignButtonState(")
+        self.assertIn("userSelectEl.value", body)
+        self.assertIn("selected.size", body)
+
+    def test_a_fresh_render_reset_clears_only_that_mounts_own_namespace(
+        self
+    ) -> None:
+        """Selection is per-rendered-view (the module docstring): reset()
+        must not sweep every OTHER mounted table's selection off the
+        page too, or ticking rows in the browse table would vanish the
+        moment the triage queue re-renders."""
+        body = _function_body(read("selection.js"), "function reset(")
+        self.assertIn("namespace", body)
+
+
+class SelectionColumnExclusivityTest(unittest.TestCase):
+    """selection.js is the ONLY place a checkbox table column may be
+    built (2026-08-10) -- four tables needed one; a fifth hand-rolled
+    copy is a fifth "does it clear on re-render" bug to get right
+    independently, the same reasoning sorting.js/urls.js/review.js
+    each already end for their own concern.
+
+    watch.js is excluded from this scan -- not because a checkbox
+    there would be fine, but because a second agent is restyling that
+    page concurrently in another worktree not touched by this feature;
+    this detector's job is this diff's blast radius, not a standing
+    claim about a file this work never opens.
+    """
+
+    _EXEMPT = frozenset(["selection.js", "watch.js"])
+
+    _CHECKBOX_RE = re.compile(r'\.type\s*=\s*"checkbox"|type\s*=\s*"checkbox"')
+
+    def test_no_hand_rolled_checkbox_column_outside_selection_js(
+        self
+    ) -> None:
+        offenders = {}  # type: Dict[str, List[int]]
+        for name, source in scripts().items():
+            if name in self._EXEMPT:
+                continue
+            hits = [
+                number for number, line in enumerate(
+                    _strip_comments(source).split("\n"), 1)
+                if self._CHECKBOX_RE.search(line)
+            ]
+            if hits:
+                offenders[name] = hits
+        self.assertEqual(
+            offenders, {},
+            "a checkbox table column outside selection.js (and the "
+            "watch.js exemption above) -- multi-select's checkbox "
+            "column belongs in selection.js, mounted via "
+            "mountSelectableTable(): " + repr(offenders))
+
+    def test_a_planted_checkbox_column_would_be_caught(self) -> None:
+        planted = (
+            'const box = document.createElement("input");\n'
+            'box.type = "checkbox";\n'
+        )
+        self.assertTrue(self._CHECKBOX_RE.search(planted))
+
+
+class SelectionMountSitesTest(unittest.TestCase):
+    """Each of the four table families actually mounts selection.js
+    (2026-08-10) -- pins the call site so a refactor that drops one
+    silently (a table that quietly stops offering multi-select) fails
+    the build instead of only a manual click-through.
+    """
+
+    #: (file, a regex fragment matching that file's mountSelectableTable
+    #: call, description) — whitespace-tolerant (re.DOTALL), since each
+    #: call is written across more than one line.
+    _SITES = (
+        ("actions.js",
+         r'mountSelectableTable\(\s*document\.getElementById\('
+         r'"actions-table"\)',
+         "Open Actions rows"),
+        ("app.js",
+         r'mountSelectableTable\(\s*document\.getElementById\('
+         r'"queue-table"\)',
+         "the triage queue table"),
+        ("app.js",
+         r'mountSelectableTable\(\s*document\.getElementById\('
+         r'"dashboard-table"\)',
+         "the browse (all tests) table"),
+        ("compare.js",
+         r'mountSelectableTable\(\s*document\.getElementById\('
+         r'"delta-table"\)',
+         "the build delta category table"),
+    )
+
+    def test_every_site_mounts_selection(self) -> None:
+        for filename, pattern, description in self._SITES:
+            with self.subTest(site=description):
+                code = _strip_comments(read(filename))
+                self.assertRegex(code, re.compile(pattern, re.S), (
+                    "{} ({}) does not mount selection.js's "
+                    "checkbox column".format(description, filename)))
+
+    def test_every_mount_imports_mountSelectableTable(self) -> None:
+        for filename in ("actions.js", "app.js", "compare.js"):
+            with self.subTest(file=filename):
+                self.assertIn(
+                    "mountSelectableTable",
+                    _imported_names(read(filename)), filename)
+
+    def test_build_delta_rows_carry_the_page_stream_id_as_origin(
+        self
+    ) -> None:
+        """Point 3 of the feature spec: a selection made on a build's
+        delta table carries that build's stream_id as origin, the same
+        entry object reviewEntry() already builds for the row-level
+        assignee picker beside it -- no separate plumbing, so this pins
+        that the SAME entry is handed to both."""
+        code = _strip_comments(read("compare.js"))
+        body = _function_body(code, "function buildDeltaRow(row) {")
+        self.assertIn("reviewEntry(row, streamId)", body)
+        self.assertIn("deltaSelectionMount.rowCell(entry)", body)
+        self.assertIn("assigneeSelect(entry", body)
+
+    def test_dashboard_rows_reuse_tagStreams_own_annotation(self) -> None:
+        """The dashboard/queue tables carry a stream_id only when
+        tagStream() already stamped one (a branch's own-results tab) --
+        rowCell() is handed the row object itself, not a stripped
+        subset, so this is "for free" rather than a second mechanism
+        parallel to assigneeSelect()'s own entry.stream_id read."""
+        code = _strip_comments(read("app.js"))
+        self.assertIn("browseSelectionMount.rowCell(row)", code)
+        self.assertIn("queueSelectionMount.rowCell(entry)", code)
+
+
+class OpenActionsUsernameDropdownTest(unittest.TestCase):
+    """Open Actions' bulk-assign control used a free-text username
+    <input> ("just lazy" — the user's words, 2026-08-10): a typo
+    silently assigned work to a name nobody could act on, with no
+    active-user check and no autocomplete, unlike every OTHER assignee
+    control in this app. Fixed to the same standard dropdown
+    (userPickerSelect(), api.js) assigneeSelect() itself builds on.
+    """
+
+    def test_the_markup_has_no_free_text_username_input(self) -> None:
+        html = read_text("actions.html")
+        bulk_at = html.index('id="bulk-actions"')
+        table_at = html.index('id="actions-table"')
+        section = html[bulk_at:table_at]
+        self.assertNotIn('id="bulk-assign-username"', section)
+        self.assertIn('id="bulk-assign-username-slot"', section)
+
+    def test_the_comment_input_stays_free_text(self) -> None:
+        """Only the USERNAME field was the bug -- the optional note is
+        still (and should stay) a plain text box."""
+        html = read_text("actions.html")
+        self.assertIn(
+            '<input id="bulk-assign-comment" type="text"', html)
+
+    def test_init_builds_the_standard_dropdown_and_keeps_the_id(
+        self
+    ) -> None:
+        """Every OTHER function in this file reads the control by
+        document.getElementById("bulk-assign-username") -- the fix
+        must keep that id on the built <select>, not rename every
+        caller."""
+        body = _function_body(read("actions.js"), "function init() {")
+        self.assertIn("userPickerSelect(", body)
+        self.assertIn('bulkAssignUsername.id = "bulk-assign-username"', body)
+        self.assertIn('"bulk-assign-username-slot"', body)
+
+    def test_userPickerSelect_is_imported(self) -> None:
+        self.assertIn(
+            "userPickerSelect", _imported_names(read("actions.js")))
+
+    def test_the_change_gate_listens_on_change_not_input(self) -> None:
+        """A <select> is a discrete choice; "input" is the wrong event
+        to gate a select on in every engine this project has to run
+        against (some fire it, some do not) -- "change" always fires."""
+        body = _function_body(read("actions.js"), "function init() {")
+        self.assertIn(
+            'bulkAssignUsername.addEventListener("change", '
+            "updateBulkActionsControl)", body)
+        self.assertNotIn(
+            '.addEventListener("input", updateBulkActionsControl)', body)
+
+    def test_a_planted_free_text_input_would_be_caught(self) -> None:
+        """Planted regression — proves the markup check above actually
+        distinguishes an input from a select."""
+        planted = (
+            '<div id="bulk-actions">'
+            '<input id="bulk-assign-username" type="text">'
+            '</div>'
+        )
+        self.assertIn('id="bulk-assign-username"', planted)
 
 
 if __name__ == "__main__":

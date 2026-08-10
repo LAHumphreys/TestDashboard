@@ -2099,3 +2099,83 @@ a.watch-stat-value {
   border-radius: 999px;
   padding: 1px 8px;
 }
+
+/* ---------------- multi-select (2026-08-10, selection.js) ----------------
+   Tick boxes on every table where a test can be assigned, plus the one
+   shared sticky-bottom action bar. Appended here (end of file, owner
+   selection.js) rather than interleaved with an existing section, since
+   this stylesheet is also being edited concurrently for the Watch page
+   restyle -- new rules for a new component belong at the end, not woven
+   into a section someone else is mid-edit on. */
+
+/* Narrow leading column, every selectable table -- the box is the only
+   content, so it should not fight the columns that carry data for
+   width. */
+.select-col {
+  width: 1%;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.select-col input[type="checkbox"],
+.select-all-checkbox,
+.row-select-checkbox {
+  cursor: pointer;
+}
+
+/* FIXED to the viewport bottom, the same idiom style.css's .failure-nav
+   pill already uses for "a control that scrolls away is used once" --
+   card-styled, visible only while the selection is non-empty (JS sets
+   [hidden]; body.has-selection-bar reserves room for it so it does not
+   sit over the last table row). z-index below .failure-nav's 40: the
+   stepper is a per-page navigation aid and should still win if the two
+   ever occupy the same corner. */
+.selection-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 39;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.14);
+}
+
+.selection-bar[hidden] { display: none; }
+
+body.has-selection-bar { padding-bottom: 60px; }
+
+.selection-count { font-weight: 650; }
+
+.selection-user-select {
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid var(--grid);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.selection-note-input {
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 8px;
+  min-width: 200px;
+  border: 1px solid var(--grid);
+  border-radius: 5px;
+}
+
+.selection-sep { color: var(--muted); }
+
+.selection-assign-btn:disabled,
+.selection-unassign-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

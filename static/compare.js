@@ -41,6 +41,7 @@ import {
   showError,
 } from "./api.js";
 import { reopenIfOpen, toggleReview } from "./review.js";
+import { mountSelectableTable } from "./selection.js";
 import { apiUrl, pageUrl, withBaseline, withStream } from "./urls.js";
 
 /** The five paginable comparison categories, in tab/tile display order. */
@@ -246,6 +247,13 @@ function reviewEntry(row, streamId) {
 
 function buildDeltaRow(row) {
   const tr = document.createElement("tr");
+  // Built below (entry) before the selection checkbox so both share the
+  // SAME object -- entry.stream_id is this page's own scope, carried as
+  // this row's selection origin exactly as it is the assignee picker's.
+  const streamId = getSelectedStreamId();
+  const entry = reviewEntry(row, streamId);
+  tr.appendChild(deltaSelectionMount.rowCell(entry));
+
   const testCell = el("td", "wrap");
   const link = document.createElement("a");
   // Carry the page's stream scope into the link: the whole point of
@@ -262,7 +270,6 @@ function buildDeltaRow(row) {
   // are still explicitly nulled because this link never carried either
   // (test.html has no product concept, and a baseline belongs to the
   // scope it was chosen in, not to a linked-to test page).
-  const streamId = getSelectedStreamId();
   link.href = pageUrl("test", {
     environment: row.environment, script: row.script, test_name: row.test_name,
   }, { product: null, baseline: null, stream: streamId });
@@ -284,8 +291,8 @@ function buildDeltaRow(row) {
   // assignee select the dashboard's own queue rows use, so a failure
   // found on a branch can be taken/assigned exactly like a mainline one
   // — assignment is never partitioned by stream, only annotated with
-  // where it was made (see reviewEntry()).
-  const entry = reviewEntry(row, streamId);
+  // where it was made (see reviewEntry(), built above with the
+  // selection checkbox).
   const assigneeTd = el("td", "assignee-cell");
   assigneeTd.appendChild(assigneeSelect(entry, () => {}));
   tr.appendChild(assigneeTd);
@@ -313,6 +320,28 @@ function buildDeltaRow(row) {
 
 /* ================= orchestration (the dashboard delta view) ================= */
 
+// Lazily mounted (2026-08-10, multi-select), not at module load: this
+// module is also imported by actions.js (for renderCompareStrip), and
+// actions.html has no #delta-table at all -- mounting only once
+// initDeltaView() actually runs keeps that page untouched by this
+// feature. Each selected row carries THIS stream's own id as origin
+// (reviewEntry() already builds that shape for the assignee picker
+// beside it) -- see selection.js's own module docstring for why that
+// needs no extra plumbing here.
+let deltaSelectionMount = null;
+
+function ensureDeltaSelectionMounted() {
+  if (deltaSelectionMount) {
+    return;
+  }
+  deltaSelectionMount = mountSelectableTable(
+    document.getElementById("delta-table"),
+    { onChanged: () => loadCategory(true) });
+  const headRow = document.querySelector("#delta-table thead tr");
+  headRow.insertBefore(
+    deltaSelectionMount.headerCell(), headRow.firstChild);
+}
+
 const deltaState = {
   streamId: null,
   // null = mainline (the server's own default) OR "no explicit choice
@@ -331,6 +360,11 @@ async function loadCategory(reset) {
   if (reset) {
     deltaState.offset = 0;
     clearNode(body);
+    // A fresh render (category switch, initial load, or the reload
+    // button) is a NEW view; "Show more" (reset=false) joins the SAME
+    // view and must not clear it -- see selection.js's own docstring.
+    ensureDeltaSelectionMounted();
+    deltaSelectionMount.reset();
   }
   const page = await fetchCompare(
     deltaState.streamId, deltaState.category, deltaState.offset,

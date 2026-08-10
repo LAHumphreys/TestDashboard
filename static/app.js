@@ -60,6 +60,7 @@ import {
   toggleReview,
 } from "./review.js";
 import { attachSorting, sortRows } from "./sorting.js";
+import { mountSelectableTable } from "./selection.js";
 import { getSelectedProduct, renderSwitcher } from "./products.js";
 import {
   fetchCompare,
@@ -130,6 +131,21 @@ const envSelect = document.getElementById("filter-environment");
 const scriptSelect = document.getElementById("filter-script");
 const qInput = document.getElementById("filter-q");
 const tbody = document.getElementById("dashboard-body");
+
+// Tick boxes on both the triage queue and the browse table (2026-08-10,
+// multi-select) -- one shared action bar, so a selection can span rows
+// from both at once. Row entries here already carry `stream_id` when
+// this page is showing a branch's own-results tab (tagStream(), above)
+// -- the SAME field the row-level assignee picker reads for origin --
+// so a mainline visit's rows simply have none and a selection there
+// carries none, by construction. Only ONE mount registers onChanged: a
+// bulk action can touch rows from either table, so one full refreshAll()
+// covers both without a duplicate fetch from a second registration.
+const queueSelectionMount = mountSelectableTable(
+  document.getElementById("queue-table"));
+const browseSelectionMount = mountSelectableTable(
+  document.getElementById("dashboard-table"),
+  { onChanged: () => refreshAll() });
 
 const SECTIONS = ["status-section", "charts-section", "triage-section",
   "browse-section"];
@@ -1099,6 +1115,10 @@ function renderQueueTable() {
   clearNode(headRow);
   clearNode(body);
   clearNode(resultNote);
+  // The queue table is rebuilt WHOLESALE on every call (no append mode
+  // here, unlike the browse table) -- so every render is a fresh view,
+  // and the selection made on the PREVIOUS render is cleared every time.
+  queueSelectionMount.reset();
 
   const invariant = QUEUE_INVARIANT_RESULT[queueId];
   resultNote.hidden = !invariant;
@@ -1148,6 +1168,7 @@ function renderQueueTable() {
     ? allEntries
     : sortRows(allEntries, state.queueSortKey || "", state.queueSortDesc);
 
+  headRow.appendChild(queueSelectionMount.headerCell());
   for (const column of columns) {
     const th = el("th");
     if (column.sortKey) {
@@ -1172,6 +1193,7 @@ function renderQueueTable() {
     if (marker) {
       tr.className = marker;
     }
+    tr.appendChild(queueSelectionMount.rowCell(entry));
     for (const column of columns) {
       tr.appendChild(column.cell(entry));
     }
@@ -1286,6 +1308,10 @@ function refilterBrowse() {
 function renderBrowse(rows, append) {
   if (!append) {
     clearNode(tbody);
+    // A fresh render (a new filter/sort/reload) is a NEW view; "Show
+    // more" (append) joins the SAME view and must not clear it -- see
+    // selection.js's own module docstring.
+    browseSelectionMount.reset();
   }
   for (const row of rows) {
     tbody.appendChild(buildRow(row));
@@ -1324,6 +1350,7 @@ function buildRow(row) {
   if (marker) {
     tr.className = marker;
   }
+  tr.appendChild(browseSelectionMount.rowCell(row));
   tr.appendChild(el("td", "", row.environment));
 
   // Hidden by default; updateProductColumn() shows it once the headline
@@ -1746,6 +1773,17 @@ async function initBranchDashboard(streamId) {
 }
 
 function init() {
+  // The browse table's checkbox column head -- static markup, so
+  // inserted once here rather than rebuilt every render (unlike the
+  // queue table's own dynamically-rebuilt head row, handled inside
+  // renderQueueTable() itself). Harmless to do even on a branch-scoped
+  // load below: that section stays hidden and unfetched, same as
+  // before this feature.
+  const dashboardHeadRow = document.querySelector(
+    "#dashboard-table thead tr");
+  dashboardHeadRow.insertBefore(
+    browseSelectionMount.headerCell(), dashboardHeadRow.firstChild);
+
   // "My actions" is scoped server-side to the signed-in user, so a
   // username change has to go back to the server for it. Rendered
   // before the stream check below: the header is not a mainline-only
