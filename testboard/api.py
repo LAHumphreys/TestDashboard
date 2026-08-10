@@ -1987,42 +1987,44 @@ def _handle_assignee(
     return _json_response(200, {"assignee": assignee})
 
 
-def _handle_bulk_assignments(
-    storage: Storage,
-    request: Request,
-    now: Callable[[], datetime.datetime],
-) -> Response:
-    """POST /api/assignments/bulk — assign or clear EVERY test the SAME
-    filters GET /api/dashboard would return, in one transaction.
+#: Every query-string key GET /api/dashboard's filter parsing
+#: (:func:`_parse_dashboard_filters`) reads and POST
+#: /api/assignments/bulk's FILTER mode therefore acts on. Bound to
+#: list mode's mutual-exclusion check (below) and pinned by
+#: ``tests/test_api.py``'s
+#: ``BulkAssignmentsFilterParamCoverageTest`` — every key
+#: ``_parse_dashboard_filters`` reads must be in this tuple or on the
+#: stated exclusion list, or the check drifts silently the next time a
+#: filter param is added. ``with_comment``/``with_streak`` are
+#: deliberately EXCLUDED: they are display options on the dashboard
+#: read, not a narrowing of the matched set, so a caller sending one
+#: alongside ``tests`` is not asking for two contradictory things.
+_DASHBOARD_FILTER_QUERY_PARAMS = (
+    "environment", "script", "q", "result", "product", "stream",
+    "stale", "retired", "assignee", "unassigned", "assigned", "open",
+    "origin",
+)
 
-    Body: ``{"username": <str or null>, "assigned_by": <str>, "comment":
-    <str or null, optional>}``. ``username: null`` bulk-clears every
-    matched triple's current assignment; a name sets all of them to
-    that one owner — the same two operations :func:`_handle_assignee`
-    performs one row at a time, applied to the whole matched set.
-    ``username``/``assigned_by`` validation matches
-    :func:`_handle_assignee` exactly (required, non-empty, ≤100 chars;
-    a non-null ``username`` naming a deactivated user is a 400) — the
-    same policy question ("can this name be assigned work") has one
-    answer regardless of how many rows are being assigned at once.
+#: Query-string keys _parse_dashboard_filters reads that are NOT
+#: narrowing filters (display options) — the other half of the
+#: coverage check above.
+_DASHBOARD_NON_FILTER_QUERY_PARAMS = ("with_comment", "with_streak")
 
-    The filters are the query string, parsed by the IDENTICAL helper
-    GET /api/dashboard uses (:func:`_parse_dashboard_filters`) — so
-    "everything the current filters match" can never mean two things
-    between the page a tester is looking at and what a bulk action
-    touches. Never scoped by ``stream=`` in practice (Open Actions never
-    sends it, docs/STREAMS_PLAN.md §0.4) and never asked to record an
-    origin: unlike :func:`_handle_assignee`, this endpoint has no
-    ``stream_id`` body field at all — a bulk action from Open Actions is
-    never "made from" a stream page, so every row it touches gets the
-    same ``stream_id: NULL`` a pre-WP-21 client would have written.
 
-    Response: ``{"updated": N}``, the count of matched triples acted on
-    — always equal to what ``GET /api/dashboard`` with the identical
-    query string reports as ``total``, since both read the same
-    ``_dashboard_filters`` clauses over the same join.
+def _parse_bulk_assignment_body(
+    storage: Storage, obj: Dict[str, Any]
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """``username``/``assigned_by``/``comment`` — the three fields
+    IDENTICAL between POST /api/assignments/bulk's filter mode and list
+    mode (:func:`_handle_bulk_assignments`/
+    :func:`_handle_bulk_assignments_list`): required non-null
+    ``assigned_by``; optional ``username`` (``null`` means bulk-clear);
+    a non-null ``username`` naming a deactivated user is a 400 — the
+    same boundary :func:`_handle_assignee` enforces one row at a time,
+    since "can this name be assigned work" has one answer regardless of
+    how many rows are being touched. Returns
+    ``(assignee, assigned_by, comment_text)``.
     """
-    obj = _parse_json_object(request.body)
     if "username" not in obj:
         raise _HttpError(
             400,
@@ -2068,7 +2070,189 @@ def _handle_bulk_assignments(
             )
         if raw_comment.strip():
             comment_text = raw_comment
+    return assignee, assigned_by, comment_text
 
+
+def _validate_test_entry_field(
+    raw: Dict[str, Any], field: str, index: int
+) -> str:
+    """One ``tests[]`` entry's identity field — the SAME per-record,
+    index-naming validation idiom ``/api/import`` uses, but LOUD (a hard
+    400) rather than skip-and-continue: an import record's shape is
+    someone else's data and one bad row should not sink a batch, but a
+    ``tests[]`` entry is built by THIS app's own selection UI a moment
+    earlier, so a bad shape means a bug worth surfacing immediately
+    rather than silently dropping one row of somebody's selection.
+    """
+    if field not in raw:
+        raise _HttpError(
+            400,
+            "tests[{}].{}: required field is missing".format(index, field),
+        )
+    value = raw[field]
+    if not isinstance(value, str) or not value:
+        raise _HttpError(
+            400,
+            "tests[{}].{}: must be a non-empty string, got {}".format(
+                index, field,
+                repr(value) if isinstance(value, str)
+                else type(value).__name__,
+            ),
+        )
+    return value
+
+
+def _validate_test_entry_stream_id(
+    storage: Storage, raw: Dict[str, Any], index: int
+) -> Optional[int]:
+    """One ``tests[]`` entry's optional ``stream_id`` — the same rules
+    :func:`_validate_optional_stream_id` applies to a single PUT
+    .../assignee body, with the error naming the entry's index (the
+    same reason :func:`_validate_test_entry_field` is a separate
+    function rather than reusing :func:`_validate_username` directly).
+    """
+    raw_stream_id = raw.get("stream_id")
+    if raw_stream_id is None:
+        return None
+    if not isinstance(raw_stream_id, int) or isinstance(
+            raw_stream_id, bool):
+        raise _HttpError(
+            400,
+            "tests[{}].stream_id: must be an integer or null, "
+            "got {}".format(index, type(raw_stream_id).__name__),
+        )
+    if storage.get_stream(raw_stream_id) is None:
+        raise _HttpError(
+            404,
+            "tests[{}].stream_id: unknown stream: {}".format(
+                index, raw_stream_id),
+        )
+    return raw_stream_id
+
+
+def _handle_bulk_assignments_list(
+    storage: Storage,
+    obj: Dict[str, Any],
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/assignments/bulk's LIST mode — an EXPLICIT
+    ``"tests": [...]`` selection, as opposed to
+    :func:`_handle_bulk_assignments`'s "everything the current filters
+    match". The multi-select action bar (static/selection.js): a
+    tester ticks rows across one rendered view and assigns/unassigns
+    exactly those, never a query the server re-evaluates against
+    whatever the estate looks like by the time the request lands.
+
+    Each entry is ``{"environment", "script", "test_name", "stream_id"
+    (optional)}`` — shape errors are a loud 400 naming the entry's
+    index (see :func:`_validate_test_entry_field`), never a silent
+    skip: unlike ``/api/import``, these records are built by this app's
+    own UI a moment earlier. ``stream_id``, when present, is WHERE that
+    ONE entry's selection was made from (a build's delta table row
+    carries its stream; a mainline table's rows carry none) — the same
+    "posted/made from" annotation :func:`_handle_assignee` accepts,
+    just per-entry instead of once for the whole request.
+
+    A triple absent from ``latest_runs`` (any stream) is counted in
+    ``unknown`` rather than failing the request — the page that built
+    the selection may be stale.
+
+    Response: ``{"updated": N, "unknown": M}`` — a DIFFERENT shape from
+    filter mode's ``{"updated": N}`` (no ``unknown`` there: a filter
+    match is always current, read in the same transaction it is acted
+    on). ``updated + unknown`` is the DISTINCT triple count a
+    duplicated entry in ``tests`` still counts once
+    (:meth:`Storage.bulk_set_assignee_for_triples`).
+    """
+    assignee, assigned_by, comment_text = _parse_bulk_assignment_body(
+        storage, obj)
+
+    raw_tests = obj["tests"]
+    if not isinstance(raw_tests, list):
+        raise _HttpError(
+            400,
+            "tests: must be a list, got {}".format(
+                type(raw_tests).__name__),
+        )
+    entries = []  # type: List[Tuple[str, str, str, Optional[int]]]
+    for index, raw in enumerate(raw_tests):
+        if not isinstance(raw, dict):
+            raise _HttpError(
+                400,
+                "tests[{}]: must be an object, got {}".format(
+                    index, type(raw).__name__),
+            )
+        environment = _validate_test_entry_field(raw, "environment", index)
+        script = _validate_test_entry_field(raw, "script", index)
+        test_name = _validate_test_entry_field(raw, "test_name", index)
+        stream_id = _validate_test_entry_stream_id(storage, raw, index)
+        entries.append((environment, script, test_name, stream_id))
+
+    updated, unknown = storage.bulk_set_assignee_for_triples(
+        assignee, assigned_by, now(), entries, comment_text=comment_text,
+    )
+    return _json_response(200, {"updated": updated, "unknown": unknown})
+
+
+def _handle_bulk_assignments(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/assignments/bulk — two mutually exclusive modes.
+
+    FILTER mode (no ``tests`` in the body, the original WP-26 shape):
+    assign or clear EVERY test the SAME filters GET /api/dashboard
+    would return, in one transaction. Body: ``{"username": <str or
+    null>, "assigned_by": <str>, "comment": <str or null, optional>}``.
+    ``username: null`` bulk-clears every matched triple's current
+    assignment; a name sets all of them to that one owner — the same
+    two operations :func:`_handle_assignee` performs one row at a time,
+    applied to the whole matched set.
+
+    The filters are the query string, parsed by the IDENTICAL helper
+    GET /api/dashboard uses (:func:`_parse_dashboard_filters`) — so
+    "everything the current filters match" can never mean two things
+    between the page a tester is looking at and what a bulk action
+    touches. Never scoped by ``stream=`` in practice (Open Actions never
+    sends it, docs/STREAMS_PLAN.md §0.4) and never asked to record an
+    origin: unlike :func:`_handle_assignee`, filter mode has no
+    ``stream_id`` body field at all — a bulk action from Open Actions is
+    never "made from" a stream page, so every row it touches gets the
+    same ``stream_id: NULL`` a pre-WP-21 client would have written.
+
+    Response: ``{"updated": N}``, the count of matched triples acted on
+    — always equal to what ``GET /api/dashboard`` with the identical
+    query string reports as ``total``, since both read the same
+    ``_dashboard_filters`` clauses over the same join.
+
+    LIST mode (``tests`` present in the body — see
+    :func:`_handle_bulk_assignments_list`) is MUTUALLY EXCLUSIVE with
+    every dashboard-filter query param
+    (:data:`_DASHBOARD_FILTER_QUERY_PARAMS`): a request naming both is
+    asking two different, possibly contradictory questions — "these
+    exact rows" and "whatever currently matches this filter" — and
+    answering either one silently would be a guess. 400, naming both
+    the mode and the offending param(s), rather than picking one.
+    """
+    obj = _parse_json_object(request.body)
+    if "tests" in obj:
+        present = [
+            name for name in _DASHBOARD_FILTER_QUERY_PARAMS
+            if name in request.query
+        ]
+        if present:
+            raise _HttpError(
+                400,
+                "tests: mutually exclusive with dashboard filter "
+                "param(s) in the query string ({}) — a request cannot "
+                "act on both an explicit list and 'everything the "
+                "filters match'".format(", ".join(sorted(present))),
+            )
+        return _handle_bulk_assignments_list(storage, obj, now)
+
+    assignee, assigned_by, comment_text = _parse_bulk_assignment_body(
+        storage, obj)
     filters = _parse_dashboard_filters(storage, request, now).filters
     updated = storage.bulk_set_assignee(
         assignee, assigned_by, now(), comment_text=comment_text, **filters

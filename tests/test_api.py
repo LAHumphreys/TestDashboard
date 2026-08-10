@@ -1554,6 +1554,286 @@ class TestBulkAssignments(ApiCase):
         self.assertEqual(data, {"updated": 0})
 
 
+class BulkAssignmentsFilterParamCoverageTest(unittest.TestCase):
+    """testboard.api._DASHBOARD_FILTER_QUERY_PARAMS (list mode's
+    mutual-exclusion check) must name every query-string key
+    _parse_dashboard_filters actually reads, or a NEW filter param
+    added there silently fails to trip the mutual-exclusion 400 --
+    "tests" plus the new param would be silently accepted as if they
+    were compatible. This scans the function's own source rather than
+    re-deriving the list by hand a second time, which is exactly the
+    kind of copy this check exists to keep honest.
+    """
+
+    def test_every_query_key_is_accounted_for(self) -> None:
+        import inspect
+        source = inspect.getsource(api._parse_dashboard_filters)
+        # `_query_single(request.query, "name")` and
+        # `request.query.get("name")` are the two access shapes that
+        # function uses.
+        found = set(re.findall(
+            r'(?:_query_single\(\s*request\.query,|request\.query\.get)'
+            r'\s*"([a-z_]+)"', source))
+        self.assertTrue(found, "the scan matched nothing -- regex drifted")
+        accounted = (
+            set(api._DASHBOARD_FILTER_QUERY_PARAMS)
+            | set(api._DASHBOARD_NON_FILTER_QUERY_PARAMS)
+        )
+        self.assertEqual(
+            found - accounted, set(),
+            "a query param _parse_dashboard_filters reads is neither in "
+            "_DASHBOARD_FILTER_QUERY_PARAMS nor "
+            "_DASHBOARD_NON_FILTER_QUERY_PARAMS: " + repr(found - accounted))
+
+    def test_the_two_lists_do_not_overlap(self) -> None:
+        self.assertEqual(
+            set(api._DASHBOARD_FILTER_QUERY_PARAMS)
+            & set(api._DASHBOARD_NON_FILTER_QUERY_PARAMS),
+            set())
+
+
+class TestBulkAssignmentsListMode(ApiCase):
+    """POST /api/assignments/bulk's LIST mode — an explicit ``"tests"``
+    selection (the multi-select action bar, static/selection.js), as
+    opposed to :class:`TestBulkAssignments`' filter mode. Same
+    fixture/PATH.
+    """
+
+    PATH = "/api/assignments/bulk"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a", result="FAIL"),
+            record(test_name="test_b", result="PASS"),
+            record(test_name="test_c", result="UNEXPECTED_PASS"),
+        ])
+        self.import_runs([record(
+            test_name="test_b", build="feat/x", result="PASS",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def _entry(self, test_name: str, **overrides: Any) -> Dict[str, Any]:
+        entry = {
+            "environment": "linux-sim", "script": "suite/alpha.py",
+            "test_name": test_name,
+        }  # type: Dict[str, Any]
+        entry.update(overrides)
+        return entry
+
+    def test_only_the_named_tests_are_updated(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a")]})
+        self.assertEqual(data, {"updated": 1, "unknown": 0})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertEqual(rows["test_a"]["assignee"], "alice")
+        self.assertIsNone(rows["test_b"]["assignee"])
+
+    def test_unassign_over_named_tests(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a"), self._entry("test_b")]})
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": None, "assigned_by": "bob",
+                  "tests": [self._entry("test_a"), self._entry("test_b")]})
+        self.assertEqual(data, {"updated": 2, "unknown": 0})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertIsNone(rows["test_a"]["assignee"])
+        self.assertIsNone(rows["test_b"]["assignee"])
+
+    def test_an_unknown_triple_is_counted_not_a_hard_failure(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [
+                      self._entry("test_a"),
+                      self._entry("no_such_test"),
+                  ]})
+        self.assertEqual(data, {"updated": 1, "unknown": 1})
+
+    def test_a_per_entry_stream_id_lands_as_that_rows_origin(self) -> None:
+        """The build delta table's own selection -- one entry carries
+        its stream_id, matching what a row-level PUT .../assignee with
+        the same body field would write."""
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [
+                      self._entry("test_a", stream_id=self.stream_id),
+                  ]})
+        self.assertEqual(data, {"updated": 1, "unknown": 0})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertEqual(rows["test_a"]["assignment_stream_id"],
+                          self.stream_id)
+
+    def test_an_entry_with_no_stream_id_writes_null_origin(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a")]})
+        self.assertEqual(data, {"updated": 1, "unknown": 0})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertIsNone(rows["test_a"]["assignment_stream_id"])
+
+    def test_comment_posted_on_every_updated_test(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": "seen in the build",
+                  "tests": [self._entry("test_a"), self._entry("test_c")]})
+        for name in ("test_a", "test_c"):
+            comments = self.call(
+                "GET", test_path("linux-sim", "suite/alpha.py", name,
+                                  "/comments"))["comments"]
+            self.assertEqual(len(comments), 1, name)
+            self.assertEqual(comments[0]["text"], "seen in the build")
+        self.assertEqual(
+            self.call(
+                "GET", test_path("linux-sim", "suite/alpha.py", "test_b",
+                                  "/comments"))["comments"],
+            [])
+
+    def test_mutually_exclusive_with_a_dashboard_filter_param(self) -> None:
+        data = self.call(
+            "POST", self.PATH, query={"environment": ["linux-sim"]},
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a")]},
+            expect=400)
+        self.assertIn("tests", data["error"])
+        self.assertIn("environment", data["error"])
+
+    def test_mutually_exclusive_with_each_filter_param_in_turn(self) -> None:
+        """Every name in _DASHBOARD_FILTER_QUERY_PARAMS actually trips
+        the 400 -- not just the one param the test above happens to
+        use."""
+        for name in api._DASHBOARD_FILTER_QUERY_PARAMS:
+            with self.subTest(param=name):
+                data = self.call(
+                    "POST", self.PATH, query={name: ["1"]},
+                    body={"username": "alice", "assigned_by": "bob",
+                          "tests": [self._entry("test_a")]},
+                    expect=400)
+                self.assertIn("tests", data["error"])
+
+    def test_tests_must_be_a_list(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": "test_a"},
+            expect=400)
+        self.assertIn("tests", data["error"])
+
+    def test_entry_must_be_an_object(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": ["test_a"]},
+            expect=400)
+        self.assertIn("tests[0]", data["error"])
+
+    def test_missing_field_names_the_index(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [
+                      self._entry("test_a"),
+                      {"environment": "linux-sim",
+                       "script": "suite/alpha.py"},
+                  ]},
+            expect=400)
+        self.assertIn("tests[1]", data["error"])
+        self.assertIn("test_name", data["error"])
+
+    def test_wrong_type_field_names_the_index(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a", environment=9)]},
+            expect=400)
+        self.assertIn("tests[0]", data["error"])
+        self.assertIn("environment", data["error"])
+
+    def test_empty_string_field_is_rejected(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a", script="")]},
+            expect=400)
+        self.assertIn("tests[0]", data["error"])
+
+    def test_unknown_stream_id_names_the_index(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a", stream_id=999999)]},
+            expect=404)
+        self.assertIn("tests[0]", data["error"])
+
+    def test_bad_stream_id_type_names_the_index(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a", stream_id="x")]},
+            expect=400)
+        self.assertIn("tests[0]", data["error"])
+        self.assertIn("stream_id", data["error"])
+
+    def test_username_assigned_by_validation_matches_filter_mode(
+        self
+    ) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"assigned_by": "bob",
+                  "tests": [self._entry("test_a")]},
+            expect=400)
+        self.assertIn("username", data["error"])
+
+    def test_a_deactivated_user_cannot_be_assigned_work(self) -> None:
+        self.call(
+            "POST", "/api/users", body={"username": "eve"}, expect=201)
+        self.call(
+            "PUT", "/api/users/eve/active",
+            body={"active": False, "changed_by": "bob"})
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "eve", "assigned_by": "bob",
+                  "tests": [self._entry("test_a")]},
+            expect=400)
+        self.assertIn("deactivated", data["error"])
+
+    def test_a_duplicated_entry_counts_once(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "tests": [self._entry("test_a"), self._entry("test_a")]})
+        self.assertEqual(data, {"updated": 1, "unknown": 0})
+
+    def test_zero_tests_updates_nothing(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob", "tests": []})
+        self.assertEqual(data, {"updated": 0, "unknown": 0})
+
+
 class TestOriginResultTruthfulDisplay(ApiCase):
     """ADDENDUM to the perf round: a row whose assignment origin is a
     non-mainline stream must not show only mainline's result -- that
