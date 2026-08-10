@@ -70,16 +70,20 @@ expected-failure footnote any more — see "the CRLF failures" below.
 
 1. **The local MariaDB is 12.3.2, not 10.3.** Prod is 10.3.39. Local
    dual-backend runs prove nothing about prod's server; **CI's two
-   `mariadb:10.3` legs are the only 10.3 evidence that exists.** Treat
-   them as mandatory for anything touching MariaDB DDL.
+   MariaDB legs are the only 10.3 evidence that exists** — and they run
+   **10.3.39, prod's exact version**, not merely its stream. Treat them
+   as mandatory for anything touching MariaDB DDL.
 2. **A new CI leg runs the whole suite against a database the upgrade
    tool built** (`python36-mariadb-upgraded`), because "the schema
    matches" and "the app serves on it" are different claims and only the
    second one is what today needs.
-3. **`ALTER TABLE runs ADD COLUMN` takes the INSTANT path** — proven by
-   an explicit `ALGORITHM=INSTANT` being accepted, not inferred from a
-   fast clock. But only at 500k rows on 12.3.2; prod has ~4.4M. The tool
-   prints the row count and warns if that step exceeds 5s.
+3. **`ALTER TABLE runs ADD COLUMN` takes the INSTANT path on 10.3.39** —
+   `InstantAddColumnTest` forces `ALGORITHM=INSTANT` on the exact
+   statement the tool emits (located via the tool's own predicate, so it
+   cannot drift) and asserts the SERVER accepts it. It passes on CI's
+   10.3.39. Capability does not vary with row count, so prod's ~4.4M
+   does not threaten it; only total wall-clock on a loaded shared daemon
+   is unmeasured. The tool still prints the row count and warns above 5s.
 4. **The CRLF failures are gone and were never real.** Two
    `ProductUrlAdoptionTest` cases asserted on `\n` against files read in
    binary (deliberately — `app.js` contains a real NUL). On a Windows

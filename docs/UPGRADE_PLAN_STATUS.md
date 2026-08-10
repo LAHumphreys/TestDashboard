@@ -3003,3 +3003,36 @@ in-progress work to another's `git stash`. Nothing was lost permanently
 (it was redone in an isolated worktree and diffed), but every parallel
 implementer now gets its own `git worktree` as the first instruction, not
 as a hope. Two superseded stashes remain in the main checkout.
+
+## 2026-08-11 (early) — addendum to the tooling night: the INSTANT claim is demonstrated on production's exact version
+
+The tooling-night entry above records the `runs ADD COLUMN` INSTANT path
+as established at 500,000 rows on the local **12.3.2** server, with
+production's 10.3.39 left as an argued rather than demonstrated case.
+That gap is now closed and the entry above is left as written (this log
+is append-only); this addendum is the correction.
+
+`tests/test_upgrade_mariadb_schema.py::InstantAddColumnTest` forces
+`ALGORITHM=INSTANT` onto the exact statement `step_8_to_9()` emits —
+located through the tool's own `_touches_runs_stream_id` predicate rather
+than retyped, so the test cannot drift from what a live upgrade runs —
+and asserts the **server accepts it**. Deliberately not a timing
+assertion: at fixture scale INSTANT and a full COPY rebuild are
+indistinguishable by clock, which is precisely the weakness it replaces.
+Forcing the algorithm makes the server declare its own capability.
+
+It passes on CI's MariaDB leg, which reports **10.3.39 — production's
+exact version, not merely its 10.3 stream**. Capability of this kind does
+not vary with row count, so production's ~4.4M rows do not threaten it.
+
+What remains unmeasured is narrower than before and worth stating
+precisely: total wall-clock for the upgrade on a *loaded, shared*
+production daemon. The tool prints `runs`'s row count before starting and
+warns if that step exceeds 5 seconds — the in-the-moment signal that it
+fell back to a rebuild despite the above.
+
+The failure path was hand-verified separately (a bogus ALGORITHM value
+forced a real `DatabaseError` and the rendered message was checked for
+legibility), since MariaDB cannot be made to refuse INSTANT on demand
+locally. If that message ever fires on a real run it names the production
+consequence and says not to soften it away.
