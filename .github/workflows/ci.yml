@@ -1,6 +1,6 @@
 # CI for testboard.
 #
-# Three jobs:
+# Four jobs:
 #   - modern:          proves the suite runs warning-clean on current Pythons (dev machines).
 #   - python36-rhel8:  THE AUTHORITATIVE GATE. Runs inside Red Hat's ubi8/python-36
 #                      container — the exact RHEL 8 platform Python (3.6.8) the
@@ -12,6 +12,14 @@
 #                      the storage and API tests run against BOTH engines here.
 #                      SQLite is not "the CI backend" and MariaDB "the real
 #                      one" — they are equal backends and both gate the merge.
+#   - tcl-conformance: an ordinary ubuntu runner plus a bare tclsh (WP-29).
+#                      tests/test_feeder_engines_conformance.py gates its Tcl
+#                      variants on tclsh being on PATH, the same pattern
+#                      TESTBOARD_TEST_DB_CNF uses for MariaDB — absent, they
+#                      simply do not exist; here, they do. This proves
+#                      clients/feeder.tcl actually RUNS end to end, on top of
+#                      the static 8.5-construct guard (tests/test_tcl_compat.py)
+#                      that runs unconditionally in every job.
 name: CI
 
 on:
@@ -85,3 +93,42 @@ jobs:
         env:
           TESTBOARD_TEST_DB_CNF: /tmp/mariadb-test.cnf
         run: python3 -m unittest discover -v
+
+  tcl-conformance:
+    name: Python 3.8 + Tcl (single-file feeder conformance)
+    # NOT the ubi8 container, and the reason is worth keeping. Installing
+    # tclsh there needs root (the image runs as uid 1001 and carries no
+    # microdnf), and running the WHOLE suite as root is not a neutral
+    # act: root ignores permission bits, so every test that asserts a
+    # permission is enforced silently stops testing anything. One did
+    # fail that way here -- test_feeder_preflight's unwritable-directory
+    # probe, which already skips on Windows for the very same reason
+    # ("a read-only bit does not stop writes"). Skipping it under root
+    # too would have papered over the fact that the rest of the suite
+    # was still running with permission checks disabled. An ordinary
+    # ubuntu runner installs tcl with sudo and then runs the tests as a
+    # normal user, so nothing is masked.
+    #
+    # The Python version here is incidental -- feeder.tcl does not care.
+    # 3.6 compatibility is gated statically in every job by
+    # tests/test_python36_compat.py and executed by the ubi8 leg.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: Install tclsh (bundled http package only - no tcllib, no tls)
+        run: sudo apt-get update && sudo apt-get install -y tcl
+      - name: Show interpreter versions
+        # Ubuntu and RHEL 8 both ship Tcl 8.6.x, so this leg proves
+        # clients/feeder.tcl actually RUNS on a real tclsh -- it is NOT
+        # 8.5 verification. No 8.5 interpreter exists on CI or on any
+        # box here; the static 8.5-construct gate
+        # (tests/test_tcl_compat.py) is what covers that, and the drop
+        # note says so rather than letting a green tick imply otherwise.
+        run: |
+          python --version
+          echo 'puts [info patchlevel]' | tclsh
+      - name: Run test suite (Tcl conformance variants active)
+        run: python -m unittest discover -v

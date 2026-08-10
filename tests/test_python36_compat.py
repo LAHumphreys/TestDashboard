@@ -63,6 +63,20 @@ ValuesView cast get_type_hints no_type_check no_type_check_decorator overload
 #: own docstrings state the rule; this is the enforcement.
 ENTRY_SCRIPTS = ("run_server.py", "run_feeder.py")
 
+#: Single-file client engines (clients/): distributed into ANOTHER
+#: product's repository, where "python" vs "python3" is exactly as
+#: uncontrolled as it is on this project's own RHEL 8 target, so they
+#: carry the same Python-2-parseable rule as ENTRY_SCRIPTS. Built with
+#: os.path.join (not a "/"-joined literal): ENTRY_SCRIPTS' bare
+#: filenames happen to need no separator, but "clients/feeder.py"
+#: joined against REPO_ROOT with the wrong separator style produces a
+#: path that will not match the walk's os.path.join(dirpath, name)
+#: keys on Windows (backslash vs forward-slash), silently exempting
+#: the file from the very check meant to cover it.
+CLIENT_ENGINES = (
+    os.path.join("clients", "feeder.py"),
+)
+
 #: ``static`` is JS/HTML/CSS and holds no Python. Nothing else is
 #: excluded: a stray .py under docs/ or tools/ must be gated too, and an
 #: empty match costs nothing since the walk already filters to .py.
@@ -379,13 +393,13 @@ class SourceCompatibilityTest(unittest.TestCase):
         self.assertEqual(bad, [], "typing names absent from Python 3.6")
 
     def test_entry_scripts_carry_no_inline_annotations(self) -> None:
-        """The bare-``python`` trap on RHEL 8.
+        """The bare-``python`` trap on RHEL 8 - and, for CLIENT_ENGINES,
+        on whatever host a contributing product's framework runs on.
 
-        These two must parse under 2.7 so they can print a readable
-        version error instead of a SyntaxError, which means type
-        comments only.
+        These must parse under 2.7 so they can print a readable version
+        error instead of a SyntaxError, which means type comments only.
         """
-        for name in ENTRY_SCRIPTS:
+        for name in ENTRY_SCRIPTS + CLIENT_ENGINES:
             path = os.path.join(REPO_ROOT, name)
             tree = self.trees[path]
             annotated = [describe(annotation)

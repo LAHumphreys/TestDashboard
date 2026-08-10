@@ -863,6 +863,20 @@ JSON shape (score and failure_rate rounded to 4 decimal places, durations to 3):
 
 ## Feeding in your own results
 
+**Onboarding a new product?** See
+**[docs/FEEDER_TEMPLATE.md](docs/FEEDER_TEMPLATE.md)** first: a single
+distributable file (`clients/feeder.py` or vanilla-Tcl `clients/feeder.tcl`)
+that a product checks into its own repository and its test framework invokes
+once per suite execution, from its own cleanup phase — no checkout of this
+repo required. The rest of this section describes the older, checkout-based
+feeder (`feeder/` + `run_feeder.py`), which one product still runs
+unchanged and which remains the tool for a one-off historical backfill.
+
+**Feeders always POST to the dashboard's backend port directly, plain
+HTTP — never through nginx, never with a URL prefix**, whether or not the
+site normally reaches the dashboard through one; this is true of both the
+single-file feeders and the checkout-based one below.
+
 The feeder framework ships in this repo (`feeder/` + `run_feeder.py`). The only
 site-specific piece is a small **reader** module that yields run dicts in the
 transport schema above — see **[docs/FEEDER_BRIEF.md](docs/FEEDER_BRIEF.md)** for a
