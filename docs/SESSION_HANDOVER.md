@@ -149,6 +149,18 @@ world, same version-must-match rule as always.
 5. Re-retire the tests the un-retire bug released (search comments for
    "Automatically un-retired"); `tools/diagnose_db.py --compare-local`
    on the production server — both still open from earlier drops.
+6. **Decide whether to close the SQLite/MariaDB divergence WP-26
+   found** on `current_assignments.stream_id`/`assignments.stream_id`:
+   SQLite's declared `ON DELETE SET NULL` FK auto-clears the column
+   when `delete_stream` runs; MariaDB's migrated schema has no FK at
+   all, so there it dangles. `comments.stream_id` was already
+   protected from exactly this by an explicit UPDATE in
+   `delete_stream` — the same fix (an explicit `UPDATE ... SET
+   stream_id = NULL` for both tables, in the same transaction) would
+   close it for good on both backends, but WP-26's brief was to make
+   the finding visible, not to change `delete_stream`'s behavior, so
+   it is untouched. Relevant before Thread B's cutover, since
+   MariaDB is where the dangling id is real.
 
 ## First ten minutes of a new session
 
