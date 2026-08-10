@@ -825,18 +825,37 @@ def _validate_optional_stream_id(
     return raw_stream_id
 
 
-def _handle_dashboard(
+class _DashboardFilters(NamedTuple):
+    """What :func:`_parse_dashboard_filters` extracts from the query
+    string, and nothing more — pagination/sort/streak/comment options
+    stay local to whichever endpoint actually uses them.
+    """
+
+    #: Ready to spread as ``**filters`` into :meth:`Storage.dashboard`,
+    #: :meth:`Storage.dashboard_count` and :meth:`Storage.bulk_set_assignee`
+    #: — the three readers/writers that must always agree on what "every
+    #: test these filters match" means.
+    filters: Dict[str, Any]
+    product: Optional[str]
+    with_comment: bool
+    with_streak: bool
+
+
+def _parse_dashboard_filters(
     storage: Storage,
     request: Request,
     now: Callable[[], datetime.datetime],
-) -> Response:
-    """GET /api/dashboard — ONE PAGE of the latest run per test, no outputs.
+) -> _DashboardFilters:
+    """Parse GET /api/dashboard's query-string filters.
 
-    The estate can hold tens of thousands of tests, so this endpoint is
-    paginated: it answers with the rows for the requested window plus the
-    exact ``total`` for the filters, and the caller pages through with
-    ``limit``/``offset``. Filtering, sorting and searching all happen in
-    SQL — no client is expected to hold the whole estate to do them.
+    Shared verbatim (WP-26) with POST /api/assignments/bulk, which acts
+    on the SAME matched set a dashboard fetch with identical params
+    would page through — a second hand-rolled copy of this parsing is
+    exactly the class of bug WP-24's ``apiUrl()``/``pageUrl()``
+    consolidation ended for hand-built URLs, just one layer further in.
+    Extracted with its validation order UNCHANGED: ``origin``'s 400
+    still fires before ``sort``'s (parsed by the caller, after this
+    returns), and ``stale=1`` still does its cutoff lookup before either.
     """
     environment = _query_single(request.query, "environment")
     script = _query_single(request.query, "script")
@@ -890,6 +909,47 @@ def _handle_dashboard(
                 assignment_origin),
         )
 
+    filters = {
+        "environment": environment,
+        "script": script,
+        "results": results,
+        "q": q,
+        "stale_before": stale_before,
+        "include_retired": include_retired,
+        "assignees": assignees,
+        "include_unassigned": include_unassigned,
+        "environments": environments,
+        "stream_id": stream_id,
+        "assignment_origin": assignment_origin,
+        "assigned_only": assigned_only,
+        "open_items": open_items,
+    }  # type: Dict[str, Any]
+    return _DashboardFilters(
+        filters=filters, product=product, with_comment=with_comment,
+        with_streak=with_streak,
+    )
+
+
+def _handle_dashboard(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """GET /api/dashboard — ONE PAGE of the latest run per test, no outputs.
+
+    The estate can hold tens of thousands of tests, so this endpoint is
+    paginated: it answers with the rows for the requested window plus the
+    exact ``total`` for the filters, and the caller pages through with
+    ``limit``/``offset``. Filtering, sorting and searching all happen in
+    SQL — no client is expected to hold the whole estate to do them.
+    """
+    parsed = _parse_dashboard_filters(storage, request, now)
+    filters = parsed.filters
+    product = parsed.product
+    with_comment = parsed.with_comment
+    with_streak = parsed.with_streak
+    stream_id = filters["stream_id"]
+
     sort = _query_single(request.query, "sort") or _DEFAULT_SORT
     if sort not in DASHBOARD_SORTS:
         raise _HttpError(
@@ -910,21 +970,6 @@ def _handle_dashboard(
     )
     offset = _parse_int_param(request, "offset", 0, 0, _MAX_OFFSET)
 
-    filters = {
-        "environment": environment,
-        "script": script,
-        "results": results,
-        "q": q,
-        "stale_before": stale_before,
-        "include_retired": include_retired,
-        "assignees": assignees,
-        "include_unassigned": include_unassigned,
-        "environments": environments,
-        "stream_id": stream_id,
-        "assignment_origin": assignment_origin,
-        "assigned_only": assigned_only,
-        "open_items": open_items,
-    }  # type: Dict[str, Any]
     rows = storage.dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,
         offset=offset, with_latest_comment=with_comment, **filters
@@ -1940,6 +1985,95 @@ def _handle_assignee(
         stream_id=stream_id,
     )
     return _json_response(200, {"assignee": assignee})
+
+
+def _handle_bulk_assignments(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/assignments/bulk — assign or clear EVERY test the SAME
+    filters GET /api/dashboard would return, in one transaction.
+
+    Body: ``{"username": <str or null>, "assigned_by": <str>, "comment":
+    <str or null, optional>}``. ``username: null`` bulk-clears every
+    matched triple's current assignment; a name sets all of them to
+    that one owner — the same two operations :func:`_handle_assignee`
+    performs one row at a time, applied to the whole matched set.
+    ``username``/``assigned_by`` validation matches
+    :func:`_handle_assignee` exactly (required, non-empty, ≤100 chars;
+    a non-null ``username`` naming a deactivated user is a 400) — the
+    same policy question ("can this name be assigned work") has one
+    answer regardless of how many rows are being assigned at once.
+
+    The filters are the query string, parsed by the IDENTICAL helper
+    GET /api/dashboard uses (:func:`_parse_dashboard_filters`) — so
+    "everything the current filters match" can never mean two things
+    between the page a tester is looking at and what a bulk action
+    touches. Never scoped by ``stream=`` in practice (Open Actions never
+    sends it, docs/STREAMS_PLAN.md §0.4) and never asked to record an
+    origin: unlike :func:`_handle_assignee`, this endpoint has no
+    ``stream_id`` body field at all — a bulk action from Open Actions is
+    never "made from" a stream page, so every row it touches gets the
+    same ``stream_id: NULL`` a pre-WP-21 client would have written.
+
+    Response: ``{"updated": N}``, the count of matched triples acted on
+    — always equal to what ``GET /api/dashboard`` with the identical
+    query string reports as ``total``, since both read the same
+    ``_dashboard_filters`` clauses over the same join.
+    """
+    obj = _parse_json_object(request.body)
+    if "username" not in obj:
+        raise _HttpError(
+            400,
+            "username: required field is missing "
+            "(use null to bulk-unassign)",
+        )
+    assignee = None  # type: Optional[str]
+    if obj["username"] is not None:
+        assignee = _validate_username(obj, "username")
+        # Same boundary _handle_assignee enforces, same reason: the
+        # picker will not offer a deactivated user, but the picker is
+        # not the boundary.
+        if not storage.is_active_user(assignee):
+            raise _HttpError(
+                400,
+                "{} has been deactivated and cannot be assigned work. "
+                "Reactivate the account first if this is "
+                "intended.".format(assignee),
+            )
+    assigned_by = _validate_username(obj, "assigned_by")
+
+    # "comment" is OPTIONAL and its non-emptiness gates whether it is
+    # used at all — unlike POST .../comments' "text", which is REQUIRED
+    # and 400s on empty. Absent, null, or whitespace-only all mean "no
+    # comment" here; a non-string value or one over the shared length
+    # cap is still a loud 400 (the type/length rules, not the
+    # not-empty rule, are what this endpoint shares with
+    # _validate_comment_text).
+    raw_comment = obj.get("comment")
+    comment_text = None  # type: Optional[str]
+    if raw_comment is not None:
+        if not isinstance(raw_comment, str):
+            raise _HttpError(
+                400,
+                "comment: must be a string or null, got {}".format(
+                    type(raw_comment).__name__),
+            )
+        if len(raw_comment) > _MAX_COMMENT_LEN:
+            raise _HttpError(
+                400,
+                "comment: must be at most {} characters (got {})".format(
+                    _MAX_COMMENT_LEN, len(raw_comment)),
+            )
+        if raw_comment.strip():
+            comment_text = raw_comment
+
+    filters = _parse_dashboard_filters(storage, request, now).filters
+    updated = storage.bulk_set_assignee(
+        assignee, assigned_by, now(), comment_text=comment_text, **filters
+    )
+    return _json_response(200, {"updated": updated})
 
 
 def _handle_script_executions(
@@ -3536,6 +3670,10 @@ def _route(
     if rest == ["dashboard"]:
         _check_method(request.method, ("GET",))
         return _handle_dashboard(storage, request, now)
+
+    if rest == ["assignments", "bulk"]:
+        _check_method(request.method, ("POST",))
+        return _handle_bulk_assignments(storage, request, now)
 
     if rest == ["summary"]:
         _check_method(request.method, ("GET",))

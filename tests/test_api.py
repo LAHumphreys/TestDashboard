@@ -1315,6 +1315,245 @@ class TestAssigneeStreamId(ApiCase):
         }, expect=400)
 
 
+class TestBulkAssignments(ApiCase):
+    """POST /api/assignments/bulk — Open Actions' bulk assign/unassign
+    (2026-08-10, found while cleaning up assignments a dead build left
+    behind: cleanup was per row until this). Acts on the SAME filters
+    GET /api/dashboard would return, reusing
+    testboard.api._parse_dashboard_filters — these tests are what
+    proves the two endpoints can never quietly mean two different
+    things by "everything the current filters match".
+    """
+
+    PATH = "/api/assignments/bulk"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a", result="FAIL"),
+            record(test_name="test_b", result="PASS"),
+            record(test_name="test_c", result="UNEXPECTED_PASS"),
+        ])
+        self.import_runs([record(
+            test_name="test_b", build="feat/x", result="PASS",
+            start_time="2026-07-25T03:00:00.000000",
+            end_time="2026-07-25T03:00:03.000000")])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        # test_b starts BUILD-originated -- proves a bulk op clears
+        # that origin the same way a row-level re-assign from this
+        # page already does (it, too, sends no stream_id).
+        self.call(
+            "PUT", test_path("linux-sim", "suite/alpha.py", "test_b",
+                              "/assignee"),
+            body={"username": "carol", "assigned_by": "dave",
+                  "stream_id": self.stream_id})
+
+    def test_bulk_assign_returns_the_matched_count(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"})
+        self.assertEqual(data, {"updated": 3})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertTrue(all(r["assignee"] == "alice" for r in rows))
+
+    def test_bulk_unassign_clears_every_matched_test(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"})
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": None, "assigned_by": "bob"})
+        self.assertEqual(data, {"updated": 3})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertTrue(all(r["assignee"] is None for r in rows))
+
+    def test_a_filtered_bulk_op_only_touches_matched_rows(self) -> None:
+        """origin=build must clear ONLY the build-originated
+        assignment — the discriminating check that filter parsing is
+        genuinely shared, not a second hand-rolled copy that can
+        drift."""
+        data = self.call(
+            "POST", self.PATH, query={"origin": ["build"]},
+            body={"username": None, "assigned_by": "bob"})
+        self.assertEqual(data, {"updated": 1})
+        rows = {
+            r["test_name"]: r
+            for r in self.call("GET", "/api/dashboard")["tests"]
+        }
+        self.assertIsNone(rows["test_b"]["assignee"])
+        self.assertEqual(rows["test_a"]["assignee"], None)
+
+    def test_updated_matches_dashboard_total_for_a_combined_filter(
+        self
+    ) -> None:
+        """open=1 + origin=build + assignee=carol together: a filter
+        combination no single param could express alone. Proof the
+        bulk endpoint and GET /api/dashboard agree on what it means —
+        the single most important check in this class."""
+        query = {
+            "open": ["1"], "origin": ["build"], "assignee": ["carol"],
+        }
+        expected_total = self.call(
+            "GET", "/api/dashboard", query=query)["total"]
+        self.assertEqual(expected_total, 1)
+        data = self.call(
+            "POST", self.PATH, query=query,
+            body={"username": None, "assigned_by": "bob"})
+        self.assertEqual(data["updated"], expected_total)
+        self.assertIsNone(
+            self.call(
+                "GET", test_path("linux-sim", "suite/alpha.py", "test_b")
+            )["assignee"])
+
+    def test_reapplying_over_origin_build_after_clearing_returns_zero(
+        self
+    ) -> None:
+        """A bulk op writes stream_id=NULL on every matched row (Open
+        Actions never records an origin) — so a bulk action filtered
+        by origin=build clears the very origin it matched on.
+        Re-running the identical request finds nothing left to match.
+        Correct, not a regression: the same thing already happens to a
+        single row reassigned from this page today."""
+        body = {"username": "alice", "assigned_by": "bob"}
+        first = self.call(
+            "POST", self.PATH, query={"origin": ["build"]}, body=body)
+        self.assertEqual(first["updated"], 1)
+        second = self.call(
+            "POST", self.PATH, query={"origin": ["build"]}, body=body)
+        self.assertEqual(second["updated"], 0)
+
+    def test_no_origin_is_ever_written_even_for_a_build_scoped_filter(
+        self
+    ) -> None:
+        """Filtering BY origin=build (which stream) selects rows, but
+        never becomes an origin WRITTEN: every row this endpoint
+        touches ends up with assignment_stream_id null, the same as a
+        row-level re-assign made from this page (docs/STREAMS_PLAN.md
+        §0.4 — Open Actions is unscoped)."""
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"})
+        rows = self.call("GET", "/api/dashboard")["tests"]
+        self.assertTrue(
+            all(r["assignment_stream_id"] is None for r in rows))
+
+    def test_username_key_required_400(self) -> None:
+        data = self.call(
+            "POST", self.PATH, body={"assigned_by": "bob"}, expect=400)
+        self.assertIn("username", data["error"])
+
+    def test_assigned_by_required_and_non_empty_400(self) -> None:
+        for body in (
+            {"username": "alice"},
+            {"username": "alice", "assigned_by": "   "},
+            {"username": "alice", "assigned_by": 9},
+        ):
+            with self.subTest(body=body):
+                data = self.call(
+                    "POST", self.PATH, body=body, expect=400)
+                self.assertIn("assigned_by", data["error"])
+
+    def test_username_wrong_type_400(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": 42, "assigned_by": "bob"}, expect=400)
+        self.assertIn("username", data["error"])
+
+    def test_a_deactivated_user_cannot_be_bulk_assigned_work(
+        self
+    ) -> None:
+        """Same boundary PUT .../assignee enforces, same reason: the
+        picker will not offer a deactivated user, but the picker is
+        not the boundary."""
+        self.call(
+            "POST", "/api/users", body={"username": "alice"}, expect=201)
+        self.call(
+            "PUT", "/api/users/alice/active",
+            body={"active": False, "changed_by": "bob"})
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"}, expect=400)
+        self.assertIn("deactivated", data["error"])
+        self.assertIn("alice", data["error"])
+
+    def test_comment_posted_on_every_matched_test(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": "build looked dead"})
+        for name in ("test_a", "test_b", "test_c"):
+            comments = self.call(
+                "GET", test_path("linux-sim", "suite/alpha.py", name,
+                                  "/comments"))["comments"]
+            self.assertEqual(len(comments), 1, name)
+            self.assertEqual(comments[0]["author"], "bob")
+            self.assertEqual(comments[0]["text"], "build looked dead")
+            self.assertIsNone(comments[0]["stream_id"])
+
+    def test_absent_comment_posts_nothing(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob"})
+        comments = self.call(
+            "GET", test_path("linux-sim", "suite/alpha.py", "test_a",
+                              "/comments"))["comments"]
+        self.assertEqual(comments, [])
+
+    def test_null_comment_posts_nothing(self) -> None:
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": None})
+        comments = self.call(
+            "GET", test_path("linux-sim", "suite/alpha.py", "test_a",
+                              "/comments"))["comments"]
+        self.assertEqual(comments, [])
+
+    def test_whitespace_only_comment_posts_nothing(self) -> None:
+        """"comment" is OPTIONAL, unlike POST .../comments' "text",
+        which 400s on empty — its non-emptiness gates whether it is
+        used at all, so whitespace-only is silently "no comment", not
+        a 400."""
+        self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": "   "})
+        comments = self.call(
+            "GET", test_path("linux-sim", "suite/alpha.py", "test_a",
+                              "/comments"))["comments"]
+        self.assertEqual(comments, [])
+
+    def test_comment_wrong_type_400(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": 9},
+            expect=400)
+        self.assertIn("comment", data["error"])
+
+    def test_comment_too_long_400(self) -> None:
+        data = self.call(
+            "POST", self.PATH,
+            body={"username": "alice", "assigned_by": "bob",
+                  "comment": "x" * 10001},
+            expect=400)
+        self.assertIn("comment", data["error"])
+
+    def test_wrong_method(self) -> None:
+        self.assert_405("GET", self.PATH, "POST")
+
+    def test_non_object_body_400(self) -> None:
+        self.call("POST", self.PATH, body=[1, 2, 3], expect=400)
+
+    def test_zero_matches_updates_nothing(self) -> None:
+        data = self.call(
+            "POST", self.PATH, query={"environment": ["does-not-exist"]},
+            body={"username": "alice", "assigned_by": "bob"})
+        self.assertEqual(data, {"updated": 0})
+
+
 class TestOriginResultTruthfulDisplay(ApiCase):
     """ADDENDUM to the perf round: a row whose assignment origin is a
     non-mainline stream must not show only mainline's result -- that
