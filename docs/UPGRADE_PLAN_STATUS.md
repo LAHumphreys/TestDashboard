@@ -2804,3 +2804,85 @@ threshold-gated), not a regression.
 Suite counts by commit: 1978 (baseline) → 1991 (WP-25 + verdict-line
 restore) → 2013 (WP-24) → 2016 (origin rename) → 2017 (four-site fix)
 → 2022 (persona fixes). Every increase is guards, none is weakening.
+## 2026-08-10 (late) — two owed writeups: the SQLite→MariaDB production cutover, and the staging deployment of the streams drop
+
+**Provenance, stated up front.** Neither of these nights was run from a
+session with this log open, and both were owed entries carried on the
+handover for days. They are reconstructed from the operator's own status
+report (captured at the time in the `mariadb-host-migration-state`
+memory note) and from the branch/tag state in the repo — not from a
+transcript. Everything below that is a *number* came from the operator;
+everything that is *absent* is marked absent rather than estimated. This
+entry is written at the start of the 2026-08-10 tooling night, before
+that night's work, so the record exists before more state moves on top
+of it.
+
+### The production cutover: SQLite → MariaDB
+
+Production now serves **MariaDB**. The cutover is complete and
+successful, everyone has moved onto it, and word is spreading among
+committers of the first onboarded product. An earlier version of the
+memory note dated this 2026-08-15/16; those dates were garbled and the
+cutover in fact happened before 2026-08-10.
+
+**Measured on PRODUCTION** — and this is one of the rare entries where
+that word is accurate, so it is worth saying plainly: the source file was
+the real **982 MB** production SQLite database, not a dev copy.
+`tools/migrate_to_mariadb.py`: **audit 10s / export 26s / load 103s /
+verify 18s**, all checks green. Nothing here was taken on the repo-root
+`testboard.db`.
+
+Deployment shape as it now stands: the dashboard serves
+`--db-config /etc/testboard/db.cnf`, unit `testboard.service`, code at
+`/opt/testboard/TestDashboard`, and the old `--db` ExecStart is kept
+**commented in place** as the rollback. The server is a shared **MariaDB
+10.3.39** daemon with other tenants on it; collation `utf8mb4_nopad_bin`,
+`sql_mode` strict.
+
+Three consequences that outlived the night, all of which shape the
+2026-08-11 drop:
+
+1. **`testboard_migrate` was DROPPED after the cutover** (operator
+   hardening, deliberate and correct). There is therefore no DDL-capable
+   credential anywhere. Any schema work on prod MariaDB must *start* with
+   root re-running runbook §A.4's CREATE USER + GRANT under a fresh
+   password with a fresh §A.9 cnf, deleted afterwards.
+2. **`max_allowed_packet` was raised to 128M via `SET GLOBAL` only**, so
+   it does NOT survive a daemon restart. Durable config needs the daemon
+   owners — still open. It mattered for the bulk load and is irrelevant
+   to DDL-only work, which is why the 08-11 upgrade does not depend on it.
+3. **Inline-`#` divergence**: the mysql client truncates an option value
+   at `#`, `dbconfig.py` does not. This bit the cutover through an app
+   password containing `#`, worked around by double-quoting the value in
+   `/etc/testboard/db.cnf`. Runbook §A.9/§A.10 does not yet warn about it
+   — being fixed tonight in the same commit as the incremental-DDL
+   section.
+
+**Not captured, and now unrecoverable at this precision:** wall-clock
+downtime, the exact cutover date, and any post-cutover endpoint timings
+against the MariaDB backend. Production read latency on MariaDB has
+never been measured; every endpoint number in this log is SQLite, on a
+dev copy. That gap is real and is not closed by this entry.
+
+### The streams drop on staging (2026-08-10)
+
+The old SQLite box is now a **staging** instance. The streams drop
+(migrations 8, 9, 10; tip `4d03da3`; branch `streams-upgrade`) was
+deployed there on **2026-08-10** and came up successfully at schema
+**v10**.
+
+What this buys, stated narrowly, because it is easy to over-claim: the
+v7→v10 migration sequence has now run to completion on **production-SIZE
+SQLite data** on a real box. It is evidence about the *migrations*, not
+about MariaDB — the DDL that will run on prod tomorrow is a different
+expression of the same schema change, and no part of it has been
+exercised by this deployment.
+
+**Not captured:** the per-migration timings on staging, the file size,
+and the startup pause the operator actually saw. The drop note's
+migration figures (0.883s for migration 9 alone, 0.806s combined v7→v9)
+remain **dev** numbers on the 220 MB dev copy and must not be quoted as
+staging or production. Had the staging timings been recorded they would
+be the best predictor available for tomorrow morning; they were not, and
+the honest position going into the prod deployment is that the only
+timing evidence is dev-scale.
