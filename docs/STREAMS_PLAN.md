@@ -17,10 +17,12 @@ WP-15 on 11) move up behind it.
 **Trimmed 2026-08-10 (docs tidy).** WP-20 … WP-23 all shipped (products,
 streams, release builds/compare-any-two, long-running branch streams — see
 `UPGRADE_PLAN_STATUS.md` and `docs/drops/2026-08-11.md` for the as-built
-record and measurements). The detailed schema/API/frontend/test specs for
-each drop, and their as-built addenda, are cut below — the shipped code and
-that log are now the record, not this plan. Two things from the cut sections
-still bind and are kept verbatim after §1. One correction to keep in mind
+record and measurements). Most of the detailed schema/API/frontend/test
+specs for each drop, and their as-built addenda, are cut below — the
+shipped code and that log are now the record, not this plan. Three things
+from the cut sections still bind and are kept (two summarised, one — §2.4,
+the Watch page's `c=` URL grammar, cited by name from a live guard test —
+kept in full) after §1. One correction to keep in mind
 while reading §0 below: item 2's `branch`/`build` two-kind model was
 collapsed to a single non-mainline kind, `build`, before the two-kind form
 ever shipped anywhere (WP-25, night of 2026-08-09) — the current wire
@@ -166,6 +168,138 @@ import response, never a silent wrong-stream update. Documented in the
 README contract section. The MariaDB schema comes from the migration
 tooling and carries the correct `UNIQUE (stream_id, …)` from day one; the
 rejection behaviour is identical on both backends (tested).
+
+### 2.4 The Watch page's `c=` URL grammar — kept in full, not a decision summary
+
+**Restored 2026-08-10 (docs tidy)**, after the first trim cut it along with
+the rest of §2: `tests/test_frontend_calls.py`'s `ScopedUrlConstructionTest`
+names this section, by number, as the documented reason `watch.js` is
+exempt from the shared `pageUrl()` builder ("its OWN `c=` grammar
+(docs/STREAMS_PLAN.md §2.4), which has nothing to do with the
+product/stream/baseline/environment scope model \[urls.js\] owns"), and
+`static/watch.js`'s own comments cite it by number more than a dozen times
+for the grammar, the staleness-suffix parsing, and the accent-precedence
+rule. Losing the section would leave that citation pointing at nothing —
+a bigger problem than the extra length, so unlike the rest of §2 this
+subsection is reproduced whole rather than summarised.
+
+The morning view (decision §0.9). One page, a grid of **cards**, each card
+one scope, each card a link into the existing detailed view of that scope.
+
+**URL grammar — the whole configuration.** Repeated `c=` params, order
+preserved; each value is a one-letter kind, a colon, then the name
+(URL-encoded; split at the FIRST colon only):
+
+```
+watch.html?c=p:Atlas&c=e:lab-alpha&c=e:dp-cert
+   p:<product name>      product card
+   e:<environment name>  environment card
+   s:<stream id>         stream card (WP-21+; ids are stable and avoid
+                         quoting product/kind/name triples in URLs)
+```
+
+**Declared staleness — an optional `@<n>h`/`@<n>d` suffix (WP-23, as
+built).** Different scopes have different cadences (a daily branch, a
+weekly build), and the URL is the whole configuration, so the expected
+cadence is part of the card spec, not a page-wide setting:
+
+```
+watch.html?c=e:win-sim@36h&c=p:Atlas@7d&c=s:2@1d
+```
+
+Parsing splits at the **LAST** `@` in the name — never the first — and
+only when the text after it matches `^\d+[hd]$`; names are free text and
+may themselves contain `@` (`p:release@2026` has no valid tail, so the
+whole thing is the name; `p:release@2026@1d` splits at the second `@`,
+name `release@2026`, expectation `1d`). No suffix means no staleness
+judgment at all — today's behaviour, byte for byte (`_parse_watch_spec`/
+`_EXPECTED_SUFFIX` in `testboard/api.py`, mirrored in `static/watch.js`'s
+`splitExpectedSuffix`/`EXPECTED_SUFFIX`, same regex on both sides).
+
+A card whose spec carries `@` gets two extra response fields — `expected`
+(the suffix, echoed) and `stale` (bool) — compared against the card's OWN
+freshness timestamp: environment → `last_reported`; product → its
+laggard's (the OLDEST-reporting environment — "everything reported" is
+the bar, not "something did"); stream → `last_seen` (always present, so a
+stream card is never stale-by-absence the way an environment/product card
+can be). The composer offers a cadence choice (none / 1d / 7d / custom
+hours) that round-trips through this grammar exactly.
+
+**Unassigned-failure highlight (WP-23, as built).** Every ok card also
+carries `unassigned_failing`: the count of tests in the card's own scope
+whose latest result is FAIL and which have no current assignee
+(assignments are triple-scoped and stream-agnostic — for an `s:` card the
+question is "failing on THIS stream and the TEST has no assignee";
+`e:`/`p:` cards are always mainline). Computed from exactly two aggregate
+queries per request regardless of card count — `Storage.
+unassigned_failing_by_environment()` (one row per environment, mainline)
+and `Storage.unassigned_failing_by_stream()` (batched across every
+requested stream id) — never a per-card query, preserving the flat-cost
+property `test_query_count_does_not_grow_with_card_count` pins (7 → 8
+queries for the FIRST card once this landed; still flat from 1 card to
+the 50-card cap).
+
+Frontend: `unassigned_failing > 0` gets the `watch-card-accent-fail`
+border (reusing `--c-fail`) plus an explicit "Unassigned failing" stat —
+colour is never the only carrier. `stale: true` gets a distinct
+`watch-card-accent-stale` border, the SAME non-result amber `.tl-partial`
+uses for a coverage warning (`#8a6d00`) — never `--c-fail`/`--c-fae`,
+since staleness is a timing fact, not a failure. **Accent precedence when
+a card is both:** the unassigned-failure accent wins the border (an owner
+gap is the more actionable fact); the staleness TEXT LINE
+("expected within 1d — last run 3 days ago", both halves real data —
+never a hidden constant) renders independently of which accent wins.
+`unassigned_failing === 0` and no `@` suffix ⇒ zero visual change, the
+card looks exactly as it did before this feature existed.
+
+A bare `watch.html` loads the browser's saved default (localStorage, same
+mechanism as the What's-new unread state). "Save as my default" and
+"Copy link" (a visible read-only input holding the URL — no clipboard-API
+dependency) are the only two persistence affordances. Editing is on the
+page: add-a-card picker, remove, drag-free reorder (up/down buttons —
+keyboard-reachable beats drag).
+
+**Cards say verdicts, dated.** A product card: failing / new failures /
+fixed, its own window timestamp. An environment card: the same scoped to
+the environment, plus its last-reported time (the env-pill fact). Every
+card labels its freshness from its own data — `WindowWordingTest` applies
+per card; there is no page-wide "as of" line because there is no single
+truthful one. Card click-through: product → `index.html` scoped to it,
+environment → `index.html` with the environment filter set, stream →
+`index.html?stream=<id>`. **Every link is scope-self-sufficient (WP-23
+bugfix, "as built"):** an environment or stream card's link ALSO carries
+`?product=<its own product>` — including the empty string for an
+environment nobody has mapped — because a link that only set the
+environment/stream filter left the PRODUCT scope to whatever this
+browser's switcher last had stored, which silently rendered under the
+wrong product (an environment filter under the wrong product resolves to
+an empty allow-list — a blank page, not an error). `index.html` (and
+every other page the switcher appears on) ADOPTS a present `?product=`
+param as both the rendered scope and the new stored selection —
+"the URL wins, and winning makes it stick" (§0.9's principle, extended
+from the Watchlist's own URL to a card's link) — so a shared Watch-card
+link reopens the exact same scope for anyone, not whatever product they
+happened to have selected last.
+
+**A missing scope is an explicit error card, not a gap.** A shared URL
+outlives renames and deletions; a card for an environment that no longer
+reports says so on the card ("nothing under this name — removed or
+renamed?"). Silently missing data is worse than an unexpected row
+(established rule).
+
+**`GET /api/watch?c=…&c=…`** answers the whole page in one request:
+an array of card objects in request order, each `{spec, kind, ok,
+headline numbers, freshness timestamps}` or `{spec, ok: false, error}`.
+Every number comes from the derived tables (`latest_runs` aggregates,
+`environment_expectations`, and in later drops `streams.last_seen` and the
+compare counts) — a card is O(derived), never O(runs). Cards per request
+capped at 50 (413-style refusal with a clear message; a URL that long is a
+mistake, and the cap is stated in the README).
+
+**Nav.** The page joins the header nav ("Watch"). Single-product,
+no-streams deployments still benefit (environment cards), so unlike the
+switcher it is NOT hidden — but it renders a short how-to empty state when
+opened bare with no default saved.
 
 ---
 
