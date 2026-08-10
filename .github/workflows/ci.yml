@@ -1,6 +1,6 @@
 # CI for testboard.
 #
-# Three jobs:
+# Four jobs:
 #   - modern:          proves the suite runs warning-clean on current Pythons (dev machines).
 #   - python36-rhel8:  THE AUTHORITATIVE GATE. Runs inside Red Hat's ubi8/python-36
 #                      container — the exact RHEL 8 platform Python (3.6.8) the
@@ -12,6 +12,14 @@
 #                      the storage and API tests run against BOTH engines here.
 #                      SQLite is not "the CI backend" and MariaDB "the real
 #                      one" — they are equal backends and both gate the merge.
+#   - python36-tcl:    the same interpreter plus a bare tclsh installed (WP-29).
+#                      tests/test_feeder_engines_conformance.py gates its Tcl
+#                      variants on tclsh being on PATH, the same pattern
+#                      TESTBOARD_TEST_DB_CNF uses for MariaDB — absent, they
+#                      simply do not exist; here, they do. This proves
+#                      clients/feeder.tcl actually RUNS end to end, on top of
+#                      the static 8.5-construct guard (tests/test_tcl_compat.py)
+#                      that runs unconditionally in every job.
 name: CI
 
 on:
@@ -84,4 +92,19 @@ jobs:
       - name: Run test suite (SQLite + MariaDB variants)
         env:
           TESTBOARD_TEST_DB_CNF: /tmp/mariadb-test.cnf
+        run: python3 -m unittest discover -v
+
+  python36-tcl:
+    name: Python 3.6.8 + Tcl (single-file feeder conformance)
+    runs-on: ubuntu-latest
+    container: registry.access.redhat.com/ubi8/python-36
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tclsh (bundled http package only - no tcllib, no tls)
+        run: microdnf install -y tcl || dnf install -y tcl
+      - name: Show interpreter versions
+        run: |
+          python3 --version
+          echo 'puts [info patchlevel]' | tclsh
+      - name: Run test suite (Tcl conformance variants active)
         run: python3 -m unittest discover -v
