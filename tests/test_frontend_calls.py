@@ -292,7 +292,7 @@ class UserListTest(unittest.TestCase):
         offenders = {}  # type: Dict[str, List[int]]
         for name, source in scripts().items():
             lines = []  # type: List[int]
-            for number in fetch_sites(source, "/api/users"):
+            for number in fetch_sites(source, "api/users"):
                 line = source.split("\n")[number - 1]
                 if "postJson" in line or "putJson" in line:
                     continue          # a mutation, not a listing
@@ -320,7 +320,7 @@ class UserListTest(unittest.TestCase):
         """
         sites = []  # type: List[str]
         for name, source in scripts().items():
-            for number in fetch_sites(source, "/api/users"):
+            for number in fetch_sites(source, "api/users"):
                 line = source.split("\n")[number - 1]
                 if "include_inactive" in line:
                     sites.append("%s:%d" % (name, number))
@@ -1105,7 +1105,7 @@ class SiteNotesFrontendTest(unittest.TestCase):
 
     def test_it_asks_the_documented_endpoint(self) -> None:
         self.assertEqual(
-            len(fetch_sites(read("whatsnew.js"), "/api/site-notes")), 1)
+            len(fetch_sites(read("whatsnew.js"), "api/site-notes")), 1)
 
     def test_the_nav_marker_never_blocks_a_page(self) -> None:
         """nav.js runs on every page, so its failure path matters most."""
@@ -2922,7 +2922,7 @@ class BulkAssignUnmappedTest(unittest.TestCase):
         environment."""
         body = _function_body(
             read("actions.js"), "async function bulkAssignUnmapped(")
-        self.assertIn('"/api/environments/"', body)
+        self.assertIn('"api/environments/"', body)
         self.assertIn('"/product"', body)
         self.assertIn("for (const item of unmappedEnvs)", body)
 
@@ -3026,7 +3026,7 @@ class OpenActionsBulkAssignmentsTest(unittest.TestCase):
         """WP-24: no hand-built URL anywhere — this is the one place a
         new endpoint's request could have reintroduced one."""
         body = _function_body(read("actions.js"), "function bulkUrl(")
-        self.assertIn('apiUrl("/api/assignments/bulk"', body)
+        self.assertIn('apiUrl("api/assignments/bulk"', body)
 
     def test_bulkUrl_shares_listUrls_filter_params(self) -> None:
         """WP-26: the SAME filterParams() listUrl() uses — never a
@@ -3604,7 +3604,7 @@ class WatchHasNoProductSwitcherTest(unittest.TestCase):
             read("watch.js"), "async function populatePicker(")
         self.assertIn('[""].concat(productNames)', body)
         self.assertIn("Promise.all(", body)
-        self.assertIn('"/api/streams?product="', body)
+        self.assertIn('"api/streams?product="', body)
 
 
 class WatchStalenessGrammarTest(unittest.TestCase):
@@ -4134,7 +4134,7 @@ class SelectionModuleTest(unittest.TestCase):
         body = _function_body(
             read("selection.js"), "function bulkAssignmentsUrl(")
         self.assertIn('apiUrl(', body)
-        self.assertIn('"/api/assignments/bulk"', body)
+        self.assertIn('"api/assignments/bulk"', body)
 
     def test_the_bulk_url_clears_every_scope_level_explicitly(self) -> None:
         """apiUrl() with no scope argument CARRIES the current page's
@@ -4409,6 +4409,153 @@ class OpenActionsUsernameDropdownTest(unittest.TestCase):
             '</div>'
         )
         self.assertIn('id="bulk-assign-username"', planted)
+
+
+#: Quote characters (string literal AND JSDoc backtick) whose presence
+#: immediately before "/api" is what distinguishes a NETWORK CALL from
+#: prose naming an endpoint ("GET /api/summary" in a comment has no
+#: quote in front of it at all).
+_QUOTE_CHARS = "'\"`"
+
+#: A quote immediately followed by "/api" and then either another "/"
+#: (the common case, "/api/summary") or a closing quote (the bare
+#: "/api" form). Comments are stripped before this ever runs (see the
+#: callers), so a JSDoc mention like `` `/api/users` `` — a backtick
+#: pair documenting an endpoint's name, not calling it — never reaches
+#: this pattern at all.
+_ROOT_ABSOLUTE_API_RE = re.compile(
+    "[" + _QUOTE_CHARS + "]/api(?:/|[" + _QUOTE_CHARS + "])")
+
+
+def _root_absolute_api_hits(source: str) -> List[int]:
+    """Line numbers where comment-stripped *source* names a root-absolute
+    ``/api/...`` literal — see :data:`_ROOT_ABSOLUTE_API_RE`."""
+    code = _strip_comments(source)
+    return [
+        number for number, line in enumerate(code.split("\n"), 1)
+        if _ROOT_ABSOLUTE_API_RE.search(line)
+    ]
+
+
+class RootAbsoluteApiUrlTest(unittest.TestCase):
+    """No ``/api/...`` literal may be root-absolute anywhere in static/
+    (WP-28, docs/NIGHT_RUN_2026-08-10.md §5).
+
+    nginx proxies a prod deployment at a path prefix it does NOT strip
+    (``/testboard/`` arrives at the backend verbatim), so every API
+    call has to resolve RELATIVE to the page that made it —
+    ``"api/summary"``, never ``"/api/summary"`` — to land inside the
+    prefix from a page served at ``/testboard/index.html`` and at the
+    bare root alike (every page in static/ is flat, so "relative to the
+    page" is simply "no leading slash", the fix this drop made
+    everywhere such a literal was found). A single surviving
+    ``"/api/..."`` literal silently escapes the prefix the moment
+    nginx is in front of the server — invisible in review (it still
+    works perfectly against a bare, unprefixed server, which is every
+    dev/local run), silent in production until someone notices a
+    request left the proxy. Exactly the shape SCOPED_URLS_PLAN.md's
+    incident list already catalogued for hand-built scope URLs, one
+    path segment further in — hence a guard in the same style as that
+    plan's ``ScopedUrlConstructionTest``, not a narrower one-off.
+    """
+
+    #: Files known to carry a legitimate NUL byte (the "\\0" composite
+    #: key separator — see ``CoverageTest``), which a shell/ripgrep-
+    #: style scan treats as binary and silently SKIPS rather than
+    #: erroring. Both were nearly missed while fixing this exact bug
+    #: family (11 of the literals this drop fixed lived in these two
+    #: files) precisely because a first-pass grep skipped them without
+    #: comment. ``scripts()``/``read()`` decode bytes explicitly and
+    #: are immune, but this asserts the scan actually reached them
+    #: rather than trusting that silently.
+    _NUL_FILES = ("actions.js", "test.js")
+
+    def test_the_nul_byte_files_are_still_in_scope(self) -> None:
+        found = scripts()
+        for name in self._NUL_FILES:
+            self.assertIn(name, found, name + " missing from the scan")
+            self.assertIn(
+                "\x00", found[name],
+                name + " no longer contains a NUL byte -- if that "
+                "changed on purpose, swap in a different NUL-bearing "
+                "example rather than losing this guard's coverage of "
+                "the blind spot silently")
+
+    def test_no_root_absolute_api_literal_anywhere(self) -> None:
+        offenders = {
+            name: hits
+            for name, source in scripts().items()
+            for hits in [_root_absolute_api_hits(source)]
+            if hits
+        }
+        self.assertEqual(
+            offenders, {},
+            "root-absolute /api/... literal(s) found -- must be "
+            "relative (\"api/...\", no leading slash) so a request "
+            "resolves inside the URL prefix from whatever page made "
+            "it, bare or under /testboard/ alike: " + repr(offenders))
+
+    def test_no_root_absolute_href_or_src_in_html(self) -> None:
+        """The other half of the audit (docs/NIGHT_RUN_2026-08-10.md
+        §5.3): every page's own nav/asset links, pinned relative too —
+        locks in the phase's recon finding rather than trusting it to
+        stay true unchecked."""
+        pattern = re.compile(r'''(?:href|src)=["']/''')
+        offenders = {}  # type: Dict[str, List[int]]
+        for name in sorted(os.listdir(STATIC_DIR)):
+            if not name.endswith(".html"):
+                continue
+            with io.open(os.path.join(STATIC_DIR, name), "rb") as handle:
+                source = handle.read().decode("utf-8")
+            hits = [
+                number for number, line in enumerate(source.split("\n"), 1)
+                if pattern.search(line)
+            ]
+            if hits:
+                offenders[name] = hits
+        self.assertEqual(
+            offenders, {},
+            "root-absolute href=\"/...\" or src=\"/...\" found in "
+            "static/*.html: " + repr(offenders))
+
+
+class PlantedRootAbsoluteApiRegressionTest(unittest.TestCase):
+    """Prove the detector can fail, not merely that it passes today."""
+
+    def test_a_wrapper_call_would_be_caught(self) -> None:
+        planted = 'return apiUrl("/api/dashboard", {}, {});'
+        self.assertEqual(len(_root_absolute_api_hits(planted)), 1)
+
+    def test_a_direct_fetch_outlier_would_be_caught_too(self) -> None:
+        """Not just fetchJson/postJson/putJson/apiUrl call sites -- the
+        SAME pattern must catch a bare fetch() outlier, the exact shape
+        whatsnew.js's own direct call had before this drop fixed it."""
+        planted = 'const response = await fetch("/api/site-notes");'
+        self.assertEqual(len(_root_absolute_api_hits(planted)), 1)
+
+    def test_a_bare_api_literal_with_no_trailing_slash_is_caught(self) -> None:
+        planted = 'const path = "/api";'
+        self.assertEqual(len(_root_absolute_api_hits(planted)), 1)
+
+    def test_a_relative_literal_is_not_flagged(self) -> None:
+        """The fixed shape must not itself trip the guard."""
+        planted = 'return apiUrl("api/dashboard", {}, {});'
+        self.assertEqual(_root_absolute_api_hits(planted), [])
+
+    def test_a_jsdoc_mention_is_not_flagged(self) -> None:
+        """The false positive this guard must NOT trip on: a backtick-
+        quoted endpoint name inside a comment, documenting behaviour
+        rather than calling it (api.js's own loadUsers() docstring, of
+        all places -- `/api/users` mentioned in prose one line below
+        the real, relative call site)."""
+        planted = (
+            "/**\n"
+            " * carry, now here): `/api/users` returns active users "
+            "only.\n"
+            " */\n"
+            'const real = fetchJson("api/users");\n'
+        )
+        self.assertEqual(_root_absolute_api_hits(planted), [])
 
 
 if __name__ == "__main__":

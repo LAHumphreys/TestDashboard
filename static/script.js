@@ -58,7 +58,7 @@ const EXECUTION_SERIES = [
 /* ================= data ================= */
 
 function scriptApiPath(suffix) {
-  return "/api/scripts/" + encodeURIComponent(state.environment)
+  return "api/scripts/" + encodeURIComponent(state.environment)
     + "/" + encodeURIComponent(state.script) + suffix;
 }
 
@@ -88,7 +88,7 @@ async function loadTests(append) {
     // Script-page parity: the "tests in this suite" table must show THIS
     // stream's own current results, not mainline's, when scoped -- the
     // same /api/dashboard?stream= every other list in the app reads.
-    const page = await fetchJson(apiUrl("/api/dashboard", {
+    const page = await fetchJson(apiUrl("api/dashboard", {
       environment: state.environment,
       script: state.script,
       retired: "1",

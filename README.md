@@ -63,6 +63,7 @@ python run_server.py [--host 127.0.0.1] [--port 8000] [--db testboard.db] [--sta
 | `--port` | `8000` | TCP port. |
 | `--db` | `testboard.db` | SQLite database file. Created and migrated automatically on startup. |
 | `--static` | `static/` next to `run_server.py` | Directory of frontend files. |
+| `--url-prefix` | `testboard` | Serve behind this path prefix, e.g. for an nginx proxy that does NOT strip it before forwarding — `/testboard/api/summary` is handled exactly as `/api/summary`. Bare paths ALWAYS keep working too, regardless of this flag, which is what makes the default harmless everywhere nginx is absent (dev, staging, a feeder posting straight to the backend port — see "Feeding in your own results" below). Give `""` to disable prefix handling entirely. |
 
 The server prints its URL on startup and shuts down cleanly on Ctrl+C. The database
 schema is versioned (`schema_version` table) and migrated automatically, so upgrading
@@ -869,6 +870,11 @@ complete brief on writing one (aimed at an AI assistant, usable by anyone).
 
 Out of the box, a JSON-lines reader is included (`--reader jsonl`): one transport
 JSON object per line, blank lines skipped, malformed lines logged and skipped.
+
+Feeders talk to the backend port directly (`--url http://host:8000`), never
+through nginx or its `--url-prefix` — plain HTTP, no prefix in any feeder
+config, and no change needed at nginx rollout (see "Running the real server"
+above for the flag itself).
 
 ### Start here: `--init`
 

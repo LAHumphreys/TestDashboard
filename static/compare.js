@@ -155,7 +155,7 @@ export async function fetchCompare(streamId, category, offset, baselineId) {
     params.limit = PAGE_LIMIT;
     params.offset = offset || 0;
   }
-  return fetchJson(apiUrl("/api/compare", params, {
+  return fetchJson(apiUrl("api/compare", params, {
     stream: streamId,
     baseline: baselineId === undefined ? null : baselineId,
   }));
@@ -721,7 +721,7 @@ const MAINLINE_SECTIONS = [
 async function fetchProductStreams(product) {
   try {
     const data = await fetchJson(
-      apiUrl("/api/streams", {}, { product: product }));
+      apiUrl("api/streams", {}, { product: product }));
     return data.streams || [];
   } catch (err) {
     return [];

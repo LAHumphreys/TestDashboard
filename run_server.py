@@ -122,6 +122,20 @@ def build_parser():
               "repository so a deployment cannot overwrite it. Read per "
               "request, so a new note needs no restart"))
     parser.add_argument(
+        "--url-prefix", default="testboard", metavar="PREFIX",
+        help=("serve behind this path prefix, in ADDITION to the bare "
+              "paths (/api/..., /index.html), which always keep working "
+              "regardless of this flag -- for an nginx proxy that does "
+              "NOT strip the prefix before forwarding (the tested shape: "
+              "a 'location /PREFIX/ { proxy_pass http://127.0.0.1:PORT; }' "
+              "block, no trailing slash on proxy_pass). Because bare "
+              "paths always work too, the default is harmless wherever "
+              "nginx is absent (dev, staging, a feeder posting straight "
+              "to the backend port -- feeders should always use the bare "
+              "path on the direct backend port, never this prefix). Give "
+              "'' to disable prefix handling entirely, so only bare "
+              "paths are served"))
+    parser.add_argument(
         "--verbose", action="store_true",
         help="DEBUG logging plus full tracebacks on fatal errors")
     return parser
@@ -278,10 +292,15 @@ def main(argv=None):
         notes_problem if notes_problem
         else "{0} note(s)".format(len(notes))))
 
+    url_prefix = args.url_prefix.strip("/")
+    print("url prefix: {0}".format(
+        "/" + url_prefix + " (and bare paths, always)" if url_prefix
+        else "(disabled -- only bare paths are served)"))
+
     try:
         server = testboard.server.create_server(
             args.host, args.port, storage, args.static, perf=perf_log,
-            site_notes_path=site_notes_path)
+            site_notes_path=site_notes_path, url_prefix=url_prefix)
     except OSError as exc:
         storage.close()
         if perf_log is not None:
