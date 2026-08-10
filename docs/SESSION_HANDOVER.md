@@ -41,9 +41,9 @@ dump is not a formality.
 | `wp-14-in-run-progress` | parked WIP; its migration renumbers to **11** before merging (registry §1) |
 
 **Suite on the ship branch: 2240 OK (skipped 1) SQLite-only; 3016 OK
-(skipped 53) dual-backend.** Sanity net PASS both unprefixed (45.3s) and
-`--url-prefix testboard` (48.0s). No expected-failure footnote any more —
-see "the CRLF failures" below.
+(skipped 53) dual-backend.** Sanity net re-run at the FINAL tip and PASS
+both unprefixed (45.7s) and `--url-prefix testboard` (47.9s). No
+expected-failure footnote any more — see "the CRLF failures" below.
 
 ## What last night added
 
