@@ -237,27 +237,22 @@ def main(argv=None):
         print("\nRows belonging to this stream:")
         _report(counts)
 
-        # current_assignments.stream_id -- unlike comments.stream_id,
-        # which delete_stream clears with an explicit UPDATE precisely
-        # so the two backends cannot disagree -- is left to whatever
-        # the schema's declared ON DELETE SET NULL foreign key does,
-        # and that is NOT the same on both backends (verified directly,
-        # see Storage.assignments_referencing_stream's docstring):
-        # SQLite's FK is enforced and cascades this to NULL the moment
-        # the stream row goes; the migrated MariaDB schema declares no
-        # FKs at all, so there it dangles. Read BEFORE the delete --
-        # the only count that is true on both -- and worded for both
-        # outcomes rather than promising the MariaDB-only one.
+        # current_assignments.stream_id: since WP-27, delete_stream
+        # clears this with an explicit UPDATE in the same transaction
+        # as the delete -- identical on both backends, the same
+        # protection comments.stream_id has always had (see
+        # Storage.assignments_referencing_stream's docstring for the
+        # pre-WP-27 divergence this closed). Read BEFORE the delete
+        # regardless: afterwards it is always 0 on both backends, which
+        # tells the operator nothing about what is ABOUT to be lost.
         referencing = storage.assignments_referencing_stream(
             match.stream_id)
         if referencing:
             print(
-                "\n{0:,} assignment(s) were made from this stream. On "
-                "SQLite the origin tag clears automatically when it is "
-                "deleted; on MariaDB (no foreign keys in the migrated "
-                "schema) the id is left dangling and the assignment(s) "
-                "keep their Build-originated filter grouping but lose "
-                "their name tag.".format(referencing))
+                "\n{0:,} assignment(s) were made from this stream. "
+                "Deleting it clears their origin tag: they keep their "
+                "Build-originated filter grouping in Open actions, but "
+                "lose the name.".format(referencing))
 
         if args.dry_run:
             print("\nDry run: nothing was changed.")

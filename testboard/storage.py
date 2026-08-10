@@ -3966,16 +3966,22 @@ class Storage:
         """Delete a stream and everything belonging to it. Cannot be undone.
 
         Refuses stream 1 (mainline) — the caller (``tools/drop_stream.py``)
-        must never be able to remove it. Comments posted from this stream
-        are NOT deleted: they annotate the (environment, script,
-        test_name) triple, not the stream. ``comments.stream_id`` is
-        cleared with an explicit UPDATE, in the same transaction, rather
-        than relied on SQLite's ``ON DELETE SET NULL``: the MariaDB
-        schema declares no foreign keys at all (runbook §B.6), so an FK
-        action would be silently a no-op there and the two backends
-        would disagree about a comment's tag after a delete — the
-        explicit UPDATE is identical on both (docs/STREAMS_PLAN.md
-        §3.8).
+        must never be able to remove it. Comments and assignments posted
+        or made from this stream are NOT deleted: they annotate the
+        (environment, script, test_name) triple, not the stream.
+        ``comments.stream_id``, ``assignments.stream_id`` and
+        ``current_assignments.stream_id`` are all cleared with an
+        explicit UPDATE, in the same transaction, rather than relied on
+        SQLite's ``ON DELETE SET NULL``: the MariaDB schema declares no
+        foreign keys at all (runbook §B.6), so an FK action would be
+        silently a no-op there and the two backends would disagree about
+        a dangling origin id after a delete — the explicit UPDATE is
+        identical on both (docs/STREAMS_PLAN.md §3.8). Originally only
+        ``comments`` had this protection; ``assignments`` and
+        ``current_assignments`` gained it later (WP-27) once SQLite's FK
+        was found to have been hiding the same gap there too — see
+        :meth:`assignments_referencing_stream`'s docstring for the
+        history.
 
         One transaction: outputs before their runs, ``latest_runs``
         before ``runs`` (derived rows before the rows they were derived
@@ -3989,6 +3995,16 @@ class Storage:
         try:
             conn.execute(
                 "UPDATE comments SET stream_id = NULL WHERE stream_id = ?",
+                (stream_id,),
+            )
+            conn.execute(
+                "UPDATE assignments SET stream_id = NULL "
+                "WHERE stream_id = ?",
+                (stream_id,),
+            )
+            conn.execute(
+                "UPDATE current_assignments SET stream_id = NULL "
+                "WHERE stream_id = ?",
                 (stream_id,),
             )
             cursor = conn.execute(
@@ -4033,33 +4049,36 @@ class Storage:
         """How many CURRENT assignments carry *stream_id* as their origin,
         RIGHT NOW — call this BEFORE :meth:`delete_stream`, not after.
 
-        Unlike ``comments.stream_id`` (cleared by an explicit UPDATE
-        inside :meth:`delete_stream`, specifically so the two backends
-        cannot disagree about it), ``current_assignments.stream_id``
-        and ``assignments.stream_id`` are left to whatever the schema's
-        declared ``ON DELETE SET NULL`` foreign key does — which is
-        NOT the same thing on both backends, a divergence this method
-        exists to make visible rather than to paper over:
+        ``delete_stream`` clears ``current_assignments.stream_id`` (and
+        ``assignments.stream_id``) with an explicit UPDATE, in the same
+        transaction as the delete — identical on both backends, the same
+        protection ``comments.stream_id`` has always had. So calling
+        this AFTER a delete always reports 0 on both backends: not
+        because the row is gone (the assignment itself survives — a
+        stream drop never touches ``assignments``/``current_assignments``
+        rows, only their ``stream_id`` tag), but because the origin tag
+        that would let it match *stream_id* has already been cleared.
+        The only way to see the count that is ABOUT to be lost is to
+        read it before the delete, which is why
+        ``tools/drop_stream.py`` reads this ONCE, up front, and reports
+        it in both ``--dry-run`` and the real path.
 
-        - **SQLite** (``PRAGMA foreign_keys=ON`` on every connection
-          this module opens): deleting the stream row CASCADES the
-          column to ``NULL`` automatically. Read after the delete and
-          this always reports 0, whatever it was before — the
-          assignment silently drops out of the Build-originated filter
-          group with no dangling id ever visible.
-        - **MariaDB** (the migrated schema declares no foreign keys at
-          all, verified against ``tools/migrate_to_mariadb.py`` — one
-          more instance of the divergence :meth:`delete_stream`'s own
-          docstring already calls out for comments): nothing nulls it.
-          The id dangles, the row keeps its origin-filter grouping,
-          and it loses only its name tag, since
-          :meth:`stream_identities` can no longer resolve an id that
-          no longer names a row.
-
-        ``tools/drop_stream.py`` therefore reads this ONCE, before
-        calling :meth:`delete_stream`, and reports the pre-delete count
-        in both ``--dry-run`` and the real path — the only reading
-        that is true on both backends.
+        Historical note, kept because it explains why this method
+        exists at all rather than a bare ``SELECT`` inline at the call
+        site: before WP-27, only ``comments.stream_id`` had the explicit
+        UPDATE, and ``current_assignments.stream_id``/
+        ``assignments.stream_id`` were left to the schema's declared
+        ``ON DELETE SET NULL`` foreign key — which SQLite enforces
+        (``PRAGMA foreign_keys=ON`` on every connection this module
+        opens) and the MariaDB schema does not declare at all (runbook
+        §B.6), so the id dangled there and the row kept its
+        origin-filter grouping while silently losing only its name tag.
+        That divergence is what made a pre-delete read the only
+        backend-agnostic option at the time; WP-27's explicit UPDATE
+        closed the gap so both backends now agree even on a *post*-delete
+        read, but the method's contract (read before, not after) is
+        unchanged, because "after" is now uselessly always zero rather
+        than unreliably backend-dependent.
         """
         row = self._conn().execute(
             "SELECT COUNT(*) FROM current_assignments WHERE stream_id = ?",
