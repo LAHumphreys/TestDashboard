@@ -2886,3 +2886,120 @@ staging or production. Had the staging timings been recorded they would
 be the best predictor available for tomorrow morning; they were not, and
 the honest position going into the prod deployment is that the only
 timing evidence is dev-scale.
+
+## 2026-08-10→11 — the tooling night: WP-27, WP-28, WP-29 and the docs tidy (ship branch `tooling-2026-08-10`)
+
+Four phases, all shipped, nothing user-visible: `whatsnew.html` gains
+nothing and no migration version was claimed. Executed 2 → 4 → 3 → 1 as
+planned, with 2/3/4 running concurrently on separate branches.
+
+**WP-27 — the MariaDB in-place upgrade tool.** `tools/upgrade_mariadb_schema.py`
+takes prod's MariaDB from v7 to v10 as stepwise DDL mirroring the SQLite
+migrations, bumping `schema_version` as the last statement of each step.
+It refuses an unexpected version in *both* directions and carries a
+bidirectional consistency check for the state DDL-autocommit makes
+possible — later-step artifacts present while the version has not yet
+been bumped — refusing with the mysqldump named. `--dry-run` prints every
+statement; `verify` diffs the result against `tools/export_for_mariadb.py`'s
+own v10 DDL as the oracle. It speaks only the vendored PyMySQL: no
+`mysql` subprocess, per the no-host-dependency rule.
+
+The v7 fixture is *derived*, never hand-written — `MIGRATIONS` 1–7 applied
+via `apply_migration_statement` to a temp SQLite file, then exported and
+loaded. A hand-typed v7 DDL would have verified the tool against a
+fiction.
+
+Second commit: the `delete_stream` dangling-id fix. `assignments.stream_id`
+and `current_assignments.stream_id` are now cleared by explicit UPDATE in
+the same transaction, the protection `comments.stream_id` already had.
+SQLite's FK made the gap invisible there; MariaDB's schema has no FKs, so
+this is what makes production correct. The SQLite-only guard lost its
+MariaDB exclusion and now runs, and passes, on both backends.
+
+**WP-28 — `--url-prefix`** (default `testboard`, `""` disables). The
+prefix is stripped once at the top of routing, before the traversal
+guard, matched at a **segment** boundary against the still-encoded path;
+`/testboardXtra` does not match, a double prefix is stripped once, and a
+bare `/testboard` gets a 307 (method-preserving, never cached permanent).
+Bare paths are accepted unconditionally — that is what makes a default-on
+flag safe and what lets feeders bypass nginx.
+
+The frontend needed no prefix knowledge at all. Reconnaissance found
+navigation already fully relative and all ~40 root-absolute `/api/...`
+literals funnelling through four wrappers in `api.js`; since every page is
+flat at the static root, dropping the leading slash resolves correctly
+under both shapes. A new guard (`RootAbsoluteApiUrlTest`) pins it, and
+catches the two files containing a real NUL byte that a plain grep skips
+as binary.
+
+**WP-29 — single-file feeders.** `clients/feeder.py` (3.6, parses under
+Python 2) and `clients/feeder.tcl` (targets vanilla 8.5), one engine in
+two languages, site slot on top, engine below a do-not-edit line, plus
+`docs/FEEDER_TEMPLATE.md`. Cleanup-invoked push model: no polling, no
+daily mode, no high-water mark — idempotency comes from the server's
+upsert + fingerprint skip. Replay files are the only persistence.
+Version/contract goes out as a `User-Agent` header, not a JSON field,
+because this drop made unknown wire fields loud rejections. Conformance
+suite drives 8 scenarios × 2 languages from one shared mixin, so a
+language cannot silently skip.
+
+**Docs tidy.** Four plan docs deleted; `STREAMS_PLAN.md` 108→20 KB;
+`UPGRADE_PLAN.md` 64→32 KB with §1's registry kept byte-for-byte. Two
+things were deliberately NOT cut: `STREAMS_PLAN.md` §2.4, because
+`ScopedUrlConstructionTest` names that section by number as the only
+documentation of `watch.js`'s builder exemption; and `FEEDER_BRIEF.md`'s
+substance, because `tests/test_feeder_brief.py`'s 13 tests assert on its
+content and `run_feeder.py` still runs in production. Trimming either to
+hit a size target would have orphaned a live guard.
+
+### Measurements and gates
+
+**Suite:** 2156 baseline → **2240 OK (skipped 1)** SQLite-only and
+**3016 OK (skipped 53)** dual-backend on the ship branch. Per-phase
+deltas: WP-27 +1, WP-28 +31, WP-29 +52 (of which 16 run for BOTH
+languages), summing exactly. Sanity net PASS unprefixed (45.3s) and
+`--url-prefix testboard` (48.0s).
+
+**All six CI legs green**, including a new `python36-mariadb-upgraded`
+leg that runs the entire suite against a database the upgrade tool built
+from v7 — "the schema matches" and "the app serves on it" being different
+claims. Verified from the logs that the upgrade genuinely drove it
+(`ALTER TABLE runs ADD COLUMN stream_id` executed) rather than the env
+var being silently ignored, and that the Tcl leg's 8 scenarios really ran
+rather than gating themselves out of existence.
+
+**`ALTER TABLE runs ADD COLUMN` takes the INSTANT path** — established by
+an explicit `ALGORITHM=INSTANT` being *accepted*, not inferred from a
+fast clock. 500,000 synthetic rows, 0.0s, **DEV on 12.3.2**. Production
+has ~4.4M rows and has not been measured. The tool now prints `runs`'s
+row count and warns if that step exceeds 5s, which is the in-the-moment
+signal it fell back to a rebuild.
+
+**Bounded-time promise:** documented ceiling ~115s; a black-holed port
+measured exit 1 at **51.3s (Python) / 51.1s (Tcl)**, DEV.
+
+### Three findings that outlived their phase
+
+1. **The local MariaDB is `12.3.2`, not 10.3** — four major versions
+   ahead of production's 10.3.39. The night plan, the handover and the
+   briefs all assumed otherwise. Every local dual-backend number proves
+   nothing about prod's server; CI's two `mariadb:10.3` legs are the only
+   10.3 evidence in existence.
+2. **The CRLF failures were a measuring-instrument bug, not a code
+   fault.** `test_frontend_calls.read()` opens in binary on purpose
+   (`app.js` contains a real `join("\0")`), which also preserves CRLF,
+   while several assertions spell JS structure with an explicit `\n`. On
+   a Windows checkout they failed on correct content in every fresh
+   worktree and passed on Linux CI. Normalising after the decode fixes
+   it; the assertions are unchanged. They had been quietly taxing every
+   count taken during the night.
+3. **CLAUDE.md's project state was wrong about migrations** — seven
+   entries claimed against ten actual, and version 8 attributed to WP-15
+   which the registry gives 11. Corrected. A session trusting it would
+   have claimed a version taken three times over.
+
+**Process:** three agents sharing the one checkout collided, and one lost
+in-progress work to another's `git stash`. Nothing was lost permanently
+(it was redone in an isolated worktree and diffed), but every parallel
+implementer now gets its own `git worktree` as the first instruction, not
+as a hope. Two superseded stashes remain in the main checkout.
