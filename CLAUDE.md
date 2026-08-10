@@ -5,8 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project State
 
 **testboard is live in production and has been since 2026-07-26.** It is no longer
-greenfield: ~25k lines, 1,385 tests (1,749 with the MariaDB variants active),
-schema at migration 7, deployed and in daily use by a small group of testers.
+greenfield: ~25k lines, 2,240 tests (3,016 with the MariaDB variants active),
+schema at migration 10, deployed and in daily use by a small group of testers.
+**Production serves MariaDB**; the old SQLite box is now staging. SQLite and
+MariaDB remain equal, permanently supported backends — see "Commands".
 
 **Starting a session: read [`docs/SESSION_HANDOVER.md`](docs/SESSION_HANDOVER.md) first.**
 It is one screen: what state the branches are in, what is parked where, and what the
@@ -130,12 +132,14 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
 - **`output` can be large**: it lives in its own table (`run_outputs`), zlib-compressed, and is read by exactly one endpoint (`GET /api/runs/{id}`). Never join it into a list query — keeping it out of `runs` is what keeps metadata reads dense.
 - **The server serves from a fixed worker pool, never a thread per request.** Storage keeps connections in `threading.local()`, so a thread per request means a connection per request means an empty SQLite page cache on every request — measured: 20 requests, 20 connections, and no `cache_size` setting can help a cache that is discarded before it is used twice. The pool size *is* the connection count and is what a `--cache-mb` budget is divided by; `tests/test_server_pool.py` fails if the mixin comes back.
 - SQLite: WAL mode + busy timeout at connect (threaded server), versioned migration
-  table (`schema_version`). **`MIGRATIONS` holds seven entries and entry 1 describes a
+  table (`schema_version`). **`MIGRATIONS` holds ten entries and entry 1 describes a
   database that exists in production — never edit it.** Every schema change is a new
   appended entry whose version is claimed from the registry in `docs/UPGRADE_PLAN.md`
-  §1 *in the same commit*; version 8 is claimed by WP-15 (renumbered from 6, then 7,
-  as WP-17 and WP-18 each shipped first — the parked WIP branch must renumber before
-  merging).
+  §1 *in the same commit*; version 11 is claimed by WP-15 (renumbered five times now,
+  as WP-17, WP-18, WP-20, WP-21 and WP-23 each shipped first — the parked WIP branch
+  must renumber before merging). **The app never runs DDL on MariaDB**: there, the
+  schema is moved by `tools/upgrade_mariadb_schema.py` (WP-27) and the backend only
+  verifies the recorded version matches, refusing in both directions.
   `tests/test_migrations.py` freezes entry 1 by hash and asserts the fresh-install and
   incremental paths produce identical schemas. A migration may contain a Python step
   (`"python: <name>"`). A database whose version exceeds the code's is refused, not
