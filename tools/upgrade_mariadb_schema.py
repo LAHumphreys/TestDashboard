@@ -28,6 +28,32 @@ There is no wrapping transaction that undoes a partial upgrade. THE
 PRE-UPGRADE ``mysqldump`` IS THE ROLLBACK — not this tool, not MariaDB's
 transaction log. Read that paragraph again before running this live.
 
+**The one number that decides whether this is fast or slow: `runs`'s row
+count.** ``runs`` is production's big table (~4.4M rows); every other
+table this tool touches is thousands of rows at most. The plan's
+"bounded by tests, not by run history" claim rests entirely on
+``ALTER TABLE runs ADD COLUMN stream_id BIGINT NOT NULL DEFAULT 1``
+(step 8->9) qualifying for MariaDB's INSTANT ADD COLUMN — a real InnoDB
+feature since 10.3.2, not a hope: it applies here because the column is
+appended LAST, carries a constant DEFAULT, and the table is
+``ROW_FORMAT=DYNAMIC``, all of which this tool's own generated DDL
+guarantees. Verified empirically on THIS box's local server (12.3.2 —
+see the module's own test-time measurements) at 500,000 synthetic rows:
+the statement completed in well under a tenth of a second, and forcing
+``ALGORITHM=INSTANT`` explicitly on an equivalent ADD COLUMN succeeded
+rather than being refused — direct evidence the instant path applies,
+not just a fast clock. **This has NOT been confirmed on production's
+10.3 stream** — CI's ``python36-mariadb`` job (``mariadb:10.3``) is the
+first real evidence at that version. If instant does not apply for some
+reason specific to 10.3, MariaDB falls back to the next InnoDB algorithm
+that fits (normally an online, LOCK=NONE rebuild — concurrent reads and
+writes keep working — not the old blocking COPY algorithm, though only
+INSTANT is fast). ``cmd_upgrade`` prints ``runs``'s row count before
+running anything and times every statement live; a `runs` step that
+takes materially longer than a few seconds against production-scale data
+is the signal that this fell back, and the honest thing to do is let it
+finish rather than interrupt a running DDL statement mid-flight.
+
 **Privileges.** Connects with a ``testboard_migrate``-style credential
 (``docs/MARIADB_MIGRATION.md`` §A.4/§A.9) — the same option-file
 mechanism as everything else, via ``testboard.dbconfig``. That account's
@@ -108,6 +134,20 @@ _ROW_COUNT_TABLES = (
     "runs", "comments", "assignments", "current_assignments",
     "latest_runs", "activity_hours", "script_hours",
 )
+
+#: A live-run tripwire, not a hard limit. The runs ALTER is expected to
+#: take well under a second (MariaDB's instant ADD COLUMN - see the
+#: module docstring); a run that clears this threshold is the signal
+#: that it fell back to a table rebuild instead, worth telling the
+#: operator about in the moment rather than only after the fact.
+_INSTANT_ADD_WARNING_SECONDS = 5.0
+
+
+def _touches_runs_stream_id(statement: str) -> bool:
+    """True for the one statement whose cost is not bounded by tests."""
+    stripped = statement.strip()
+    return (stripped.startswith("ALTER TABLE runs ")
+            and "stream_id" in stripped)
 
 
 # --------------------------------------------------------------------
@@ -517,6 +557,19 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
         log("row counts: " + ", ".join(
             "{0} {1:,}".format(name, counts[name])
             for name in _ROW_COUNT_TABLES if name in counts))
+        log("")
+        log("*** runs has {0:,} rows. Everything else this tool touches "
+            "is a few thousand rows at most - runs is the ONE table "
+            "where 'bounded by tests, not by run history' depends on "
+            "MariaDB's instant ADD COLUMN actually applying (see this "
+            "tool's own module docstring). Expected: well under a "
+            "second, on any row count, verified locally with an "
+            "explicit ALGORITHM=INSTANT force-success - but NOT yet "
+            "confirmed on production's 10.3 stream (only this box's "
+            "local server has been tried). Watch the per-statement "
+            "timer below if you are running this live; a runs step "
+            "taking materially longer than a few seconds means it did "
+            "NOT take the instant path.".format(counts.get("runs", 0)))
 
         now_iso = model.format_iso(model.utcnow())
         steps = [(v, s) for v, s in plan(sizes, now_iso) if v >= recorded]
@@ -535,7 +588,8 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
                 "touches - MariaDB rewrites the whole table for a "
                 "column add or a PRIMARY KEY change, so they are a "
                 "reasonable proxy for how long each step takes; they "
-                "are NOT a timing estimate on their own.")
+                "are NOT a timing estimate on their own. See the runs "
+                "note above for the one number that actually matters.")
             return 0
 
         log("")
@@ -549,8 +603,22 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
             for statement in statements:
                 started = time.time()
                 migrate.execute(conn, statement)
+                elapsed = time.time() - started
                 log("  [{0:.1f}s] {1}".format(
-                    time.time() - started, migrate.first_line(statement)))
+                    elapsed, migrate.first_line(statement)))
+                if (_touches_runs_stream_id(statement)
+                        and elapsed > _INSTANT_ADD_WARNING_SECONDS):
+                    log("")
+                    log("  *** That took {0:.1f}s against {1:,} rows - "
+                        "MUCH longer than the sub-second instant add "
+                        "this tool expects (see the module docstring "
+                        "and the note printed before this run started). "
+                        "It almost certainly means MariaDB fell back to "
+                        "a table rebuild rather than the instant path. "
+                        "The statement already committed successfully "
+                        "(DDL autocommits) - there is nothing to "
+                        "interrupt or undo, this is informational, not "
+                        "a failure.".format(elapsed, counts.get("runs", 0)))
         log("")
         log("All steps applied in {0:.1f}s (DEV timing on this box; "
             "not a production number - see the report).".format(

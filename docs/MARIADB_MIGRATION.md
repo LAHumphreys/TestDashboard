@@ -1244,6 +1244,28 @@ execute it" that a person tired at 2am skips if it is not the tool's own
 default behaviour, which is why `--dry-run` exists as a separate,
 harmless step rather than a flag nobody remembers to pass.
 
+**Read the `runs` row count the dry run prints, specifically.** Every
+other table this tool touches is thousands of rows at most; `runs` is
+production's ~4.4M-row table, and the whole "bounded by tests, not by run
+history" claim for this upgrade rests on
+`ALTER TABLE runs ADD COLUMN stream_id BIGINT NOT NULL DEFAULT 1`
+(step 8→9) qualifying for MariaDB's **instant** ADD COLUMN — a real
+InnoDB feature since 10.3.2 that this statement satisfies by construction
+(the column is appended last, carries a constant default, the table is
+`ROW_FORMAT=DYNAMIC`), verified LOCALLY at 500,000 synthetic rows
+(sub-second, and forcing `ALGORITHM=INSTANT` explicitly succeeded rather
+than being refused) — but **not yet confirmed on production's 10.3
+stream**, only on this development box's newer server. If it does not
+take the instant path on 10.3 for some reason this box cannot surface,
+MariaDB falls back to an online rebuild (the dashboard stays readable and
+writable during it) whose cost should be assumed comparable to this
+runbook's own measured full-load benchmark (§0/§E.1 — "tens of minutes
+at best" for a ~950 MB database), not the sub-second number this dry run
+prints. The live run's per-statement timer watches this FOR you and
+prints a loud (but non-alarming — the statement has already committed
+successfully either way) notice if the `runs` step takes more than five
+seconds.
+
 Then, for real:
 
 ```bash
