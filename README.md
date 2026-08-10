@@ -1651,7 +1651,9 @@ static/                 # vanilla ES6 frontend, no build step:
                         #   script.html  one suite's execution history
                         #   test.html    one test's detail
 tests/                  # unittest suites (unit + e2e on an ephemeral port)
-docs/                   # briefs, incl. FEEDER_BRIEF.md for site readers
+docs/                   # briefs; FEEDER_TEMPLATE.md for a new product's single-
+                        #   file feeder, FEEDER_BRIEF.md for the older checkout-
+                        #   based one
 ```
 
 Ground rules for contributions: Python 3.6-compatible, standard library only, every

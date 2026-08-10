@@ -1,5 +1,15 @@
 # Feeder Reader Brief — writing the site-specific reader for testboard
 
+> **Superseded for new products, 2026-08-10.** A product onboarding today
+> should use **[`docs/FEEDER_TEMPLATE.md`](FEEDER_TEMPLATE.md)** instead: one
+> file checked into the product's own repository, invoked once per suite
+> execution from the framework's own cleanup phase — no checkout of this repo
+> required. This document remains the accurate reference for the **older,
+> checkout-based feeder** (`run_feeder.py` + `feeder/`) described below, which
+> one product still runs unchanged, and which remains the tool for a one-off
+> historical backfill. Everything below this notice is still true of that
+> feeder; nothing here has been rewritten, only the framing above it.
+
 **Audience:** an AI coding assistant (and its human reviewer) with access to the
 internal test system whose results are being imported. Follow this brief exactly.
 Do not invent alternative interfaces, file names, or JSON shapes — the dashboard
@@ -12,7 +22,11 @@ other file in the repository.
 
 ---
 
-## How to use this with Copilot (read this first)
+## How to use this with Copilot
+
+*(For a **new** product, use `docs/FEEDER_TEMPLATE.md`'s own Copilot workflow
+instead — same shape, aimed at the single-file feeder. What follows is for a
+site still writing an `internal_reader.py` against the checkout-based feeder.)*
 
 Attach **three** files and paste the prompt below:
 
