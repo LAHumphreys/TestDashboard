@@ -97,12 +97,24 @@ jobs:
   python36-tcl:
     name: Python 3.6.8 + Tcl (single-file feeder conformance)
     runs-on: ubuntu-latest
-    container: registry.access.redhat.com/ubi8/python-36
+    container:
+      image: registry.access.redhat.com/ubi8/python-36
+      # The image's default user is 1001, which cannot install packages
+      # (`dnf` exits "has to be run with superuser privileges"), and the
+      # image carries no `microdnf` at all -- the first run of this leg
+      # failed on both. Root is needed ONLY to add tclsh; the suite
+      # itself does not care who runs it.
+      options: --user root
     steps:
       - uses: actions/checkout@v4
       - name: Install tclsh (bundled http package only - no tcllib, no tls)
-        run: microdnf install -y tcl || dnf install -y tcl
+        run: dnf install -y tcl
       - name: Show interpreter versions
+        # RHEL 8 ships Tcl 8.6.8, so this leg proves clients/feeder.tcl
+        # RUNS on a real tclsh -- it is NOT 8.5 verification. No 8.5
+        # interpreter exists here or on any developer box; that is what
+        # the static 8.5-construct gate (tests/test_tcl_compat.py) is
+        # for, and the drop note says so rather than implying otherwise.
         run: |
           python3 --version
           echo 'puts [info patchlevel]' | tclsh
