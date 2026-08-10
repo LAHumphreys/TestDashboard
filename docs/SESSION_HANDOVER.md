@@ -35,8 +35,8 @@ decision closed with the user, nothing left to ask overnight.
 |---|---|
 | **prod** | MariaDB, schema **v7**, pre-streams code. Gets v7→v10 + the streams drop TOMORROW via tonight's Phase 2 tool |
 | **staging** (old SQLite box) | the streams drop, tip `4d03da3`, schema v10, deployed 2026-08-10 |
-| **`streams-upgrade`** | THE branch — deployed-to-staging tip `4d03da3` plus tonight's plan/handover commit. Cut every night branch from its tip |
-| `origin/master` | `4d31dfa` — has wp-18, does **NOT** have the streams work. The deployed drop was never merged to master — outstanding history debt, needs the user, not tonight |
+| **`streams-upgrade`** | THE branch — deployed-to-staging tip `4d03da3` + tonight's plan/handover commit + a merge of current master. Cut every night branch from its tip |
+| `origin/master` | `1e1ceae` — **current**: PR #6 merged the streams work this morning; master fully contains the deployed drop |
 | `wp-24-scoped-urls` / `wp-25-one-kind` / `wp-20…23` | superseded, all contained in `streams-upgrade` |
 | `wp-14-in-run-progress` | parked WIP; its migration renumbers to **11** before merging (registry §1) |
 
@@ -63,11 +63,9 @@ nothing user-visible; no whatsnew line. Ship branch:
    section): recreate `testboard_migrate` (root, §A.4), pre-drop
    mysqldump, dry-run then live upgrade, deploy, restart, first-hour
    checks.
-2. **Merge the shipped drop to master** — deployed code should not live
-   only on a work branch.
-3. **Status-log writeups owed**: the cutover night (numbers live only in
+2. **Status-log writeups owed**: the cutover night (numbers live only in
    the memory note) and the 2026-08-10 staging deployment.
-4. Carried from before: re-retire the tests the un-retire bug released
+3. Carried from before: re-retire the tests the un-retire bug released
    (search comments for "Automatically un-retired");
    `tools/diagnose_db.py --compare-local` on prod; `max_allowed_packet`
    persistence with the daemon owners; import output-size cap; the
@@ -78,7 +76,7 @@ nothing user-visible; no whatsnew line. Ship branch:
 ## First ten minutes of the fresh session
 
 ```bash
-git log --oneline -3                  # expect the plan/handover commit atop 4d03da3 on streams-upgrade
+git log --oneline -4                  # expect: master merge, plan/handover commit, then PR #6's merge — on streams-upgrade
 git status --short                    # clean
 python -m unittest discover           # expect 2094 OK (skipped 1)
 python .scratch\net\run_net.py        # expect PASS, ~18s
