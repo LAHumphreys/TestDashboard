@@ -49,9 +49,21 @@ def read(name: str) -> str:
     contains a legitimate ``join("\\0")`` separator, which makes tools
     that sniff for NUL treat the file as binary. A test that silently
     matched nothing would pass forever.
+
+    Line endings are then normalised to ``\\n``, which reading in binary
+    would otherwise leave alone. Every assertion in this module is about
+    the STRUCTURE of the JavaScript — that a call sits at top level, that
+    a guard clause returns — and several spell that structure with an
+    explicit ``\\n``. On a Windows checkout with ``core.autocrlf=true``
+    those files arrive CRLF, so two such tests failed on content that was
+    entirely correct, in every fresh worktree, while passing on Linux CI.
+    Git stores these blobs as LF, so normalising here compares against
+    what the repository actually contains rather than against whatever
+    the checkout happened to write to disk. The assertions are unchanged.
     """
     with io.open(os.path.join(STATIC_DIR, name), "rb") as handle:
-        return handle.read().decode("utf-8")
+        text = handle.read().decode("utf-8")
+    return text.replace("\r\n", "\n")
 
 
 def scripts() -> Dict[str, str]:
@@ -597,9 +609,14 @@ class SharedControlStylingTest(unittest.TestCase):
 
 
 def read_text(name: str) -> str:
-    """Read any file from the static directory as text."""
+    """Read any file from the static directory as text.
+
+    Normalises line endings for the same reason :func:`read` does — a
+    CRLF checkout must not change what an assertion about file content
+    sees.
+    """
     with io.open(os.path.join(STATIC_DIR, name), "rb") as handle:
-        return handle.read().decode("utf-8")
+        return handle.read().decode("utf-8").replace("\r\n", "\n")
 
 
 class SortingTest(unittest.TestCase):

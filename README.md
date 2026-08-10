@@ -872,10 +872,13 @@ repo required. The rest of this section describes the older, checkout-based
 feeder (`feeder/` + `run_feeder.py`), which one product still runs
 unchanged and which remains the tool for a one-off historical backfill.
 
-**Feeders always POST to the dashboard's backend port directly, plain
-HTTP — never through nginx, never with a URL prefix**, whether or not the
-site normally reaches the dashboard through one; this is true of both the
-single-file feeders and the checkout-based one below.
+**Feeders always POST to the dashboard's backend port directly
+(`--url http://host:8000`), plain HTTP — never through nginx, never with a
+URL prefix**, whether or not the site normally reaches the dashboard
+through one. This is true of both the single-file feeders and the
+checkout-based one below, and it means no feeder config changes at an
+nginx rollout (see `--url-prefix` under "Running the real server" above
+for the flag itself; bare paths keep working precisely so this holds).
 
 The feeder framework ships in this repo (`feeder/` + `run_feeder.py`). The only
 site-specific piece is a small **reader** module that yields run dicts in the
@@ -884,11 +887,6 @@ complete brief on writing one (aimed at an AI assistant, usable by anyone).
 
 Out of the box, a JSON-lines reader is included (`--reader jsonl`): one transport
 JSON object per line, blank lines skipped, malformed lines logged and skipped.
-
-Feeders talk to the backend port directly (`--url http://host:8000`), never
-through nginx or its `--url-prefix` — plain HTTP, no prefix in any feeder
-config, and no change needed at nginx rollout (see "Running the real server"
-above for the flag itself).
 
 ### Start here: `--init`
 
