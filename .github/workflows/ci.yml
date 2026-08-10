@@ -12,6 +12,9 @@
 #                      the storage and API tests run against BOTH engines here.
 #                      SQLite is not "the CI backend" and MariaDB "the real
 #                      one" — they are equal backends and both gate the merge.
+#   - python36-mariadb-upgraded: the same suite again, but against a database
+#                      the upgrade tool built from v7 rather than one created
+#                      at v10 — the shape production is in. See the job.
 #   - tcl-conformance: an ordinary ubuntu runner plus a bare tclsh (WP-29).
 #                      tests/test_feeder_engines_conformance.py gates its Tcl
 #                      variants on tclsh being on PATH, the same pattern
@@ -92,6 +95,51 @@ jobs:
       - name: Run test suite (SQLite + MariaDB variants)
         env:
           TESTBOARD_TEST_DB_CNF: /tmp/mariadb-test.cnf
+        run: python3 -m unittest discover -v
+
+  python36-mariadb-upgraded:
+    # The SAME suite, against a database that reached v10 by running
+    # tools/upgrade_mariadb_schema.py over a v7 fixture instead of being
+    # created at v10 — which is exactly how production gets there.
+    #
+    # Why this is a separate job rather than a flag on the one above: it
+    # roughly doubles that job's runtime, and the two answer different
+    # questions. The job above asks "does the app work on MariaDB". This
+    # one asks "does the app work on a database the upgrade tool built",
+    # and it is the only place the upgrade path meets the whole suite on
+    # PROD'S VERSION. tests/test_upgrade_mariadb_schema.py already proves
+    # 7→10 plus a schema diff on 10.3; this proves the result is not
+    # merely shaped right but actually serves.
+    name: Python 3.6.8 + MariaDB 10.3 (suite on an UPGRADED database)
+    runs-on: ubuntu-latest
+    container: registry.access.redhat.com/ubi8/python-36
+    services:
+      mariadb:
+        image: mariadb:10.3
+        env:
+          MYSQL_ROOT_PASSWORD: testboard-ci
+          MARIADB_ROOT_PASSWORD: testboard-ci
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=5s
+          --health-timeout=2s
+          --health-retries=12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write the test-database credentials
+        run: |
+          cat > /tmp/mariadb-test.cnf <<'EOF'
+          [client]
+          host = mariadb
+          port = 3306
+          user = root
+          password = testboard-ci
+          database = testboard_test
+          EOF
+      - name: Run test suite (schema built by the upgrade tool)
+        env:
+          TESTBOARD_TEST_DB_CNF: /tmp/mariadb-test.cnf
+          TESTBOARD_TEST_DB_VIA_UPGRADE: "1"
         run: python3 -m unittest discover -v
 
   tcl-conformance:
