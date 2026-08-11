@@ -73,7 +73,7 @@ const state = {
 
 function timelineUrl() {
   const windowSet = state.from !== null && state.to !== null;
-  return apiUrl("/api/timeline", {
+  return apiUrl("api/timeline", {
     environment: state.environment,
     days: state.days,
     from: windowSet ? state.from : null,
@@ -105,7 +105,7 @@ function runsUrl(row) {
   // apiUrl()'s default scope carriage (this page's own URL carries
   // `environment=` too, as the page's own identity).
   return apiUrl(
-    "/api/scripts/" + encodeURIComponent(state.environment)
+    "api/scripts/" + encodeURIComponent(state.environment)
       + "/" + encodeURIComponent(row.script) + "/runs",
     { from: row.started, to: row.ended },
     { stream: state.streamId, product: null, baseline: null,
@@ -766,7 +766,7 @@ let suggestionNames = [];
 let completionIndex = -1;
 
 async function fetchSearchMatches(query) {
-  const data = await fetchJson(apiUrl("/api/dashboard", {
+  const data = await fetchJson(apiUrl("api/dashboard", {
     environment: state.environment, q: query, limit: "20",
   }, { stream: state.streamId, product: null, baseline: null }));
   return data.tests.map((test) => ({
@@ -964,7 +964,7 @@ function handleHotkey(event) {
 }
 
 async function loadEnvironments() {
-  const data = await fetchJson("/api/environments");
+  const data = await fetchJson("api/environments");
   // WP-20: the picker itself is the "existing environment filter
   // semantics" product= is defined to work through here (this page is
   // inherently single-environment, so there is no separate product=

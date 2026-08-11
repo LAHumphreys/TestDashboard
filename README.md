@@ -63,6 +63,7 @@ python run_server.py [--host 127.0.0.1] [--port 8000] [--db testboard.db] [--sta
 | `--port` | `8000` | TCP port. |
 | `--db` | `testboard.db` | SQLite database file. Created and migrated automatically on startup. |
 | `--static` | `static/` next to `run_server.py` | Directory of frontend files. |
+| `--url-prefix` | `testboard` | Serve behind this path prefix, e.g. for an nginx proxy that does NOT strip it before forwarding — `/testboard/api/summary` is handled exactly as `/api/summary`. Bare paths ALWAYS keep working too, regardless of this flag, which is what makes the default harmless everywhere nginx is absent (dev, staging, a feeder posting straight to the backend port — see "Feeding in your own results" below). Give `""` to disable prefix handling entirely. |
 
 The server prints its URL on startup and shuts down cleanly on Ctrl+C. The database
 schema is versioned (`schema_version` table) and migrated automatically, so upgrading
@@ -862,6 +863,23 @@ JSON shape (score and failure_rate rounded to 4 decimal places, durations to 3):
 
 ## Feeding in your own results
 
+**Onboarding a new product?** See
+**[docs/FEEDER_TEMPLATE.md](docs/FEEDER_TEMPLATE.md)** first: a single
+distributable file (`clients/feeder.py` or vanilla-Tcl `clients/feeder.tcl`)
+that a product checks into its own repository and its test framework invokes
+once per suite execution, from its own cleanup phase — no checkout of this
+repo required. The rest of this section describes the older, checkout-based
+feeder (`feeder/` + `run_feeder.py`), which one product still runs
+unchanged and which remains the tool for a one-off historical backfill.
+
+**Feeders always POST to the dashboard's backend port directly
+(`--url http://host:8000`), plain HTTP — never through nginx, never with a
+URL prefix**, whether or not the site normally reaches the dashboard
+through one. This is true of both the single-file feeders and the
+checkout-based one below, and it means no feeder config changes at an
+nginx rollout (see `--url-prefix` under "Running the real server" above
+for the flag itself; bare paths keep working precisely so this holds).
+
 The feeder framework ships in this repo (`feeder/` + `run_feeder.py`). The only
 site-specific piece is a small **reader** module that yields run dicts in the
 transport schema above — see **[docs/FEEDER_BRIEF.md](docs/FEEDER_BRIEF.md)** for a
@@ -1633,7 +1651,9 @@ static/                 # vanilla ES6 frontend, no build step:
                         #   script.html  one suite's execution history
                         #   test.html    one test's detail
 tests/                  # unittest suites (unit + e2e on an ephemeral port)
-docs/                   # briefs, incl. FEEDER_BRIEF.md for site readers
+docs/                   # briefs; FEEDER_TEMPLATE.md for a new product's single-
+                        #   file feeder, FEEDER_BRIEF.md for the older checkout-
+                        #   based one
 ```
 
 Ground rules for contributions: Python 3.6-compatible, standard library only, every

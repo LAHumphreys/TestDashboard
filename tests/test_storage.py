@@ -5867,22 +5867,24 @@ class DropStreamTest(StorageTestBase):
         self.assertEqual(
             self.store.assignments_referencing_stream(self.stream_id), 1)
 
-    def test_sqlite_fk_cascade_clears_the_origin_on_delete(self) -> None:
-        """The finding this method exists to surface, and the reason it
-        must be read BEFORE :meth:`Storage.delete_stream`, not after:
-        current_assignments.stream_id has an ``ON DELETE SET NULL`` FK
-        (same as comments.stream_id, same as assignments.stream_id),
-        and every connection this module opens runs with
-        ``PRAGMA foreign_keys=ON`` -- so on SQLite, deleting the
-        stream row CASCADES the column to NULL automatically. The
-        assignment survives (assignments are never deleted by a stream
-        drop), but its origin tag is gone the instant the stream is --
-        there is no dangling id to report AFTER the fact on this
-        backend; only tools/drop_stream.py's PRE-delete read ever sees
-        the real count. (The MariaDB schema declares no FKs at all, so
-        the same column dangles there instead -- see
-        Storage.assignments_referencing_stream's docstring; there is no
-        automated pin for that half without a live server.)"""
+    def test_the_origin_tag_clears_on_delete(self) -> None:
+        """The finding :meth:`Storage.assignments_referencing_stream`
+        exists to surface, and the reason it must be read BEFORE
+        :meth:`Storage.delete_stream`, not after: WP-27 gave
+        ``current_assignments.stream_id`` and ``assignments.stream_id``
+        the same explicit-UPDATE protection ``comments.stream_id`` has
+        always had, in the SAME transaction as the delete -- identical
+        on both backends (this class runs against MariaDB too via
+        ``tests/test_mariadb_backend.py``'s generator; there is no
+        longer an exclusion entry for this test, because there is
+        nothing backend-specific left to exclude). Before WP-27, SQLite
+        alone cleared it, via a declared ``ON DELETE SET NULL`` foreign
+        key the migrated MariaDB schema never declared (runbook §B.6),
+        so the id dangled there instead -- see
+        ``Storage.assignments_referencing_stream``'s docstring for that
+        history. The assignment survives either way (assignments are
+        never deleted by a stream drop); only its origin annotation is
+        cleared."""
         self.store.set_assignee(
             "linux-sim", "suite.py", "test_b", "alice", "bob", CREATED,
             stream_id=self.stream_id)
@@ -5892,9 +5894,9 @@ class DropStreamTest(StorageTestBase):
         after = self.store.assignments_referencing_stream(self.stream_id)
         self.assertEqual(
             after, 0,
-            "SQLite's declared ON DELETE SET NULL FK did not cascade "
-            "-- either PRAGMA foreign_keys regressed to OFF, or the "
-            "column's FK declaration changed")
+            "delete_stream's explicit UPDATE did not clear "
+            "current_assignments.stream_id -- the column is dangling, "
+            "the exact bug WP-27 closed")
         # The assignment itself survives the stream's deletion --
         # only the origin annotation is gone, not the assignee.
         self.assertEqual(

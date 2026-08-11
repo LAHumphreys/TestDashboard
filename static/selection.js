@@ -75,7 +75,7 @@ import { apiUrl } from "./urls.js";
  */
 function bulkAssignmentsUrl() {
   return apiUrl(
-    "/api/assignments/bulk", null,
+    "api/assignments/bulk", null,
     { product: null, stream: null, baseline: null, environment: null },
   );
 }

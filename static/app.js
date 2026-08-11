@@ -204,21 +204,21 @@ function summaryUrl() {
   // tests out of an already-capped queue would hide their own work.
   // The headline needs the assignee too — the "mine" tab count.
   return apiUrl(
-    "/api/summary", { parts: "headline", assignee: getUsername() },
+    "api/summary", { parts: "headline", assignee: getUsername() },
     apiScope());
 }
 
 /** URL for one triage queue's rows. */
 function queueUrl(kind) {
   return apiUrl(
-    "/api/summary",
+    "api/summary",
     { parts: "queue", queue: kind, assignee: getUsername() },
     apiScope());
 }
 
 /** URL for one page of the test list under the current filters. */
 function browseUrl(offset) {
-  return apiUrl("/api/dashboard", {
+  return apiUrl("api/dashboard", {
     script: state.script,
     result: state.activeResults,
     stale: state.staleOnly ? "1" : null,
@@ -1717,7 +1717,7 @@ async function initBranchDashboard(streamId) {
     // it did not pay before (a branch-scoped page always did).
     const [compareData, headline] = await Promise.all([
       fetchCompare(streamId, null, 0, getSelectedBaselineId()),
-      fetchJson("/api/summary?parts=headline&stream=" + streamId)
+      fetchJson("api/summary?parts=headline&stream=" + streamId)
         .catch(() => null),
     ]);
     data = compareData;

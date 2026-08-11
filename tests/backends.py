@@ -19,6 +19,24 @@ the fresh-file semantics the id-stability tests assume) plus
 re-seeding the ``schema_version`` row. The app itself never runs DDL
 on MariaDB; this harness is not the app.
 
+**``TESTBOARD_TEST_DB_VIA_UPGRADE`` (opt-in, WP-27).** Set alongside
+``TESTBOARD_TEST_DB_CNF`` and the ONE-TIME schema build above is
+replaced: a v7 schema (``tests/mariadb_v7_fixture.py``) is loaded, then
+``tools/upgrade_mariadb_schema.py``'s own ``plan()`` — the exact
+statements a live operator run executes, not a re-derivation of them —
+is run against it to reach v10. Everything downstream (TRUNCATE-based
+per-test reset, ``schema_version``/mainline-stream reseeding) is
+UNCHANGED, because it does not care how the schema it is truncating came
+to exist. The point: with this set, the ENTIRE dual-backend suite (every
+existing test in ``tests/test_mariadb_backend.py``, ~2,900 cases) runs
+against a database that reached v10 by upgrading a v7 database, not by a
+fresh v10 load — the one thing ``upgrade_mariadb_schema.py``'s own
+schema-diff proves is STRUCTURALLY identical but cannot prove behaves
+identically under real queries. Off by default, including in CI: the
+same suite runs about twice as long with it on, and turning it on is a
+deliberate choice about what a session is verifying, not a standing
+cost every push should pay.
+
 The named database is DROPPED and recreated at process start. The
 config file is the guard against pointing this at anything precious:
 whatever database it names is sacrificial by definition.
@@ -34,6 +52,9 @@ from testboard.storage import MAINLINE_STREAM_ID, MIGRATIONS, Storage
 
 MARIADB_CNF = os.environ.get("TESTBOARD_TEST_DB_CNF", "")
 MARIADB_AVAILABLE = bool(MARIADB_CNF)
+
+#: See the module docstring. Any non-empty value opts in.
+VIA_UPGRADE = bool(os.environ.get("TESTBOARD_TEST_DB_VIA_UPGRADE", ""))
 
 _settings = None  # type: Optional[dbconfig.Settings]
 _admin = None  # type: Any
@@ -94,13 +115,50 @@ def ensure_schema() -> None:
     _run("CREATE DATABASE `{0}` CHARACTER SET utf8mb4 "
          "COLLATE utf8mb4_nopad_bin".format(name))
     _run("USE `{0}`".format(name))
-    ddl = exporter.ddl(exporter.Sizes(64, 255, 255))
-    for statement in split_statements(ddl):
-        _run(statement)
-    for statement in split_statements(exporter.INDEXES):
-        _run(statement)
+    if VIA_UPGRADE:
+        _build_schema_via_upgrade()
+    else:
+        ddl = exporter.ddl(exporter.Sizes(64, 255, 255))
+        for statement in split_statements(ddl):
+            _run(statement)
+        for statement in split_statements(exporter.INDEXES):
+            _run(statement)
     _TABLES = tuple(exporter.TABLE_ORDER)
     _schema_ready = True
+
+
+def _build_schema_via_upgrade() -> None:
+    """The VIA_UPGRADE path: v7, then ``upgrade_mariadb_schema.plan()``.
+
+    Loads the frozen v7 schema (``tests/mariadb_v7_fixture.py`` — the
+    real exporter DDL as it stood before migration 8, see that module's
+    own docstring for provenance), then runs the EXACT statement plan
+    ``tools/upgrade_mariadb_schema.py``'s live ``upgrade`` command would
+    run — not a second, hand-written translation of it — against this
+    connection directly. No data: this is a schema-only build, so there
+    is nothing for the ``ADD COLUMN ... DEFAULT`` backfills to do; what
+    is under test is that the STATEMENTS this tool emits are the ones
+    ``tools/export_for_mariadb.py``'s DDL generator would also produce,
+    which ``upgrade_mariadb_schema.schema_diff`` already checks once per
+    real upgrade run and this harness does not need to re-check per
+    test.
+    """
+    from tests import mariadb_v7_fixture as v7_fixture
+    from tools import export_for_mariadb as exporter
+    from tools import upgrade_mariadb_schema as upgrade
+    from tools.migrate_to_mariadb import split_statements
+    sizes = v7_fixture.Sizes(64, 255, 255)
+    for statement in split_statements(v7_fixture.ddl(sizes)):
+        _run(statement)
+    for statement in split_statements(v7_fixture.INDEXES):
+        _run(statement)
+    _run("INSERT INTO schema_version (version) VALUES (7)")
+    now = model.format_iso(model.utcnow())
+    oracle_sizes = exporter.Sizes(
+        sizes.environment, sizes.script, sizes.test_name)
+    for _from_version, statements in upgrade.plan(oracle_sizes, now):
+        for statement in statements:
+            _run(statement)
 
 
 def reset_database() -> None:

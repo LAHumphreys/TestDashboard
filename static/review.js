@@ -170,7 +170,7 @@ async function buildReviewPanel(entry, container, opts) {
   panel.appendChild(pre);
 
   try {
-    const run = await fetchJson("/api/runs/" + entry.run_id);
+    const run = await fetchJson("api/runs/" + entry.run_id);
     const truncated = fillOutput(pre, run.output);
     if (truncated) {
       pre.parentNode.insertBefore(

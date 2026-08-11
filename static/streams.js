@@ -139,7 +139,7 @@ async function init() {
   }
   try {
     const data = await fetchJson(
-      apiUrl("/api/streams", {}, { product: getSelectedProduct() }));
+      apiUrl("api/streams", {}, { product: getSelectedProduct() }));
     const selectedId = currentScope().stream
       ? parseInt(currentScope().stream, 10) : null;
     renderPicker(container, data.streams || [], selectedId);

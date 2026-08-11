@@ -2804,3 +2804,317 @@ threshold-gated), not a regression.
 Suite counts by commit: 1978 (baseline) → 1991 (WP-25 + verdict-line
 restore) → 2013 (WP-24) → 2016 (origin rename) → 2017 (four-site fix)
 → 2022 (persona fixes). Every increase is guards, none is weakening.
+## 2026-08-10 (late) — two owed writeups: the SQLite→MariaDB production cutover, and the staging deployment of the streams drop
+
+**Provenance, stated up front.** Neither of these nights was run from a
+session with this log open, and both were owed entries carried on the
+handover for days. They are reconstructed from the operator's own status
+report (captured at the time in the `mariadb-host-migration-state`
+memory note) and from the branch/tag state in the repo — not from a
+transcript. Everything below that is a *number* came from the operator;
+everything that is *absent* is marked absent rather than estimated. This
+entry is written at the start of the 2026-08-10 tooling night, before
+that night's work, so the record exists before more state moves on top
+of it.
+
+### The production cutover: SQLite → MariaDB
+
+Production now serves **MariaDB**. The cutover is complete and
+successful, everyone has moved onto it, and word is spreading among
+committers of the first onboarded product. An earlier version of the
+memory note dated this 2026-08-15/16; those dates were garbled and the
+cutover in fact happened before 2026-08-10.
+
+**Measured on PRODUCTION** — and this is one of the rare entries where
+that word is accurate, so it is worth saying plainly: the source file was
+the real **982 MB** production SQLite database, not a dev copy.
+`tools/migrate_to_mariadb.py`: **audit 10s / export 26s / load 103s /
+verify 18s**, all checks green. Nothing here was taken on the repo-root
+`testboard.db`.
+
+Deployment shape as it now stands: the dashboard serves
+`--db-config /etc/testboard/db.cnf`, unit `testboard.service`, code at
+`/opt/testboard/TestDashboard`, and the old `--db` ExecStart is kept
+**commented in place** as the rollback. The server is a shared **MariaDB
+10.3.39** daemon with other tenants on it; collation `utf8mb4_nopad_bin`,
+`sql_mode` strict.
+
+Three consequences that outlived the night, all of which shape the
+2026-08-11 drop:
+
+1. **`testboard_migrate` was DROPPED after the cutover** (operator
+   hardening, deliberate and correct). There is therefore no DDL-capable
+   credential anywhere. Any schema work on prod MariaDB must *start* with
+   root re-running runbook §A.4's CREATE USER + GRANT under a fresh
+   password with a fresh §A.9 cnf, deleted afterwards.
+2. **`max_allowed_packet` was raised to 128M via `SET GLOBAL` only**, so
+   it does NOT survive a daemon restart. Durable config needs the daemon
+   owners — still open. It mattered for the bulk load and is irrelevant
+   to DDL-only work, which is why the 08-11 upgrade does not depend on it.
+3. **Inline-`#` divergence**: the mysql client truncates an option value
+   at `#`, `dbconfig.py` does not. This bit the cutover through an app
+   password containing `#`, worked around by double-quoting the value in
+   `/etc/testboard/db.cnf`. Runbook §A.9/§A.10 does not yet warn about it
+   — being fixed tonight in the same commit as the incremental-DDL
+   section.
+
+**Not captured, and now unrecoverable at this precision:** wall-clock
+downtime, the exact cutover date, and any post-cutover endpoint timings
+against the MariaDB backend. Production read latency on MariaDB has
+never been measured; every endpoint number in this log is SQLite, on a
+dev copy. That gap is real and is not closed by this entry.
+
+### The streams drop on staging (2026-08-10)
+
+The old SQLite box is now a **staging** instance. The streams drop
+(migrations 8, 9, 10; tip `4d03da3`; branch `streams-upgrade`) was
+deployed there on **2026-08-10** and came up successfully at schema
+**v10**.
+
+What this buys, stated narrowly, because it is easy to over-claim: the
+v7→v10 migration sequence has now run to completion on **production-SIZE
+SQLite data** on a real box. It is evidence about the *migrations*, not
+about MariaDB — the DDL that will run on prod tomorrow is a different
+expression of the same schema change, and no part of it has been
+exercised by this deployment.
+
+**Not captured:** the per-migration timings on staging, the file size,
+and the startup pause the operator actually saw. The drop note's
+migration figures (0.883s for migration 9 alone, 0.806s combined v7→v9)
+remain **dev** numbers on the 220 MB dev copy and must not be quoted as
+staging or production. Had the staging timings been recorded they would
+be the best predictor available for tomorrow morning; they were not, and
+the honest position going into the prod deployment is that the only
+timing evidence is dev-scale.
+
+## 2026-08-10→11 — the tooling night: WP-27, WP-28, WP-29 and the docs tidy (ship branch `tooling-2026-08-10`)
+
+Four phases, all shipped, nothing user-visible: `whatsnew.html` gains
+nothing and no migration version was claimed. Executed 2 → 4 → 3 → 1 as
+planned, with 2/3/4 running concurrently on separate branches.
+
+**WP-27 — the MariaDB in-place upgrade tool.** `tools/upgrade_mariadb_schema.py`
+takes prod's MariaDB from v7 to v10 as stepwise DDL mirroring the SQLite
+migrations, bumping `schema_version` as the last statement of each step.
+It refuses an unexpected version in *both* directions and carries a
+bidirectional consistency check for the state DDL-autocommit makes
+possible — later-step artifacts present while the version has not yet
+been bumped — refusing with the mysqldump named. `--dry-run` prints every
+statement; `verify` diffs the result against `tools/export_for_mariadb.py`'s
+own v10 DDL as the oracle. It speaks only the vendored PyMySQL: no
+`mysql` subprocess, per the no-host-dependency rule.
+
+The v7 fixture is *derived*, never hand-written — `MIGRATIONS` 1–7 applied
+via `apply_migration_statement` to a temp SQLite file, then exported and
+loaded. A hand-typed v7 DDL would have verified the tool against a
+fiction.
+
+Second commit: the `delete_stream` dangling-id fix. `assignments.stream_id`
+and `current_assignments.stream_id` are now cleared by explicit UPDATE in
+the same transaction, the protection `comments.stream_id` already had.
+SQLite's FK made the gap invisible there; MariaDB's schema has no FKs, so
+this is what makes production correct. The SQLite-only guard lost its
+MariaDB exclusion and now runs, and passes, on both backends.
+
+**WP-28 — `--url-prefix`** (default `testboard`, `""` disables). The
+prefix is stripped once at the top of routing, before the traversal
+guard, matched at a **segment** boundary against the still-encoded path;
+`/testboardXtra` does not match, a double prefix is stripped once, and a
+bare `/testboard` gets a 307 (method-preserving, never cached permanent).
+Bare paths are accepted unconditionally — that is what makes a default-on
+flag safe and what lets feeders bypass nginx.
+
+The frontend needed no prefix knowledge at all. Reconnaissance found
+navigation already fully relative and all ~40 root-absolute `/api/...`
+literals funnelling through four wrappers in `api.js`; since every page is
+flat at the static root, dropping the leading slash resolves correctly
+under both shapes. A new guard (`RootAbsoluteApiUrlTest`) pins it, and
+catches the two files containing a real NUL byte that a plain grep skips
+as binary.
+
+**WP-29 — single-file feeders.** `clients/feeder.py` (3.6, parses under
+Python 2) and `clients/feeder.tcl` (targets vanilla 8.5), one engine in
+two languages, site slot on top, engine below a do-not-edit line, plus
+`docs/FEEDER_TEMPLATE.md`. Cleanup-invoked push model: no polling, no
+daily mode, no high-water mark — idempotency comes from the server's
+upsert + fingerprint skip. Replay files are the only persistence.
+Version/contract goes out as a `User-Agent` header, not a JSON field,
+because this drop made unknown wire fields loud rejections. Conformance
+suite drives 8 scenarios × 2 languages from one shared mixin, so a
+language cannot silently skip.
+
+**Docs tidy.** Four plan docs deleted; `STREAMS_PLAN.md` 108→20 KB;
+`UPGRADE_PLAN.md` 64→32 KB with §1's registry kept byte-for-byte. Two
+things were deliberately NOT cut: `STREAMS_PLAN.md` §2.4, because
+`ScopedUrlConstructionTest` names that section by number as the only
+documentation of `watch.js`'s builder exemption; and `FEEDER_BRIEF.md`'s
+substance, because `tests/test_feeder_brief.py`'s 13 tests assert on its
+content and `run_feeder.py` still runs in production. Trimming either to
+hit a size target would have orphaned a live guard.
+
+### Measurements and gates
+
+**Suite:** 2156 baseline → **2240 OK (skipped 1)** SQLite-only and
+**3016 OK (skipped 53)** dual-backend on the ship branch. Per-phase
+deltas: WP-27 +1, WP-28 +31, WP-29 +52 (of which 16 run for BOTH
+languages), summing exactly. Sanity net PASS unprefixed (45.3s) and
+`--url-prefix testboard` (48.0s).
+
+**All six CI legs green**, including a new `python36-mariadb-upgraded`
+leg that runs the entire suite against a database the upgrade tool built
+from v7 — "the schema matches" and "the app serves on it" being different
+claims. Verified from the logs that the upgrade genuinely drove it
+(`ALTER TABLE runs ADD COLUMN stream_id` executed) rather than the env
+var being silently ignored, and that the Tcl leg's 8 scenarios really ran
+rather than gating themselves out of existence.
+
+**`ALTER TABLE runs ADD COLUMN` takes the INSTANT path** — established by
+an explicit `ALGORITHM=INSTANT` being *accepted*, not inferred from a
+fast clock. 500,000 synthetic rows, 0.0s, **DEV on 12.3.2**. Production
+has ~4.4M rows and has not been measured. The tool now prints `runs`'s
+row count and warns if that step exceeds 5s, which is the in-the-moment
+signal it fell back to a rebuild.
+
+**Bounded-time promise:** documented ceiling ~115s; a black-holed port
+measured exit 1 at **51.3s (Python) / 51.1s (Tcl)**, DEV.
+
+### Three findings that outlived their phase
+
+1. **The local MariaDB is `12.3.2`, not 10.3** — four major versions
+   ahead of production's 10.3.39. The night plan, the handover and the
+   briefs all assumed otherwise. Every local dual-backend number proves
+   nothing about prod's server; CI's two `mariadb:10.3` legs are the only
+   10.3 evidence in existence.
+2. **The CRLF failures were a measuring-instrument bug, not a code
+   fault.** `test_frontend_calls.read()` opens in binary on purpose
+   (`app.js` contains a real `join("\0")`), which also preserves CRLF,
+   while several assertions spell JS structure with an explicit `\n`. On
+   a Windows checkout they failed on correct content in every fresh
+   worktree and passed on Linux CI. Normalising after the decode fixes
+   it; the assertions are unchanged. They had been quietly taxing every
+   count taken during the night.
+3. **CLAUDE.md's project state was wrong about migrations** — seven
+   entries claimed against ten actual, and version 8 attributed to WP-15
+   which the registry gives 11. Corrected. A session trusting it would
+   have claimed a version taken three times over.
+
+**Process:** three agents sharing the one checkout collided, and one lost
+in-progress work to another's `git stash`. Nothing was lost permanently
+(it was redone in an isolated worktree and diffed), but every parallel
+implementer now gets its own `git worktree` as the first instruction, not
+as a hope. Two superseded stashes remain in the main checkout.
+
+## 2026-08-11 (early) — addendum to the tooling night: the INSTANT claim is demonstrated on production's exact version
+
+The tooling-night entry above records the `runs ADD COLUMN` INSTANT path
+as established at 500,000 rows on the local **12.3.2** server, with
+production's 10.3.39 left as an argued rather than demonstrated case.
+That gap is now closed and the entry above is left as written (this log
+is append-only); this addendum is the correction.
+
+`tests/test_upgrade_mariadb_schema.py::InstantAddColumnTest` forces
+`ALGORITHM=INSTANT` onto the exact statement `step_8_to_9()` emits —
+located through the tool's own `_touches_runs_stream_id` predicate rather
+than retyped, so the test cannot drift from what a live upgrade runs —
+and asserts the **server accepts it**. Deliberately not a timing
+assertion: at fixture scale INSTANT and a full COPY rebuild are
+indistinguishable by clock, which is precisely the weakness it replaces.
+Forcing the algorithm makes the server declare its own capability.
+
+It passes on CI's MariaDB leg, which reports **10.3.39 — production's
+exact version, not merely its 10.3 stream**. Capability of this kind does
+not vary with row count, so production's ~4.4M rows do not threaten it.
+
+What remains unmeasured is narrower than before and worth stating
+precisely: total wall-clock for the upgrade on a *loaded, shared*
+production daemon. The tool prints `runs`'s row count before starting and
+warns if that step exceeds 5 seconds — the in-the-moment signal that it
+fell back to a rebuild despite the above.
+
+The failure path was hand-verified separately (a bogus ALGORITHM value
+forced a real `DatabaseError` and the rendered message was checked for
+legibility), since MariaDB cannot be made to refuse INSTANT on demand
+locally. If that message ever fires on a real run it names the production
+consequence and says not to soften it away.
+
+## 2026-08-11 — quality pass over the single-file clients (WP-29 follow-up)
+
+Prompted by the user reviewing `clients/feeder.py` on the morning of the
+drop: these are the most VISIBLE code this project produces — they get
+checked into other people's repositories — and they were not holding the
+standard the rest of the codebase does. A craftsmanship pass, no
+behaviour change; the conformance suite (8 scenarios × 2 languages,
+black-box over subprocesses) stayed untouched and green throughout,
+which is the evidence nothing moved.
+
+**Decision: `clients/feeder.py` no longer has to parse under Python 2.**
+It targets 3.6+ and now reads like `testboard/*.py` — real inline
+annotations, f-strings, no `# type:` comments. What that gave up is
+stated plainly rather than glossed: a Python 2 or 3.5 invocation now
+fails at PARSE time with a bare `SyntaxError`, and **no in-file check can
+pre-empt one**, which is why the docstring tells frameworks to invoke it
+as `python3`. The file is correspondingly removed from
+`tests/test_python36_compat.py`'s exemption list (`run_server.py` and
+`run_feeder.py` stay, being genuinely Python-2-parseable entry scripts)
+and is now held to the FULL standard.
+
+Worth recording that the Python 2 rule was NOT what made the file fall
+short. Type comments are first-class PEP 484 and check identically; the
+real defects were independent of the annotation style and would have been
+just as wrong spelled inline:
+
+- **`Any` outside a JSON boundary** — the injected `clock`/`sleep` were
+  typed `Any`. Now `Clock = Callable[[], float]` and
+  `Sleep = Callable[[float], None]`. `_truncate` had the same defect
+  (`Any` → `Union[bytes, str]`), found during the pass, not by me.
+- **Dicts and bare tuples used as structs** — `_send_with_retry` returned
+  a five-key dict indexed by string; `_send_own_records` returned
+  `Tuple[int, int, int, int, int]`. Now `SendOutcome`,
+  `BatchReportCounts`, `SendRecordsOutcome`, all `NamedTuple` class
+  syntax.
+- **`validate_record` returned `Dict[str, Any]`** and never converted, in
+  a codebase whose rule is to convert at the boundary. Now returns a
+  `RunRecord` NamedTuple with `to_wire()`, which is where the
+  "omit `build`, never send it as null" rule now lives — one documented
+  place instead of a conditional at the call site.
+- **Eleven-parameter signatures**, twice. A `TransportContext` NamedTuple
+  bundles what every HTTP attempt needs; both functions drop from 11
+  parameters to 5. This was the root cause of the unreadable 200-column
+  type comments, so it improves the file under either annotation style.
+
+`RunRecord.to_wire()` is this repo's first `typing.NamedTuple` carrying a
+method (methods on the class syntax need 3.6.1+, and no 3.6 interpreter
+exists on any dev box here). Verified where it counts: the ubi8 leg on
+**Python 3.6.8** runs 2241 OK, including the new
+`ClientFeederAnnotationsTest` — which exists because `clients/` is
+deliberately not a package and so cannot join the existing annotation
+sweep. Both compat gates were proven to still bite by planting a
+violation and watching them fail.
+
+**`clients/feeder.tcl`** got the same bar, with the bar itself written
+down since none existed: snake_case for the procs that speak the wire
+contract, PascalCase for internals (Tcl's stand-in for a leading
+underscore), stated in the file. All 49 procs now document arguments,
+return SHAPE and what they raise — in a language with no type system the
+doc comment IS the signature. Two procs returning bare positional lists
+now return named dicts, matching the Python side's NamedTuples.
+
+**It also found a real bug, not a style issue.** In
+`tb::DrainReplayFiles`, `open`/`fconfigure`/`read`/`close` sat inside one
+`catch`, so a failure in `fconfigure` or `read` skipped the `close` and
+leaked the channel — precisely the failure mode Tcl 8.5 invites by having
+no `finally`. Fixed with an unconditional `catch {close $fh}` after a
+separate catch. Every constant was diffed against the Python engine
+(timeouts, attempts, backoff, batch size, byte caps, truncation limit);
+all matched, which matters because the conformance suite asserts the two
+behave identically.
+
+Suite 2240 → **2241 OK (skipped 1)**; the +1 is the new annotation guard.
+
+**Known divergence, deliberately not closed today:** the `branch`
+rejection message is ASCII in the client and still carries a literal
+em-dash server-side (`testboard/model.py`, pinned by `test_api.py`).
+Changing a serving-path string on the morning of a production migration
+is not worth the cosmetic win. Worth closing later — the server's version
+is what a feeder PRINTS on rejection, and an em-dash on a site with a
+non-UTF-8 terminal is the one place it could actually matter.

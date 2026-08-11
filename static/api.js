@@ -72,7 +72,7 @@ export function putJson(url, body) {
  * "/", spaces, brackets etc. survive as single path segments (%2F and friends).
  */
 export function testApiPath(environment, script, testName, suffix) {
-  const base = "/api/tests/"
+  const base = "api/tests/"
     + encodeURIComponent(environment) + "/"
     + encodeURIComponent(script) + "/"
     + encodeURIComponent(testName);
@@ -81,7 +81,7 @@ export function testApiPath(environment, script, testName, suffix) {
 
 /** Build "/api/runs/{runId}". */
 export function runApiPath(runId) {
-  return "/api/runs/" + encodeURIComponent(String(runId));
+  return "api/runs/" + encodeURIComponent(String(runId));
 }
 
 /* ---------------- username handling ---------------- */
@@ -204,7 +204,7 @@ const addedUsers = [];
 /** Every username the server knows, for the assignee pickers. */
 export function loadUsers() {
   if (usersPromise === null) {
-    usersPromise = fetchJson("/api/users")
+    usersPromise = fetchJson("api/users")
       .then((data) => data.users.map((user) => user.username))
       // A missing user list must not break assigning: the dropdown still
       // offers you, the current assignee, and anyone added since.
