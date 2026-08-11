@@ -10,7 +10,53 @@ All four phases of that night's plan are **done, merged, and green**
 tooling-night entry in [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md)).
 The night's output is one branch: **`tooling-2026-08-10`**.
 
-## The one thing that matters this morning
+## Today's plan (agreed 2026-08-11)
+
+1. **Merge PR #7** (`tooling-2026-08-10` → `master`). Green, fast-forward.
+2. **Deploy to internal staging** (the SQLite box). Note this deliberately
+   does NOT rehearse the MariaDB migration — staging is already v10 and
+   tonight's branch adds no migration. Staging is here to exercise the
+   APP and the onboarding path, not the DDL.
+3. **Onboard the second product into staging.** This is the real
+   acceptance test — see the watch-list below.
+4. **If that goes well, upgrade production (MariaDB) end of day**, per
+   the procedure below.
+
+**What staging is actually testing, stated precisely.** The UI has been
+exercised in dev; what it has NOT met is REAL DATA — real product and
+environment names, real scale (production is ~4× the dev copy), real
+messy history, and a genuinely second product rather than a synthetic
+one. Everything on the watch-list below is a case where dev data
+happened to have something declared that a fresh onboarding will not.
+
+### Watch-list for the second product landing on staging
+
+- **A new product's environments arrive UNMAPPED.** `environment_products`
+  (migration 8) is DECLARED state, not inferred from imports. Until each
+  environment is mapped, the new product's data will not gather under it
+  in any product-scoped view. Open Actions has a bulk-assign for exactly
+  this (`bulkAssignUnmapped`) — it is an onboarding STEP, not a bug.
+- **A new product has no declared coverage denominator.**
+  `environment_expectations` (migration 5) is also declared. Inferred
+  from `latest_runs` it is a high-water mark, and **too large a
+  denominator means no pass counts, which silently drops the staleness
+  cutoff back to the 36-hour wall clock** — which is wrong for any suite
+  that does not run nightly, and will make the new product's dashboard
+  look broken when it is merely undeclared. `/api/environments` echoes
+  how many recent passes actually counted; check that number FIRST when
+  something looks stale, before believing the UI.
+- **The sticky product scope** adopts-and-sticks in `localStorage`. A
+  tester who once opened a `?product=X` link keeps that scope on every
+  page. Expect at least one "my data vanished" report that is really a
+  stuck product filter; clearing it is "All products" in the switcher.
+- **A brand-new product has no history**, so analytics windows (90 days
+  / 200 runs), flakiness scores and day-of-week profiles will be empty or
+  odd for a while. Expected, not a regression.
+- **Feeder invocation:** the single-file client must be invoked as
+  `python3`. As of this morning it no longer prints a friendly message on
+  Python 2 — it fails at parse time with a bare `SyntaxError`.
+
+## Production upgrade (end of day)
 
 **Deploy `tooling-2026-08-10` to production (MariaDB), including the
 v7→v10 schema upgrade.** Everything needed now exists; last night it did
