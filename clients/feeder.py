@@ -75,14 +75,16 @@ only change-nothing way to say "here is which engine sent this". No
 site is ever required to update this file for the dashboard to keep
 accepting it.
 
-Python 3.6+, standard library only - nothing to install on whatever
-machine your framework's cleanup step runs on. This file also PARSES
-(though it does not run) under Python 2, so invoking it with the wrong
-interpreter prints this file's own clear version message instead of a
-bare SyntaxError - which is why every function below uses type
-COMMENTS rather than inline annotations, and there are no f-strings
-anywhere in the file. Do not add either to this file, above or below
-the line.
+Python 3.6+ REQUIRED, standard library only - nothing to install on
+whatever machine your framework's cleanup step runs on. Unlike
+``run_server.py``/``run_feeder.py`` in the testboard repository itself,
+this file does NOT parse under Python 2: it uses real inline type
+annotations and f-strings throughout, same as the rest of testboard's
+own code. Invoking it with Python 2, or with Python 3 older than 3.6,
+fails at PARSE time with a plain SyntaxError - there is no in-file
+check that can pre-empt this, because the interpreter cannot get far
+enough to run one. Frameworks embedding this file must invoke it as
+``python3`` (or a specific ``python3.6+``), never bare ``python``.
 """
 
 import argparse
@@ -97,17 +99,20 @@ import socket
 import sys
 import time
 import traceback
-
-try:
-    from typing import Any, Dict, Iterator, List, Optional, Tuple  # noqa: F401
-except ImportError:  # pragma: no cover - Python 2: main() exits before use
-    pass
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple, Union
 
 #: This engine's own version and the /api/import wire-contract version it
 #: was written against. Sent as the User-Agent header, never as a JSON
 #: field - see the module docstring.
 ENGINE_VERSION = "1.0.0"
 CONTRACT_VERSION = "1"
+
+#: A wall clock read, ``time.time``-shaped. Injected (rather than called
+#: directly) so tests can supply a fake one without sleeping for real.
+Clock = Callable[[], float]
+
+#: A blocking delay, ``time.sleep``-shaped. Injected for the same reason.
+Sleep = Callable[[float], None]
 
 
 # ============================================================================
@@ -123,8 +128,7 @@ CONTRACT_VERSION = "1"
 DASHBOARD_URL = "http://localhost:8000"  # CHANGE ME
 
 
-def add_site_arguments(parser):
-    # type: (argparse.ArgumentParser) -> None
+def add_site_arguments(parser: argparse.ArgumentParser) -> None:
     """Add whatever arguments read_records() needs to find this run's
     results. The worked convention is a single ``--results PATH``
     (repeatable); add more if your source needs them (e.g. --log-dir,
@@ -143,8 +147,7 @@ def add_site_arguments(parser):
     )
 
 
-def read_records(args):
-    # type: (argparse.Namespace) -> Iterator[Dict[str, Any]]
+def read_records(args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
     """Yield one raw transport dict per test run for THIS invocation.
 
     Plain dicts in the /api/import RunRecord schema: result,
@@ -258,6 +261,55 @@ class ValidationError(Exception):
     """One record failed the /api/import wire-schema rules."""
 
 
+class RunRecord(NamedTuple):
+    """One validated, canonical run record - the JSON boundary is crossed
+    exactly once, in :func:`validate_record`, and everything downstream
+    (batching, replay files, the dry-run printout) works with this typed
+    shape instead of a bare dict.
+
+    ``start_time``/``end_time`` are already the canonical formatted
+    strings (not ``datetime`` objects): validation and canonicalisation
+    happen together in :func:`validate_record`, so there is nothing left
+    to reformat later. ``known_failure_reason`` and ``build`` are
+    ``None`` when absent; :meth:`to_wire` is where the wire-shape rule
+    "omit build, never send it as null" lives.
+    """
+
+    environment: str
+    script: str
+    test_name: str
+    result: str
+    start_time: str
+    end_time: str
+    output: str
+    source_link: str
+    known_failure_reason: Optional[str]
+    build: Optional[str]
+
+    def to_wire(self) -> Dict[str, Any]:
+        """Serialize to the exact /api/import transport dict shape.
+
+        ``build`` is included only when set - a mainline record
+        serializes to exactly the shape sent before builds existed at
+        all, and an unknown key (``"build": null``) would be a loud
+        per-record rejection server-side.
+        """
+        wire: Dict[str, Any] = {
+            "environment": self.environment,
+            "script": self.script,
+            "test_name": self.test_name,
+            "result": self.result,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "output": self.output,
+            "source_link": self.source_link,
+            "known_failure_reason": self.known_failure_reason,
+        }
+        if self.build is not None:
+            wire["build"] = self.build
+        return wire
+
+
 # ----------------------------------------------------------------------
 # Wire-schema validation - a standalone reimplementation of the same
 # rules testboard.model.parse_run_record enforces server-side (this
@@ -266,39 +318,33 @@ class ValidationError(Exception):
 # ----------------------------------------------------------------------
 
 
-def _require_str(obj, field):
-    # type: (Dict[str, Any], str) -> str
+def _require_str(obj: Dict[str, Any], field: str) -> str:
     if field not in obj:
-        raise ValidationError("{0}: required field is missing".format(field))
+        raise ValidationError(f"{field}: required field is missing")
     value = obj[field]
     if not isinstance(value, str):
         raise ValidationError(
-            "{0}: must be a string, got {1}".format(field, type(value).__name__)
+            f"{field}: must be a string, got {type(value).__name__}"
         )
     if not value.strip():
-        raise ValidationError(
-            "{0}: must not be empty or whitespace-only".format(field)
-        )
+        raise ValidationError(f"{field}: must not be empty or whitespace-only")
     return value
 
 
-def _parse_timestamp(obj, field):
-    # type: (Dict[str, Any], str) -> datetime.datetime
+def _parse_timestamp(obj: Dict[str, Any], field: str) -> datetime.datetime:
     if field not in obj:
-        raise ValidationError("{0}: required field is missing".format(field))
+        raise ValidationError(f"{field}: required field is missing")
     value = obj[field]
     if not isinstance(value, str):
         raise ValidationError(
-            "{0}: expected an ISO-8601 timestamp string, got {1}".format(
-                field, type(value).__name__
-            )
+            f"{field}: expected an ISO-8601 timestamp string, got "
+            f"{type(value).__name__}"
         )
     match = _TIMESTAMP_RE.match(value)
     if match is None:
         raise ValidationError(
-            "{0}: invalid timestamp {1!r}: expected "
-            "'YYYY-MM-DDTHH:MM:SS[.ffffff]' (naive UTC, no timezone "
-            "suffix)".format(field, value)
+            f"{field}: invalid timestamp {value!r}: expected "
+            "'YYYY-MM-DDTHH:MM:SS[.ffffff]' (naive UTC, no timezone suffix)"
         )
     year, month, day, hour, minute, second = (
         int(match.group(i)) for i in range(1, 7)
@@ -309,19 +355,18 @@ def _parse_timestamp(obj, field):
         return datetime.datetime(year, month, day, hour, minute, second, micro)
     except ValueError:
         raise ValidationError(
-            "{0}: invalid timestamp {1!r}: not a real calendar "
-            "date/time".format(field, value)
+            f"{field}: invalid timestamp {value!r}: not a real calendar "
+            "date/time"
         )
 
 
-def _format_timestamp(dt):
-    # type: (datetime.datetime) -> str
+def _format_timestamp(dt: datetime.datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
-def validate_record(raw):
-    # type: (Any) -> Dict[str, Any]
-    """Validate one raw transport dict; return the canonical wire dict.
+def validate_record(raw: Any) -> RunRecord:
+    """Validate one raw transport dict; return the canonical
+    :class:`RunRecord`.
 
     Raises ValidationError (message names the offending field) on any
     violation. Mirrors testboard.model.parse_run_record exactly,
@@ -331,9 +376,7 @@ def validate_record(raw):
     """
     if not isinstance(raw, dict):
         raise ValidationError(
-            "run record must be a JSON object, got {0}".format(
-                type(raw).__name__
-            )
+            f"run record must be a JSON object, got {type(raw).__name__}"
         )
     environment = _require_str(raw, "environment")
     script = _require_str(raw, "script")
@@ -343,35 +386,29 @@ def validate_record(raw):
         raise ValidationError("result: required field is missing")
     result = raw["result"]
     if not isinstance(result, str) or result not in _RESULT_VALUES:
+        joined = ", ".join(_RESULT_VALUES)
         raise ValidationError(
-            "result: unknown value {0!r} (expected one of {1})".format(
-                result, ", ".join(_RESULT_VALUES)
-            )
+            f"result: unknown value {result!r} (expected one of {joined})"
         )
 
     start_time = _parse_timestamp(raw, "start_time")
     end_time = _parse_timestamp(raw, "end_time")
     if end_time < start_time:
         raise ValidationError(
-            "end_time: must be >= start_time ({0} < {1})".format(
-                _format_timestamp(end_time), _format_timestamp(start_time)
-            )
+            f"end_time: must be >= start_time "
+            f"({_format_timestamp(end_time)} < {_format_timestamp(start_time)})"
         )
 
     if "output" not in raw:
         raise ValidationError("output: required field is missing")
     output = raw["output"]
     if not isinstance(output, str):
-        raise ValidationError(
-            "output: must be a string, got {0}".format(type(output).__name__)
-        )
+        raise ValidationError(f"output: must be a string, got {type(output).__name__}")
 
     source_link = raw.get("source_link", "")
     if not isinstance(source_link, str):
         raise ValidationError(
-            "source_link: must be a string, got {0}".format(
-                type(source_link).__name__
-            )
+            f"source_link: must be a string, got {type(source_link).__name__}"
         )
 
     known_failure_reason = raw.get("known_failure_reason")
@@ -380,7 +417,7 @@ def validate_record(raw):
     ):
         raise ValidationError(
             "known_failure_reason: must be a string or null, got "
-            "{0}".format(type(known_failure_reason).__name__)
+            f"{type(known_failure_reason).__name__}"
         )
     if known_failure_reason is not None and not known_failure_reason.strip():
         known_failure_reason = None
@@ -390,42 +427,36 @@ def validate_record(raw):
     # same regardless of what else the record carries.
     if "branch" in raw:
         raise ValidationError(
-            "branch: removed before this contract ever shipped — use "
-            "build:"
+            "branch: removed before this contract ever shipped - use build:"
         )
 
     build = raw.get("build")
     if build is not None:
         if not isinstance(build, str):
             raise ValidationError(
-                "build: must be a string or null, got {0}".format(
-                    type(build).__name__
-                )
+                f"build: must be a string or null, got {type(build).__name__}"
             )
         build = build.strip() or None
 
-    record = {
-        "environment": environment,
-        "script": script,
-        "test_name": test_name,
-        "result": result,
-        "start_time": _format_timestamp(start_time),
-        "end_time": _format_timestamp(end_time),
-        "output": output,
-        "source_link": source_link,
-        "known_failure_reason": known_failure_reason,
-    }  # type: Dict[str, Any]
-    if build is not None:
-        record["build"] = build
-    return record
+    return RunRecord(
+        environment=environment,
+        script=script,
+        test_name=test_name,
+        result=result,
+        start_time=_format_timestamp(start_time),
+        end_time=_format_timestamp(end_time),
+        output=output,
+        source_link=source_link,
+        known_failure_reason=known_failure_reason,
+        build=build,
+    )
 
 
-def _identity_of(raw):
-    # type: (Any) -> str
+def _identity_of(raw: Any) -> str:
     """Best-effort ``environment / script / test_name [@ start_time]``."""
     if not isinstance(raw, dict):
-        return "<no identity: record is {0}>".format(type(raw).__name__)
-    parts = []  # type: List[str]
+        return f"<no identity: record is {type(raw).__name__}>"
+    parts: List[str] = []
     for field in ("environment", "script", "test_name"):
         value = raw.get(field)
         parts.append(value if isinstance(value, str) and value.strip() else "?")
@@ -441,16 +472,16 @@ def _identity_of(raw):
 # ----------------------------------------------------------------------
 
 
-def _normalize_url(url):
-    # type: (str) -> str
+def _normalize_url(url: str) -> str:
     trimmed = url.rstrip("/")
     if not trimmed.endswith("/api/import"):
         trimmed += "/api/import"
     return trimmed
 
 
-def _post(url, body, headers, timeout):
-    # type: (str, bytes, Dict[str, str], float) -> Tuple[int, bytes]
+def _post(
+    url: str, body: bytes, headers: Dict[str, str], timeout: float
+) -> Tuple[int, bytes]:
     """POST once; HTTP error statuses return, transport failures raise."""
     import urllib.error
     import urllib.request
@@ -468,11 +499,10 @@ def _post(url, body, headers, timeout):
         response.close()
 
 
-def _describe_connection_error(url, exc):
-    # type: (str, BaseException) -> str
+def _describe_connection_error(url: str, exc: BaseException) -> str:
     import urllib.error
 
-    reason = exc  # type: BaseException
+    reason: BaseException = exc
     if isinstance(exc, urllib.error.URLError) and not isinstance(
         exc, urllib.error.HTTPError
     ):
@@ -480,22 +510,18 @@ def _describe_connection_error(url, exc):
         if isinstance(inner, BaseException):
             reason = inner
     if isinstance(reason, socket.timeout):
-        return "request to {0} timed out".format(url)
+        return f"request to {url} timed out"
     if isinstance(reason, socket.gaierror):
-        return "DNS lookup failed for the host in {0}".format(url)
-    return "cannot reach {0} ({1}: {2})".format(
-        url, type(reason).__name__, reason
-    )
+        return f"DNS lookup failed for the host in {url}"
+    return f"cannot reach {url} ({type(reason).__name__}: {reason})"
 
 
-def _truncate(data, limit=200):
-    # type: (Any, int) -> str
+def _truncate(data: Union[bytes, str], limit: int = 200) -> str:
     text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
     return text if len(text) <= limit else text[:limit] + "...[truncated]"
 
 
-def _decode_json_object(data):
-    # type: (bytes) -> Optional[Dict[str, Any]]
+def _decode_json_object(data: bytes) -> Optional[Dict[str, Any]]:
     try:
         payload = json.loads(data.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -503,83 +529,121 @@ def _decode_json_object(data):
     return payload if isinstance(payload, dict) else None
 
 
-def _send_with_retry(
-    url, body, headers, deadline, http_timeout, max_attempts,
-    backoff_base, clock, sleep, log, label,
-):
-    # type: (str, bytes, Dict[str, str], float, float, int, float, Any, Any, logging.Logger, str) -> Dict[str, Any]
-    """POST ``body`` with retry/backoff, bounded by ``deadline``.
+class TransportContext(NamedTuple):
+    """Everything one HTTP attempt against the dashboard needs, bundled
+    so it travels as a single parameter instead of a fan of positional
+    ones through every function that eventually calls :func:`_post`.
 
-    Returns a dict: {"ok": bool, "deferred": bool, "reason": str,
-    "payload": Optional[dict], "streams_seen_present": bool}.
-    ``deferred`` means the time budget ran out before any attempt was
-    even made - as distinct from an attempt that was made and failed.
+    ``deadline`` is an absolute ``clock()`` reading, not a duration: the
+    same wall-clock budget is shared across draining replay files and
+    sending this run's own batches, so passing the deadline itself
+    through (rather than "seconds remaining") keeps it stable no matter
+    how many attempts came before.
     """
+
+    url: str
+    headers: Dict[str, str]
+    http_timeout: float
+    deadline: float
+    clock: Clock
+    sleep: Sleep
+    log: logging.Logger
+
+
+class SendOutcome(NamedTuple):
+    """Result of one :func:`_send_with_retry` call.
+
+    ``deferred`` means the time budget ran out before any attempt was
+    even made - as distinct from an attempt that was made and failed
+    (``ok=False, deferred=False``).
+    """
+
+    ok: bool
+    deferred: bool
+    reason: str
+    payload: Optional[Dict[str, Any]]
+    streams_seen_present: bool
+
+
+def _send_with_retry(
+    ctx: TransportContext, body: bytes, max_attempts: int,
+    backoff_base: float, label: str,
+) -> SendOutcome:
+    """POST ``body`` with retry/backoff, bounded by ``ctx.deadline``."""
     reason = "unknown error"
     for attempt in range(1, max_attempts + 1):
-        if clock() >= deadline:
-            return {
-                "ok": False, "deferred": True,
-                "reason": (
-                    "time budget exhausted before attempt {0} of {1} "
-                    "for {2}".format(attempt, max_attempts, label)
+        if ctx.clock() >= ctx.deadline:
+            return SendOutcome(
+                ok=False, deferred=True,
+                reason=(
+                    f"time budget exhausted before attempt {attempt} of "
+                    f"{max_attempts} for {label}"
                 ),
-                "payload": None, "streams_seen_present": False,
-            }
+                payload=None, streams_seen_present=False,
+            )
         if attempt > 1:
             delay = backoff_base * (2 ** (attempt - 2))
-            log.info(
+            ctx.log.info(
                 "%s: retrying in %.1fs (attempt %d of %d)",
                 label, delay, attempt, max_attempts,
             )
-            sleep(delay)
+            ctx.sleep(delay)
         try:
-            status, response_body = _post(url, body, headers, http_timeout)
+            status, response_body = _post(
+                ctx.url, body, ctx.headers, ctx.http_timeout
+            )
         except Exception as exc:
-            reason = _describe_connection_error(url, exc)
-            log.warning(
+            reason = _describe_connection_error(ctx.url, exc)
+            ctx.log.warning(
                 "%s: attempt %d of %d failed: %s",
                 label, attempt, max_attempts, reason,
             )
             continue
         if status == 200:
             payload = _decode_json_object(response_body)
-            return {
-                "ok": True, "deferred": False, "reason": "",
-                "payload": payload,
-                "streams_seen_present": (
+            return SendOutcome(
+                ok=True, deferred=False, reason="",
+                payload=payload,
+                streams_seen_present=(
                     payload is not None and "streams_seen" in payload
                 ),
-            }
-        if status >= 500:
-            reason = "server error HTTP {0} (response: {1})".format(
-                status, _truncate(response_body)
             )
-            log.warning(
+        if status >= 500:
+            reason = f"server error HTTP {status} (response: {_truncate(response_body)})"
+            ctx.log.warning(
                 "%s: attempt %d of %d failed: %s",
                 label, attempt, max_attempts, reason,
             )
             continue
         # 4xx: the request itself was rejected - retrying cannot help.
-        reason = "HTTP {0} from the server (response: {1})".format(
-            status, _truncate(response_body)
-        )
-        log.warning("%s: %s - not retrying a client error", label, reason)
+        reason = f"HTTP {status} from the server (response: {_truncate(response_body)})"
+        ctx.log.warning("%s: %s - not retrying a client error", label, reason)
         break
-    return {
-        "ok": False, "deferred": False, "reason": reason,
-        "payload": None, "streams_seen_present": False,
-    }
+    return SendOutcome(
+        ok=False, deferred=False, reason=reason,
+        payload=None, streams_seen_present=False,
+    )
 
 
-def _report_batch_payload(payload, label, log):
-    # type: (Optional[Dict[str, Any]], str, logging.Logger) -> Tuple[int, int, int]
+class BatchReportCounts(NamedTuple):
+    """The three counters :func:`_report_batch_payload` extracts from one
+    server response, named rather than three bare ints at every call
+    site."""
+
+    inserted: int
+    updated: int
+    rejected: int
+
+
+def _report_batch_payload(
+    payload: Optional[Dict[str, Any]], label: str, log: logging.Logger
+) -> BatchReportCounts:
     if payload is None:
         log.warning(
             "%s: server returned 200 but the response body was not a "
             "usable JSON object", label,
         )
-        return (0, 0, 0)
+        return BatchReportCounts(inserted=0, updated=0, rejected=0)
     inserted = int(payload.get("inserted", 0) or 0)
     updated = int(payload.get("updated", 0) or 0)
     rejected = int(payload.get("rejected", 0) or 0)
@@ -600,7 +664,7 @@ def _report_batch_payload(payload, label, log):
         "%s: inserted=%d updated=%d rejected=%d", label, inserted, updated,
         rejected,
     )
-    return (inserted, updated, rejected)
+    return BatchReportCounts(inserted=inserted, updated=updated, rejected=rejected)
 
 
 # ----------------------------------------------------------------------
@@ -612,21 +676,15 @@ def _report_batch_payload(payload, label, log):
 # ----------------------------------------------------------------------
 
 
-def _sanitize(text):
-    # type: (str) -> str
+def _sanitize(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", text).strip("-") or "unnamed"
 
 
-def _new_replay_path(replay_dir, environment):
-    # type: (str, str) -> str
+def _new_replay_path(replay_dir: str, environment: str) -> str:
     safe_env = _sanitize(environment)
     for _attempt in range(50):
-        token = "{0}-{1}-{2:04d}".format(
-            os.getpid(), int(time.time() * 1000), random.randint(0, 9999)
-        )
-        name = "{0}{1}_{2}{3}".format(
-            _REPLAY_PREFIX, safe_env, token, _REPLAY_SUFFIX
-        )
+        token = f"{os.getpid()}-{int(time.time() * 1000)}-{random.randint(0, 9999):04d}"
+        name = f"{_REPLAY_PREFIX}{safe_env}_{token}{_REPLAY_SUFFIX}"
         path = os.path.join(replay_dir, name)
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -634,27 +692,20 @@ def _new_replay_path(replay_dir, environment):
             continue  # name collision (astronomically unlikely) - retry
         os.close(fd)
         return path
-    raise OSError(
-        "could not allocate a unique replay file name in {0}".format(
-            replay_dir
-        )
-    )
+    raise OSError(f"could not allocate a unique replay file name in {replay_dir}")
 
 
-def _write_replay(path, body):
-    # type: (str, bytes) -> None
+def _write_replay(path: str, body: bytes) -> None:
     with open(path, "wb") as handle:
         handle.write(body)
 
 
-def _pending_replay_files(replay_dir):
-    # type: (str) -> List[str]
+def _pending_replay_files(replay_dir: str) -> List[str]:
     pattern = os.path.join(replay_dir, _REPLAY_PREFIX + "*" + _REPLAY_SUFFIX)
     return sorted(glob.glob(pattern))
 
 
-def _claim(path):
-    # type: (str) -> Optional[str]
+def _claim(path: str) -> Optional[str]:
     """Atomically rename ``path`` to reserve it for this process.
 
     Returns the claimed path, or None if another invocation already
@@ -668,8 +719,7 @@ def _claim(path):
     return claimed
 
 
-def _release_claim(claimed, original, log):
-    # type: (str, str, logging.Logger) -> None
+def _release_claim(claimed: str, original: str, log: logging.Logger) -> None:
     """Give a claimed-but-still-failing replay file back its real name
     so a later invocation will pick it up again."""
     try:
@@ -682,8 +732,7 @@ def _release_claim(claimed, original, log):
         )
 
 
-def _body_expects_streams_ack(body):
-    # type: (bytes) -> bool
+def _body_expects_streams_ack(body: bytes) -> bool:
     """True if any record in ``body`` carries a build (needs streams_seen).
 
     Computed from the OUTGOING body rather than from this invocation's
@@ -702,16 +751,13 @@ def _body_expects_streams_ack(body):
     return any(isinstance(r, dict) and "build" in r for r in runs)
 
 
-def _drain_replay_files(
-    url, headers, replay_dir, deadline, http_timeout, clock, sleep, log,
-):
-    # type: (str, Dict[str, str], str, float, float, Any, Any, logging.Logger) -> int
+def _drain_replay_files(ctx: TransportContext, replay_dir: str) -> int:
     """Resend every pending replay file; return the count still pending
     afterwards (failed again, or never attempted for lack of time)."""
     still_pending = 0
     for path in _pending_replay_files(replay_dir):
-        if clock() >= deadline:
-            log.warning(
+        if ctx.clock() >= ctx.deadline:
+            ctx.log.warning(
                 "time budget exhausted; leaving %s (and any later replay "
                 "files) for the next invocation", path,
             )
@@ -724,22 +770,21 @@ def _drain_replay_files(
             with open(claimed, "rb") as handle:
                 body = handle.read()
         except OSError as exc:
-            log.error(
+            ctx.log.error(
                 "could not read replay file %s (%s); leaving it for a "
                 "later retry", claimed, exc,
             )
-            _release_claim(claimed, path, log)
+            _release_claim(claimed, path, ctx.log)
             still_pending += 1
             continue
         expect_ack = _body_expects_streams_ack(body)
-        result = _send_with_retry(
-            url, body, headers, deadline, http_timeout, MAX_ATTEMPTS,
-            BACKOFF_BASE_SECONDS, clock, sleep, log,
-            "replay file {0}".format(os.path.basename(path)),
+        outcome = _send_with_retry(
+            ctx, body, MAX_ATTEMPTS, BACKOFF_BASE_SECONDS,
+            f"replay file {os.path.basename(path)}",
         )
-        if result["ok"]:
-            if expect_ack and not result["streams_seen_present"]:
-                log.error(
+        if outcome.ok:
+            if expect_ack and not outcome.streams_seen_present:
+                ctx.log.error(
                     "replay file %s: this batch carries --build records "
                     "but the server's response has no streams_seen key "
                     "at all - an old server would have filed it into "
@@ -748,18 +793,18 @@ def _drain_replay_files(
                 )
             else:
                 _report_batch_payload(
-                    result["payload"], "replay file " + path, log
+                    outcome.payload, "replay file " + path, ctx.log
                 )
             try:
                 os.remove(claimed)
             except OSError:
                 pass
-            log.info("replay file %s: resent successfully", path)
+            ctx.log.info("replay file %s: resent successfully", path)
         else:
-            log.error(
-                "replay file %s: still failing (%s)", path, result["reason"]
+            ctx.log.error(
+                "replay file %s: still failing (%s)", path, outcome.reason
             )
-            _release_claim(claimed, path, log)
+            _release_claim(claimed, path, ctx.log)
             still_pending += 1
     return still_pending
 
@@ -769,13 +814,14 @@ def _drain_replay_files(
 # ----------------------------------------------------------------------
 
 
-def _batches(records, batch_size, max_bytes):
-    # type: (List[Dict[str, Any]], int, int) -> Iterator[List[Dict[str, Any]]]
-    batch = []  # type: List[Dict[str, Any]]
+def _batches(
+    records: List[RunRecord], batch_size: int, max_bytes: int
+) -> Iterator[List[RunRecord]]:
+    batch: List[RunRecord] = []
     batch_bytes = 0
     for record in records:
         batch.append(record)
-        batch_bytes += len(record.get("output", "")) + _RECORD_OVERHEAD_BYTES
+        batch_bytes += len(record.output) + _RECORD_OVERHEAD_BYTES
         if len(batch) >= batch_size or batch_bytes >= max_bytes:
             yield batch
             batch = []
@@ -784,37 +830,46 @@ def _batches(records, batch_size, max_bytes):
         yield batch
 
 
+class SendRecordsOutcome(NamedTuple):
+    """Totals from one :func:`_send_own_records` call, across every
+    batch it sent - named rather than five bare ints at the call site."""
+
+    sent: int
+    inserted: int
+    updated: int
+    rejected: int
+    failed_batches: int
+
+
 def _send_own_records(
-    records, url, environment, build, replay_dir, deadline, http_timeout,
-    clock, sleep, log, headers,
-):
-    # type: (List[Dict[str, Any]], str, str, Optional[str], str, float, float, Any, Any, logging.Logger, Dict[str, str]) -> Tuple[int, int, int, int, int]
-    """Batch and send ``records``; return (sent, inserted, updated,
-    rejected, failed_batches). Every failed batch is saved to a fresh
-    replay file before this returns - nothing is ever only in memory."""
+    records: List[RunRecord], ctx: TransportContext, environment: str,
+    build: Optional[str], replay_dir: str,
+) -> SendRecordsOutcome:
+    """Batch and send ``records``. Every failed batch is saved to a
+    fresh replay file before this returns - nothing is ever only in
+    memory."""
     sent = inserted = updated = rejected = failed_batches = 0
     for batch in _batches(records, BATCH_SIZE, MAX_BATCH_BYTES):
-        body = json.dumps({"runs": batch}).encode("utf-8")
-        expect_ack = any("build" in record for record in batch)
-        if clock() >= deadline:
+        body = json.dumps({"runs": [r.to_wire() for r in batch]}).encode("utf-8")
+        expect_ack = any(r.build is not None for r in batch)
+        if ctx.clock() >= ctx.deadline:
             path = _new_replay_path(replay_dir, environment)
             _write_replay(path, body)
-            log.error(
+            ctx.log.error(
                 "time budget exhausted before this batch of %d records "
                 "could be sent; saved to %s for the next invocation",
                 len(batch), path,
             )
             failed_batches += 1
             continue
-        result = _send_with_retry(
-            url, body, headers, deadline, http_timeout, MAX_ATTEMPTS,
-            BACKOFF_BASE_SECONDS, clock, sleep, log,
-            "batch of {0} records".format(len(batch)),
+        outcome = _send_with_retry(
+            ctx, body, MAX_ATTEMPTS, BACKOFF_BASE_SECONDS,
+            f"batch of {len(batch)} records",
         )
-        if result["ok"] and expect_ack and not result["streams_seen_present"]:
+        if outcome.ok and expect_ack and not outcome.streams_seen_present:
             path = _new_replay_path(replay_dir, environment)
             _write_replay(path, body)
-            log.error(
+            ctx.log.error(
                 "this run used --build %r but the server's response has "
                 "no streams_seen key at all - it does not understand "
                 "builds and would have silently filed these into "
@@ -825,22 +880,25 @@ def _send_own_records(
             )
             failed_batches += 1
             continue
-        if result["ok"]:
-            counts = _report_batch_payload(result["payload"], "this run", log)
+        if outcome.ok:
+            counts = _report_batch_payload(outcome.payload, "this run", ctx.log)
             sent += len(batch)
-            inserted += counts[0]
-            updated += counts[1]
-            rejected += counts[2]
+            inserted += counts.inserted
+            updated += counts.updated
+            rejected += counts.rejected
             continue
         path = _new_replay_path(replay_dir, environment)
         _write_replay(path, body)
-        log.error(
+        ctx.log.error(
             "batch of %d records failed (%s); saved to %s - the NEXT "
             "invocation resends it before its own batch",
-            len(batch), result["reason"], path,
+            len(batch), outcome.reason, path,
         )
         failed_batches += 1
-    return sent, inserted, updated, rejected, failed_batches
+    return SendRecordsOutcome(
+        sent=sent, inserted=inserted, updated=updated, rejected=rejected,
+        failed_batches=failed_batches,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -860,8 +918,7 @@ schema, the invocation contract and two worked reader examples.
 """
 
 
-def build_parser():
-    # type: () -> argparse.ArgumentParser
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="feeder.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -920,14 +977,19 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
-    # type: (Optional[List[str]]) -> int
+def main(argv: Optional[List[str]] = None) -> int:
+    # In practice Python 2 and 3.0-3.5 never reach this line: f-strings
+    # and inline annotations are a SyntaxError at PARSE time on those
+    # interpreters (see the module docstring), and no in-file check can
+    # pre-empt a parse failure. This check is kept anyway rather than
+    # deleted as dead code: it is cheap, it is the one place this exact
+    # civil message lives, and removing it would be a behaviour change
+    # this refactor has no reason to make.
     if sys.version_info < (3, 6):
+        major, minor, micro = sys.version_info[:3]
         sys.stderr.write(
-            "this feeder requires Python 3.6+ - you are running "
-            "{0}.{1}.{2}. Re-run with: python3 feeder.py\n".format(
-                sys.version_info[0], sys.version_info[1], sys.version_info[2]
-            )
+            f"this feeder requires Python 3.6+ - you are running "
+            f"{major}.{minor}.{micro}. Re-run with: python3 feeder.py\n"
         )
         return 2
 
@@ -978,21 +1040,20 @@ def main(argv=None):
 
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "testboard-feeder-python/{0} (contract {1})".format(
-            ENGINE_VERSION, CONTRACT_VERSION
-        ),
+        "User-Agent": f"testboard-feeder-python/{ENGINE_VERSION} (contract {CONTRACT_VERSION})",
     }
 
-    clock = time.time
-    sleep = time.sleep
+    clock: Clock = time.time
+    sleep: Sleep = time.sleep
     deadline = clock() + args.time_budget
+    ctx = TransportContext(
+        url=url, headers=headers, http_timeout=args.http_timeout,
+        deadline=deadline, clock=clock, sleep=sleep, log=log,
+    )
 
     still_pending = 0
     if not args.dry_run:
-        still_pending = _drain_replay_files(
-            url, headers, replay_dir, deadline, args.http_timeout,
-            clock, sleep, log,
-        )
+        still_pending = _drain_replay_files(ctx, replay_dir)
 
     try:
         raw_iterator = iter(read_records(args))
@@ -1008,8 +1069,8 @@ def main(argv=None):
     read = 0
     valid = 0
     skipped = 0
-    reasons = {}  # type: Dict[str, int]
-    canonical = []  # type: List[Dict[str, Any]]
+    reasons: Dict[str, int] = {}
+    canonical: List[RunRecord] = []
     try:
         for raw in raw_iterator:
             read += 1
@@ -1050,10 +1111,8 @@ def main(argv=None):
 
     if args.dry_run:
         for index, record in enumerate(canonical[:3], 1):
-            sys.stdout.write(
-                "\n--- record {0} would be sent as ---\n".format(index)
-            )
-            sys.stdout.write(json.dumps(record, indent=2, sort_keys=True))
+            sys.stdout.write(f"\n--- record {index} would be sent as ---\n")
+            sys.stdout.write(json.dumps(record.to_wire(), indent=2, sort_keys=True))
             sys.stdout.write("\n")
         sys.stdout.flush()
         log.info(
@@ -1062,19 +1121,17 @@ def main(argv=None):
         )
         return 0
 
-    sent, inserted, updated, rejected, failed_batches = _send_own_records(
-        canonical, url, environment, build, replay_dir, deadline,
-        args.http_timeout, clock, sleep, log, headers,
-    )
+    outcome = _send_own_records(canonical, ctx, environment, build, replay_dir)
 
     log.info(
         "feeder summary: read=%d valid=%d skipped=%d sent=%d inserted=%d "
         "updated=%d rejected=%d failed_batches=%d replay_files_pending=%d",
-        read, valid, skipped, sent, inserted, updated, rejected,
-        failed_batches, still_pending,
+        read, valid, skipped, outcome.sent, outcome.inserted,
+        outcome.updated, outcome.rejected, outcome.failed_batches,
+        still_pending,
     )
 
-    if failed_batches or still_pending:
+    if outcome.failed_batches or still_pending:
         return 1
     return 0
 

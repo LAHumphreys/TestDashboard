@@ -203,8 +203,7 @@ catch for you.
 ### Python (`clients/feeder.py`)
 
 ```python
-def read_records(args):
-    # type: (argparse.Namespace) -> Iterator[Dict[str, Any]]
+def read_records(args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
     """Yield one raw transport dict per test run for THIS invocation."""
 ```
 
@@ -222,8 +221,7 @@ Site-specific arguments come from `add_site_arguments(parser)`, called once
 before parsing:
 
 ```python
-def add_site_arguments(parser):
-    # type: (argparse.ArgumentParser) -> None
+def add_site_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--results", action="append", default=None,
                          metavar="PATH", help="a results file to read")
 ```
@@ -315,6 +313,7 @@ Given input lines like:
 ```
 
 ```python
+import argparse
 import datetime
 import logging
 import re
@@ -334,8 +333,7 @@ _UTC_OFFSET = datetime.timedelta(hours=1)  # BST -> UTC
 _RESULTS = {"OK": "PASS", "FAILED": "FAIL", "KNOWN_FAIL": "FAILED_AS_EXPECTED"}
 
 
-def read_records(args):
-    # type: (Any) -> Iterator[Dict[str, Any]]
+def read_records(args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
     if not args.results:
         logger.warning("no --results given; nothing to read")
         return

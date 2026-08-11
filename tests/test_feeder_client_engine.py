@@ -55,8 +55,9 @@ class ValidateRecordTest(unittest.TestCase):
 
     def test_accepts_a_good_record(self) -> None:
         record = self.feeder.validate_record(self._good())
-        self.assertEqual(record["environment"], "e")
-        self.assertNotIn("build", record)
+        self.assertEqual(record.environment, "e")
+        self.assertIsNone(record.build)
+        self.assertNotIn("build", record.to_wire())
 
     def test_rejects_unknown_result(self) -> None:
         with self.assertRaises(self.feeder.ValidationError):
@@ -91,21 +92,24 @@ class ValidateRecordTest(unittest.TestCase):
         record = self.feeder.validate_record(
             self._good(known_failure_reason="   ")
         )
-        self.assertIsNone(record["known_failure_reason"])
+        self.assertIsNone(record.known_failure_reason)
 
     def test_carries_a_real_known_failure_reason(self) -> None:
         record = self.feeder.validate_record(
             self._good(known_failure_reason="JIRA-1")
         )
-        self.assertEqual(record["known_failure_reason"], "JIRA-1")
+        self.assertEqual(record.known_failure_reason, "JIRA-1")
 
     def test_build_present_only_when_set(self) -> None:
         mainline = self.feeder.validate_record(self._good())
-        self.assertNotIn("build", mainline)
+        self.assertIsNone(mainline.build)
+        self.assertNotIn("build", mainline.to_wire())
         build = self.feeder.validate_record(self._good(build="rc1"))
-        self.assertEqual(build["build"], "rc1")
+        self.assertEqual(build.build, "rc1")
+        self.assertEqual(build.to_wire()["build"], "rc1")
         blank_build = self.feeder.validate_record(self._good(build="   "))
-        self.assertNotIn("build", blank_build)
+        self.assertIsNone(blank_build.build)
+        self.assertNotIn("build", blank_build.to_wire())
 
     def test_rejects_missing_required_field(self) -> None:
         raw = self._good()
@@ -131,8 +135,8 @@ class TimestampNormalizationTest(unittest.TestCase):
             "end_time": "2026-01-01T00:00:01",
             "output": "",
         })
-        self.assertEqual(record["start_time"], "2026-01-01T00:00:00.500000")
-        self.assertEqual(record["end_time"], "2026-01-01T00:00:01.000000")
+        self.assertEqual(record.start_time, "2026-01-01T00:00:00.500000")
+        self.assertEqual(record.end_time, "2026-01-01T00:00:01.000000")
 
 
 class BatchingTest(unittest.TestCase):
@@ -140,13 +144,22 @@ class BatchingTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.feeder = _load_client_feeder()
 
+    def _record(self, output: str = "") -> Any:
+        return self.feeder.RunRecord(
+            environment="e", script="s", test_name="t", result="PASS",
+            start_time="2026-01-01T00:00:00.000000",
+            end_time="2026-01-01T00:00:01.000000",
+            output=output, source_link="", known_failure_reason=None,
+            build=None,
+        )
+
     def test_flushes_at_batch_size(self) -> None:
-        records = [{"output": ""} for _ in range(5)]
+        records = [self._record() for _ in range(5)]
         batches = list(self.feeder._batches(records, batch_size=2, max_bytes=10 ** 9))
         self.assertEqual([len(b) for b in batches], [2, 2, 1])
 
     def test_flushes_early_on_byte_ceiling(self) -> None:
-        records = [{"output": "x" * 100} for _ in range(3)]
+        records = [self._record(output="x" * 100) for _ in range(3)]
         batches = list(self.feeder._batches(records, batch_size=100, max_bytes=250))
         self.assertGreater(len(batches), 1)
 

@@ -63,19 +63,22 @@ ValuesView cast get_type_hints no_type_check no_type_check_decorator overload
 #: own docstrings state the rule; this is the enforcement.
 ENTRY_SCRIPTS = ("run_server.py", "run_feeder.py")
 
-#: Single-file client engines (clients/): distributed into ANOTHER
-#: product's repository, where "python" vs "python3" is exactly as
-#: uncontrolled as it is on this project's own RHEL 8 target, so they
-#: carry the same Python-2-parseable rule as ENTRY_SCRIPTS. Built with
-#: os.path.join (not a "/"-joined literal): ENTRY_SCRIPTS' bare
-#: filenames happen to need no separator, but "clients/feeder.py"
-#: joined against REPO_ROOT with the wrong separator style produces a
-#: path that will not match the walk's os.path.join(dirpath, name)
-#: keys on Windows (backslash vs forward-slash), silently exempting
-#: the file from the very check meant to cover it.
-CLIENT_ENGINES = (
-    os.path.join("clients", "feeder.py"),
-)
+#: `clients/feeder.py` was exempted here through WP-29 (single-file
+#: client engine, distributed into ANOTHER product's repository, where
+#: "python" vs "python3" is exactly as uncontrolled as it is on this
+#: project's own RHEL 8 target). That is no longer true: the file now
+#: targets Python 3.6+ only, uses real inline annotations and f-strings
+#: like the rest of testboard, and fails at PARSE time (not a graceful
+#: in-file message) on anything older - there is no in-file check that
+#: can pre-empt a SyntaxError. It is therefore held to the FULL
+#: standard, same as every other .py file under the repo root: no
+#: exemption from test_entry_scripts_carry_no_inline_annotations below,
+#: swept unexempted by SourceCompatibilityTest above (grammar, builtin
+#: generics, PEP 604, __future__ annotations, the 3.6 typing whitelist),
+#: and its own annotations are forced to evaluate by
+#: ClientFeederAnnotationsTest below - it cannot join the package sweep
+#: in AnnotationsEvaluateTest, because "clients" has no __init__.py and
+#: is deliberately not a package.
 
 #: ``static`` is JS/HTML/CSS and holds no Python. Nothing else is
 #: excluded: a stray .py under docs/ or tools/ must be gated too, and an
@@ -393,13 +396,15 @@ class SourceCompatibilityTest(unittest.TestCase):
         self.assertEqual(bad, [], "typing names absent from Python 3.6")
 
     def test_entry_scripts_carry_no_inline_annotations(self) -> None:
-        """The bare-``python`` trap on RHEL 8 - and, for CLIENT_ENGINES,
-        on whatever host a contributing product's framework runs on.
+        """The bare-``python`` trap on RHEL 8.
 
         These must parse under 2.7 so they can print a readable version
         error instead of a SyntaxError, which means type comments only.
+        ``clients/feeder.py`` used to be listed alongside these
+        (WP-29's predecessor decision) but is not any more - see the
+        comment where it was removed, above ENTRY_SCRIPTS' definition.
         """
-        for name in ENTRY_SCRIPTS + CLIENT_ENGINES:
+        for name in ENTRY_SCRIPTS:
             path = os.path.join(REPO_ROOT, name)
             tree = self.trees[path]
             annotated = [describe(annotation)
@@ -449,32 +454,74 @@ class AnnotationsEvaluateTest(unittest.TestCase):
                 for name in sorted(names)]
 
     def test_every_annotation_resolves_to_a_real_object(self) -> None:
-        import inspect
-
         checked = 0
         failures = []  # type: List[str]
         for name, module in self.modules():
-            targets = []
-            for attr, obj in sorted(vars(module).items(), key=lambda kv: kv[0]):
-                if getattr(obj, "__module__", None) != name:
-                    continue
-                if inspect.isfunction(obj):
-                    targets.append((name + "." + attr, obj))
-                elif inspect.isclass(obj):
-                    for sub, member in sorted(vars(obj).items(),
-                                              key=lambda kv: kv[0]):
-                        if inspect.isfunction(member):
-                            targets.append(
-                                ("%s.%s.%s" % (name, attr, sub), member))
-            for label, obj in targets:
-                checked += 1
-                try:
-                    dict(getattr(obj, "__annotations__", {}) or {})
-                except Exception as exc:  # pragma: no cover - the bug case
-                    failures.append("%s: %r" % (label, exc))
+            module_checked, module_failures = _annotation_failures(name, module)
+            checked += module_checked
+            failures.extend(module_failures)
         self.assertEqual(failures, [], "annotations fail to evaluate")
         self.assertGreater(checked, 200,
                            "annotation sweep covered almost nothing")
+
+
+def _annotation_failures(name: str, module: object) -> Tuple[int, List[str]]:
+    """Force every module/class-level function's ``__annotations__`` to
+    evaluate; return (checked count, failure messages).
+
+    Shared by :class:`AnnotationsEvaluateTest`-style sweeps: the package
+    one above and :class:`ClientFeederAnnotationsTest` below, which
+    cannot join that sweep because its module is not part of a package.
+    """
+    import inspect
+
+    checked = 0
+    failures = []  # type: List[str]
+    targets = []
+    for attr, obj in sorted(vars(module).items(), key=lambda kv: kv[0]):
+        if getattr(obj, "__module__", None) != name:
+            continue
+        if inspect.isfunction(obj):
+            targets.append((name + "." + attr, obj))
+        elif inspect.isclass(obj):
+            for sub, member in sorted(vars(obj).items(), key=lambda kv: kv[0]):
+                if inspect.isfunction(member):
+                    targets.append(("%s.%s.%s" % (name, attr, sub), member))
+    for label, obj in targets:
+        checked += 1
+        try:
+            dict(getattr(obj, "__annotations__", {}) or {})
+        except Exception as exc:  # pragma: no cover - the bug case
+            failures.append("%s: %r" % (label, exc))
+    return checked, failures
+
+
+class ClientFeederAnnotationsTest(unittest.TestCase):
+    """``clients/feeder.py`` is not part of any package - "clients" has
+    no ``__init__.py`` (see tests/test_feeder_client_engine.py's module
+    docstring) - so :class:`AnnotationsEvaluateTest`'s ``pkgutil``-based
+    sweep never loads it, and the file would otherwise get the static
+    3.6-grammar checks above but NOT the runtime "annotations actually
+    evaluate" proof every other shipped module gets. This closes that
+    gap the same way: load the file, force every function's and
+    method's ``__annotations__``, on the interpreter actually running
+    the suite.
+    """
+
+    def test_client_feeder_annotations_evaluate(self) -> None:
+        import importlib.util
+
+        path = os.path.join(REPO_ROOT, "clients", "feeder.py")
+        spec = importlib.util.spec_from_file_location("client_feeder_annotations", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        checked, failures = _annotation_failures("client_feeder_annotations", module)
+        self.assertEqual(failures, [], "annotations fail to evaluate")
+        self.assertGreater(
+            checked, 15, "annotation sweep of clients/feeder.py covered "
+            "almost nothing - is the module loading correctly?"
+        )
 
 
 #: Everything the interpreter provides without an import. An annotation
