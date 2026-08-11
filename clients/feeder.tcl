@@ -184,6 +184,33 @@ proc read_records {opts emit} {
 # above is untouched by that.
 # ============================================================================
 
+# Naming convention for everything below this line
+# ---------------------------------------------------
+# snake_case: the small set of procs that speak the wire/JSON contract
+# in a general, schema-agnostic way, independent of this engine's own
+# internals - tb::json::parse, tb::json::to_raw, tb::validate_record -
+# plus read_records itself (the one proc a site author writes, above
+# this banner). This is the Tcl analogue of the Python engine's bare
+# (no-underscore) public names: read_records(), validate_record() are
+# named identically there.
+#
+# PascalCase (tb::SendWithRetry, tb::RecordToJson, tb::json::Escape,
+# ...): everything else - engine-internal plumbing specific to THIS
+# file's implementation: HTTP, retries, replay files, batching, CLI,
+# logging, and JSON-encoding of this engine's OWN record shape (as
+# opposed to parsing arbitrary JSON, which is schema-agnostic and
+# stays snake_case). Tcl has no leading-underscore convention the way
+# Python names do - a capitalized name is this file's visual stand-in
+# for Python's "_" prefix ("private": not part of the documented
+# contract, free to change between engine drops).
+#
+# One deliberate wrinkle: tb::Log and tb::DGetList are PascalCase
+# (internal-style) even though the IMPLEMENT THIS section above calls
+# both by name, because read_records() is the worked EXAMPLE, not the
+# only shape a reader is allowed to write. Being handy to a site
+# author does not promote a proc into the contract; the contract is
+# the wire shape - validate_record's fields, json::parse's tagged
+# values - not "everything reachable from read_records()".
 namespace eval tb {
     # This engine's own version and the /api/import wire-contract
     # version it was written against. Sent as the User-Agent header,
@@ -260,6 +287,12 @@ namespace eval tb::json {
 
 # -- encode ---------------------------------------------------------
 
+# Escape one string for embedding inside a JSON string literal (quote,
+# backslash, and the C0 control characters become \" \\ and \u00XX).
+# Internal to JString - call JString, not this, to get a full literal.
+# Args: s - the raw (unescaped) text.
+# Returns: s with JSON string-escaping applied; still unquoted.
+# Raises: never.
 proc tb::json::Escape {s} {
     set map [list \\ \\\\ \" \\\" \n \\n \r \\r \t \\t]
     set s [string map $map $s]
@@ -277,18 +310,29 @@ proc tb::json::Escape {s} {
     return $out
 }
 
+# Encode one Tcl string as a quoted JSON string literal.
+# Args: s - the raw text.
+# Returns: the JSON text, including the surrounding quotes (e.g. "hi"
+#   in Tcl becomes the 4-character text {"hi"}).
+# Raises: never.
 proc tb::json::JString {s} {
     return "\"[tb::json::Escape $s]\""
 }
 
+# Args: none.
+# Returns: the literal JSON text "null" (4 characters).
+# Raises: never.
 proc tb::json::JNull {} {
     return "null"
 }
 
-# pairs: a flat key/value list where every VALUE is already valid JSON
-# text (built with JString/JNull/JObject/JArray) - keeps escaping
-# localized to one place per field, and matches the "flat records"
-# shape the wire contract uses.
+# Encode a flat set of key/value pairs as a JSON object.
+# Args: pairs - a flat key/value list where every VALUE is already
+#   valid JSON text (built with JString/JNull/JObject/JArray) - keeps
+#   escaping localized to one place per field, and matches the "flat
+#   records" shape the wire contract uses.
+# Returns: the JSON object text, e.g. {"k":"v","n":null}.
+# Raises: never.
 proc tb::json::JObject {pairs} {
     set parts [list]
     foreach {k v} $pairs {
@@ -297,7 +341,10 @@ proc tb::json::JObject {pairs} {
     return "{[join $parts ,]}"
 }
 
-# items: a list of already-valid JSON text fragments.
+# Encode a list of already-JSON-encoded fragments as a JSON array.
+# Args: items - a list of already-valid JSON text fragments.
+# Returns: the JSON array text, e.g. [1,"x",null].
+# Raises: never.
 proc tb::json::JArray {items} {
     return "\[[join $items ,]\]"
 }
@@ -317,6 +364,14 @@ proc tb::json::JArray {items} {
 # that flattened shape is what the rest of the engine (and
 # read_records) actually works with.
 
+# Parse one complete JSON document.
+# Args: text - the full JSON text to parse; nothing but optional
+#   trailing whitespace is allowed after the value.
+# Returns: a tagged {type value} list - see the block comment above
+#   for the tagging scheme; call to_raw to flatten it.
+# Raises: on any malformed JSON (unexpected character, unterminated
+#   string/object/array, trailing data, ...) - the message names the
+#   character position.
 proc tb::json::parse {text} {
     variable Text
     variable Pos
@@ -333,6 +388,11 @@ proc tb::json::parse {text} {
     return $value
 }
 
+# Advance Pos past any run of JSON whitespace (space/tab/CR/LF) at the
+# current position.
+# Args: none (reads/advances the shared parser state Text/Pos/Len).
+# Returns: nothing meaningful.
+# Raises: never.
 proc tb::json::SkipWs {} {
     variable Text
     variable Pos
@@ -347,6 +407,10 @@ proc tb::json::SkipWs {} {
     }
 }
 
+# Look at (without consuming) the character at the current position.
+# Args: none (reads the shared parser state Text/Pos/Len).
+# Returns: that one character.
+# Raises: if Pos is already at or past Len (unexpected end of input).
 proc tb::json::Peek {} {
     variable Text
     variable Pos
@@ -357,6 +421,10 @@ proc tb::json::Peek {} {
     return [string index $Text $Pos]
 }
 
+# Consume one specific character, or fail.
+# Args: ch - the single character required at the current position.
+# Returns: nothing meaningful.
+# Raises: if the current character is not ch (or input has run out).
 proc tb::json::Expect {ch} {
     variable Text
     variable Pos
@@ -367,6 +435,11 @@ proc tb::json::Expect {ch} {
     incr Pos
 }
 
+# Dispatch on the next character to the matching Parse* routine.
+# Args: none.
+# Returns: a tagged {type value} list (see the block comment above
+#   tb::json::parse).
+# Raises: if the next character starts no valid JSON value.
 proc tb::json::ParseValue {} {
     variable Pos
     SkipWs
@@ -387,6 +460,12 @@ proc tb::json::ParseValue {} {
     error "unexpected character '$c' in JSON at position $Pos"
 }
 
+# Parse a JSON object, starting at (and consuming) the opening '{'.
+# Args: none.
+# Returns: a dict of tagged values, keyed by the (plain, untagged)
+#   JSON key strings - a duplicate key silently keeps the last value,
+#   matching Tcl dict semantics.
+# Raises: on a missing ':' or ',' or '}', or a malformed key/value.
 proc tb::json::ParseObject {} {
     Expect "\{"
     SkipWs
@@ -418,6 +497,10 @@ proc tb::json::ParseObject {} {
     return $result
 }
 
+# Parse a JSON array, starting at (and consuming) the opening '['.
+# Args: none.
+# Returns: a list of tagged values, in document order.
+# Raises: on a missing ',' or ']', or a malformed element.
 proc tb::json::ParseArray {} {
     Expect "\["
     SkipWs
@@ -445,6 +528,15 @@ proc tb::json::ParseArray {} {
     return $result
 }
 
+# Parse a JSON string, starting at (and consuming) the opening quote.
+# Handles all six two-character escapes (\" \\ \/ \b \f \n \r \t) plus
+# \uXXXX (within the Basic Multilingual Plane only - no surrogate-pair
+# combination for characters outside it; this engine's wire records
+# never need one).
+# Args: none.
+# Returns: the decoded (unescaped) Tcl string.
+# Raises: on an unterminated string, an unrecognised escape, or a
+#   truncated/non-hex \u escape.
 proc tb::json::ParseString {} {
     variable Text
     variable Pos
@@ -512,6 +604,12 @@ proc tb::json::ParseString {} {
     return $out
 }
 
+# Parse the literal true or false. ParseValue only calls this when the
+# next character is already 't' or 'f', so in practice the error case
+# below means a truncated or misspelled literal.
+# Args: none.
+# Returns: a tagged {true {}} or {false {}} - to_raw maps these to 1/0.
+# Raises: if neither literal matches at the current position.
 proc tb::json::ParseBool {} {
     variable Text
     variable Pos
@@ -527,6 +625,11 @@ proc tb::json::ParseBool {} {
     error "invalid literal at position $Pos"
 }
 
+# Parse the literal null. ParseValue only calls this when the next
+# character is already 'n'.
+# Args: none.
+# Returns: a tagged {null {}} - to_raw maps this to the NULL sentinel.
+# Raises: if the literal does not match at the current position.
 proc tb::json::ParseNull {} {
     variable Text
     variable Pos
@@ -538,6 +641,14 @@ proc tb::json::ParseNull {} {
     error "invalid literal at position $Pos"
 }
 
+# Parse a JSON number per the JSON grammar (optional '-', digits,
+# optional '.digits', optional exponent).
+# Args: none.
+# Returns: the raw matched text, unconverted (ParseValue is what wraps
+#   it as a tagged {number TEXT}) - the engine only ever forwards or
+#   logs numbers, never does arithmetic on them, so keeping the source
+#   text avoids any float-formatting round-trip surprise.
+# Raises: if no digits were consumed (a bare '-', or no digit at all).
 proc tb::json::ParseNumber {} {
     variable Text
     variable Pos
@@ -575,6 +686,10 @@ proc tb::json::ParseNumber {} {
 # (of flattened values), array -> list (of flattened values), string/
 # number -> the raw text, true/false -> 1/0, null -> the NULL
 # sentinel.
+# Args: tagged - a {type value} list, as produced by parse/ParseValue.
+# Returns: the flattened value (dict/list/string/int) described above.
+# Raises: on an unrecognised type tag (defensive - parse never
+#   produces one).
 proc tb::json::to_raw {tagged} {
     variable NULL
     set type [lindex $tagged 0]
@@ -607,6 +722,16 @@ proc tb::json::to_raw {tagged} {
 # Small utilities shared by validation, transport and reporting.
 # ----------------------------------------------------------------------
 
+# Write one timestamped line to stderr, in the shared engine/site log
+# voice. Site read_records implementations are expected to call this
+# directly for their own warnings (see the IMPLEMENT THIS section
+# above) - it is documented, stable API for site authors even though
+# it is named like an internal helper (see the naming-convention note
+# above namespace eval tb).
+# Args: level - one of DEBUG/INFO/WARNING/ERROR (DEBUG is dropped
+#   unless --verbose); msg - the message text.
+# Returns: nothing.
+# Raises: never.
 proc tb::Log {level msg} {
     variable ::tb::VERBOSE
     if {$level eq "DEBUG" && !$::tb::VERBOSE} {
@@ -616,6 +741,13 @@ proc tb::Log {level msg} {
     puts stderr "$ts $level testboard_feeder: $msg"
 }
 
+# Shorten text for a log line, so one huge server response body cannot
+# flood stderr.
+# Args: text - the text to shorten; limit - max length before
+#   truncating (default 200, matching the Python engine's default).
+# Returns: text unchanged if within limit, else the first `limit`
+#   characters plus a "...[truncated]" marker.
+# Raises: never.
 proc tb::Truncate {text {limit 200}} {
     if {[string length $text] <= $limit} {
         return $text
@@ -623,8 +755,14 @@ proc tb::Truncate {text {limit 200}} {
     return "[string range $text 0 [expr {$limit - 1}]]...\[truncated\]"
 }
 
-# The 8.5-safe equivalent of Tcl 8.6's "dict getwithdefault" - never
-# used here (see the compat guard test).
+# The 8.5-safe equivalent of Tcl 8.6's "dict getwithdefault" (never
+# spelled that way here - see the compat guard test), extended to
+# treat a JSON null (the tb::json::NULL sentinel) the same as "key
+# absent".
+# Args: d - the dict; key - the key to read; default - the value to
+#   use if the key is absent or its value is JSON null.
+# Returns: the value at key, or default.
+# Raises: never.
 proc tb::DGet {d key default} {
     if {[dict exists $d $key]} {
         set v [dict get $d $key]
@@ -636,6 +774,12 @@ proc tb::DGet {d key default} {
     return $default
 }
 
+# Read a REPEATABLE flag's collected values (see EXTRA_FLAGS and
+# site_args in the IMPLEMENT THIS section above), or more generally
+# any dict key expected to hold a list.
+# Args: d - the dict (e.g. opts' site_args); key - the key to read.
+# Returns: the list at key, or {} (empty list) if key is absent.
+# Raises: never.
 proc tb::DGetList {d key} {
     if {[dict exists $d $key]} {
         return [dict get $d $key]
@@ -643,6 +787,13 @@ proc tb::DGetList {d key} {
     return {}
 }
 
+# Turn arbitrary text (an --environment value) into a safe filename
+# fragment for a replay file name.
+# Args: text - the raw text.
+# Returns: text with every run of characters outside [A-Za-z0-9_.-]
+#   collapsed to a single '-', leading/trailing '-' trimmed, or the
+#   literal "unnamed" if that leaves nothing.
+# Raises: never.
 proc tb::Sanitize {text} {
     set out [regsub -all {[^A-Za-z0-9_.-]+} $text "-"]
     set out [string trim $out "-"]
@@ -652,6 +803,14 @@ proc tb::Sanitize {text} {
     return $out
 }
 
+# Best-effort "environment / script / test_name [@ start_time]" label
+# for a log line about one raw (possibly invalid) record - used after
+# validate_record has just rejected raw, so the fields it names may
+# themselves be missing or malformed.
+# Args: raw - a raw record dict (not necessarily valid).
+# Returns: the label string, with "?" standing in for any missing or
+#   blank identity field.
+# Raises: never.
 proc tb::IdentityOf {raw} {
     set parts [list]
     foreach field {environment script test_name} {
@@ -687,6 +846,14 @@ proc tb::IdentityOf {raw} {
 # identically.
 # ----------------------------------------------------------------------
 
+# Read one field and require it to be present, non-null, and non-
+# blank after trimming - the shared rule behind environment/script/
+# test_name (output has its own, laxer check: empty is fine, only
+# missing/null is not).
+# Args: d - the record dict; field - the field name.
+# Returns: the field's value, unmodified (not trimmed).
+# Raises: if the field is missing, is JSON null, or is empty/
+#   whitespace-only.
 proc tb::RequireStr {d field} {
     if {![dict exists $d $field]} {
         error "$field: required field is missing"
@@ -706,6 +873,12 @@ proc tb::RequireStr {d field} {
 # width, plain Tcl string comparison is chronological comparison (the
 # same "lexical ordering works" property the rest of the project
 # relies on for these timestamps).
+# Args: raw - the record dict; field - the field name.
+# Returns: the timestamp normalized to fixed-width fraction, e.g.
+#   "2026-01-01T00:00:00.000000".
+# Raises: if the field is missing/null, does not match the
+#   'YYYY-MM-DDTHH:MM:SS[.ffffff]' shape, or is not a real calendar
+#   date/time (e.g. 2026-02-30).
 proc tb::ParseTimestamp {raw field} {
     if {![dict exists $raw $field]} {
         error "$field: required field is missing"
@@ -734,6 +907,19 @@ proc tb::ParseTimestamp {raw field} {
     return "$y-$mo-${d}T$h:$mi:$s.$micro"
 }
 
+# Validate one raw transport dict against the /api/import wire schema
+# and return the canonical wire dict (mirrors testboard.model.
+# parse_run_record - see the section note above for the one
+# documented gap versus the Python engine).
+# Args: raw - a dict as decoded from JSON, with environment (and
+#   build, if this run has one) already stamped on by the caller - see
+#   tb::acc::Handle.
+# Returns: a dict with keys environment/script/test_name/result/
+#   start_time/end_time/output/source_link/known_failure_reason always
+#   present, plus build only when a non-blank build was given.
+# Raises: on the first rule violated; the message names the offending
+#   field (e.g. "result: unknown value ...", "branch: removed before
+#   this contract ever shipped ...").
 proc tb::validate_record {raw} {
     set environment [tb::RequireStr $raw environment]
     set script [tb::RequireStr $raw script]
@@ -807,6 +993,13 @@ proc tb::validate_record {raw} {
     return $out
 }
 
+# Encode one CANONICAL record (as returned by validate_record) to its
+# wire JSON text.
+# Args: rec - a canonical record dict.
+# Returns: the JSON object text for one /api/import "runs" array
+#   entry.
+# Raises: never - assumes rec is already canonical; do not call this
+#   on an unvalidated raw dict.
 proc tb::RecordToJson {rec} {
     set pairs [list]
     foreach key {environment script test_name result start_time end_time output source_link} {
@@ -829,6 +1022,11 @@ proc tb::RecordToJson {rec} {
 # install), -timeout on every call.
 # ----------------------------------------------------------------------
 
+# Append /api/import if the configured URL doesn't already end with
+# it, after trimming any trailing slash.
+# Args: url - the raw --url/DASHBOARD_URL value.
+# Returns: the full URL to POST to.
+# Raises: never.
 proc tb::NormalizeUrl {url} {
     set trimmed [string trimright $url "/"]
     if {![string match "*/api/import" $trimmed]} {
@@ -837,6 +1035,15 @@ proc tb::NormalizeUrl {url} {
     return $trimmed
 }
 
+# POST body to url exactly once - no retry; see SendWithRetry for that.
+# Args: url - the full request URL; body - the JSON text to send (this
+#   proc UTF-8-encodes it); timeoutSeconds - the per-call socket
+#   timeout.
+# Returns: a dict - {ok 1 code N body TEXT} for any HTTP response
+#   received (including a 4xx/5xx status - interpreting the status is
+#   the caller's job), or {ok 0 reason TEXT} if no response was ever
+#   received (connection failure or timeout).
+# Raises: never - every failure is reported via ok=0, not error.
 proc tb::HttpPost {url body timeoutSeconds} {
     package require http 2
     # ::http::config -useragent, not a "User-Agent" entry in -headers:
@@ -878,9 +1085,19 @@ proc tb::HttpPost {url body timeoutSeconds} {
     return [dict create ok 1 code $code body $respBody]
 }
 
+# POST body to url with retry/backoff, bounded by deadline.
+# Args: url; body - the JSON text to send; deadline - a
+#   [clock milliseconds] wall-clock deadline; httpTimeout - per-call
+#   socket timeout in seconds; label - a short description used in log
+#   lines (e.g. "batch of 500 records").
 # Returns dict: ok deferred reason payload streams_seen_present.
-# deferred means the time budget ran out before any attempt was even
-# made, as distinct from an attempt that was made and failed.
+#   deferred means the time budget ran out before any attempt was even
+#   made, as distinct from an attempt that was made and failed. payload
+#   is the decoded JSON response body (a dict) on a 200 with a usable
+#   body, else {}. streams_seen_present is whether payload contains a
+#   streams_seen key.
+# Raises: never - every failure mode is reported via the returned
+#   dict, not error.
 proc tb::SendWithRetry {url body deadline httpTimeout label} {
     set reason "unknown error"
     for {set attempt 1} {$attempt <= $::tb::MAX_ATTEMPTS} {incr attempt} {
@@ -928,10 +1145,17 @@ proc tb::SendWithRetry {url body deadline httpTimeout label} {
     return [dict create ok 0 deferred 0 reason $reason payload {} streams_seen_present 0]
 }
 
+# Log a summary line for one server response and extract its counts.
+# Args: payload - the decoded JSON response body (a dict), or {} if
+#   the body was not usable JSON (see SendWithRetry); label - a short
+#   description used in log lines.
+# Returns: a dict {inserted N updated N rejected N} - all zero if
+#   payload was unusable.
+# Raises: never.
 proc tb::ReportBatchPayload {payload label} {
     if {$payload eq {}} {
         tb::Log WARNING "$label: server returned 200 but the response body was not a usable JSON object"
-        return {0 0 0}
+        return [dict create inserted 0 updated 0 rejected 0]
     }
     set inserted [tb::DGet $payload inserted 0]
     set updated [tb::DGet $payload updated 0]
@@ -951,7 +1175,7 @@ proc tb::ReportBatchPayload {payload label} {
         tb::Log WARNING "$label: [expr {[llength $errors] - 5}] more rejected record(s) not shown individually"
     }
     tb::Log INFO "$label: inserted=$inserted updated=$updated rejected=$rejected"
-    return [list $inserted $updated $rejected]
+    return [dict create inserted $inserted updated $updated rejected $rejected]
 }
 
 # ----------------------------------------------------------------------
@@ -967,6 +1191,12 @@ proc tb::ReportBatchPayload {payload label} {
 # error.
 # ----------------------------------------------------------------------
 
+# Reserve a fresh, uniquely-named, empty replay file.
+# Args: replayDir; environment - folded into the filename so a
+#   directory listing is recognisable at a glance.
+# Returns: the new file's full path (already created, empty).
+# Raises: if 50 attempts all lost the name-collision race
+#   (astronomically unlikely - see the section note above).
 proc tb::NewReplayPath {replayDir environment} {
     set safeEnv [tb::Sanitize $environment]
     for {set attempt 0} {$attempt < 50} {incr attempt} {
@@ -982,6 +1212,15 @@ proc tb::NewReplayPath {replayDir environment} {
     error "could not allocate a unique replay file name in $replayDir"
 }
 
+# Write body to path as UTF-8, with no translation surprises.
+# Args: path; body - the JSON text to persist.
+# Returns: nothing.
+# Raises: on any I/O failure (disk full, permission denied, ...) -
+#   DELIBERATELY uncaught by every caller: if a run's results cannot
+#   even be written to a replay file, they are not actually safe, and
+#   a loud crash beats a silently wrong "sent" claim. Matches the
+#   Python engine's _write_replay, which every caller there also
+#   leaves uncaught.
 proc tb::WriteReplay {path body} {
     set fh [open $path w]
     fconfigure $fh -encoding utf-8 -translation lf
@@ -989,13 +1228,25 @@ proc tb::WriteReplay {path body} {
     close $fh
 }
 
+# List every not-yet-claimed replay file waiting to be resent.
+# Args: replayDir.
+# Returns: a sorted list of full paths (lexical order of the pid-
+#   timestamp-random filename - a deterministic iteration order, not a
+#   promise about send order).
+# Raises: never (glob -nocomplain).
 proc tb::PendingReplayFiles {replayDir} {
     set pattern [file join $replayDir "$::tb::REPLAY_PREFIX*$::tb::REPLAY_SUFFIX"]
     return [lsort [glob -nocomplain -- $pattern]]
 }
 
-# Returns the claimed path, or "" if another invocation already
-# claimed or removed the file first (a lost race, not an error).
+# Atomically reserve path for this process by renaming it to its
+# fixed ".sending" suffix (see the section note above for why this
+# makes the race safe).
+# Args: path.
+# Returns: the claimed path, or "" if another invocation already
+#   claimed or removed the file first (a lost race, not an error).
+# Raises: never - a rename failure is reported via the empty-string
+#   return, not error.
 proc tb::Claim {path} {
     set claimed "$path$::tb::CLAIM_SUFFIX"
     if {[catch {file rename -- $path $claimed}]} {
@@ -1012,12 +1263,28 @@ proc tb::Claim {path} {
 # suffix, so it will not be retried automatically. This mirrors an
 # ordinary process-killed-mid-flight risk in any at-least-once queue;
 # recovering it is a manual "rename it back" on the host.
+# Args: claimed - the ".sending" path; original - the path to restore
+#   it to.
+# Returns: nothing.
+# Raises: never - a failure to restore the name is logged, not
+#   propagated (see the NOTE above and the body below).
 proc tb::ReleaseClaim {claimed original} {
     if {[catch {file rename -- $claimed $original} err]} {
         tb::Log WARNING "could not restore replay file $original for a later retry ($err); if this persists, check [file dirname $original] by hand"
     }
 }
 
+# True if any record in a request body carries build (so the response
+# must ack via streams_seen). Read from the OUTGOING body rather than
+# from this invocation's own --build, because a queued replay file may
+# have been produced by a build-carrying invocation and drained by a
+# later mainline one (or vice versa) - see the Python engine's
+# _body_expects_streams_ack docstring for the same reasoning.
+# Args: body - a request body (JSON text, as sent or about to be
+#   sent).
+# Returns: 1 or 0.
+# Raises: never - malformed JSON, or JSON that isn't the expected
+#   {"runs": [...]} shape, is treated as 0 ("no").
 proc tb::BodyExpectsStreamsAck {body} {
     if {[catch {set tagged [tb::json::parse $body]}]} {
         return 0
@@ -1037,8 +1304,12 @@ proc tb::BodyExpectsStreamsAck {body} {
     return 0
 }
 
-# Resend every pending replay file; return the count still pending
-# afterwards (failed again, or never attempted for lack of time).
+# Resend every pending replay file.
+# Args: url; replayDir; deadline; httpTimeout.
+# Returns: the count still pending afterwards (failed again, or never
+#   attempted for lack of time).
+# Raises: never - every failure path is logged and reflected in the
+#   returned count, not propagated.
 proc tb::DrainReplayFiles {url replayDir deadline httpTimeout} {
     set stillPending 0
     foreach path [tb::PendingReplayFiles $replayDir] {
@@ -1051,12 +1322,23 @@ proc tb::DrainReplayFiles {url replayDir deadline httpTimeout} {
         if {$claimed eq ""} {
             continue
         }
-        if {[catch {
-            set fh [open $claimed r]
+        if {[catch {set fh [open $claimed r]} err]} {
+            tb::Log ERROR "could not read replay file $claimed ($err); leaving it for a later retry"
+            tb::ReleaseClaim $claimed $path
+            incr stillPending
+            continue
+        }
+        # fconfigure/read are a SEPARATE catch from the open above, and
+        # the close below is unconditional (8.5 has no finally): a
+        # single catch around open+fconfigure+read+close would skip
+        # close entirely on a fconfigure/read failure and leak the
+        # channel - this is exactly that leak, fixed.
+        set readFailed [catch {
             fconfigure $fh -encoding utf-8 -translation lf
             set body [read $fh]
-            close $fh
-        } err]} {
+        } err]
+        catch {close $fh}
+        if {$readFailed} {
             tb::Log ERROR "could not read replay file $claimed ($err); leaving it for a later retry"
             tb::ReleaseClaim $claimed $path
             incr stillPending
@@ -1086,6 +1368,15 @@ proc tb::DrainReplayFiles {url replayDir deadline httpTimeout} {
 # Batching and sending this invocation's own records
 # ----------------------------------------------------------------------
 
+# Split records into batches, each under batchSize records and (by
+# estimate) maxBytes of encoded size - see MAX_BATCH_BYTES/
+# RECORD_OVERHEAD_BYTES above for why the size is an estimate, not the
+# exact encoded length.
+# Args: records - a list of canonical record dicts; batchSize;
+#   maxBytes.
+# Returns: a list of batches, each a list of record dicts, in input
+#   order - every input record appears in exactly one batch.
+# Raises: never.
 proc tb::Batches {records batchSize maxBytes} {
     set batches [list]
     set batch [list]
@@ -1105,9 +1396,15 @@ proc tb::Batches {records batchSize maxBytes} {
     return $batches
 }
 
-# Returns {sent inserted updated rejected failedBatches}. Every failed
-# batch is saved to a fresh replay file before this returns - nothing
-# is ever only in memory.
+# Batch and send this invocation's own canonical records.
+# Args: records - a list of canonical record dicts; url; environment -
+#   used only for replay filenames; build - "" if this run has none,
+#   used only in log text; replayDir; deadline; httpTimeout.
+# Returns: a dict {sent N inserted N updated N rejected N
+#   failed_batches N}. Every failed batch is saved to a fresh replay
+#   file before this returns - nothing is ever only in memory.
+# Raises: never - every failure path is logged, saved to a replay
+#   file, and reflected in the returned counts.
 proc tb::SendOwnRecords {records url environment build replayDir deadline httpTimeout} {
     set sent 0
     set inserted 0
@@ -1141,11 +1438,11 @@ proc tb::SendOwnRecords {records url environment build replayDir deadline httpTi
             continue
         }
         if {[dict get $result ok]} {
-            lassign [tb::ReportBatchPayload [dict get $result payload] "this run"] ins upd rej
+            set counts [tb::ReportBatchPayload [dict get $result payload] "this run"]
             incr sent [llength $batch]
-            incr inserted $ins
-            incr updated $upd
-            incr rejected $rej
+            incr inserted [dict get $counts inserted]
+            incr updated [dict get $counts updated]
+            incr rejected [dict get $counts rejected]
             continue
         }
         set path [tb::NewReplayPath $replayDir $environment]
@@ -1153,7 +1450,8 @@ proc tb::SendOwnRecords {records url environment build replayDir deadline httpTi
         tb::Log ERROR "batch of [llength $batch] records failed ([dict get $result reason]); saved to $path - the NEXT invocation resends it before its own batch"
         incr failedBatches
     }
-    return [list $sent $inserted $updated $rejected $failedBatches]
+    return [dict create sent $sent inserted $inserted updated $updated \
+        rejected $rejected failed_batches $failedBatches]
 }
 
 # ----------------------------------------------------------------------
@@ -1173,7 +1471,16 @@ namespace eval tb::acc {
     variable HasBuild 0
 }
 
-proc tb::acc::reset {environment build hasBuild} {
+# Reset the per-invocation accumulator before a read_records() run
+# (see the section note above for why this is namespace state rather
+# than a closure). PascalCase despite living in a lowercase-named
+# namespace: acc is internal engine plumbing, not called by site code
+# (see the naming-convention note above namespace eval tb).
+# Args: environment; build; hasBuild - stamped onto every raw record
+#   Handle receives.
+# Returns: nothing.
+# Raises: never.
+proc tb::acc::Reset {environment build hasBuild} {
     variable Read
     variable Valid
     variable Skipped
@@ -1192,7 +1499,18 @@ proc tb::acc::reset {environment build hasBuild} {
     set HasBuild $hasBuild
 }
 
-proc tb::acc::handle {raw} {
+# The $emit callback read_records() invokes once per raw record:
+# stamps environment/build, validates, and accumulates.
+# Args: raw - one raw record dict from read_records().
+# Returns: nothing - updates the namespace accumulator variables
+#   Read/Valid/Skipped/Canonical/Reasons, which Main reads back after
+#   read_records returns.
+# Raises: never - an invalid record is logged and skipped, per the
+#   read_records contract (see the IMPLEMENT THIS section above). This
+#   is the one spot where "never raise" is load-bearing: an error here
+#   would abort read_records entirely over one bad record, rather than
+#   just that record.
+proc tb::acc::Handle {raw} {
     variable Read
     variable Valid
     variable Skipped
@@ -1228,6 +1546,10 @@ proc tb::acc::handle {raw} {
 # CLI
 # ----------------------------------------------------------------------
 
+# Print --help usage text to stdout.
+# Args: none.
+# Returns: nothing.
+# Raises: never.
 proc tb::PrintHelp {} {
     puts "usage: feeder.tcl --environment NAME \[--build NAME\] \[--dry-run\]"
     puts "                  \[--url URL\] \[--replay-dir DIR\]"
@@ -1244,6 +1566,15 @@ proc tb::PrintHelp {} {
     puts "schema, the invocation contract, and two worked reader examples."
 }
 
+# Fetch the value following a flag that takes one, or exit(2) with a
+# clear message if the flag was the last argument.
+# Args: argv; i - the index of the value (one past the flag itself);
+#   n - llength argv; flag - the flag's own text, for the error
+#   message.
+# Returns: the value at argv[i].
+# Raises: never directly - exits the process with code 2 on the
+#   missing-value case (see ParseArgs, which has no other way to
+#   report a usage error mid-parse).
 proc tb::NeedValue {argv i n flag} {
     if {$i >= $n} {
         tb::Log ERROR "$flag requires a value"
@@ -1252,6 +1583,16 @@ proc tb::NeedValue {argv i n flag} {
     return [lindex $argv $i]
 }
 
+# Parse argv into engine options plus site-specific flags.
+# Args: argv.
+# Returns: a dict with keys environment/build/dry_run/url/replay_dir/
+#   http_timeout/time_budget/verbose/site_args - site_args is itself a
+#   dict keyed by each flag named in ::EXTRA_FLAGS, each value a list
+#   of the strings given for that flag (possibly empty).
+# Raises: never directly for a bad argument - an unknown flag or a
+#   flag missing its value prints an error and exit(2)s immediately
+#   (see NeedValue), and --help exits 0; this proc only returns once
+#   argv has parsed cleanly.
 proc tb::ParseArgs {argv} {
     set opts [dict create environment "" build "" dry_run 0 url "" \
         replay_dir "." http_timeout $::tb::HTTP_TIMEOUT_SECONDS \
@@ -1302,6 +1643,15 @@ proc tb::ParseArgs {argv} {
     return $opts
 }
 
+# Entry point once argv has been separated from --self-test (see the
+# bottom of this file).
+# Args: argv.
+# Returns: the process exit code - 0/1/2, per the file header's exit-
+#   code contract.
+# Raises: never - every failure path returns 2 or 1 instead of
+#   raising; see ParseArgs/NeedValue for the two spots that exit()
+#   directly rather than returning, both pure usage errors before any
+#   work has started.
 proc tb::Main {argv} {
     set opts [tb::ParseArgs $argv]
     set ::tb::VERBOSE [dict get $opts verbose]
@@ -1350,8 +1700,8 @@ proc tb::Main {argv} {
         set stillPending [tb::DrainReplayFiles $url $replayDir $deadline $httpTimeout]
     }
 
-    tb::acc::reset $environment $build $hasBuild
-    if {[catch {read_records $opts tb::acc::handle} collectErr]} {
+    tb::acc::Reset $environment $build $hasBuild
+    if {[catch {read_records $opts tb::acc::Handle} collectErr]} {
         tb::Log ERROR "read_records crashed after producing $::tb::acc::Read record(s): $collectErr"
         return 2
     }
@@ -1375,8 +1725,12 @@ proc tb::Main {argv} {
         return 0
     }
 
-    lassign [tb::SendOwnRecords $canonical $url $environment $build $replayDir $deadline $httpTimeout] \
-        sent inserted updated rejected failedBatches
+    set sendResult [tb::SendOwnRecords $canonical $url $environment $build $replayDir $deadline $httpTimeout]
+    set sent [dict get $sendResult sent]
+    set inserted [dict get $sendResult inserted]
+    set updated [dict get $sendResult updated]
+    set rejected [dict get $sendResult rejected]
+    set failedBatches [dict get $sendResult failed_batches]
 
     tb::Log INFO "feeder summary: read=$readCount valid=$validCount skipped=$skippedCount sent=$sent inserted=$inserted updated=$updated rejected=$rejected failed_batches=$failedBatches replay_files_pending=$stillPending"
 
@@ -1398,6 +1752,13 @@ proc tb::Main {argv} {
 # only under tclsh 8.6; it has never executed on real 8.5.
 # ----------------------------------------------------------------------
 
+# Record one self-test assertion's outcome.
+# Args: name - a short label printed alongside ok/FAIL; cond - the
+#   ALREADY-EVALUATED boolean result (see the NOTE below SelfTest's
+#   opening for why every call site evaluates its condition with
+#   [expr {...}] rather than passing deferred {...} text).
+# Returns: nothing - increments SelfTestFailures on failure.
+# Raises: never.
 proc tb::SelfTestCheck {name cond} {
     variable SelfTestFailures
     if {$cond} {
@@ -1408,6 +1769,11 @@ proc tb::SelfTestCheck {name cond} {
     }
 }
 
+# Run every self-check; see the section banner above for how and why.
+# Args: none.
+# Returns: 0 if every check passed, 1 otherwise (also printed as a
+#   one-line summary).
+# Raises: never.
 proc tb::SelfTest {} {
     variable SelfTestFailures
     set SelfTestFailures 0
