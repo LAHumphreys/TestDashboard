@@ -3036,3 +3036,85 @@ forced a real `DatabaseError` and the rendered message was checked for
 legibility), since MariaDB cannot be made to refuse INSTANT on demand
 locally. If that message ever fires on a real run it names the production
 consequence and says not to soften it away.
+
+## 2026-08-11 — quality pass over the single-file clients (WP-29 follow-up)
+
+Prompted by the user reviewing `clients/feeder.py` on the morning of the
+drop: these are the most VISIBLE code this project produces — they get
+checked into other people's repositories — and they were not holding the
+standard the rest of the codebase does. A craftsmanship pass, no
+behaviour change; the conformance suite (8 scenarios × 2 languages,
+black-box over subprocesses) stayed untouched and green throughout,
+which is the evidence nothing moved.
+
+**Decision: `clients/feeder.py` no longer has to parse under Python 2.**
+It targets 3.6+ and now reads like `testboard/*.py` — real inline
+annotations, f-strings, no `# type:` comments. What that gave up is
+stated plainly rather than glossed: a Python 2 or 3.5 invocation now
+fails at PARSE time with a bare `SyntaxError`, and **no in-file check can
+pre-empt one**, which is why the docstring tells frameworks to invoke it
+as `python3`. The file is correspondingly removed from
+`tests/test_python36_compat.py`'s exemption list (`run_server.py` and
+`run_feeder.py` stay, being genuinely Python-2-parseable entry scripts)
+and is now held to the FULL standard.
+
+Worth recording that the Python 2 rule was NOT what made the file fall
+short. Type comments are first-class PEP 484 and check identically; the
+real defects were independent of the annotation style and would have been
+just as wrong spelled inline:
+
+- **`Any` outside a JSON boundary** — the injected `clock`/`sleep` were
+  typed `Any`. Now `Clock = Callable[[], float]` and
+  `Sleep = Callable[[float], None]`. `_truncate` had the same defect
+  (`Any` → `Union[bytes, str]`), found during the pass, not by me.
+- **Dicts and bare tuples used as structs** — `_send_with_retry` returned
+  a five-key dict indexed by string; `_send_own_records` returned
+  `Tuple[int, int, int, int, int]`. Now `SendOutcome`,
+  `BatchReportCounts`, `SendRecordsOutcome`, all `NamedTuple` class
+  syntax.
+- **`validate_record` returned `Dict[str, Any]`** and never converted, in
+  a codebase whose rule is to convert at the boundary. Now returns a
+  `RunRecord` NamedTuple with `to_wire()`, which is where the
+  "omit `build`, never send it as null" rule now lives — one documented
+  place instead of a conditional at the call site.
+- **Eleven-parameter signatures**, twice. A `TransportContext` NamedTuple
+  bundles what every HTTP attempt needs; both functions drop from 11
+  parameters to 5. This was the root cause of the unreadable 200-column
+  type comments, so it improves the file under either annotation style.
+
+`RunRecord.to_wire()` is this repo's first `typing.NamedTuple` carrying a
+method (methods on the class syntax need 3.6.1+, and no 3.6 interpreter
+exists on any dev box here). Verified where it counts: the ubi8 leg on
+**Python 3.6.8** runs 2241 OK, including the new
+`ClientFeederAnnotationsTest` — which exists because `clients/` is
+deliberately not a package and so cannot join the existing annotation
+sweep. Both compat gates were proven to still bite by planting a
+violation and watching them fail.
+
+**`clients/feeder.tcl`** got the same bar, with the bar itself written
+down since none existed: snake_case for the procs that speak the wire
+contract, PascalCase for internals (Tcl's stand-in for a leading
+underscore), stated in the file. All 49 procs now document arguments,
+return SHAPE and what they raise — in a language with no type system the
+doc comment IS the signature. Two procs returning bare positional lists
+now return named dicts, matching the Python side's NamedTuples.
+
+**It also found a real bug, not a style issue.** In
+`tb::DrainReplayFiles`, `open`/`fconfigure`/`read`/`close` sat inside one
+`catch`, so a failure in `fconfigure` or `read` skipped the `close` and
+leaked the channel — precisely the failure mode Tcl 8.5 invites by having
+no `finally`. Fixed with an unconditional `catch {close $fh}` after a
+separate catch. Every constant was diffed against the Python engine
+(timeouts, attempts, backoff, batch size, byte caps, truncation limit);
+all matched, which matters because the conformance suite asserts the two
+behave identically.
+
+Suite 2240 → **2241 OK (skipped 1)**; the +1 is the new annotation guard.
+
+**Known divergence, deliberately not closed today:** the `branch`
+rejection message is ASCII in the client and still carries a literal
+em-dash server-side (`testboard/model.py`, pinned by `test_api.py`).
+Changing a serving-path string on the morning of a production migration
+is not worth the cosmetic win. Worth closing later — the server's version
+is what a feeder PRINTS on rejection, and an em-dash on a site with a
+non-UTF-8 terminal is the one place it could actually matter.
