@@ -330,7 +330,8 @@ def _is_api_path(raw_path: str) -> bool:
     return raw_path == "/api" or raw_path.startswith("/api/")
 
 
-#: Default ``--url-prefix``: WP-28 (docs/NIGHT_RUN_2026-08-10.md §5).
+#: Default ``--url-prefix``: WP-28 (see docs/UPGRADE_PLAN_STATUS.md,
+#: the tooling night).
 #: Prefixed paths (``/testboard/api/...``) work out of the box behind an
 #: nginx proxy that does NOT strip the prefix before forwarding (the
 #: confirmed shape); bare paths (``/api/...``) ALWAYS keep working too

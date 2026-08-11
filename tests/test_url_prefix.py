@@ -1,4 +1,5 @@
-"""WP-28: the ``--url-prefix`` flag (docs/NIGHT_RUN_2026-08-10.md §5).
+"""WP-28: the ``--url-prefix`` flag (see docs/UPGRADE_PLAN_STATUS.md,
+the tooling night).
 
 Boots a real threaded server (:func:`testboard.server.create_server`,
 same pattern as ``tests/test_e2e.py``) and drives it over HTTP, because
@@ -266,7 +267,7 @@ class DefaultPrefixAcceptsBothShapesTest(_PrefixServerTestCase):
     def test_a_feeder_import_round_trips_on_the_bare_path(self) -> None:
         """Deliverable: a feeder POSTing straight to the backend port
         on the BARE path (never the prefix -- feeders bypass nginx
-        entirely, docs/NIGHT_RUN_2026-08-10.md §5.5) still round-trips
+        entirely; see docs/UPGRADE_PLAN_STATUS.md) still round-trips
         cleanly against a prefix-ENABLED server -- the accept-both-
         shapes rule is what makes that automatic, with no feeder-side
         prefix awareness needed at all."""
@@ -318,7 +319,7 @@ class DefaultPrefixAcceptsBothShapesTest(_PrefixServerTestCase):
 
 class CustomPrefixTest(_PrefixServerTestCase):
     """--url-prefix accepts any value, not just the default "testboard"
-    (docs/NIGHT_RUN_2026-08-10.md §5: "configurable")."""
+    (WP-28, docs/UPGRADE_PLAN_STATUS.md: "configurable")."""
 
     URL_PREFIX = "dashboards/prod"
 

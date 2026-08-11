@@ -5,8 +5,10 @@ The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
 Last rewritten: **2026-08-10, overnight**, closing the tooling night.
-All four phases of `NIGHT_RUN_2026-08-10.md` are **done, merged, and
-green**. The night's output is one branch: **`tooling-2026-08-10`**.
+All four phases of that night's plan are **done, merged, and green**
+(the plan doc itself is deleted, executed — the record is the
+tooling-night entry in [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md)).
+The night's output is one branch: **`tooling-2026-08-10`**.
 
 ## The one thing that matters this morning
 

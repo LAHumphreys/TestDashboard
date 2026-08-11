@@ -4456,7 +4456,7 @@ def _root_absolute_api_hits(source: str) -> List[int]:
 
 class RootAbsoluteApiUrlTest(unittest.TestCase):
     """No ``/api/...`` literal may be root-absolute anywhere in static/
-    (WP-28, docs/NIGHT_RUN_2026-08-10.md §5).
+    (WP-28; see docs/UPGRADE_PLAN_STATUS.md, the tooling night).
 
     nginx proxies a prod deployment at a path prefix it does NOT strip
     (``/testboard/`` arrives at the backend verbatim), so every API
@@ -4513,10 +4513,10 @@ class RootAbsoluteApiUrlTest(unittest.TestCase):
             "it, bare or under /testboard/ alike: " + repr(offenders))
 
     def test_no_root_absolute_href_or_src_in_html(self) -> None:
-        """The other half of the audit (docs/NIGHT_RUN_2026-08-10.md
-        §5.3): every page's own nav/asset links, pinned relative too —
-        locks in the phase's recon finding rather than trusting it to
-        stay true unchecked."""
+        """The other half of the audit (WP-28; see
+        docs/UPGRADE_PLAN_STATUS.md): every page's own nav/asset
+        links, pinned relative too — locks in the phase's recon
+        finding rather than trusting it to stay true unchecked."""
         pattern = re.compile(r'''(?:href|src)=["']/''')
         offenders = {}  # type: Dict[str, List[int]]
         for name in sorted(os.listdir(STATIC_DIR)):
