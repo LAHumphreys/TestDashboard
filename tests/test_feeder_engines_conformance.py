@@ -1,5 +1,9 @@
 """Conformance suite for the single-file feeder engines (WP-29):
-clients/feeder.py and clients/feeder.tcl.
+clients/feeder.py, clients/feeder.tcl, and the reduced
+clients/feeder_micro.py (PythonMicroFeederConformanceTest below - NOT
+a ScenarioMixin engine, because its semantics deliberately differ; its
+class docstring says how, and DropInTransplantTest is what holds the
+two Python engines to an interchangeable IMPLEMENT THIS contract).
 
 Each engine is driven as a SUBPROCESS - exactly how a contributing
 product's test framework would invoke it from its own cleanup phase -
@@ -45,6 +49,7 @@ from testboard.storage import Storage
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FEEDER_PY = os.path.join(REPO_ROOT, "clients", "feeder.py")
+FEEDER_MICRO_PY = os.path.join(REPO_ROOT, "clients", "feeder_micro.py")
 FEEDER_TCL = os.path.join(REPO_ROOT, "clients", "feeder.tcl")
 
 TCLSH = shutil.which("tclsh")
@@ -421,6 +426,281 @@ class ScenarioMixin:
             saved = json.load(handle)
         self.assertEqual(saved["runs"][0]["test_name"], "test_build")
         self.assertEqual(saved["runs"][0]["build"], "rc-conf-2")
+
+
+# ----------------------------------------------------------------------
+# Micro engine (clients/feeder_micro.py)
+# ----------------------------------------------------------------------
+
+
+def _split_on_banners(path: str) -> Tuple[str, str, str]:
+    """(head, drop-in section, engine) around the two banner comment
+    lines. Anchored to line-start comment form ("\\n# ...") because both
+    files' module docstrings also SAY the banner phrases in prose."""
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    start = text.index("\n# IMPLEMENT THIS SECTION")
+    end = text.index("\n# DO NOT EDIT BELOW THIS LINE")
+    return text[:start], text[start:end], text[end:]
+
+
+class DropInTransplantTest(unittest.TestCase):
+    """A site's IMPLEMENT THIS section written for the full engine must
+    drop into the micro engine unchanged - that compatibility is the
+    micro engine's headline promise (its module docstring makes it),
+    and this test is what makes the promise safe to print: it splices
+    feeder.py's actual drop-in section onto feeder_micro.py's engine
+    and runs the hybrid end-to-end. Byte-equality of the two shipped
+    sections is deliberately NOT asserted - feeder.py's section obeys
+    that file's Python-2-parse rule (type comments), the micro one
+    uses ordinary annotations - so what is pinned is the contract:
+    same symbols, same arguments, interchangeable code."""
+
+    def test_full_engine_dropin_runs_on_the_micro_engine(self) -> None:
+        micro_head, _, micro_engine = _split_on_banners(FEEDER_MICRO_PY)
+        _, full_dropin, _ = _split_on_banners(FEEDER_PY)
+        tmp = tempfile.mkdtemp(prefix="feeder_transplant_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        hybrid = os.path.join(tmp, "feeder_hybrid.py")
+        with open(hybrid, "w", encoding="utf-8") as handle:
+            handle.write(micro_head + full_dropin + micro_engine)
+
+        results = os.path.join(tmp, "one.jsonl")
+        with open(results, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(ScenarioMixin._record("test_hybrid")) + "\n")
+        control = _StubControl()
+        control.queue(200, dict(_DEFAULT_OK_PAYLOAD, inserted=1))
+        httpd, port = _start_stub_server(control)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        completed = subprocess.run(
+            [sys.executable, hybrid,
+             "--environment", "conf-env-hybrid", "--results", results,
+             "--url", "http://127.0.0.1:{0}".format(port)],
+            cwd=tmp, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30.0,
+        )
+        err = completed.stderr.decode("utf-8", "replace")
+        self.assertEqual(completed.returncode, 0, err)
+        self.assertEqual(control.request_count(), 1)
+        sent = json.loads(control.requests[0][1].decode("utf-8"))
+        self.assertEqual(sent["runs"][0]["test_name"], "test_hybrid")
+
+
+class PythonMicroFeederConformanceTest(unittest.TestCase):
+    """clients/feeder_micro.py conformance, driven as a subprocess like
+    the ScenarioMixin engines - but deliberately NOT via the mixin: the
+    micro engine has no replay files and no --time-budget, so most
+    shared scenarios assert behaviour it does not (and must not) have.
+    What it shares with the full engines - skip-don't-abort, server
+    idempotency, the --build/streams_seen handshake, a bounded exit
+    against a dead server - is asserted here with micro semantics:
+    exit 1 leaves NOTHING on disk, and re-invocation is the recovery."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="feeder_micro_conformance_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _invoke(
+        self, args: List[str], cwd: str, timeout: float = 30.0,
+    ) -> Tuple[int, str, str]:
+        cmd = [sys.executable, FEEDER_MICRO_PY] + args
+        completed = subprocess.run(
+            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        return (
+            completed.returncode,
+            completed.stdout.decode("utf-8", "replace"),
+            completed.stderr.decode("utf-8", "replace"),
+        )
+
+    def _write_results(self, name: str, records: List[Dict[str, Any]]) -> str:
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        return path
+
+    def _files_created(self) -> List[str]:
+        """Everything in the working directory that is not a fixture -
+        the micro engine must never create ANY file, replay or other."""
+        return sorted(
+            name for name in os.listdir(self.tmp)
+            if not name.endswith(".jsonl")
+        )
+
+    def test_bad_record_skipped_and_counted(self) -> None:
+        path = self._write_results("mixed.jsonl", [
+            ScenarioMixin._record("test_ok"),
+            ScenarioMixin._record("test_bad", result="NOPE"),
+        ])
+        control = _StubControl()
+        control.queue(200, dict(_DEFAULT_OK_PAYLOAD, inserted=1))
+        httpd, port = _start_stub_server(control)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        rc, _out, err = self._invoke([
+            "--environment", "conf-env", "--results", path,
+            "--url", "http://127.0.0.1:{0}".format(port),
+        ], self.tmp)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("skipped=1", err)
+        self.assertEqual(control.request_count(), 1)
+        sent = json.loads(control.requests[0][1].decode("utf-8"))
+        self.assertEqual(len(sent["runs"]), 1)
+        self.assertEqual(sent["runs"][0]["test_name"], "test_ok")
+
+    def test_persistent_failure_exits_1_and_creates_no_files(self) -> None:
+        path = self._write_results("one.jsonl", [ScenarioMixin._record("test_a")])
+        control = _StubControl()
+        control.queue(500, {"error": "synthetic failure"})
+        httpd, port = _start_stub_server(control)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        rc, _out, err = self._invoke([
+            "--environment", "conf-env", "--results", path,
+            "--url", "http://127.0.0.1:{0}".format(port),
+            "--http-timeout", "2",
+        ], self.tmp)
+        self.assertEqual(rc, 1, err)
+        # Exactly the documented MAX_ATTEMPTS, all against the
+        # always-500 stub, then give up - and the giving up must leave
+        # no file of any kind behind: exit 1 IS the persistence.
+        self.assertEqual(control.request_count(), 3)
+        self.assertEqual(self._files_created(), [])
+        self.assertIn("re-invoke", err)
+
+    def test_reinvocation_after_failure_recovers(self) -> None:
+        """The micro recovery story end-to-end: a failed invocation
+        saves nothing, and simply re-running the same command line
+        against a healthy (real) server delivers the results."""
+        path = self._write_results("one.jsonl", [ScenarioMixin._record("test_a")])
+        control = _StubControl()
+        control.queue(500, {"error": "synthetic failure"})
+        httpd, port = _start_stub_server(control)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        rc, _out, err = self._invoke([
+            "--environment", "conf-env", "--results", path,
+            "--url", "http://127.0.0.1:{0}".format(port),
+            "--http-timeout", "2",
+        ], self.tmp)
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(self._files_created(), [])
+
+        srv, storage, real_port = _start_real_server(self.tmp)
+        self.addCleanup(storage.close)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        rc2, _out2, err2 = self._invoke([
+            "--environment", "conf-env", "--results", path,
+            "--url", "http://127.0.0.1:{0}".format(real_port),
+        ], self.tmp)
+        self.assertEqual(rc2, 0, err2)
+        self.assertIn("inserted=1", err2)
+
+    def test_reinvoked_cleanup_is_a_noop_on_the_server(self) -> None:
+        srv, storage, port = _start_real_server(self.tmp)
+        self.addCleanup(storage.close)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        path = self._write_results(
+            "one.jsonl", [ScenarioMixin._record("test_repeat")]
+        )
+        url = "http://127.0.0.1:{0}".format(port)
+
+        rc1, _out1, err1 = self._invoke([
+            "--environment", "conf-env-repeat", "--results", path,
+            "--url", url,
+        ], self.tmp)
+        self.assertEqual(rc1, 0, err1)
+        self.assertIn("inserted=1", err1)
+
+        rc2, _out2, err2 = self._invoke([
+            "--environment", "conf-env-repeat", "--results", path,
+            "--url", url,
+        ], self.tmp)
+        self.assertEqual(rc2, 0, err2)
+        self.assertIn("inserted=0", err2)
+        self.assertIn("updated=1", err2)
+
+    def test_build_and_streams_seen_handshake(self) -> None:
+        srv, storage, port = _start_real_server(self.tmp)
+        self.addCleanup(storage.close)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        path = self._write_results(
+            "one.jsonl", [ScenarioMixin._record("test_build")]
+        )
+        rc, _out, err = self._invoke([
+            "--environment", "conf-env-build", "--build", "rc-conf-1",
+            "--results", path,
+            "--url", "http://127.0.0.1:{0}".format(port),
+        ], self.tmp)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("no streams_seen key", err)
+
+    def test_old_server_without_streams_seen_fails_loudly(self) -> None:
+        control = _StubControl()
+        control.queue(200, {
+            "inserted": 1, "updated": 0, "unchanged": 0, "rejected": 0,
+            "errors": [],
+            # no "streams_seen" key - the old-server signature
+        })
+        httpd, port = _start_stub_server(control)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        path = self._write_results(
+            "one.jsonl", [ScenarioMixin._record("test_build")]
+        )
+        rc, _out, err = self._invoke([
+            "--environment", "conf-env-old", "--build", "rc-conf-2",
+            "--results", path,
+            "--url", "http://127.0.0.1:{0}".format(port),
+        ], self.tmp)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("streams_seen", err)
+        self.assertEqual(self._files_created(), [])
+
+    def test_bounded_time_promise_against_a_blackholed_port(self) -> None:
+        """With no --time-budget, the micro engine's documented ceiling
+        is MAX_ATTEMPTS * --http-timeout plus the two fixed pauses."""
+        sock, port = _start_blackhole()
+        self.addCleanup(sock.close)
+        path = self._write_results("one.jsonl", [ScenarioMixin._record("test_a")])
+        http_timeout = 2.0
+        ceiling = 3 * http_timeout + 2 * 2.0
+        started = time.time()
+        rc, _out, err = self._invoke([
+            "--environment", "conf-env", "--results", path,
+            "--url", "http://127.0.0.1:{0}".format(port),
+            "--http-timeout", str(http_timeout),
+        ], self.tmp, timeout=ceiling + 30.0)
+        elapsed = time.time() - started
+        self.assertEqual(rc, 1, err)
+        self.assertLess(
+            elapsed, ceiling + 15.0,
+            "micro: black-holed port took {0:.1f}s, documented ceiling "
+            "is {1:.1f}s (3 attempts x http-timeout {2} + two 2s "
+            "pauses, plus slack for process startup)".format(
+                elapsed, ceiling, http_timeout,
+            ),
+        )
+        self.assertEqual(self._files_created(), [])
+
+    def test_full_engine_flags_are_refused(self) -> None:
+        """--replay-dir and --time-budget belong to the full engine. An
+        invocation carrying them must fail with a usage error (exit 2),
+        not silently ignore a durability flag the caller believed in."""
+        path = self._write_results("one.jsonl", [ScenarioMixin._record("test_a")])
+        for flag, value in (("--replay-dir", self.tmp), ("--time-budget", "20")):
+            rc, _out, _err = self._invoke([
+                "--environment", "conf-env", "--results", path,
+                "--url", "http://127.0.0.1:1", flag, value,
+            ], self.tmp)
+            self.assertEqual(rc, 2, flag)
 
 
 # ----------------------------------------------------------------------

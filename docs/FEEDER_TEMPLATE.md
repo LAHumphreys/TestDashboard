@@ -25,6 +25,8 @@ into that product's own repository.
 **One file.** Either:
 
 - `clients/feeder.py` (Python 3.6+), or
+- `clients/feeder_micro.py` (Python 3.6+ — the reduced engine, about a
+  third of the code; see "Choosing between the two Python engines" below), or
 - `clients/feeder.tcl` (vanilla Tcl 8.5+ — no tcllib, no `tls`, nothing
   beyond a bare `tclsh`)
 
@@ -52,6 +54,38 @@ ask a site to touch it.
 That is the entire task. The engine already handles validation, batching,
 retries, replay files and exit codes — do not reimplement any of it, and do
 not add fields, flags, or files beyond what is described here.
+
+### Choosing between the two Python engines
+
+Both Python files carry the **same IMPLEMENT THIS contract** — the same
+three symbols, the same arguments, the same shipped default reader — and a
+section written for `feeder.py` drops into `feeder_micro.py` unchanged (a
+conformance test in the testboard repository transplants it on every push).
+Write your reader once; it runs on both. One asymmetry: `feeder.py` is
+additionally kept parseable under Python 2 (type comments, no f-strings —
+its header explains), while `feeder_micro.py` deliberately is not and uses
+ordinary annotations. So micro → full is the one direction where a reader
+may need its annotation style adjusted; full → micro is always a straight
+paste.
+
+**Default to `feeder.py`.** Pick `feeder_micro.py` when the receiving
+product's review gate balks at the full engine's size — that is the reason
+it exists. What the micro engine gives up, and what stands in for it:
+
+| Full engine (`feeder.py`) | Micro engine (`feeder_micro.py`) |
+|---|---|
+| A failed batch is saved to a **replay file**; the next invocation resends it automatically | **Nothing is written to disk, ever.** Exit 1 means "re-invoke me" — safe, because the server skips anything it already has. Recovery needs the framework to retry its cleanup step, or a person to re-run the command; a run that nobody re-invokes during an outage is a visible gap on the board |
+| Full client-side validation mirroring the server's rules; `--dry-run` catches bad records locally | A shallow sanity check (required fields present, `result` recognised); the server's per-record rejections are reported in the log instead |
+| Hard wall-clock ceiling: `--time-budget` + `--http-timeout`, ~115 s worst case | No budget flag; worst case is 3 × `--http-timeout` + two 2 s pauses per batch (~49 s by default, one batch is typical) |
+| Exponential backoff between retries | A flat 2 s pause |
+
+Identical in both: the invocation model, `--environment`/`--build`
+stamping, the `--build` acknowledgement (an old server is a loud exit 1 in
+both, never a silent misfile into mainline), batching (500 records / 8 MB),
+the exit-code meanings of 0 and 2, and the wire contract. Where the rest of
+this document says "replay file" or "time budget", read it as full-engine
+behaviour; the micro engine's own header comment states its versions of
+those promises.
 
 ---
 
