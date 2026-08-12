@@ -463,9 +463,10 @@ class PythonMicroFeederConformanceTest(unittest.TestCase):
     micro docstring's promise that a section written for the full
     engine drops in unchanged - every scenario here re-proves it.
     Byte-equality of the sections is deliberately not asserted:
-    feeder.py's obeys that file's Python-2-parse rule and defines a
-    DASHBOARD_URL the micro engine ignores (it requires --url); what
-    is pinned is the contract - same symbols, interchangeable code."""
+    feeder.py's section defines a DASHBOARD_URL the micro engine
+    ignores (it requires --url) and ships the worked reader the micro
+    file deliberately does not; what is pinned is the contract - same
+    symbols, interchangeable code."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="feeder_micro_conformance_")

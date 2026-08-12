@@ -63,12 +63,9 @@ Both Python files carry the **same IMPLEMENT THIS contract** — the same
 hook and reader symbols, called the same way — and a section written for
 `feeder.py` drops into `feeder_micro.py` unchanged (the conformance suite
 in the testboard repository transplants it on every push).
-Write your reader once; it runs on both. One asymmetry: `feeder.py` is
-additionally kept parseable under Python 2 (type comments, no f-strings —
-its header explains), while `feeder_micro.py` deliberately is not and uses
-ordinary annotations. So micro → full is the one direction where a reader
-may need its annotation style adjusted; full → micro is always a straight
-paste.
+Write your reader once; it runs on both — either direction is a straight
+paste (both files are ordinary annotated Python 3.6+; neither parses under
+Python 2).
 
 **Default to `feeder.py`.** Pick `feeder_micro.py` when the receiving
 product's review gate balks at the full engine's size — that is the reason

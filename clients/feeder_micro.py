@@ -78,9 +78,7 @@ that want them. The IMPLEMENT THIS contract is shared: a section
 written for the full engine drops in here unchanged - a conformance
 test in the testboard repository transplants it on every push -
 though its ``DASHBOARD_URL`` constant goes unused, because this
-engine always takes ``--url``. (Going the other way, note that
-feeder.py is additionally kept parseable under Python 2; its header
-says what that means for annotations and f-strings.)
+engine always takes ``--url``.
 """
 
 import argparse
