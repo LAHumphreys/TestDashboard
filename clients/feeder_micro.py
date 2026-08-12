@@ -59,8 +59,7 @@ Exit codes (safe for a cleanup step to rely on):
      are reported in the log and never abort an import), or --dry-run
      finished cleanly
   1  a batch was not accepted - the server was unreachable or kept
-     failing, or (with --build) it was too old to understand build
-     streams. Nothing is saved locally; re-invoking this feeder
+     failing. Nothing is saved locally; re-invoking this feeder
      re-sends everything, safely.
   2  the invocation itself was wrong (missing or bad arguments, or
      read_records() crashed) - nothing was sent.
@@ -73,12 +72,14 @@ contract.
 
 This is the reduced sibling of the full engine (``clients/feeder.py``
 in the testboard repository), which adds on-disk replay files, a
-wall-clock time budget and full client-side wire validation for sites
-that want them. The IMPLEMENT THIS contract is shared: a section
-written for the full engine drops in here unchanged - a conformance
-test in the testboard repository transplants it on every push -
-though its ``DASHBOARD_URL`` constant goes unused, because this
-engine always takes ``--url``.
+wall-clock time budget, full client-side wire validation, and a check
+that the server acknowledged ``--build`` records, for sites that want
+them - this engine simply trusts the server it was pointed at. The
+IMPLEMENT THIS contract is shared: a section written for the full
+engine drops in here unchanged - a conformance test in the testboard
+repository transplants it on every push - though its
+``DASHBOARD_URL`` constant goes unused, because this engine always
+takes ``--url``.
 """
 
 import argparse
@@ -90,7 +91,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 #: This engine's own version and the /api/import wire-contract version
 #: it was written against. Sent as the User-Agent header on every
@@ -264,75 +265,93 @@ def _describe_connection_error(url: str, exc: BaseException) -> str:
     return f"cannot reach {url} ({type(reason).__name__}: {reason})"
 
 
-def _send_batch(
-    url: str,
-    body: bytes,
-    headers: Dict[str, str],
-    http_timeout: float,
-    sleep: Callable[[float], None],
-    log: logging.Logger,
-    label: str,
-) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    """POST ``body``, up to MAX_ATTEMPTS times; return (ok, payload).
-
-    ``payload`` is the decoded 200 response object, or None when the
-    response body was not usable JSON. Connection errors and HTTP 5xx
-    get another try after a flat pause; a 4xx means the request itself
-    was rejected, so it is final on first sight.
-    """
-    reason = "unknown error"
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        if attempt > 1:
-            log.info(
-                "%s: retrying in %.0fs (attempt %d of %d)",
-                label, RETRY_PAUSE_SECONDS, attempt, MAX_ATTEMPTS,
-            )
-            sleep(RETRY_PAUSE_SECONDS)
-        try:
-            status, response_body = _post(url, body, headers, http_timeout)
-        except Exception as exc:
-            reason = _describe_connection_error(url, exc)
-            log.warning(
-                "%s: attempt %d of %d failed: %s",
-                label, attempt, MAX_ATTEMPTS, reason,
-            )
-            continue
-        if status == 200:
-            try:
-                payload = json.loads(response_body.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                payload = None
-            return (True, payload if isinstance(payload, dict) else None)
-        text = response_body.decode("utf-8", errors="replace")
-        if len(text) > 200:
-            text = text[:200] + "...[truncated]"
-        reason = f"HTTP {status} from the server (response: {text})"
-        if status >= 500:
-            log.warning(
-                "%s: attempt %d of %d failed: %s",
-                label, attempt, MAX_ATTEMPTS, reason,
-            )
-            continue
-        log.warning("%s: %s - not retrying a client error", label, reason)
-        break
-    log.error("%s: giving up (%s)", label, reason)
-    return (False, None)
+def _describe_http_error(status: int, response_body: bytes) -> str:
+    """One readable sentence for a non-200, with the response text cut
+    to a size that keeps the log line useful."""
+    text = response_body.decode("utf-8", errors="replace")
+    if len(text) > 200:
+        text = text[:200] + "...[truncated]"
+    return f"HTTP {status} from the server (response: {text})"
 
 
-def _report_payload(
-    payload: Optional[Dict[str, Any]], label: str, log: logging.Logger,
-) -> Tuple[int, int, int]:
-    """Log what the server said about an accepted batch and return
-    (inserted, updated, rejected). The first few per-record rejections
-    are logged in full - enough to see what was wrong from the log
-    alone - and the rest are summarised as a count.
-    """
-    if payload is None:
+def _decode_response(
+    response_body: bytes, log: logging.Logger, label: str,
+) -> Dict[str, Any]:
+    """The 200 response decoded, or {} - with a warning - when the
+    body was not a JSON object. Accepted-but-unreadable is still
+    accepted; it only costs the per-batch counts in the log."""
+    try:
+        payload = json.loads(response_body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if not isinstance(payload, dict):
         log.warning(
             "%s: server returned 200 but the response body was not a "
             "usable JSON object", label,
         )
-        return (0, 0, 0)
+        return {}
+    return payload
+
+
+class _Attempt(NamedTuple):
+    """What one POST attempt came back with."""
+
+    payload: Optional[Dict[str, Any]]  # set when the batch was accepted
+    failure: str                       # why not, when payload is None
+    retryable: bool                    # could another try change this?
+
+
+def _attempt_post(
+    url: str, body: bytes, headers: Dict[str, str], timeout: float,
+    log: logging.Logger, label: str,
+) -> _Attempt:
+    """One POST. A payload (possibly {}) means the batch was accepted;
+    otherwise ``failure`` says why not, and ``retryable`` whether
+    another try could change the answer - yes for connection errors
+    and HTTP 5xx, no for a 4xx (the request itself was rejected, and
+    re-sending the same request cannot help)."""
+    try:
+        status, response_body = _post(url, body, headers, timeout)
+    except Exception as exc:
+        return _Attempt(None, _describe_connection_error(url, exc), True)
+    if status == 200:
+        return _Attempt(_decode_response(response_body, log, label), "", False)
+    return _Attempt(
+        None, _describe_http_error(status, response_body), status >= 500
+    )
+
+
+def _send_batch(
+    url: str, body: bytes, headers: Dict[str, str], http_timeout: float,
+    log: logging.Logger, label: str,
+) -> Optional[Dict[str, Any]]:
+    """Deliver one batch, riding out brief trouble; return the server's
+    response object once accepted, or None once out of attempts (or on
+    a failure a retry cannot fix)."""
+    for attempt_number in range(1, MAX_ATTEMPTS + 1):
+        attempt = _attempt_post(url, body, headers, http_timeout, log, label)
+        if attempt.payload is not None:
+            return attempt.payload
+        out_of_attempts = attempt_number == MAX_ATTEMPTS
+        if out_of_attempts or not attempt.retryable:
+            log.error("%s: giving up (%s)", label, attempt.failure)
+            return None
+        log.warning(
+            "%s: attempt %d of %d failed: %s - retrying in %.0fs",
+            label, attempt_number, MAX_ATTEMPTS, attempt.failure,
+            RETRY_PAUSE_SECONDS,
+        )
+        time.sleep(RETRY_PAUSE_SECONDS)
+    return None  # not reached: every pass through the loop returns above
+
+
+def _report_payload(
+    payload: Dict[str, Any], label: str, log: logging.Logger,
+) -> Tuple[int, int, int]:
+    """Log what the server said about an accepted batch and return
+    (inserted, updated, rejected). The first few per-record rejections
+    are logged in full - enough to see what was wrong from the log
+    alone - and the rest are summarised as a count."""
     inserted = int(payload.get("inserted", 0) or 0)
     updated = int(payload.get("updated", 0) or 0)
     rejected = int(payload.get("rejected", 0) or 0)
@@ -421,9 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "file every record under build stream NAME instead of "
             "mainline - pass your framework's branch/release parameter "
-            "here (there is no separate --branch). The server must "
-            "acknowledge builds; one too old to do so is a loud exit "
-            "1, never a silent misfile into mainline"
+            "here (there is no separate --branch)"
         ),
     )
     parser.add_argument(
@@ -442,42 +459,137 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_parser()
-    add_site_arguments(parser)
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as exc:
-        code = exc.code
-        if code is None:
-            return 0
-        return code if isinstance(code, int) else 2
+# ----------------------------------------------------------------------
+# One invocation, start to finish
+# ----------------------------------------------------------------------
 
+
+class _UsageError(Exception):
+    """The invocation itself is wrong - exit code 2, nothing sent."""
+
+
+class _Invocation(NamedTuple):
+    """The engine-owned arguments, cleaned: stripped, never blank, and
+    the URL already pointing at the import endpoint."""
+
+    environment: str
+    build: Optional[str]
+    url: str
+
+
+class _Gathered(NamedTuple):
+    """Everything the site's reader produced, already screened."""
+
+    read: int
+    skipped: int
+    records: List[Dict[str, Any]]
+
+
+class _SendOutcome(NamedTuple):
+    """What became of the batches."""
+
+    sent: int
+    inserted: int
+    updated: int
+    rejected: int
+    failed_batches: int
+
+
+def _configured_logger(verbose: bool) -> logging.Logger:
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    log = logging.getLogger("testboard_feeder")
+    return logging.getLogger("testboard_feeder")
 
+
+def _cleaned_invocation(args: argparse.Namespace) -> _Invocation:
+    """argparse guarantees the required flags are present; this guards
+    against the present-but-blank, and normalizes the URL."""
     environment = args.environment.strip()
     if not environment:
-        log.error("--environment must not be empty or whitespace-only")
-        return 2
+        raise _UsageError(
+            "--environment must not be empty or whitespace-only"
+        )
+    build = None
+    if args.build is not None:
+        build = args.build.strip()
+        if not build:
+            raise _UsageError("--build must not be empty or whitespace-only")
+    url = args.url.strip()
+    if not url:
+        raise _UsageError("--url must not be empty or whitespace-only")
+    return _Invocation(environment, build, _normalize_url(url))
 
-    build = args.build
-    if build is not None:
-        build = build.strip() or None
-        if build is None:
-            log.error("--build must not be empty or whitespace-only")
-            return 2
 
-    raw_url = args.url.strip()
-    if not raw_url:
-        log.error("--url must not be empty or whitespace-only")
-        return 2
-    url = _normalize_url(raw_url)
+def _stamped(raw: Any, invocation: _Invocation) -> Any:
+    """A copy of ``raw`` with the engine-owned fields applied - the
+    command line is their single source of truth, whatever the reader
+    set. Non-dicts pass through for sanity_error() to describe."""
+    if not isinstance(raw, dict):
+        return raw
+    record = dict(raw)
+    record["environment"] = invocation.environment
+    if invocation.build is not None:
+        record["build"] = invocation.build
+    return record
 
-    headers = {
+
+def _screened_records(
+    args: argparse.Namespace, invocation: _Invocation, log: logging.Logger,
+) -> _Gathered:
+    """Run the site's read_records(), stamp each record, and screen it
+    through sanity_error(). A bad record is logged and skipped, never
+    fatal; the reader itself crashing is fatal, because a half-read
+    results source cannot be told apart from a complete one."""
+    try:
+        raw_iterator = iter(read_records(args))
+    except Exception as exc:
+        if args.verbose:
+            traceback.print_exc()
+        raise _UsageError(
+            f"read_records() raised before producing anything: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    read = 0
+    skipped = 0
+    records: List[Dict[str, Any]] = []
+    try:
+        for raw in raw_iterator:
+            read += 1
+            record = _stamped(raw, invocation)
+            problem = sanity_error(record)
+            if problem is not None:
+                skipped += 1
+                log.warning("skipping record %d: %s", read, problem)
+                continue
+            records.append(record)
+    except Exception as exc:
+        if args.verbose:
+            traceback.print_exc()
+        raise _UsageError(
+            f"read_records() crashed after producing {read} record(s): "
+            f"{type(exc).__name__}: {exc}"
+        )
+    return _Gathered(read, skipped, records)
+
+
+def _dry_run_report(gathered: _Gathered, log: logging.Logger) -> int:
+    """Print the first records verbatim, count the rest, send nothing."""
+    for index, record in enumerate(gathered.records[:3], 1):
+        sys.stdout.write(f"\n--- record {index} would be sent as ---\n")
+        sys.stdout.write(json.dumps(record, indent=2, sort_keys=True))
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+    log.info(
+        "dry run: read=%d valid=%d skipped=%d - nothing was sent",
+        gathered.read, len(gathered.records), gathered.skipped,
+    )
+    return 0
+
+
+def _headers() -> Dict[str, str]:
+    return {
         "Content-Type": "application/json",
         "User-Agent": (
             f"testboard-feeder-python-micro/{ENGINE_VERSION} "
@@ -485,106 +597,79 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     }
 
-    try:
-        raw_iterator = iter(read_records(args))
-    except Exception as exc:
-        log.error(
-            "read_records() raised before producing anything: %s: %s",
-            type(exc).__name__, exc,
-        )
-        if args.verbose:
-            traceback.print_exc()
-        return 2
 
-    read = 0
-    valid = 0
-    skipped = 0
-    records: List[Dict[str, Any]] = []
-    try:
-        for raw in raw_iterator:
-            read += 1
-            if isinstance(raw, dict):
-                # The engine owns these two fields: the command line is
-                # their single source of truth, whatever the reader set.
-                raw = dict(raw)
-                raw["environment"] = environment
-                if build is not None:
-                    raw["build"] = build
-            reason = sanity_error(raw)
-            if reason is not None:
-                skipped += 1
-                log.warning("skipping record %d: %s", read, reason)
-                continue
-            valid += 1
-            records.append(raw)
-    except Exception as exc:
-        log.error(
-            "read_records() crashed after producing %d record(s): %s: "
-            "%s", read, type(exc).__name__, exc,
-        )
-        if args.verbose:
-            traceback.print_exc()
-        return 2
-
-    if args.dry_run:
-        for index, record in enumerate(records[:3], 1):
-            sys.stdout.write(f"\n--- record {index} would be sent as ---\n")
-            sys.stdout.write(json.dumps(record, indent=2, sort_keys=True))
-            sys.stdout.write("\n")
-        sys.stdout.flush()
-        log.info(
-            "dry run: read=%d valid=%d skipped=%d - nothing was sent",
-            read, valid, skipped,
-        )
-        return 0
-
-    sent = inserted = updated = rejected = failed_batches = 0
+def _send_all(
+    records: List[Dict[str, Any]], url: str, http_timeout: float,
+    log: logging.Logger,
+) -> _SendOutcome:
+    """Batch and send everything. Each batch gets its own retries, and
+    one failed batch never stops the next - whatever the server did
+    accept stays accepted."""
+    headers = _headers()
+    sent = inserted = updated = rejected = failed = 0
     for batch in _batches(records, BATCH_SIZE, MAX_BATCH_BYTES):
         body = json.dumps({"runs": batch}).encode("utf-8")
         label = f"batch of {len(batch)} records"
-        ok, payload = _send_batch(
-            url, body, headers, args.http_timeout, time.sleep, log, label,
-        )
-        if not ok:
+        payload = _send_batch(url, body, headers, http_timeout, log, label)
+        if payload is None:
             log.error(
                 "%s was not accepted; nothing is saved locally - "
                 "re-invoke this feeder to re-send it (safe: the server "
                 "skips anything it already has)", label,
             )
-            failed_batches += 1
-            continue
-        if build is not None and (
-            payload is None or "streams_seen" not in payload
-        ):
-            # A server that understands builds always echoes a
-            # streams_seen list. Silence means it is too old for
-            # builds and has filed these records into mainline.
-            log.error(
-                "this run used --build %r but the server did not "
-                "acknowledge it (no streams_seen in the response): the "
-                "server is too old for build streams and has filed "
-                "these records into mainline. Update the dashboard and "
-                "re-invoke this feeder, or drop --build to import as "
-                "mainline deliberately.", build,
-            )
-            failed_batches += 1
+            failed += 1
             continue
         counts = _report_payload(payload, label, log)
         sent += len(batch)
         inserted += counts[0]
         updated += counts[1]
         rejected += counts[2]
+    return _SendOutcome(sent, inserted, updated, rejected, failed)
 
+
+def _log_summary(
+    gathered: _Gathered, outcome: _SendOutcome, log: logging.Logger,
+) -> None:
     log.info(
         "feeder summary: read=%d valid=%d skipped=%d sent=%d inserted=%d "
         "updated=%d rejected=%d failed_batches=%d",
-        read, valid, skipped, sent, inserted, updated, rejected,
-        failed_batches,
+        gathered.read, len(gathered.records), gathered.skipped,
+        outcome.sent, outcome.inserted, outcome.updated, outcome.rejected,
+        outcome.failed_batches,
     )
 
-    if failed_batches:
-        return 1
-    return 0
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """One invocation, start to finish - parse, read, send. The exit
+    codes are the contract in the module docstring."""
+    parser = build_parser()
+    add_site_arguments(parser)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # argparse exits for --help and usage errors; return its code
+        # instead, so main() always returns rather than raising.
+        code = exc.code
+        if code is None:
+            return 0
+        return code if isinstance(code, int) else 2
+
+    log = _configured_logger(args.verbose)
+    try:
+        invocation = _cleaned_invocation(args)
+        gathered = _screened_records(args, invocation, log)
+    except _UsageError as error:
+        log.error("%s", error)
+        return 2
+
+    if args.dry_run:
+        return _dry_run_report(gathered, log)
+
+    outcome = _send_all(
+        gathered.records, invocation.url, args.http_timeout, log
+    )
+    _log_summary(gathered, outcome, log)
+    return 1 if outcome.failed_batches else 0
 
 
 if __name__ == "__main__":

@@ -79,10 +79,10 @@ it exists. What the micro engine gives up, and what stands in for it:
 | Exponential backoff between retries | A flat 2 s pause |
 | A `DASHBOARD_URL` constant, with `--url` as an optional override | **No hardcoded URL**: `--url` is mandatory on every invocation |
 | Ships the `--results` JSON-lines reader as its worked default section | **Ships stubs** — every site writes its own flags and reader (in practice they all do anyway); the unmodified file warns "not implemented" and sends nothing |
+| Refuses a server that does not acknowledge `--build` (`streams_seen`) — an old server is a loud exit 1, never a silent misfile into mainline | **Trusts the server** to file `--build` records correctly; no acknowledgement check. Fine when dashboards are kept current — use the full engine if the old-server guard matters to you |
 
 Identical in both: the invocation model, `--environment`/`--build`
-stamping, the `--build` acknowledgement (an old server is a loud exit 1 in
-both, never a silent misfile into mainline), batching (500 records / 8 MB),
+stamping, batching (500 records / 8 MB),
 the exit-code meanings of 0 and 2, and the wire contract. Where the rest of
 this document says "replay file" or "time budget", read it as full-engine
 behaviour; the micro engine's own header comment states its versions of

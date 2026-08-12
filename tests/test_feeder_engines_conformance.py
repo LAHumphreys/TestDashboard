@@ -451,9 +451,10 @@ class PythonMicroFeederConformanceTest(unittest.TestCase):
     micro engine has no replay files and no --time-budget, so most
     shared scenarios assert behaviour it does not (and must not) have.
     What it shares with the full engines - skip-don't-abort, server
-    idempotency, the --build/streams_seen handshake, a bounded exit
-    against a dead server - is asserted here with micro semantics:
-    exit 1 leaves NOTHING on disk, and re-invocation is the recovery.
+    idempotency, a bounded exit against a dead server - is asserted
+    here with micro semantics: exit 1 leaves NOTHING on disk,
+    re-invocation is the recovery, and --build is stamped but never
+    acknowledged (the streams_seen trust cut is pinned below).
 
     The micro file ships its IMPLEMENT THIS section as STUBS (a site
     always writes its own flags and reader), so setUp builds the
@@ -603,7 +604,7 @@ class PythonMicroFeederConformanceTest(unittest.TestCase):
         self.assertIn("inserted=0", err2)
         self.assertIn("updated=1", err2)
 
-    def test_build_and_streams_seen_handshake(self) -> None:
+    def test_build_records_accepted(self) -> None:
         srv, storage, port = _start_real_server(self.tmp)
         self.addCleanup(storage.close)
         self.addCleanup(srv.server_close)
@@ -617,9 +618,17 @@ class PythonMicroFeederConformanceTest(unittest.TestCase):
             "--url", "http://127.0.0.1:{0}".format(port),
         ], self.tmp)
         self.assertEqual(rc, 0, err)
-        self.assertNotIn("no streams_seen key", err)
+        self.assertIn("inserted=1", err)
 
-    def test_old_server_without_streams_seen_fails_loudly(self) -> None:
+    def test_build_trusts_the_server_response(self) -> None:
+        """The agreed micro cut (2026-08-12): NO streams_seen
+        acknowledgement check. A --build run against a server whose
+        response has no streams_seen key at all - the old-server
+        signature the full engine refuses loudly - is trusted and
+        exits 0 here. Sites that need the old-server guard use the
+        full engine; this test pins the trust as a decision, not an
+        oversight, so a reappearing check is as visible as a missing
+        one."""
         control = _StubControl()
         control.queue(200, {
             "inserted": 1, "updated": 0, "unchanged": 0, "rejected": 0,
@@ -637,9 +646,11 @@ class PythonMicroFeederConformanceTest(unittest.TestCase):
             "--results", path,
             "--url", "http://127.0.0.1:{0}".format(port),
         ], self.tmp)
-        self.assertEqual(rc, 1, err)
-        self.assertIn("streams_seen", err)
-        self.assertEqual(self._files_created(), [])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("streams_seen", err)
+        self.assertEqual(control.request_count(), 1)
+        sent = json.loads(control.requests[0][1].decode("utf-8"))
+        self.assertEqual(sent["runs"][0]["build"], "rc-conf-2")
 
     def test_bounded_time_promise_against_a_blackholed_port(self) -> None:
         """With no --time-budget, the micro engine's documented ceiling
