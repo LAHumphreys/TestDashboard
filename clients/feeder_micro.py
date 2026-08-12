@@ -206,7 +206,10 @@ def sanity_error(raw: Any) -> Optional[str]:
             return f"{field}: required and must be a non-empty string"
     if raw.get("result") not in _RESULT_VALUES:
         expected = ", ".join(_RESULT_VALUES)
-        return f"result: unknown value {raw.get('result')!r} (expected one of {expected})"
+        return (
+            f"result: unknown value {raw.get('result')!r} "
+            f"(expected one of {expected})"
+        )
     if not isinstance(raw.get("output"), str):
         return "output: required and must be a string"
     return None
