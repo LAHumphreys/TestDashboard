@@ -2,8 +2,9 @@
 clients/feeder.py, clients/feeder.tcl, and the reduced
 clients/feeder_micro.py (PythonMicroFeederConformanceTest below - NOT
 a ScenarioMixin engine, because its semantics deliberately differ; its
-class docstring says how, and DropInTransplantTest is what holds the
-two Python engines to an interchangeable IMPLEMENT THIS contract).
+class docstring says how, and its setUp splice of feeder.py's drop-in
+section onto the micro engine is what holds the two Python engines to
+an interchangeable IMPLEMENT THIS contract).
 
 Each engine is driven as a SUBPROCESS - exactly how a contributing
 product's test framework would invoke it from its own cleanup phase -
@@ -444,50 +445,6 @@ def _split_on_banners(path: str) -> Tuple[str, str, str]:
     return text[:start], text[start:end], text[end:]
 
 
-class DropInTransplantTest(unittest.TestCase):
-    """A site's IMPLEMENT THIS section written for the full engine must
-    drop into the micro engine unchanged - that compatibility is the
-    micro engine's headline promise (its module docstring makes it),
-    and this test is what makes the promise safe to print: it splices
-    feeder.py's actual drop-in section onto feeder_micro.py's engine
-    and runs the hybrid end-to-end. Byte-equality of the two shipped
-    sections is deliberately NOT asserted - feeder.py's section obeys
-    that file's Python-2-parse rule (type comments), the micro one
-    uses ordinary annotations - so what is pinned is the contract:
-    same symbols, same arguments, interchangeable code."""
-
-    def test_full_engine_dropin_runs_on_the_micro_engine(self) -> None:
-        micro_head, _, micro_engine = _split_on_banners(FEEDER_MICRO_PY)
-        _, full_dropin, _ = _split_on_banners(FEEDER_PY)
-        tmp = tempfile.mkdtemp(prefix="feeder_transplant_")
-        self.addCleanup(shutil.rmtree, tmp, True)
-        hybrid = os.path.join(tmp, "feeder_hybrid.py")
-        with open(hybrid, "w", encoding="utf-8") as handle:
-            handle.write(micro_head + full_dropin + micro_engine)
-
-        results = os.path.join(tmp, "one.jsonl")
-        with open(results, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(ScenarioMixin._record("test_hybrid")) + "\n")
-        control = _StubControl()
-        control.queue(200, dict(_DEFAULT_OK_PAYLOAD, inserted=1))
-        httpd, port = _start_stub_server(control)
-        self.addCleanup(httpd.server_close)
-        self.addCleanup(httpd.shutdown)
-
-        completed = subprocess.run(
-            [sys.executable, hybrid,
-             "--environment", "conf-env-hybrid", "--results", results,
-             "--url", "http://127.0.0.1:{0}".format(port)],
-            cwd=tmp, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=30.0,
-        )
-        err = completed.stderr.decode("utf-8", "replace")
-        self.assertEqual(completed.returncode, 0, err)
-        self.assertEqual(control.request_count(), 1)
-        sent = json.loads(control.requests[0][1].decode("utf-8"))
-        self.assertEqual(sent["runs"][0]["test_name"], "test_hybrid")
-
-
 class PythonMicroFeederConformanceTest(unittest.TestCase):
     """clients/feeder_micro.py conformance, driven as a subprocess like
     the ScenarioMixin engines - but deliberately NOT via the mixin: the
@@ -496,16 +453,34 @@ class PythonMicroFeederConformanceTest(unittest.TestCase):
     What it shares with the full engines - skip-don't-abort, server
     idempotency, the --build/streams_seen handshake, a bounded exit
     against a dead server - is asserted here with micro semantics:
-    exit 1 leaves NOTHING on disk, and re-invocation is the recovery."""
+    exit 1 leaves NOTHING on disk, and re-invocation is the recovery.
+
+    The micro file ships its IMPLEMENT THIS section as STUBS (a site
+    always writes its own flags and reader), so setUp builds the
+    site-implemented copy every scenario drives: feeder.py's actual
+    drop-in section (--results JSON-lines reader) spliced onto the
+    micro engine. That splice doubles as the transplant guard for the
+    micro docstring's promise that a section written for the full
+    engine drops in unchanged - every scenario here re-proves it.
+    Byte-equality of the sections is deliberately not asserted:
+    feeder.py's obeys that file's Python-2-parse rule and defines a
+    DASHBOARD_URL the micro engine ignores (it requires --url); what
+    is pinned is the contract - same symbols, interchangeable code."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="feeder_micro_conformance_")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        micro_head, _, micro_engine = _split_on_banners(FEEDER_MICRO_PY)
+        _, full_dropin, _ = _split_on_banners(FEEDER_PY)
+        self.site_engine = os.path.join(self.tmp, "feeder_site.py")
+        with open(self.site_engine, "w", encoding="utf-8") as handle:
+            handle.write(micro_head + full_dropin + micro_engine)
 
     def _invoke(
         self, args: List[str], cwd: str, timeout: float = 30.0,
+        engine: Optional[str] = None,
     ) -> Tuple[int, str, str]:
-        cmd = [sys.executable, FEEDER_MICRO_PY] + args
+        cmd = [sys.executable, engine or self.site_engine] + args
         completed = subprocess.run(
             cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=timeout,
@@ -524,11 +499,12 @@ class PythonMicroFeederConformanceTest(unittest.TestCase):
         return path
 
     def _files_created(self) -> List[str]:
-        """Everything in the working directory that is not a fixture -
-        the micro engine must never create ANY file, replay or other."""
+        """Everything in the working directory that is not a fixture
+        (.jsonl results, the spliced feeder_site.py) - the micro engine
+        must never create ANY file, replay or other."""
         return sorted(
             name for name in os.listdir(self.tmp)
-            if not name.endswith(".jsonl")
+            if not name.endswith(".jsonl") and name != "feeder_site.py"
         )
 
     def test_bad_record_skipped_and_counted(self) -> None:
@@ -701,6 +677,32 @@ class PythonMicroFeederConformanceTest(unittest.TestCase):
                 "--url", "http://127.0.0.1:1", flag, value,
             ], self.tmp)
             self.assertEqual(rc, 2, flag)
+
+    def test_shipped_file_requires_url(self) -> None:
+        """No DASHBOARD_URL constant is honoured and no default exists:
+        an invocation without --url is a usage error, exit 2."""
+        rc, _out, err = self._invoke(
+            ["--environment", "conf-env"], self.tmp, engine=FEEDER_MICRO_PY,
+        )
+        self.assertEqual(rc, 2, err)
+        self.assertIn("--url", err)
+
+    def test_shipped_reader_stub_warns_and_sends_nothing(self) -> None:
+        """The file as shipped (IMPLEMENT THIS still stubs) must say so
+        and exit 0 without a single request - a copied-but-unfinished
+        feeder in a cleanup step is loud in the log, never a crash and
+        never a stray POST."""
+        control = _StubControl()
+        httpd, port = _start_stub_server(control)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        rc, _out, err = self._invoke([
+            "--environment", "conf-env",
+            "--url", "http://127.0.0.1:{0}".format(port),
+        ], self.tmp, engine=FEEDER_MICRO_PY)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("not been implemented", err)
+        self.assertEqual(control.request_count(), 0)
 
 
 # ----------------------------------------------------------------------

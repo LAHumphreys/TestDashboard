@@ -9,12 +9,12 @@ this repository like any other piece of test tooling.
 
 For the reviewer: what this file does, in full
 -----------------------------------------------
-- Reads this run's results from wherever ``read_records()`` (below)
-  says they are - the shipped default reads JSON-lines files named
-  with ``--results``.
-- POSTs them, in batches, to ONE configured URL: the ``DASHBOARD_URL``
-  constant below. Plain HTTP on the internal network; nothing else is
-  contacted.
+- Reads this run's results using the two functions in the IMPLEMENT
+  THIS section below - this site's own command-line flags and its own
+  reader, filled in where the shipped stubs are.
+- POSTs them, in batches, to the ONE URL given on the command line as
+  ``--url``. Plain HTTP on the internal network; nothing else is
+  contacted, and no URL is baked into the file.
 - Uses only the Python 3.6+ standard library. Nothing to install, no
   build step, no imports beyond the stdlib.
 - Writes no files, keeps no state, starts no background work. Its only
@@ -32,9 +32,10 @@ state file, or any persistence of its own.
 
 How the file is laid out
 -------------------------
-1. IMPLEMENT THIS (between the two banners): a ``DASHBOARD_URL``
-   constant, an ``add_site_arguments()`` hook and a ``read_records()``
-   function - the only part written per site.
+1. IMPLEMENT THIS (between the two banners): an
+   ``add_site_arguments()`` hook for this site's command-line flags,
+   and a ``read_records()`` function that yields this run's results.
+   Shipped as stubs - this is the only part written per site.
 2. DO NOT EDIT BELOW THIS LINE: the engine - argument parsing, a
    shallow sanity check, batching, retries, exit codes. To take a
    newer engine release later, paste it over everything below that
@@ -42,13 +43,15 @@ How the file is laid out
 
 Invoking it
 ------------
-    python3 feeder_micro.py --environment NAME [--build NAME] \\
-        [--results PATH ...]
+    python3 feeder_micro.py --url http://dashboard-host:8000 \\
+        --environment NAME [--build NAME] [this site's own flags]
 
-``--environment`` (required) names the test environment the suite ran
-on. ``--build`` marks the whole run as belonging to a release/RC build
-stream instead of mainline - pass the framework's branch/release
-parameter here. The engine stamps both onto every record; the reader
+``--url`` (required) is the dashboard's backend host:port - always
+given on the command line, never hardcoded. ``--environment``
+(required) names the test environment the suite ran on. ``--build``
+marks the whole run as belonging to a release/RC build stream instead
+of mainline - pass the framework's branch/release parameter here. The
+engine stamps environment and build onto every record; the reader
 never sets them.
 
 Exit codes (safe for a cleanup step to rely on):
@@ -59,8 +62,8 @@ Exit codes (safe for a cleanup step to rely on):
      failing, or (with --build) it was too old to understand build
      streams. Nothing is saved locally; re-invoking this feeder
      re-sends everything, safely.
-  2  the invocation itself was wrong (bad arguments, no dashboard URL
-     configured, or read_records() crashed) - nothing was sent.
+  2  the invocation itself was wrong (missing or bad arguments, or
+     read_records() crashed) - nothing was sent.
 
 One convention worth knowing before reading the code: the engine's
 version travels as the ``User-Agent`` header rather than inside the
@@ -71,12 +74,13 @@ contract.
 This is the reduced sibling of the full engine (``clients/feeder.py``
 in the testboard repository), which adds on-disk replay files, a
 wall-clock time budget and full client-side wire validation for sites
-that want them. The section between the banners follows the same
-contract in both files, and a section written for the full engine
-drops in here unchanged - a conformance test in the testboard
-repository transplants it on every push. (Going the other way, note
-that feeder.py is additionally kept parseable under Python 2; its
-header says what that means for annotations and f-strings.)
+that want them. The IMPLEMENT THIS contract is shared: a section
+written for the full engine drops in here unchanged - a conformance
+test in the testboard repository transplants it on every push -
+though its ``DASHBOARD_URL`` constant goes unused, because this
+engine always takes ``--url``. (Going the other way, note that
+feeder.py is additionally kept parseable under Python 2; its header
+says what that means for annotations and f-strings.)
 """
 
 import argparse
@@ -103,89 +107,45 @@ CONTRACT_VERSION = "1"
 # two worked examples, and the acceptance checklist.
 # ============================================================================
 
-#: Your dashboard's backend host:port - the DIRECT port, never an nginx
-#: front door and never a URL prefix (feeders always speak bare paths).
-#: Override at invocation time with --url, mainly useful for testing
-#: against a scratch server without editing this constant.
-DASHBOARD_URL = "http://localhost:8000"  # CHANGE ME
-
 
 def add_site_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add whatever arguments read_records() needs to find this run's
-    results. The worked convention is a single ``--results PATH``
-    (repeatable); add more if your source needs them (e.g. --log-dir,
-    --build-id). Called once, before argument parsing - argparse
-    validates for you, so read_records() can assume args is well-formed.
+    """Add the command-line flags read_records() needs to find this
+    run's results - a log directory, a results file, a run id,
+    whatever fits this site's test framework. Called once, before
+    argument parsing - argparse validates for you, so read_records()
+    can assume args is well-formed.
+
+    Example:
+        parser.add_argument("--log-dir", required=True, metavar="DIR",
+                            help="directory holding this run's logs")
     """
-    parser.add_argument(
-        "--results", action="append", default=None, metavar="PATH",
-        help=(
-            "a results file to read (repeatable). The shipped default "
-            "reader below treats each as JSON-lines: one run-record "
-            "object per line, in the exact /api/import transport "
-            "schema (see docs/FEEDER_TEMPLATE.md). Replace "
-            "read_records() to read your own format instead"
-        ),
-    )
+    pass
 
 
 def read_records(args: argparse.Namespace) -> Iterator[Dict[str, Any]]:
-    """Yield one raw transport dict per test run for THIS invocation.
-
-    Plain dicts in the /api/import RunRecord schema: result,
+    """Yield one dict per test run for THIS invocation, in the
+    /api/import RunRecord schema: script, test_name, result,
     start_time, end_time, output, and optionally source_link /
     known_failure_reason. Do NOT set "environment" or "build" - the
     engine stamps --environment (and --build, if given) onto every
     record after this function returns, overriding anything set here.
 
     Must be a generator (``yield``) or return an iterator, and must
-    never raise because ONE record is bad: log a warning and skip it -
-    the engine validates each record independently anyway, so
-    over-reporting (yielding something malformed) is fine and expected.
-    What must never happen is this function itself crashing; if your
-    source cannot be opened at all, log the problem and return without
-    yielding anything rather than raising.
+    never raise because ONE record is bad: log a warning, skip it, and
+    keep going - the engine checks each record independently anyway,
+    so over-reporting (yielding something malformed) is fine and
+    expected. What must never happen is this function itself crashing;
+    if your source cannot be opened at all, log the problem and return
+    without yielding anything rather than raising.
 
-    The shipped default below is the "results-file reader" worked
-    example from docs/FEEDER_TEMPLATE.md: JSON-lines from --results,
-    passed straight through with no site-specific mapping at all. A
-    second worked example (scraping a plain-text test log) is in the
-    template; replace this function with whichever shape - or neither -
-    fits your test system.
+    See docs/FEEDER_TEMPLATE.md in the testboard repository for the
+    full schema and two complete worked readers.
     """
-    log = logging.getLogger("testboard_feeder")
-    if not args.results:
-        log.warning(
-            "no --results given and read_records() was not customized; "
-            "nothing to read"
-        )
-        return
-    for path in args.results:
-        try:
-            handle = open(path, "r", encoding="utf-8", errors="replace")
-        except OSError as exc:
-            log.warning("cannot open %s (%s); skipping it", path, exc)
-            continue
-        with handle:
-            for line_number, line in enumerate(handle, 1):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    obj = json.loads(stripped)
-                except ValueError as exc:
-                    log.warning(
-                        "%s:%d: skipping malformed JSON line (%s)",
-                        path, line_number, exc,
-                    )
-                    continue
-                if not isinstance(obj, dict):
-                    log.warning(
-                        "%s:%d: skipping non-object JSON line (got %s)",
-                        path, line_number, type(obj).__name__,
-                    )
-                    continue
-                yield obj
+    logging.getLogger("testboard_feeder").warning(
+        "read_records() has not been implemented for this site yet; "
+        "nothing to read"
+    )
+    return iter(())
 
 
 # ============================================================================
@@ -448,6 +408,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="the environment this suite execution ran on (required)",
     )
     parser.add_argument(
+        "--url", required=True, metavar="URL",
+        help=(
+            "the dashboard's backend host:port (required) - the DIRECT "
+            "port, never an nginx front door and never a URL prefix "
+            "(feeders always speak bare paths)"
+        ),
+    )
+    parser.add_argument(
         "--build", default=None, metavar="NAME",
         help=(
             "file every record under build stream NAME instead of "
@@ -460,10 +428,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="check records and print what would be sent; POST nothing",
-    )
-    parser.add_argument(
-        "--url", default=None, metavar="URL",
-        help="override the DASHBOARD_URL constant above (mainly for testing)",
     )
     parser.add_argument(
         "--http-timeout", type=float, default=HTTP_TIMEOUT_SECONDS,
@@ -506,12 +470,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             log.error("--build must not be empty or whitespace-only")
             return 2
 
-    raw_url = (args.url or DASHBOARD_URL or "").strip()
+    raw_url = args.url.strip()
     if not raw_url:
-        log.error(
-            "no dashboard URL: set DASHBOARD_URL at the top of this file, "
-            "or pass --url"
-        )
+        log.error("--url must not be empty or whitespace-only")
         return 2
     url = _normalize_url(raw_url)
 

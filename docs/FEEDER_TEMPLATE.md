@@ -42,7 +42,9 @@ ask a site to touch it.
 
 **What you implement, concretely:**
 
-- A `DASHBOARD_URL` constant — the dashboard's backend `host:port`.
+- A `DASHBOARD_URL` constant — the dashboard's backend `host:port`
+  (`feeder.py` and `feeder.tcl` only; `feeder_micro.py` has no such
+  constant and takes a mandatory `--url` on every invocation instead).
 - Whatever command-line flags your reader needs to find this run's results —
   the worked convention is a single `--results PATH`. In `feeder.py` this is
   a small `add_site_arguments(parser)` hook; in `feeder.tcl` it is a flat
@@ -58,9 +60,9 @@ not add fields, flags, or files beyond what is described here.
 ### Choosing between the two Python engines
 
 Both Python files carry the **same IMPLEMENT THIS contract** — the same
-three symbols, the same arguments, the same shipped default reader — and a
-section written for `feeder.py` drops into `feeder_micro.py` unchanged (a
-conformance test in the testboard repository transplants it on every push).
+hook and reader symbols, called the same way — and a section written for
+`feeder.py` drops into `feeder_micro.py` unchanged (the conformance suite
+in the testboard repository transplants it on every push).
 Write your reader once; it runs on both. One asymmetry: `feeder.py` is
 additionally kept parseable under Python 2 (type comments, no f-strings —
 its header explains), while `feeder_micro.py` deliberately is not and uses
@@ -78,6 +80,8 @@ it exists. What the micro engine gives up, and what stands in for it:
 | Full client-side validation mirroring the server's rules; `--dry-run` catches bad records locally | A shallow sanity check (required fields present, `result` recognised); the server's per-record rejections are reported in the log instead |
 | Hard wall-clock ceiling: `--time-budget` + `--http-timeout`, ~115 s worst case | No budget flag; worst case is 3 × `--http-timeout` + two 2 s pauses per batch (~49 s by default, one batch is typical) |
 | Exponential backoff between retries | A flat 2 s pause |
+| A `DASHBOARD_URL` constant, with `--url` as an optional override | **No hardcoded URL**: `--url` is mandatory on every invocation |
+| Ships the `--results` JSON-lines reader as its worked default section | **Ships stubs** — every site writes its own flags and reader (in practice they all do anyway); the unmodified file warns "not implemented" and sends nothing |
 
 Identical in both: the invocation model, `--environment`/`--build`
 stamping, the `--build` acknowledgement (an old server is a loud exit 1 in
@@ -85,7 +89,9 @@ both, never a silent misfile into mainline), batching (500 records / 8 MB),
 the exit-code meanings of 0 and 2, and the wire contract. Where the rest of
 this document says "replay file" or "time budget", read it as full-engine
 behaviour; the micro engine's own header comment states its versions of
-those promises.
+those promises. (A full-engine section transplanted into the micro engine
+keeps its `DASHBOARD_URL` constant as harmless dead weight — the micro
+engine never reads it.)
 
 ---
 
