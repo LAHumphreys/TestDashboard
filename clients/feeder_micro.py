@@ -180,6 +180,13 @@ MAX_BATCH_BYTES = 8 * 1024 * 1024
 #: in the early-flush arithmetic above - approximate is fine.
 _RECORD_OVERHEAD_BYTES = 400
 
+#: How many per-record rejections to quote in full in the log before
+#: summarising the rest as a count.
+_MAX_LOGGED_REJECTIONS = 5
+
+#: Longest piece of a server error response quoted into one log line.
+_MAX_ERROR_TEXT_CHARS = 200
+
 #: The four result values the dashboard understands, and the fields
 #: every record must carry as non-empty strings.
 _RESULT_VALUES = ("PASS", "FAIL", "FAILED_AS_EXPECTED", "UNEXPECTED_PASS")
@@ -266,11 +273,11 @@ def _describe_connection_error(url: str, exc: BaseException) -> str:
 
 
 def _describe_http_error(status: int, response_body: bytes) -> str:
-    """One readable sentence for a non-200, with the response text cut
-    to a size that keeps the log line useful."""
+    """One readable sentence for a non-200 response, quoting what the
+    server said, cut to a size that keeps the log line useful."""
     text = response_body.decode("utf-8", errors="replace")
-    if len(text) > 200:
-        text = text[:200] + "...[truncated]"
+    if len(text) > _MAX_ERROR_TEXT_CHARS:
+        text = text[:_MAX_ERROR_TEXT_CHARS] + "...[truncated]"
     return f"HTTP {status} from the server (response: {text})"
 
 
@@ -294,30 +301,43 @@ def _decode_response(
 
 
 class _Attempt(NamedTuple):
-    """What one POST attempt came back with."""
+    """What one POST attempt came back with.
 
-    payload: Optional[Dict[str, Any]]  # set when the batch was accepted
-    failure: str                       # why not, when payload is None
-    retryable: bool                    # could another try change this?
+    ``payload`` is set - possibly to {} - when the batch was accepted.
+    Otherwise ``failure`` says what went wrong, and ``retryable``
+    whether another try could change the answer.
+    """
+
+    payload: Optional[Dict[str, Any]]
+    failure: str
+    retryable: bool
 
 
 def _attempt_post(
     url: str, body: bytes, headers: Dict[str, str], timeout: float,
     log: logging.Logger, label: str,
 ) -> _Attempt:
-    """One POST. A payload (possibly {}) means the batch was accepted;
-    otherwise ``failure`` says why not, and ``retryable`` whether
-    another try could change the answer - yes for connection errors
-    and HTTP 5xx, no for a 4xx (the request itself was rejected, and
-    re-sending the same request cannot help)."""
+    """Make one POST and classify what came back.
+
+    Connection errors and HTTP 5xx are worth retrying; a 4xx is not,
+    because the request itself was rejected and re-sending the same
+    request cannot help.
+    """
     try:
         status, response_body = _post(url, body, headers, timeout)
     except Exception as exc:
-        return _Attempt(None, _describe_connection_error(url, exc), True)
+        return _Attempt(
+            payload=None,
+            failure=_describe_connection_error(url, exc),
+            retryable=True,
+        )
     if status == 200:
-        return _Attempt(_decode_response(response_body, log, label), "", False)
+        payload = _decode_response(response_body, log, label)
+        return _Attempt(payload=payload, failure="", retryable=False)
     return _Attempt(
-        None, _describe_http_error(status, response_body), status >= 500
+        payload=None,
+        failure=_describe_http_error(status, response_body),
+        retryable=status >= 500,
     )
 
 
@@ -325,54 +345,81 @@ def _send_batch(
     url: str, body: bytes, headers: Dict[str, str], http_timeout: float,
     log: logging.Logger, label: str,
 ) -> Optional[Dict[str, Any]]:
-    """Deliver one batch, riding out brief trouble; return the server's
-    response object once accepted, or None once out of attempts (or on
-    a failure a retry cannot fix)."""
-    for attempt_number in range(1, MAX_ATTEMPTS + 1):
-        attempt = _attempt_post(url, body, headers, http_timeout, log, label)
+    """Deliver one batch, riding out brief trouble.
+
+    Returns the server's response object once accepted, or None once
+    out of attempts (or on a failure a retry cannot fix).
+    """
+    attempts_used = 0
+    while True:
+        attempts_used += 1
+        attempt = _attempt_post(
+            url, body, headers, http_timeout, log, label
+        )
         if attempt.payload is not None:
             return attempt.payload
-        out_of_attempts = attempt_number == MAX_ATTEMPTS
-        if out_of_attempts or not attempt.retryable:
+        no_attempts_left = attempts_used == MAX_ATTEMPTS
+        if no_attempts_left or not attempt.retryable:
             log.error("%s: giving up (%s)", label, attempt.failure)
             return None
         log.warning(
             "%s: attempt %d of %d failed: %s - retrying in %.0fs",
-            label, attempt_number, MAX_ATTEMPTS, attempt.failure,
+            label, attempts_used, MAX_ATTEMPTS, attempt.failure,
             RETRY_PAUSE_SECONDS,
         )
         time.sleep(RETRY_PAUSE_SECONDS)
-    return None  # not reached: every pass through the loop returns above
+
+
+class _BatchCounts(NamedTuple):
+    """The server's verdict on one accepted batch."""
+
+    inserted: int
+    updated: int
+    rejected: int
+
+
+def _count(payload: Dict[str, Any], key: str) -> int:
+    """A count from the server response, read defensively: absent or
+    not a number means zero - a count is never worth crashing over."""
+    value = payload.get(key)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
 
 
 def _report_payload(
     payload: Dict[str, Any], label: str, log: logging.Logger,
-) -> Tuple[int, int, int]:
-    """Log what the server said about an accepted batch and return
-    (inserted, updated, rejected). The first few per-record rejections
-    are logged in full - enough to see what was wrong from the log
-    alone - and the rest are summarised as a count."""
-    inserted = int(payload.get("inserted", 0) or 0)
-    updated = int(payload.get("updated", 0) or 0)
-    rejected = int(payload.get("rejected", 0) or 0)
+) -> _BatchCounts:
+    """Log what the server said about an accepted batch.
+
+    The first few per-record rejections are quoted in full - enough to
+    see what was wrong from the log alone - and the rest are
+    summarised as a count.
+    """
+    counts = _BatchCounts(
+        inserted=_count(payload, "inserted"),
+        updated=_count(payload, "updated"),
+        rejected=_count(payload, "rejected"),
+    )
     errors = payload.get("errors", [])
     if isinstance(errors, list):
-        for error in errors[:5]:
+        for error in errors[:_MAX_LOGGED_REJECTIONS]:
             if isinstance(error, dict):
                 log.warning(
                     "%s: server rejected record index %s: %s",
                     label, error.get("index"), error.get("error"),
                 )
-        if len(errors) > 5:
+        unlogged = len(errors) - _MAX_LOGGED_REJECTIONS
+        if unlogged > 0:
             log.warning(
                 "%s: %d more rejected record(s) not shown individually",
-                label, len(errors) - 5,
+                label, unlogged,
             )
     log.info(
-        "%s: inserted=%d updated=%d rejected=%d", label, inserted, updated,
-        rejected,
+        "%s: inserted=%d updated=%d rejected=%d",
+        label, counts.inserted, counts.updated, counts.rejected,
     )
-    return (inserted, updated, rejected)
+    return counts
 
 
 def _batches(
@@ -384,7 +431,8 @@ def _batches(
     batch_bytes = 0
     for record in records:
         batch.append(record)
-        batch_bytes += len(record.get("output", "")) + _RECORD_OVERHEAD_BYTES
+        output_size = len(record.get("output", ""))
+        batch_bytes += output_size + _RECORD_OVERHEAD_BYTES
         if len(batch) >= batch_size or batch_bytes >= max_bytes:
             yield batch
             batch = []
@@ -495,6 +543,17 @@ class _SendOutcome(NamedTuple):
     failed_batches: int
 
 
+def _argparse_exit_code(exc: SystemExit) -> int:
+    """argparse exits rather than returns - code 0 for --help, code 2
+    for usage errors. main() converts the exit back into a return
+    value, so callers of main() always get an int."""
+    if exc.code is None:
+        return 0
+    if isinstance(exc.code, int):
+        return exc.code
+    return 2
+
+
 def _configured_logger(verbose: bool) -> logging.Logger:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -515,11 +574,19 @@ def _cleaned_invocation(args: argparse.Namespace) -> _Invocation:
     if args.build is not None:
         build = args.build.strip()
         if not build:
-            raise _UsageError("--build must not be empty or whitespace-only")
+            raise _UsageError(
+                "--build must not be empty or whitespace-only"
+            )
     url = args.url.strip()
     if not url:
-        raise _UsageError("--url must not be empty or whitespace-only")
-    return _Invocation(environment, build, _normalize_url(url))
+        raise _UsageError(
+            "--url must not be empty or whitespace-only"
+        )
+    return _Invocation(
+        environment=environment,
+        build=build,
+        url=_normalize_url(url),
+    )
 
 
 def _stamped(raw: Any, invocation: _Invocation) -> Any:
@@ -543,12 +610,15 @@ def _screened_records(
     fatal; the reader itself crashing is fatal, because a half-read
     results source cannot be told apart from a complete one."""
     try:
+        # iter() both accepts whatever iterable read_records() chose to
+        # return and fails HERE, catchably, if it returned something
+        # that is not iterable at all.
         raw_iterator = iter(read_records(args))
     except Exception as exc:
         if args.verbose:
             traceback.print_exc()
         raise _UsageError(
-            f"read_records() raised before producing anything: "
+            "read_records() raised before producing anything: "
             f"{type(exc).__name__}: {exc}"
         )
     read = 0
@@ -571,7 +641,7 @@ def _screened_records(
             f"read_records() crashed after producing {read} record(s): "
             f"{type(exc).__name__}: {exc}"
         )
-    return _Gathered(read, skipped, records)
+    return _Gathered(read=read, skipped=skipped, records=records)
 
 
 def _dry_run_report(gathered: _Gathered, log: logging.Logger) -> int:
@@ -606,7 +676,11 @@ def _send_all(
     one failed batch never stops the next - whatever the server did
     accept stays accepted."""
     headers = _headers()
-    sent = inserted = updated = rejected = failed = 0
+    sent = 0
+    inserted = 0
+    updated = 0
+    rejected = 0
+    failed_batches = 0
     for batch in _batches(records, BATCH_SIZE, MAX_BATCH_BYTES):
         body = json.dumps({"runs": batch}).encode("utf-8")
         label = f"batch of {len(batch)} records"
@@ -617,14 +691,20 @@ def _send_all(
                 "re-invoke this feeder to re-send it (safe: the server "
                 "skips anything it already has)", label,
             )
-            failed += 1
+            failed_batches += 1
             continue
         counts = _report_payload(payload, label, log)
         sent += len(batch)
-        inserted += counts[0]
-        updated += counts[1]
-        rejected += counts[2]
-    return _SendOutcome(sent, inserted, updated, rejected, failed)
+        inserted += counts.inserted
+        updated += counts.updated
+        rejected += counts.rejected
+    return _SendOutcome(
+        sent=sent,
+        inserted=inserted,
+        updated=updated,
+        rejected=rejected,
+        failed_batches=failed_batches,
+    )
 
 
 def _log_summary(
@@ -647,12 +727,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        # argparse exits for --help and usage errors; return its code
-        # instead, so main() always returns rather than raising.
-        code = exc.code
-        if code is None:
-            return 0
-        return code if isinstance(code, int) else 2
+        return _argparse_exit_code(exc)
 
     log = _configured_logger(args.verbose)
     try:
@@ -669,7 +744,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         gathered.records, invocation.url, args.http_timeout, log
     )
     _log_summary(gathered, outcome, log)
-    return 1 if outcome.failed_batches else 0
+    if outcome.failed_batches:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
