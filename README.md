@@ -865,7 +865,9 @@ JSON shape (score and failure_rate rounded to 4 decimal places, durations to 3):
 
 **Onboarding a new product?** See
 **[docs/FEEDER_TEMPLATE.md](docs/FEEDER_TEMPLATE.md)** first: a single
-distributable file (`clients/feeder.py` or vanilla-Tcl `clients/feeder.tcl`)
+distributable file (`clients/feeder.py`, its reduced sibling
+`clients/feeder_micro.py` for products whose review gates balk at the full
+engine, or vanilla-Tcl `clients/feeder.tcl`)
 that a product checks into its own repository and its test framework invokes
 once per suite execution, from its own cleanup phase — no checkout of this
 repo required. The rest of this section describes the older, checkout-based

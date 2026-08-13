@@ -497,31 +497,42 @@ def _annotation_failures(name: str, module: object) -> Tuple[int, List[str]]:
 
 
 class ClientFeederAnnotationsTest(unittest.TestCase):
-    """``clients/feeder.py`` is not part of any package - "clients" has
-    no ``__init__.py`` (see tests/test_feeder_client_engine.py's module
-    docstring) - so :class:`AnnotationsEvaluateTest`'s ``pkgutil``-based
-    sweep never loads it, and the file would otherwise get the static
-    3.6-grammar checks above but NOT the runtime "annotations actually
-    evaluate" proof every other shipped module gets. This closes that
-    gap the same way: load the file, force every function's and
-    method's ``__annotations__``, on the interpreter actually running
-    the suite.
+    """The ``clients/`` engines are not part of any package - "clients"
+    has no ``__init__.py`` (see tests/test_feeder_client_engine.py's
+    module docstring) - so :class:`AnnotationsEvaluateTest`'s
+    ``pkgutil``-based sweep never loads them, and the files would
+    otherwise get the static 3.6-grammar checks above but NOT the
+    runtime "annotations actually evaluate" proof every other shipped
+    module gets. This closes that gap the same way: load each file,
+    force every function's and method's ``__annotations__``, on the
+    interpreter actually running the suite.
     """
+
+    #: (filename, floor on annotated defs) - the floor is what catches
+    #: a sweep that silently loaded nothing. The micro engine's is
+    #: lower because the whole file is deliberately smaller (WP-30).
+    _ENGINES = (("feeder.py", 15), ("feeder_micro.py", 8))
 
     def test_client_feeder_annotations_evaluate(self) -> None:
         import importlib.util
 
-        path = os.path.join(REPO_ROOT, "clients", "feeder.py")
-        spec = importlib.util.spec_from_file_location("client_feeder_annotations", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        for filename, floor in self._ENGINES:
+            path = os.path.join(REPO_ROOT, "clients", filename)
+            module_name = "client_annotations_" + filename.replace(".", "_")
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
 
-        checked, failures = _annotation_failures("client_feeder_annotations", module)
-        self.assertEqual(failures, [], "annotations fail to evaluate")
-        self.assertGreater(
-            checked, 15, "annotation sweep of clients/feeder.py covered "
-            "almost nothing - is the module loading correctly?"
-        )
+            checked, failures = _annotation_failures(module_name, module)
+            self.assertEqual(
+                failures, [],
+                "annotations fail to evaluate in clients/" + filename,
+            )
+            self.assertGreater(
+                checked, floor,
+                "annotation sweep of clients/{0} covered almost nothing "
+                "- is the module loading correctly?".format(filename),
+            )
 
 
 #: Everything the interpreter provides without an import. An annotation
