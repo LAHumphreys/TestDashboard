@@ -195,7 +195,7 @@ _REQUIRED_STRING_FIELDS = (
 )
 
 
-def sanity_error(raw: Any) -> Optional[str]:
+def _validate_record(raw: Any) -> Optional[str]:
     """Return why ``raw`` cannot be sent, or None if it looks sendable.
 
     Deliberately shallow: required fields present, result value
@@ -208,16 +208,19 @@ def sanity_error(raw: Any) -> Optional[str]:
     """
     if not isinstance(raw, dict):
         return f"record must be a JSON object, got {type(raw).__name__}"
+
     for field in _REQUIRED_STRING_FIELDS:
         value = raw.get(field)
         if not isinstance(value, str) or not value.strip():
             return f"{field}: required and must be a non-empty string"
+
     if raw.get("result") not in _RESULT_VALUES:
         expected = ", ".join(_RESULT_VALUES)
         return (
             f"result: unknown value {raw.get('result')!r} "
             f"(expected one of {expected})"
         )
+
     if not isinstance(raw.get("output"), str):
         return "output: required and must be a string"
     return None
@@ -236,18 +239,21 @@ def _normalize_url(url: str) -> str:
     return trimmed
 
 
-def _post(
-    url: str, body: bytes, headers: Dict[str, str], timeout: float,
-) -> Tuple[int, bytes]:
+def _post(url: str,
+          body: bytes,
+          headers: Dict[str, str],
+          timeout: float) -> Tuple[int, bytes]:
     """POST once. HTTP error statuses are returned like any other
     response; only transport failures (refused, timed out) raise."""
-    request = urllib.request.Request(
-        url, data=body, headers=headers, method="POST"
-    )
+
+    request = (
+        urllib.request.Request(url, data=body, headers=headers, method="POST"))
+
     try:
         response = urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
     try:
         return response.getcode(), response.read()
     finally:
@@ -258,13 +264,22 @@ def _describe_connection_error(url: str, exc: BaseException) -> str:
     """One readable sentence for a failed connection, naming the two
     commonest causes (timeout, DNS) directly instead of via a nested
     exception repr."""
+    # urllib never raises the underlying OS error directly: a refused
+    # connection, timeout or DNS failure arrives wrapped in URLError,
+    # with the real cause attached as its .reason - usually the
+    # original exception, occasionally a plain string. Unwrap it only
+    # when it IS an exception, so the isinstance checks below see the
+    # real socket error. HTTPError (a URLError subclass) is excluded:
+    # its .reason is just the status phrase ("Not Found"), and _post()
+    # returns HTTP error statuses rather than raising them anyway.
     reason: BaseException = exc
-    if isinstance(exc, urllib.error.URLError) and not isinstance(
-        exc, urllib.error.HTTPError
-    ):
+
+    if (isinstance(exc, urllib.error.URLError) and
+        not isinstance(exc, urllib.error.HTTPError)):
         inner = getattr(exc, "reason", None)
         if isinstance(inner, BaseException):
             reason = inner
+
     if isinstance(reason, socket.timeout):
         return f"request to {url} timed out"
     if isinstance(reason, socket.gaierror):
@@ -278,12 +293,13 @@ def _describe_http_error(status: int, response_body: bytes) -> str:
     text = response_body.decode("utf-8", errors="replace")
     if len(text) > _MAX_ERROR_TEXT_CHARS:
         text = text[:_MAX_ERROR_TEXT_CHARS] + "...[truncated]"
+
     return f"HTTP {status} from the server (response: {text})"
 
 
-def _decode_response(
-    response_body: bytes, log: logging.Logger, label: str,
-) -> Dict[str, Any]:
+def _decode_response(response_body: bytes,
+                     log: logging.Logger,
+                     label: str) -> Dict[str, Any]:
     """The 200 response decoded, or {} - with a warning - when the
     body was not a JSON object. Accepted-but-unreadable is still
     accepted; it only costs the per-batch counts in the log."""
@@ -291,6 +307,7 @@ def _decode_response(
         payload = json.loads(response_body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         payload = None
+
     if not isinstance(payload, dict):
         log.warning(
             "%s: server returned 200 but the response body was not a "
@@ -307,16 +324,17 @@ class _Attempt(NamedTuple):
     Otherwise ``failure`` says what went wrong, and ``retryable``
     whether another try could change the answer.
     """
-
     payload: Optional[Dict[str, Any]]
     failure: str
     retryable: bool
 
 
-def _attempt_post(
-    url: str, body: bytes, headers: Dict[str, str], timeout: float,
-    log: logging.Logger, label: str,
-) -> _Attempt:
+def _attempt_post(url: str,
+                  body: bytes,
+                  headers: Dict[str, str],
+                  timeout: float,
+                  log: logging.Logger,
+                  label: str) -> _Attempt:
     """Make one POST and classify what came back.
 
     Connection errors and HTTP 5xx are worth retrying; a 4xx is not,
@@ -331,6 +349,7 @@ def _attempt_post(
             failure=_describe_connection_error(url, exc),
             retryable=True,
         )
+
     if status == 200:
         payload = _decode_response(response_body, log, label)
         return _Attempt(payload=payload, failure="", retryable=False)
@@ -341,33 +360,38 @@ def _attempt_post(
     )
 
 
-def _send_batch(
-    url: str, body: bytes, headers: Dict[str, str], http_timeout: float,
-    log: logging.Logger, label: str,
-) -> Optional[Dict[str, Any]]:
+def _send_batch(url: str,
+                body: bytes,
+                headers: Dict[str, str],
+                http_timeout: float,
+                log: logging.Logger,
+                label: str) -> Optional[Dict[str, Any]]:
     """Deliver one batch, riding out brief trouble.
 
     Returns the server's response object once accepted, or None once
     out of attempts (or on a failure a retry cannot fix).
     """
     attempts_used = 0
-    while True:
+    payload: Optional[Dict[str, Any]] = None
+    keep_trying = True
+
+    while payload is None and keep_trying:
         attempts_used += 1
-        attempt = _attempt_post(
-            url, body, headers, http_timeout, log, label
-        )
+        attempt = _attempt_post(url, body, headers, http_timeout, log, label)
+
         if attempt.payload is not None:
-            return attempt.payload
-        no_attempts_left = attempts_used == MAX_ATTEMPTS
-        if no_attempts_left or not attempt.retryable:
+            payload = attempt.payload
+        elif attempts_used >= MAX_ATTEMPTS or not attempt.retryable:
             log.error("%s: giving up (%s)", label, attempt.failure)
-            return None
-        log.warning(
-            "%s: attempt %d of %d failed: %s - retrying in %.0fs",
-            label, attempts_used, MAX_ATTEMPTS, attempt.failure,
-            RETRY_PAUSE_SECONDS,
-        )
-        time.sleep(RETRY_PAUSE_SECONDS)
+            keep_trying = False
+        else:
+            log.warning(
+                "%s: attempt %d of %d failed: %s - retrying in %.0fs",
+                label, attempts_used, MAX_ATTEMPTS, attempt.failure,
+                RETRY_PAUSE_SECONDS)
+            time.sleep(RETRY_PAUSE_SECONDS)
+
+    return payload
 
 
 class _BatchCounts(NamedTuple):
@@ -387,9 +411,9 @@ def _count(payload: Dict[str, Any], key: str) -> int:
     return 0
 
 
-def _report_payload(
-    payload: Dict[str, Any], label: str, log: logging.Logger,
-) -> _BatchCounts:
+def _report_payload(payload: Dict[str, Any],
+                    label: str,
+                    log: logging.Logger) -> _BatchCounts:
     """Log what the server said about an accepted batch.
 
     The first few per-record rejections are quoted in full - enough to
@@ -401,6 +425,7 @@ def _report_payload(
         updated=_count(payload, "updated"),
         rejected=_count(payload, "rejected"),
     )
+
     errors = payload.get("errors", [])
     if isinstance(errors, list):
         for error in errors[:_MAX_LOGGED_REJECTIONS]:
@@ -415,6 +440,7 @@ def _report_payload(
                 "%s: %d more rejected record(s) not shown individually",
                 label, unlogged,
             )
+
     log.info(
         "%s: inserted=%d updated=%d rejected=%d",
         label, counts.inserted, counts.updated, counts.rejected,
@@ -422,21 +448,24 @@ def _report_payload(
     return counts
 
 
-def _batches(
-    records: List[Dict[str, Any]], batch_size: int, max_bytes: int,
-) -> Iterator[List[Dict[str, Any]]]:
+def _batches(records: List[Dict[str, Any]],
+             batch_size: int,
+             max_bytes: int) -> Iterator[List[Dict[str, Any]]]:
     """Group records into lists of at most ``batch_size``, flushing a
     batch early when its estimated encoded size reaches ``max_bytes``."""
     batch: List[Dict[str, Any]] = []
     batch_bytes = 0
+
     for record in records:
         batch.append(record)
         output_size = len(record.get("output", ""))
         batch_bytes += output_size + _RECORD_OVERHEAD_BYTES
+
         if len(batch) >= batch_size or batch_bytes >= max_bytes:
             yield batch
             batch = []
             batch_bytes = 0
+
     if batch:
         yield batch
 
@@ -516,7 +545,7 @@ class _UsageError(Exception):
     """The invocation itself is wrong - exit code 2, nothing sent."""
 
 
-class _Invocation(NamedTuple):
+class _Arguments(NamedTuple):
     """The engine-owned arguments, cleaned: stripped, never blank, and
     the URL already pointing at the import endpoint."""
 
@@ -562,7 +591,7 @@ def _configured_logger(verbose: bool) -> logging.Logger:
     return logging.getLogger("testboard_feeder")
 
 
-def _cleaned_invocation(args: argparse.Namespace) -> _Invocation:
+def _cleaned_args(args: argparse.Namespace) -> _Arguments:
     """argparse guarantees the required flags are present; this guards
     against the present-but-blank, and normalizes the URL."""
     environment = args.environment.strip()
@@ -582,33 +611,34 @@ def _cleaned_invocation(args: argparse.Namespace) -> _Invocation:
         raise _UsageError(
             "--url must not be empty or whitespace-only"
         )
-    return _Invocation(
+    return _Arguments(
         environment=environment,
         build=build,
         url=_normalize_url(url),
     )
 
 
-def _stamped(raw: Any, invocation: _Invocation) -> Any:
+def _stamped(raw: Any, parameters: _Arguments) -> Any:
     """A copy of ``raw`` with the engine-owned fields applied - the
     command line is their single source of truth, whatever the reader
-    set. Non-dicts pass through for sanity_error() to describe."""
+    set. Non-dicts pass through for _validate_record() to describe."""
     if not isinstance(raw, dict):
         return raw
     record = dict(raw)
-    record["environment"] = invocation.environment
-    if invocation.build is not None:
-        record["build"] = invocation.build
+    record["environment"] = parameters.environment
+    if parameters.build is not None:
+        record["build"] = parameters.build
     return record
 
 
-def _screened_records(
-    args: argparse.Namespace, invocation: _Invocation, log: logging.Logger,
-) -> _Gathered:
+def _screened_records(args: argparse.Namespace,
+                      parameters: _Arguments,
+                      log: logging.Logger) -> _Gathered:
     """Run the site's read_records(), stamp each record, and screen it
-    through sanity_error(). A bad record is logged and skipped, never
-    fatal; the reader itself crashing is fatal, because a half-read
-    results source cannot be told apart from a complete one."""
+    through _validate_record(). A bad record is logged and skipped,
+    never fatal; the reader itself crashing is fatal, because a
+    half-read results source cannot be told apart from a complete
+    one."""
     try:
         # iter() both accepts whatever iterable read_records() chose to
         # return and fails HERE, catchably, if it returned something
@@ -621,19 +651,23 @@ def _screened_records(
             "read_records() raised before producing anything: "
             f"{type(exc).__name__}: {exc}"
         )
+
     read = 0
     skipped = 0
     records: List[Dict[str, Any]] = []
+
     try:
         for raw in raw_iterator:
             read += 1
-            record = _stamped(raw, invocation)
-            problem = sanity_error(record)
+            record = _stamped(raw, parameters)
+            problem = _validate_record(record)
+
             if problem is not None:
                 skipped += 1
                 log.warning("skipping record %d: %s", read, problem)
-                continue
-            records.append(record)
+            else:
+                records.append(record)
+
     except Exception as exc:
         if args.verbose:
             traceback.print_exc()
@@ -641,6 +675,7 @@ def _screened_records(
             f"read_records() crashed after producing {read} record(s): "
             f"{type(exc).__name__}: {exc}"
         )
+
     return _Gathered(read=read, skipped=skipped, records=records)
 
 
@@ -668,23 +703,27 @@ def _headers() -> Dict[str, str]:
     }
 
 
-def _send_all(
-    records: List[Dict[str, Any]], url: str, http_timeout: float,
-    log: logging.Logger,
-) -> _SendOutcome:
+def _send_all(records: List[Dict[str, Any]],
+              url: str,
+              http_timeout: float,
+              log: logging.Logger) -> _SendOutcome:
     """Batch and send everything. Each batch gets its own retries, and
     one failed batch never stops the next - whatever the server did
     accept stays accepted."""
+
     headers = _headers()
     sent = 0
     inserted = 0
     updated = 0
     rejected = 0
     failed_batches = 0
+
     for batch in _batches(records, BATCH_SIZE, MAX_BATCH_BYTES):
         body = json.dumps({"runs": batch}).encode("utf-8")
         label = f"batch of {len(batch)} records"
+
         payload = _send_batch(url, body, headers, http_timeout, log, label)
+
         if payload is None:
             log.error(
                 "%s was not accepted; nothing is saved locally - "
@@ -692,24 +731,23 @@ def _send_all(
                 "skips anything it already has)", label,
             )
             failed_batches += 1
-            continue
-        counts = _report_payload(payload, label, log)
-        sent += len(batch)
-        inserted += counts.inserted
-        updated += counts.updated
-        rejected += counts.rejected
-    return _SendOutcome(
-        sent=sent,
-        inserted=inserted,
-        updated=updated,
-        rejected=rejected,
-        failed_batches=failed_batches,
-    )
+        else:
+            counts = _report_payload(payload, label, log)
+            sent += len(batch)
+            inserted += counts.inserted
+            updated += counts.updated
+            rejected += counts.rejected
+
+    return _SendOutcome(sent=sent,
+                        inserted=inserted,
+                        updated=updated,
+                        rejected=rejected,
+                        failed_batches=failed_batches)
 
 
-def _log_summary(
-    gathered: _Gathered, outcome: _SendOutcome, log: logging.Logger,
-) -> None:
+def _log_summary(gathered: _Gathered,
+                 outcome: _SendOutcome,
+                 log: logging.Logger) -> None:
     log.info(
         "feeder summary: read=%d valid=%d skipped=%d sent=%d inserted=%d "
         "updated=%d rejected=%d failed_batches=%d",
@@ -731,8 +769,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     log = _configured_logger(args.verbose)
     try:
-        invocation = _cleaned_invocation(args)
-        gathered = _screened_records(args, invocation, log)
+        parameters = _cleaned_args(args)
+        gathered = _screened_records(args, parameters, log)
     except _UsageError as error:
         log.error("%s", error)
         return 2
@@ -740,10 +778,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         return _dry_run_report(gathered, log)
 
-    outcome = _send_all(
-        gathered.records, invocation.url, args.http_timeout, log
-    )
+    outcome = _send_all(gathered.records,
+                        parameters.url,
+                        args.http_timeout,
+                        log)
     _log_summary(gathered, outcome, log)
+
     if outcome.failed_batches:
         return 1
     return 0

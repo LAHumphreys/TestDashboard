@@ -1,6 +1,6 @@
 """Direct unit tests for the Python client engines' internal functions:
-clients/feeder.py (WP-29) and clients/feeder_micro.py's sanity_error
-(MicroSanityErrorTest at the bottom).
+clients/feeder.py (WP-29) and clients/feeder_micro.py's
+_validate_record (MicroValidateRecordTest at the bottom).
 
 clients/feeder.tcl carries a ``--self-test`` mode (run as one scenario in
 tests/test_feeder_engines_conformance.py) because Tcl has no assumed test
@@ -183,14 +183,16 @@ class ReplayFileNamingTest(unittest.TestCase):
         self.assertEqual(self.feeder._sanitize("///"), "unnamed")
 
 
-class MicroSanityErrorTest(unittest.TestCase):
-    """clients/feeder_micro.py's sanity_error - the micro engine's whole
-    client-side check, so what it deliberately does NOT catch is pinned
-    here as explicitly as what it does."""
+class MicroValidateRecordTest(unittest.TestCase):
+    """clients/feeder_micro.py's _validate_record - the micro engine's
+    whole client-side check, so what it deliberately does NOT catch is
+    pinned here as explicitly as what it does."""
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.feeder = _load_client_feeder(FEEDER_MICRO_PY, "client_feeder_micro")
+        cls.feeder = _load_client_feeder(
+            FEEDER_MICRO_PY, "client_feeder_micro"
+        )
 
     def _good(self, **overrides: Any) -> dict:
         base = {
@@ -204,42 +206,43 @@ class MicroSanityErrorTest(unittest.TestCase):
         return base
 
     def test_accepts_a_good_record(self) -> None:
-        self.assertIsNone(self.feeder.sanity_error(self._good()))
+        self.assertIsNone(self.feeder._validate_record(self._good()))
 
     def test_rejects_non_dict_record(self) -> None:
-        self.assertIn("JSON object", self.feeder.sanity_error(["nope"]))
+        self.assertIn("JSON object", self.feeder._validate_record(["nope"]))
 
     def test_rejects_missing_or_blank_required_field(self) -> None:
         raw = self._good()
         del raw["script"]
-        self.assertIn("script", self.feeder.sanity_error(raw))
-        self.assertIn(
-            "test_name", self.feeder.sanity_error(self._good(test_name="  "))
-        )
+        self.assertIn("script", self.feeder._validate_record(raw))
+        blank_name = self._good(test_name="  ")
+        self.assertIn("test_name", self.feeder._validate_record(blank_name))
 
     def test_rejects_unknown_result(self) -> None:
-        self.assertIn("result", self.feeder.sanity_error(self._good(result="NOPE")))
+        bad_result = self._good(result="NOPE")
+        self.assertIn("result", self.feeder._validate_record(bad_result))
 
     def test_rejects_non_string_output(self) -> None:
-        self.assertIn("output", self.feeder.sanity_error(self._good(output=7)))
+        bad_output = self._good(output=7)
+        self.assertIn("output", self.feeder._validate_record(bad_output))
 
     def test_deep_rules_are_deliberately_the_servers_job(self) -> None:
         """The agreed micro cut: no timestamp parsing, no ordering
         check, no rejected-key check. These records pass the shallow
         check and are rejected (loudly, per-record) by the server -
         that is the design, not an oversight. If this test starts
-        failing because sanity_error grew deeper rules, the addition
-        belongs in the full engine, not here."""
+        failing because _validate_record grew deeper rules, the
+        addition belongs in the full engine, not here."""
         self.assertIsNone(
-            self.feeder.sanity_error(self._good(start_time="not a time  "))
+            self.feeder._validate_record(self._good(start_time="not a time  "))
         )
         self.assertIsNone(
-            self.feeder.sanity_error(self._good(
+            self.feeder._validate_record(self._good(
                 start_time="2026-01-01T00:00:02.000000",
                 end_time="2026-01-01T00:00:01.000000",
             ))
         )
-        self.assertIsNone(self.feeder.sanity_error(self._good(branch="x")))
+        self.assertIsNone(self.feeder._validate_record(self._good(branch="x")))
 
 
 if __name__ == "__main__":
