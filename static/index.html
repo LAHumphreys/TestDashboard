@@ -34,12 +34,14 @@
       <a id="branch-band-back" href="index.html">Back to mainline</a>
     </div>
 
-    <!-- WP-23 (docs/STREAMS_PLAN.md §5.2): the two-tab header for a
-         long-running BRANCH stream only -- app.js's initBranchDashboard()
-         hides this outright for a build stream, or when this page is
-         not stream-scoped at all. Both tabs always exist; only the
-         DEFAULT selection depends on the branch's own cadence, and that
-         heuristic is stated in the caption below it, from data. -->
+    <!-- WP-23 (docs/STREAMS_PLAN.md §5.2), un-gated by WP-31: the
+         two-tab header for EVERY stream-scoped load (?stream=<id>) --
+         app.js's initBranchDashboard() shows it unconditionally there,
+         and it stays hidden only when this page is not stream-scoped
+         at all. Both tabs always exist; only the DEFAULT selection
+         depends on the build's own cadence (or on the URL carrying
+         browse filters), and that rule is stated in the caption below
+         it, from data. -->
     <div id="branch-tabs" class="tab-row" role="tablist"
          aria-label="Build dashboard view" hidden>
       <button id="branch-tab-own" class="tab" type="button" role="tab">Its own results</button>

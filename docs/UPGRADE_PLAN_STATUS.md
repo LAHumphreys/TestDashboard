@@ -3118,3 +3118,86 @@ Changing a serving-path string on the morning of a production migration
 is not worth the cosmetic win. Worth closing later — the server's version
 is what a feeder PRINTS on rejection, and an em-dash on a site with a
 non-UTF-8 terminal is the one place it could actually matter.
+
+## 2026-09-23 — WP-31: a build's own dashboard is always reachable (branch `wp-31-own-results-always`)
+
+**The trigger.** Branch builds were loaded into the live dashboard for the
+first time. The compare-to-mainline view worked; the immediate report was
+that nothing told the tester how much of the build had actually run — the
+"Watch" card and the main page both showed *differences* only. The ask was
+a drop that (a) lets the home dashboard be seen in "branch" mode without a
+compare and (b) adds data to the Watch card. Mid-session the user withdrew
+(b) — "the watch card is fine as it is — we do need to be able to get to
+the main screen though" — so this is (a) alone.
+
+**The finding.** The view already existed. WP-23 gave every stream-scoped
+load two tabs, "Its own results" (the home dashboard scoped to the stream)
+and "Difference from mainline", with the covered-pass threshold
+(`OWN_RESULTS_DEFAULT_PASSES = 2`) picking only the default. WP-25 then
+reused that threshold to gate the header's *existence*: below two covered
+passes in the 14-day lookback, the tabs were hidden and the page was
+delta-only. Read at the time as "a one-shot upload stays delta-only, the
+WP-21/22 behaviour"; in first real use the one-shot upload is precisely
+the build someone opens wanting to see it whole. `index.html`'s own
+comment still described the WP-23 shape ("Both tabs always exist; only
+the DEFAULT selection depends on the branch's own cadence") — the markup
+comment was right and the code had drifted from it.
+
+**The change** (`static/app.js`, `initBranchDashboard`): the header is
+shown unconditionally on every `?stream=` load, before the threshold is
+consulted, with no early return after; the threshold picks the default;
+the caption states which tab opened and why from the build's own count
+and the threshold in all three cases — at/above ("…first. The other tab
+lists only where it differs from mainline."), below ("…first. “Its own
+results” shows everything that has run on this build, whether or not it
+differs." — the sentence that was missing), and a URL carrying
+`result=`/`unassigned=1`/`stale=1` (new `urlAsksForBrowseFilters()`,
+consulted first): opens on its own results regardless of cadence, because
+only that tab's browse table reads those params. The Watch card's "N
+unassigned failures" link builds exactly that URL and, on a sparse build,
+used to land on the diff view with the filter silently gone —
+`WatchUnassignedStatLinkTest`'s own docstring had reasoned the params
+were "inert there rather than wrong"; inert *was* wrong once the link was
+the way in. No server change, no migration, no flag.
+
+**Guards** (`tests/test_frontend_calls.py::OwnResultsAlwaysReachableTest`,
++5): `tabs.hidden = true` never appears in the function (comments
+stripped, so the history note cannot satisfy it); the header is shown
+before the threshold and nothing returns after; both `which` outcomes
+reach `selectBranchTab`; one shared `cadence` sentence carries both
+numbers and all three captions include it; the filter override precedes
+the cadence rule; the own tab still reuses the mainline body. Run against
+master's `app.js`: 4 of 5 fail (the fifth pins code this did not touch).
+
+**Suite:** 2257 → **2262 OK (skipped 1)**, SQLite-only. Dual-backend
+variants not run (no option file this session); no Python changed.
+
+**Live evidence** (DOM shim, no browser): `.scratch/net/
+wp31_drive_branch_tabs.mjs`, built on `walk_index_scope.mjs`'s loader —
+the legacy WP-23 driver's hand-written id list is stale against today's
+`app.js` and renders nothing, which cost a round. Server booted from the
+fix commit (`.scratch/net-wt` re-pointed, then pinned back) on a seeded
+copy of the dev estate. First run on the net seed as-is: its nights are
+dated August, so under today's date every build had **0** covered passes
+— the four "cadenced build opens on own results" checks failed *because
+the fixture was sparse*, and every sparse-build check passed. Re-seeded
+with the nights shifted 39 days into the last fortnight:
+`feature/checkout-rewrite` = **5** covered passes → opens on "Its own
+results", tiles show 4,449 runs on the build; `feat/payment-retry-backoff`
+= **1** → opens on the difference, one click reaches its own results ("3
+tests tracked", Time/Timeline quick links shown); `&result=FAIL&
+unassigned=1` → opens on own results, "Unassigned only" pressed; mainline
+load: band, tabs, caption, delta all stay hidden. **All checks pass on
+both seeds.**
+
+**Seen and left alone, on purpose.** A build whose last run is older than
+36 hours shows "Reported 0 of N — nothing has reported since <the
+fallback cutoff>" on its own tiles until it runs again (first run above,
+before the shift: "3 tests tracked · counting each test's latest run
+since 2026-09-22 01:32:58", Reported 0 of 3). That is the unchanged 36h
+fallback for a stream with no covered pass, pinned by
+`test_the_36h_fallback_clamp_applies_to_a_sparse_branch_too` and
+protected by CLAUDE.md's "do not remove the clamps". The wording is built
+from the real window, so it is honest; whether a one-shot build should
+have a *different* notion of "recent" is a design question for the user,
+recorded in the drop note and the handover, not decided here.

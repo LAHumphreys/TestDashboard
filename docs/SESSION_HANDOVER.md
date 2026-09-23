@@ -4,175 +4,100 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-08-10, overnight**, closing the tooling night.
-All four phases of that night's plan are **done, merged, and green**
-(the plan doc itself is deleted, executed — the record is the
-tooling-night entry in [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md)).
-The night's output is one branch: **`tooling-2026-08-10`**.
+Last rewritten: **2026-09-23**, after the first day branch builds were
+loaded into the live dashboard and the one thing that came up immediately
+was fixed as **WP-31** (branch `wp-31-own-results-always`).
 
-## Today's plan (agreed 2026-08-11)
+## Where things stand
 
-1. **Merge PR #7** (`tooling-2026-08-10` → `master`). Green, fast-forward.
-2. **Deploy to internal staging** (the SQLite box). Note this deliberately
-   does NOT rehearse the MariaDB migration — staging is already v10 and
-   tonight's branch adds no migration. Staging is here to exercise the
-   APP and the onboarding path, not the DDL.
-3. **Onboard the second product into staging.** This is the real
-   acceptance test — see the watch-list below.
-4. **If that goes well, upgrade production (MariaDB) end of day**, per
-   the procedure below.
+- **Production is MariaDB, schema v10, serving the streams drop** (the
+  2026-08-11 drop, `tooling-2026-08-10` → `master` via PR #7). WP-30's
+  micro feeder client (PR #8) is on `master` too; its Java sibling is on
+  `wp-30-java-feeder`, one commit ahead of `master`, not yet merged.
+- **Branch builds are now being fed to the dashboard for real** — the
+  streams work has met real data. First finding, same day: a fresh branch
+  build was **compare-only**. Its "Its own results" tab (WP-23) was hidden
+  by WP-25's covered-pass gate until the build had run twice in a
+  fortnight, so nothing on the page said how much had actually run.
+- **WP-31 fixes that** and is the next drop: both tabs always exist on a
+  stream-scoped load, the threshold picks only the default, the caption
+  says why, and a Watch card's filtered click-through opens the own
+  results tab. Static files only, no migration, no new flag. Operator
+  note: `docs/drops/2026-09-23.md`. Tester note: `whatsnew.html`,
+  section dated 2026-09-23 (provisional — re-date both if it ships later).
 
-**What staging is actually testing, stated precisely.** The UI has been
-exercised in dev; what it has NOT met is REAL DATA — real product and
-environment names, real scale (production is ~4× the dev copy), real
-messy history, and a genuinely second product rather than a synthetic
-one. Everything on the watch-list below is a case where dev data
-happened to have something declared that a fresh onboarding will not.
+## Today's plan
 
-### Watch-list for the second product landing on staging
-
-- **A new product's environments arrive UNMAPPED.** `environment_products`
-  (migration 8) is DECLARED state, not inferred from imports. Until each
-  environment is mapped, the new product's data will not gather under it
-  in any product-scoped view. Open Actions has a bulk-assign for exactly
-  this (`bulkAssignUnmapped`) — it is an onboarding STEP, not a bug.
-- **A new product has no declared coverage denominator.**
-  `environment_expectations` (migration 5) is also declared. Inferred
-  from `latest_runs` it is a high-water mark, and **too large a
-  denominator means no pass counts, which silently drops the staleness
-  cutoff back to the 36-hour wall clock** — which is wrong for any suite
-  that does not run nightly, and will make the new product's dashboard
-  look broken when it is merely undeclared. `/api/environments` echoes
-  how many recent passes actually counted; check that number FIRST when
-  something looks stale, before believing the UI.
-- **The sticky product scope** adopts-and-sticks in `localStorage`. A
-  tester who once opened a `?product=X` link keeps that scope on every
-  page. Expect at least one "my data vanished" report that is really a
-  stuck product filter; clearing it is "All products" in the switcher.
-- **A brand-new product has no history**, so analytics windows (90 days
-  / 200 runs), flakiness scores and day-of-week profiles will be empty or
-  odd for a while. Expected, not a regression.
-- **Feeder invocation:** the single-file client must be invoked as
-  `python3`. As of this morning it no longer prints a friendly message on
-  Python 2 — it fails at parse time with a bare `SyntaxError`.
-
-## Production upgrade (end of day)
-
-**Deploy `tooling-2026-08-10` to production (MariaDB), including the
-v7→v10 schema upgrade.** Everything needed now exists; last night it did
-not. Read, in this order:
-
-1. `docs/drops/2026-08-11.md` § **"Production deployment (MariaDB)"** —
-   the exact command order, and the only section you must not skim.
-2. `docs/MARIADB_MIGRATION.md` § **G** — the incremental-DDL runbook.
-
-The shape of it: recreate `testboard_migrate` as root (§A.4; it was
-dropped after the cutover, so **no DDL-capable credential exists** until
-you do) → **pre-upgrade `mysqldump`, which IS the rollback** → run
-`tools/upgrade_mariadb_schema.py --dry-run`, then live → verify → deploy
-the code → **restart the server** → first-hour checks → delete the
-migrate credential.
-
-**DDL autocommits on MariaDB 10.3.** There is no transactional undo. The
-dump is not a formality.
+1. **Push `wp-31-own-results-always`, open the PR, wait for all CI legs**
+   (nothing touches Python or SQL, but the ubi8 3.6 leg and the MariaDB
+   legs are the only evidence the suite is green anywhere but this box).
+2. **Merge and deploy** per `docs/drops/2026-09-23.md` — stop, checkout,
+   start. Restart is the whole deployment.
+3. **Watch for the one thing the drop note flags:** a build whose last
+   run is more than 36 hours old shows "Reported 0 of N" on its own tiles
+   until it runs again (the unchanged fallback window, worded from data).
+   "N tests tracked" and the browse table still show everything that ran.
+   If testers report it, the answer is a design decision about a
+   build-specific window, not a bug — bring it to the user, do not loosen
+   the clamp.
 
 ## Where the code is
 
 | | |
 |---|---|
-| **`tooling-2026-08-10`** | **THE branch. Ship this.** `streams-upgrade` + WP-27 + WP-28 + WP-29 + the docs tidy. All six CI legs green |
-| **prod** | MariaDB, schema **v7**, pre-streams code. Goes to v10 + this branch today |
-| **staging** (old SQLite box) | streams drop, schema v10, deployed 2026-08-10 |
-| `streams-upgrade` | the streams work + the two owed status-log writeups. Contained in the ship branch |
-| `wp-27/28/29`, `docs-tidy-2026-08-10` | merged into the ship branch; keep until it lands, then prune |
-| `origin/master` | `1e1ceae`. **Behind** — the ship branch is what merges into it |
+| **`wp-31-own-results-always`** | **THE branch. Ship this.** Two commits on `origin/master`: the fix + guards, then the notes and log |
+| `origin/master` | `b9700b3` — the 2026-08-11 drop plus WP-30's Python client |
+| `wp-30-java-feeder` | Java micro client + CI, one commit ahead of master, unmerged |
 | `wp-14-in-run-progress` | parked WIP; its migration renumbers to **11** before merging (registry §1) |
+| `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*` | merged into master via PR #7; prune when convenient |
 
-**Suite on the ship branch: 2240 OK (skipped 1) SQLite-only; 3016 OK
-(skipped 53) dual-backend.** Sanity net re-run at the FINAL tip and PASS
-both unprefixed (45.7s) and `--url-prefix testboard` (47.9s). No
-expected-failure footnote any more — see "the CRLF failures" below.
+**Suite on the ship branch: 2262 OK (skipped 1), SQLite-only.** Dual-
+backend variants not run this session (no MariaDB option file here); the
+change contains no Python.
 
-## What last night added
+## Live evidence for WP-31 (DOM shim, not a browser)
 
-- **WP-27 — `tools/upgrade_mariadb_schema.py`.** In-place MariaDB v7→v10.
-  Refuses an unexpected version in both directions, bidirectional
-  consistency check, `--dry-run`, and a `verify` that diffs the result
-  against a fresh v10 export. Plus the `delete_stream` dangling-id fix
-  (`assignments`/`current_assignments`, the protection `comments` already
-  had — SQLite's FK had been hiding the gap).
-- **WP-28 — `--url-prefix`**, default `testboard`, for an nginx front
-  door. **Bare paths always keep working**, which is what makes a
-  default-on flag safe and what lets feeders bypass nginx entirely.
-- **WP-29 — single-file feeders** (`clients/feeder.py`,
-  `clients/feeder.tcl`) + `docs/FEEDER_TEMPLATE.md`, so a new product
-  checks in ONE file instead of linking a checkout. The deployed feeder is
-  untouched.
-- **Docs tidy**: four plan docs deleted, `STREAMS_PLAN.md` 108→20 KB,
-  `UPGRADE_PLAN.md` 64→32 KB (§1's registry kept verbatim).
-- **CLAUDE.md's project state was wrong and is fixed** — it claimed seven
-  migrations (there are ten) and that WP-15 owns version 8 (it owns 11).
-  Anyone trusting it would have claimed a taken version.
-
-## Findings worth carrying, not just outcomes
-
-1. **The local MariaDB is 12.3.2, not 10.3.** Prod is 10.3.39. Local
-   dual-backend runs prove nothing about prod's server; **CI's two
-   MariaDB legs are the only 10.3 evidence that exists** — and they run
-   **10.3.39, prod's exact version**, not merely its stream. Treat them
-   as mandatory for anything touching MariaDB DDL.
-2. **A new CI leg runs the whole suite against a database the upgrade
-   tool built** (`python36-mariadb-upgraded`), because "the schema
-   matches" and "the app serves on it" are different claims and only the
-   second one is what today needs.
-3. **`ALTER TABLE runs ADD COLUMN` takes the INSTANT path on 10.3.39** —
-   `InstantAddColumnTest` forces `ALGORITHM=INSTANT` on the exact
-   statement the tool emits (located via the tool's own predicate, so it
-   cannot drift) and asserts the SERVER accepts it. It passes on CI's
-   10.3.39. Capability does not vary with row count, so prod's ~4.4M
-   does not threaten it; only total wall-clock on a loaded shared daemon
-   is unmeasured. The tool still prints the row count and warns above 5s.
-4. **The CRLF failures are gone and were never real.** Two
-   `ProductUrlAdoptionTest` cases asserted on `\n` against files read in
-   binary (deliberately — `app.js` contains a real NUL). On a Windows
-   checkout they failed on correct content in every fresh worktree while
-   passing on Linux CI. `read()` now normalises line endings; the
-   assertions are unchanged.
-5. **Agents sharing one checkout corrupt each other.** Three collided in
-   the main tree last night and one lost work to another's `git stash`.
-   Every parallel implementer now gets its own `git worktree`, stated as
-   the first instruction. Do this from the start.
+`.scratch/net/wp31_drive_branch_tabs.mjs` (scratch, gitignored) against a
+server booted from the fix commit on a seeded copy of the dev estate.
+Two runs: the net seed as-is (its nights are dated August, so under
+today's date every build has 0 covered passes — every build is "sparse")
+and a re-seed with the nights shifted 39 days into the last fortnight (the
+cadenced build then meets the threshold). Both PASS on every check:
+sparse build shows both tabs, opens on the difference with the stated
+caption, reaches its own results in one click with its own count of 3;
+filtered URL opens on own results with the toggle pressed; cadenced
+build opens on its own results; mainline load unchanged. The legacy
+WP-23 driver (`legacy_drive_branch_tabs.mjs`) is stale against today's
+`app.js` (hand-written id list) — use the WP-31 one or the `walk_*`
+scripts, which parse ids from the shipped markup.
 
 ## Needs a person, not a commit
 
-1. **Today's deployment** (above). The one hard deadline.
-2. **Only prod goes behind nginx**, and it is a follow-up whenever the box
-   owners are ready — nothing in this drop assumes nginx exists. The
-   tested `location` block is in the drop note; note it deliberately has
-   **no trailing slash**, or a bare `/testboard` never reaches the backend.
-3. Carried: re-retire the tests the un-retire bug released (search
-   comments for "Automatically un-retired"); `tools/diagnose_db.py
-   --compare-local` on prod; `max_allowed_packet` persistence with the
-   daemon owners (still `SET GLOBAL` only); import output-size cap; the
+1. **Merge + deploy WP-31** (above).
+2. **Decide the Java client's fate** (`wp-30-java-feeder`): merge or
+   park.
+3. Carried from 2026-08-11, still open: re-retire the tests the un-retire
+   bug released (search comments for "Automatically un-retired");
+   `tools/diagnose_db.py --compare-local` on prod; `max_allowed_packet`
+   persistence with the daemon owners; import output-size cap; the
    morning decision list's UI judgement calls (watch-card accents,
    composer placeholder, "Not run" tab dominance, Build-picker
-   discoverability, Watch back-navigation).
-4. **First 8.5 site is an experiment.** No Tcl 8.5 interpreter has ever
-   executed `clients/feeder.tcl` — none exists here or in CI (8.6 only).
-   A static gate rejects 8.6-only constructs; that is an argument, not a
-   demonstration.
+   discoverability, Watch back-navigation); first Tcl 8.5 site is still
+   an experiment (no 8.5 interpreter has ever run `clients/feeder.tcl`).
+4. **Old-build tiles** (the "Reported 0 of N" reading above) if it comes
+   up — a design decision, see the drop note's "What was NOT verified".
 
 ## First ten minutes of the next session
 
 ```bash
-git checkout tooling-2026-08-10
-git log --oneline -6
-python -m unittest discover        # expect 2240 OK (skipped 1)
-gh run list --branch tooling-2026-08-10 --limit 1   # expect success
+git checkout wp-31-own-results-always
+git log --oneline -3
+python -m unittest discover        # expect 2262 OK (skipped 1)
+gh run list --branch wp-31-own-results-always --limit 1
 ```
 
-The repo-root `testboard.db` is generated dev data (220 MB, v5) — only ever
-copied, never opened with current code. There is still no browser here.
-Two stale `git stash` entries exist in the main checkout from last night's
-collision; they are superseded safety nets and can be dropped once today's
-deployment is done.
+The repo-root `testboard.db` is generated dev data — only ever copied,
+never opened with current code. There is still no browser here.
+`.scratch/net-wt` is pinned back at `b816151` after this session's live
+runs; re-point it (`git -C .scratch/net-wt checkout --detach <branch>`)
+to verify a branch, and restore the pin afterwards.

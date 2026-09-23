@@ -3385,6 +3385,103 @@ class BranchQuickLinksTest(unittest.TestCase):
             "must be stashed before either tab (own/diff) can render")
 
 
+class OwnResultsAlwaysReachableTest(unittest.TestCase):
+    """WP-31 (2026-09-23, first real use with branch builds): a build's
+    "Its own results" tab must ALWAYS be reachable from a stream-scoped
+    dashboard load, whatever the build's cadence.
+
+    WP-23 shipped both tabs unconditionally with the covered-pass
+    threshold (OWN_RESULTS_DEFAULT_PASSES) choosing only the default;
+    WP-25 made that same threshold gate the header's EXISTENCE, so a
+    build with fewer than two covered passes was delta-only. In use
+    that hid the one view that answers "what has actually run on this
+    build?" -- the delta view lists differences only -- and the tester
+    had no way through to the whole dashboard. These tests pin the
+    WP-23 shape back in place: the threshold may pick the default, it
+    may never hide the tab.
+    """
+
+    def body(self) -> str:
+        return _strip_comments(_function_body(
+            read("app.js"), "async function initBranchDashboard("))
+
+    def test_the_tab_header_is_never_hidden_on_a_stream_scoped_load(
+        self
+    ) -> None:
+        """The WP-25 gate was literally `tabs.hidden = true` inside this
+        function. Comments are stripped first so the history note in
+        the source cannot satisfy or trip the assertion."""
+        body = self.body()
+        self.assertNotIn("tabs.hidden = true", body)
+        self.assertIn("tabs.hidden = false", body)
+        self.assertNotIn("caption.hidden = true", body)
+
+    def test_the_threshold_picks_only_the_default_tab(self) -> None:
+        """Both outcomes of the threshold must end in selectBranchTab()
+        with the header shown -- an early `return` before the tab
+        wiring is the gate coming back under another name."""
+        body = self.body()
+        self.assertIn("OWN_RESULTS_DEFAULT_PASSES", body)
+        wiring_at = body.index("tabs.hidden = false")
+        threshold_at = body.index("coveredPasses >= OWN_RESULTS_DEFAULT_PASSES")
+        self.assertLess(
+            wiring_at, threshold_at,
+            "the header is shown BEFORE the threshold is consulted, so "
+            "no outcome of the threshold can leave it hidden")
+        self.assertNotIn("return", body[wiring_at:],
+                         "no early exit after the header is shown")
+        self.assertIn('which = "own"', body)
+        self.assertIn('which = "diff"', body)
+        self.assertIn("selectBranchTab(which, streamId)", body)
+
+    def test_every_caption_states_the_count_and_the_threshold(self) -> None:
+        """docs/STREAMS_PLAN.md §5.2: the heuristic "must be stated in the
+        UI caption, not buried" -- from data, never a silent constant.
+        One shared `cadence` sentence carries both numbers and every
+        branch of the default choice includes it."""
+        body = self.body()
+        cadence_at = body.index("const cadence =")
+        cadence_line = body[cadence_at:body.index(";", cadence_at)]
+        self.assertIn("coveredPasses", cadence_line)
+        self.assertIn("OWN_RESULTS_DEFAULT_PASSES", cadence_line)
+        self.assertEqual(
+            body.count("+ cadence"), 3,
+            "all three default outcomes (filters / meets / below) "
+            "carry the cadence sentence")
+
+    def test_a_url_carrying_browse_filters_opens_its_own_results(
+        self
+    ) -> None:
+        """A Watch card's "N unassigned failures" click-through lands on
+        index.html?stream=<id>&result=FAIL&unassigned=1 -- filters only
+        the own-results BROWSE TABLE reads (BrowseFilterUrlInitTest).
+        On the diff tab they were silently inert, so such a URL must
+        open the own-results tab regardless of cadence."""
+        src = read("app.js")
+        helper = _strip_comments(_function_body(
+            src, "function urlAsksForBrowseFilters("))
+        self.assertIn('getAll("result")', helper)
+        self.assertIn('get("unassigned") === "1"', helper)
+        self.assertIn('get("stale") === "1"', helper)
+        body = self.body()
+        filters_at = body.index("urlAsksForBrowseFilters()")
+        self.assertIn('which = "own"', body[filters_at:filters_at + 120])
+        # The filter override is consulted BEFORE the cadence rule, so
+        # it wins over a below-threshold build's "diff" default.
+        self.assertLess(filters_at, body.index("meetsThreshold)"))
+
+    def test_the_own_tab_reuses_the_mainline_body_unchanged(self) -> None:
+        """The whole point: the own-results tab IS the home dashboard
+        (status tiles, charts, triage, browse) scoped to the stream --
+        activateOwnResultsTab() still wires the mainline controls and
+        refreshes, and hides the delta section. Nothing new to render."""
+        body = _function_body(
+            read("app.js"), "function activateOwnResultsTab()")
+        self.assertIn("wireMainlineControls()", body)
+        self.assertIn("refreshAll()", body)
+        self.assertIn('"delta-section").hidden = true', body)
+
+
 class BrowseFilterUrlInitTest(unittest.TestCase):
     """F4(a) (docs/STREAMS_PLAN.md §5.2 "as built"): the browse filter
     row's state can be set from the page's own URL at load, so a deep
