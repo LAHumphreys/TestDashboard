@@ -35,6 +35,33 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-09-23">
+      <div class="section-head">
+        <h2 class="eyebrow">23 September 2026</h2>
+        <span class="muted">Fixed: a build's own dashboard is always one click away</span>
+      </div>
+
+      <h3>Fixed</h3>
+      <ul>
+        <li><strong>Every build now has both tabs.</strong> Opening a
+          build from the <strong>Build</strong> picker (or a Watch card)
+          used to show only <strong>Difference from mainline</strong>
+          unless the build had run at least twice in the last fortnight
+          — so a build uploaded once listed what differed and nothing
+          else, and there was no way to see how much of it had actually
+          run. The <strong>Its own results</strong> tab is now always
+          there: the same tiles, trend, triage queues and test table as
+          the home screen, scoped to that build alone. Which tab opens
+          first still depends on how often the build has run, and the
+          line under the tabs says which one you are on and why.</li>
+        <li><strong>Watch card click-throughs land where the filter
+          works.</strong> Clicking a build card's unassigned-failures
+          count now opens the build's own results with that filter
+          applied, however often the build has run. Before, on a build
+          uploaded once, it opened the comparison view and the filter was
+          quietly lost.</li>
+      </ul>
+    </section>
     <section class="release" data-drop-date="2026-08-11">
       <div class="section-head">
         <h2 class="eyebrow">11 August 2026</h2>
