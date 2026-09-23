@@ -75,12 +75,29 @@ import { apiUrl, pageUrl } from "./urls.js";
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
 
-/** Covered passes (docs/STREAMS_PLAN.md §5.2) a branch needs in the
- * 14-day lookback before its dashboard defaults to "Its own results"
- * rather than "Difference from mainline". Not hidden: the caption this
- * feeds (see selectBranchTab()) states the number and this threshold in
- * plain words, built from data, never silently assumed. */
+/** Covered passes (docs/STREAMS_PLAN.md §5.2) a build needs in the
+ * 14-day lookback before its dashboard OPENS ON "Its own results"
+ * rather than "Difference from mainline". WP-31: this decides the
+ * default tab ONLY, never whether the tab exists -- every non-mainline
+ * stream gets both tabs (see initBranchDashboard()). Not hidden: the
+ * caption this feeds states the number and this threshold in plain
+ * words, built from data, never silently assumed. */
 const OWN_RESULTS_DEFAULT_PASSES = 2;
+
+/** WP-31: does this page's URL carry the browse-filter deep-link state
+ * F4 reads (result=/unassigned=/stale= -- wireMainlineControls())? Those
+ * params mean "land on the browse TABLE, filtered" -- a Watch card's
+ * "N unassigned failures" click-through builds exactly this URL -- and
+ * only the "Its own results" tab has that table, so a URL carrying
+ * them opens that tab whatever the build's cadence. On the diff tab
+ * they were silently inert: the reader landed on a view that never
+ * reads them and the filter they clicked for was simply gone. */
+function urlAsksForBrowseFilters() {
+  const params = new URL(window.location.href).searchParams;
+  return params.getAll("result").length > 0
+    || params.get("unassigned") === "1"
+    || params.get("stale") === "1";
+}
 
 const state = {
   environment: "",        // "" = all environments
@@ -1680,16 +1697,23 @@ function activateDiffTab(streamId) {
 }
 
 /**
- * The two-tab header for a long-running stream (WP-23,
- * docs/STREAMS_PLAN.md §5.2; DATA-gated by WP-25, docs/ONE_KIND_PLAN.md
- * §1.4): "Its own results" (this same dashboard, scoped to the stream's
- * own stream_id) and "Difference from <baseline>" (the WP-21/22 delta
- * view, unchanged). Both tabs exist together, or not at all — see
- * initBranchDashboard(), which decides that from the SAME covered-pass
- * threshold that used to decide only the default selection: a stream
- * meeting it is exactly what "long-running enough for its own dashboard"
- * means, however it was uploaded. A one-shot upload stays delta-only,
- * the same behaviour every stream had before WP-23.
+ * The two-tab header for EVERY non-mainline stream (WP-23,
+ * docs/STREAMS_PLAN.md §5.2; un-gated by WP-31): "Its own results" (this
+ * same dashboard, scoped to the stream's own stream_id) and "Difference
+ * from <baseline>" (the WP-21/22 delta view, unchanged). Both tabs
+ * always exist on a stream-scoped page -- see initBranchDashboard(),
+ * where the covered-pass threshold decides only which one opens FIRST.
+ *
+ * History, because the gate came and went: WP-23 shipped both tabs
+ * always, with the threshold picking the default; WP-25 (the one-kind
+ * collapse) made the same threshold gate the header's EXISTENCE, so a
+ * one-shot upload was delta-only. In first real use with branch builds
+ * (2026-09-23) that hid the one view that answers "what has actually
+ * run on this build?" -- the delta view lists differences only, and a
+ * build that has run once is exactly the build someone wants to see
+ * whole. So the gate is gone again and the WP-23 shape is restored:
+ * the tab is always there, and the caption still says, from data, why
+ * the page opened where it did.
  */
 function selectBranchTab(which, streamId) {
   const ownBtn = document.getElementById("branch-tab-own");
@@ -1724,9 +1748,10 @@ async function initBranchDashboard(streamId) {
     if (headline) {
       coveredPasses = headline.covered_passes;
     }
-    // A failed headline fetch leaves coveredPasses at 0 -- the tab
-    // header simply does not appear this load, the same safe fallback
-    // the old code used for the default-selection choice alone.
+    // A failed headline fetch leaves coveredPasses at 0 -- the page
+    // opens on the difference tab this load (WP-31: the header itself
+    // is unconditional), the same safe fallback the WP-23 code used for
+    // the default-selection choice alone.
   } catch (err) {
     showError(err.message);
     return;
@@ -1738,49 +1763,53 @@ async function initBranchDashboard(streamId) {
 
   const tabs = document.getElementById("branch-tabs");
   const caption = document.getElementById("branch-tab-caption");
-  // WP-25 (docs/ONE_KIND_PLAN.md §1.4): "any stream whose covered-passes
-  // count meets the existing threshold gets both tabs, however it was
-  // uploaded" -- meeting the threshold IS what "prefer its own results"
-  // means, so the same test now gates existence AND default together;
-  // below it, a stream stays delta-only, the WP-21/22 behaviour every
-  // stream had before WP-23 (and everything WP-25 collapsed the 'build'
-  // kind into keeps, unless it earns its own dashboard by cadence).
-  const meetsThreshold = coveredPasses >= OWN_RESULTS_DEFAULT_PASSES;
-  if (!meetsThreshold || !tabs) {
-    if (tabs) {
-      tabs.hidden = true;
-    }
-    if (caption) {
-      caption.hidden = true;
-    }
-    activateDiffTab(streamId);
-    return;
-  }
-
   const ownBtn = document.getElementById("branch-tab-own");
   const diffBtn = document.getElementById("branch-tab-diff");
-  diffBtn.textContent = "Difference from " + streamLabel(data.baseline);
+  const baselineName = streamLabel(data.baseline);
+  diffBtn.textContent = "Difference from " + baselineName;
   ownBtn.onclick = () => selectBranchTab("own", streamId);
   diffBtn.onclick = () => selectBranchTab("diff", streamId);
+  // WP-31: the header is UNCONDITIONAL on a stream-scoped page. The
+  // covered-pass threshold below picks which tab opens first and
+  // nothing else -- a one-shot build reaches "Its own results" with one
+  // click, where before WP-31 it could not reach it at all.
   tabs.hidden = false;
 
-  // Stated in the caption FROM DATA -- the covered-pass count and the
-  // threshold are both literally in the sentence, never a silent
-  // constant (docs/STREAMS_PLAN.md §5.2's own wording: "must be stated
-  // in the UI caption, not buried" -- the same discipline
-  // WindowWordingTest holds every other recency line to). The "showing
-  // the difference by default" wording this caption used to carry for a
-  // below-threshold stream is gone WITH the case it described: that
-  // stream no longer reaches this branch of the code at all.
-  if (caption) {
-    const passWord = coveredPasses === 1 ? "pass" : "passes";
-    caption.hidden = false;
-    caption.textContent = "Showing its own results by default — this "
-      + "stream has completed " + coveredPasses + " " + passWord
-      + " in the last 14 days (" + OWN_RESULTS_DEFAULT_PASSES
-      + " or more shows its own dashboard first).";
+  // Which tab opens first, and why -- stated in the caption FROM DATA:
+  // the covered-pass count and the threshold are both literally in the
+  // sentence, never a silent constant (docs/STREAMS_PLAN.md §5.2's own
+  // wording: "must be stated in the UI caption, not buried" -- the same
+  // discipline WindowWordingTest holds every other recency line to).
+  // A URL carrying browse-filter params (a Watch card's unassigned-
+  // failures click-through) overrides the cadence rule: those filters
+  // only mean anything on the own-results browse table, so that is
+  // where such a link lands. A failed headline fetch left coveredPasses
+  // at 0 above, which reads as "opens on the difference" -- the safe
+  // fallback, and still an honest sentence.
+  const meetsThreshold = coveredPasses >= OWN_RESULTS_DEFAULT_PASSES;
+  const passWord = coveredPasses === 1 ? "pass" : "passes";
+  const cadence = "this build has completed " + coveredPasses + " "
+    + passWord + " in the last 14 days (" + OWN_RESULTS_DEFAULT_PASSES
+    + " or more opens its own results first)";
+  let which;
+  if (urlAsksForBrowseFilters()) {
+    which = "own";
+    caption.textContent = "Showing its own results, filtered as the "
+      + "link asked — " + cadence + ".";
+  } else if (meetsThreshold) {
+    which = "own";
+    caption.textContent = "Showing its own results first — " + cadence
+      + ". The other tab lists only where it differs from "
+      + baselineName + ".";
+  } else {
+    which = "diff";
+    caption.textContent = "Showing the difference from " + baselineName
+      + " first — " + cadence + ". “Its own results” shows "
+      + "everything that has run on this build, whether or not it "
+      + "differs.";
   }
-  selectBranchTab("own", streamId);
+  caption.hidden = false;
+  selectBranchTab(which, streamId);
 }
 
 function init() {
