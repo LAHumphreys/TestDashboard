@@ -53,11 +53,14 @@ const LONG_LOOKBACK_DAYS = 365;
 
 /* Follow mode's cadence (WP-32). A run can take seven hours and the
  * feeder pushes results as it goes, so a page left open has to catch up
- * on its own. One check a minute is well inside what /api/timeline
- * costs (derived hour tables, never a scan of runs), and the Follow
- * button's own title is built from this number rather than stating
- * one -- the same rule every window phrase in this project follows. */
-const FOLLOW_POLL_MS = 60000;
+ * on its own. Ten seconds, by the user's call after measuring: one
+ * poll is ~30-50 ms on the dev-scale copy (8 ms of that is the bare
+ * HTTP round trip; the derived hour tables it reads are under 1 ms),
+ * and the same request sustained 238/s when hammered -- ten followers
+ * at this cadence are one request a second. The Follow button's own
+ * title is built from this number rather than stating one -- the same
+ * rule every window phrase in this project follows. */
+const FOLLOW_POLL_MS = 10000;
 
 const state = {
   environment: null,
@@ -374,7 +377,7 @@ function setFollow(on) {
   syncUrl();
   if (on) {
     // Turning it on IS a refresh -- the reader asked to see the latest,
-    // not to wait a minute for it. The chain starts after that lands.
+    // not to wait a tick for it. The chain starts after that lands.
     refresh().then(() => {
       if (state.follow) {
         scheduleFollow();

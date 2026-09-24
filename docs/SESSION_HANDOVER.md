@@ -33,8 +33,9 @@ Last rewritten: **2026-09-24**. Two one-day drops in a row from real use:
 1. **Merge and deploy `wp-32-timeline-follow`** per
    `docs/drops/2026-09-24.md` — stop, checkout, start. If WP-31 was never
    deployed, this deploys both; the procedure is the same.
-2. **Watch a real run with Follow on.** The 60-second cadence has only
-   ever been invoked by hand in the shim; the first seven-hour run with a
+2. **Watch a real run with Follow on.** The ten-second cadence (60 s in
+   the first draft; dropped after measuring — see the drop note's "Load,
+   stated") has only ever been invoked by hand in the shim; the first seven-hour run with a
    tab following it is the first time the timer has actually ticked.
    Scroll restoration is also unexercised (no viewport in the shim).
 3. **Carried from WP-31:** a build whose last run is more than 36 hours
@@ -63,7 +64,7 @@ change contains no Python.
 `.scratch/net/wp32_drive_timeline.mjs` (scratch, gitignored), importing
 the WORKING TREE's `static/timeline.js` (not the pinned worktree) against
 a server booted from the repo root on a copy of the shifted seed: 43
-checks PASS — see the status log entry for the sequence. The 60-second
+checks PASS — see the status log entry for the sequence. The ten-second
 poll is captured by wrapping `setTimeout` and invoked by hand; runs are
 imported into the newest block between checks (start = last row's end +
 5 min, so they join it).

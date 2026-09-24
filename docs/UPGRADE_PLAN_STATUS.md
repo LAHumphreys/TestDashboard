@@ -3276,3 +3276,21 @@ shim); the failure stepper restarts after a changed refresh
 been deployed is not recorded here — the operator was going to; confirm
 on the box (`git log -1` in `/opt/testboard`, or the nav's What's new
 date) before assuming this drop lands on top of it.
+
+### Addendum, same day — Follow cadence 60 s → 10 s, on measurement
+
+The user asked how heavy a poll is and whether 10 s could be justified.
+Measured on the dev-scale copy (`.scratch` server from this checkout):
+heaviest environment 27 ms mean / 42 ms p95 per `/api/timeline` over
+HTTP, of which ~8 ms is the bare round trip (a trivial endpoint costs
+the same on this box), 6–12 ms is `known_environments()` validating the
+name (a scan of the `latest_runs` PK — 32k rows here; the method's own
+docstring points at `environment_exists()` for a single name, three
+seeks; **Python follow-up, not in this static-only drop**), ~8 ms is
+parsing/grouping ~800 `script_hours` buckets into executions, ~3 ms the
+68 KB JSON; the two derived-table reads are under 1 ms. Ten concurrent
+clients hammering it: 238 req/s sustained, p95 71 ms, max 111 ms. At
+10 s, ten followers are one request a second. `FOLLOW_POLL_MS` is now
+10000; the title, tests and driver derive from it; the drop note's
+"Load, stated" carries the numbers. Suite and the 43-check driver
+re-run at the new value — see the commit.
