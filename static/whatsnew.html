@@ -35,6 +35,33 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-09-24">
+      <div class="section-head">
+        <h2 class="eyebrow">24 September 2026</h2>
+        <span class="muted">New: the Timeline keeps up with a run that is still going</span>
+      </div>
+
+      <h3>What's new</h3>
+      <ul>
+        <li><strong>Refresh, on the Timeline.</strong> Results now arrive
+          while a run is still going, and a full run can take hours.
+          The new <strong>Refresh</strong> button next to the Run picker
+          re-reads the run you are looking at in place: rows you had
+          open stay open (and pick up their new tests), the page does
+          not jump, and if nothing has changed nothing is redrawn. The
+          line beside it says when the page last read the server.</li>
+        <li><strong>Follow.</strong> Press <strong>Follow</strong> and the
+          page checks for new results by itself while it is open, and
+          shows them as they land — the line beside it reads
+          "Following — checked HH:MM" and, once something new arrives,
+          "new results at HH:MM". It only checks while the tab is
+          visible, and catches up the moment you come back to it. Follow
+          is for the newest run only; pick an earlier run and it switches
+          off, since a finished run cannot change. Follow is remembered
+          in the page's address, so a link copied with it on opens with
+          it on.</li>
+      </ul>
+    </section>
     <section class="release" data-drop-date="2026-09-23">
       <div class="section-head">
         <h2 class="eyebrow">23 September 2026</h2>

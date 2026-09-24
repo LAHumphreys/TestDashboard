@@ -3201,3 +3201,96 @@ protected by CLAUDE.md's "do not remove the clamps". The wording is built
 from the real window, so it is honest; whether a one-shot build should
 have a *different* notion of "recent" is a design question for the user,
 recorded in the drop note and the handover, not decided here.
+
+## 2026-09-24 — WP-32: Refresh and Follow on the Timeline (branch `wp-32-timeline-follow`)
+
+**The trigger.** The site started pushing results to the dashboard DURING
+a run rather than after it, so the Timeline updates in near real time —
+except that the page itself did not: it showed the run as it was when
+loaded, and a full run can take seven hours. The ask: a refresh button,
+and ideally a "follow" mode that checks in the background and loads new
+results as they arrive; deploy today; front-end only if possible.
+
+**Front-end only, confirmed before building.** The worry was whether an
+in-progress run is even a block: `analytics.complete_passes` (what
+`/api/timeline` shows) trims passes whose start is within `gap_hours` of
+the lookback FLOOR — the old edge — and nothing at the new edge, so the
+newest block grows as `activity_hours` fills in and a re-fetch of
+"newest block" (no `from`/`to`) is the whole mechanism. No endpoint
+changed.
+
+**What shipped** (`static/timeline.js`, `timeline.html`, `style.css`):
+`load({preserve, quiet})`. `preserve` fingerprints the response
+(blocks/window/rows — rows carry `ended` and counts, so growth always
+differs) and, when unchanged, touches only the status line; when
+changed, re-renders, re-opens the rows the reader had open (each
+re-fetches its detail: the in-progress script's tests are exactly what
+grew) and restores `scrollY`. Refresh = normalise a window pinned to the
+newest block's stale edges back to "newest" (else it would trim what
+arrived since), then a preserving load. Follow = a chain of
+`setTimeout(FOLLOW_POLL_MS = 60s)`, each scheduled after the previous
+check completes — never `setInterval`; a hidden tab skips the fetch and
+keeps the clock, `visibilitychange` catches up at once; a quiet check's
+failure goes to the status line and never to the banner (and never
+clears one). Follow is confined to the newest run: an earlier block is
+finished by construction; selecting one switches Follow off and the
+button is disabled there with a title saying why. Turning Follow on
+refreshes immediately. `follow=1` rides the URL. Every phrase is built
+from a recorded clock or the constant ("checked 12:04 UTC", "every 60
+seconds").
+
+**Guards** (`TimelineLiveRefreshTest`, +8): chained timeouts / no
+`setInterval`; hidden-tab check precedes the fetch; quiet catch path
+never calls `showError`, `clearError` gated the same way; fingerprint
+short-circuit precedes `render()`; open-row keys captured before the
+re-render, restored after; Follow disabled off the newest run and
+stopped on selecting an earlier one; `follow=1` in `syncUrl`/`init`;
+cadence from the constant, no "minute" literal in the markup. Against
+master's page: 8 of 8 fail.
+
+**Suite:** 2262 → **2270 OK (skipped 1)**, SQLite-only; no Python changed.
+
+**Live evidence** (DOM shim; server booted from the working tree, not a
+worktree, on a copy of the shifted seed; `.scratch/net/
+wp32_drive_timeline.mjs`): 43 checks PASS. The 60-second timer is
+captured by wrapping `setTimeout` and each poll invoked by hand after
+importing a run into the newest block (start = last row's end + 5 min,
+so it joins the block). Sequence: unchanged Refresh keeps the same row
+node and the open row; an imported run appears on Refresh (251 → 252
+rows) with the open row re-opened and its detail re-fetched, status
+gains "new results at HH:MM UTC"; Follow on refreshes at once (→ 253),
+`follow=1` in the URL, exactly one poll chained; the poll draws the next
+run (→ 254) and chains one more; `document.hidden = true` makes the
+poll skip the fetch and re-schedule; selecting block 1 switches Follow
+off, disables it, drops `follow=1`, leaves no poll; back to block 0
+re-enables it without switching it on; a `follow=1` load starts the
+chain after first paint.
+
+**Not verified, stated in the drop note:** the real cadence ticking (the
+timer was invoked by hand); scroll restoration (no viewport in the
+shim); the failure stepper restarts after a changed refresh
+(deliberate); a run that pauses over six hours splits into two blocks
+(the existing rule, visible to a follower).
+
+**WP-31 status:** merged to `master` 2026-09-23 (#10). Whether it has
+been deployed is not recorded here — the operator was going to; confirm
+on the box (`git log -1` in `/opt/testboard`, or the nav's What's new
+date) before assuming this drop lands on top of it.
+
+### Addendum, same day — Follow cadence 60 s → 10 s, on measurement
+
+The user asked how heavy a poll is and whether 10 s could be justified.
+Measured on the dev-scale copy (`.scratch` server from this checkout):
+heaviest environment 27 ms mean / 42 ms p95 per `/api/timeline` over
+HTTP, of which ~8 ms is the bare round trip (a trivial endpoint costs
+the same on this box), 6–12 ms is `known_environments()` validating the
+name (a scan of the `latest_runs` PK — 32k rows here; the method's own
+docstring points at `environment_exists()` for a single name, three
+seeks; **Python follow-up, not in this static-only drop**), ~8 ms is
+parsing/grouping ~800 `script_hours` buckets into executions, ~3 ms the
+68 KB JSON; the two derived-table reads are under 1 ms. Ten concurrent
+clients hammering it: 238 req/s sustained, p95 71 ms, max 111 ms. At
+10 s, ten followers are one request a second. `FOLLOW_POLL_MS` is now
+10000; the title, tests and driver derive from it; the drop note's
+"Load, stated" carries the numbers. Suite and the 43-check driver
+re-run at the new value — see the commit.
