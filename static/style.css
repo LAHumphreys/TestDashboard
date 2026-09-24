@@ -1671,6 +1671,24 @@ button.env-updated-item[aria-pressed="true"] .env-updated-when {
 
 .timeline-card { padding: 14px 16px 10px; }
 
+/* WP-32: Refresh / Follow / "checked HH:MM" beside the Run picker. The
+   Follow toggle's pressed state reuses the pass colour: it is "on",
+   not a result. A disabled Follow (an earlier, finished run selected)
+   reads as unavailable rather than merely unpressed. */
+.tl-live {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  font-size: 13px;
+}
+.tl-live .toggle[aria-pressed="true"] {
+  background: var(--c-pass);
+  color: #fff;
+  border-color: transparent;
+}
+.tl-live .toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+
 .timeline-axis {
   position: relative;
   height: 18px;

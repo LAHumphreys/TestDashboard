@@ -70,6 +70,22 @@
       </label>
       <datalist id="test-search-list"></datalist>
       <span id="search-note" class="muted search-note"></span>
+      <!-- WP-32: results arrive while a run is still going (a full run
+           can take hours). Refresh re-reads the selected run in place --
+           open rows stay open, scroll stays put, and nothing is redrawn
+           when nothing changed. Follow does the same on a timer while
+           the page is visible, for the newest run only: an earlier run
+           is finished by construction (blocks are separated by a full
+           quiet gap), so timeline.js disables the button there. The
+           status span says when the page last read the server, from a
+           recorded clock, never "just now". -->
+      <span class="tl-live" role="group" aria-label="Live updates">
+        <button id="timeline-refresh" type="button"
+                title="Re-read this run now">Refresh</button>
+        <button id="timeline-follow" class="toggle" type="button"
+                aria-pressed="false">Follow</button>
+        <span id="timeline-refreshed" class="muted"></span>
+      </span>
     </div>
 
     <!-- Optional vi-flavoured keys; the mouse does all of it too. -->

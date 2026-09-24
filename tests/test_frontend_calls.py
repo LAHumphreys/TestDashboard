@@ -3482,6 +3482,124 @@ class OwnResultsAlwaysReachableTest(unittest.TestCase):
         self.assertIn('"delta-section").hidden = true', body)
 
 
+class TimelineLiveRefreshTest(unittest.TestCase):
+    """WP-32 (2026-09-24): results now arrive WHILE a run is going (a
+    full run can take seven hours), so the Timeline gained a Refresh
+    button and a Follow mode that re-reads the selected run on a timer.
+    Front-end only -- the newest block already grows server-side as
+    hours fill in (analytics.complete_passes trims at the OLD edge of
+    the lookback only), so a re-fetch of "newest block" is the whole
+    mechanism.
+
+    What these pin is the shape that keeps it safe to leave on for
+    hours: chained timeouts (never an interval that can stack requests),
+    no fetch while the tab is hidden, a quiet failure path that never
+    reaches the error banner, a fingerprint so an unchanged response
+    touches nothing, open rows restored after a re-render, and Follow
+    confined to the newest run.
+    """
+
+    def js(self) -> str:
+        return _strip_comments(read("timeline.js"))
+
+    def test_the_controls_ship_in_the_markup(self) -> None:
+        html = read_text("timeline.html")
+        self.assertIn('id="timeline-refresh"', html)
+        follow_at = html.index('id="timeline-follow"')
+        self.assertIn('aria-pressed="false"', html[follow_at:follow_at + 120])
+        self.assertIn('id="timeline-refreshed"', html)
+        for page in ("timeline.html",):
+            self.assertEqual(read_text(page).count('id="timeline-follow"'), 1)
+
+    def test_follow_is_a_chain_of_timeouts_never_an_interval(self) -> None:
+        code = self.js()
+        self.assertNotIn("setInterval", code)
+        tick = _function_body(code, "async function followTick(")
+        self.assertIn("await load({ preserve: true, quiet: true })", tick)
+        # The next check is scheduled AFTER the awaited load, not before.
+        self.assertGreater(tick.index("scheduleFollow()", tick.index("await load")),
+                           tick.index("await load"))
+        schedule = _function_body(code, "function scheduleFollow(")
+        self.assertIn("clearTimeout(state.followTimer)", schedule)
+        self.assertIn("setTimeout(followTick, FOLLOW_POLL_MS)", schedule)
+
+    def test_a_hidden_tab_skips_the_fetch_and_catches_up_when_shown(
+        self
+    ) -> None:
+        code = self.js()
+        tick = _function_body(code, "async function followTick(")
+        hidden_at = tick.index("document.hidden === true")
+        self.assertLess(hidden_at, tick.index("await load"))
+        self.assertIn("scheduleFollow()", tick[hidden_at:hidden_at + 80])
+        init = _function_body(code, "async function init(")
+        self.assertIn('"visibilitychange"', init)
+        self.assertIn("document.hidden === false", init)
+
+    def test_a_quiet_check_never_reaches_the_error_banner(self) -> None:
+        body = _function_body(self.js(), "async function load(")
+        catch_at = body.index("} catch (err) {")
+        catch_body = body[catch_at:]
+        quiet_at = catch_body.index("if (opts.quiet)")
+        self.assertIn("state.checkFailed = err.message",
+                      catch_body[quiet_at:catch_body.index("} else {")])
+        self.assertIn("showError(err.message)",
+                      catch_body[catch_body.index("} else {"):])
+        # And a quiet check does not clear a banner the reader is
+        # looking at, either -- clearError() is gated the same way.
+        self.assertIn("if (!opts.quiet) {\n    clearError();", body)
+
+    def test_an_unchanged_response_touches_nothing(self) -> None:
+        body = _function_body(self.js(), "async function load(")
+        same_at = body.index("fingerprint === state.fingerprint")
+        self.assertIn("return", body[same_at:same_at + 80])
+        self.assertLess(same_at, body.index("render(data)"))
+        fp = _function_body(self.js(), "function fingerprintOf(")
+        for field in ("blocks", "window", "rows"):
+            self.assertIn(field, fp)
+
+    def test_open_rows_and_scroll_survive_a_refresh(self) -> None:
+        code = self.js()
+        body = _function_body(code, "async function load(")
+        keys_at = body.index("openRowKeys()")
+        render_at = body.index("render(data)")
+        self.assertLess(keys_at, render_at, "keys captured BEFORE re-render")
+        self.assertGreater(body.index("reopenRows(reopen)"), render_at)
+        self.assertGreater(body.index("window.scrollTo(0, scrollY)"), render_at)
+        row = _function_body(code, "function buildRow(")
+        self.assertIn("key: rowKey(row)", row)
+        self.assertIn('isOpen: () => toggle.getAttribute("aria-expanded") === "true"', row)
+        reopen = _function_body(code, "function reopenRows(")
+        self.assertIn("controller.openTests()", reopen)
+
+    def test_follow_is_confined_to_the_newest_run(self) -> None:
+        code = self.js()
+        status = _function_body(code, "function renderLiveStatus(")
+        self.assertIn("followBtn.disabled = !newest", status)
+        init = _function_body(code, "async function init(")
+        stop_at = init.index("if (!isNewest && state.follow)")
+        self.assertIn("setFollow(false)", init[stop_at:stop_at + 300])
+        # A refresh of the newest run re-derives its window rather than
+        # keeping edges that would trim what arrived since.
+        norm = _function_body(code, "function normaliseNewestWindow(")
+        self.assertIn("state.from = null", norm)
+        for fn in ("function refresh(", "async function followTick("):
+            self.assertIn("normaliseNewestWindow()", _function_body(code, fn))
+
+    def test_follow_travels_in_the_url_and_the_cadence_is_not_a_literal(
+        self
+    ) -> None:
+        code = self.js()
+        self.assertIn('follow: state.follow ? "1" : null',
+                      _function_body(code, "function syncUrl("))
+        self.assertIn('state.follow = params.get("follow") === "1"',
+                      _function_body(code, "async function init("))
+        status = _function_body(code, "function renderLiveStatus(")
+        self.assertIn("FOLLOW_POLL_MS / 1000", status)
+        html = re.sub(r"<!--.*?-->", "", read_text("timeline.html"), flags=re.S)
+        self.assertNotIn("minute", html.lower(),
+                         "the cadence is stated from the constant, in JS")
+
+
 class BrowseFilterUrlInitTest(unittest.TestCase):
     """F4(a) (docs/STREAMS_PLAN.md §5.2 "as built"): the browse filter
     row's state can be set from the page's own URL at load, so a deep

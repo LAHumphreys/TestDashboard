@@ -51,6 +51,14 @@ import { apiUrl, pageUrl } from "./urls.js";
  * matches retention — so it means "any recorded run", not a teaser. */
 const LONG_LOOKBACK_DAYS = 365;
 
+/* Follow mode's cadence (WP-32). A run can take seven hours and the
+ * feeder pushes results as it goes, so a page left open has to catch up
+ * on its own. One check a minute is well inside what /api/timeline
+ * costs (derived hour tables, never a scan of runs), and the Follow
+ * button's own title is built from this number rather than stating
+ * one -- the same rule every window phrase in this project follows. */
+const FOLLOW_POLL_MS = 60000;
+
 const state = {
   environment: null,
   blocks: [],
@@ -69,6 +77,19 @@ const state = {
   // mainline, zero visible change. Fixed at load, same as the rest of
   // this page's scope (there is no in-page stream switcher here).
   streamId: null,
+  /* WP-32 live updates. `follow` is the Follow toggle (mirrored to the
+   * URL as follow=1 so a link can carry it); `followTimer` the one
+   * pending setTimeout (never more than one -- polls are chained, not
+   * an interval, so a slow response can never overlap the next check);
+   * `fingerprint` what the page last drew, so a check that finds the
+   * same data leaves the DOM alone; the three clocks feed the status
+   * line beside the buttons, and are display strings (HH:MM UTC). */
+  follow: false,
+  followTimer: null,
+  fingerprint: null,
+  checkedAt: null,
+  changedAt: null,
+  checkFailed: null,
 };
 
 function timelineUrl() {
@@ -126,6 +147,8 @@ function syncUrl() {
     days: state.days,
     from: windowSet ? state.from : null,
     to: windowSet ? state.to : null,
+    // WP-32: Follow travels with the link, off by default (omitted).
+    follow: state.follow ? "1" : null,
   }, { stream: state.streamId, product: null, baseline: null }));
 }
 
@@ -142,21 +165,223 @@ function ms(iso) {
   return Date.parse(iso.slice(0, 23) + "Z");
 }
 
-async function load() {
+/* ================= WP-32: refresh and follow ================= */
+
+/* Everything the page draws from a timeline response. Two responses
+ * with the same fingerprint would render identically, so a refresh
+ * that finds no change leaves the DOM alone: no flicker, no lost scroll
+ * position, no row details re-fetched for nothing. Rows carry their
+ * ended time and counts, so a run that has grown always differs. */
+function fingerprintOf(data) {
+  return JSON.stringify({
+    blocks: data.blocks, window: data.window, rows: data.rows,
+  });
+}
+
+/** "12:04" -- the current UTC clock, for the status line. */
+function nowClock() {
+  return new Date().toISOString().slice(11, 16);
+}
+
+/** Is the page showing the newest run? Follow applies to it alone: an
+ * earlier block is finished by construction (blocks are separated by a
+ * full quiet gap), so there is nothing to follow. Both spellings of
+ * "newest" count -- the default (no window) and a window that names
+ * the newest block's own edges (a shared link, or the picker before
+ * it normalises). */
+function viewingNewest() {
+  if (state.from === null && state.to === null) {
+    return true;
+  }
+  const newest = state.blocks[0];
+  return Boolean(newest) && state.from === newest.started
+    && state.to === newest.ended;
+}
+
+/* A refresh of the newest run must re-derive the window: an in-progress
+ * run's end moves, and a window pinned to its old edges would trim the
+ * rows that arrived since. So "the newest block by its edges" becomes
+ * "the newest block" before the fetch -- the same normalisation the
+ * picker's own change handler applies. */
+function normaliseNewestWindow() {
+  if (state.from !== null && viewingNewest()) {
+    state.from = null;
+    state.to = null;
+    syncUrl();
+  }
+}
+
+/* A row is identified across refreshes by its script and start time --
+ * its end time and counts are exactly what a refresh changes. */
+function rowKey(row) {
+  return row.script + "\n" + row.started;
+}
+
+function openRowKeys() {
+  return rowControllers
+    .filter((controller) => controller.isOpen())
+    .map((controller) => controller.key);
+}
+
+/* Re-open the rows that were open before a re-render. openTests()
+ * re-fetches each one's detail, which is wanted: an in-progress
+ * script's tests are the rows most likely to have grown. */
+function reopenRows(keys) {
+  if (!keys.length) {
+    return;
+  }
+  const wanted = new Set(keys);
+  for (const controller of rowControllers) {
+    if (wanted.has(controller.key)) {
+      controller.openTests();
+    }
+  }
+}
+
+/* The status line beside Refresh/Follow, and the Follow button's own
+ * state -- every phrase built from a recorded clock or the constant,
+ * never a wall-clock word like "just now". */
+function renderLiveStatus() {
+  const status = document.getElementById("timeline-refreshed");
+  const followBtn = document.getElementById("timeline-follow");
+  const newest = viewingNewest();
+  followBtn.setAttribute("aria-pressed", state.follow ? "true" : "false");
+  followBtn.disabled = !newest;
+  followBtn.title = newest
+    ? "Check for new results every " + (FOLLOW_POLL_MS / 1000)
+      + " seconds while this page is open, and show them as they arrive"
+    : "Follow applies to the newest run only — the selected run has "
+      + "finished";
+  const bits = [];
+  if (state.checkedAt !== null) {
+    bits.push((state.follow ? "Following — checked " : "Updated ")
+      + state.checkedAt + " UTC");
+    if (state.changedAt !== null) {
+      bits.push("new results at " + state.changedAt + " UTC");
+    }
+  }
+  if (state.checkFailed !== null) {
+    bits.push("last check failed (" + state.checkFailed + ") — will retry");
+  }
+  status.textContent = bits.join(" · ");
+}
+
+/* Selection changed (environment, block): the fingerprint and the
+ * "new results" clock belonged to the old selection. */
+function resetLive() {
+  state.fingerprint = null;
+  state.changedAt = null;
+  state.checkFailed = null;
+}
+
+/**
+ * Fetch and draw the selected window.
+ *
+ * options.preserve (a refresh): compare against what is on screen and,
+ * when nothing changed, touch only the status line; when something did,
+ * re-render and then restore what the reader had -- open rows re-opened
+ * (and re-fetched), scroll position kept.
+ * options.quiet (a follow-mode check): a failure goes to the status
+ * line and the next check still happens, never to the error banner --
+ * a page left open overnight must not greet the reader with a stale
+ * banner from one dropped request at 03:00.
+ */
+async function load(options) {
+  const opts = options || {};
   const seq = ++state.seq;
-  clearError();
+  if (!opts.quiet) {
+    clearError();
+  }
   try {
     const data = await fetchJson(timelineUrl());
     if (seq !== state.seq) {
       return;    // a later selection overtook this one
     }
+    state.checkedAt = nowClock();
+    state.checkFailed = null;
+    const fingerprint = fingerprintOf(data);
+    if (opts.preserve && fingerprint === state.fingerprint) {
+      renderLiveStatus();
+      return;
+    }
+    const reopen = opts.preserve ? openRowKeys() : [];
+    const scrollY = opts.preserve && typeof window.scrollY === "number"
+      ? window.scrollY : null;
+    if (opts.preserve && state.fingerprint !== null) {
+      state.changedAt = state.checkedAt;
+    }
+    state.fingerprint = fingerprint;
     state.blocks = data.blocks;
     state.rows = data.rows;
     render(data);
+    reopenRows(reopen);
+    if (scrollY !== null && typeof window.scrollTo === "function") {
+      window.scrollTo(0, scrollY);
+    }
+    renderLiveStatus();
   } catch (err) {
-    if (seq === state.seq) {
+    if (seq !== state.seq) {
+      return;
+    }
+    if (opts.quiet) {
+      state.checkFailed = err.message;
+      renderLiveStatus();
+    } else {
       showError(err.message);
     }
+  }
+}
+
+/** The Refresh button: the selected run, re-read in place. */
+function refresh() {
+  normaliseNewestWindow();
+  return load({ preserve: true });
+}
+
+function scheduleFollow() {
+  if (state.followTimer !== null) {
+    clearTimeout(state.followTimer);
+  }
+  state.followTimer = setTimeout(followTick, FOLLOW_POLL_MS);
+}
+
+/* One check, then the next is scheduled AFTER it completes -- chained,
+ * never an interval, so a slow server cannot stack requests. A hidden
+ * tab skips the fetch and keeps the clock running; visibilitychange
+ * below catches it up the moment it is looked at again. */
+async function followTick() {
+  state.followTimer = null;
+  if (!state.follow) {
+    return;
+  }
+  if (document.hidden === true) {
+    scheduleFollow();
+    return;
+  }
+  normaliseNewestWindow();
+  await load({ preserve: true, quiet: true });
+  if (state.follow) {
+    scheduleFollow();
+  }
+}
+
+function setFollow(on) {
+  state.follow = on;
+  if (state.followTimer !== null) {
+    clearTimeout(state.followTimer);
+    state.followTimer = null;
+  }
+  syncUrl();
+  if (on) {
+    // Turning it on IS a refresh -- the reader asked to see the latest,
+    // not to wait a minute for it. The chain starts after that lands.
+    refresh().then(() => {
+      if (state.follow) {
+        scheduleFollow();
+      }
+    });
+  } else {
+    renderLiveStatus();
   }
 }
 
@@ -597,6 +822,10 @@ function buildRow(row, domainFrom, span, showDate) {
   return {
     wrap: wrap,
     row: row,
+    // WP-32: identity across a refresh, and whether the reader had it
+    // open -- what reopenRows() restores after a re-render.
+    key: rowKey(row),
+    isOpen: () => toggle.getAttribute("aria-expanded") === "true",
     /** Open the row and resolve to its test controllers. */
     openTests: () => {
       setOpen(true);
@@ -1019,6 +1248,8 @@ async function init() {
   }
   const rawStream = params.get("stream");
   state.streamId = rawStream ? parseInt(rawStream, 10) : null;
+  // WP-32: a link can arrive with Follow already on.
+  state.follow = params.get("follow") === "1";
   if (params.get("test") && params.get("script")) {
     pendingLocate = {
       script: params.get("script"),
@@ -1033,9 +1264,26 @@ async function init() {
       state.from = null;    // a window belongs to one environment
       state.to = null;
       searchMatches = [];   // suggestions belonged to the old one
+      resetLive();          // WP-32: so did the fingerprint
       syncUrl();
       load();
     });
+
+  // WP-32: Refresh re-reads the selected run in place; Follow does the
+  // same on a timer (see followTick) and is mirrored to the URL.
+  document.getElementById("timeline-refresh")
+    .addEventListener("click", () => { refresh(); });
+  document.getElementById("timeline-follow")
+    .addEventListener("click", () => { setFollow(!state.follow); });
+  if (document.addEventListener) {
+    document.addEventListener("visibilitychange", () => {
+      // Back from a background tab: catch up now rather than at the
+      // next tick (followTick skipped its fetches while hidden).
+      if (state.follow && document.hidden === false) {
+        followTick();
+      }
+    });
+  }
 
   const searchBox = document.getElementById("test-search");
   searchBox.addEventListener("input", (event) => {
@@ -1075,6 +1323,13 @@ async function init() {
         && block.ended === newest.ended;
       state.from = isNewest ? null : block.started;
       state.to = isNewest ? null : block.ended;
+      resetLive();          // WP-32: the fingerprint was the old block's
+      if (!isNewest && state.follow) {
+        // An earlier run is finished; there is nothing to follow. Off,
+        // explicitly, rather than left polling a window that cannot
+        // change -- renderLiveStatus() disables the button after load.
+        setFollow(false);
+      }
       syncUrl();
       load();
     });
@@ -1093,7 +1348,13 @@ async function init() {
     return;
   }
   syncUrl();
-  load();
+  // WP-32: a follow=1 link starts the chain after the first paint; a
+  // plain load leaves the status line to say when it was read.
+  load().then(() => {
+    if (state.follow) {
+      scheduleFollow();
+    }
+  });
 }
 
 init();
