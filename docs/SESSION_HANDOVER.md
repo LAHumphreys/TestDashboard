@@ -4,9 +4,10 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-09-23**, after the first day branch builds were
-loaded into the live dashboard and the one thing that came up immediately
-was fixed as **WP-31** (branch `wp-31-own-results-always`).
+Last rewritten: **2026-09-24**. Two one-day drops in a row from real use:
+**WP-31** (a build's own dashboard always reachable; merged #10,
+2026-09-23) and **WP-32** (Refresh + Follow on the Timeline, branch
+`wp-32-timeline-follow`, today's drop).
 
 ## Where things stand
 
@@ -19,41 +20,53 @@ was fixed as **WP-31** (branch `wp-31-own-results-always`).
   build was **compare-only**. Its "Its own results" tab (WP-23) was hidden
   by WP-25's covered-pass gate until the build had run twice in a
   fortnight, so nothing on the page said how much had actually run.
-- **WP-31 fixes that** and is the next drop: both tabs always exist on a
-  stream-scoped load, the threshold picks only the default, the caption
-  says why, and a Watch card's filtered click-through opens the own
-  results tab. Static files only, no migration, no new flag. Operator
-  note: `docs/drops/2026-09-23.md`. Tester note: `whatsnew.html`,
-  section dated 2026-09-23 (provisional — re-date both if it ships later).
+- **WP-31 fixed that** and is merged (#10, 2026-09-23). Whether it has
+  been DEPLOYED is not recorded here — check the box's What's new date.
+- **The site now pushes results DURING a run** (a full run takes ~7h), so
+  the Timeline fell behind the run it showed. **WP-32** adds Refresh and
+  Follow to the Timeline: front-end only, no migration, no flag. Operator
+  note: `docs/drops/2026-09-24.md`. Tester note: `whatsnew.html`, section
+  dated 2026-09-24 (provisional — re-date both if it ships later).
 
 ## Today's plan
 
-1. **Push `wp-31-own-results-always`, open the PR, wait for all CI legs**
-   (nothing touches Python or SQL, but the ubi8 3.6 leg and the MariaDB
-   legs are the only evidence the suite is green anywhere but this box).
-2. **Merge and deploy** per `docs/drops/2026-09-23.md` — stop, checkout,
-   start. Restart is the whole deployment.
-3. **Watch for the one thing the drop note flags:** a build whose last
-   run is more than 36 hours old shows "Reported 0 of N" on its own tiles
-   until it runs again (the unchanged fallback window, worded from data).
-   "N tests tracked" and the browse table still show everything that ran.
-   If testers report it, the answer is a design decision about a
-   build-specific window, not a bug — bring it to the user, do not loosen
-   the clamp.
+1. **Merge and deploy `wp-32-timeline-follow`** per
+   `docs/drops/2026-09-24.md` — stop, checkout, start. If WP-31 was never
+   deployed, this deploys both; the procedure is the same.
+2. **Watch a real run with Follow on.** The 60-second cadence has only
+   ever been invoked by hand in the shim; the first seven-hour run with a
+   tab following it is the first time the timer has actually ticked.
+   Scroll restoration is also unexercised (no viewport in the shim).
+3. **Carried from WP-31:** a build whose last run is more than 36 hours
+   old shows "Reported 0 of N" on its own tiles until it runs again (the
+   unchanged fallback window, worded from data). If testers report it,
+   it is a design decision about a build-specific window, not a bug —
+   bring it to the user, do not loosen the clamp.
 
 ## Where the code is
 
 | | |
 |---|---|
-| **`wp-31-own-results-always`** | **THE branch. Ship this.** Two commits on `origin/master`: the fix + guards, then the notes and log |
-| `origin/master` | `b9700b3` — the 2026-08-11 drop plus WP-30's Python client |
+| **`wp-32-timeline-follow`** | **THE branch. Ship this.** Two commits on `origin/master`: the feature + guards, then the notes and log |
+| `origin/master` | `158fbcd` — WP-31 merged (#10) on top of the 2026-08-11 drop and WP-30's Python client |
+| `wp-31-own-results-always` | merged; prune |
 | `wp-30-java-feeder` | Java micro client + CI, one commit ahead of master, unmerged |
 | `wp-14-in-run-progress` | parked WIP; its migration renumbers to **11** before merging (registry §1) |
 | `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*` | merged into master via PR #7; prune when convenient |
 
-**Suite on the ship branch: 2262 OK (skipped 1), SQLite-only.** Dual-
+**Suite on the ship branch: 2270 OK (skipped 1), SQLite-only.** Dual-
 backend variants not run this session (no MariaDB option file here); the
 change contains no Python.
+
+## Live evidence for WP-32 (DOM shim, not a browser)
+
+`.scratch/net/wp32_drive_timeline.mjs` (scratch, gitignored), importing
+the WORKING TREE's `static/timeline.js` (not the pinned worktree) against
+a server booted from the repo root on a copy of the shifted seed: 43
+checks PASS — see the status log entry for the sequence. The 60-second
+poll is captured by wrapping `setTimeout` and invoked by hand; runs are
+imported into the newest block between checks (start = last row's end +
+5 min, so they join it).
 
 ## Live evidence for WP-31 (DOM shim, not a browser)
 
@@ -73,7 +86,7 @@ scripts, which parse ids from the shipped markup.
 
 ## Needs a person, not a commit
 
-1. **Merge + deploy WP-31** (above).
+1. **Merge + deploy WP-32** (above); confirm WP-31 reached the box.
 2. **Decide the Java client's fate** (`wp-30-java-feeder`): merge or
    park.
 3. Carried from 2026-08-11, still open: re-retire the tests the un-retire
@@ -90,10 +103,10 @@ scripts, which parse ids from the shipped markup.
 ## First ten minutes of the next session
 
 ```bash
-git checkout wp-31-own-results-always
+git checkout wp-32-timeline-follow
 git log --oneline -3
-python -m unittest discover        # expect 2262 OK (skipped 1)
-gh run list --branch wp-31-own-results-always --limit 1
+python -m unittest discover        # expect 2270 OK (skipped 1)
+gh run list --branch wp-32-timeline-follow --limit 1
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,
