@@ -4,92 +4,79 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-09-24**. Two one-day drops in a row from real use:
-**WP-31** (a build's own dashboard always reachable; merged #10,
-2026-09-23) and **WP-32** (Refresh + Follow on the Timeline, branch
-`wp-32-timeline-follow`, today's drop).
+Last rewritten: **2026-09-29**. WP-31 and WP-32 are both in production;
+nothing is waiting to ship. The next drop has **not been specified yet** —
+it is to be specced today, built overnight, deployed 2026-09-30.
 
 ## Where things stand
 
-- **Production is MariaDB, schema v10, serving the streams drop** (the
-  2026-08-11 drop, `tooling-2026-08-10` → `master` via PR #7). WP-30's
-  micro feeder client (PR #8) is on `master` too; its Java sibling is on
-  `wp-30-java-feeder`, one commit ahead of `master`, not yet merged.
-- **Branch builds are now being fed to the dashboard for real** — the
-  streams work has met real data. First finding, same day: a fresh branch
-  build was **compare-only**. Its "Its own results" tab (WP-23) was hidden
-  by WP-25's covered-pass gate until the build had run twice in a
-  fortnight, so nothing on the page said how much had actually run.
-- **WP-31 fixed that** and is merged (#10, 2026-09-23). Whether it has
-  been DEPLOYED is not recorded here — check the box's What's new date.
-- **The site now pushes results DURING a run** (a full run takes ~7h), so
-  the Timeline fell behind the run it showed. **WP-32** adds Refresh and
-  Follow to the Timeline: front-end only, no migration, no flag. Operator
-  note: `docs/drops/2026-09-24.md`. Tester note: `whatsnew.html`, section
-  dated 2026-09-24 (provisional — re-date both if it ships later).
+- **Production is MariaDB, schema v10, serving `master` at `91d5cd3`** —
+  the 2026-09-24 drop (WP-32, PR #11) on top of the 2026-09-23 drop
+  (WP-31, PR #10). The user states GitHub `master` is what is deployed.
+- **Follow works on real runs.** The user's report, 2026-09-29: "Follow
+  is working beautifully". That is the first time the ten-second timer
+  has been seen ticking by itself. Scroll restoration, the failure
+  stepper restarting, and the six-hour block split were not itemised in
+  that report — no complaint, no separate confirmation.
+- **The site pushes results DURING a run** (a full run takes ~7h), and
+  branch builds are being fed for real. Both are now the normal case,
+  not the new one.
+- **No drop is in flight.** No branch carries unshipped dashboard code
+  except the two listed as parked/open below.
 
-## Today's plan
+## The next piece of work
 
-1. **Merge and deploy `wp-32-timeline-follow`** per
-   `docs/drops/2026-09-24.md` — stop, checkout, start. If WP-31 was never
-   deployed, this deploys both; the procedure is the same.
-2. **Watch a real run with Follow on.** The ten-second cadence (60 s in
-   the first draft; dropped after measuring — see the drop note's "Load,
-   stated") has only ever been invoked by hand in the shim; the first seven-hour run with a
-   tab following it is the first time the timer has actually ticked.
-   Scroll restoration is also unexercised (no viewport in the shim).
-3. **Carried from WP-31:** a build whose last run is more than 36 hours
-   old shows "Reported 0 of N" on its own tiles until it runs again (the
-   unchanged fallback window, worded from data). If testers report it,
-   it is a design decision about a build-specific window, not a bug —
-   bring it to the user, do not loosen the clamp.
+**A small drop, spec to come from the user.** Until the spec exists there
+is nothing to build; do not infer one from the candidates below.
+
+- It will be **WP-33** (no WP-33 exists anywhere in the repo yet), on a
+  branch `wp-33-<slug>` cut from `origin/master`.
+- Deploying 2026-09-30 means the tester section in `whatsnew.html`
+  (`data-drop-date="2026-09-30"`) and the operator note
+  `docs/drops/2026-09-30.md` are dated **2026-09-30**, and the operator
+  note is written before it ships.
+- If it needs a schema change, version **11 is claimed by WP-15**
+  (registry, `UPGRADE_PLAN.md` §1) — a new claim renumbers WP-15 again,
+  in the same commit. A migration also turns the rollback from
+  `git checkout` into a database restore, and on MariaDB the schema moves
+  by `tools/upgrade_mariadb_schema.py`, never by the app. Say which in
+  the operator note.
+
+**Candidates already on record** (for the user to pick from, or ignore):
+
+1. **`/api/timeline` environment check** — `environment not in
+   storage.known_environments()` scans the `latest_runs` primary key
+   (6–12 ms of a 27 ms request, dev-scale copy); the neighbouring
+   handlers use `storage.environment_exists()`, three seeks. Follow now
+   calls this every ten seconds per open tab. Python, so a restart.
+2. **Old-build tiles** — a build whose last run is more than 36 hours
+   old shows "Reported 0 of N" on its own tiles until it runs again.
+   A design decision about a build-specific window, not a bug — bring it
+   to the user, **do not loosen the clamp**.
+3. The 2026-08-11 morning list's UI judgement calls (below).
 
 ## Where the code is
 
 | | |
 |---|---|
-| **`wp-32-timeline-follow`** | **THE branch. Ship this.** Two commits on `origin/master`: the feature + guards, then the notes and log |
-| `origin/master` | `158fbcd` — WP-31 merged (#10) on top of the 2026-08-11 drop and WP-30's Python client |
-| `wp-31-own-results-always` | merged; prune |
-| `wp-30-java-feeder` | Java micro client + CI, one commit ahead of master, unmerged |
+| `origin/master` | `91d5cd3` — **deployed.** Cut the next branch from here |
+| `docs-handover-2026-09-29` | this rewrite + one status-log entry; docs only |
+| `wp-32-timeline-follow`, `wp-31-own-results-always` | merged (squash); prune |
+| `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, all checks green, untouched since 2026-09-08; one commit ahead of `master`, two behind |
 | `wp-14-in-run-progress` | parked WIP; its migration renumbers to **11** before merging (registry §1) |
-| `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*` | merged into master via PR #7; prune when convenient |
+| `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*`, `wp-17`…`wp-25` | merged; prune when convenient. Six sibling worktrees (`TestDashboard-*-wt`) still hold some of them checked out — remove the worktree before the branch |
 
-**Suite on the ship branch: 2270 OK (skipped 1), SQLite-only.** Dual-
-backend variants not run this session (no MariaDB option file here); the
-change contains no Python.
+There is **no local `master` branch** in this checkout; work from
+`origin/master`.
 
-## Live evidence for WP-32 (DOM shim, not a browser)
-
-`.scratch/net/wp32_drive_timeline.mjs` (scratch, gitignored), importing
-the WORKING TREE's `static/timeline.js` (not the pinned worktree) against
-a server booted from the repo root on a copy of the shifted seed: 43
-checks PASS — see the status log entry for the sequence. The ten-second
-poll is captured by wrapping `setTimeout` and invoked by hand; runs are
-imported into the newest block between checks (start = last row's end +
-5 min, so they join it).
-
-## Live evidence for WP-31 (DOM shim, not a browser)
-
-`.scratch/net/wp31_drive_branch_tabs.mjs` (scratch, gitignored) against a
-server booted from the fix commit on a seeded copy of the dev estate.
-Two runs: the net seed as-is (its nights are dated August, so under
-today's date every build has 0 covered passes — every build is "sparse")
-and a re-seed with the nights shifted 39 days into the last fortnight (the
-cadenced build then meets the threshold). Both PASS on every check:
-sparse build shows both tabs, opens on the difference with the stated
-caption, reaches its own results in one click with its own count of 3;
-filtered URL opens on own results with the toggle pressed; cadenced
-build opens on its own results; mainline load unchanged. The legacy
-WP-23 driver (`legacy_drive_branch_tabs.mjs`) is stale against today's
-`app.js` (hand-written id list) — use the WP-31 one or the `walk_*`
-scripts, which parse ids from the shipped markup.
+**Suite on `master`'s tree: 2270 OK (skipped 1)**, 144 s, SQLite-only,
+run 2026-09-29. Dual-backend variants not run here (no MariaDB option
+file on this machine); CI's MariaDB legs are green on `91d5cd3`.
 
 ## Needs a person, not a commit
 
-1. **Merge + deploy WP-32** (above); confirm WP-31 reached the box.
-2. **Decide the Java client's fate** (`wp-30-java-feeder`): merge or
-   park.
+1. **Spec the next drop** (above).
+2. **Decide the Java client's fate** (PR #9): merge or park.
 3. Carried from 2026-08-11, still open: re-retire the tests the un-retire
    bug released (search comments for "Automatically un-retired");
    `tools/diagnose_db.py --compare-local` on prod; `max_allowed_packet`
@@ -98,20 +85,37 @@ scripts, which parse ids from the shipped markup.
    composer placeholder, "Not run" tab dominance, Build-picker
    discoverability, Watch back-navigation); first Tcl 8.5 site is still
    an experiment (no 8.5 interpreter has ever run `clients/feeder.tcl`).
-4. **Old-build tiles** (the "Reported 0 of N" reading above) if it comes
-   up — a design decision, see the drop note's "What was NOT verified".
+4. **Prune merged branches and worktrees** — deletion, so it waits to be
+   asked for.
+
+## Verification tooling (DOM shim, not a browser)
+
+There is still no browser here; every drop's operator note says so.
+
+- `.scratch/net/run_net.py` — the six-class sanity net (~18 s, port 8931).
+- `.scratch/net/wp32_drive_timeline.mjs` — 43 checks on the Timeline's
+  Refresh/Follow; imports the WORKING TREE's `static/timeline.js`
+  against a server booted from the repo root on a copy of the shifted
+  seed. The poll is captured by wrapping `setTimeout` and invoked by hand.
+- `.scratch/net/wp31_drive_branch_tabs.mjs` — the branch-build tabs.
+  The legacy WP-23 driver (`legacy_drive_branch_tabs.mjs`) is stale
+  against today's `app.js`; use the WP-31 one or the `walk_*` scripts,
+  which parse ids from the shipped markup.
+- `.scratch/net-wt` is pinned at `b816151`; re-point it
+  (`git -C .scratch/net-wt checkout --detach <branch>`) to verify a
+  branch, and restore the pin afterwards.
+
+All of `.scratch/` is gitignored — it exists on this machine only.
 
 ## First ten minutes of the next session
 
 ```bash
-git checkout wp-32-timeline-follow
-git log --oneline -3
-python -m unittest discover        # expect 2270 OK (skipped 1)
-gh run list --branch wp-32-timeline-follow --limit 1
+git fetch origin --prune
+git log --oneline -3 origin/master   # expect 91d5cd3 on top, unless the drop has merged
+git switch -c wp-33-<slug> origin/master
+python -m unittest discover          # expect 2270 OK (skipped 1) before any change
+gh run list --branch master --limit 1
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,
-never opened with current code. There is still no browser here.
-`.scratch/net-wt` is pinned back at `b816151` after this session's live
-runs; re-point it (`git -C .scratch/net-wt checkout --detach <branch>`)
-to verify a branch, and restore the pin afterwards.
+never opened with current code.

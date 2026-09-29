@@ -3294,3 +3294,55 @@ clients hammering it: 238 req/s sustained, p95 71 ms, max 111 ms. At
 10000; the title, tests and driver derive from it; the drop note's
 "Load, stated" carries the numbers. Suite and the 43-check driver
 re-run at the new value — see the commit.
+
+## 2026-09-29 — WP-32 is in production and Follow has been used on real runs (admin only, branch `docs-handover-2026-09-29`)
+
+**No code in this entry.** It records what happened to the 2026-09-24
+drop after the previous entry was written, and closes what that entry
+left open.
+
+**What is deployed.** `origin/master` is `91d5cd3` — WP-32 squash-merged
+as PR #11 on 2026-09-24 (13:36 UTC). The user states that GitHub
+`master` is the currently deployed software. The squash carries all
+three branch commits: master's tree and the branch tip `5972fc4` are the
+same tree object (`623d579`), so the ten-second cadence
+(`FOLLOW_POLL_MS = 10000`) is what production serves, not the first
+draft's sixty. CI on the master push: success (run 36008385377, 4m1s).
+The drop shipped on its provisional date, so neither `whatsnew.html` nor
+`docs/drops/2026-09-24.md` needed re-dating.
+
+**WP-31 deployment, left open by the previous entry:** closed by
+construction. WP-31 (`158fbcd`, #10) is the parent of the WP-32 commit
+on `master`, and `master` is what is deployed.
+
+**Follow in real use.** The user's report, 2026-09-29, verbatim: "Follow
+is working beautifully". That is the first observation of the timer
+ticking on its own — every earlier check invoked the poll by hand in the
+DOM shim. What the report does NOT itemise, and so what this entry does
+not claim: scroll restoration specifically, the failure stepper
+restarting after a changed refresh, or a run pausing past six hours and
+splitting into two blocks. No complaint has been raised about any of
+them; none has been separately confirmed either. Observed in the user's
+browser, not by this project's tooling — there is still no browser here.
+
+**Still owed from the WP-32 addendum** (Python, so it was out of scope
+for a static-only drop): `/api/timeline` validates its environment with
+`environment not in storage.known_environments()` (`api.py`, the
+timeline handler) — a scan of the `latest_runs` primary key, measured at
+6–12 ms of a 27 ms request on the dev-scale copy — where
+`storage.environment_exists()` is three seeks and is already what the
+neighbouring handlers use. At a ten-second poll this is the one cost in
+the request that is proportional to the estate. Not yet changed; a
+candidate for the next drop.
+
+**Suite on `master`'s tree, this session: 2270 OK (skipped 1)**, 144 s,
+SQLite-only, on the development machine. The dual-backend variants were
+not run here (no MariaDB option file on this machine); CI's MariaDB legs
+are green on the same commit.
+
+**Repository state found, not changed.** PR #9 (`wp-30-java-feeder`,
+Java micro client) is still open, all fourteen checks green, last
+touched 2026-09-08; it is one commit ahead of `master` and two behind.
+Twenty-odd merged branches and six sibling worktrees remain, local and
+remote; none was pruned in this session — pruning deletes, and was not
+asked for.
