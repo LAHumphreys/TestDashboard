@@ -762,7 +762,11 @@ endpoint, a different way of saying which tests to act on. Body carries
   bad shape is a bug worth surfacing immediately rather than skipping the
   row silently. An unknown `stream_id` is a `404`, same index-naming.
 - `"username"`/`"assigned_by"`/`"comment"` follow the identical rules
-  filter mode uses above.
+  filter mode uses above. In list mode the comment is recorded as posted
+  from each entry's own `stream_id` (WP-35) — a note typed while assigning
+  from a build's page is a comment on that build. Before WP-35 it was
+  written with no origin whatever the entry said. Filter mode still writes
+  none, for the reason given above.
 - A triple absent from `latest_runs` (on ANY stream) is **not** a failure
   — the page that built the selection may be stale (a retirement, or the
   test simply never having reported) — it is counted in the response
@@ -773,6 +777,35 @@ Response: `{"updated": 3, "unknown": 1}` — a **different shape** from
 filter mode's `{"updated": N}` (filter mode has no "unknown": a match is
 always current, read in the same transaction it acts on).
 `updated + unknown` is the count of DISTINCT triples named in `"tests"`.
+
+### POST /api/comments/bulk — one comment on each of a list of tests
+
+Added WP-35, for the multi-select bar's "Comment only": the thirty failures
+that share one cause. It changes no assignment.
+
+```json
+{
+  "username": "amy", "text": "feature flag is off on this branch",
+  "tests": [
+    {"environment": "linux-sim", "script": "suite/alpha.py",
+     "test_name": "test_x", "stream_id": 7}
+  ]
+}
+```
+
+`"username"` and `"text"` are required, validated as `POST .../comments`
+validates them. `"tests"` is the same list the endpoint above takes in list
+mode, validated the same way and as a whole before anything is written;
+an empty list is a `400`. Each entry's optional `"stream_id"` is where THAT
+comment is recorded as posted from. Response: `{"commented": 3, "unknown":
+1}`, with `unknown` meaning what it means above.
+
+A comment posted from a build — by this endpoint, by the note on a list-mode
+bulk assignment, by `POST .../comments` with a `stream_id` — is what
+`GET /api/compare` returns as that row's `stream_comment`: the newest comment
+posted FROM the stream being compared, `{author, created_at, text}` or
+`null`. A comment posted from anywhere else never appears there; the test's
+own thread (`GET .../comments`) always carries every comment with its origin.
 
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 

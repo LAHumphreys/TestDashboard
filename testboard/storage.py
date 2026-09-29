@@ -1526,6 +1526,11 @@ class CompareRow(NamedTuple):
     deep-link correctly. ``assignee`` is the triple's CURRENT assignee,
     unpartitioned by stream (docs/STREAMS_PLAN.md §3.4: assigning from a
     branch row assigns the same test everyone else sees).
+    ``stream_comment`` (WP-35) is the newest comment POSTED FROM the
+    stream being compared — what somebody said about this test on this
+    build — or ``None``. Never a comment posted from anywhere else: the
+    test's whole thread, with every comment's origin, is the test
+    page's to show.
     """
 
     environment: str
@@ -1536,6 +1541,7 @@ class CompareRow(NamedTuple):
     stream_run_id: Optional[int]
     stream_start_time: Optional[datetime.datetime]
     assignee: Optional[str]
+    stream_comment: Optional["LatestComment"]
 
 
 class StreamResult(NamedTuple):
@@ -1898,6 +1904,21 @@ _LATEST_COMMENT_COLUMNS = (
     "(SELECT c.text FROM comments AS c "
     " WHERE c.environment = lr.environment AND c.script = lr.script "
     " AND c.test_name = lr.test_name ORDER BY c.id DESC LIMIT 1)"
+)
+
+#: The same lookup restricted to comments POSTED FROM one stream
+#: (WP-35), for :meth:`Storage.compare_category`. ``{alias}`` is the row
+#: being described; each of the three subqueries binds the stream id
+#: once, in SELECT-list order. Still ``idx_comments_triple``, walked
+#: from its high end until a comment from that stream turns up — a
+#: test's thread is a handful of rows.
+_STREAM_COMMENT_COLUMNS = ", ".join(
+    "(SELECT c.{column} FROM comments AS c "
+    " WHERE c.environment = {{alias}}.environment "
+    " AND c.script = {{alias}}.script "
+    " AND c.test_name = {{alias}}.test_name AND c.stream_id = ? "
+    " ORDER BY c.id DESC LIMIT 1)".format(column=column)
+    for column in ("author", "created_at", "text")
 )
 
 #: The columns of a status row, in TestSummaryRow field order. Anything
@@ -4641,11 +4662,16 @@ class Storage:
         # shape as every other page-only join in this module (e.g. the
         # dashboard's `ca` join), not a cost that grows with the
         # comparison's size.
+        # The comment lookup sits in the OUTER select list, so it runs
+        # for the rows of the returned page and no others. Its three
+        # bound parameters come first: qmark binds in the order the
+        # placeholders appear in the statement.
         sql = (
             "SELECT categorized.environment, categorized.script, "
             "categorized.test_name, categorized.stream_result, "
             "categorized.baseline_result, categorized.stream_run_id, "
-            "categorized.stream_start_time, ca.assignee "
+            "categorized.stream_start_time, ca.assignee, "
+            + _STREAM_COMMENT_COLUMNS.format(alias="categorized") + " "
             "FROM (SELECT environment, script, test_name, "
             "stream_result, baseline_result, stream_run_id, "
             "stream_start_time, {0} AS category "
@@ -4660,7 +4686,7 @@ class Storage:
             "LIMIT ? OFFSET ?"
         ).format(self._COMPARE_CASE, pairs_sql)
         rows = self._conn().execute(
-            sql, params + [category, limit, offset]
+            sql, [stream_id] * 3 + params + [category, limit, offset]
         ).fetchall()
         return [
             CompareRow(
@@ -4674,6 +4700,13 @@ class Storage:
                     None if row[6] is None else model.parse_iso(row[6])
                 ),
                 assignee=row[7],
+                stream_comment=(
+                    None if row[8] is None else LatestComment(
+                        author=row[8],
+                        created_at=model.parse_iso(row[9]),
+                        text=row[10],
+                    )
+                ),
             )
             for row in rows
         ]
@@ -6919,6 +6952,72 @@ class Storage:
         )
         return int(cursor.lastrowid)
 
+    def bulk_add_comment(
+        self,
+        author: str,
+        text: str,
+        created_at: datetime.datetime,
+        triples: Sequence[Tuple[str, str, str, Optional[int]]],
+    ) -> Tuple[int, int]:
+        """Post ONE comment on each of the given tests (WP-35) — the
+        multi-select bar's "Comment", for the thirty failures that
+        share one cause. Changes no assignment.
+
+        *triples* is ``(environment, script, test_name, stream_id)``,
+        the shape :meth:`bulk_set_assignee_for_triples` takes, and
+        *stream_id* is that one test's own "posted from". Returns
+        ``(commented, unknown)`` with that method's meaning: *unknown*
+        counts tests with no row in ``latest_runs`` on any stream,
+        skipped rather than failed; both are over the de-duplicated
+        set. One transaction, existence resolved a chunk at a time.
+        """
+        by_triple = {}  # type: Dict[Tuple[str, str, str], Optional[int]]
+        for env, scr, test, origin in triples:
+            by_triple[(env, scr, test)] = origin
+        unique_triples = list(by_triple.keys())
+        if not unique_triples:
+            return 0, 0
+
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            found = []  # type: List[Tuple[str, str, str]]
+            for start in range(0, len(unique_triples), _RECENT_CHUNK):
+                chunk = unique_triples[start:start + _RECENT_CHUNK]
+                clause = " OR ".join(
+                    "(environment = ? AND script = ? AND test_name = ?)"
+                    for _ in chunk
+                )
+                params = []  # type: List[str]
+                for triple in chunk:
+                    params.extend(triple)
+                rows = conn.execute(
+                    "SELECT DISTINCT environment, script, test_name "
+                    "FROM latest_runs WHERE ({0})".format(clause),
+                    tuple(params),
+                ).fetchall()
+                found.extend((row[0], row[1], row[2]) for row in rows)
+            if found:
+                self.ensure_user(author, created_at)
+                created_at_iso = model.format_iso(created_at)
+                conn.executemany(
+                    "INSERT INTO comments (environment, script, "
+                    "test_name, author, created_at, text, stream_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (env, scr, test, author, created_at_iso, text,
+                         by_triple[(env, scr, test)])
+                        for (env, scr, test) in found
+                    ],
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if found:
+            self._invalidate_summary_cache()
+        return len(found), len(unique_triples) - len(found)
+
     def comments(
         self, environment: str, script: str, test_name: str
     ) -> List[Comment]:
@@ -7070,6 +7169,13 @@ class Storage:
         already have a ``current_assignments`` row — SELECT-then-
         UPDATE-or-INSERT, never ``INSERT OR REPLACE``, same rule as
         every other upsert in this module.
+
+        The optional comment carries each entry's OWN origin too
+        (WP-35). Until then it was written with ``stream_id NULL``
+        whatever the entry said, so a note typed while assigning from a
+        build's page was recorded as if it had been posted from
+        nowhere — while the assignment beside it, from the same click,
+        was tagged.
         """
         conn.executemany(
             "INSERT INTO assignments (environment, script, "
@@ -7113,11 +7219,11 @@ class Storage:
             conn.executemany(
                 "INSERT INTO comments (environment, script, "
                 "test_name, author, created_at, text, stream_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [
                     (env, scr, test, assigned_by, assigned_at_iso,
-                     comment_text)
-                    for (env, scr, test, _origin) in entries
+                     comment_text, origin)
+                    for (env, scr, test, origin) in entries
                 ],
             )
 

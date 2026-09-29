@@ -250,6 +250,9 @@
       <p id="delta-drift" class="muted" hidden></p>
       <p id="delta-stale-warning" class="empty-state" hidden></p>
       <div id="delta-tabs" class="tab-row" role="tablist" aria-label="Comparison categories"></div>
+      <!-- WP-35: how many of the rows listed have a comment posted
+           from this build. Counted from the rows on the page. -->
+      <p id="delta-commented" class="muted" hidden></p>
       <div class="table-wrap">
         <table class="data-table" id="delta-table">
           <thead>
@@ -257,6 +260,7 @@
               <th>Test</th>
               <th id="delta-col-baseline">Mainline</th>
               <th id="delta-col-stream">This build</th>
+              <th id="delta-col-comment">Comment on this build</th>
               <th>Assignee</th>
               <th>Output</th>
             </tr>

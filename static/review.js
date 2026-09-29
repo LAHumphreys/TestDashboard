@@ -229,14 +229,31 @@ function buildReviewActions(entry, opts) {
     }
     post.disabled = true;
     try {
-      await postJson(
+      // WP-35: say where this comment was posted from, the way the
+      // assignee picker beside it always has. entry.stream_id is set on
+      // exactly the rows that were read from a build's own page (see
+      // the link scope above); until this, a comment typed here on a
+      // build's row was recorded as posted from nowhere -- only the
+      // test page's own comment box tagged it.
+      const body = { username: me, text: text };
+      if (entry.stream_id) {
+        body.stream_id = entry.stream_id;
+      }
+      const posted = await postJson(
         testApiPath(entry.environment, entry.script, entry.test_name,
           "/comments"),
-        { username: me, text: text });
+        body);
       input.value = "";
       post.textContent = "Posted";
       window.setTimeout(() => { post.textContent = "Post"; }, 1500);
-      changed({ kind: "commented", value: { author: me, text: text } });
+      changed({
+        kind: "commented",
+        value: {
+          author: me, text: text,
+          created_at: posted && posted.comment
+            ? posted.comment.created_at : null,
+        },
+      });
     } catch (err) {
       showError(err.message);
     } finally {

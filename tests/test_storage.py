@@ -5570,6 +5570,230 @@ class CompareEnvironmentFilterTest(StorageTestBase):
         self.assertEqual(counts.both_failing, 0)
 
 
+class BuildCommentTest(StorageTestBase):
+    """WP-35: a comment made from a build's page is recorded against
+    that build however it is made, and the build's comparison shows it.
+
+    Before this, only the test page's own comment box recorded where a
+    comment came from. The note typed while bulk-assigning from a
+    build's page was written with no origin at all.
+    """
+
+    LATER = CREATED + datetime.timedelta(minutes=5)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        start = BASE + datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(test_name="test_a"),
+            make_record(test_name="test_b"),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="feat/x", start=start),
+            make_record(test_name="test_b", result=Result.FAIL,
+                        build="feat/x", start=start),
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="feat/y",
+                        start=start + datetime.timedelta(seconds=1)),
+        ])
+        by_name = {
+            stream.name: stream.stream_id
+            for stream in self.store.list_streams("Atlas")}
+        self.stream_id = by_name["feat/x"]
+        self.other_id = by_name["feat/y"]
+
+    def _row(self, test_name: str) -> storage.CompareRow:
+        rows = self.store.compare_category(self.stream_id, "new_failures")
+        return [row for row in rows if row.test_name == test_name][0]
+
+    def _thread(self, test_name: str) -> List[Tuple[str, Optional[int]]]:
+        return [
+            (comment.text, comment.stream_id) for comment in
+            self.store.comments("linux-sim", "suite.py", test_name)]
+
+    # -- what the comparison shows ------------------------------------
+
+    def test_no_comment_is_none(self) -> None:
+        self.assertIsNone(self._row("test_a").stream_comment)
+
+    def test_a_comment_posted_from_the_build_is_shown(self) -> None:
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "API changed",
+            CREATED, stream_id=self.stream_id)
+        self.assertEqual(
+            self._row("test_a").stream_comment,
+            storage.LatestComment(
+                author="amy", created_at=CREATED, text="API changed"))
+        self.assertIsNone(self._row("test_b").stream_comment)
+
+    def test_the_newest_from_the_build_wins(self) -> None:
+        for text, at in (("first", CREATED), ("second", self.LATER)):
+            self.store.add_comment(
+                "linux-sim", "suite.py", "test_a", "amy", text, at,
+                stream_id=self.stream_id)
+        self.assertEqual(self._row("test_a").stream_comment.text, "second")
+
+    def test_a_comment_from_elsewhere_is_never_shown(self) -> None:
+        """Newer than the build's own, and still not the build's."""
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "on this build",
+            CREATED, stream_id=self.stream_id)
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "bob", "on mainline",
+            self.LATER)
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "cat", "on the other",
+            self.LATER, stream_id=self.other_id)
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_b", "bob", "on mainline",
+            self.LATER)
+        self.assertEqual(
+            self._row("test_a").stream_comment.text, "on this build")
+        self.assertIsNone(self._row("test_b").stream_comment)
+
+    def test_each_build_sees_its_own(self) -> None:
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "x says", CREATED,
+            stream_id=self.stream_id)
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "y says", CREATED,
+            stream_id=self.other_id)
+        other = self.store.compare_category(self.other_id, "new_failures")
+        self.assertEqual(
+            [(row.test_name, row.stream_comment.text) for row in other],
+            [("test_a", "y says")])
+
+    def test_the_filtered_page_carries_it_too(self) -> None:
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_b", "amy", "rig fault",
+            CREATED, stream_id=self.stream_id)
+        rows = self.store.compare_category(
+            self.stream_id, "new_failures", environment="linux-sim",
+            limit=1, offset=1)
+        self.assertEqual(
+            [(row.test_name, row.stream_comment.text) for row in rows],
+            [("test_b", "rig fault")])
+
+    # -- the bulk-assign note -----------------------------------------
+
+    def test_a_bulk_assign_note_is_posted_from_the_rows_origin(
+            self) -> None:
+        self.store.bulk_set_assignee_for_triples(
+            "alice", "amy", CREATED, [
+                ("linux-sim", "suite.py", "test_a", self.stream_id),
+                ("linux-sim", "suite.py", "test_b", None),
+            ], comment_text="same cause")
+        self.assertEqual(
+            self._thread("test_a"), [("same cause", self.stream_id)])
+        self.assertEqual(self._thread("test_b"), [("same cause", None)])
+        self.assertEqual(
+            self._row("test_a").stream_comment.text, "same cause")
+        self.assertIsNone(self._row("test_b").stream_comment)
+
+    def test_a_filter_mode_note_still_carries_no_origin(self) -> None:
+        """Open Actions' "everything the filters match" is never made
+        from a build's page; that has not changed."""
+        self.store.bulk_set_assignee(
+            "alice", "amy", CREATED, comment_text="sweep",
+            environment="linux-sim")
+        self.assertEqual(self._thread("test_a"), [("sweep", None)])
+
+    # -- the bulk comment ---------------------------------------------
+
+    def test_a_bulk_comment_lands_on_each_test_with_its_origin(
+            self) -> None:
+        result = self.store.bulk_add_comment(
+            "amy", "flag off on this branch", CREATED, [
+                ("linux-sim", "suite.py", "test_a", self.stream_id),
+                ("linux-sim", "suite.py", "test_b", self.stream_id),
+            ])
+        self.assertEqual(result, (2, 0))
+        for name in ("test_a", "test_b"):
+            self.assertEqual(
+                self._thread(name),
+                [("flag off on this branch", self.stream_id)])
+            comment = self._row(name).stream_comment
+            self.assertEqual(comment.author, "amy")
+            self.assertEqual(comment.created_at, CREATED)
+
+    def test_a_bulk_comment_changes_no_assignment(self) -> None:
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "bob", CREATED)
+        self.store.bulk_add_comment(
+            "amy", "noted", self.LATER, [
+                ("linux-sim", "suite.py", "test_a", self.stream_id),
+                ("linux-sim", "suite.py", "test_b", self.stream_id),
+            ])
+        self.assertEqual(
+            self.store.current_assignee(
+                "linux-sim", "suite.py", "test_a"), "alice")
+        self.assertIsNone(self.store.current_assignee(
+            "linux-sim", "suite.py", "test_b"))
+        self.assertEqual(int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM assignments").fetchone()[0]), 1)
+
+    def test_a_test_that_no_longer_exists_is_counted_and_skipped(
+            self) -> None:
+        result = self.store.bulk_add_comment(
+            "amy", "noted", CREATED, [
+                ("linux-sim", "suite.py", "test_a", self.stream_id),
+                ("linux-sim", "suite.py", "gone", self.stream_id),
+            ])
+        self.assertEqual(result, (1, 1))
+        self.assertEqual(int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM comments").fetchone()[0]), 1)
+
+    def test_a_test_named_twice_gets_one_comment(self) -> None:
+        result = self.store.bulk_add_comment(
+            "amy", "noted", CREATED, [
+                ("linux-sim", "suite.py", "test_a", self.stream_id),
+                ("linux-sim", "suite.py", "test_a", self.stream_id),
+            ])
+        self.assertEqual(result, (1, 0))
+        self.assertEqual(len(self._thread("test_a")), 1)
+
+    def test_nothing_selected_writes_nothing(self) -> None:
+        self.assertEqual(
+            self.store.bulk_add_comment("amy", "noted", CREATED, []),
+            (0, 0))
+        self.assertIsNone(self.store.get_user("amy"))
+
+    def test_nothing_found_creates_no_user(self) -> None:
+        result = self.store.bulk_add_comment(
+            "newcomer", "noted", CREATED,
+            [("linux-sim", "suite.py", "gone", None)])
+        self.assertEqual(result, (0, 1))
+        self.assertIsNone(self.store.get_user("newcomer"))
+
+    def test_the_author_becomes_a_user(self) -> None:
+        self.store.bulk_add_comment(
+            "newcomer", "noted", CREATED,
+            [("linux-sim", "suite.py", "test_a", None)])
+        self.assertIsNotNone(self.store.get_user("newcomer"))
+
+    def test_more_tests_than_one_lookup_holds(self) -> None:
+        count = storage._RECENT_CHUNK * 2 + 1
+        start = BASE + datetime.timedelta(hours=2)
+        self.store.upsert_runs([
+            make_record(test_name="bulk_{}".format(index),
+                        build="feat/x", start=start)
+            for index in range(count)
+        ])
+        result = self.store.bulk_add_comment(
+            "amy", "noted", CREATED, [
+                ("linux-sim", "suite.py", "bulk_{}".format(index),
+                 self.stream_id)
+                for index in range(count)
+            ])
+        self.assertEqual(result, (count, 0))
+        self.assertEqual(int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM comments WHERE stream_id = ?",
+            (self.stream_id,)).fetchone()[0]), count)
+
+
 class CompareCountsManyTest(StorageTestBase):
     """compare_counts_many: the Watchlist s: cards' batched path.
 

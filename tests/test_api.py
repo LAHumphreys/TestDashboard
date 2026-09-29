@@ -5585,6 +5585,165 @@ class TestStreamsEndpoint(ApiCase):
         self.assertEqual(without, withempty)
 
 
+class TestBuildComments(ApiCase):
+    """WP-35: /api/compare's per-row ``stream_comment`` and
+    POST /api/comments/bulk."""
+
+    BRANCH_TIMES = {
+        "start_time": "2026-07-25T03:00:00.000000",
+        "end_time": "2026-07-25T03:00:03.000000",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a"), record(test_name="test_b"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+            record(test_name="test_b", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def _entry(self, test_name: str, **extra: Any) -> Dict[str, Any]:
+        entry = {
+            "environment": "linux-sim", "script": "suite/alpha.py",
+            "test_name": test_name, "stream_id": self.stream_id,
+        }  # type: Dict[str, Any]
+        entry.update(extra)
+        return entry
+
+    def _body(self, **overrides: Any) -> Dict[str, Any]:
+        body = {
+            "username": "amy", "text": "flag off on this branch",
+            "tests": [self._entry("test_a"), self._entry("test_b")],
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return body
+
+    def _rows(self) -> Dict[str, Any]:
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "category": ["new_failures"]})
+        return {row["test_name"]: row["stream_comment"]
+                for row in data["tests"]}
+
+    def _thread(self, test_name: str) -> List[Dict[str, Any]]:
+        return self.call("GET", test_path(
+            "linux-sim", "suite/alpha.py", test_name, "/comments")
+        )["comments"]
+
+    def test_rows_carry_null_until_someone_comments(self) -> None:
+        self.assertEqual(self._rows(), {"test_a": None, "test_b": None})
+
+    def test_a_comment_posted_from_the_build_appears_on_its_row(
+            self) -> None:
+        self.call(
+            "POST",
+            test_path("linux-sim", "suite/alpha.py", "test_a",
+                      "/comments"),
+            body={"username": "amy", "text": "API changed",
+                  "stream_id": self.stream_id},
+            expect=201)
+        self.call(
+            "POST",
+            test_path("linux-sim", "suite/alpha.py", "test_b",
+                      "/comments"),
+            body={"username": "bob", "text": "a mainline remark"},
+            expect=201)
+        rows = self._rows()
+        self.assertEqual(rows["test_a"], {
+            "author": "amy", "text": "API changed",
+            "created_at": format_iso(fixed_now()),
+        })
+        self.assertIsNone(rows["test_b"])
+
+    def test_a_bulk_comment_appears_on_every_row(self) -> None:
+        data = self.call("POST", "/api/comments/bulk", body=self._body())
+        self.assertEqual(data, {"commented": 2, "unknown": 0})
+        rows = self._rows()
+        for name in ("test_a", "test_b"):
+            self.assertEqual(rows[name]["text"], "flag off on this branch")
+            self.assertEqual(rows[name]["author"], "amy")
+            thread = self._thread(name)
+            self.assertEqual(len(thread), 1)
+            self.assertEqual(thread[0]["stream_id"], self.stream_id)
+
+    def test_an_entry_without_a_stream_is_a_plain_comment(self) -> None:
+        entry = self._entry("test_a")
+        del entry["stream_id"]
+        self.call(
+            "POST", "/api/comments/bulk", body=self._body(tests=[entry]))
+        self.assertIsNone(self._thread("test_a")[0]["stream_id"])
+        self.assertIsNone(self._rows()["test_a"])
+
+    def test_a_bulk_assign_note_is_tagged_with_the_build(self) -> None:
+        self.call("POST", "/api/assignments/bulk", body={
+            "username": "alice", "assigned_by": "amy",
+            "comment": "yours, same cause",
+            "tests": [self._entry("test_a")],
+        })
+        self.assertEqual(
+            self._thread("test_a")[0]["stream_id"], self.stream_id)
+        self.assertEqual(
+            self._rows()["test_a"]["text"], "yours, same cause")
+
+    def test_a_vanished_test_is_counted_not_fatal(self) -> None:
+        data = self.call("POST", "/api/comments/bulk", body=self._body(
+            tests=[self._entry("test_a"), self._entry("gone")]))
+        self.assertEqual(data, {"commented": 1, "unknown": 1})
+
+    def test_who_and_what_are_required(self) -> None:
+        for field in ("username", "text", "tests"):
+            body = self._body()
+            del body[field]
+            error = self.call(
+                "POST", "/api/comments/bulk", body=body, expect=400)
+            self.assertIn(field, error["error"])
+        for field in ("username", "text"):
+            error = self.call(
+                "POST", "/api/comments/bulk",
+                body=self._body(**{field: "  "}), expect=400)
+            self.assertIn(field, error["error"])
+        self.assertEqual(self._rows(), {"test_a": None, "test_b": None})
+
+    def test_a_comment_on_nothing_is_refused(self) -> None:
+        error = self.call(
+            "POST", "/api/comments/bulk", body=self._body(tests=[]),
+            expect=400)
+        self.assertIn("tests", error["error"])
+
+    def test_a_malformed_selection_writes_nothing(self) -> None:
+        """Validated whole, before the first write: a bad last entry
+        must not leave the first one commented."""
+        for bad in ("not-an-object", self._entry(""),
+                    self._entry("test_b", stream_id="5"),
+                    {"environment": "linux-sim"}):
+            self.call(
+                "POST", "/api/comments/bulk",
+                body=self._body(tests=[self._entry("test_a"), bad]),
+                expect=400)
+        self.call(
+            "POST", "/api/comments/bulk", body=self._body(
+                tests=[self._entry("test_a"),
+                       self._entry("test_b", stream_id=999999)]),
+            expect=404)
+        self.call(
+            "POST", "/api/comments/bulk",
+            body=self._body(tests="test_a"), expect=400)
+        self.assertEqual(self._rows(), {"test_a": None, "test_b": None})
+
+    def test_only_post_is_accepted(self) -> None:
+        self.call("GET", "/api/comments/bulk", expect=405)
+        self.call(
+            "PUT", "/api/comments/bulk", body=self._body(), expect=405)
+
+
 class TestStreamEnvironmentDelete(ApiCase):
     """GET /api/streams/{id}/environments and the delete beside it
     (WP-34)."""

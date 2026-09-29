@@ -2131,6 +2131,72 @@ def _validate_test_entry_stream_id(
     return raw_stream_id
 
 
+def _parse_test_entries(
+    storage: Storage, raw_tests: Any
+) -> List[Tuple[str, str, str, Optional[int]]]:
+    """A ``tests`` list as ``(environment, script, test_name,
+    stream_id)`` — the explicit selection both bulk endpoints act on.
+    Every entry is validated before anything is written; see
+    :func:`_validate_test_entry_field` for why a bad one is a 400
+    rather than a skipped row.
+    """
+    if not isinstance(raw_tests, list):
+        raise _HttpError(
+            400,
+            "tests: must be a list, got {}".format(
+                type(raw_tests).__name__),
+        )
+    entries = []  # type: List[Tuple[str, str, str, Optional[int]]]
+    for index, raw in enumerate(raw_tests):
+        if not isinstance(raw, dict):
+            raise _HttpError(
+                400,
+                "tests[{}]: must be an object, got {}".format(
+                    index, type(raw).__name__),
+            )
+        environment = _validate_test_entry_field(raw, "environment", index)
+        script = _validate_test_entry_field(raw, "script", index)
+        test_name = _validate_test_entry_field(raw, "test_name", index)
+        stream_id = _validate_test_entry_stream_id(storage, raw, index)
+        entries.append((environment, script, test_name, stream_id))
+    return entries
+
+
+def _handle_bulk_comments(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/comments/bulk — one comment on each of a list of tests
+    (WP-35). Changes no assignment.
+
+    Body: ``{"username": <str>, "text": <str>, "tests": [{environment,
+    script, test_name, stream_id?}, ...]}``. ``tests`` is the same list
+    ``POST /api/assignments/bulk`` takes in list mode, validated the
+    same way; each entry's ``stream_id`` is where THAT comment is
+    recorded as posted from — a selection made on a build's page
+    carries the build, one made on a mainline page carries none.
+
+    An empty ``tests`` is a 400: a comment on nothing is a page that
+    lost its selection, not a request. A test that no longer has a
+    row on any stream is counted in ``unknown`` and skipped.
+
+    Response: ``{"commented": N, "unknown": M}``.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    text = _validate_comment_text(obj)
+    if "tests" not in obj:
+        raise _HttpError(400, "tests: required field is missing")
+    entries = _parse_test_entries(storage, obj["tests"])
+    if not entries:
+        raise _HttpError(400, "tests: must name at least one test")
+    commented, unknown = storage.bulk_add_comment(
+        username, text, now(), entries)
+    return _json_response(
+        200, {"commented": commented, "unknown": unknown})
+
+
 def _handle_bulk_assignments_list(
     storage: Storage,
     obj: Dict[str, Any],
@@ -2167,27 +2233,7 @@ def _handle_bulk_assignments_list(
     """
     assignee, assigned_by, comment_text = _parse_bulk_assignment_body(
         storage, obj)
-
-    raw_tests = obj["tests"]
-    if not isinstance(raw_tests, list):
-        raise _HttpError(
-            400,
-            "tests: must be a list, got {}".format(
-                type(raw_tests).__name__),
-        )
-    entries = []  # type: List[Tuple[str, str, str, Optional[int]]]
-    for index, raw in enumerate(raw_tests):
-        if not isinstance(raw, dict):
-            raise _HttpError(
-                400,
-                "tests[{}]: must be an object, got {}".format(
-                    index, type(raw).__name__),
-            )
-        environment = _validate_test_entry_field(raw, "environment", index)
-        script = _validate_test_entry_field(raw, "script", index)
-        test_name = _validate_test_entry_field(raw, "test_name", index)
-        stream_id = _validate_test_entry_stream_id(storage, raw, index)
-        entries.append((environment, script, test_name, stream_id))
+    entries = _parse_test_entries(storage, obj["tests"])
 
     updated, unknown = storage.bulk_set_assignee_for_triples(
         assignee, assigned_by, now(), entries, comment_text=comment_text,
@@ -3230,6 +3276,13 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
     already being sent ``environment=`` by every page that carried one
     in its URL (urls.js carries scope by default) and ignored it; a 4xx
     here would turn links that work today into pages that cannot load.
+
+    Each row of a ``category`` page carries ``stream_comment`` (WP-35):
+    the newest comment posted FROM ``stream``, or null. It is read in
+    the page query's own select list, for the rows returned and no
+    others — there is deliberately no count of commented tests across
+    the whole category, which would be a third run of the pairs SQL
+    (see the WP-23 note below, and the test that pins it at two).
     """
     raw_stream = _query_single(request.query, "stream")
     if raw_stream is None:
@@ -3349,6 +3402,16 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
                     else model.format_iso(row.stream_start_time)
                 ),
                 "assignee": row.assignee,
+                # WP-35: the newest comment posted FROM this stream, or
+                # null -- never one posted from anywhere else.
+                "stream_comment": (
+                    None if row.stream_comment is None else {
+                        "author": row.stream_comment.author,
+                        "created_at": model.format_iso(
+                            row.stream_comment.created_at),
+                        "text": row.stream_comment.text,
+                    }
+                ),
             }
             for row in rows
         ]
@@ -4020,6 +4083,10 @@ def _route(
     if rest == ["assignments", "bulk"]:
         _check_method(request.method, ("POST",))
         return _handle_bulk_assignments(storage, request, now)
+
+    if rest == ["comments", "bulk"]:
+        _check_method(request.method, ("POST",))
+        return _handle_bulk_comments(storage, request, now)
 
     if rest == ["summary"]:
         _check_method(request.method, ("GET",))

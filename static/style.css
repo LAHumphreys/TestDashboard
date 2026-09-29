@@ -2363,6 +2363,7 @@ body.has-selection-bar { padding-bottom: 60px; }
 .selection-sep { color: var(--muted); }
 
 .selection-assign-btn:disabled,
+.selection-comment-btn:disabled,
 .selection-unassign-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;

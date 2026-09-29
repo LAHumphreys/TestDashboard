@@ -80,6 +80,16 @@ function bulkAssignmentsUrl() {
   );
 }
 
+/** The bulk comment endpoint (WP-35), scope cleared for the same
+ * reason: where each comment was posted from travels per test, inside
+ * the body, exactly as it does for an assignment. */
+function bulkCommentsUrl() {
+  return apiUrl(
+    "api/comments/bulk", null,
+    { product: null, stream: null, baseline: null, environment: null },
+  );
+}
+
 /** key -> {environment, script, test_name, stream_id, namespace}. */
 const selected = new Map();
 
@@ -94,6 +104,7 @@ let userSelectEl = null;
 let noteInputEl = null;
 let assignBtnEl = null;
 let unassignBtnEl = null;
+let commentBtnEl = null;
 
 function selectionEntries() {
   return Array.from(selected.values());
@@ -164,6 +175,50 @@ function updateAssignButtonState() {
     return;
   }
   assignBtnEl.disabled = !userSelectEl.value || selected.size === 0;
+  updateCommentButtonState();
+}
+
+/** "Comment only" needs something to say and somewhere to say it. */
+function updateCommentButtonState() {
+  if (!commentBtnEl) {
+    return;
+  }
+  commentBtnEl.disabled =
+    noteInputEl.value.trim() === "" || selected.size === 0;
+}
+
+/**
+ * Post the note on every selected test and change nothing else (WP-35)
+ * -- for the thirty failures that share one cause. Each comment is
+ * recorded as posted from wherever its row was selected (testsPayload()
+ * carries that per test), so a selection made on a build's page reads
+ * back on that build's own list.
+ */
+async function doComment() {
+  const me = requireUsername();
+  if (!me) {
+    showError(
+      "Set a username first (the “Change” button, top right) "
+      + "— comments are recorded against a name.");
+    return;
+  }
+  const note = noteInputEl.value.trim();
+  if (!note || selected.size === 0) {
+    return;
+  }
+  commentBtnEl.disabled = true;
+  try {
+    await postJson(
+      bulkCommentsUrl(),
+      { username: me, text: note, tests: testsPayload() });
+    noteInputEl.value = "";
+    clearSelection();
+    notifyChanged();
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    updateCommentButtonState();
+  }
 }
 
 async function doAssign() {
@@ -246,9 +301,11 @@ function ensureBar() {
   noteInputEl = document.createElement("input");
   noteInputEl.type = "text";
   noteInputEl.className = "selection-note-input";
-  noteInputEl.placeholder = "note (optional)";
+  noteInputEl.placeholder = "note";
   noteInputEl.setAttribute(
-    "aria-label", "Optional comment to post on every selected test");
+    "aria-label", "Comment to post on every selected test — optional "
+      + "when assigning");
+  noteInputEl.addEventListener("input", updateCommentButtonState);
   barEl.appendChild(noteInputEl);
 
   assignBtnEl = el("button", "selection-assign-btn", "Assign");
@@ -263,6 +320,16 @@ function ensureBar() {
   unassignBtnEl.type = "button";
   unassignBtnEl.addEventListener("click", doUnassign);
   barEl.appendChild(unassignBtnEl);
+
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
+  commentBtnEl = el("button", "selection-comment-btn", "Comment only");
+  commentBtnEl.type = "button";
+  commentBtnEl.disabled = true;
+  commentBtnEl.title = "Post the note on every selected test, without "
+    + "changing who any of them is assigned to";
+  commentBtnEl.addEventListener("click", doComment);
+  barEl.appendChild(commentBtnEl);
 
   const clearBtn = el("button", "selection-clear-btn", "Clear selection");
   clearBtn.type = "button";

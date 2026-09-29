@@ -1975,6 +1975,176 @@ class BuildDeleteControlTest(unittest.TestCase):
         self.assertNotIn("insertAdjacentHTML", code)
 
 
+class BuildCommentTest(unittest.TestCase):
+    """WP-35: a comment made from a build's page is recorded against
+    that build however it is made, and the build's difference list
+    shows it.
+
+    Three ways to comment from a build's row existed or now exist --
+    the Review panel, the note on a bulk assignment, the bulk "Comment
+    only" -- and before this work package only a fourth, the test
+    page's own box, said where the comment came from. Each is pinned
+    separately because each was, or would be, silently untagged.
+    """
+
+    def test_the_review_panel_says_where_a_comment_was_posted_from(
+            self) -> None:
+        code = _strip_comments(read("review.js"))
+        post_at = code.index('"/comments"')
+        block = code[code.rindex("const body", 0, post_at):post_at]
+        self.assertIn("entry.stream_id", block)
+        self.assertIn("body.stream_id = entry.stream_id", block)
+        sent = code[post_at:code.index(";", post_at)]
+        self.assertIn("body", sent)
+        self.assertNotIn("{ username: me, text: text }", sent)
+
+    def test_a_mainline_rows_comment_still_carries_no_origin(
+            self) -> None:
+        """Guarded, not unconditional: an absent stream_id must stay
+        absent rather than become `stream_id: undefined` or null."""
+        code = _strip_comments(read("review.js"))
+        assign_at = code.index("body.stream_id = entry.stream_id")
+        guard_at = code.rindex("if (", 0, assign_at)
+        self.assertIn("entry.stream_id", code[guard_at:assign_at])
+
+    def test_the_panel_reports_the_servers_own_timestamp(self) -> None:
+        code = _strip_comments(read("review.js"))
+        at = code.index('kind: "commented"')
+        self.assertIn(
+            "posted.comment.created_at", code[at:at + 300])
+
+    def test_the_difference_list_has_a_comment_column(self) -> None:
+        html = read("index.html")
+        head = html[html.index('id="delta-table"'):]
+        head = head[:head.index("</thead>")]
+        self.assertLess(
+            head.index('id="delta-col-stream"'),
+            head.index('id="delta-col-comment"'))
+        row = _strip_comments(_function_body(
+            read("compare.js"), "function buildDeltaRow("))
+        self.assertIn(
+            "fillDeltaCommentCell(commentTd, row.stream_comment)", row)
+
+    def test_the_column_shows_the_builds_comment_and_no_other(
+            self) -> None:
+        code = _strip_comments(read("compare.js"))
+        self.assertNotIn("latest_comment", code)
+        fill = _function_body(code, "function fillDeltaCommentCell(")
+        self.assertNotIn("no comments", fill)
+        self.assertIn("comment.text", fill)
+        self.assertIn("comment.author", fill)
+
+    def test_the_heading_names_what_is_being_compared(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderBaselineCard("))
+        self.assertIn('"Comment on this " + streamNoun', body)
+
+    def test_a_posted_comment_updates_its_row_in_place(self) -> None:
+        """Reloading the page of rows would close every open panel on
+        a list that is being worked down."""
+        row = _strip_comments(_function_body(
+            read("compare.js"), "function buildDeltaRow("))
+        handler = row[row.index("const onCommented"):]
+        handler = handler[:handler.index("renderCommentedLine();") + 22]
+        self.assertIn("row.stream_comment =", handler)
+        self.assertIn("fillDeltaCommentCell(", handler)
+        self.assertIn("renderCommentedLine()", handler)
+        self.assertNotIn("loadCategory(", handler)
+        self.assertEqual(
+            row.count("deltaReviewOptions(onCommented)"), 2)
+
+    def test_an_open_panel_is_reopened_only_once_the_row_is_attached(
+            self) -> None:
+        """Reopening inserts the panel as the row's next sibling, which
+        needs a parent. buildDeltaRow() returns a row that has none, and
+        called reopenIfOpen() itself -- so Refresh, or any bulk action,
+        with a panel open threw and left the list cut short. A bulk
+        comment makes that re-render routine."""
+        code = _strip_comments(read("compare.js"))
+        build = _function_body(code, "function buildDeltaRow(")
+        self.assertEqual(build.count("reopenIfOpen("), 1)
+        self.assertIn("reopenAfterAttach.set(tr, () => reopenIfOpen(",
+                      build)
+        load = _function_body(code, "async function loadCategory(")
+        attach_at = load.index("body.appendChild(tr)")
+        reopen_at = load.index("reopenAfterAttach.get(tr)")
+        self.assertLess(attach_at, reopen_at)
+
+    def test_delta_review_options_still_offer_no_retirement(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function deltaReviewOptions("))
+        self.assertNotIn("staleBefore", body)
+        self.assertNotIn("onRetired", body)
+        self.assertIn('change.kind === "commented"', body)
+
+    def test_the_count_is_worded_from_the_rows_on_the_page(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderCommentedLine("))
+        self.assertIn("deltaState.rows", body)
+        self.assertIn("row.stream_comment", body)
+        self.assertIn("shown >= deltaState.total", body)
+        self.assertIn("shown so far", body)
+        self.assertIn("deltaState.total", body)
+        html = read("index.html")
+        at = html.index('id="delta-commented"')
+        self.assertIn("hidden", html[at:at + 60])
+
+    def test_the_count_follows_the_rows_as_they_load(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "async function loadCategory("))
+        reset = body[body.index("if (reset)"):]
+        reset = reset[:reset.index("}")]
+        self.assertIn("deltaState.rows = []", reset)
+        self.assertIn("deltaState.rows.push(row)", body)
+        self.assertIn("renderCommentedLine()", body)
+
+    def test_comment_only_needs_a_note_and_a_selection(self) -> None:
+        body = _strip_comments(_function_body(
+            read("selection.js"), "function updateCommentButtonState("))
+        self.assertIn('noteInputEl.value.trim() === ""', body)
+        self.assertIn("selected.size === 0", body)
+        self.assertIn("||", body)
+        bar = _strip_comments(_function_body(
+            read("selection.js"), "function ensureBar("))
+        self.assertIn("commentBtnEl.disabled = true", bar)
+        self.assertIn(
+            'noteInputEl.addEventListener("input", '
+            'updateCommentButtonState)', bar)
+
+    def test_comment_only_is_rechecked_with_the_selection(self) -> None:
+        """The bar re-renders as boxes are ticked; the button has to
+        follow a selection that empties as well as a note that does."""
+        body = _strip_comments(_function_body(
+            read("selection.js"), "function updateAssignButtonState("))
+        self.assertIn("updateCommentButtonState()", body)
+
+    def test_comment_only_posts_the_selection_and_no_assignment(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("selection.js"), "async function doComment("))
+        self.assertIn("requireUsername()", body)
+        post_at = body.index("postJson(")
+        sent = body[post_at:body.index(");", post_at)]
+        self.assertIn("bulkCommentsUrl()", sent)
+        self.assertIn("tests: testsPayload()", sent)
+        self.assertIn("text: note", sent)
+        self.assertNotIn("assigned_by", sent)
+        self.assertNotIn("bulkAssignmentsUrl", body)
+        self.assertIn("notifyChanged()", body)
+
+    def test_each_selected_test_carries_its_own_origin(self) -> None:
+        body = _strip_comments(_function_body(
+            read("selection.js"), "function testsPayload("))
+        self.assertIn("out.stream_id = entry.stream_id", body)
+
+    def test_the_bulk_comment_request_carries_no_page_scope(self) -> None:
+        body = _strip_comments(_function_body(
+            read("selection.js"), "function bulkCommentsUrl("))
+        self.assertIn('"api/comments/bulk"', body)
+        for level in ("product", "stream", "baseline", "environment"):
+            self.assertIn(level + ": null", body)
+
+
 class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     """PART A of a follow-up link-matrix audit (after the F1-F7
     usability sweep): three more test.html links that only became
