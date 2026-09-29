@@ -347,6 +347,14 @@ class MariaDBBackend(object):
         print("vacuum: no-op on MariaDB (InnoDB manages its own space; "
               "see OPTIMIZE TABLE if reclaiming disk is the goal)")
 
+    def suspend_foreign_keys(self, conn: Any) -> None:
+        """No-op: this schema declares no foreign keys at all (runbook
+        §B.6), so there is no per-row check to suspend. See the SQLite
+        backend's method for what this is the counterpart of."""
+
+    def restore_foreign_keys(self, conn: Any) -> None:
+        """No-op, as :meth:`suspend_foreign_keys`."""
+
 
 def describe_connect_error(settings: Settings, exc: BaseException) -> str:
     """A startup failure message an operator can act on.

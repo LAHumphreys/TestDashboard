@@ -56,6 +56,7 @@ from testboard.storage import (
     Comment,
     CompareCounts,
     CompareRow,
+    DerivedTablesDisagree,
     FailureStreak,
     RollupCount,
     Storage,
@@ -3058,6 +3059,145 @@ def _handle_streams_list(storage: Storage, request: Request) -> Response:
     )
 
 
+def _stream_from_path(storage: Storage, raw: str) -> Stream:
+    """The stream a ``/api/streams/{id}/...`` path names; 404 if none."""
+    try:
+        stream_id = int(raw)
+    except ValueError:
+        raise _HttpError(404, "unknown stream: {}".format(raw))
+    stream = storage.get_stream(stream_id)
+    if stream is None:
+        raise _HttpError(404, "unknown stream: {}".format(stream_id))
+    return stream
+
+
+def _handle_stream_environments(
+    storage: Storage, raw_stream: str
+) -> Response:
+    """GET /api/streams/{id}/environments — what a build holds, per
+    environment (WP-34).
+
+    The figures a person is shown BEFORE deleting one: how many tests
+    and how many runs the build has on each environment, and when it
+    last ran there. Read from the build's own partitions of the derived
+    tables (:meth:`Storage.stream_environments`), so asking costs the
+    build's size and nothing more. ``deletable`` is false for mainline,
+    which no endpoint here will delete from.
+    """
+    stream = _stream_from_path(storage, raw_stream)
+    return _json_response(
+        200,
+        {
+            "stream": _stream_json(stream),
+            "deletable": stream.kind != "mainline",
+            "environments": [
+                {
+                    "environment": row.environment,
+                    "tests": row.tests,
+                    "runs": row.runs,
+                    "last_run": model.format_iso(row.last_run),
+                }
+                for row in storage.stream_environments(stream.stream_id)
+            ],
+        },
+    )
+
+
+def _handle_stream_environment_delete(
+    storage: Storage, request: Request, raw_stream: str, environment: str
+) -> Response:
+    """POST /api/streams/{id}/environments/{environment}/delete —
+    delete what one build holds for one environment (WP-34). Cannot be
+    undone.
+
+    Body: ``{"username": <str>, "reason": <str>, "confirm": <str>}``,
+    all three required. ``confirm`` must be the build's name, exactly:
+    this dashboard has no login, so anyone who can open a page can send
+    this request, and typing the name back is the one thing that
+    separates a decision from a slip. ``username`` and ``reason`` are
+    written to the server log with the row counts; nothing in the
+    schema records a deletion, and adding somewhere that did would
+    have been a migration.
+
+    POST, not DELETE, because the HTTP shell speaks GET/POST/PUT and
+    one endpoint is not a reason to teach it a fourth method.
+
+    Refusals, each before anything is touched: an unknown stream is
+    404; mainline is 400; a wrong or missing ``confirm`` is 400; an
+    environment the build holds nothing for is 404. If the derived
+    tables disagree with the runs stored (see
+    :meth:`Storage.delete_stream_environment`) the answer is 409 and
+    nothing has been deleted.
+
+    Response: ``{"deleted": {<table>: <rows>}, "stream_deleted":
+    <bool>, "stream": <stream or null>, ...}``. ``stream_deleted`` is
+    true when that was the build's only environment: the build is gone
+    and its id will 404 from now on.
+
+    A delete does not prevent the same records being imported again.
+    """
+    stream = _stream_from_path(storage, raw_stream)
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    reason = _validate_comment_text(obj, field="reason")
+    if stream.kind == "mainline":
+        raise _HttpError(
+            400, "mainline results cannot be deleted from here")
+    confirm = obj.get("confirm")
+    if not isinstance(confirm, str) or confirm != stream.name:
+        raise _HttpError(
+            400,
+            "confirm: must be the build's name exactly ('{}') — nothing "
+            "was deleted".format(stream.name),
+        )
+    held = [
+        row for row in storage.stream_environments(stream.stream_id)
+        if row.environment == environment
+    ]
+    if not held:
+        raise _HttpError(
+            404,
+            "{} {} has no results on environment '{}'".format(
+                stream.kind, stream.name, environment),
+        )
+    try:
+        deleted = storage.delete_stream_environment(
+            stream.stream_id, environment)
+    except DerivedTablesDisagree as exc:
+        _LOGGER.error(
+            "build results NOT deleted: stream=%s (%s:%s, product %r) "
+            "environment=%r by=%r: %s",
+            stream.stream_id, stream.kind, stream.name, stream.product,
+            environment, username, exc)
+        raise _HttpError(
+            409,
+            "nothing was deleted: the dashboard's summary tables do not "
+            "match the runs stored for this build ({}). This needs an "
+            "operator.".format(exc),
+        )
+    _LOGGER.warning(
+        "build results deleted: stream=%s (%s:%s, product %r) "
+        "environment=%r by=%r reason=%r rows=%s",
+        stream.stream_id, stream.kind, stream.name, stream.product,
+        environment, username, reason,
+        ", ".join(
+            "{}={}".format(table, deleted[table])
+            for table in sorted(deleted)))
+    remaining = storage.get_stream(stream.stream_id)
+    return _json_response(
+        200,
+        {
+            "deleted": deleted,
+            "environment": environment,
+            "deleted_by": username,
+            "reason": reason,
+            "stream_deleted": remaining is None,
+            "stream": (
+                None if remaining is None else _stream_json(remaining)),
+        },
+    )
+
+
 def _handle_compare(storage: Storage, request: Request) -> Response:
     """GET /api/compare?stream=&baseline=&environment=&category=&limit=&offset=
 
@@ -3926,6 +4066,17 @@ def _route(
     if rest == ["compare"]:
         _check_method(request.method, ("GET",))
         return _handle_compare(storage, request)
+
+    if (len(rest) == 3 and rest[0] == "streams"
+            and rest[2] == "environments"):
+        _check_method(request.method, ("GET",))
+        return _handle_stream_environments(storage, rest[1])
+
+    if (len(rest) == 5 and rest[0] == "streams"
+            and rest[2] == "environments" and rest[4] == "delete"):
+        _check_method(request.method, ("POST",))
+        return _handle_stream_environment_delete(
+            storage, request, rest[1], rest[3])
 
     if rest == ["users"]:
         _check_method(request.method, ("GET", "POST"))

@@ -1846,6 +1846,135 @@ class DeltaEnvironmentFilterTest(unittest.TestCase):
         self.assertIn("applied +", body[guard_at:shown_at])
 
 
+class BuildDeleteControlTest(unittest.TestCase):
+    """WP-34: deleting what a build holds for one environment, from the
+    page. The dashboard has no login, so the control is the safeguard a
+    login would otherwise be -- and each part of it is something a
+    later tidy-up could remove without anything looking broken."""
+
+    def _body(self, signature: str) -> str:
+        return _strip_comments(
+            _function_body(read("buildadmin.js"), signature))
+
+    def test_the_section_ships_hidden_and_collapsed(self) -> None:
+        html = read("index.html")
+        at = html.index('id="build-admin"')
+        tag = html[html.rindex("<", 0, at):html.index(">", at)]
+        self.assertIn("<details", tag)
+        self.assertIn("hidden", tag)
+        self.assertNotIn(" open", tag)
+        self.assertIn('src="buildadmin.js"', html)
+
+    def test_the_delete_button_ships_disabled(self) -> None:
+        html = read("index.html")
+        at = html.index('id="build-admin-delete"')
+        self.assertIn("disabled", html[at:html.index(">", at)])
+
+    def test_a_mainline_page_never_shows_it_or_fetches_for_it(
+            self) -> None:
+        body = self._body("function init()")
+        guard_at = body.index("streamId === null")
+        shown_at = body.index("section.hidden = false")
+        self.assertLess(guard_at, shown_at)
+        self.assertIn("return", body[guard_at:shown_at])
+        self.assertNotIn("fetchJson(", body)
+        self.assertNotIn("postJson(", body)
+
+    def test_nothing_is_fetched_until_it_is_opened(self) -> None:
+        body = self._body("function init()")
+        toggle_at = body.index('addEventListener("toggle"')
+        handler = body[toggle_at:body.index("});", toggle_at)]
+        self.assertIn("section.open", handler)
+        self.assertIn("load()", handler)
+        self.assertEqual(body.count("load()"), 1)
+        code = _strip_comments(read("buildadmin.js"))
+        self.assertEqual(code.count("fetchJson("), 1)
+        self.assertIn(
+            "fetchJson(", self._body("async function load()"))
+
+    def test_the_button_needs_a_target_a_reason_and_the_exact_name(
+            self) -> None:
+        body = self._body("function readyToDelete()")
+        self.assertIn("state.target !== null", body)
+        self.assertIn('"build-admin-reason").value.trim() !== ""', body)
+        self.assertIn(
+            '"build-admin-confirm").value === state.stream.name', body)
+        self.assertNotIn("toLowerCase", body)
+        self.assertNotIn("||", body)
+        sync = self._body("function syncDeleteButton()")
+        self.assertIn("disabled = !readyToDelete()", sync)
+
+    def test_the_button_is_rechecked_as_either_field_changes(
+            self) -> None:
+        body = self._body("function init()")
+        for field in ("build-admin-reason", "build-admin-confirm"):
+            self.assertIn(
+                '"' + field + '").addEventListener("input", '
+                'syncDeleteButton)', body)
+
+    def test_a_click_is_rechecked_before_anything_is_sent(self) -> None:
+        body = self._body("async function submit()")
+        guard_at = body.index("!readyToDelete()")
+        post_at = body.index("postJson(")
+        self.assertLess(guard_at, post_at)
+        self.assertIn("return", body[guard_at:post_at])
+
+    def test_a_name_is_required_and_sent(self) -> None:
+        body = self._body("async function submit()")
+        name_at = body.index("requireUsername()")
+        post_at = body.index("postJson(")
+        self.assertLess(name_at, post_at)
+        self.assertIn("return", body[name_at:post_at])
+        sent = body[post_at:body.index("});", post_at)]
+        for field in ("username:", "reason:", "confirm:"):
+            self.assertIn(field, sent)
+
+    def test_the_request_names_one_environment_and_carries_no_scope(
+            self) -> None:
+        body = self._body("function deleteUrl(")
+        self.assertIn("encodeURIComponent(environment)", body)
+        self.assertIn('"/delete"', body)
+        self.assertIn("NO_SCOPE", body)
+        self.assertIn("NO_SCOPE", self._body("function environmentsUrl()"))
+        code = _strip_comments(read("buildadmin.js"))
+        block = code[code.index("const NO_SCOPE"):]
+        block = block[:block.index("};")]
+        for level in ("product", "stream", "baseline", "environment"):
+            self.assertIn(level + ": null", block)
+
+    def test_what_will_go_is_stated_from_the_servers_counts(self) -> None:
+        body = self._body("function openForm(")
+        for source in ("row.tests", "row.runs", "row.environment",
+                       "state.stream.name"):
+            self.assertIn(source, body)
+        self.assertIn("cannot be undone", body)
+
+    def test_it_says_a_feeder_will_put_the_results_back(self) -> None:
+        """The delete does not block a re-import. A person who does not
+        know that deletes, sees the build return ten minutes later, and
+        reports the delete as broken."""
+        body = self._body("function openForm(")
+        self.assertIn("feeder", body)
+        self.assertIn("come back", body)
+
+    def test_the_last_environment_is_called_out(self) -> None:
+        body = self._body("function openForm(")
+        self.assertIn("state.environments.length === 1", body)
+        self.assertIn("build itself will disappear", body)
+
+    def test_after_a_delete_the_page_is_not_left_stale(self) -> None:
+        body = self._body("async function submit()")
+        gone_at = body.index("result.stream_deleted")
+        self.assertIn("withStream(null)", body[gone_at:])
+        self.assertIn('byId("reload-btn")', body[gone_at:])
+        self.assertIn("await load()", body[gone_at:])
+
+    def test_every_word_reaches_the_page_as_text(self) -> None:
+        code = _strip_comments(read("buildadmin.js"))
+        self.assertNotIn("innerHTML", code)
+        self.assertNotIn("insertAdjacentHTML", code)
+
+
 class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     """PART A of a follow-up link-matrix audit (after the F1-F7
     usability sweep): three more test.html links that only became

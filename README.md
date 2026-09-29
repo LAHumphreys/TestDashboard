@@ -267,6 +267,27 @@ stream's own product's; never narrowed by the filter, since it is what a
 filter control offers). An `environment` that is not one of them is not an
 error: it matches nothing, every count is zero, and the echo plus the list let
 the caller say why.
+
+`GET /api/streams/<id>/environments` (WP-34) reports what one stream holds, per
+environment: `{stream, deletable, environments: [{environment, tests, runs,
+last_run}]}`. It is read from the stream's own partitions of the derived
+tables, so it costs the build's size and never scans `runs`. `deletable` is
+`false` for mainline. `POST /api/streams/<id>/environments/<environment>/delete`
+deletes what that build holds for that one environment — runs, their output,
+and the build's partitions of the three derived tables — and **cannot be
+undone**. The body is `{"username", "reason", "confirm"}`, all required;
+`confirm` must be the build's name exactly (the dashboard has no login, so
+typing the name back is what separates a decision from a slip). Mainline is
+refused (`400`), as is a wrong `confirm` (`400`) and an environment the build
+holds nothing for (`404`). The response is `{deleted: {<table>: <rows>},
+stream_deleted, stream, environment, deleted_by, reason}`; `stream_deleted` is
+`true` when that was the build's only environment, in which case the build
+itself is gone and its id is `404` from then on. Comments and assignments are
+never deleted. Who deleted what, and why, is written to the server log at
+`WARNING`; nothing in the database records it. **A delete does not block a
+re-import**: a feeder still sending those records will put them back. The
+whole-build equivalent remains `tools/drop_stream.py`, run with the server
+stopped.
 `GET /api/dashboard`, test detail and test history all accept an optional
 `stream=<id>` (default: mainline).
 

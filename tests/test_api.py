@@ -19,6 +19,7 @@ Covers, per the build-spec checklist:
 
 import datetime
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -5582,6 +5583,201 @@ class TestStreamsEndpoint(ApiCase):
         withempty = self.call(
             "GET", "/api/streams", query={"product": [""]})["streams"]
         self.assertEqual(without, withempty)
+
+
+class TestStreamEnvironmentDelete(ApiCase):
+    """GET /api/streams/{id}/environments and the delete beside it
+    (WP-34)."""
+
+    BRANCH_TIMES = {
+        "start_time": "2026-07-25T03:00:00.000000",
+        "end_time": "2026-07-25T03:00:03.000000",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        # A successful delete logs at WARNING by design; keep that out
+        # of the test run's own output. assertLogs() swaps the handlers
+        # for its own and puts these back, so the tests that read the
+        # log are unaffected.
+        logger = logging.getLogger("testboard.api")
+        silence = logging.NullHandler()
+        propagate = logger.propagate
+        logger.addHandler(silence)
+        logger.propagate = False
+        self.addCleanup(setattr, logger, "propagate", propagate)
+        self.addCleanup(logger.removeHandler, silence)
+        self.import_runs([
+            record(test_name="test_a"),
+            record(environment="win-sim", test_name="test_a"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+            record(test_name="test_b", build="feat/x",
+                   **self.BRANCH_TIMES),
+            record(environment="win-sim", test_name="test_a",
+                   build="feat/x", **self.BRANCH_TIMES),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.base = "/api/streams/{}/environments".format(self.stream_id)
+
+    def _body(self, **overrides: Any) -> Dict[str, Any]:
+        body = {
+            "username": "amy", "reason": "uploaded against the wrong rig",
+            "confirm": "feat/x",
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return body
+
+    def _delete(self, environment: str, body: Dict[str, Any],
+                expect: int = 200) -> Dict[str, Any]:
+        return self.call(
+            "POST", "{}/{}/delete".format(self.base, environment),
+            body=body, expect=expect)
+
+    def _held(self) -> Dict[str, int]:
+        return {
+            row["environment"]: row["runs"]
+            for row in self.call("GET", self.base)["environments"]}
+
+    def test_the_listing_is_what_the_build_holds(self) -> None:
+        data = self.call("GET", self.base)
+        self.assertEqual(data["stream"]["name"], "feat/x")
+        self.assertTrue(data["deletable"])
+        self.assertEqual(data["environments"], [
+            {"environment": "linux-sim", "tests": 2, "runs": 2,
+             "last_run": "2026-07-25T03:00:00.000000"},
+            {"environment": "win-sim", "tests": 1, "runs": 1,
+             "last_run": "2026-07-25T03:00:00.000000"},
+        ])
+
+    def test_mainline_is_listed_but_not_deletable(self) -> None:
+        data = self.call("GET", "/api/streams/1/environments")
+        self.assertFalse(data["deletable"])
+        self.assertEqual(
+            [row["environment"] for row in data["environments"]],
+            ["linux-sim", "win-sim"])
+
+    def test_an_unknown_stream_is_404_on_both(self) -> None:
+        for raw in ("999999", "not-a-number"):
+            self.call(
+                "GET", "/api/streams/{}/environments".format(raw),
+                expect=404)
+            self.call(
+                "POST",
+                "/api/streams/{}/environments/win-sim/delete".format(raw),
+                body=self._body(), expect=404)
+
+    def test_only_the_documented_methods_are_accepted(self) -> None:
+        self.call("POST", self.base, body={}, expect=405)
+        self.call("GET", self.base + "/win-sim/delete", expect=405)
+        self.call(
+            "PUT", self.base + "/win-sim/delete", body=self._body(),
+            expect=405)
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_deleting_one_environment_leaves_the_rest(self) -> None:
+        data = self._delete("win-sim", self._body())
+        self.assertEqual(data["deleted"]["runs"], 1)
+        self.assertEqual(data["deleted"]["latest_runs"], 1)
+        self.assertEqual(data["deleted"]["run_outputs"], 1)
+        self.assertEqual(data["deleted"]["streams"], 0)
+        self.assertFalse(data["stream_deleted"])
+        self.assertEqual(data["stream"]["id"], self.stream_id)
+        self.assertEqual(data["environment"], "win-sim")
+        self.assertEqual(data["deleted_by"], "amy")
+        self.assertEqual(self._held(), {"linux-sim": 2})
+        # Mainline's own run of the same test, same environment.
+        detail = self.call(
+            "GET", test_path("win-sim", "suite/alpha.py", "test_a"))
+        self.assertEqual(detail["latest"]["result"], "PASS")
+
+    def test_deleting_the_last_environment_deletes_the_build(
+            self) -> None:
+        self._delete("win-sim", self._body())
+        data = self._delete("linux-sim", self._body())
+        self.assertTrue(data["stream_deleted"])
+        self.assertIsNone(data["stream"])
+        self.assertEqual(data["deleted"]["streams"], 1)
+        self.call("GET", self.base, expect=404)
+        self.assertEqual(self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"],
+            [])
+
+    def test_the_name_must_be_typed_back_exactly(self) -> None:
+        for confirm in ("feat/X", " feat/x", "feat/x ", "", "feat",
+                        None, 7, ["feat/x"]):
+            error = self._delete(
+                "win-sim", self._body(confirm=confirm), expect=400)
+            self.assertIn("confirm", error["error"])
+            self.assertIn("nothing was deleted", error["error"])
+        body = self._body()
+        del body["confirm"]
+        self._delete("win-sim", body, expect=400)
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_who_and_why_are_both_required(self) -> None:
+        for field in ("username", "reason"):
+            body = self._body()
+            del body[field]
+            error = self._delete("win-sim", body, expect=400)
+            self.assertIn(field, error["error"])
+            error = self._delete(
+                "win-sim", self._body(**{field: "   "}), expect=400)
+            self.assertIn(field, error["error"])
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_mainline_is_refused_whatever_is_typed(self) -> None:
+        error = self.call(
+            "POST", "/api/streams/1/environments/win-sim/delete",
+            body=self._body(confirm=""), expect=400)
+        self.assertIn("mainline", error["error"])
+        detail = self.call(
+            "GET", test_path("win-sim", "suite/alpha.py", "test_a"))
+        self.assertEqual(detail["latest"]["result"], "PASS")
+
+    def test_an_environment_the_build_is_not_on_is_404(self) -> None:
+        error = self._delete("mac-sim", self._body(), expect=404)
+        self.assertIn("mac-sim", error["error"])
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_an_environment_name_is_decoded_from_the_path(self) -> None:
+        self.import_runs([
+            record(environment="rig/7 east", test_name="test_a",
+                   build="feat/x", **self.BRANCH_TIMES),
+        ])
+        self.assertIn("rig/7 east", self._held())
+        self._delete(
+            urllib.parse.quote("rig/7 east", safe=""), self._body())
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_the_delete_is_logged_with_who_and_why(self) -> None:
+        with self.assertLogs("testboard.api", level="WARNING") as logs:
+            self._delete("win-sim", self._body())
+        line = "\n".join(logs.output)
+        for expected in ("amy", "uploaded against the wrong rig",
+                         "feat/x", "win-sim", "runs=1"):
+            self.assertIn(expected, line)
+
+    def test_a_refused_delete_is_not_logged_as_one(self) -> None:
+        with self.assertRaises(AssertionError):
+            with self.assertLogs("testboard.api", level="WARNING"):
+                self._delete(
+                    "win-sim", self._body(confirm="nope"), expect=400)
+
+    def test_disagreeing_tables_are_409_and_delete_nothing(self) -> None:
+        self.storage._conn().execute(
+            "UPDATE activity_hours SET count = count + 1 "
+            "WHERE stream_id = ? AND environment = ?",
+            (self.stream_id, "win-sim"))
+        with self.assertLogs("testboard.api", level="ERROR"):
+            error = self._delete("win-sim", self._body(), expect=409)
+        self.assertIn("nothing was deleted", error["error"])
+        self.assertEqual(
+            sorted(self._held()), ["linux-sim", "win-sim"])
 
 
 class TestCompareEnvironmentFilter(ApiCase):

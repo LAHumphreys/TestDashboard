@@ -267,11 +267,58 @@
       <p id="delta-empty" class="empty-state" hidden></p>
       <button id="delta-show-more" type="button" hidden>Show more</button>
     </section>
+
+    <!-- ============ Delete a build's results (WP-34) ============
+         Hidden in the shipped markup; buildadmin.js shows it only on a
+         page opened ?stream=<id>, collapsed, and fetches nothing until
+         it is opened. Below both of a build's tabs, on purpose: it is
+         the last thing on the page, not one of the things the page is
+         for. -->
+    <details id="build-admin" class="charts-details build-admin" hidden>
+      <summary class="charts-summary">Delete results from this build…</summary>
+      <div class="build-admin-body">
+        <p id="build-admin-intro" class="muted"></p>
+        <div class="table-wrap">
+          <table class="data-table small" id="build-admin-table" hidden>
+            <thead>
+              <tr>
+                <th>Environment</th>
+                <th>Tests</th>
+                <th>Runs</th>
+                <th>Last ran</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="build-admin-rows"></tbody>
+          </table>
+        </div>
+        <div id="build-admin-form" class="build-admin-form" hidden>
+          <p id="build-admin-target" class="build-admin-target"></p>
+          <p id="build-admin-consequence" class="muted"></p>
+          <label class="build-admin-field">Why is this being deleted?
+            <input id="build-admin-reason" type="text" autocomplete="off">
+          </label>
+          <label class="build-admin-field">
+            <span id="build-admin-confirm-label"></span>
+            <input id="build-admin-confirm" type="text" autocomplete="off"
+                   spellcheck="false">
+          </label>
+          <div class="build-admin-actions">
+            <button id="build-admin-delete" type="button"
+                    class="build-admin-delete" disabled>Delete</button>
+            <button id="build-admin-cancel" type="button">Cancel</button>
+          </div>
+        </div>
+        <p id="build-admin-status" class="muted" role="status" hidden></p>
+        <a id="build-admin-back" href="index.html" hidden>Back to mainline</a>
+      </div>
+    </details>
   </main>
 
   <script type="module" src="app.js"></script>
   <script type="module" src="products.js"></script>
   <script type="module" src="streams.js"></script>
+  <script type="module" src="buildadmin.js"></script>
   <script type="module" src="nav.js"></script>
 </body>
 </html>

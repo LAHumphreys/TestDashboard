@@ -49,6 +49,12 @@ EXCLUDED_CLASSES = {
         "EXPLAIN was checked by hand against the local mariadbd "
         "(eq_ref on the latest_runs PRIMARY KEY) — see the commit "
         "message; there is no equivalent automated pin for it here.",
+    "DeleteStreamEnvironmentQueryPlanTest":
+        "asserts EXPLAIN QUERY PLAN output (WP-34) — SQLite's planner, "
+        "SQLite's syntax, same reason as TestSortIndexesAreUsed above. "
+        "The delete itself runs against MariaDB in "
+        "DeleteStreamEnvironmentTest's generated variant; which index "
+        "MariaDB chooses for it has no automated pin here.",
     "TestEnvironmentListingCost":
         "counts sqlite page reads to pin a query-shape regression; "
         "the instrument is engine-specific even though the shape "

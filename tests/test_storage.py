@@ -20,7 +20,9 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    Any, Callable, Dict, List, Optional, Sequence, Tuple,
+)
 
 from testboard import analytics, model, storage
 from testboard.model import Result, RunRecord
@@ -5961,6 +5963,442 @@ class EnvironmentsForStreamTest(StorageTestBase):
 
     def test_an_unknown_stream_id_is_an_empty_list(self) -> None:
         self.assertEqual(self.store.environments_for_stream(999999), [])
+
+
+class _StreamEnvironmentFixture(StorageTestBase):
+    """Two builds and mainline across two environments, with history.
+
+    Every partition the delete must leave alone has rows of its own in
+    the SAME hours as the one it removes: mainline on the same
+    environment, the same build on the other environment, and a second
+    build on the same environment. A delete keyed on too little takes
+    one of them with it.
+    """
+
+    HOUR = datetime.timedelta(hours=1)
+
+    def setUp(self) -> None:
+        super().setUp()
+        for environment in ("linux-sim", "win-sim"):
+            self.store.set_environment_product(
+                environment, "Atlas", "alice", CREATED)
+        records = []
+        for environment in ("linux-sim", "win-sim"):
+            for offset in (0, 1, 26):
+                start = BASE + offset * self.HOUR
+                for name in ("test_a", "test_b"):
+                    records.append(make_record(
+                        environment=environment, test_name=name,
+                        start=start))
+                    # One second later: the runs table's UNIQUE does
+                    # not include the stream, so the builds cannot
+                    # share mainline's start times.
+                    records.append(make_record(
+                        environment=environment, test_name=name,
+                        build="feat/x",
+                        result=Result.FAIL if name == "test_b"
+                        else Result.PASS,
+                        start=start + datetime.timedelta(seconds=1)))
+        for offset in (0, 1):
+            records.append(make_record(
+                test_name="test_a", build="feat/y",
+                start=BASE + offset * self.HOUR
+                + datetime.timedelta(seconds=2)))
+        self.store.upsert_runs(records)
+        by_name = {
+            stream.name: stream.stream_id
+            for stream in self.store.list_streams("Atlas")}
+        self.stream_id = by_name["feat/x"]
+        self.other_id = by_name["feat/y"]
+
+    def _count(self, table: str, stream_id: int,
+               environment: str) -> int:
+        return int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM {} WHERE stream_id = ? "
+            "AND environment = ?".format(table),
+            (stream_id, environment)).fetchone()[0])
+
+    def _outputs(self, stream_id: int, environment: str) -> int:
+        return int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM run_outputs o JOIN runs r "
+            "ON r.id = o.run_id WHERE r.stream_id = ? "
+            "AND r.environment = ?",
+            (stream_id, environment)).fetchone()[0])
+
+    def _snapshot(self) -> Dict[Tuple[int, str, str], int]:
+        """Row counts for every (stream, environment, table)."""
+        counts = {}  # type: Dict[Tuple[int, str, str], int]
+        for stream_id in (storage.MAINLINE_STREAM_ID, self.stream_id,
+                          self.other_id):
+            for environment in ("linux-sim", "win-sim"):
+                for table in ("runs", "latest_runs", "activity_hours",
+                              "script_hours"):
+                    counts[(stream_id, environment, table)] = self._count(
+                        table, stream_id, environment)
+                counts[(stream_id, environment, "run_outputs")] = (
+                    self._outputs(stream_id, environment))
+        return counts
+
+
+class StreamEnvironmentsTest(_StreamEnvironmentFixture):
+    """Storage.stream_environments — what a person is shown before
+    deleting (WP-34)."""
+
+    def test_reports_each_environment_of_the_build(self) -> None:
+        self.assertEqual(
+            self.store.stream_environments(self.stream_id),
+            [
+                storage.StreamEnvironment(
+                    environment="linux-sim", tests=2, runs=6,
+                    last_run=BASE + 26 * self.HOUR
+                    + datetime.timedelta(seconds=1)),
+                storage.StreamEnvironment(
+                    environment="win-sim", tests=2, runs=6,
+                    last_run=BASE + 26 * self.HOUR
+                    + datetime.timedelta(seconds=1)),
+            ])
+
+    def test_the_run_count_is_what_the_delete_removes(self) -> None:
+        before = self.store.stream_environments(self.stream_id)
+        deleted = self.store.delete_stream_environment(
+            self.stream_id, "win-sim")
+        self.assertEqual(deleted["runs"], before[1].runs)
+        self.assertEqual(deleted["latest_runs"], before[1].tests)
+
+    def test_a_build_with_nothing_is_an_empty_list(self) -> None:
+        self.assertEqual(self.store.stream_environments(999999), [])
+
+    def test_it_never_reads_the_runs_table(self) -> None:
+        """`runs` has no index leading with stream_id; a count there
+        walks the environment's whole history. Asserted on the text of
+        the statements issued, which is the same on both backends."""
+        seen = []  # type: List[str]
+        real_conn = self.store._conn()
+
+        class Recorder(object):
+            def execute(self, sql: str, *args: Any) -> Any:
+                seen.append(sql)
+                return real_conn.execute(sql, *args)
+
+        self.store._conn = lambda: Recorder()  # type: ignore
+        try:
+            self.store.stream_environments(self.stream_id)
+        finally:
+            del self.store._conn
+        self.assertEqual(len(seen), 2)
+        for sql in seen:
+            self.assertNotIn(
+                " runs ", sql.replace("latest_runs", "") + " ", sql)
+
+
+class DeleteStreamEnvironmentTest(_StreamEnvironmentFixture):
+    """Storage.delete_stream_environment (WP-34): one build's results
+    for one environment, and nothing else."""
+
+    def test_refuses_mainline(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.delete_stream_environment(
+                storage.MAINLINE_STREAM_ID, "linux-sim")
+        self.assertEqual(
+            self._count("runs", storage.MAINLINE_STREAM_ID, "linux-sim"),
+            6)
+
+    def test_removes_exactly_that_partition(self) -> None:
+        before = self._snapshot()
+        deleted = self.store.delete_stream_environment(
+            self.stream_id, "win-sim")
+        after = self._snapshot()
+        for key in sorted(before):
+            stream_id, environment, table = key
+            if (stream_id, environment) == (self.stream_id, "win-sim"):
+                self.assertEqual(after[key], 0, key)
+                self.assertEqual(deleted[table], before[key], key)
+                self.assertGreater(before[key], 0, key)
+            else:
+                self.assertEqual(after[key], before[key], key)
+        self.assertEqual(deleted["streams"], 0)
+
+    def test_the_derived_tables_still_equal_a_group_by_over_runs(
+            self) -> None:
+        self.store.delete_stream_environment(self.stream_id, "win-sim")
+        conn = self.store._conn()
+        pairs = [
+            ("SELECT stream_id, environment, SUBSTR(start_time, 1, 13), "
+             "result, COUNT(*) FROM runs GROUP BY 1, 2, 3, 4",
+             "SELECT stream_id, environment, hour, result, count "
+             "FROM activity_hours"),
+            ("SELECT stream_id, environment, SUBSTR(start_time, 1, 13), "
+             "script, result, COUNT(*), MIN(start_time), MAX(end_time) "
+             "FROM runs GROUP BY 1, 2, 3, 4, 5",
+             "SELECT stream_id, environment, hour, script, result, "
+             "count, first_start, last_end FROM script_hours"),
+        ]
+        for grouped, table in pairs:
+            for left, right in ((grouped, table), (table, grouped)):
+                self.assertEqual(int(conn.execute(
+                    "SELECT COUNT(*) FROM ({0} EXCEPT {1}) AS t".format(
+                        left, right)).fetchone()[0]), 0, table)
+
+    def test_the_surviving_build_reads_normally(self) -> None:
+        self.store.delete_stream_environment(self.stream_id, "win-sim")
+        self.assertEqual(
+            self.store.environments_for_stream(self.stream_id),
+            ["linux-sim"])
+        self.assertIsNone(self.store.latest_run(
+            "win-sim", "suite.py", "test_a", stream_id=self.stream_id))
+        kept = self.store.latest_run(
+            "linux-sim", "suite.py", "test_b", stream_id=self.stream_id)
+        self.assertEqual(kept.result, Result.FAIL)
+        self.assertEqual(
+            self.store.compare_counts(
+                self.stream_id, environment="win-sim").no_result, 2)
+        self.assertEqual(self.store.get_stream(self.stream_id).failing, 1)
+
+    def test_the_builds_clock_is_rederived_from_what_remains(
+            self) -> None:
+        """A later upload to the deleted environment must not go on
+        being quoted as when the build "last ran"."""
+        late = BASE + 50 * self.HOUR
+        early = BASE - 50 * self.HOUR
+        self.store.upsert_runs([
+            make_record(environment="win-sim", test_name="test_a",
+                        build="feat/x", start=late),
+            make_record(environment="win-sim", test_name="test_a",
+                        build="feat/x", start=early),
+        ])
+        widened = self.store.get_stream(self.stream_id)
+        self.assertEqual(widened.first_seen, early)
+        self.assertEqual(widened.last_seen, late)
+        self.store.delete_stream_environment(self.stream_id, "win-sim")
+        settled = self.store.get_stream(self.stream_id)
+        self.assertEqual(
+            settled.first_seen, BASE + datetime.timedelta(seconds=1))
+        self.assertEqual(
+            settled.last_seen,
+            BASE + 26 * self.HOUR + datetime.timedelta(seconds=1))
+
+    def test_the_last_environment_takes_the_build_with_it(self) -> None:
+        self.store.delete_stream_environment(self.stream_id, "win-sim")
+        self.assertIsNotNone(self.store.get_stream(self.stream_id))
+        deleted = self.store.delete_stream_environment(
+            self.stream_id, "linux-sim")
+        self.assertEqual(deleted["streams"], 1)
+        self.assertIsNone(self.store.get_stream(self.stream_id))
+        self.assertEqual(
+            [stream.name for stream in self.store.list_streams("Atlas")],
+            ["feat/y"])
+
+    def test_tags_are_kept_while_the_build_survives(self) -> None:
+        self.store.add_comment(
+            "win-sim", "suite.py", "test_b", "amy", "broken rig", CREATED,
+            stream_id=self.stream_id)
+        self.store.set_assignee(
+            "win-sim", "suite.py", "test_b", "alice", "amy", CREATED,
+            stream_id=self.stream_id)
+        self.store.delete_stream_environment(self.stream_id, "win-sim")
+        comments = self.store.comments("win-sim", "suite.py", "test_b")
+        self.assertEqual(
+            [(c.text, c.stream_id) for c in comments],
+            [("broken rig", self.stream_id)])
+        self.assertEqual(
+            self.store.assignments_referencing_stream(self.stream_id), 1)
+        self.assertEqual(
+            self.store.current_assignee("win-sim", "suite.py", "test_b"),
+            "alice")
+
+    def test_tags_are_cleared_when_the_build_goes(self) -> None:
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "one-off", CREATED,
+            stream_id=self.other_id)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "amy", CREATED,
+            stream_id=self.other_id)
+        deleted = self.store.delete_stream_environment(
+            self.other_id, "linux-sim")
+        self.assertEqual(deleted["streams"], 1)
+        comments = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertEqual(
+            [(c.text, c.stream_id) for c in comments],
+            [("one-off", None)])
+        self.assertEqual(
+            self.store.current_assignee(
+                "linux-sim", "suite.py", "test_a"), "alice")
+        self.assertEqual(int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM assignments WHERE stream_id = ?",
+            (self.other_id,)).fetchone()[0]), 0)
+
+    def test_an_environment_the_build_never_ran_on_deletes_nothing(
+            self) -> None:
+        before = self._snapshot()
+        deleted = self.store.delete_stream_environment(
+            self.other_id, "win-sim")
+        self.assertEqual(sorted(set(deleted.values())), [0])
+        self.assertEqual(self._snapshot(), before)
+        self.assertIsNotNone(self.store.get_stream(self.other_id))
+
+    def test_more_runs_than_one_statement_may_bind(self) -> None:
+        """The ids are deleted in chunks; the boundary is where a chunk
+        is dropped or sent twice."""
+        chunk = storage.Storage._DELETE_CHUNK
+        records = [
+            make_record(
+                environment="win-sim", test_name="bulk_{}".format(index),
+                build="feat/x",
+                start=BASE + datetime.timedelta(seconds=10 + index))
+            for index in range(chunk * 2 + 1)
+        ]
+        self.store.upsert_runs(records)
+        deleted = self.store.delete_stream_environment(
+            self.stream_id, "win-sim")
+        self.assertEqual(deleted["runs"], 6 + chunk * 2 + 1)
+        self.assertEqual(deleted["run_outputs"], 6 + chunk * 2 + 1)
+        self.assertEqual(self._count("runs", self.stream_id, "win-sim"), 0)
+        self.assertEqual(
+            self._count("runs", storage.MAINLINE_STREAM_ID, "win-sim"), 6)
+
+    def test_the_same_records_can_be_imported_again(self) -> None:
+        """Nothing here blocks a re-import -- stated in the docstring,
+        the operator note and the confirmation text, and pinned here so
+        that it stays a decision rather than becoming an accident."""
+        self.store.delete_stream_environment(self.stream_id, "win-sim")
+        counts = self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_a", build="feat/x",
+            start=BASE + datetime.timedelta(seconds=1))])
+        self.assertEqual(counts.inserted, 1)
+        self.assertEqual(
+            self.store.environments_for_stream(self.stream_id),
+            ["linux-sim", "win-sim"])
+
+    def test_a_disagreeing_hour_count_deletes_nothing(self) -> None:
+        conn = self.store._conn()
+        conn.execute(
+            "UPDATE activity_hours SET count = count + 1 "
+            "WHERE stream_id = ? AND environment = ? AND hour = ? "
+            "AND result = ?",
+            (self.stream_id, "win-sim",
+             model.format_iso(BASE)[:13], Result.PASS.value))
+        before = self._snapshot()
+        with self.assertRaises(storage.DerivedTablesDisagree) as raised:
+            self.store.delete_stream_environment(self.stream_id, "win-sim")
+        self.assertIn("activity_hours", str(raised.exception))
+        self.assertEqual(self._snapshot(), before)
+        self.assertIsNotNone(self.store.get_stream(self.stream_id))
+
+    def test_a_reference_from_another_partition_deletes_nothing(
+            self) -> None:
+        """Foreign keys are not enforced during the delete, so the one
+        thing they would have caught is caught by hand: a latest_runs
+        row ELSEWHERE pointing at a run about to go."""
+        conn = self.store._conn()
+        victim = self.store.latest_run(
+            "win-sim", "suite.py", "test_a", stream_id=self.stream_id)
+        conn.execute(
+            "UPDATE latest_runs SET run_id = ? WHERE stream_id = ? "
+            "AND environment = ? AND test_name = ?",
+            (victim.run_id, self.other_id, "linux-sim", "test_a"))
+        before = self._snapshot()
+        with self.assertRaises(storage.DerivedTablesDisagree) as raised:
+            self.store.delete_stream_environment(self.stream_id, "win-sim")
+        self.assertIn("outside", str(raised.exception))
+        self.assertEqual(self._snapshot(), before)
+
+    def test_foreign_keys_are_enforced_again_afterwards(self) -> None:
+        """Both ways out: a delete that commits and one that raises."""
+        if not self.store._backend.runs_migrations:
+            self.skipTest("MariaDB's schema declares no foreign keys")
+        conn = self.store._conn()
+        self.store.delete_stream_environment(self.stream_id, "win-sim")
+        self.assertEqual(
+            int(conn.execute("PRAGMA foreign_keys").fetchone()[0]), 1)
+        conn.execute(
+            "DELETE FROM activity_hours WHERE stream_id = ? "
+            "AND environment = ?", (self.stream_id, "linux-sim"))
+        with self.assertRaises(storage.DerivedTablesDisagree):
+            self.store.delete_stream_environment(
+                self.stream_id, "linux-sim")
+        self.assertEqual(
+            int(conn.execute("PRAGMA foreign_keys").fetchone()[0]), 1)
+
+    def test_an_unaccounted_latest_run_deletes_nothing(self) -> None:
+        """The other direction: runs the hour table does not know
+        about. Its counts agree hour by hour with what it records, so
+        only the latest_runs cross-check can see this."""
+        conn = self.store._conn()
+        conn.execute(
+            "DELETE FROM activity_hours WHERE stream_id = ? "
+            "AND environment = ? AND hour = ?",
+            (self.stream_id, "win-sim",
+             model.format_iso(BASE + 26 * self.HOUR)[:13]))
+        before = self._snapshot()
+        with self.assertRaises(storage.DerivedTablesDisagree) as raised:
+            self.store.delete_stream_environment(self.stream_id, "win-sim")
+        self.assertIn("latest_runs", str(raised.exception))
+        self.assertEqual(self._snapshot(), before)
+
+
+class DeleteStreamEnvironmentQueryPlanTest(_StreamEnvironmentFixture):
+    """The delete may not walk an environment's history (WP-34).
+
+    `runs` has two indexes: the frozen UNIQUE from migration 1, which
+    leads with environment, and idx_runs_start_time_result. Found
+    through the first, one build's runs cost every run the environment
+    has recorded in a year. The statements are captured from the real
+    method, then planned — so a rewrite that changes how the runs are
+    found is what gets tested, not a copy of today's SQL.
+    """
+
+    def _runs_statements(self) -> List[Tuple[str, Any]]:
+        seen = []  # type: List[Tuple[str, Any]]
+        real_conn = self.store._conn()
+
+        class Recorder(object):
+            def execute(self, sql: str, *args: Any) -> Any:
+                if "runs" in sql.replace("latest_runs", ""):
+                    seen.append((sql, args[0] if args else ()))
+                return real_conn.execute(sql, *args)
+
+        self.store._conn = lambda: Recorder()  # type: ignore
+        try:
+            self.store.delete_stream_environment(self.stream_id, "win-sim")
+        finally:
+            del self.store._conn
+        return seen
+
+    def test_every_statement_touching_runs_is_a_bounded_search(
+            self) -> None:
+        statements = self._runs_statements()
+        self.assertGreater(len(statements), 0)
+        conn = self.store._conn()
+        for sql, params in statements:
+            plan = " | ".join(
+                str(row[-1]) for row in conn.execute(
+                    "EXPLAIN QUERY PLAN " + sql, params).fetchall())
+            # The line for `runs` itself. A DELETE's plan also lists
+            # the foreign-key lookups SQLite would make into the child
+            # tables -- those are what suspend_foreign_keys() exists
+            # for, and are measured, not planned.
+            lines = [
+                str(row[-1]).upper() for row in conn.execute(
+                    "EXPLAIN QUERY PLAN " + sql, params).fetchall()]
+            own = [
+                line for line in lines
+                if " RUNS " in line.replace("LATEST_RUNS", "") + " "]
+            self.assertEqual(len(own), 1, sql + " -> " + plan)
+            self.assertTrue(own[0].startswith("SEARCH"), own[0])
+            self.assertNotIn("SQLITE_AUTOINDEX_RUNS_1", own[0])
+            self.assertTrue(
+                "IDX_RUNS_START_TIME_RESULT" in own[0]
+                or "PRIMARY KEY" in own[0],
+                sql + " -> " + plan)
+
+    def test_a_delete_by_environment_alone_would_be_caught(self) -> None:
+        """The detector can fail: the obvious statement, planned."""
+        plan = " | ".join(
+            str(row[-1]) for row in self.store._conn().execute(
+                "EXPLAIN QUERY PLAN DELETE FROM runs WHERE stream_id = ? "
+                "AND environment = ?",
+                (self.stream_id, "win-sim")).fetchall()).upper()
+        self.assertIn("SQLITE_AUTOINDEX_RUNS_1", plan)
 
 
 class DropStreamTest(StorageTestBase):

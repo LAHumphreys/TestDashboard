@@ -2367,3 +2367,56 @@ body.has-selection-bar { padding-bottom: 60px; }
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+/* ---------------- delete a build's results (WP-34) ---------------- */
+
+/* The frame is .charts-details'; this is the spacing inside it and the
+   one control that must not look like every other button. */
+.build-admin { margin-top: 28px; }
+
+.build-admin-body { padding: 0 14px 14px; }
+
+.build-admin-form {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--grid);
+}
+
+.build-admin-target { font-weight: 600; margin: 0 0 6px; }
+
+.build-admin-field {
+  display: block;
+  margin: 10px 0 0;
+  font-size: 13px;
+}
+
+.build-admin-field input[type="text"] {
+  display: block;
+  width: 100%;
+  max-width: 420px;
+  margin-top: 4px;
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid var(--grid);
+  border-radius: 5px;
+}
+
+.build-admin-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+button.build-admin-delete {
+  background: #8c1d18;
+  border-color: #8c1d18;
+  color: #fff;
+}
+
+button.build-admin-delete:hover { background: #6f1713; }
+
+button.build-admin-delete:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

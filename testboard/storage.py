@@ -1456,6 +1456,32 @@ class Stream(NamedTuple):
     failing: int
 
 
+class StreamEnvironment(NamedTuple):
+    """What one build holds for one environment (WP-34) — the figures a
+    person is shown before deleting it, all read from the build's own
+    partitions of the derived tables, never from ``runs``.
+
+    ``tests`` is the partition's ``latest_runs`` row count; ``runs`` is
+    the sum of its ``activity_hours`` counts, which the writing
+    transaction keeps byte-equal to a ``GROUP BY`` over ``runs``;
+    ``last_run`` is the newest start time among its tests.
+    """
+
+    environment: str
+    tests: int
+    runs: int
+    last_run: datetime.datetime
+
+
+class DerivedTablesDisagree(Exception):
+    """The derived tables do not describe the runs actually stored.
+
+    Raised by :meth:`Storage.delete_stream_environment`, which finds the
+    runs to delete THROUGH ``activity_hours`` and checks what it found
+    against it. Nothing has been deleted when this is raised.
+    """
+
+
 class CompareCounts(NamedTuple):
     """The six headline counts of :meth:`Storage.compare_streams`.
 
@@ -2027,6 +2053,30 @@ class _SqliteBackend(object):
     def vacuum(self, conn: sqlite3.Connection) -> None:
         """Rebuild the file. SQLite-shaped maintenance; see Storage.vacuum."""
         conn.execute("VACUUM")
+
+    def suspend_foreign_keys(self, conn: sqlite3.Connection) -> None:
+        """Stop enforcing foreign keys on *conn* until
+        :meth:`restore_foreign_keys` — for ONE caller,
+        :meth:`Storage.delete_stream_environment`, which re-establishes
+        by explicit check what it asks not to have enforced.
+
+        Why it exists: ``latest_runs.run_id`` references ``runs(id)``
+        and has no index, so deleting a run makes SQLite scan
+        ``latest_runs`` for a row that points at it — once per run
+        deleted. Measured on the dev-scale seeded estate (605,050 runs,
+        33,378 ``latest_runs`` rows): 2,036 runs took 6.8 s and 22,245
+        took 64.7 s with enforcement on, 37 ms and 345 ms with it off.
+        The index that would make this unnecessary is a schema change.
+
+        Must be called OUTSIDE a transaction: inside one the pragma is
+        silently ignored. Per connection, so no other thread's
+        connection is affected.
+        """
+        conn.execute("PRAGMA foreign_keys=OFF")
+
+    def restore_foreign_keys(self, conn: sqlite3.Connection) -> None:
+        """Undo :meth:`suspend_foreign_keys`. Outside a transaction."""
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 class Storage:
@@ -3993,20 +4043,7 @@ class Storage:
         deleted = {}  # type: Dict[str, int]
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                "UPDATE comments SET stream_id = NULL WHERE stream_id = ?",
-                (stream_id,),
-            )
-            conn.execute(
-                "UPDATE assignments SET stream_id = NULL "
-                "WHERE stream_id = ?",
-                (stream_id,),
-            )
-            conn.execute(
-                "UPDATE current_assignments SET stream_id = NULL "
-                "WHERE stream_id = ?",
-                (stream_id,),
-            )
+            self._clear_stream_origin_tags(conn, stream_id)
             cursor = conn.execute(
                 "DELETE FROM run_outputs WHERE run_id IN "
                 "(SELECT id FROM runs WHERE stream_id = ?)", (stream_id,)
@@ -4044,6 +4081,291 @@ class Storage:
         self._invalidate_trend_cache()
         self._invalidate_summary_cache()
         return deleted
+
+    @staticmethod
+    def _clear_stream_origin_tags(
+        conn: sqlite3.Connection, stream_id: int,
+    ) -> None:
+        """Clear every "posted/made from *stream_id*" tag, inside the
+        caller's transaction — what has to happen before a ``streams``
+        row is deleted. The rows themselves stay: a comment or an
+        assignment annotates the test, not the stream. See
+        :meth:`delete_stream` for why this is an explicit UPDATE and
+        not an ``ON DELETE SET NULL``.
+        """
+        conn.execute(
+            "UPDATE comments SET stream_id = NULL WHERE stream_id = ?",
+            (stream_id,),
+        )
+        conn.execute(
+            "UPDATE assignments SET stream_id = NULL "
+            "WHERE stream_id = ?",
+            (stream_id,),
+        )
+        conn.execute(
+            "UPDATE current_assignments SET stream_id = NULL "
+            "WHERE stream_id = ?",
+            (stream_id,),
+        )
+
+    def stream_environments(self, stream_id: int) -> List["StreamEnvironment"]:
+        """What *stream_id* holds, per environment, sorted by name.
+
+        Two grouped reads over the stream's OWN partitions —
+        ``latest_runs`` and ``activity_hours``, both keyed
+        ``(stream_id, environment, ...)`` — so the cost is the build's
+        own size, never the estate's or its history's. ``runs`` carries
+        no index that leads with ``stream_id``; counting there would
+        walk every run the environment has ever recorded.
+        """
+        conn = self._conn()
+        latest = conn.execute(
+            "SELECT environment, COUNT(*), MAX(start_time) "
+            "FROM latest_runs WHERE stream_id = ? "
+            "GROUP BY environment ORDER BY environment",
+            (stream_id,),
+        ).fetchall()
+        runs = {
+            row[0]: int(row[1]) for row in conn.execute(
+                "SELECT environment, SUM(count) FROM activity_hours "
+                "WHERE stream_id = ? GROUP BY environment",
+                (stream_id,),
+            ).fetchall()
+        }
+        return [
+            StreamEnvironment(
+                environment=row[0],
+                tests=int(row[1]),
+                runs=runs.get(row[0], 0),
+                last_run=model.parse_iso(row[2]),
+            )
+            for row in latest
+        ]
+
+    #: Ids per ``DELETE ... WHERE id IN (...)`` — under SQLite's
+    #: default limit of 999 bound parameters.
+    _DELETE_CHUNK = 500
+
+    def delete_stream_environment(
+        self, stream_id: int, environment: str,
+    ) -> Dict[str, int]:
+        """Delete what ONE build holds for ONE environment (WP-34).
+        Cannot be undone.
+
+        For the upload that should not have happened: a build pushed
+        against the wrong environment, or a run of it that was broken
+        from the start. The build's results on every other environment
+        are untouched. If this was the only environment it had, the
+        build has nothing left and its ``streams`` row goes too
+        (``deleted["streams"]`` is 1), exactly as
+        :meth:`delete_stream` would have left it; otherwise its
+        ``first_seen``/``last_seen`` are re-derived from what remains,
+        so "last ran" never quotes a run that no longer exists.
+
+        Refuses mainline. Comments and assignments are never deleted —
+        they annotate the test — and keep their origin tag while the
+        build survives.
+
+        Nothing here prevents the same records being imported again.
+        A feeder that is still sending them will put them back.
+
+        HOW THE RUNS ARE FOUND. ``runs`` has no index leading with
+        ``stream_id``, and its one index on ``environment`` is the
+        frozen UNIQUE from migration 1 — through it, this delete would
+        visit every run the environment has recorded in a year to find
+        one build's. Instead the build's own ``activity_hours``
+        partition names the hours it ran in, and each hour is read
+        through ``idx_runs_start_time_result``: the rows visited are the
+        runs that STARTED in those hours, on any environment, bounded
+        by the build's own activity. The derived tables are maintained in the writing
+        transaction and asserted byte-equal to ``runs`` by the suite,
+        but this is a delete, so what they say is checked rather than
+        trusted: each hour must yield exactly the count it records, and
+        every ``latest_runs`` row of the partition must point at a run
+        that was found. Any disagreement raises
+        :class:`DerivedTablesDisagree` and deletes nothing.
+
+        FOREIGN KEYS are not enforced for the length of this one
+        transaction (see the SQLite backend's ``suspend_foreign_keys``
+        for the measurement that made that necessary). What they would
+        have guaranteed is checked instead, before the commit: the
+        outputs are deleted by the same ids as their runs, and no
+        ``latest_runs`` row in ANY partition may still point at a
+        deleted run. MariaDB declares no foreign keys, so there the
+        check is the only guarantee there has ever been.
+
+        Safe with the server running: one transaction, and unlike
+        :meth:`delete_stream` no statement in it scans ``runs``.
+        """
+        if stream_id == MAINLINE_STREAM_ID:
+            raise ValueError("refusing to delete from the mainline stream")
+        conn = self._conn()
+        self._backend.suspend_foreign_keys(conn)
+        try:
+            return self._delete_stream_environment(
+                conn, stream_id, environment)
+        finally:
+            self._backend.restore_foreign_keys(conn)
+
+    def _delete_stream_environment(
+        self, conn: sqlite3.Connection, stream_id: int, environment: str,
+    ) -> Dict[str, int]:
+        """The transaction of :meth:`delete_stream_environment`."""
+        deleted = {}  # type: Dict[str, int]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            run_ids = self._stream_environment_run_ids(
+                conn, stream_id, environment)
+            outputs = 0
+            runs = 0
+            for at in range(0, len(run_ids), self._DELETE_CHUNK):
+                chunk = run_ids[at:at + self._DELETE_CHUNK]
+                marks = ", ".join("?" for _ in chunk)
+                cursor = conn.execute(
+                    "DELETE FROM run_outputs WHERE run_id IN ({})".format(
+                        marks), chunk)
+                outputs += int(cursor.rowcount)
+            for table in ("latest_runs", "activity_hours", "script_hours"):
+                cursor = conn.execute(
+                    "DELETE FROM {} WHERE stream_id = ? "
+                    "AND environment = ?".format(table),
+                    (stream_id, environment),
+                )
+                deleted[table] = int(cursor.rowcount)
+            for at in range(0, len(run_ids), self._DELETE_CHUNK):
+                chunk = run_ids[at:at + self._DELETE_CHUNK]
+                marks = ", ".join("?" for _ in chunk)
+                dangling = conn.execute(
+                    "SELECT COUNT(*) FROM latest_runs "
+                    "WHERE run_id IN ({})".format(marks), chunk,
+                ).fetchone()[0]
+                if int(dangling):
+                    raise DerivedTablesDisagree(
+                        "{0} latest_runs row(s) outside stream {1} / "
+                        "{2!r} point at runs inside it".format(
+                            int(dangling), stream_id, environment))
+                cursor = conn.execute(
+                    "DELETE FROM runs WHERE id IN ({})".format(marks),
+                    chunk)
+                runs += int(cursor.rowcount)
+            deleted["run_outputs"] = outputs
+            deleted["runs"] = runs
+            deleted["streams"] = self._settle_stream_after_delete(
+                conn, stream_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        self._invalidate_trend_cache()
+        self._invalidate_summary_cache()
+        return deleted
+
+    @staticmethod
+    def _stream_environment_run_ids(
+        conn: sqlite3.Connection, stream_id: int, environment: str,
+    ) -> List[int]:
+        """Every run id *stream_id* holds for *environment*, found
+        through its ``activity_hours`` partition and checked against it.
+        See :meth:`delete_stream_environment`.
+        """
+        expected = {}  # type: Dict[str, int]
+        for row in conn.execute(
+            "SELECT hour, SUM(count) FROM activity_hours "
+            "WHERE stream_id = ? AND environment = ? GROUP BY hour",
+            (stream_id, environment),
+        ).fetchall():
+            expected[row[0]] = int(row[1])
+        found = []  # type: List[int]
+        for hour in sorted(expected):
+            # Full-width bounds, so every comparison is between two
+            # timestamps of the same shape — no reliance on how a
+            # collation orders a prefix against a longer string.
+            begins = model.parse_iso(hour + ":00:00.000000")
+            ends = begins + datetime.timedelta(hours=1)
+            # The environment is matched HERE, not in the WHERE clause.
+            # Given `environment = ?` the planner takes the frozen
+            # UNIQUE index that leads with it, an equality beating a
+            # range, and walks the environment's whole history after
+            # all (measured: that is the plan SQLite chose, and
+            # DeleteStreamEnvironmentQueryPlanTest is what caught it).
+            # Without it, the start-time range is the only index the
+            # statement can use, on either backend.
+            rows = [
+                row for row in conn.execute(
+                    "SELECT id, environment FROM runs "
+                    "WHERE start_time >= ? AND start_time < ? "
+                    "AND stream_id = ?",
+                    (model.format_iso(begins), model.format_iso(ends),
+                     stream_id),
+                ).fetchall()
+                if row[1] == environment
+            ]
+            if len(rows) != expected[hour]:
+                raise DerivedTablesDisagree(
+                    "activity_hours records {0} run(s) for stream {1} on "
+                    "{2!r} in hour {3}, but runs holds {4}".format(
+                        expected[hour], stream_id, environment, hour,
+                        len(rows)))
+            found.extend(int(row[0]) for row in rows)
+        known = set(found)
+        for row in conn.execute(
+            "SELECT run_id, script, test_name FROM latest_runs "
+            "WHERE stream_id = ? AND environment = ?",
+            (stream_id, environment),
+        ).fetchall():
+            if int(row[0]) not in known:
+                raise DerivedTablesDisagree(
+                    "latest_runs points at run {0} for {1!r} / {2!r} / "
+                    "{3!r} on stream {4}, which activity_hours does not "
+                    "account for".format(
+                        int(row[0]), environment, row[1], row[2],
+                        stream_id))
+        return found
+
+    def _settle_stream_after_delete(
+        self, conn: sqlite3.Connection, stream_id: int,
+    ) -> int:
+        """Leave *stream_id* truthful after part of it was deleted:
+        remove the row if nothing is left (returns 1), else re-derive
+        ``first_seen``/``last_seen`` from what remains (returns 0).
+
+        Both bounds are start times (:meth:`upsert_runs` widens them
+        from each record's start). The newest is the newest
+        ``latest_runs`` start; the oldest lies in the stream's earliest
+        active hour, which is read through the same index the delete
+        itself uses.
+        """
+        newest = conn.execute(
+            "SELECT MAX(start_time) FROM latest_runs WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0]
+        if newest is None:
+            self._clear_stream_origin_tags(conn, stream_id)
+            cursor = conn.execute(
+                "DELETE FROM streams WHERE id = ?", (stream_id,))
+            return int(cursor.rowcount)
+        oldest = None  # type: Optional[str]
+        hour = conn.execute(
+            "SELECT MIN(hour) FROM activity_hours WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0]
+        if hour is not None:
+            begins = model.parse_iso(hour + ":00:00.000000")
+            ends = begins + datetime.timedelta(hours=1)
+            oldest = conn.execute(
+                "SELECT MIN(start_time) FROM runs WHERE start_time >= ? "
+                "AND start_time < ? AND stream_id = ?",
+                (model.format_iso(begins), model.format_iso(ends),
+                 stream_id),
+            ).fetchone()[0]
+        if oldest is None:
+            oldest = newest
+        conn.execute(
+            "UPDATE streams SET first_seen = ?, last_seen = ? "
+            "WHERE id = ?",
+            (oldest, newest, stream_id),
+        )
+        return 0
 
     def assignments_referencing_stream(self, stream_id: int) -> int:
         """How many CURRENT assignments carry *stream_id* as their origin,
