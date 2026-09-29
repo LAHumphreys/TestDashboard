@@ -1,6 +1,6 @@
 # CI for testboard.
 #
-# Four jobs:
+# Six jobs:
 #   - modern:          proves the suite runs warning-clean on current Pythons (dev machines).
 #   - python36-rhel8:  THE AUTHORITATIVE GATE. Runs inside Red Hat's ubi8/python-36
 #                      container — the exact RHEL 8 platform Python (3.6.8) the
@@ -23,6 +23,13 @@
 #                      clients/feeder.tcl actually RUNS end to end, on top of
 #                      the static 8.5-construct guard (tests/test_tcl_compat.py)
 #                      that runs unconditionally in every job.
+#   - java-feeder:     an ordinary ubuntu runner plus a JDK (WP-30). Same
+#                      gating pattern again: tests/test_feeder_java_conformance.py
+#                      exists only when javac/java are on PATH. Compiles
+#                      clients/FeederMicro.java fresh (there is no other
+#                      compile check for it — it ships outside the
+#                      Python-3.6 static gates) and drives it as a subprocess
+#                      against real and stub dashboard servers.
 name: CI
 
 on:
@@ -179,4 +186,29 @@ jobs:
           python --version
           echo 'puts [info patchlevel]' | tclsh
       - name: Run test suite (Tcl conformance variants active)
+        run: python -m unittest discover -v
+
+  java-feeder:
+    # clients/FeederMicro.java has no build step and no test framework
+    # of its own (JDK-only, no jars) - tests/test_feeder_java_conformance.py
+    # compiles it fresh and drives it as a subprocess, the same pattern
+    # tcl-conformance uses for clients/feeder.tcl. A plain ubuntu runner
+    # plus setup-java is enough; the file targets no particular RHEL 8
+    # constraint the way the dashboard's own Python code does.
+    name: JDK 17 (Java feeder client conformance)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Show interpreter/JDK versions
+        run: |
+          python --version
+          javac -version
+      - name: Run test suite (Java feeder conformance active)
         run: python -m unittest discover -v
