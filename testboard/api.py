@@ -1350,6 +1350,28 @@ def _products_summary(
     ]
 
 
+def _handle_products(storage: Storage) -> Response:
+    """GET /api/products — the declared products, by name (WP-36).
+
+    ``{"products": [{"product": <name>}, ...]}``, sorted; an empty list
+    when none is declared. One read of ``environment_products``.
+
+    For the product switcher and the Watch page's picker on the pages
+    that have no summary of their own to take the list from (Time,
+    Timeline, Watch, the test and script pages). They were fetching
+    ``/api/summary?parts=headline`` for it — every headline number of
+    the whole estate, computed and sent, to read the names out of one
+    field. The entries are objects, not bare strings, so they are the
+    same shape ``/api/summary``'s ``products`` has and the same code
+    reads both.
+    """
+    return _json_response(200, {
+        "products": [
+            {"product": name} for name in storage.distinct_products()
+        ],
+    })
+
+
 def _handle_summary(
     storage: Storage,
     request: Request,
@@ -2467,7 +2489,12 @@ def _handle_timeline(
             environment = product_environments[0]
     if not environment:
         raise _HttpError(400, "environment: required parameter is missing")
-    if environment not in storage.known_environments():
+    # WP-36: three seeks for one name. It was `environment not in
+    # storage.known_environments()` -- the whole list, a scan of every
+    # stream's latest_runs, to look one name up in it; measured at 6-12
+    # ms of this request (WP-32 addendum), which a page with Follow on
+    # repeats every ten seconds for as long as it is open.
+    if not storage.environment_exists(environment):
         raise _HttpError(
             404,
             "unknown environment: no runs recorded for {}".format(
@@ -3277,6 +3304,11 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
     in its URL (urls.js carries scope by default) and ignored it; a 4xx
     here would turn links that work today into pages that cannot load.
 
+    ``counts=0`` (WP-36), without ``category``, returns the two
+    identities and the environment list with ``counts: null`` and runs
+    no comparison at all. Any other value, or any request naming a
+    category, is answered in full as before.
+
     Each row of a ``category`` page carries ``stream_comment`` (WP-35):
     the newest comment posted FROM ``stream``, or null. It is read in
     the page query's own select list, for the rows returned and no
@@ -3352,6 +3384,29 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
     # WP-33. An empty value is "no filter", the same reading every
     # other optional filter here gives it.
     environment = _query_single(request.query, "environment") or None
+
+    # WP-36: `counts=0` asks who is being compared with whom and
+    # nothing else -- a build's page needs both names before it can
+    # draw its header, on whichever tab it opens, and was paying for a
+    # whole comparison to get them.
+    if (_query_single(request.query, "counts") == "0"
+            and category is None):
+        return _json_response(
+            200,
+            {
+                "stream": _stream_json(stream),
+                "baseline": _stream_json(baseline),
+                "environment": environment,
+                "environments": storage.environments_for_product(
+                    stream.product),
+                "counts": None,
+                "category": None,
+                "tests": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
 
     counts = storage.compare_counts(
         stream_id, baseline_id=baseline_id, environment=environment)
@@ -3657,6 +3712,12 @@ def _handle_watch(
     pass_view = _pass_view(storage, now_value)
     all_passes = pass_view.passes
     estate_cutoff = pass_view.cutoff.when
+    # WP-36: the rollup FIRST. It is one pass over mainline's partition
+    # and keeps each environment's newest start as it goes, so the
+    # "last reported" read a few lines down is answered from it rather
+    # than by a second pass of its own. Read again by name further
+    # down, from the memo.
+    storage.summary_rollup(estate_cutoff)
     known_environments = set(storage.known_environments())
     env_to_product = storage.environment_products_map()
     product_to_envs = {}  # type: Dict[str, List[str]]
@@ -4091,6 +4152,10 @@ def _route(
     if rest == ["summary"]:
         _check_method(request.method, ("GET",))
         return _handle_summary(storage, request, now)
+
+    if rest == ["products"]:
+        _check_method(request.method, ("GET",))
+        return _handle_products(storage)
 
     if rest == ["time"]:
         _check_method(request.method, ("GET",))

@@ -2145,6 +2145,85 @@ class BuildCommentTest(unittest.TestCase):
             self.assertIn(level + ": null", body)
 
 
+class AskForLessTest(unittest.TestCase):
+    """WP-36: pages that were asking the server for far more than they
+    read. Each of these still WORKS if it is reverted -- it is just
+    slow again, on every page load, for everyone -- so each is pinned
+    the way SummaryPartsFetchTest pins the split it guards."""
+
+    def test_the_product_list_is_fetched_as_a_product_list(self) -> None:
+        for name in ("products.js", "watch.js"):
+            code = _strip_comments(read(name))
+            self.assertIn("fetchProducts()", code, name)
+            self.assertNotIn("api/summary", code, name)
+
+    def test_it_falls_back_for_a_server_not_yet_restarted(self) -> None:
+        """Static files are read from disk per request; Python is not.
+        This script can arrive before the endpoint it asks for."""
+        body = _strip_comments(_function_body(
+            read("api.js"), "export async function fetchProducts("))
+        first = body.index('"api/products"')
+        caught = body.index("catch", first)
+        self.assertIn(
+            '"api/summary?parts=headline"', body[caught:])
+        self.assertEqual(body.count("fetchJson("), 2)
+
+    def test_importing_the_helper_has_no_side_effects(self) -> None:
+        """It lives in api.js, not products.js: importing products.js
+        adopts ?product= from the address bar, which the Watch page --
+        whose URL is its own grammar -- must not start doing."""
+        self.assertNotIn(
+            "products.js", _strip_comments(read("watch.js")))
+        self.assertNotIn(
+            "function fetchProducts", _strip_comments(read("products.js")))
+
+    def test_a_builds_page_asks_who_before_it_asks_how_many(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "async function initBranchDashboard("))
+        self.assertIn("fetchCompareIdentity(", body)
+        self.assertNotIn("fetchCompare(", body)
+        identity = _strip_comments(_function_body(
+            read("compare.js"),
+            "export async function fetchCompareIdentity("))
+        self.assertIn('counts: "0"', identity)
+        self.assertIn("stream: streamId", identity)
+        self.assertIn("baseline:", identity)
+
+    def test_its_own_results_never_runs_a_comparison(self) -> None:
+        code = _strip_comments(read("app.js"))
+        self.assertNotIn("fetchCompare(", code)
+        body = _function_body(code, "function activateOwnResultsTab(")
+        self.assertNotIn("initDeltaView(", body)
+
+    def test_the_difference_tab_opens_on_one_request(self) -> None:
+        """The header and the first page of rows come from the same
+        answer. Asked separately, the comparison behind the counts ran
+        twice, in sequence, before a row was shown."""
+        body = _strip_comments(_function_body(
+            read("compare.js"), "export async function initDeltaView("))
+        first = body[body.index("fetchCompare("):]
+        first = first[:first.index(");")]
+        self.assertIn("deltaState.category", first)
+        self.assertNotIn("null, 0", first)
+        self.assertIn("loadCategory(true, data)", body)
+        load = _strip_comments(_function_body(
+            read("compare.js"), "async function loadCategory("))
+        self.assertIn("fetched || await fetchCompare(", load)
+
+    def test_later_pages_and_tabs_still_fetch_their_own(self) -> None:
+        code = _strip_comments(read("compare.js"))
+        self.assertIn("loadCategory(false)", code)
+        tabs = _function_body(code, "function renderTabs(")
+        self.assertIn("loadCategory(true)", tabs)
+        self.assertNotIn("loadCategory(true, ", tabs)
+
+    def test_the_difference_tab_runs_it_once_itself(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "export async function initDeltaView("))
+        self.assertEqual(body.count("fetchCompare("), 1)
+        self.assertNotIn("fetchCompareIdentity(", body)
+
+
 class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     """PART A of a follow-up link-matrix audit (after the F1-F7
     usability sweep): three more test.html links that only became

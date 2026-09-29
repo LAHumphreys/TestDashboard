@@ -19,6 +19,7 @@ import {
   clearNode,
   el,
   fetchJson,
+  fetchProducts,
   formatTime,
   showError,
 } from "./api.js";
@@ -632,8 +633,9 @@ async function populatePicker() {
   const nameSelect = document.getElementById("add-name");
   let entries = { p: [], e: [], s: [] };
   try {
+    // WP-36: the product NAMES are all this reads from it.
     const [summary, environments] = await Promise.all([
-      fetchJson("api/summary?parts=headline"),
+      fetchProducts(),
       fetchJson("api/environments"),
     ]);
     const productNames = summary.products.map((entry) => entry.product);

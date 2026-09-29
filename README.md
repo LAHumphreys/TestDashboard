@@ -268,6 +268,17 @@ filter control offers). An `environment` that is not one of them is not an
 error: it matches nothing, every count is zero, and the echo plus the list let
 the caller say why.
 
+`counts=0` (WP-36), on a request with no `category=`, returns the two
+identities and the environment list with `counts: null` and runs no comparison
+— what a build's page asks before it draws its header. Any other value, and
+any request naming a category, is answered in full.
+
+`GET /api/products` (WP-36) is the declared products by name,
+`{"products": [{"product": "Atlas"}, ...]}`, sorted, from one read of the
+declarations and no read of any test result. It exists for pages that want the
+product list and nothing else; `/api/summary`'s own `products` field is
+unchanged and carries the same names with their counts.
+
 `GET /api/streams/<id>/environments` (WP-34) reports what one stream holds, per
 environment: `{stream, deletable, environments: [{environment, tests, runs,
 last_run}]}`. It is read from the stream's own partitions of the derived

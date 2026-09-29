@@ -3310,6 +3310,16 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
+        # WP-36: mainline's partition has usually just been walked for
+        # the rollup; the environments in it are that pass's own keys.
+        shared = self._any_partition_rollup(MAINLINE_STREAM_ID)
+        if shared is not None:
+            allowed = None if environments is None else set(environments)
+            derived = sorted(
+                name for name in shared[1]
+                if allowed is None or name in allowed)
+            self._store_summary(key, derived)
+            return derived
         clause, clause_params = self._environments_clause(
             environments, column="environment"
         )
@@ -3433,43 +3443,75 @@ class Storage:
         ``summary_rollup`` call (see ``_handle_watch``), so the two
         endpoints share one cache entry on the common unscoped load.
         """
-        envs_key = (
-            None if environments is None else tuple(sorted(environments))
-        )
-        key = (
-            "summary_rollup", recent_cutoff, environment, envs_key,
-            stream_id,
-        )
+        # WP-36: every scope of one stream at one cutoff is a FILTER of
+        # the same few dozen cells, because the cells are grouped by
+        # environment. See _partition_rollup for what that saves.
+        cells, _latest = self._partition_rollup(stream_id, recent_cutoff)
+        allowed = None if environments is None else set(environments)
+        return [
+            cell for cell in cells
+            if (environment is None or cell.environment == environment)
+            and (allowed is None or cell.environment in allowed)
+        ]
+
+    def _partition_rollup(
+        self, stream_id: int, recent_cutoff: datetime.datetime,
+    ) -> Tuple[List[RollupCount], Dict[str, datetime.datetime]]:
+        """ONE grouped read of a stream's whole ``latest_runs``
+        partition, and everything a summary needs from it (WP-36).
+
+        Returns the rollup cells for EVERY environment of the stream,
+        and each environment's newest start time. Memoized per
+        ``(stream, cutoff)``.
+
+        Why it exists. A cold ``/api/summary?parts=headline`` read
+        mainline's partition five separate times — the rollup, the
+        queue counts, the per-environment "last reported", and twice
+        more for the product switcher and the environment list — each a
+        full pass for an answer the others had already walked past.
+        Measured on the dev-scale estate (24,854 mainline tests): 77 ms
+        cold, 76 of them in those statements. It was also cold far more
+        often than when it was written: the site now pushes results
+        DURING a run, and any import that changes a row clears every
+        memo here, so for the hours a run lasts nothing is served from
+        one.
+
+        What shares it:
+
+        - :meth:`summary_rollup`, for any ``environment``/
+          ``environments`` scope — a filter of these cells;
+        - :meth:`queue_counts`, whose five result-shaped queues are sums
+          over the same cells;
+        - :meth:`latest_run_time_by_environment`, from the second
+          return value;
+        - the product switcher's estate-wide counts, which a scoped
+          request used to fetch as a second rollup of its own.
+
+        The pass is over the whole partition even when the request
+        names one environment. That costs a single-environment request
+        more than its own scoped query did — and saves it the
+        estate-wide rollup every summary ran as well, for the product
+        list, scoped or not.
+        """
+        key = ("partition_rollup", recent_cutoff, stream_id)
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
-        sql = (
+        rows = self._conn().execute(
             "SELECT lr.environment, lr.result, lr.prev_result, "
             "CASE WHEN lr.start_time >= ? THEN 1 ELSE 0 END AS recent, "
             "CASE WHEN tr.retired_at IS NULL THEN 0 ELSE 1 END AS retired, "
-            "COUNT(*) "
+            "COUNT(*), MAX(lr.start_time) "
             "FROM latest_runs AS lr "
             "LEFT JOIN test_retirements AS tr "
             "  ON tr.environment = lr.environment "
-            " AND tr.script = lr.script AND tr.test_name = lr.test_name"
-        )
-        params = [model.format_iso(recent_cutoff)]  # type: List[Any]
-        where = ["lr.stream_id = ?"]  # type: List[str]
-        params.append(stream_id)
-        if environment is not None:
-            where.append("lr.environment = ?")
-            params.append(environment)
-        envs_clause, envs_params = self._environments_clause(environments)
-        if envs_clause is not None:
-            where.append(envs_clause)
-            params.extend(envs_params)
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += (
-            " GROUP BY lr.environment, lr.result, lr.prev_result, recent, "
-            "retired ORDER BY lr.environment, lr.result"
-        )
-        result = [
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE lr.stream_id = ? "
+            "GROUP BY lr.environment, lr.result, lr.prev_result, recent, "
+            "retired ORDER BY lr.environment, lr.result",
+            (model.format_iso(recent_cutoff), stream_id),
+        ).fetchall()
+        cells = [
             RollupCount(
                 environment=row[0],
                 result=Result(row[1]),
@@ -3478,10 +3520,36 @@ class Storage:
                 retired=bool(row[4]),
                 count=int(row[5]),
             )
-            for row in self._conn().execute(sql, params).fetchall()
+            for row in rows
         ]
+        latest = {}  # type: Dict[str, datetime.datetime]
+        for row in rows:
+            if row[6] is None:
+                continue
+            when = model.parse_iso(row[6])
+            if row[0] not in latest or when > latest[row[0]]:
+                latest[row[0]] = when
+        result = (cells, latest)
         self._store_summary(key, result)
         return result
+
+    def _any_partition_rollup(
+        self, stream_id: int,
+    ) -> Optional[Tuple[List[RollupCount], Dict[str, datetime.datetime]]]:
+        """A memoized :meth:`_partition_rollup` of *stream_id* at ANY
+        cutoff, or None — for callers whose answer does not depend on
+        the cutoff (an environment's newest start time is the same
+        whichever window the cells were counted for). Never computes
+        one: a caller with no cutoff has no business choosing it.
+        """
+        now = time.time()
+        with self._summary_lock:
+            for key, entry in self._summary_cache.items():
+                if (len(key) == 3 and key[0] == "partition_rollup"
+                        and key[2] == stream_id
+                        and now - entry[0] <= _TREND_CACHE_TTL_SECONDS):
+                    return entry[1]
+        return None
 
     def assigned_open_count(
         self,
@@ -5109,6 +5177,18 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
+        # WP-36: a summary has usually just walked this partition for
+        # its rollup, and kept each environment's newest start as it
+        # went (retired tests included there too, flagged not dropped).
+        shared = self._any_partition_rollup(stream_id)
+        if shared is not None:
+            allowed = None if environments is None else set(environments)
+            derived = {
+                name: when for name, when in shared[1].items()
+                if allowed is None or name in allowed
+            }
+            self._store_summary(key, derived)
+            return derived
         clause, clause_params = self._environments_clause(
             environments, column="environment"
         )
@@ -5209,9 +5289,20 @@ class Storage:
         every test in the estate quietly going stale. *stream_id*
         (WP-23, default mainline) — see
         :meth:`latest_run_time_by_environment`.
+
+        Read from ``latest_runs`` (WP-36), where it is the high end of
+        ``idx_latest_runs_start_time`` for the stream: one seek. It was
+        ``MAX(start_time) FROM runs WHERE stream_id = ?``, and ``runs``
+        has no index that leads with the stream — the planner walked
+        ``idx_runs_start_time_result`` backwards from the newest run on
+        record until it met one of this stream's. Instant for whichever
+        stream ran last; for a build that last ran two months ago, a
+        walk through two months of everyone else's runs. The two agree
+        by construction: a test's ``latest_runs`` row IS its newest
+        run, so the newest of those is the stream's newest.
         """
         row = self._conn().execute(
-            "SELECT MAX(start_time) FROM runs WHERE stream_id = ?",
+            "SELECT MAX(start_time) FROM latest_runs WHERE stream_id = ?",
             (stream_id,),
         ).fetchone()
         if row is None or row[0] is None:
@@ -5584,49 +5675,62 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
-        # not_run's predicate carries the one parameterised placeholder
-        # among QUEUE_KINDS (`lr.start_time < ?`) -- its bind value is
-        # appended in the same left-to-right order the columns
-        # themselves are built in, so select_params ends up matching
-        # the SELECT-list's ?s positionally.
-        select_params = []  # type: List[Any]
-        ordered_columns = []  # type: List[str]
-        for kind in QUEUE_KINDS:
-            ordered_columns.append(
-                "SUM(CASE WHEN {} THEN 1 ELSE 0 END)".format(
-                    _QUEUE_PREDICATES[kind]))
-            if kind in _STALE_QUEUES:
-                select_params.append(model.format_iso(stale_before))
-        include_mine = bool(assignee)
-        if include_mine:
-            ordered_columns.append(
-                "SUM(CASE WHEN {} AND ca.assignee = ? "
-                "THEN 1 ELSE 0 END)".format(_QUEUE_PREDICATES["assigned"])
-            )
-            select_params.append(assignee)
+        # WP-36. The five result-shaped queues are sums over the rollup
+        # cells the same summary has already computed (same stream,
+        # same cutoff, same scope) -- each predicate below is
+        # _QUEUE_PREDICATES' own, restated over a cell's fields, and
+        # QueueCountsTest pins both against status_queue_count, which
+        # still runs the SQL. `not_run` is `start_time < stale_before`;
+        # a cell's `recent` is `start_time >= recent_cutoff`; the two
+        # are one test when the cutoffs are one value, which is how
+        # every caller has always passed them.
+        fail = Result.FAIL
+        counts = {kind: 0 for kind in QUEUE_KINDS}
+        for cell in self.summary_rollup(
+                stale_before, environment, environments=environments,
+                stream_id=stream_id):
+            if cell.retired:
+                continue
+            if cell.result == fail and cell.prev_result != fail:
+                counts["new_failures"] += cell.count
+            if cell.result == fail and cell.prev_result == fail:
+                counts["still_failing"] += cell.count
+            if cell.prev_result == fail and cell.result != fail:
+                counts["fixed"] += cell.count
+            if cell.result == Result.UNEXPECTED_PASS:
+                counts["unexpected_passes"] += cell.count
+            if not cell.recent:
+                counts["not_run"] += cell.count
+        # `assigned` and `mine` are the two that read who owns a test,
+        # which no cell carries. Driven FROM current_assignments -- a
+        # row per assigned test, a handful against the partition's
+        # thousands -- with latest_runs reached by its primary key.
+        # As a SUM(CASE) column of the old single statement it made
+        # that statement a pass over the whole partition.
         sql = (
-            "SELECT " + ", ".join(ordered_columns) + " "
-            + self._LATEST_COUNT_JOIN
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN ca.assignee = ? THEN 1 ELSE 0 END) "
+            "FROM current_assignments AS ca "
+            "JOIN latest_runs AS lr "
+            "  ON lr.stream_id = ? AND lr.environment = ca.environment "
+            " AND lr.script = ca.script AND lr.test_name = ca.test_name "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE " + _QUEUE_PREDICATES["assigned"]
+            + " AND " + self._NOT_RETIRED
         )
-        where = ["lr.stream_id = ?", self._NOT_RETIRED]
-        where_params = [stream_id]  # type: List[Any]
+        params = [assignee or "", stream_id]  # type: List[Any]
         if environment is not None:
-            where.append("lr.environment = ?")
-            where_params.append(environment)
+            sql += " AND lr.environment = ?"
+            params.append(environment)
         envs_clause, envs_params = self._environments_clause(environments)
         if envs_clause is not None:
-            where.append(envs_clause)
-            where_params.extend(envs_params)
-        sql += " WHERE " + " AND ".join(where)
-        row = self._conn().execute(
-            sql, select_params + where_params
-        ).fetchone()
-        counts = {
-            kind: int(row[i] or 0) for i, kind in enumerate(QUEUE_KINDS)
-        }
-        counts["mine"] = (
-            int(row[len(QUEUE_KINDS)] or 0) if include_mine else 0
-        )
+            sql += " AND " + envs_clause
+            params.extend(envs_params)
+        row = self._conn().execute(sql, params).fetchone()
+        counts["assigned"] = int(row[0] or 0)
+        counts["mine"] = int(row[1] or 0) if assignee else 0
         self._store_summary(key, counts)
         return counts
 

@@ -48,6 +48,25 @@ export async function fetchJson(url, opts) {
   return data;
 }
 
+/**
+ * The declared products, for a page with no summary of its own to read
+ * them from (WP-36). `/api/products` is the names and nothing else;
+ * this used to fetch `/api/summary?parts=headline` -- every headline
+ * number of the whole estate -- to read one field of it.
+ *
+ * The fallback is for a server that has not been restarted onto this
+ * drop: static files are read from disk per request, Python is not, so
+ * this script can arrive before the endpoint it asks for. Falling back
+ * costs that one deployment mistake what every page load cost before.
+ */
+export async function fetchProducts() {
+  try {
+    return await fetchJson("api/products");
+  } catch (err) {
+    return fetchJson("api/summary?parts=headline");
+  }
+}
+
 /** POST a JSON body and parse the JSON response (see fetchJson for errors). */
 export function postJson(url, body) {
   return fetchJson(url, {

@@ -2919,19 +2919,358 @@ class TestQueueCounts(EstateTestBase):
         with self.assertRaises(ValueError):
             self.store.queue_counts()
 
-    def test_one_query_regardless_of_assignee(self) -> None:
-        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+    def _selects(self, call: Callable[[], Any]) -> List[str]:
         seen = []  # type: List[str]
         conn = self.store._conn()
         trace_sql_into(conn, seen)
         try:
-            self.store.queue_counts(assignee="alice", stale_before=cutoff)
+            call()
         finally:
             conn.set_trace_callback(None)
-        selects = [
-            s for s in seen if s.strip().upper().startswith("SELECT")
-        ]
-        self.assertEqual(len(selects), 1, selects)
+        return [s for s in seen if s.strip().upper().startswith("SELECT")]
+
+    def test_one_query_regardless_of_assignee(self) -> None:
+        """WIDENED for WP-36, not weakened. What this pins is that the
+        queue totals cost a fixed number of statements -- it replaced
+        one per queue kind, twice over -- and never one that grows with
+        the kinds or with whether an assignee was named.
+
+        The number it pins has changed meaning. It was "one statement":
+        a pass over the whole partition with every kind as a SUM(CASE).
+        It is now one statement the summary does not already run -- the
+        ownership count, driven from current_assignments -- plus the
+        rollup pass the same summary has always run and memoizes. So:
+        one SELECT once that rollup is in hand, which is how the
+        handler calls it; two at most from nothing; the same number
+        with or without an assignee; and the one that is this method's
+        own must not be a pass over latest_runs.
+        """
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        cold = self._selects(lambda: self.store.queue_counts(
+            assignee="alice", stale_before=cutoff))
+        self.assertEqual(len(cold), 2, cold)
+        self.store._invalidate_summary_cache()
+        anonymous = self._selects(lambda: self.store.queue_counts(
+            stale_before=cutoff))
+        self.assertEqual(len(anonymous), len(cold))
+
+        self.store._invalidate_summary_cache()
+        self.store.summary_rollup(cutoff)
+        within = self._selects(lambda: self.store.queue_counts(
+            assignee="alice", stale_before=cutoff))
+        self.assertEqual(len(within), 1, within)
+        own = " ".join(within[0].split()).upper()
+        self.assertIn("FROM CURRENT_ASSIGNMENTS AS CA JOIN LATEST_RUNS", own)
+        self.assertEqual(
+            self._selects(lambda: self.store.queue_counts(
+                assignee="alice", stale_before=cutoff)), [])
+
+    def test_the_ownership_count_reaches_latest_runs_by_its_key(
+            self) -> None:
+        """The reason that statement is not a pass: it starts from the
+        handful of assigned tests. SQLite's planner, SQLite's words --
+        excluded from the MariaDB variants by name."""
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        self.store.summary_rollup(cutoff)
+        statement = self._selects(lambda: self.store.queue_counts(
+            assignee="alice", stale_before=cutoff))[0]
+        plan = [
+            str(row[-1]).upper() for row in self.store._conn().execute(
+                "EXPLAIN QUERY PLAN " + statement).fetchall()]
+        latest = [line for line in plan if "LATEST_RUNS" in line
+                  or " LR " in line + " " or " AS LR" in line]
+        self.assertTrue(latest, plan)
+        for line in latest:
+            self.assertTrue(line.startswith("SEARCH"), plan)
+
+    def test_every_kind_still_agrees_with_its_own_query(self) -> None:
+        """The five result-shaped kinds are now sums over rollup cells,
+        each predicate restated in Python. status_queue_count still
+        runs _QUEUE_PREDICATES as SQL, so it is the oracle: every kind,
+        every scope this class seeds, with and without an assignee."""
+        cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
+        scopes = [
+            {}, {"environment": "win-sim"}, {"environment": "linux-sim"},
+            {"environments": ["win-sim"]},
+            {"environments": ["linux-sim", "win-sim"]},
+            {"environments": []}, {"environment": "does-not-exist"},
+        ]  # type: List[Dict[str, Any]]
+        for scope in scopes:
+            for assignee in (None, "alice", "nobody"):
+                self.store._invalidate_summary_cache()
+                counts = self.store.queue_counts(
+                    assignee=assignee, stale_before=cutoff, **scope)
+                for kind in storage.QUEUE_KINDS:
+                    self.assertEqual(
+                        counts[kind],
+                        self.store.status_queue_count(
+                            kind, stale_before=cutoff, **scope),
+                        (kind, scope, assignee))
+                mine = 0
+                if assignee:
+                    mine = self.store.status_queue_count(
+                        "assigned", stale_before=cutoff,
+                        assignee=assignee, **scope)
+                self.assertEqual(
+                    counts["mine"], mine, (scope, assignee))
+
+
+class PartitionRollupTest(StorageTestBase):
+    """WP-36: one grouped read of a stream's partition of latest_runs,
+    and every scope of a summary a filter of it.
+
+    The oracle throughout is SQL that does not go through the shared
+    pass: written out here, scoped in its own WHERE clause, so a filter
+    that dropped or leaked an environment disagrees with it.
+    """
+
+    CUTOFF = BASE + datetime.timedelta(hours=12)
+
+    def setUp(self) -> None:
+        super().setUp()
+        day = datetime.timedelta(days=1)
+        records = []
+        for environment, count in (("linux-sim", 5), ("win-sim", 3),
+                                   ("mac-sim", 2)):
+            for index in range(count):
+                name = "test_{}".format(index)
+                records.append(make_record(
+                    environment=environment, test_name=name,
+                    result=Result.FAIL if index % 2 else Result.PASS,
+                    start=BASE))
+                if index % 3 == 0:
+                    records.append(make_record(
+                        environment=environment, test_name=name,
+                        result=Result.FAIL if index % 2 == 0
+                        else Result.PASS,
+                        start=BASE + day + datetime.timedelta(
+                            seconds=index)))
+        records.append(make_record(
+            environment="linux-sim", test_name="test_0",
+            result=Result.FAIL, build="feat/x",
+            start=BASE + 2 * day))
+        self.store.upsert_runs(records)
+        self.store.set_retired(
+            "win-sim", "suite.py", "test_1", True, "amy", "gone", CREATED)
+        self.stream_id = self.store.list_streams("")[0].stream_id
+
+    def _oracle(self, stream_id: int,
+                environments: Optional[List[str]]) -> List[Tuple[Any, ...]]:
+        sql = (
+            "SELECT lr.environment, lr.result, lr.prev_result, "
+            "CASE WHEN lr.start_time >= ? THEN 1 ELSE 0 END, "
+            "CASE WHEN tr.retired_at IS NULL THEN 0 ELSE 1 END, COUNT(*) "
+            "FROM latest_runs lr LEFT JOIN test_retirements tr "
+            "ON tr.environment = lr.environment AND tr.script = lr.script "
+            "AND tr.test_name = lr.test_name WHERE lr.stream_id = ?")
+        params = [model.format_iso(self.CUTOFF), stream_id]  # type: List[Any]
+        if environments is not None:
+            if not environments:
+                return []
+            sql += " AND lr.environment IN ({})".format(
+                ", ".join("?" for _ in environments))
+            params.extend(environments)
+        sql += " GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2"
+        return [
+            (row[0], row[1], row[2], bool(row[3]), bool(row[4]),
+             int(row[5]))
+            for row in self.store._conn().execute(sql, params).fetchall()]
+
+    @staticmethod
+    def _ordered(rows: List[Tuple[Any, ...]]) -> List[Tuple[Any, ...]]:
+        return sorted(rows, key=repr)
+
+    @staticmethod
+    def _cells(rows: List[storage.RollupCount]) -> List[Tuple[Any, ...]]:
+        return sorted((
+            (row.environment, row.result.value,
+             None if row.prev_result is None else row.prev_result.value,
+             row.recent, row.retired, row.count)
+            for row in rows), key=repr)
+
+    def _selects(self, call: Callable[[], Any]) -> int:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            call()
+        finally:
+            conn.set_trace_callback(None)
+        return len([
+            s for s in seen if s.strip().upper().startswith("SELECT")])
+
+    def test_every_scope_is_what_its_own_query_would_return(self) -> None:
+        for stream_id in (storage.MAINLINE_STREAM_ID, self.stream_id):
+            for environments in (None, ["win-sim"], ["linux-sim"],
+                                 ["linux-sim", "mac-sim"], [],
+                                 ["no-such-environment"]):
+                self.assertEqual(
+                    self._cells(self.store.summary_rollup(
+                        self.CUTOFF, environments=environments,
+                        stream_id=stream_id)),
+                    self._ordered(self._oracle(stream_id, environments)),
+                    (stream_id, environments))
+            for environment in ("win-sim", "no-such-environment"):
+                self.assertEqual(
+                    self._cells(self.store.summary_rollup(
+                        self.CUTOFF, environment=environment,
+                        stream_id=stream_id)),
+                    self._ordered(self._oracle(stream_id, [environment])),
+                    (stream_id, environment))
+
+    def test_the_two_filters_combine_by_and(self) -> None:
+        self.assertEqual(
+            self.store.summary_rollup(
+                self.CUTOFF, environment="win-sim",
+                environments=["linux-sim"]), [])
+        self.assertEqual(
+            self._cells(self.store.summary_rollup(
+                self.CUTOFF, environment="win-sim",
+                environments=["linux-sim", "win-sim"])),
+            self._ordered(self._oracle(
+                storage.MAINLINE_STREAM_ID, ["win-sim"])))
+
+    def test_the_order_every_caller_was_given_is_kept(self) -> None:
+        rows = self.store.summary_rollup(self.CUTOFF)
+        keys = [(row.environment, row.result.value) for row in rows]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_a_second_scope_costs_no_query(self) -> None:
+        self.assertEqual(
+            self._selects(lambda: self.store.summary_rollup(self.CUTOFF)),
+            1)
+        for call in (
+            lambda: self.store.summary_rollup(
+                self.CUTOFF, environment="win-sim"),
+            lambda: self.store.summary_rollup(
+                self.CUTOFF, environments=["linux-sim", "mac-sim"]),
+            lambda: self.store.latest_run_time_by_environment(),
+            lambda: self.store.latest_run_time_by_environment(
+                environments=["win-sim"]),
+        ):
+            self.assertEqual(self._selects(call), 0)
+
+    def test_another_stream_or_cutoff_is_its_own_pass(self) -> None:
+        """Shared within a partition and a window; never across."""
+        self.store.summary_rollup(self.CUTOFF)
+        self.assertEqual(self._selects(
+            lambda: self.store.summary_rollup(
+                self.CUTOFF, stream_id=self.stream_id)), 1)
+        self.assertEqual(self._selects(
+            lambda: self.store.summary_rollup(
+                self.CUTOFF + datetime.timedelta(seconds=1))), 1)
+
+    def test_a_write_discards_it(self) -> None:
+        before = self._cells(self.store.summary_rollup(self.CUTOFF))
+        self.store.upsert_runs([make_record(
+            environment="mac-sim", test_name="test_new",
+            result=Result.FAIL,
+            start=BASE + datetime.timedelta(days=3))])
+        after = self._cells(self.store.summary_rollup(self.CUTOFF))
+        self.assertNotEqual(after, before)
+        self.assertEqual(
+            after, self._ordered(
+                self._oracle(storage.MAINLINE_STREAM_ID, None)))
+        self.assertEqual(
+            self.store.latest_run_time_by_environment()["mac-sim"],
+            BASE + datetime.timedelta(days=3))
+
+    def test_last_reported_is_the_same_derived_or_queried(self) -> None:
+        for stream_id in (storage.MAINLINE_STREAM_ID, self.stream_id):
+            for environments in (None, ["win-sim"],
+                                 ["linux-sim", "mac-sim"], []):
+                self.store._invalidate_summary_cache()
+                queried = self.store.latest_run_time_by_environment(
+                    stream_id, environments=environments)
+                self.store._invalidate_summary_cache()
+                self.store.summary_rollup(
+                    self.CUTOFF, stream_id=stream_id)
+                derived = self.store.latest_run_time_by_environment(
+                    stream_id, environments=environments)
+                self.assertEqual(
+                    derived, queried, (stream_id, environments))
+
+    def test_last_reported_still_counts_a_retired_tests_run(self) -> None:
+        """It answers "when did we last hear from this environment" --
+        a question about the feeder, not the suite."""
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_1",
+            start=BASE + datetime.timedelta(hours=1))])
+        self.store.set_retired(
+            "win-sim", "suite.py", "test_1", True, "amy", "gone", CREATED)
+        newest = self.store._conn().execute(
+            "SELECT MAX(start_time) FROM latest_runs WHERE stream_id = 1 "
+            "AND environment = 'win-sim'").fetchone()[0]
+        self.store.summary_rollup(self.CUTOFF)
+        self.assertEqual(
+            self.store.latest_run_time_by_environment()["win-sim"],
+            model.parse_iso(newest))
+
+    def test_the_environment_list_is_the_same_derived_or_queried(
+            self) -> None:
+        """Mainline only, as it always was: the build's one run on
+        linux-sim must not change it, and an environment only a build
+        has reported must not appear in it."""
+        self.store.upsert_runs([make_record(
+            environment="build-only-rig", build="feat/x",
+            start=BASE + datetime.timedelta(days=4))])
+        for environments in (None, ["win-sim"], ["mac-sim", "linux-sim"],
+                             [], ["build-only-rig"]):
+            self.store._invalidate_summary_cache()
+            queried = self.store.environments(environments=environments)
+            self.store._invalidate_summary_cache()
+            self.store.summary_rollup(self.CUTOFF)
+            self.store.summary_rollup(
+                self.CUTOFF, stream_id=self.stream_id)
+            derived = self.store.environments(environments=environments)
+            self.assertEqual(derived, queried, environments)
+            self.assertNotIn("build-only-rig", derived)
+
+    def test_the_streams_clock_is_its_newest_run(self) -> None:
+        for stream_id in (storage.MAINLINE_STREAM_ID, self.stream_id):
+            newest = self.store._conn().execute(
+                "SELECT MAX(start_time) FROM runs WHERE stream_id = ?",
+                (stream_id,)).fetchone()[0]
+            self.assertEqual(
+                self.store.latest_run_time(stream_id),
+                model.parse_iso(newest))
+        self.assertIsNone(self.store.latest_run_time(999999))
+
+
+class StreamClockQueryPlanTest(StorageTestBase):
+    """WP-36: a stream's newest run is one index seek.
+
+    `runs` has no index that leads with stream_id, so asked there the
+    planner walks idx_runs_start_time_result back from the newest run
+    on record until it meets one of the stream's -- for a build that
+    last ran months ago, through months of everyone else's runs.
+    """
+
+    def _plan(self, sql: str) -> str:
+        return " | ".join(
+            str(row[-1]) for row in self.store._conn().execute(
+                "EXPLAIN QUERY PLAN " + sql, (2,)).fetchall()).upper()
+
+    def test_it_is_read_from_the_streams_own_index(self) -> None:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            self.store.latest_run_time(2)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(len(seen), 1, seen)
+        self.assertNotIn(" RUNS ", " " + seen[0].upper().replace(
+            "LATEST_RUNS", "") + " ")
+        plan = self._plan(
+            "SELECT MAX(start_time) FROM latest_runs WHERE stream_id = ?")
+        self.assertIn("SEARCH", plan)
+        self.assertIn("IDX_LATEST_RUNS_START", plan)
+
+    def test_the_old_statement_would_be_caught(self) -> None:
+        plan = self._plan(
+            "SELECT MAX(start_time) FROM runs WHERE stream_id = ?")
+        self.assertNotIn("STREAM_ID=?", plan)
 
 
 class TestFailureStreakBounds(StorageTestBase):

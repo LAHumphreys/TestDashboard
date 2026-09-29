@@ -5585,6 +5585,159 @@ class TestStreamsEndpoint(ApiCase):
         self.assertEqual(without, withempty)
 
 
+class TestPerformancePassEndpoints(ApiCase):
+    """WP-36: the two requests that exist so a page can ask for less,
+    and the one that stopped asking for a list to look up one name."""
+
+    BRANCH_TIMES = {
+        "start_time": "2026-07-25T03:00:00.000000",
+        "end_time": "2026-07-25T03:00:03.000000",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a"),
+            record(environment="win-sim", test_name="test_a"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def _traced(self, method: str, path: str,
+                query: Dict[str, List[str]]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        conn.set_trace_callback(lambda statement: seen.append(statement))
+        try:
+            self.call(method, path, query=query)
+        finally:
+            conn.set_trace_callback(None)
+        return seen
+
+    # -- /api/products ------------------------------------------------
+
+    def test_no_products_is_an_empty_list(self) -> None:
+        self.assertEqual(
+            self.call("GET", "/api/products"), {"products": []})
+
+    def test_products_are_listed_by_name_in_order(self) -> None:
+        for environment, product in (("win-sim", "Zephyr"),
+                                     ("linux-sim", "Atlas")):
+            self.call(
+                "PUT", "/api/environments/{}/product".format(environment),
+                body={"product": product, "username": "amy"})
+        data = self.call("GET", "/api/products")
+        self.assertEqual(
+            data, {"products": [{"product": "Atlas"},
+                                {"product": "Zephyr"}]})
+        summary = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        self.assertEqual(
+            [entry["product"] for entry in summary["products"]],
+            [entry["product"] for entry in data["products"]])
+
+    def test_the_product_list_reads_no_test_results(self) -> None:
+        """The point of it: a page that wants the names must not make
+        the server count the estate to get them."""
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        statements = self._traced("GET", "/api/products", {})
+        self.assertEqual(len(statements), 1, statements)
+        self.assertNotIn("latest_runs", statements[0])
+        self.assertNotIn(" runs", statements[0])
+
+    def test_products_accepts_get_only(self) -> None:
+        self.call("POST", "/api/products", body={}, expect=405)
+
+    # -- /api/compare?counts=0 ----------------------------------------
+
+    def test_identity_only_names_both_sides_and_counts_nothing(
+            self) -> None:
+        full = self.call(
+            "GET", "/api/compare", query={"stream": [str(self.stream_id)]})
+        lean = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)], "counts": ["0"]})
+        self.assertIsNone(lean["counts"])
+        self.assertEqual(lean["tests"], [])
+        for field in ("stream", "baseline", "environment",
+                      "environments", "category"):
+            self.assertEqual(lean[field], full[field], field)
+        self.assertEqual(full["counts"]["new_failures"], 1)
+
+    def test_identity_only_runs_no_comparison(self) -> None:
+        statements = self._traced(
+            "GET", "/api/compare",
+            {"stream": [str(self.stream_id)], "counts": ["0"]})
+        for statement in statements:
+            self.assertNotIn("UNION ALL", statement)
+            self.assertNotIn("new_failures", statement)
+
+    def test_identity_only_still_refuses_what_a_comparison_refuses(
+            self) -> None:
+        self.call(
+            "GET", "/api/compare", query={"counts": ["0"]}, expect=400)
+        self.call(
+            "GET", "/api/compare",
+            query={"stream": ["999999"], "counts": ["0"]}, expect=404)
+        self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)], "counts": ["0"],
+                   "baseline": ["999999"]}, expect=404)
+
+    def test_a_category_is_always_answered_in_full(self) -> None:
+        """counts=0 with a category would be a list without its total;
+        the parameter is ignored rather than half-obeyed."""
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)], "counts": ["0"],
+                   "category": ["new_failures"]})
+        self.assertEqual(data["counts"]["new_failures"], 1)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(len(data["tests"]), 1)
+
+    def test_any_other_value_is_the_full_answer(self) -> None:
+        for value in ("1", "", "false"):
+            data = self.call(
+                "GET", "/api/compare",
+                query={"stream": [str(self.stream_id)],
+                       "counts": [value]})
+            self.assertEqual(data["counts"]["new_failures"], 1, value)
+
+    # -- /api/timeline ------------------------------------------------
+
+    def test_the_timeline_checks_one_name_not_the_whole_list(
+            self) -> None:
+        statements = self._traced(
+            "GET", "/api/timeline", {"environment": ["linux-sim"]})
+        for statement in statements:
+            self.assertNotIn("UNION", statement.upper(), statement)
+
+    def test_an_unknown_environment_is_still_404(self) -> None:
+        error = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["no-such-rig"]}, expect=404)
+        self.assertIn("no-such-rig", error["error"])
+
+    def test_a_declared_but_silent_environment_is_still_known(
+            self) -> None:
+        """known_environments() counted an environment that carries a
+        declaration and has never run; so does environment_exists()."""
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        self.storage.set_environment_product(
+            "quiet-rig", "Atlas", "amy", fixed_now())
+        self.call(
+            "GET", "/api/timeline", query={"environment": ["quiet-rig"]})
+
+
 class TestBuildComments(ApiCase):
     """WP-35: /api/compare's per-row ``stream_comment`` and
     POST /api/comments/bulk."""

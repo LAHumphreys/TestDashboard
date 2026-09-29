@@ -63,7 +63,7 @@ import { attachSorting, sortRows } from "./sorting.js";
 import { mountSelectableTable } from "./selection.js";
 import { getSelectedProduct, renderSwitcher } from "./products.js";
 import {
-  fetchCompare,
+  fetchCompareIdentity,
   getSelectedBaselineId,
   getSelectedStreamId,
   initDeltaView,
@@ -1770,8 +1770,12 @@ async function initBranchDashboard(streamId) {
     // that decision is made rather than fetched afterwards -- a build-
     // scoped page therefore now pays this one extra counts-only request
     // it did not pay before (a branch-scoped page always did).
+    // WP-36: the IDENTITIES only. This used to be the whole
+    // comparison, run for the two names in it: thrown away unread on
+    // "Its own results", and run again by initDeltaView() on the
+    // other tab.
     const [compareData, headline] = await Promise.all([
-      fetchCompare(streamId, null, 0, getSelectedBaselineId()),
+      fetchCompareIdentity(streamId, getSelectedBaselineId()),
       fetchJson("api/summary?parts=headline&stream=" + streamId)
         .catch(() => null),
     ]);

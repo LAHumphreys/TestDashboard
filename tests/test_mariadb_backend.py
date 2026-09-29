@@ -49,6 +49,12 @@ EXCLUDED_CLASSES = {
         "EXPLAIN was checked by hand against the local mariadbd "
         "(eq_ref on the latest_runs PRIMARY KEY) — see the commit "
         "message; there is no equivalent automated pin for it here.",
+    "StreamClockQueryPlanTest":
+        "asserts EXPLAIN QUERY PLAN output (WP-36) — SQLite's planner, "
+        "SQLite's syntax, same reason as TestSortIndexesAreUsed above. "
+        "That the value is right on MariaDB is PartitionRollupTest's "
+        "test_the_streams_clock_is_its_newest_run, which does run "
+        "there.",
     "DeleteStreamEnvironmentQueryPlanTest":
         "asserts EXPLAIN QUERY PLAN output (WP-34) — SQLite's planner, "
         "SQLite's syntax, same reason as TestSortIndexesAreUsed above. "
@@ -70,6 +76,24 @@ EXCLUDED_CLASSES = {
 #: is not — skipped with the reason, so a green MariaDB run cannot be
 #: read as having exercised them.
 EXCLUDED_TESTS = {
+    "TestPerformancePassEndpoints.test_the_product_list_reads_no_test_results":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TestPerformancePassEndpoints.test_identity_only_runs_no_comparison":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TestPerformancePassEndpoints"
+    ".test_the_timeline_checks_one_name_not_the_whole_list":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TestQueueCounts.test_one_query_regardless_of_assignee":
+        "counts statements with sqlite3's set_trace_callback (WP-36 "
+        "widened what it counts, not how). The values it guards are "
+        "compared against their own SQL on MariaDB by "
+        "test_every_kind_still_agrees_with_its_own_query.",
+    "TestQueueCounts.test_the_ownership_count_reaches_latest_runs_by_its_key":
+        "asserts EXPLAIN QUERY PLAN output — SQLite's planner.",
+    "PartitionRollupTest.test_a_second_scope_costs_no_query":
+        "counts statements with sqlite3's set_trace_callback.",
+    "PartitionRollupTest.test_another_stream_or_cutoff_is_its_own_pass":
+        "counts statements with sqlite3's set_trace_callback.",
     "TestPreviousResult.test_start_time_index_created":
         "asserts PRAGMA index_list output; MariaDB indexes are created "
         "by the migration DDL and asserted by the schema bootstrap.",

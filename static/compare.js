@@ -168,6 +168,20 @@ export async function fetchCompare(streamId, category, offset, baselineId) {
   }));
 }
 
+/**
+ * Who is being compared with whom, and nothing else (WP-36): the two
+ * identities a build's page needs before it can draw its header, on
+ * whichever tab it opens. `counts=0` asks the server not to run the
+ * comparison; a server that does not know the parameter runs it anyway
+ * and the answer still carries both identities.
+ */
+export async function fetchCompareIdentity(streamId, baselineId) {
+  return fetchJson(apiUrl("api/compare", { counts: "0" }, {
+    stream: streamId,
+    baseline: baselineId === undefined ? null : baselineId,
+  }));
+}
+
 /** Every test compared, including the ones that agree — counts.agree is
  * a real field precisely so this total does not have to be re-derived
  * from a category fetch nobody asked for. */
@@ -543,7 +557,7 @@ function renderEnvironmentFilter(data, streamId) {
   }
 }
 
-async function loadCategory(reset) {
+async function loadCategory(reset, fetched) {
   const body = document.getElementById("delta-body");
   const empty = document.getElementById("delta-empty");
   const moreBtn = document.getElementById("delta-show-more");
@@ -557,7 +571,8 @@ async function loadCategory(reset) {
     ensureDeltaSelectionMounted();
     deltaSelectionMount.reset();
   }
-  const page = await fetchCompare(
+  // `fetched` is a page initDeltaView() already has in hand (WP-36).
+  const page = fetched || await fetchCompare(
     deltaState.streamId, deltaState.category, deltaState.offset,
     deltaState.baselineId);
   deltaState.total = page.total;
@@ -1050,7 +1065,14 @@ export async function initDeltaView(streamId, options) {
 
   let productStreams = [];
   try {
-    const data = await fetchCompare(streamId, null, 0, getSelectedBaselineId());
+    // WP-36: ONE request for the header and the first page of rows.
+    // A category page carries everything the counts-only answer does
+    // -- both identities, the six counts, the environments -- so
+    // asking for the counts first and the page second ran the
+    // comparison for the counts twice over, one after the other, and
+    // the rows waited for both.
+    const data = await fetchCompare(
+      streamId, deltaState.category, 0, getSelectedBaselineId());
     if (data.stream.kind !== "mainline") {
       productStreams = await fetchProductStreams(data.stream.product);
     }
@@ -1071,7 +1093,7 @@ export async function initDeltaView(streamId, options) {
     renderBuildVerdict(streamId, data, productStreams).catch(() => {});
     document.getElementById("delta-section").hidden = false;
     loading.hidden = true;
-    await loadCategory(true);
+    await loadCategory(true, data);
   } catch (err) {
     loading.hidden = true;
     showError(err.message);
