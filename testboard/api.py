@@ -47,6 +47,7 @@ from typing import (
 )
 
 from testboard import analytics, model, site_notes
+from testboard.metrics import Metrics
 from testboard.model import Result, RunRecord, StoredRun, ValidationError
 from testboard.storage import (
     COMPARE_CATEGORIES,
@@ -1348,6 +1349,48 @@ def _products_summary(
         }
         for product in products
     ]
+
+
+def _handle_metrics(
+    storage: Storage, metrics: Optional[Metrics]
+) -> Response:
+    """GET /api/metrics — what the server has been doing, and how big
+    the database is (WP-37). The Metrics page's one request.
+
+    ``activity`` is :meth:`testboard.metrics.Metrics.snapshot`: every
+    request route and storage method since the process started or the
+    counters were last reset, and the slowest requests with their
+    targets. ``{"collecting": false}`` when the server was started with
+    ``--no-metrics``. ``memo`` is how the summary memo has done over
+    the same period. ``database`` is :meth:`Storage.size_report`.
+
+    Asking costs the person asking and nobody else: the counters are
+    merged from memory, and the sizes are read here — kept for a
+    minute — and at no other time.
+    """
+    return _json_response(200, {
+        "activity": (
+            {"collecting": False} if metrics is None
+            else metrics.snapshot()),
+        "memo": storage.memo_report(),
+        "database": storage.size_report(),
+    })
+
+
+def _handle_metrics_reset(
+    storage: Storage, metrics: Optional[Metrics]
+) -> Response:
+    """POST /api/metrics/reset — start counting again from nothing.
+
+    For "reset, do the thing that feels slow, look": totals since the
+    process started are an average over everything, and say little
+    about the last five minutes. Changes no data; the database and the
+    memo's contents are untouched.
+    """
+    if metrics is not None:
+        metrics.reset()
+    storage.reset_memo_counts()
+    return _json_response(200, {"reset": True})
 
 
 def _handle_products(storage: Storage) -> Response:
@@ -4115,6 +4158,7 @@ def _route(
     request: Request,
     now: Callable[[], datetime.datetime],
     site_notes_path: Optional[str] = None,
+    metrics: Optional[Metrics] = None,
 ) -> Response:
     """Match the decoded path segments to a handler and dispatch.
 
@@ -4156,6 +4200,14 @@ def _route(
     if rest == ["products"]:
         _check_method(request.method, ("GET",))
         return _handle_products(storage)
+
+    if rest == ["metrics"]:
+        _check_method(request.method, ("GET",))
+        return _handle_metrics(storage, metrics)
+
+    if rest == ["metrics", "reset"]:
+        _check_method(request.method, ("POST",))
+        return _handle_metrics_reset(storage, metrics)
 
     if rest == ["time"]:
         _check_method(request.method, ("GET",))
@@ -4286,19 +4338,23 @@ def handle_api(
     request: Request,
     now: Callable[[], datetime.datetime] = model.utcnow,
     site_notes_path: Optional[str] = None,
+    metrics: Optional[Metrics] = None,
 ) -> Response:
     """Handle one API request and ALWAYS return a JSON :class:`Response`.
 
     This is the single entry point the HTTP server calls for every path
     under ``/api``. *storage* is the injected storage layer; *now* is the
-    clock (injectable for tests). Errors are JSON ``{"error": "message"}``
+    clock (injectable for tests); *metrics* is the server's counters,
+    read by ``GET /api/metrics`` and by nothing else in this module —
+    ``None`` when the server is not collecting any. Errors are JSON
+    ``{"error": "message"}``
     bodies — never HTML: 400 for validation failures, 404 for unknown
     routes/resources, 405 for a known path with the wrong method (the
     response then carries an ``Allow`` header listing permitted methods),
     and 500 for unexpected internal failures (logged with traceback).
     """
     try:
-        return _route(storage, request, now, site_notes_path)
+        return _route(storage, request, now, site_notes_path, metrics)
     except _HttpError as exc:
         return _json_response(
             exc.status, {"error": exc.message}, exc.headers

@@ -1729,6 +1729,10 @@ _ENVIRONMENT_TABLES = (
 #: and ``ca`` (current_assignments). These are the SQL half of the same
 #: definitions :func:`testboard.analytics.summarize_rollup` applies to the
 #: rollup counts — ``tests/test_storage.py`` asserts the two agree.
+#: How long :meth:`Storage.size_report` is kept. Sizes move slowly, and
+#: unlike the summary memo this one is NOT cleared by a write.
+_SIZE_REPORT_TTL_SECONDS = 60
+
 QUEUE_KINDS = (
     "new_failures",
     "still_failing",
@@ -2075,6 +2079,41 @@ class _SqliteBackend(object):
         """Rebuild the file. SQLite-shaped maintenance; see Storage.vacuum."""
         conn.execute("VACUUM")
 
+    #: What the Metrics page calls this engine.
+    engine_name = "SQLite"
+
+    def size_report(self, conn: sqlite3.Connection) -> Dict[str, Any]:
+        """What the database weighs on disk, without reading it.
+
+        Three pragmas and two ``stat`` calls. SQLite cannot say what
+        one TABLE weighs without the ``dbstat`` virtual table, which
+        the interpreter's bundled library is not guaranteed to have, so
+        ``tables`` is empty here and the page shows row counts alone.
+        """
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        free = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        parts = [
+            {"label": "Database (pages in use and free)",
+             "bytes": pages * page_size},
+            {"label": "of which free: reusable, not returned to the "
+                      "file system until VACUUM",
+             "bytes": free * page_size},
+        ]  # type: List[Dict[str, Any]]
+        total = pages * page_size
+        try:
+            wal = os.path.getsize(self._path + "-wal")
+        except OSError:
+            wal = 0
+        parts.append({"label": "Write-ahead log", "bytes": wal})
+        return {
+            "engine": self.engine_name,
+            "version": sqlite3.sqlite_version,
+            "bytes": total + wal,
+            "parts": parts,
+            "tables": {},
+        }
+
     def suspend_foreign_keys(self, conn: sqlite3.Connection) -> None:
         """Stop enforcing foreign keys on *conn* until
         :meth:`restore_foreign_keys` — for ONE caller,
@@ -2173,6 +2212,11 @@ class Storage:
         # finished using them.
         self._streak_cache = {}  # type: Dict[Tuple[Any, ...], Tuple[float, Any]]
         self._streak_lock = threading.Lock()
+        # WP-37: how the summary memo is doing, for the Metrics page --
+        # [hits, misses, clears]. Stepped under _summary_lock, which
+        # every one of those paths already holds.
+        self._memo_counts = [0, 0, 0]
+        self._size_memo = None  # type: Optional[Tuple[float, Dict[str, Any]]]
         self._migrate()
 
     @classmethod
@@ -6279,11 +6323,14 @@ class Storage:
         with self._summary_lock:
             entry = self._summary_cache.get(key)
             if entry is None:
+                self._memo_counts[1] += 1
                 return None
             stored_at, value = entry
             if now - stored_at > _TREND_CACHE_TTL_SECONDS:
                 del self._summary_cache[key]
+                self._memo_counts[1] += 1
                 return None
+            self._memo_counts[0] += 1
             return value
 
     def _store_summary(self, key: Tuple[Any, ...], value: Any) -> None:
@@ -6354,8 +6401,104 @@ class Storage:
         """
         with self._summary_lock:
             self._summary_cache.clear()
+            self._memo_counts[2] += 1
         with self._streak_lock:
             self._streak_cache.clear()
+
+    #: Tables small enough to count exactly whenever the Metrics page
+    #: asks. ``runs`` and ``run_outputs`` are deliberately not here.
+    _COUNTED_TABLES = (
+        "latest_runs", "activity_hours", "script_hours", "streams",
+        "comments", "assignments", "current_assignments", "users",
+        "test_retirements", "environment_products",
+        "environment_expectations",
+    )
+
+    def memo_report(self) -> Dict[str, int]:
+        """How the summary memo has done since the counters were last
+        reset (WP-37): served from it, computed instead, and how many
+        times a write cleared it. With results pushed during a run,
+        ``clears`` is the number to watch — every one puts the next
+        load of every page back to its cold cost.
+        """
+        with self._summary_lock:
+            return {
+                "hits": self._memo_counts[0],
+                "misses": self._memo_counts[1],
+                "clears": self._memo_counts[2],
+                "entries": len(self._summary_cache),
+            }
+
+    def reset_memo_counts(self) -> None:
+        """Zero :meth:`memo_report`'s counters. The memo is untouched."""
+        with self._summary_lock:
+            self._memo_counts = [0, 0, 0]
+
+    def size_report(self) -> Dict[str, Any]:
+        """How big the database is and what is in it, for the Metrics
+        page (WP-37). Read when that page asks and at no other time,
+        and kept for :data:`_SIZE_REPORT_TTL_SECONDS` so a page left
+        refreshing itself costs one read a minute.
+
+        Nothing here scans ``runs``. Its row count is the sum of
+        ``activity_hours``, which the writing transaction keeps equal
+        to it (measured on the dev-scale estate: 0.3 ms, against 55 ms
+        for ``COUNT(*)`` over 656,680 runs — and production holds
+        several times that). Its oldest and newest start times are two
+        statements, each one end of ``idx_runs_start_time_result``;
+        asked for together they are a scan (95 ms here). ``run_outputs``
+        is not counted at all: there is one row per run, and counting
+        them means walking the largest table in the file.
+        """
+        with self._summary_lock:
+            kept = self._size_memo
+        if kept is not None and time.time() - kept[0] <= (
+                _SIZE_REPORT_TTL_SECONDS):
+            return kept[1]
+        conn = self._conn()
+        report = self._backend.size_report(conn)
+        rows = {}  # type: Dict[str, Optional[int]]
+        total = conn.execute(
+            "SELECT SUM(count) FROM activity_hours").fetchone()[0]
+        rows["runs"] = int(total or 0)
+        for table in self._COUNTED_TABLES:
+            rows[table] = int(conn.execute(
+                "SELECT COUNT(*) FROM {}".format(table)).fetchone()[0])
+        oldest = conn.execute(
+            "SELECT MIN(start_time) FROM runs").fetchone()[0]
+        newest = conn.execute(
+            "SELECT MAX(start_time) FROM runs").fetchone()[0]
+        names = {
+            int(row[0]): (row[1], row[2], row[3]) for row in conn.execute(
+                "SELECT id, product, kind, name FROM streams").fetchall()
+        }
+        streams = []  # type: List[Dict[str, Any]]
+        for row in conn.execute(
+            "SELECT stream_id, COUNT(*), COUNT(DISTINCT environment) "
+            "FROM latest_runs GROUP BY stream_id ORDER BY stream_id"
+        ).fetchall():
+            product, kind, name = names.get(int(row[0]), ("", "?", "?"))
+            streams.append({
+                "id": int(row[0]), "product": product, "kind": kind,
+                "name": name, "tests": int(row[1]),
+                "environments": int(row[2]),
+            })
+        version = conn.execute(
+            "SELECT MAX(version) FROM schema_version").fetchone()[0]
+        report.update({
+            "as_of": model.format_iso(model.utcnow()),
+            "kept_seconds": _SIZE_REPORT_TTL_SECONDS,
+            "schema_version": None if version is None else int(version),
+            "connections": self._max_connections,
+            "rows": rows,
+            "rows_not_counted": ["run_outputs"],
+            "oldest_run": oldest,
+            "newest_run": newest,
+            "streams": streams,
+        })
+        with self._summary_lock:
+            self._size_memo = (time.time(), report)
+        return report
 
     def test_exists(
         self, environment: str, script: str, test_name: str
