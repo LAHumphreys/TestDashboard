@@ -3059,7 +3059,7 @@ def _handle_streams_list(storage: Storage, request: Request) -> Response:
 
 
 def _handle_compare(storage: Storage, request: Request) -> Response:
-    """GET /api/compare?stream=&baseline=&category=&limit=&offset=
+    """GET /api/compare?stream=&baseline=&environment=&category=&limit=&offset=
 
     docs/STREAMS_PLAN.md §3.5/§4.1. ``stream`` is required. ``baseline``
     defaults to mainline; since WP-22 it may also be any stream of the
@@ -3076,6 +3076,20 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
     The response carries both sides' identity and freshness
     (``last_seen``) so the UI can build its own honesty line ("baseline
     N days old") from data, never from a constant.
+
+    ``environment`` (WP-33), when given, narrows the WHOLE comparison —
+    the six counts and the paginated list alike — to that one
+    environment. The response echoes it back as ``environment`` (null
+    when no filter was applied) and lists the environments the
+    unfiltered comparison spans as ``environments`` (the stream's own
+    product's, the same allow-list the comparison has always used), so
+    the page builds its filter from what the server compared rather than
+    from a list of its own. An ``environment`` that is not one of them
+    is NOT an error: it matches nothing, every count is zero, and the
+    echo plus the list are what let the page say why. This endpoint was
+    already being sent ``environment=`` by every page that carried one
+    in its URL (urls.js carries scope by default) and ignored it; a 4xx
+    here would turn links that work today into pages that cannot load.
     """
     raw_stream = _query_single(request.query, "stream")
     if raw_stream is None:
@@ -3142,13 +3156,18 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
     )
     offset = _parse_int_param(request, "offset", 0, 0, _MAX_OFFSET)
 
-    counts = storage.compare_counts(stream_id, baseline_id=baseline_id)
+    # WP-33. An empty value is "no filter", the same reading every
+    # other optional filter here gives it.
+    environment = _query_single(request.query, "environment") or None
+
+    counts = storage.compare_counts(
+        stream_id, baseline_id=baseline_id, environment=environment)
     tests = []  # type: List[Dict[str, Any]]
     total = 0
     if category is not None:
         rows = storage.compare_category(
             stream_id, category, baseline_id=baseline_id, limit=limit,
-            offset=offset,
+            offset=offset, environment=environment,
         )
         # WP-23 perf pass: every /api/compare?category= request used to
         # run the expensive pairs SQL (_compare_pairs_sql) THREE times —
@@ -3199,6 +3218,9 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
         {
             "stream": _stream_json(stream),
             "baseline": _stream_json(baseline),
+            "environment": environment,
+            "environments": storage.environments_for_product(
+                stream.product),
             "counts": {
                 "new_failures": counts.new_failures,
                 "new_passes": counts.new_passes,

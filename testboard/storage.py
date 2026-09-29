@@ -4214,8 +4214,33 @@ class Storage:
         "ELSE 'agree' END"
     ).format(fail=Result.FAIL.value)
 
+    def _compare_environments(
+        self, product: str, environment: Optional[str],
+    ) -> List[str]:
+        """The environments one comparison spans (WP-33).
+
+        Always the stream's own product's environments — the rule every
+        comparison has followed since WP-21 — narrowed to *environment*
+        alone when one is named. An *environment* OUTSIDE the product
+        narrows to nothing rather than widening to it: the comparison
+        then matches no rows (see :meth:`_environments_clause`'s empty
+        list), which is the truthful answer to "how does this build
+        differ on an environment its product does not have", and the
+        API echoes the name it applied so the page can say so. Raising
+        instead would turn a stale filter in a shared link into a page
+        that cannot load at all — including the control that would
+        correct it.
+        """
+        environments = self.environments_for_product(product)
+        if environment is None:
+            return environments
+        if environment in environments:
+            return [environment]
+        return []
+
     def compare_counts(
         self, stream_id: int, baseline_id: int = MAINLINE_STREAM_ID,
+        environment: Optional[str] = None,
     ) -> "CompareCounts":
         """The five headline counts of a stream-vs-baseline comparison.
 
@@ -4223,12 +4248,15 @@ class Storage:
         joins of two ``latest_runs`` partitions (see
         :meth:`_compare_pairs_sql`) — never a scan of ``runs``, and
         bounded by the stream's own product's test count (a few
-        thousand to ~12k), not by history.
+        thousand to ~12k), not by history. *environment* (WP-33)
+        narrows BOTH sides to that one environment — see
+        :meth:`_compare_environments`.
         """
         stream = self.get_stream(stream_id)
         if stream is None:
             raise KeyError(stream_id)
-        environments = self.environments_for_product(stream.product)
+        environments = self._compare_environments(
+            stream.product, environment)
         pairs_sql, params = self._compare_pairs_sql(
             stream_id, baseline_id, environments
         )
@@ -4257,8 +4285,13 @@ class Storage:
         baseline_id: int = MAINLINE_STREAM_ID,
         limit: int = 250,
         offset: int = 0,
+        environment: Optional[str] = None,
     ) -> List["CompareRow"]:
         """ONE PAGE of one comparison category, paginated in SQL.
+
+        *environment* (WP-33) narrows the comparison exactly as it does
+        for :meth:`compare_counts` — the two must always be given the
+        same value, or a page's rows and its own total disagree.
 
         *category* must be one of :data:`_COMPARE_CATEGORIES` — like
         :data:`DASHBOARD_SORTS`, callers choose from a whitelist and
@@ -4276,7 +4309,8 @@ class Storage:
         stream = self.get_stream(stream_id)
         if stream is None:
             raise KeyError(stream_id)
-        environments = self.environments_for_product(stream.product)
+        environments = self._compare_environments(
+            stream.product, environment)
         pairs_sql, params = self._compare_pairs_sql(
             stream_id, baseline_id, environments
         )
@@ -4327,6 +4361,7 @@ class Storage:
         stream_id: int,
         category: str,
         baseline_id: int = MAINLINE_STREAM_ID,
+        environment: Optional[str] = None,
     ) -> int:
         """Exact size of one comparison category, ignoring any display cap."""
         if category not in self._COMPARE_CATEGORIES:
@@ -4338,7 +4373,8 @@ class Storage:
         stream = self.get_stream(stream_id)
         if stream is None:
             raise KeyError(stream_id)
-        environments = self.environments_for_product(stream.product)
+        environments = self._compare_environments(
+            stream.product, environment)
         pairs_sql, params = self._compare_pairs_sql(
             stream_id, baseline_id, environments
         )

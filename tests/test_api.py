@@ -5584,6 +5584,104 @@ class TestStreamsEndpoint(ApiCase):
         self.assertEqual(without, withempty)
 
 
+class TestCompareEnvironmentFilter(ApiCase):
+    """GET /api/compare?environment= (WP-33): one environment of the
+    comparison, echoed back, with the list the filter is built from."""
+
+    BRANCH_TIMES = {
+        "start_time": "2026-07-25T03:00:00.000000",
+        "end_time": "2026-07-25T03:00:03.000000",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a", result="PASS"),
+            record(test_name="test_c", result="PASS"),
+            record(environment="win-sim", test_name="test_a",
+                   result="FAIL"),
+            record(environment="win-sim", test_name="test_b",
+                   result="FAIL"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+            record(environment="win-sim", test_name="test_a",
+                   result="FAIL", build="feat/x", **self.BRANCH_TIMES),
+            record(environment="win-sim", test_name="test_b",
+                   result="PASS", build="feat/x", **self.BRANCH_TIMES),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def _compare(self, **extra: str) -> Dict[str, Any]:
+        query = {"stream": [str(self.stream_id)]}
+        for name, value in extra.items():
+            query[name] = [value]
+        return self.call("GET", "/api/compare", query=query)
+
+    def test_no_filter_echoes_null_and_lists_the_environments(
+            self) -> None:
+        data = self._compare()
+        self.assertIsNone(data["environment"])
+        self.assertEqual(
+            data["environments"], [record()["environment"], "win-sim"])
+        self.assertEqual(data["counts"]["new_failures"], 1)
+        self.assertEqual(data["counts"]["both_failing"], 1)
+        self.assertEqual(data["counts"]["new_passes"], 1)
+        self.assertEqual(data["counts"]["no_result"], 1)
+
+    def test_the_filter_narrows_the_counts_and_is_echoed(self) -> None:
+        data = self._compare(environment="win-sim")
+        self.assertEqual(data["environment"], "win-sim")
+        self.assertEqual(data["counts"], {
+            "new_failures": 0, "new_passes": 1, "both_failing": 1,
+            "new_tests": 0, "no_result": 0, "agree": 0,
+        })
+
+    def test_the_environment_list_is_not_narrowed_by_the_filter(
+            self) -> None:
+        """The list is what the control offers: narrowing it to the
+        current choice would leave nothing to switch to."""
+        unfiltered = self._compare()
+        filtered = self._compare(environment="win-sim")
+        self.assertEqual(
+            filtered["environments"], unfiltered["environments"])
+
+    def test_the_filter_narrows_the_page_and_its_total_together(
+            self) -> None:
+        mainline_env = record()["environment"]
+        data = self._compare(
+            environment=mainline_env, category="new_failures")
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(
+            [(row["environment"], row["test_name"])
+             for row in data["tests"]],
+            [(mainline_env, "test_a")])
+        data = self._compare(
+            environment="win-sim", category="new_failures")
+        self.assertEqual(data["total"], 0)
+        self.assertEqual(data["tests"], [])
+
+    def test_an_environment_outside_the_comparison_is_empty_not_an_error(
+            self) -> None:
+        """urls.js has always carried a page's `environment=` onto this
+        request, and the handler used to ignore it -- so a 4xx here
+        would break links that load today. Zero counts plus the echo
+        is what lets the page say what happened."""
+        data = self._compare(environment="no-such-environment")
+        self.assertEqual(data["environment"], "no-such-environment")
+        self.assertNotIn("no-such-environment", data["environments"])
+        self.assertEqual(sorted(set(data["counts"].values())), [0])
+
+    def test_an_empty_value_is_no_filter(self) -> None:
+        data = self._compare(environment="")
+        self.assertIsNone(data["environment"])
+        self.assertEqual(data["counts"]["new_passes"], 1)
+        self.assertEqual(data["counts"]["no_result"], 1)
+
+
 class TestCompareEndpoint(ApiCase):
     """GET /api/compare — the six counts plus one paginated category."""
 

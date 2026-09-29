@@ -42,7 +42,13 @@ import {
 } from "./api.js";
 import { reopenIfOpen, toggleReview } from "./review.js";
 import { mountSelectableTable } from "./selection.js";
-import { apiUrl, pageUrl, withBaseline, withStream } from "./urls.js";
+import {
+  apiUrl,
+  pageUrl,
+  withBaseline,
+  withEnvironment,
+  withStream,
+} from "./urls.js";
 
 /** The five paginable comparison categories, in tab/tile display order. */
 export const CATEGORY_ORDER = [
@@ -343,6 +349,11 @@ function ensureDeltaSelectionMounted() {
 }
 
 const deltaState = {
+  // True from initDeltaView() until leaveDeltaView(): the delta view
+  // shares the toolbar's Environment select and Refresh button with
+  // "Its own results" (WP-33), so both modules need to know whose turn
+  // it is. See isDeltaViewActive().
+  active: false,
   streamId: null,
   // null = mainline (the server's own default) OR "no explicit choice
   // yet" during the initial build-predecessor lookup — see
@@ -352,6 +363,99 @@ const deltaState = {
   offset: 0,
   total: 0,
 };
+
+/**
+ * Whether the delta view currently owns the page's shared toolbar
+ * controls (WP-33). app.js's own listeners on the Environment select
+ * and the Refresh button check this and stand down while it is true:
+ * they were wired for "Its own results", stay wired after a tab switch,
+ * and would otherwise reload the MAINLINE dashboard underneath the
+ * comparison (state.streamId is null on this tab) and un-hide it.
+ */
+export function isDeltaViewActive() {
+  return deltaState.active;
+}
+
+/**
+ * Hand the shared toolbar controls back -- called by app.js when "Its
+ * own results" takes over. The Refresh button's handler is cleared
+ * because initDeltaView() assigned it: left in place, Refresh on the
+ * other tab would bring the comparison back on top of it.
+ */
+export function leaveDeltaView() {
+  deltaState.active = false;
+  const reload = document.getElementById("reload-btn");
+  if (reload) {
+    reload.onclick = null;
+  }
+}
+
+/**
+ * The Environment filter on the "Difference from" tab (WP-33) -- the
+ * SAME toolbar select "Its own results" uses, so the filter sits in one
+ * place and a choice made on either tab is the other tab's choice too
+ * (both read and write `environment=` in the address bar, nothing
+ * else).
+ *
+ * Every word and every option comes from the response: `environments`
+ * is the list the server compared across, `environment` is the filter
+ * it actually applied. A server that sends no list (a process not yet
+ * restarted onto this drop) gets the pre-WP-33 behaviour -- the field
+ * hidden -- rather than a control that filters nothing.
+ */
+function renderEnvironmentFilter(data, streamId) {
+  const field = document.getElementById("env-filter-field");
+  const select = document.getElementById("filter-environment");
+  const note = document.getElementById("delta-environment-note");
+  if (note) {
+    note.hidden = true;
+  }
+  if (!field || !select) {
+    return;
+  }
+  if (!Array.isArray(data.environments)) {
+    field.hidden = true;
+    return;
+  }
+  const applied = data.environment || "";
+  const covered = data.environments.indexOf(applied) !== -1;
+
+  clearNode(select);
+  const allOption = el("option", "", "All environments");
+  allOption.value = "";
+  select.appendChild(allOption);
+  for (const name of data.environments) {
+    const option = el("option", "", name);
+    option.value = name;
+    select.appendChild(option);
+  }
+  if (applied && !covered) {
+    // Never show "All environments" over a filter that is in force.
+    const stray = el("option", "", applied + " (not in this comparison)");
+    stray.value = applied;
+    select.appendChild(stray);
+  }
+  select.value = applied;
+  // Idempotent assignment, the same reasoning as the buttons below.
+  select.onchange = () => {
+    if (!deltaState.active) {
+      return;
+    }
+    window.history.replaceState(null, "", withEnvironment(select.value));
+    initDeltaView(streamId, { keepCategory: true });
+  };
+  field.hidden = false;
+
+  if (note && applied) {
+    note.textContent = covered
+      ? "Showing " + applied + " only — every count and list here is "
+        + "limited to it. The “last ran” times are the whole build’s."
+      : "“" + applied + "” is not one of the environments this "
+        + "comparison covers, so nothing matches. Choose another from "
+        + "the Environment filter.";
+    note.hidden = false;
+  }
+}
 
 async function loadCategory(reset) {
   const body = document.getElementById("delta-body");
@@ -828,19 +932,21 @@ function renderCompareToControl(streamMeta, baselineMeta, streams) {
  * for any non-mainline stream, because the Compare-to control (which
  * IS how a predecessor gets chosen now) needs it.
  */
-export async function initDeltaView(streamId) {
+export async function initDeltaView(streamId, options) {
+  deltaState.active = true;
   deltaState.streamId = streamId;
-  deltaState.category = CATEGORY_ORDER[0];
+  // WP-33: changing the environment keeps the category tab the reader
+  // was on -- they are narrowing the list in front of them, not
+  // starting again.
+  if (!(options && options.keepCategory)) {
+    deltaState.category = CATEGORY_ORDER[0];
+  }
 
   const loading = document.getElementById("loading-state");
   loading.hidden = false;
   loading.textContent = "Loading comparison…";
   for (const id of MAINLINE_SECTIONS) {
     document.getElementById(id).hidden = true;
-  }
-  const envField = document.getElementById("env-filter-field");
-  if (envField) {
-    envField.hidden = true;
   }
 
   let productStreams = [];
@@ -854,6 +960,7 @@ export async function initDeltaView(streamId) {
     renderBranchBand(data.stream, data.baseline);
     renderBuildFraming(data.stream, Date.now());
     renderCompareToControl(data.stream, data.baseline, productStreams);
+    renderEnvironmentFilter(data, streamId);
     renderTiles(document.getElementById("delta-tiles"), data.counts);
     renderBaselineCard(data.stream, data.baseline, data.counts, Date.now());
     renderTabs();

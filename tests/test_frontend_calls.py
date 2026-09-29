@@ -1680,6 +1680,172 @@ class DeltaViewTest(unittest.TestCase):
         self.assertIn("reviewEntry(row, streamId)", row_body)
 
 
+class DeltaEnvironmentFilterTest(unittest.TestCase):
+    """WP-33: the Environment filter on a build's "Difference from" tab.
+
+    The filter is the toolbar's existing select, shared with "Its own
+    results" -- which is what makes it one control in one place, and
+    also what makes it dangerous: app.js wired that select (and the
+    Refresh button beside it) for the dashboard, those listeners
+    outlive a tab switch, and on the difference tab state.streamId is
+    null. Left unguarded, changing the filter there loads MAINLINE's
+    dashboard and un-hides it under the comparison. Most of this class
+    is about that hand-over, not about the filter.
+    """
+
+    def test_the_filter_is_no_longer_hidden_on_the_difference_tab(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "export async function initDeltaView("))
+        self.assertNotIn("env-filter-field", body)
+        self.assertIn("renderEnvironmentFilter(data, streamId)", body)
+
+    def test_options_and_selection_come_from_the_response(self) -> None:
+        """The list the server compared across and the filter it
+        applied -- never a list or a value the page worked out."""
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        self.assertIn("data.environments", body)
+        self.assertIn("data.environment ", body)
+        self.assertIn("select.value = applied", body)
+        self.assertNotIn("location.search", body)
+        self.assertNotIn("currentScope(", body)
+
+    def test_a_server_without_the_list_keeps_the_field_hidden(
+            self) -> None:
+        """Static files are read from disk per request; Python is not.
+        A process that was not restarted serves this script against a
+        handler that ignores `environment=` -- the control would then
+        change the address bar and nothing else."""
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        guard_at = body.index("Array.isArray(data.environments)")
+        hide_at = body.index("field.hidden = true", guard_at)
+        show_at = body.index("field.hidden = false")
+        self.assertLess(guard_at, hide_at)
+        self.assertLess(hide_at, show_at)
+        self.assertIn("return", body[hide_at:show_at])
+
+    def test_a_filter_outside_the_comparison_is_never_shown_as_all(
+            self) -> None:
+        """select.value falls back to the first option when nothing
+        matches -- "All environments", over a filter that is in force
+        and matching nothing. The stray value gets its own option."""
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        stray_at = body.index("applied && !covered")
+        assign_at = body.index("select.value = applied")
+        self.assertLess(stray_at, assign_at)
+        self.assertIn("stray.value = applied", body[stray_at:assign_at])
+
+    def test_changing_it_rewrites_the_address_bar_through_urls_js(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        self.assertIn(
+            "replaceState(null, \"\", withEnvironment(select.value))",
+            body)
+        self.assertIsNone(_ENVIRONMENT_PARAM_RE.search(
+            _strip_comments(read("compare.js"))))
+
+    def test_changing_it_keeps_the_category_tab(self) -> None:
+        change = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        self.assertIn(
+            "initDeltaView(streamId, { keepCategory: true })", change)
+        init = _strip_comments(_function_body(
+            read("compare.js"), "export async function initDeltaView("))
+        reset_at = init.index("deltaState.category = CATEGORY_ORDER[0]")
+        guard_at = init.rindex("if (", 0, reset_at)
+        self.assertIn("keepCategory", init[guard_at:reset_at])
+
+    def test_with_environment_changes_that_level_and_no_other(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("urls.js"), "export function withEnvironment("))
+        self.assertIn("currentUrlWithScope(", body)
+        self.assertIn("environment:", body)
+        for level in ("product", "stream", "baseline"):
+            self.assertNotIn(level + ":", body)
+
+    def test_the_change_handler_stands_down_off_the_difference_tab(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        handler = body[body.index("select.onchange"):]
+        guard_at = handler.index("!deltaState.active")
+        act_at = handler.index("replaceState(")
+        self.assertLess(guard_at, act_at)
+        self.assertIn("return", handler[guard_at:act_at])
+
+    def _guarded(self, listener: str, action: str) -> None:
+        self.assertIn("isDeltaViewActive()", listener)
+        guard_at = listener.index("isDeltaViewActive()")
+        act_at = listener.index(action)
+        self.assertLess(guard_at, act_at)
+        self.assertIn("return", listener[guard_at:act_at])
+
+    def test_the_dashboards_own_listeners_stand_down_on_that_tab(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function wireMainlineControls("))
+        env_at = body.index('envSelect.addEventListener("change"')
+        self._guarded(
+            body[env_at:body.index("scriptSelect.addEventListener")],
+            "setEnvironment(")
+        reload_at = body.index('getElementById("reload-btn")')
+        self._guarded(
+            body[reload_at:body.index('getElementById("show-more")')],
+            "refreshAll(")
+
+    def test_own_results_takes_the_controls_back(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function activateOwnResultsTab("))
+        self.assertIn("leaveDeltaView()", body)
+        self.assertLess(
+            body.index("leaveDeltaView()"), body.index("refreshAll("))
+        leave = _strip_comments(_function_body(
+            read("compare.js"), "export function leaveDeltaView("))
+        self.assertIn("deltaState.active = false", leave)
+        self.assertIn("reload.onclick = null", leave)
+
+    def test_own_results_rereads_the_filter_on_every_activation(
+            self) -> None:
+        """wireMainlineControls() reads the address bar once, the first
+        time it runs. The difference tab can have changed it since."""
+        body = _strip_comments(_function_body(
+            read("app.js"), "function activateOwnResultsTab("))
+        wired_at = body.index("wireMainlineControls()")
+        read_at = body.index(
+            "state.environment = currentScope().environment")
+        load_at = body.index("refreshAll(")
+        self.assertLess(wired_at, read_at)
+        self.assertLess(read_at, load_at)
+
+    def test_switching_to_the_difference_abandons_a_load_in_flight(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function activateDiffTab("))
+        self.assertLess(
+            body.index("state.requestSeq++"),
+            body.index("initDeltaView("))
+        self.assertIn("state.browseSeq++", body)
+
+    def test_the_filter_in_force_is_stated_from_the_servers_echo(
+            self) -> None:
+        html = read("index.html")
+        note_at = html.index('id="delta-environment-note"')
+        self.assertIn("hidden", html[note_at:note_at + 60])
+        self.assertLess(note_at, html.index('id="delta-tiles"'))
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        self.assertIn("note.hidden = true", body)
+        shown_at = body.index("note.hidden = false")
+        guard_at = body.rindex("if (", 0, shown_at)
+        self.assertIn("applied", body[guard_at:shown_at])
+        self.assertIn("applied +", body[guard_at:shown_at])
+
+
 class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     """PART A of a follow-up link-matrix audit (after the F1-F7
     usability sweep): three more test.html links that only became

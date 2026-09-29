@@ -5407,6 +5407,167 @@ class CompareStreamsTest(StorageTestBase):
         ))
 
 
+class CompareEnvironmentFilterTest(StorageTestBase):
+    """WP-33: a comparison narrowed to ONE of the product's environments.
+
+    Two environments of one product, deliberately given DIFFERENT
+    outcomes in every category, so a filter that leaked the other
+    environment's rows (or dropped its own) moves a count."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for environment in ("linux-sim", "win-sim"):
+            self.store.set_environment_product(
+                environment, "Atlas", "alice", CREATED)
+        branch_start = BASE + datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.PASS),
+            make_record(test_name="test_c", result=Result.PASS),
+            make_record(environment="win-sim", test_name="test_a",
+                        result=Result.FAIL),
+            make_record(environment="win-sim", test_name="test_b",
+                        result=Result.FAIL),
+            make_record(environment="win-sim", test_name="test_e",
+                        result=Result.PASS),
+        ])
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="feat/x", start=branch_start),
+            make_record(environment="win-sim", test_name="test_a",
+                        result=Result.FAIL, build="feat/x",
+                        start=branch_start),
+            make_record(environment="win-sim", test_name="test_b",
+                        result=Result.PASS, build="feat/x",
+                        start=branch_start),
+            make_record(environment="win-sim", test_name="test_d",
+                        result=Result.PASS, build="feat/x",
+                        start=branch_start),
+            make_record(environment="win-sim", test_name="test_e",
+                        result=Result.PASS, build="feat/x",
+                        start=branch_start),
+        ])
+        self.stream_id = self.store.list_streams("Atlas")[0].stream_id
+
+    def test_no_filter_spans_both_environments(self) -> None:
+        self.assertEqual(
+            self.store.compare_counts(self.stream_id),
+            storage.CompareCounts(
+                new_failures=1,   # linux-sim test_a
+                new_passes=1,     # win-sim test_b
+                both_failing=1,   # win-sim test_a
+                new_tests=1,      # win-sim test_d
+                no_result=1,      # linux-sim test_c
+                agree=1,          # win-sim test_e
+            ))
+
+    def test_counts_are_narrowed_to_the_named_environment(self) -> None:
+        self.assertEqual(
+            self.store.compare_counts(
+                self.stream_id, environment="linux-sim"),
+            storage.CompareCounts(
+                new_failures=1, new_passes=0, both_failing=0,
+                new_tests=0, no_result=1, agree=0))
+        self.assertEqual(
+            self.store.compare_counts(
+                self.stream_id, environment="win-sim"),
+            storage.CompareCounts(
+                new_failures=0, new_passes=1, both_failing=1,
+                new_tests=1, no_result=0, agree=1))
+
+    def test_the_two_environments_sum_to_the_unfiltered_counts(
+            self) -> None:
+        """The filter partitions the comparison: nothing counted twice,
+        nothing dropped. Stated as a sum so it keeps holding when the
+        fixture above changes."""
+        whole = self.store.compare_counts(self.stream_id)
+        parts = [
+            self.store.compare_counts(self.stream_id, environment=name)
+            for name in ("linux-sim", "win-sim")
+        ]
+        for field in storage.CompareCounts._fields:
+            self.assertEqual(
+                sum(getattr(part, field) for part in parts),
+                getattr(whole, field), field)
+
+    def test_rows_are_narrowed_on_both_halves_of_the_join(self) -> None:
+        """both_failing comes from the stream-anchored half of the
+        pairs SQL and no_result from the baseline-anchored half -- the
+        filter is applied to each separately, so each needs its own
+        check."""
+        rows = self.store.compare_category(
+            self.stream_id, "both_failing", environment="linux-sim")
+        self.assertEqual(rows, [])
+        rows = self.store.compare_category(
+            self.stream_id, "both_failing", environment="win-sim")
+        self.assertEqual(
+            [(row.environment, row.test_name) for row in rows],
+            [("win-sim", "test_a")])
+        rows = self.store.compare_category(
+            self.stream_id, "no_result", environment="win-sim")
+        self.assertEqual(rows, [])
+        rows = self.store.compare_category(
+            self.stream_id, "no_result", environment="linux-sim")
+        self.assertEqual(
+            [(row.environment, row.test_name) for row in rows],
+            [("linux-sim", "test_c")])
+
+    def test_the_category_total_agrees_with_the_counts(self) -> None:
+        for environment in (None, "linux-sim", "win-sim"):
+            counts = self.store.compare_counts(
+                self.stream_id, environment=environment)
+            for category in storage.COMPARE_CATEGORIES:
+                self.assertEqual(
+                    self.store.compare_category_count(
+                        self.stream_id, category,
+                        environment=environment),
+                    getattr(counts, category),
+                    (environment, category))
+
+    def test_an_environment_outside_the_product_matches_nothing(
+            self) -> None:
+        """Narrowing, never widening: naming another product's
+        environment must not pull its rows into this comparison."""
+        self.store.set_environment_product(
+            "other-product-env", "Zephyr", "alice", CREATED)
+        self.store.upsert_runs([make_record(
+            environment="other-product-env", test_name="unrelated")])
+        for environment in ("other-product-env", "no-such-environment"):
+            self.assertEqual(
+                self.store.compare_counts(
+                    self.stream_id, environment=environment),
+                storage.CompareCounts(
+                    new_failures=0, new_passes=0, both_failing=0,
+                    new_tests=0, no_result=0, agree=0),
+                environment)
+            for category in storage.COMPARE_CATEGORIES:
+                self.assertEqual(
+                    self.store.compare_category(
+                        self.stream_id, category,
+                        environment=environment),
+                    [], (environment, category))
+
+    def test_the_filter_applies_to_a_non_mainline_baseline_too(
+            self) -> None:
+        self.store.upsert_runs([
+            make_record(environment="win-sim", test_name="test_a",
+                        result=Result.PASS, build="feat/w",
+                        start=BASE + datetime.timedelta(hours=2)),
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="feat/w",
+                        start=BASE + datetime.timedelta(hours=2)),
+        ])
+        other_id = [
+            stream.stream_id for stream in self.store.list_streams("Atlas")
+            if stream.name == "feat/w"][0]
+        counts = self.store.compare_counts(
+            self.stream_id, baseline_id=other_id, environment="win-sim")
+        # On win-sim, feat/x FAILs test_a where feat/w PASSes it; the
+        # other three win-sim tests on feat/x have no counterpart.
+        self.assertEqual(counts.new_failures, 1)
+        self.assertEqual(counts.new_tests, 3)
+        self.assertEqual(counts.both_failing, 0)
+
+
 class CompareCountsManyTest(StorageTestBase):
     """compare_counts_many: the Watchlist s: cards' batched path.
 

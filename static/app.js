@@ -67,10 +67,12 @@ import {
   getSelectedBaselineId,
   getSelectedStreamId,
   initDeltaView,
+  isDeltaViewActive,
+  leaveDeltaView,
   renderBranchBand,
   streamLabel,
 } from "./compare.js";
-import { apiUrl, pageUrl } from "./urls.js";
+import { apiUrl, currentScope, pageUrl } from "./urls.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
@@ -1561,8 +1563,17 @@ function wireMainlineControls() {
   syncStaleToggle();
   syncUnassignedToggle();
 
-  envSelect.addEventListener("change",
-    () => setEnvironment(envSelect.value));
+  // WP-33: the select is shared with the "Difference from" tab, which
+  // handles its own change there (compare.js renderEnvironmentFilter).
+  // This listener outlives a tab switch, and on that tab
+  // state.streamId is null -- so without the guard it would load
+  // MAINLINE's dashboard and un-hide it under the comparison.
+  envSelect.addEventListener("change", () => {
+    if (isDeltaViewActive()) {
+      return;
+    }
+    setEnvironment(envSelect.value);
+  });
   scriptSelect.addEventListener("change", () => {
     state.script = scriptSelect.value;
     refilterBrowse();
@@ -1595,8 +1606,17 @@ function wireMainlineControls() {
       syncUnassignedToggle();
       refilterBrowse();
     });
+  // Same guard, same reason (WP-33): found while wiring the filter.
+  // Before it, Refresh on the "Difference from" tab -- once "Its own
+  // results" had been visited -- also ran refreshAll() and drew the
+  // mainline dashboard beneath the comparison.
   document.getElementById("reload-btn")
-    .addEventListener("click", () => refreshAll());
+    .addEventListener("click", () => {
+      if (isDeltaViewActive()) {
+        return;
+      }
+      refreshAll();
+    });
   document.getElementById("show-more").addEventListener("click", () => {
     loadBrowse(true);
   });
@@ -1674,12 +1694,18 @@ function renderBranchQuickLinks(streamId) {
  * mainline controls exactly once, and reloads.
  */
 function activateOwnResultsTab() {
+  leaveDeltaView();
   document.getElementById("delta-section").hidden = true;
   const envField = document.getElementById("env-filter-field");
   if (envField) {
     envField.hidden = false;
   }
   wireMainlineControls();
+  // WP-33: the other tab can change the environment filter too, and
+  // wireMainlineControls() reads the address bar only the FIRST time
+  // it runs -- so read it again on every activation. The address bar
+  // is the one place both tabs keep this.
+  state.environment = currentScope().environment || "";
   renderBranchQuickLinks(state.streamId);
   document.getElementById("loading-state").hidden = false;
   refreshAll();
@@ -1689,6 +1715,11 @@ function activateOwnResultsTab() {
  * body outright, the same swap compare.js's own initDeltaView() has
  * always done for a branch-scoped page. */
 function activateDiffTab(streamId) {
+  // Abandon any own-results load still in flight: every block of
+  // refreshAll() checks these before it renders, and renderHeadline()
+  // un-hides the very sections this function is about to hide.
+  state.requestSeq++;
+  state.browseSeq++;
   for (const id of DASHBOARD_SECTIONS) {
     document.getElementById(id).hidden = true;
   }

@@ -259,7 +259,14 @@ both `null` exactly when `stream_result` is (nothing to review on that side);
 `assignee` is the triple's current, UNPARTITIONED assignee (the same value a
 mainline view of the same test would show — assigning is never scoped to a
 stream, only annotated with where it was made, see the assignee endpoint
-below).
+below). `environment=<name>` (WP-33) narrows the whole comparison — the six
+counts and the `category=` page alike — to that one environment. The response
+echoes the filter it applied as `environment` (`null` when unfiltered) and
+lists the environments the unfiltered comparison spans as `environments` (the
+stream's own product's; never narrowed by the filter, since it is what a
+filter control offers). An `environment` that is not one of them is not an
+error: it matches nothing, every count is zero, and the echo plus the list let
+the caller say why.
 `GET /api/dashboard`, test detail and test history all accept an optional
 `stream=<id>` (default: mainline).
 
