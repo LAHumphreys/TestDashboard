@@ -28,7 +28,11 @@ tool's debt before building migration 11 on it — is done.
   ledger — one `Step` per migration above 7, everything derived from it,
   `LedgerTest` (server-free) failing the suite when a SQLite migration
   has no MariaDB step. Runbook §G is a procedure; §G.5 is how to add a
-  step. **No spec for the package itself is written yet** — the
+  step. **Feeders are never stopped for an upgrade** (a dozen servers;
+  every feeder's contract defers a push that meets a stopped server);
+  the dry run says whether the SERVER must stop, from the ledger's
+  declaration of which tables a step rewrites. Migration 11 will only
+  create, so it runs under the live server. **No spec for the package itself is written yet** — the
   proposal and its review are in the conversation of 2026-09-30 evening
   and summarised below.
 

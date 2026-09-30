@@ -122,6 +122,27 @@ class LedgerTest(unittest.TestCase):
                 [s for s in statements[:-1]
                  if s.lower().startswith("update schema_version")], [])
 
+    def test_whether_the_server_must_stop_is_read_from_the_ledger(
+            self) -> None:
+        """Runbook §G.3: the feeders are never stopped (a dozen servers;
+        their contract defers a push that meets a stopped server), and
+        the SERVER stops only for a step that rewrites an existing
+        table. The dry run's advice comes from the steps' own
+        declarations, so a creates-only step says "may keep running"
+        and the streams steps say "stop it first", naming the tables."""
+        self.assertEqual(upgrade.rewritten_tables([]), [])
+        creates_only = upgrade.Step(
+            from_version=upgrade.TARGET_VERSION, package="planted",
+            summary="planted",
+            statements=lambda sizes, now: ["CREATE TABLE planted (x INT)"],
+            probes=(upgrade.Probe("planted table", "planted", None),),
+            alters=())
+        self.assertEqual(upgrade.rewritten_tables([creates_only]), [])
+        streams = [s for s in upgrade.LEDGER if s.from_version == 8][0]
+        self.assertIn((9, "latest_runs"),
+                      upgrade.rewritten_tables([streams]))
+        self.assertIn((9, "runs"), upgrade.rewritten_tables([streams]))
+
     def test_row_count_tables_are_the_altered_ones_runs_first(
             self) -> None:
         self.assertEqual(upgrade._ROW_COUNT_TABLES[0], "runs")

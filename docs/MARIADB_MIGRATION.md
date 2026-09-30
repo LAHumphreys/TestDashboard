@@ -1234,22 +1234,51 @@ partway looks like a rollback plan right up until the moment it is
 needed. Keep it until the upgrade has been live and quiet for at least a
 day, the same as the full-migration export directory (§E.6).
 
-### G.3 Stop, dry run, live, verify
+### G.3 Dry run, live, verify — and whether anything stops
 
-Stop the feeder, then the service, first. The app checks
-`schema_version` only when it starts, so a running server would in fact
-keep serving old code through the upgrade (that is how the 2026-08-11
-run went) — but its connections wait at most ten seconds for a lock,
-and an `ALTER TABLE` holds one for as long as it takes; a push arriving
-mid-step is a failed push, not a queued one. The drop needs the restart
-anyway, so stopping first costs the seconds the steps take and buys a
-dump with nothing written after it and no request meeting a
-half-changed schema.
+**The feeders need no action — ever.** There are more than a dozen of
+them on as many servers now, and coordinating a stop across them is
+not a procedure anyone can run; nor is it needed. The import contract
+already makes an unreachable dashboard "deferred, not lost", per
+feeder:
+
+| Feeder | A push that meets a stopped server |
+|---|---|
+| `run_feeder.py` (the site feeder, every 10 minutes) | Exits 1 with the batch in a replay file; the high-water mark moves **only when no batch failed**, and the next 10-minute run re-pushes the whole window anyway. Self-healing within one cycle |
+| `clients/feeder.py` / `feeder.tcl` (single-file engine) | Retries for under a minute, then writes a replay file that its **next invocation resends automatically** before its own batch. Self-healing at the next run |
+| `clients/feeder_micro.py` | Writes nothing; exits 1 meaning "re-invoke me". Self-healing only if the framework retries its cleanup step — a run nobody re-invokes is a visible gap on the board, not lost data (re-running later is safe; the server upserts) |
+
+So expect replay resends in feeder logs for the hour after an upgrade,
+and count nothing as missing until a run has pushed since the restart.
+A push that arrives while the server is UP but a step is mid-`ALTER`
+on the table it writes is the one case that is a failed push rather
+than a deferred one — see the next paragraph for when that can happen.
+
+**Whether the SERVER must stop depends on the step, and the tool says
+which.** The app checks `schema_version` only when it starts, so old
+code keeps serving through the upgrade (that is how the 2026-08-11 run
+went) and refuses only at its next start. What decides it is the
+ledger's own declaration of which existing tables a step rewrites:
+
+- **A step that only creates tables** (migration 11's shape) touches
+  nothing the running server reads or writes. Run it with the server
+  up; the only gap is the restart into the new code, which every drop
+  has. A push landing during the step is just a push.
+- **A step that rewrites an existing table** (an `ALTER TABLE` on
+  `latest_runs`, say) holds that table's lock for as long as it takes,
+  and the app's connections wait ten seconds at most — a push arriving
+  mid-step fails and is deferred by its feeder as above, a page read
+  mid-step errors. Stop the server first for those; the window is the
+  step's own duration plus the restart.
+
+The dry run prints which of the two applies to the steps it will run,
+naming the tables. Do what it says.
 
 ```bash
-# systemctl stop testboard          # and the feeder's timer/cron, as in §E.2
 $ python3 tools/upgrade_mariadb_schema.py upgrade \
     --config ~/.testboard-migrate.cnf --dry-run
+# then, ONLY if the dry run said so:
+# systemctl stop testboard
 ```
 
 The dry run prints, in this order: the rollback command with real values
@@ -1322,11 +1351,15 @@ with the two `SHOW CREATE TABLE` texts side by side, and the tool exits
 non-zero. **Do not start the server against a database that failed this
 check** — restore from the dump.
 
-### G.4 Start, verify, first hour
+### G.4 Deploy the code, restart, verify, first hour
 
-Same discipline as §E.4's cutover restart:
+The server must now run the code that carries the migration — a
+restart is never optional after a Python change, and here the old
+process would in any case refuse the new schema at its next start:
 
 ```bash
+# systemctl stop testboard   # if it was still running through G.3
+$ cd /opt/testboard && git fetch && git checkout <this drop's commit>
 # systemctl start testboard
 ```
 

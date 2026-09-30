@@ -367,6 +367,23 @@ def plan(sizes: exporter.Sizes,
     ]
 
 
+def rewritten_tables(steps: Sequence[Step]) -> List[Tuple[int, str]]:
+    """``(target version, table)`` for every existing table one of
+    *steps* rewrites — the list that decides whether the SERVER must
+    stop before the upgrade (runbook §G.3). Empty means every pending
+    step only creates things: the old code keeps serving through it,
+    and the only gap is the restart into the new code. Non-empty means
+    an ALTER holds that table's lock for as long as it takes while the
+    app's connections wait ten seconds at most.
+
+    The feeders never need stopping either way: an unreachable server
+    is "deferred, not lost" under every feeder's contract, and there
+    are too many of them to coordinate.
+    """
+    return [(step.from_version + 1, table)
+            for step in steps for table in step.alters]
+
+
 def ledger_gaps(migration_versions: Sequence[int],
                 ledger: Optional[Sequence[Step]] = None) -> List[str]:
     """Everything wrong with *ledger* (default: ``LEDGER``) against the
@@ -760,6 +777,23 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
             log("  {0} -> {1}  {2}: {3}".format(
                 step.from_version, step.from_version + 1, step.package,
                 step.summary))
+        log("")
+        rewritten = rewritten_tables(pending)
+        if rewritten:
+            log("SERVER: STOP IT FIRST. These steps rewrite existing "
+                "tables, and an ALTER holds the table's lock for as long "
+                "as it takes while the app waits ten seconds at most: "
+                + ", ".join("{0} (step to {1})".format(table, version)
+                            for version, table in rewritten)
+                + ". Feeders need no action - a push that meets a stopped "
+                "server is deferred by every feeder's contract, not lost "
+                "(runbook section G.3).")
+        else:
+            log("SERVER: may keep running. No pending step rewrites an "
+                "existing table - they only create - so the old code "
+                "serves through the upgrade and refuses only at its next "
+                "start. Stop it for the restart into the new code, as "
+                "for any drop. Feeders need no action.")
 
         if args.dry_run:
             log("")

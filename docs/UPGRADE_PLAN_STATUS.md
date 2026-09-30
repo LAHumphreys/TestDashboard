@@ -3757,3 +3757,51 @@ a schema `plan()` built. CI's two 10.3 legs are the authority.
 
 **Next.** Migration 11 for WP-40 is the first step written into this
 shape; the spec for the package itself follows in the next entry.
+
+## 2026-10-01 — WP-40 (1, correction): feeders are never stopped; the ledger says whether the server is
+
+**The user's constraint, the same morning.** "It's now no longer
+possible for us to shut down all feeders before an upgrade — that
+would require coordination across over a dozen servers. If that's
+required, the server needs a way of putting itself into a pre-upgrade
+state." The entry above had imported the August drop note's "stop the
+feeder" step into runbook §G.3. Withdrawn.
+
+**Why no server-side pre-upgrade state is needed.** Checked against
+the feeders as deployed, not assumed: `run_feeder.py` advances its
+high-water mark only when no batch failed (`run_feeder.py`, the
+`failed_batches == 0` guard before `advance_high_water_mark`), keeps a
+one-day overlap, and re-pushes its whole window every ten minutes
+regardless; `clients/feeder.py`/`feeder.tcl` write a replay file after
+under a minute of retries and resend it automatically at their next
+invocation; `clients/feeder_micro.py` writes nothing and exits 1
+meaning "re-invoke me", which is safe because the server upserts. A
+push that meets a stopped server is therefore deferred, not lost, for
+every feeder in the field, with one honest caveat: a micro-client run
+nobody re-invokes is a visible gap on the board until its next run. A
+server that accepted and spooled imports it could not write would be a
+new persistence layer, a new failure class (acknowledged data not yet
+stored), and would cover a gap the clients already cover. Not built.
+
+**What was built instead.** The question that remains is whether the
+SERVER must stop, and that depends on the step: one that only creates
+tables (migration 11's shape) touches nothing the running server
+reads or writes, so old code serves through it — the app checks
+`schema_version` only at start — and the only gap is the drop's own
+restart; one that rewrites an existing table holds its lock while the
+app's connections wait ten seconds at most, so a push mid-step fails
+(and is deferred by its feeder) and a page read mid-step errors. The
+ledger already declares which tables a step rewrites, so
+`rewritten_tables(steps)` reads it and the dry run prints one of two
+lines — `SERVER: may keep running` or `SERVER: STOP IT FIRST`, naming
+the tables and the step — with "feeders need no action" on both.
+Pinned by `LedgerTest` (13 tests now). §G.3 rewritten around the two
+cases with the per-feeder table; §G.4 now includes deploying the code
+between the stop and the start, which the August wording had left to
+the drop note.
+
+**Measured.** Server-free: 35 tests OK across the ledger and 3.6
+modules. Local MariaDB 12.3: the tool's 21 tests OK, the dry run
+printing `SERVER: STOP IT FIRST … runs (step to 9), … latest_runs
+(step to 9), activity_hours (step to 10), script_hours (step to 10)`
+for the v7 fixture, as it should.
