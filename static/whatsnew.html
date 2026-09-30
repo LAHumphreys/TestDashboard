@@ -6,6 +6,14 @@
   <title>testboard — what's new</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
+  <!-- WP-38: every module this page will import, named up
+       front so the browser fetches them all at once instead
+       of discovering each level as the one before it parses.
+       Kept equal to the import graph by
+       tests/test_frontend_calls.py::ModulePreloadTest. -->
+  <link rel="modulepreload" href="whatsnew.js">
+  <link rel="modulepreload" href="nav.js">
+  <link rel="modulepreload" href="urls.js">
 </head>
 <body class="home">
   <header class="site-header">
@@ -16,6 +24,7 @@
       <a href="time.html">Time</a>
       <a href="timeline.html">Timeline</a>
       <a href="watch.html">Watch</a>
+      <a href="metrics.html">Metrics</a>
       <a id="nav-whatsnew" href="whatsnew.html" aria-current="page">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
@@ -35,6 +44,116 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-09-30">
+      <div class="section-head">
+        <h2 class="eyebrow">30 September 2026</h2>
+        <span class="muted">New: filter, comment on and tidy up a build; faster pages; a Metrics page</span>
+      </div>
+
+      <h3>What's new</h3>
+      <ul>
+        <li><strong>An Environment filter on a build's "Difference
+          from" tab.</strong> It is the same <strong>Environment</strong>
+          box that "Its own results" has, in the same place, and the two
+          tabs share it: choose an environment on one and the other
+          opens on it too. Every count and list on the tab is then
+          limited to that environment, and a line under the heading says
+          so. A build that ran on one environment is still compared
+          across the whole product, so its "No result" list is mostly
+          the environments it never ran on — filtering to the one it
+          did run on is how to see what it actually missed. The filter
+          is remembered in the page's address, so a link copied with it
+          on opens with it on.</li>
+        <li><strong>Say why a test is broken on a build.</strong> The
+          "Difference from" list has a new column, <strong>Comment on
+          this build</strong>, showing the latest comment made about
+          that test <em>from this build's page</em> and who made it. A
+          line above the list says how many of the rows shown have one.
+          To add one, press <strong>Review</strong> on a row and use
+          "Add a comment" — it appears on the row at once, without
+          closing anything you had open.</li>
+        <li><strong>Comment on many tests at once.</strong> Tick the
+          rows, type a note in the bar at the bottom of the page, and
+          press <strong>Comment only</strong>. The note is posted on
+          every ticked test and nothing else changes — nobody is
+          assigned or unassigned. This works on every list that has
+          tick boxes, not only on a build's.</li>
+        <li><strong>Delete a build's results for one
+          environment.</strong> For the upload that should not have
+          happened — a build pushed against the wrong environment. At
+          the foot of a build's page, open <strong>Delete results from
+          this build…</strong>, choose the environment, and the page
+          states exactly what will go. You have to type the build's
+          name and give a reason before the button works. Only that
+          build's results on that environment are removed: its other
+          environments, mainline, and every comment and assignment are
+          left alone. If it was the build's only environment, the build
+          disappears. <strong>It cannot be undone</strong>, and if
+          whatever uploaded the results is still sending them, they
+          will come back the next time it does.</li>
+        <li><strong>A Metrics page</strong>. The page shows a summary
+           level view of what the dashboard has been doing since it was
+           last started — counters it keeps in memory, separate from
+           testboard's --perf-log option. It is intended for an administrator to spot
+           an issue so they can enable detailed metric capture (--perf-log) if required.
+           It is expected this will add little overhead to the board's
+           response time - but can be disabled from command line if required.</li>
+      </ul>
+
+      <h3>Faster</h3>
+      <ul>
+        <li><strong>Pages load faster while a run is in
+          progress.</strong> The previous drop added first class support
+          for incremental updates to the dashboard. Each results push
+          that arrives clear's the server cache, and summaries are recomputed
+          again for the next person to open a page.
+
+          That work is now
+          done in one pass over the results instead of five. The
+          Dashboard's headline figures take about half as long to work
+          out as they did; the Time, Timeline and Watch pages no longer
+          ask for the whole estate's summary just to fill in the
+          Product box; and a build's page no longer runs a full
+          comparison before it can draw its heading.</li>
+        <li><strong>A build's results arriving no longer slows the
+          mainline Dashboard, and one environment's arriving no longer
+          slows the others.</strong> The dashboard used to throw away
+          everything it had worked out whenever any results arrived
+          from anywhere. Now it keeps what a batch did not touch: a
+          batch for a build leaves mainline's figures ready; a batch
+          for one environment leaves the other environments' ready.
+          Pushing results costs the same as before.</li>
+        <li><strong>The Dashboard shows its frame at once, and fills
+          it in part by part.</strong> The page's sections appear the
+          moment it arrives, with placeholders, and each fills in as
+          its own data lands: the test list and the triage queue
+          usually first, the headline tiles and charts when the
+          summary is ready — instead of a blank page with "Loading…"
+          until everything is. A tab count that is not yet known reads
+          "…" rather than 0. Every page also tells the browser up front
+          which scripts it needs, so they are all fetched together
+          rather than one layer at a time.</li>
+      </ul>
+
+      <h3>Fixed</h3>
+      <ul>
+        <li><strong>A comment made from a build's row is now recorded
+          against the build.</strong> Until now only a comment typed on
+          the test's own page said which build it was about. One typed
+          in <strong>Review</strong> on a build's list, or as the note
+          on a bulk assignment made there, was recorded with no build
+          at all. Comments made before today keep whatever they were
+          recorded with.</li>
+        <li><strong>Refresh on a build's "Difference from" tab</strong>
+          could draw mainline's dashboard underneath the comparison, if
+          "Its own results" had been opened first. It now refreshes the
+          tab you are on.</li>
+        <li><strong>Refreshing a build's "Difference from" list with a
+          Review panel open</strong> stopped the list at that row with
+          an error. The panel now stays open and the list is
+          complete.</li>
+      </ul>
+    </section>
     <section class="release" data-drop-date="2026-09-24">
       <div class="section-head">
         <h2 class="eyebrow">24 September 2026</h2>

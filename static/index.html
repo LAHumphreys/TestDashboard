@@ -6,6 +6,23 @@
   <title>testboard — dashboard</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
+  <!-- WP-38: every module this page will import, named up
+       front so the browser fetches them all at once instead
+       of discovering each level as the one before it parses.
+       Kept equal to the import graph by
+       tests/test_frontend_calls.py::ModulePreloadTest. -->
+  <link rel="modulepreload" href="app.js">
+  <link rel="modulepreload" href="products.js">
+  <link rel="modulepreload" href="streams.js">
+  <link rel="modulepreload" href="buildadmin.js">
+  <link rel="modulepreload" href="nav.js">
+  <link rel="modulepreload" href="api.js">
+  <link rel="modulepreload" href="charts.js">
+  <link rel="modulepreload" href="compare.js">
+  <link rel="modulepreload" href="review.js">
+  <link rel="modulepreload" href="selection.js">
+  <link rel="modulepreload" href="sorting.js">
+  <link rel="modulepreload" href="urls.js">
 </head>
 <body class="home">
   <header class="site-header">
@@ -16,6 +33,7 @@
       <a href="time.html">Time</a>
       <a href="timeline.html">Timeline</a>
       <a href="watch.html">Watch</a>
+      <a href="metrics.html">Metrics</a>
       <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
     </nav>
     <span id="product-switcher" class="product-switcher" data-host-managed
@@ -72,8 +90,23 @@
 
     <p id="loading-state" class="empty-state">Loading…</p>
 
-    <!-- ============ Latest results ============ -->
-    <section id="status-section" aria-labelledby="status-heading" hidden>
+    <!-- ============ Latest results ============
+         NOT hidden in the shipped markup (WP-38), unlike every section
+         below it: the frame of the page -- its heading and the row of
+         tiles, with placeholders -- is on screen the moment the HTML
+         parses, before a script has loaded or a request been answered.
+         renderStatus() replaces the placeholders in place; a build's
+         page (?stream=) hides the whole section synchronously in
+         app.js's init(), before its first request, so the frame shows
+         there for the time it takes the script to run and no longer.
+         The placeholder labels are the real tiles' labels, pinned to
+         them by tests/test_frontend_calls.py::FirstPaintTest. The
+         three sections below it ship visible for the same reason:
+         each fills in when its OWN request lands -- the queue rows and
+         the browse page usually before the headline -- and a section
+         that appeared only then would push everything under it down.
+         -->
+    <section id="status-section" aria-labelledby="status-heading">
       <div class="section-head">
         <h2 id="status-heading" class="eyebrow">Latest results</h2>
         <span id="status-meta" class="muted"></span>
@@ -83,11 +116,19 @@
            the newest of them and says nothing about the one you are
            waiting on. -->
       <p id="env-updated" class="env-updated"></p>
-      <div id="stat-tiles" class="tile-row"></div>
+      <div id="stat-tiles" class="tile-row">
+        <div class="tile tile-hero tile-skeleton"><span class="tile-label">Pass rate</span><span class="tile-value">…</span></div>
+        <div class="tile tile-skeleton"><span class="tile-label">Reported</span><span class="tile-value">…</span></div>
+        <div class="tile tile-skeleton"><span class="tile-label">New failures</span><span class="tile-value">…</span></div>
+        <div class="tile tile-skeleton"><span class="tile-label">Still failing</span><span class="tile-value">…</span></div>
+        <div class="tile tile-skeleton"><span class="tile-label">Newly fixed</span><span class="tile-value">…</span></div>
+        <div class="tile tile-skeleton"><span class="tile-label">Stale annotations</span><span class="tile-value">…</span></div>
+        <div class="tile tile-skeleton"><span class="tile-label">Not run</span><span class="tile-value">…</span></div>
+      </div>
     </section>
 
     <!-- ============ Charts ============ -->
-    <section id="charts-section" aria-label="Charts" hidden>
+    <section id="charts-section" aria-label="Charts">
       <div class="chart-grid">
         <div class="card">
           <!-- Per DAY, not per night: a suite can run more than once in
@@ -126,7 +167,7 @@
     </section>
 
     <!-- ============ Triage queues ============ -->
-    <section id="triage-section" aria-labelledby="triage-heading" hidden>
+    <section id="triage-section" aria-labelledby="triage-heading">
       <div class="section-head">
         <h2 id="triage-heading" class="eyebrow">Triage</h2>
         <span id="triage-meta" class="muted"></span>
@@ -155,7 +196,7 @@
     </section>
 
     <!-- ============ All tests (browse) ============ -->
-    <section id="browse-section" aria-labelledby="browse-heading" hidden>
+    <section id="browse-section" aria-labelledby="browse-heading">
       <div class="section-head">
         <h2 id="browse-heading" class="eyebrow">All tests</h2>
         <span id="browse-meta" class="muted"></span>
@@ -236,6 +277,10 @@
            delta-tiles/delta-agree/etc. from showing. Hidden outright
            for mainline scope, or a build with no predecessor to name. -->
       <p id="delta-verdict" class="muted" hidden></p>
+      <!-- WP-33: states the Environment filter in force on this tab, in
+           words, from the server's own echo of what it applied. Hidden
+           when the comparison is unfiltered. -->
+      <p id="delta-environment-note" class="muted" hidden></p>
       <div id="delta-tiles" class="tile-row"></div>
       <p id="delta-agree" class="muted"></p>
       <p id="delta-coverage" class="muted"></p>
@@ -246,6 +291,9 @@
       <p id="delta-drift" class="muted" hidden></p>
       <p id="delta-stale-warning" class="empty-state" hidden></p>
       <div id="delta-tabs" class="tab-row" role="tablist" aria-label="Comparison categories"></div>
+      <!-- WP-35: how many of the rows listed have a comment posted
+           from this build. Counted from the rows on the page. -->
+      <p id="delta-commented" class="muted" hidden></p>
       <div class="table-wrap">
         <table class="data-table" id="delta-table">
           <thead>
@@ -253,6 +301,7 @@
               <th>Test</th>
               <th id="delta-col-baseline">Mainline</th>
               <th id="delta-col-stream">This build</th>
+              <th id="delta-col-comment">Comment on this build</th>
               <th>Assignee</th>
               <th>Output</th>
             </tr>
@@ -263,11 +312,58 @@
       <p id="delta-empty" class="empty-state" hidden></p>
       <button id="delta-show-more" type="button" hidden>Show more</button>
     </section>
+
+    <!-- ============ Delete a build's results (WP-34) ============
+         Hidden in the shipped markup; buildadmin.js shows it only on a
+         page opened ?stream=<id>, collapsed, and fetches nothing until
+         it is opened. Below both of a build's tabs, on purpose: it is
+         the last thing on the page, not one of the things the page is
+         for. -->
+    <details id="build-admin" class="charts-details build-admin" hidden>
+      <summary class="charts-summary">Delete results from this build…</summary>
+      <div class="build-admin-body">
+        <p id="build-admin-intro" class="muted"></p>
+        <div class="table-wrap">
+          <table class="data-table small" id="build-admin-table" hidden>
+            <thead>
+              <tr>
+                <th>Environment</th>
+                <th>Tests</th>
+                <th>Runs</th>
+                <th>Last ran</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="build-admin-rows"></tbody>
+          </table>
+        </div>
+        <div id="build-admin-form" class="build-admin-form" hidden>
+          <p id="build-admin-target" class="build-admin-target"></p>
+          <p id="build-admin-consequence" class="muted"></p>
+          <label class="build-admin-field">Why is this being deleted?
+            <input id="build-admin-reason" type="text" autocomplete="off">
+          </label>
+          <label class="build-admin-field">
+            <span id="build-admin-confirm-label"></span>
+            <input id="build-admin-confirm" type="text" autocomplete="off"
+                   spellcheck="false">
+          </label>
+          <div class="build-admin-actions">
+            <button id="build-admin-delete" type="button"
+                    class="build-admin-delete" disabled>Delete</button>
+            <button id="build-admin-cancel" type="button">Cancel</button>
+          </div>
+        </div>
+        <p id="build-admin-status" class="muted" role="status" hidden></p>
+        <a id="build-admin-back" href="index.html" hidden>Back to mainline</a>
+      </div>
+    </details>
   </main>
 
   <script type="module" src="app.js"></script>
   <script type="module" src="products.js"></script>
   <script type="module" src="streams.js"></script>
+  <script type="module" src="buildadmin.js"></script>
   <script type="module" src="nav.js"></script>
 </body>
 </html>

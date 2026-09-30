@@ -36,13 +36,20 @@ import {
   clearNode,
   el,
   fetchJson,
+  formatTime,
   ghostChip,
   resultChip,
   showError,
 } from "./api.js";
 import { reopenIfOpen, toggleReview } from "./review.js";
 import { mountSelectableTable } from "./selection.js";
-import { apiUrl, pageUrl, withBaseline, withStream } from "./urls.js";
+import {
+  apiUrl,
+  pageUrl,
+  withBaseline,
+  withEnvironment,
+  withStream,
+} from "./urls.js";
 
 /** The five paginable comparison categories, in tab/tile display order. */
 export const CATEGORY_ORDER = [
@@ -161,6 +168,20 @@ export async function fetchCompare(streamId, category, offset, baselineId) {
   }));
 }
 
+/**
+ * Who is being compared with whom, and nothing else (WP-36): the two
+ * identities a build's page needs before it can draw its header, on
+ * whichever tab it opens. `counts=0` asks the server not to run the
+ * comparison; a server that does not know the parameter runs it anyway
+ * and the answer still carries both identities.
+ */
+export async function fetchCompareIdentity(streamId, baselineId) {
+  return fetchJson(apiUrl("api/compare", { counts: "0" }, {
+    stream: streamId,
+    baseline: baselineId === undefined ? null : baselineId,
+  }));
+}
+
 /** Every test compared, including the ones that agree — counts.agree is
  * a real field precisely so this total does not have to be re-derived
  * from a category fetch nobody asked for. */
@@ -222,8 +243,64 @@ export function renderTiles(container, counts) {
  * review.js having to know whose page it is on (it explicitly cannot;
  * see its module docstring).
  */
-function deltaReviewOptions() {
-  return {};
+function deltaReviewOptions(onCommented) {
+  return {
+    onChanged: (change) => {
+      if (change.kind === "commented" && onCommented) {
+        onCommented(change.value);
+      }
+    },
+  };
+}
+
+/**
+ * What somebody said about this test ON THIS BUILD (WP-35) -- the
+ * newest comment posted from the stream being compared, as the server
+ * chose it (`row.stream_comment`). Never a comment from anywhere else:
+ * a remark about why a test fails on mainline is not a remark about
+ * this build, and the test's own page shows the whole thread with each
+ * comment's origin. An empty cell says nothing rather than "no
+ * comments" -- the test may well have some, just none from here.
+ */
+function fillDeltaCommentCell(cell, comment) {
+  clearNode(cell);
+  if (!comment) {
+    return;
+  }
+  cell.appendChild(el("span", "comment-text", comment.text));
+  cell.appendChild(el("span", "row-sub",
+    comment.author + " · " + formatTime(comment.created_at)));
+}
+
+/**
+ * "9 of the 22 listed have a comment on this build." Counted from the
+ * rows on the page, and worded to say so: when "Show more" has not yet
+ * brought the whole category in, the sentence names how many are shown
+ * and how many there are. (A count across the whole category would be
+ * a third run of the comparison query per request; the server's own
+ * test pins that at two.)
+ */
+function renderCommentedLine() {
+  const line = document.getElementById("delta-commented");
+  if (!line) {
+    return;
+  }
+  const shown = deltaState.rows.length;
+  if (shown === 0 || !deltaState.streamNoun) {
+    line.hidden = true;
+    return;
+  }
+  const commented = deltaState.rows.filter(
+    (row) => Boolean(row.stream_comment)).length;
+  line.textContent = shown >= deltaState.total
+    ? commented + " of the " + shown + " listed "
+      + (commented === 1 ? "has" : "have") + " a comment on this "
+      + deltaState.streamNoun + "."
+    : commented + " of the " + shown + " shown so far "
+      + (commented === 1 ? "has" : "have") + " a comment on this "
+      + deltaState.streamNoun + " — " + deltaState.total.toLocaleString()
+      + " in all.";
+  line.hidden = false;
 }
 
 /**
@@ -244,6 +321,10 @@ function reviewEntry(row, streamId) {
     stream_id: streamId,
   };
 }
+
+/** Row -> "reopen my Review panel if it was open", run by
+ * loadCategory() once the row is in the table. See buildDeltaRow(). */
+const reopenAfterAttach = new WeakMap();
 
 function buildDeltaRow(row) {
   const tr = document.createElement("tr");
@@ -287,6 +368,20 @@ function buildDeltaRow(row) {
   streamTd.appendChild(streamCell(row.stream_result));
   tr.appendChild(streamTd);
 
+  const commentTd = el("td", "wrap comment-cell");
+  fillDeltaCommentCell(commentTd, row.stream_comment);
+  tr.appendChild(commentTd);
+  // A comment posted from this row's Review panel shows here at once,
+  // in place: reloading the page of rows would close every open panel.
+  const onCommented = (value) => {
+    row.stream_comment = {
+      author: value.author, text: value.text,
+      created_at: value.created_at,
+    };
+    fillDeltaCommentCell(commentTd, row.stream_comment);
+    renderCommentedLine();
+  };
+
   // Triage from a branch (docs/STREAMS_PLAN.md §0.4/§3.6): the SAME
   // assignee select the dashboard's own queue rows use, so a failure
   // found on a branch can be taken/assigned exactly like a mainline one
@@ -307,11 +402,17 @@ function buildDeltaRow(row) {
     reviewBtn.setAttribute("aria-expanded", "false");
     reviewBtn.title = "Show this run's output, and assign it";
     reviewBtn.addEventListener("click", () => toggleReview(
-      entry, tr, reviewBtn, deltaReviewOptions()));
+      entry, tr, reviewBtn, deltaReviewOptions(onCommented)));
     outputTd.appendChild(reviewBtn);
-    // Keep the panel open across the re-render a category switch or
-    // "Show more" triggers — the same rule app.js's queue table follows.
-    reopenIfOpen(entry, tr, reviewBtn, deltaReviewOptions());
+    // Keep the panel open across a re-render (Refresh, a bulk action)
+    // — the same rule app.js's queue table follows. NOT done here:
+    // reopening inserts the panel as this row's next sibling, and the
+    // row has no parent until loadCategory() appends it. Done here, as
+    // it was until WP-35, it threw on the first re-render with a panel
+    // open ("Cannot read properties of null") and the list stopped at
+    // that row.
+    reopenAfterAttach.set(tr, () => reopenIfOpen(
+      entry, tr, reviewBtn, deltaReviewOptions(onCommented)));
   }
   tr.appendChild(outputTd);
 
@@ -343,6 +444,11 @@ function ensureDeltaSelectionMounted() {
 }
 
 const deltaState = {
+  // True from initDeltaView() until leaveDeltaView(): the delta view
+  // shares the toolbar's Environment select and Refresh button with
+  // "Its own results" (WP-33), so both modules need to know whose turn
+  // it is. See isDeltaViewActive().
+  active: false,
   streamId: null,
   // null = mainline (the server's own default) OR "no explicit choice
   // yet" during the initial build-predecessor lookup — see
@@ -351,14 +457,113 @@ const deltaState = {
   category: CATEGORY_ORDER[0],
   offset: 0,
   total: 0,
+  // WP-35: the row objects on the page, in order -- what the
+  // "N of M have a comment" line counts -- and the word for what is
+  // being compared ("build"), set with the column headers.
+  rows: [],
+  streamNoun: "",
 };
 
-async function loadCategory(reset) {
+/**
+ * Whether the delta view currently owns the page's shared toolbar
+ * controls (WP-33). app.js's own listeners on the Environment select
+ * and the Refresh button check this and stand down while it is true:
+ * they were wired for "Its own results", stay wired after a tab switch,
+ * and would otherwise reload the MAINLINE dashboard underneath the
+ * comparison (state.streamId is null on this tab) and un-hide it.
+ */
+export function isDeltaViewActive() {
+  return deltaState.active;
+}
+
+/**
+ * Hand the shared toolbar controls back -- called by app.js when "Its
+ * own results" takes over. The Refresh button's handler is cleared
+ * because initDeltaView() assigned it: left in place, Refresh on the
+ * other tab would bring the comparison back on top of it.
+ */
+export function leaveDeltaView() {
+  deltaState.active = false;
+  const reload = document.getElementById("reload-btn");
+  if (reload) {
+    reload.onclick = null;
+  }
+}
+
+/**
+ * The Environment filter on the "Difference from" tab (WP-33) -- the
+ * SAME toolbar select "Its own results" uses, so the filter sits in one
+ * place and a choice made on either tab is the other tab's choice too
+ * (both read and write `environment=` in the address bar, nothing
+ * else).
+ *
+ * Every word and every option comes from the response: `environments`
+ * is the list the server compared across, `environment` is the filter
+ * it actually applied. A server that sends no list (a process not yet
+ * restarted onto this drop) gets the pre-WP-33 behaviour -- the field
+ * hidden -- rather than a control that filters nothing.
+ */
+function renderEnvironmentFilter(data, streamId) {
+  const field = document.getElementById("env-filter-field");
+  const select = document.getElementById("filter-environment");
+  const note = document.getElementById("delta-environment-note");
+  if (note) {
+    note.hidden = true;
+  }
+  if (!field || !select) {
+    return;
+  }
+  if (!Array.isArray(data.environments)) {
+    field.hidden = true;
+    return;
+  }
+  const applied = data.environment || "";
+  const covered = data.environments.indexOf(applied) !== -1;
+
+  clearNode(select);
+  const allOption = el("option", "", "All environments");
+  allOption.value = "";
+  select.appendChild(allOption);
+  for (const name of data.environments) {
+    const option = el("option", "", name);
+    option.value = name;
+    select.appendChild(option);
+  }
+  if (applied && !covered) {
+    // Never show "All environments" over a filter that is in force.
+    const stray = el("option", "", applied + " (not in this comparison)");
+    stray.value = applied;
+    select.appendChild(stray);
+  }
+  select.value = applied;
+  // Idempotent assignment, the same reasoning as the buttons below.
+  select.onchange = () => {
+    if (!deltaState.active) {
+      return;
+    }
+    window.history.replaceState(null, "", withEnvironment(select.value));
+    initDeltaView(streamId, { keepCategory: true });
+  };
+  field.hidden = false;
+
+  if (note && applied) {
+    note.textContent = covered
+      ? "Showing " + applied + " only — every count and list here is "
+        + "limited to it. The “last ran” times are the whole build’s."
+      : "“" + applied + "” is not one of the environments this "
+        + "comparison covers, so nothing matches. Choose another from "
+        + "the Environment filter.";
+    note.hidden = false;
+  }
+}
+
+async function loadCategory(reset, fetched) {
   const body = document.getElementById("delta-body");
   const empty = document.getElementById("delta-empty");
   const moreBtn = document.getElementById("delta-show-more");
   if (reset) {
     deltaState.offset = 0;
+    deltaState.rows = [];
     clearNode(body);
     // A fresh render (category switch, initial load, or the reload
     // button) is a NEW view; "Show more" (reset=false) joins the SAME
@@ -366,13 +571,21 @@ async function loadCategory(reset) {
     ensureDeltaSelectionMounted();
     deltaSelectionMount.reset();
   }
-  const page = await fetchCompare(
+  // `fetched` is a page initDeltaView() already has in hand (WP-36).
+  const page = fetched || await fetchCompare(
     deltaState.streamId, deltaState.category, deltaState.offset,
     deltaState.baselineId);
   deltaState.total = page.total;
   for (const row of page.tests) {
-    body.appendChild(buildDeltaRow(row));
+    deltaState.rows.push(row);
+    const tr = buildDeltaRow(row);
+    body.appendChild(tr);
+    const reopen = reopenAfterAttach.get(tr);
+    if (reopen) {
+      reopen();
+    }
   }
+  renderCommentedLine();
   deltaState.offset += page.tests.length;
   empty.hidden = body.children.length !== 0;
   if (empty.hidden === false) {
@@ -421,6 +634,11 @@ function renderBaselineCard(streamMeta, baselineMeta, counts, nowMs) {
     baselineMeta.kind === "mainline" ? "Mainline" : baseline;
   document.getElementById("delta-col-stream").textContent =
     "This " + streamNoun;
+  const commentHead = document.getElementById("delta-col-comment");
+  if (commentHead) {
+    commentHead.textContent = "Comment on this " + streamNoun;
+  }
+  deltaState.streamNoun = streamNoun;
 
   document.getElementById("delta-agree").textContent =
     counts.agree + " test" + (counts.agree === 1 ? "" : "s")
@@ -828,9 +1046,15 @@ function renderCompareToControl(streamMeta, baselineMeta, streams) {
  * for any non-mainline stream, because the Compare-to control (which
  * IS how a predecessor gets chosen now) needs it.
  */
-export async function initDeltaView(streamId) {
+export async function initDeltaView(streamId, options) {
+  deltaState.active = true;
   deltaState.streamId = streamId;
-  deltaState.category = CATEGORY_ORDER[0];
+  // WP-33: changing the environment keeps the category tab the reader
+  // was on -- they are narrowing the list in front of them, not
+  // starting again.
+  if (!(options && options.keepCategory)) {
+    deltaState.category = CATEGORY_ORDER[0];
+  }
 
   const loading = document.getElementById("loading-state");
   loading.hidden = false;
@@ -838,14 +1062,17 @@ export async function initDeltaView(streamId) {
   for (const id of MAINLINE_SECTIONS) {
     document.getElementById(id).hidden = true;
   }
-  const envField = document.getElementById("env-filter-field");
-  if (envField) {
-    envField.hidden = true;
-  }
 
   let productStreams = [];
   try {
-    const data = await fetchCompare(streamId, null, 0, getSelectedBaselineId());
+    // WP-36: ONE request for the header and the first page of rows.
+    // A category page carries everything the counts-only answer does
+    // -- both identities, the six counts, the environments -- so
+    // asking for the counts first and the page second ran the
+    // comparison for the counts twice over, one after the other, and
+    // the rows waited for both.
+    const data = await fetchCompare(
+      streamId, deltaState.category, 0, getSelectedBaselineId());
     if (data.stream.kind !== "mainline") {
       productStreams = await fetchProductStreams(data.stream.product);
     }
@@ -854,6 +1081,7 @@ export async function initDeltaView(streamId) {
     renderBranchBand(data.stream, data.baseline);
     renderBuildFraming(data.stream, Date.now());
     renderCompareToControl(data.stream, data.baseline, productStreams);
+    renderEnvironmentFilter(data, streamId);
     renderTiles(document.getElementById("delta-tiles"), data.counts);
     renderBaselineCard(data.stream, data.baseline, data.counts, Date.now());
     renderTabs();
@@ -865,7 +1093,7 @@ export async function initDeltaView(streamId) {
     renderBuildVerdict(streamId, data, productStreams).catch(() => {});
     document.getElementById("delta-section").hidden = false;
     loading.hidden = true;
-    await loadCategory(true);
+    await loadCategory(true, data);
   } catch (err) {
     loading.hidden = true;
     showError(err.message);

@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>testboard — metrics</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <!-- WP-38: every module this page will import, named up
+       front so the browser fetches them all at once instead
+       of discovering each level as the one before it parses.
+       Kept equal to the import graph by
+       tests/test_frontend_calls.py::ModulePreloadTest. -->
+  <link rel="modulepreload" href="metrics.js">
+  <link rel="modulepreload" href="nav.js">
+  <link rel="modulepreload" href="api.js">
+  <link rel="modulepreload" href="urls.js">
+</head>
+<body class="home">
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html">Dashboard</a>
+      <a href="actions.html">Open actions</a>
+      <a href="time.html">Time</a>
+      <a href="timeline.html">Timeline</a>
+      <a href="watch.html">Watch</a>
+      <a href="metrics.html" aria-current="page">Metrics</a>
+      <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
+    </nav>
+  </header>
+
+  <main class="wide">
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <!-- WP-37. One request fills this page, made when the page is
+         opened or Refresh is pressed and at no other time: there is no
+         timer here. A page of counters that polled would be traffic of
+         its own in the figures it shows. -->
+    <section class="toolbar" aria-label="Counters">
+      <span id="metrics-since" class="muted toolbar-meta"></span>
+      <span class="toolbar-spacer"></span>
+      <button id="metrics-reset" type="button"
+              title="Start counting again from nothing. Changes no data.">Reset counters</button>
+      <button id="reload-btn" type="button">Refresh</button>
+    </section>
+    <p id="metrics-not-collecting" class="empty-state" hidden></p>
+
+    <section aria-labelledby="metrics-requests-heading">
+      <div class="section-head">
+        <h2 id="metrics-requests-heading" class="eyebrow">Requests, by where the time went</h2>
+        <span id="metrics-requests-meta" class="muted"></span>
+      </div>
+      <p class="muted">
+        “Waited” is time queued for a free worker before the request
+        was looked at. A slow request that waited is a busy server; one
+        that did not is a slow query. They have opposite cures.
+      </p>
+      <div class="table-wrap">
+        <table class="data-table small" id="metrics-requests">
+          <thead>
+            <tr>
+              <th>Request</th>
+              <th>Count</th>
+              <th>Mean</th>
+              <th>95% within</th>
+              <th>Slowest</th>
+              <th>Waited, mean</th>
+              <th>Storage calls</th>
+              <th>In storage</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody id="metrics-requests-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="metrics-slowest-heading">
+      <div class="section-head">
+        <h2 id="metrics-slowest-heading" class="eyebrow">Slowest requests</h2>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table small" id="metrics-slowest">
+          <thead>
+            <tr>
+              <th>When (UTC)</th>
+              <th>Request</th>
+              <th>Status</th>
+              <th>Took</th>
+              <th>Waited</th>
+              <th>Storage calls</th>
+              <th>In storage</th>
+            </tr>
+          </thead>
+          <tbody id="metrics-slowest-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="metrics-storage-heading">
+      <div class="section-head">
+        <h2 id="metrics-storage-heading" class="eyebrow">Storage methods, by where the time went</h2>
+      </div>
+      <p class="muted">
+        One row per method of the storage layer — the unit the
+        performance log uses too. A method’s time includes any other
+        storage method it called, so this column does not add up to
+        the time spent in storage; the “In storage” column above does.
+      </p>
+      <div class="table-wrap">
+        <table class="data-table small" id="metrics-storage">
+          <thead>
+            <tr>
+              <th>Method</th>
+              <th>Calls</th>
+              <th>Mean</th>
+              <th>Slowest</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody id="metrics-storage-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="metrics-memo-heading">
+      <div class="section-head">
+        <h2 id="metrics-memo-heading" class="eyebrow">Summary memo</h2>
+      </div>
+      <p id="metrics-memo" class="muted"></p>
+    </section>
+
+    <section aria-labelledby="metrics-database-heading">
+      <div class="section-head">
+        <h2 id="metrics-database-heading" class="eyebrow">Database</h2>
+        <span id="metrics-database-meta" class="muted"></span>
+      </div>
+      <p id="metrics-database-summary"></p>
+      <div class="table-wrap">
+        <table class="data-table small" id="metrics-parts">
+          <thead>
+            <tr><th>On disk</th><th>Size</th></tr>
+          </thead>
+          <tbody id="metrics-parts-body"></tbody>
+        </table>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table small" id="metrics-rows">
+          <thead>
+            <tr>
+              <th>Table</th>
+              <th>Rows</th>
+              <th id="metrics-rows-size-head" hidden>Size</th>
+            </tr>
+          </thead>
+          <tbody id="metrics-rows-body"></tbody>
+        </table>
+      </div>
+      <p id="metrics-rows-note" class="muted"></p>
+      <div class="table-wrap">
+        <table class="data-table small" id="metrics-streams">
+          <thead>
+            <tr>
+              <th>Stream</th>
+              <th>Product</th>
+              <th>Tests</th>
+              <th>Environments</th>
+            </tr>
+          </thead>
+          <tbody id="metrics-streams-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="metrics.js"></script>
+  <script type="module" src="nav.js"></script>
+</body>
+</html>

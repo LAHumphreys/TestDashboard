@@ -63,14 +63,16 @@ import { attachSorting, sortRows } from "./sorting.js";
 import { mountSelectableTable } from "./selection.js";
 import { getSelectedProduct, renderSwitcher } from "./products.js";
 import {
-  fetchCompare,
+  fetchCompareIdentity,
   getSelectedBaselineId,
   getSelectedStreamId,
   initDeltaView,
+  isDeltaViewActive,
+  leaveDeltaView,
   renderBranchBand,
   streamLabel,
 } from "./compare.js";
-import { apiUrl, pageUrl } from "./urls.js";
+import { apiUrl, currentScope, pageUrl } from "./urls.js";
 
 /** Rows fetched per page of the All-tests table ("Show more" adds one). */
 const CHUNK = 250;
@@ -295,6 +297,7 @@ async function refreshAll() {
       state.browseRows = tagStream(page.tests);
       state.browseTotal = page.total;
       renderBrowse(state.browseRows, false);
+      document.getElementById("browse-section").hidden = false;
     } catch (err) {
       if (seq === state.requestSeq) {
         showError(err.message);
@@ -323,13 +326,18 @@ async function loadQueue(kind, seq) {
       return;
     }
     tagStream(payload.queue.tests);
+    // WP-38: the queue's own payload carries the clock and the cutoff
+    // the table needs, so it renders the moment it lands rather than
+    // waiting for the headline -- which is the slowest of the three
+    // requests and used to gate all of them.
+    payload.queue.generated_at = payload.generated_at;
+    payload.queue.stale_before = payload.stale_before;
     state.queues[kind] = payload.queue;
-    if (state.summary) {
-      renderQueueTabs();
-      if (state.activeQueue === kind) {
-        renderQueueTable();
-      }
+    renderQueueTabs();
+    if (state.activeQueue === kind) {
+      renderQueueTable();
     }
+    document.getElementById("triage-section").hidden = false;
   } catch (err) {
     if (seq === state.requestSeq) {
       showError(err.message);
@@ -854,6 +862,25 @@ function queueCount(queueId) {
   return totals ? (totals[queueId] || 0) : 0;
 }
 
+/** True once SOMETHING can say how big `queueId` is. Before that a
+ * badge reads "…", not "0": a zero that is really "not yet known" is
+ * exactly the kind of number people act on. */
+function queueCountKnown(queueId) {
+  return Boolean(state.queues[queueId])
+    || Boolean(state.summary && state.summary.queue_totals);
+}
+
+/** The server's clock for the rows on screen: the headline's once it
+ * has landed, else the active queue's own. Both are the same server
+ * clock; the queue merely arrived first. */
+function serverClock() {
+  if (state.summary) {
+    return state.summary.generated_at;
+  }
+  const queue = state.queues[state.activeQueue];
+  return queue ? queue.generated_at : null;
+}
+
 function openQueue(queueId) {
   state.activeQueue = queueId;
   renderQueues();
@@ -900,7 +927,7 @@ function renderQueueTabs() {
     btn.appendChild(el("span",
       "tab-count" + (tab.id === "new_failures" && count > 0
         ? " tab-count-hot" : ""),
-      String(count)));
+      queueCountKnown(tab.id) ? String(count) : "…"));
     btn.addEventListener("click", () => {
       state.activeQueue = tab.id;
       renderQueues();
@@ -914,9 +941,13 @@ function renderQueueTabs() {
   const problems = queueCount("new_failures")
     + queueCount("still_failing")
     + queueCount("unexpected_passes");
-  document.getElementById("all-clear").hidden = problems !== 0;
+  // "All clear" is a claim about three queues; it waits until all
+  // three are known, which the headline is the first to say.
+  const known = ["new_failures", "still_failing", "unexpected_passes"]
+    .every(queueCountKnown);
+  document.getElementById("all-clear").hidden = !known || problems !== 0;
   document.getElementById("triage-meta").textContent =
-    problems === 0 ? "" : problems.toLocaleString() + " open items";
+    !known || problems === 0 ? "" : problems.toLocaleString() + " open items";
 }
 
 /** Column sets per queue: header + cell builder. */
@@ -1003,8 +1034,7 @@ function queueColumns(queueId) {
       }
       cell.appendChild(document.createTextNode(
         formatNight(entry.failing_since)));
-      const nights = nightsBetween(entry.failing_since,
-        state.summary.generated_at);
+      const nights = nightsBetween(entry.failing_since, serverClock());
       if (nights >= 1) {
         cell.appendChild(el("span", "row-sub",
           nights + (nights === 1 ? " night" : " nights")));
@@ -1123,8 +1153,10 @@ function reviewOptions() {
   // value gates the offer to retire a test. Recomputing it here from
   // recent_hours would re-introduce the bug where every test looks
   // abandoned on a Monday.
+  const queue = state.queues[state.activeQueue];
   return {
-    staleBefore: state.summary ? state.summary.stale_before : null,
+    staleBefore: state.summary ? state.summary.stale_before
+      : (queue ? queue.stale_before : null),
     onChanged: () => refreshQueueCounts(),
     onRetired: () => refreshSummary(),
   };
@@ -1561,8 +1593,17 @@ function wireMainlineControls() {
   syncStaleToggle();
   syncUnassignedToggle();
 
-  envSelect.addEventListener("change",
-    () => setEnvironment(envSelect.value));
+  // WP-33: the select is shared with the "Difference from" tab, which
+  // handles its own change there (compare.js renderEnvironmentFilter).
+  // This listener outlives a tab switch, and on that tab
+  // state.streamId is null -- so without the guard it would load
+  // MAINLINE's dashboard and un-hide it under the comparison.
+  envSelect.addEventListener("change", () => {
+    if (isDeltaViewActive()) {
+      return;
+    }
+    setEnvironment(envSelect.value);
+  });
   scriptSelect.addEventListener("change", () => {
     state.script = scriptSelect.value;
     refilterBrowse();
@@ -1595,8 +1636,17 @@ function wireMainlineControls() {
       syncUnassignedToggle();
       refilterBrowse();
     });
+  // Same guard, same reason (WP-33): found while wiring the filter.
+  // Before it, Refresh on the "Difference from" tab -- once "Its own
+  // results" had been visited -- also ran refreshAll() and drew the
+  // mainline dashboard beneath the comparison.
   document.getElementById("reload-btn")
-    .addEventListener("click", () => refreshAll());
+    .addEventListener("click", () => {
+      if (isDeltaViewActive()) {
+        return;
+      }
+      refreshAll();
+    });
   document.getElementById("show-more").addEventListener("click", () => {
     loadBrowse(true);
   });
@@ -1674,12 +1724,18 @@ function renderBranchQuickLinks(streamId) {
  * mainline controls exactly once, and reloads.
  */
 function activateOwnResultsTab() {
+  leaveDeltaView();
   document.getElementById("delta-section").hidden = true;
   const envField = document.getElementById("env-filter-field");
   if (envField) {
     envField.hidden = false;
   }
   wireMainlineControls();
+  // WP-33: the other tab can change the environment filter too, and
+  // wireMainlineControls() reads the address bar only the FIRST time
+  // it runs -- so read it again on every activation. The address bar
+  // is the one place both tabs keep this.
+  state.environment = currentScope().environment || "";
   renderBranchQuickLinks(state.streamId);
   document.getElementById("loading-state").hidden = false;
   refreshAll();
@@ -1689,6 +1745,11 @@ function activateOwnResultsTab() {
  * body outright, the same swap compare.js's own initDeltaView() has
  * always done for a branch-scoped page. */
 function activateDiffTab(streamId) {
+  // Abandon any own-results load still in flight: every block of
+  // refreshAll() checks these before it renders, and renderHeadline()
+  // un-hides the very sections this function is about to hide.
+  state.requestSeq++;
+  state.browseSeq++;
   for (const id of DASHBOARD_SECTIONS) {
     document.getElementById(id).hidden = true;
   }
@@ -1739,8 +1800,12 @@ async function initBranchDashboard(streamId) {
     // that decision is made rather than fetched afterwards -- a build-
     // scoped page therefore now pays this one extra counts-only request
     // it did not pay before (a branch-scoped page always did).
+    // WP-36: the IDENTITIES only. This used to be the whole
+    // comparison, run for the two names in it: thrown away unread on
+    // "Its own results", and run again by initDeltaView() on the
+    // other tab.
     const [compareData, headline] = await Promise.all([
-      fetchCompare(streamId, null, 0, getSelectedBaselineId()),
+      fetchCompareIdentity(streamId, getSelectedBaselineId()),
       fetchJson("api/summary?parts=headline&stream=" + streamId)
         .catch(() => null),
     ]);
@@ -1838,6 +1903,14 @@ function init() {
   // visible change.
   const streamId = getSelectedStreamId();
   if (streamId !== null) {
+    // WP-38: index.html ships the status section VISIBLE, as the
+    // page's frame before any request is answered. A build's page
+    // opens on one of its own tabs instead, so the frame goes now --
+    // synchronously, before the first fetch -- not when the tab
+    // decision lands.
+    for (const id of SECTIONS) {
+      document.getElementById(id).hidden = true;
+    }
     initBranchDashboard(streamId);
     return;
   }

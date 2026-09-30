@@ -47,6 +47,7 @@ from typing import (
 )
 
 from testboard import analytics, model, site_notes
+from testboard.metrics import Metrics
 from testboard.model import Result, RunRecord, StoredRun, ValidationError
 from testboard.storage import (
     COMPARE_CATEGORIES,
@@ -56,6 +57,7 @@ from testboard.storage import (
     Comment,
     CompareCounts,
     CompareRow,
+    DerivedTablesDisagree,
     FailureStreak,
     RollupCount,
     Storage,
@@ -1349,6 +1351,70 @@ def _products_summary(
     ]
 
 
+def _handle_metrics(
+    storage: Storage, metrics: Optional[Metrics]
+) -> Response:
+    """GET /api/metrics — what the server has been doing, and how big
+    the database is (WP-37). The Metrics page's one request.
+
+    ``activity`` is :meth:`testboard.metrics.Metrics.snapshot`: every
+    request route and storage method since the process started or the
+    counters were last reset, and the slowest requests with their
+    targets. ``{"collecting": false}`` when the server was started with
+    ``--no-metrics``. ``memo`` is how the summary memo has done over
+    the same period. ``database`` is :meth:`Storage.size_report`.
+
+    Asking costs the person asking and nobody else: the counters are
+    merged from memory, and the sizes are read here — kept for a
+    minute — and at no other time.
+    """
+    return _json_response(200, {
+        "activity": (
+            {"collecting": False} if metrics is None
+            else metrics.snapshot()),
+        "memo": storage.memo_report(),
+        "database": storage.size_report(),
+    })
+
+
+def _handle_metrics_reset(
+    storage: Storage, metrics: Optional[Metrics]
+) -> Response:
+    """POST /api/metrics/reset — start counting again from nothing.
+
+    For "reset, do the thing that feels slow, look": totals since the
+    process started are an average over everything, and say little
+    about the last five minutes. Changes no data; the database and the
+    memo's contents are untouched.
+    """
+    if metrics is not None:
+        metrics.reset()
+    storage.reset_memo_counts()
+    return _json_response(200, {"reset": True})
+
+
+def _handle_products(storage: Storage) -> Response:
+    """GET /api/products — the declared products, by name (WP-36).
+
+    ``{"products": [{"product": <name>}, ...]}``, sorted; an empty list
+    when none is declared. One read of ``environment_products``.
+
+    For the product switcher and the Watch page's picker on the pages
+    that have no summary of their own to take the list from (Time,
+    Timeline, Watch, the test and script pages). They were fetching
+    ``/api/summary?parts=headline`` for it — every headline number of
+    the whole estate, computed and sent, to read the names out of one
+    field. The entries are objects, not bare strings, so they are the
+    same shape ``/api/summary``'s ``products`` has and the same code
+    reads both.
+    """
+    return _json_response(200, {
+        "products": [
+            {"product": name} for name in storage.distinct_products()
+        ],
+    })
+
+
 def _handle_summary(
     storage: Storage,
     request: Request,
@@ -2130,6 +2196,72 @@ def _validate_test_entry_stream_id(
     return raw_stream_id
 
 
+def _parse_test_entries(
+    storage: Storage, raw_tests: Any
+) -> List[Tuple[str, str, str, Optional[int]]]:
+    """A ``tests`` list as ``(environment, script, test_name,
+    stream_id)`` — the explicit selection both bulk endpoints act on.
+    Every entry is validated before anything is written; see
+    :func:`_validate_test_entry_field` for why a bad one is a 400
+    rather than a skipped row.
+    """
+    if not isinstance(raw_tests, list):
+        raise _HttpError(
+            400,
+            "tests: must be a list, got {}".format(
+                type(raw_tests).__name__),
+        )
+    entries = []  # type: List[Tuple[str, str, str, Optional[int]]]
+    for index, raw in enumerate(raw_tests):
+        if not isinstance(raw, dict):
+            raise _HttpError(
+                400,
+                "tests[{}]: must be an object, got {}".format(
+                    index, type(raw).__name__),
+            )
+        environment = _validate_test_entry_field(raw, "environment", index)
+        script = _validate_test_entry_field(raw, "script", index)
+        test_name = _validate_test_entry_field(raw, "test_name", index)
+        stream_id = _validate_test_entry_stream_id(storage, raw, index)
+        entries.append((environment, script, test_name, stream_id))
+    return entries
+
+
+def _handle_bulk_comments(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/comments/bulk — one comment on each of a list of tests
+    (WP-35). Changes no assignment.
+
+    Body: ``{"username": <str>, "text": <str>, "tests": [{environment,
+    script, test_name, stream_id?}, ...]}``. ``tests`` is the same list
+    ``POST /api/assignments/bulk`` takes in list mode, validated the
+    same way; each entry's ``stream_id`` is where THAT comment is
+    recorded as posted from — a selection made on a build's page
+    carries the build, one made on a mainline page carries none.
+
+    An empty ``tests`` is a 400: a comment on nothing is a page that
+    lost its selection, not a request. A test that no longer has a
+    row on any stream is counted in ``unknown`` and skipped.
+
+    Response: ``{"commented": N, "unknown": M}``.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    text = _validate_comment_text(obj)
+    if "tests" not in obj:
+        raise _HttpError(400, "tests: required field is missing")
+    entries = _parse_test_entries(storage, obj["tests"])
+    if not entries:
+        raise _HttpError(400, "tests: must name at least one test")
+    commented, unknown = storage.bulk_add_comment(
+        username, text, now(), entries)
+    return _json_response(
+        200, {"commented": commented, "unknown": unknown})
+
+
 def _handle_bulk_assignments_list(
     storage: Storage,
     obj: Dict[str, Any],
@@ -2166,27 +2298,7 @@ def _handle_bulk_assignments_list(
     """
     assignee, assigned_by, comment_text = _parse_bulk_assignment_body(
         storage, obj)
-
-    raw_tests = obj["tests"]
-    if not isinstance(raw_tests, list):
-        raise _HttpError(
-            400,
-            "tests: must be a list, got {}".format(
-                type(raw_tests).__name__),
-        )
-    entries = []  # type: List[Tuple[str, str, str, Optional[int]]]
-    for index, raw in enumerate(raw_tests):
-        if not isinstance(raw, dict):
-            raise _HttpError(
-                400,
-                "tests[{}]: must be an object, got {}".format(
-                    index, type(raw).__name__),
-            )
-        environment = _validate_test_entry_field(raw, "environment", index)
-        script = _validate_test_entry_field(raw, "script", index)
-        test_name = _validate_test_entry_field(raw, "test_name", index)
-        stream_id = _validate_test_entry_stream_id(storage, raw, index)
-        entries.append((environment, script, test_name, stream_id))
+    entries = _parse_test_entries(storage, obj["tests"])
 
     updated, unknown = storage.bulk_set_assignee_for_triples(
         assignee, assigned_by, now(), entries, comment_text=comment_text,
@@ -2420,7 +2532,12 @@ def _handle_timeline(
             environment = product_environments[0]
     if not environment:
         raise _HttpError(400, "environment: required parameter is missing")
-    if environment not in storage.known_environments():
+    # WP-36: three seeks for one name. It was `environment not in
+    # storage.known_environments()` -- the whole list, a scan of every
+    # stream's latest_runs, to look one name up in it; measured at 6-12
+    # ms of this request (WP-32 addendum), which a page with Follow on
+    # repeats every ten seconds for as long as it is open.
+    if not storage.environment_exists(environment):
         raise _HttpError(
             404,
             "unknown environment: no runs recorded for {}".format(
@@ -3058,8 +3175,147 @@ def _handle_streams_list(storage: Storage, request: Request) -> Response:
     )
 
 
+def _stream_from_path(storage: Storage, raw: str) -> Stream:
+    """The stream a ``/api/streams/{id}/...`` path names; 404 if none."""
+    try:
+        stream_id = int(raw)
+    except ValueError:
+        raise _HttpError(404, "unknown stream: {}".format(raw))
+    stream = storage.get_stream(stream_id)
+    if stream is None:
+        raise _HttpError(404, "unknown stream: {}".format(stream_id))
+    return stream
+
+
+def _handle_stream_environments(
+    storage: Storage, raw_stream: str
+) -> Response:
+    """GET /api/streams/{id}/environments — what a build holds, per
+    environment (WP-34).
+
+    The figures a person is shown BEFORE deleting one: how many tests
+    and how many runs the build has on each environment, and when it
+    last ran there. Read from the build's own partitions of the derived
+    tables (:meth:`Storage.stream_environments`), so asking costs the
+    build's size and nothing more. ``deletable`` is false for mainline,
+    which no endpoint here will delete from.
+    """
+    stream = _stream_from_path(storage, raw_stream)
+    return _json_response(
+        200,
+        {
+            "stream": _stream_json(stream),
+            "deletable": stream.kind != "mainline",
+            "environments": [
+                {
+                    "environment": row.environment,
+                    "tests": row.tests,
+                    "runs": row.runs,
+                    "last_run": model.format_iso(row.last_run),
+                }
+                for row in storage.stream_environments(stream.stream_id)
+            ],
+        },
+    )
+
+
+def _handle_stream_environment_delete(
+    storage: Storage, request: Request, raw_stream: str, environment: str
+) -> Response:
+    """POST /api/streams/{id}/environments/{environment}/delete —
+    delete what one build holds for one environment (WP-34). Cannot be
+    undone.
+
+    Body: ``{"username": <str>, "reason": <str>, "confirm": <str>}``,
+    all three required. ``confirm`` must be the build's name, exactly:
+    this dashboard has no login, so anyone who can open a page can send
+    this request, and typing the name back is the one thing that
+    separates a decision from a slip. ``username`` and ``reason`` are
+    written to the server log with the row counts; nothing in the
+    schema records a deletion, and adding somewhere that did would
+    have been a migration.
+
+    POST, not DELETE, because the HTTP shell speaks GET/POST/PUT and
+    one endpoint is not a reason to teach it a fourth method.
+
+    Refusals, each before anything is touched: an unknown stream is
+    404; mainline is 400; a wrong or missing ``confirm`` is 400; an
+    environment the build holds nothing for is 404. If the derived
+    tables disagree with the runs stored (see
+    :meth:`Storage.delete_stream_environment`) the answer is 409 and
+    nothing has been deleted.
+
+    Response: ``{"deleted": {<table>: <rows>}, "stream_deleted":
+    <bool>, "stream": <stream or null>, ...}``. ``stream_deleted`` is
+    true when that was the build's only environment: the build is gone
+    and its id will 404 from now on.
+
+    A delete does not prevent the same records being imported again.
+    """
+    stream = _stream_from_path(storage, raw_stream)
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    reason = _validate_comment_text(obj, field="reason")
+    if stream.kind == "mainline":
+        raise _HttpError(
+            400, "mainline results cannot be deleted from here")
+    confirm = obj.get("confirm")
+    if not isinstance(confirm, str) or confirm != stream.name:
+        raise _HttpError(
+            400,
+            "confirm: must be the build's name exactly ('{}') — nothing "
+            "was deleted".format(stream.name),
+        )
+    held = [
+        row for row in storage.stream_environments(stream.stream_id)
+        if row.environment == environment
+    ]
+    if not held:
+        raise _HttpError(
+            404,
+            "{} {} has no results on environment '{}'".format(
+                stream.kind, stream.name, environment),
+        )
+    try:
+        deleted = storage.delete_stream_environment(
+            stream.stream_id, environment)
+    except DerivedTablesDisagree as exc:
+        _LOGGER.error(
+            "build results NOT deleted: stream=%s (%s:%s, product %r) "
+            "environment=%r by=%r: %s",
+            stream.stream_id, stream.kind, stream.name, stream.product,
+            environment, username, exc)
+        raise _HttpError(
+            409,
+            "nothing was deleted: the dashboard's summary tables do not "
+            "match the runs stored for this build ({}). This needs an "
+            "operator.".format(exc),
+        )
+    _LOGGER.warning(
+        "build results deleted: stream=%s (%s:%s, product %r) "
+        "environment=%r by=%r reason=%r rows=%s",
+        stream.stream_id, stream.kind, stream.name, stream.product,
+        environment, username, reason,
+        ", ".join(
+            "{}={}".format(table, deleted[table])
+            for table in sorted(deleted)))
+    remaining = storage.get_stream(stream.stream_id)
+    return _json_response(
+        200,
+        {
+            "deleted": deleted,
+            "environment": environment,
+            "deleted_by": username,
+            "reason": reason,
+            "stream_deleted": remaining is None,
+            "stream": (
+                None if remaining is None else _stream_json(remaining)),
+        },
+    )
+
+
 def _handle_compare(storage: Storage, request: Request) -> Response:
-    """GET /api/compare?stream=&baseline=&category=&limit=&offset=
+    """GET /api/compare?stream=&baseline=&environment=&category=&limit=&offset=
 
     docs/STREAMS_PLAN.md §3.5/§4.1. ``stream`` is required. ``baseline``
     defaults to mainline; since WP-22 it may also be any stream of the
@@ -3076,6 +3332,32 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
     The response carries both sides' identity and freshness
     (``last_seen``) so the UI can build its own honesty line ("baseline
     N days old") from data, never from a constant.
+
+    ``environment`` (WP-33), when given, narrows the WHOLE comparison —
+    the six counts and the paginated list alike — to that one
+    environment. The response echoes it back as ``environment`` (null
+    when no filter was applied) and lists the environments the
+    unfiltered comparison spans as ``environments`` (the stream's own
+    product's, the same allow-list the comparison has always used), so
+    the page builds its filter from what the server compared rather than
+    from a list of its own. An ``environment`` that is not one of them
+    is NOT an error: it matches nothing, every count is zero, and the
+    echo plus the list are what let the page say why. This endpoint was
+    already being sent ``environment=`` by every page that carried one
+    in its URL (urls.js carries scope by default) and ignored it; a 4xx
+    here would turn links that work today into pages that cannot load.
+
+    ``counts=0`` (WP-36), without ``category``, returns the two
+    identities and the environment list with ``counts: null`` and runs
+    no comparison at all. Any other value, or any request naming a
+    category, is answered in full as before.
+
+    Each row of a ``category`` page carries ``stream_comment`` (WP-35):
+    the newest comment posted FROM ``stream``, or null. It is read in
+    the page query's own select list, for the rows returned and no
+    others — there is deliberately no count of commented tests across
+    the whole category, which would be a third run of the pairs SQL
+    (see the WP-23 note below, and the test that pins it at two).
     """
     raw_stream = _query_single(request.query, "stream")
     if raw_stream is None:
@@ -3142,13 +3424,41 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
     )
     offset = _parse_int_param(request, "offset", 0, 0, _MAX_OFFSET)
 
-    counts = storage.compare_counts(stream_id, baseline_id=baseline_id)
+    # WP-33. An empty value is "no filter", the same reading every
+    # other optional filter here gives it.
+    environment = _query_single(request.query, "environment") or None
+
+    # WP-36: `counts=0` asks who is being compared with whom and
+    # nothing else -- a build's page needs both names before it can
+    # draw its header, on whichever tab it opens, and was paying for a
+    # whole comparison to get them.
+    if (_query_single(request.query, "counts") == "0"
+            and category is None):
+        return _json_response(
+            200,
+            {
+                "stream": _stream_json(stream),
+                "baseline": _stream_json(baseline),
+                "environment": environment,
+                "environments": storage.environments_for_product(
+                    stream.product),
+                "counts": None,
+                "category": None,
+                "tests": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+
+    counts = storage.compare_counts(
+        stream_id, baseline_id=baseline_id, environment=environment)
     tests = []  # type: List[Dict[str, Any]]
     total = 0
     if category is not None:
         rows = storage.compare_category(
             stream_id, category, baseline_id=baseline_id, limit=limit,
-            offset=offset,
+            offset=offset, environment=environment,
         )
         # WP-23 perf pass: every /api/compare?category= request used to
         # run the expensive pairs SQL (_compare_pairs_sql) THREE times —
@@ -3190,6 +3500,16 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
                     else model.format_iso(row.stream_start_time)
                 ),
                 "assignee": row.assignee,
+                # WP-35: the newest comment posted FROM this stream, or
+                # null -- never one posted from anywhere else.
+                "stream_comment": (
+                    None if row.stream_comment is None else {
+                        "author": row.stream_comment.author,
+                        "created_at": model.format_iso(
+                            row.stream_comment.created_at),
+                        "text": row.stream_comment.text,
+                    }
+                ),
             }
             for row in rows
         ]
@@ -3199,6 +3519,9 @@ def _handle_compare(storage: Storage, request: Request) -> Response:
         {
             "stream": _stream_json(stream),
             "baseline": _stream_json(baseline),
+            "environment": environment,
+            "environments": storage.environments_for_product(
+                stream.product),
             "counts": {
                 "new_failures": counts.new_failures,
                 "new_passes": counts.new_passes,
@@ -3432,6 +3755,12 @@ def _handle_watch(
     pass_view = _pass_view(storage, now_value)
     all_passes = pass_view.passes
     estate_cutoff = pass_view.cutoff.when
+    # WP-36: the rollup FIRST. It is one pass over mainline's partition
+    # and keeps each environment's newest start as it goes, so the
+    # "last reported" read a few lines down is answered from it rather
+    # than by a second pass of its own. Read again by name further
+    # down, from the memo.
+    storage.summary_rollup(estate_cutoff)
     known_environments = set(storage.known_environments())
     env_to_product = storage.environment_products_map()
     product_to_envs = {}  # type: Dict[str, List[str]]
@@ -3829,6 +4158,7 @@ def _route(
     request: Request,
     now: Callable[[], datetime.datetime],
     site_notes_path: Optional[str] = None,
+    metrics: Optional[Metrics] = None,
 ) -> Response:
     """Match the decoded path segments to a handler and dispatch.
 
@@ -3859,9 +4189,25 @@ def _route(
         _check_method(request.method, ("POST",))
         return _handle_bulk_assignments(storage, request, now)
 
+    if rest == ["comments", "bulk"]:
+        _check_method(request.method, ("POST",))
+        return _handle_bulk_comments(storage, request, now)
+
     if rest == ["summary"]:
         _check_method(request.method, ("GET",))
         return _handle_summary(storage, request, now)
+
+    if rest == ["products"]:
+        _check_method(request.method, ("GET",))
+        return _handle_products(storage)
+
+    if rest == ["metrics"]:
+        _check_method(request.method, ("GET",))
+        return _handle_metrics(storage, metrics)
+
+    if rest == ["metrics", "reset"]:
+        _check_method(request.method, ("POST",))
+        return _handle_metrics_reset(storage, metrics)
 
     if rest == ["time"]:
         _check_method(request.method, ("GET",))
@@ -3904,6 +4250,17 @@ def _route(
     if rest == ["compare"]:
         _check_method(request.method, ("GET",))
         return _handle_compare(storage, request)
+
+    if (len(rest) == 3 and rest[0] == "streams"
+            and rest[2] == "environments"):
+        _check_method(request.method, ("GET",))
+        return _handle_stream_environments(storage, rest[1])
+
+    if (len(rest) == 5 and rest[0] == "streams"
+            and rest[2] == "environments" and rest[4] == "delete"):
+        _check_method(request.method, ("POST",))
+        return _handle_stream_environment_delete(
+            storage, request, rest[1], rest[3])
 
     if rest == ["users"]:
         _check_method(request.method, ("GET", "POST"))
@@ -3981,19 +4338,23 @@ def handle_api(
     request: Request,
     now: Callable[[], datetime.datetime] = model.utcnow,
     site_notes_path: Optional[str] = None,
+    metrics: Optional[Metrics] = None,
 ) -> Response:
     """Handle one API request and ALWAYS return a JSON :class:`Response`.
 
     This is the single entry point the HTTP server calls for every path
     under ``/api``. *storage* is the injected storage layer; *now* is the
-    clock (injectable for tests). Errors are JSON ``{"error": "message"}``
+    clock (injectable for tests); *metrics* is the server's counters,
+    read by ``GET /api/metrics`` and by nothing else in this module —
+    ``None`` when the server is not collecting any. Errors are JSON
+    ``{"error": "message"}``
     bodies — never HTML: 400 for validation failures, 404 for unknown
     routes/resources, 405 for a known path with the wrong method (the
     response then carries an ``Allow`` header listing permitted methods),
     and 500 for unexpected internal failures (logged with traceback).
     """
     try:
-        return _route(storage, request, now, site_notes_path)
+        return _route(storage, request, now, site_notes_path, metrics)
     except _HttpError as exc:
         return _json_response(
             exc.status, {"error": exc.message}, exc.headers

@@ -347,6 +347,51 @@ class MariaDBBackend(object):
         print("vacuum: no-op on MariaDB (InnoDB manages its own space; "
               "see OPTIMIZE TABLE if reclaiming disk is the goal)")
 
+    #: What the Metrics page calls this engine.
+    engine_name = "MariaDB"
+
+    def size_report(self, conn: Any) -> Dict[str, Any]:
+        """What the database weighs, from the server's own catalogue.
+
+        ``information_schema.TABLES`` for this schema: one statement,
+        no table read. ``data_length``/``index_length`` are InnoDB's own
+        figures; ``table_rows`` is InnoDB's ESTIMATE, reported as one —
+        the exact counts on the page come from ``Storage.size_report``.
+        """
+        rows = conn.execute(
+            "SELECT table_name, table_rows, data_length, index_length "
+            "FROM information_schema.TABLES "
+            "WHERE table_schema = DATABASE()").fetchall()
+        tables = {}  # type: Dict[str, Dict[str, int]]
+        data = 0
+        indexes = 0
+        for row in rows:
+            data += int(row[2] or 0)
+            indexes += int(row[3] or 0)
+            tables[str(row[0])] = {
+                "bytes": int(row[2] or 0) + int(row[3] or 0),
+                "rows_estimate": int(row[1] or 0),
+            }
+        version = conn.execute("SELECT VERSION()").fetchone()[0]
+        return {
+            "engine": self.engine_name,
+            "version": str(version),
+            "bytes": data + indexes,
+            "parts": [
+                {"label": "Data", "bytes": data},
+                {"label": "Indexes", "bytes": indexes},
+            ],
+            "tables": tables,
+        }
+
+    def suspend_foreign_keys(self, conn: Any) -> None:
+        """No-op: this schema declares no foreign keys at all (runbook
+        §B.6), so there is no per-row check to suspend. See the SQLite
+        backend's method for what this is the counterpart of."""
+
+    def restore_foreign_keys(self, conn: Any) -> None:
+        """No-op, as :meth:`suspend_foreign_keys`."""
+
 
 def describe_connect_error(settings: Settings, exc: BaseException) -> str:
     """A startup failure message an operator can act on.

@@ -84,11 +84,17 @@ __all__ = [
 _ROUTE_ACTIONS = frozenset([
     "active",
     "assignee",
+    "bulk",
     "comments",
+    "delete",
+    "environments",
     "executions",
     "expectation",
     "history",
+    "product",
+    "reset",
     "retired",
+    "streams",
 ])
 
 _PLACEHOLDER = "*"

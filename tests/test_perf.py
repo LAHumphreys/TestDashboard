@@ -243,6 +243,32 @@ class RouteLabelTest(unittest.TestCase):
             "GET /api/scripts/*/*/executions")
 
     def test_a_run_id_collapses(self) -> None:
+        # Added with the endpoints that carry them (WP-34/35/37), so a
+        # bulk comment and a bulk assignment, or a reset and a read,
+        # are not one row.
+        self.assertEqual(
+            perf.route_label("POST", "/api/assignments/bulk"),
+            "POST /api/assignments/bulk")
+        self.assertEqual(
+            perf.route_label("POST", "/api/comments/bulk"),
+            "POST /api/comments/bulk")
+        self.assertEqual(
+            perf.route_label("POST", "/api/metrics/reset"),
+            "POST /api/metrics/reset")
+        self.assertEqual(
+            perf.route_label(
+                "POST", "/api/streams/7/environments/win-sim/delete"),
+            "POST /api/streams/*/environments/*/delete")
+        self.assertEqual(
+            perf.route_label("GET", "/api/streams/7/environments"),
+            "GET /api/streams/*/environments")
+        self.assertEqual(
+            perf.route_label("PUT", "/api/environments/win-sim/product"),
+            "PUT /api/environments/*/product")
+        self.assertEqual(
+            perf.route_label(
+                "GET", "/api/tests/linux/suite.py/test_x/streams"),
+            "GET /api/tests/*/*/*/streams")
         self.assertEqual(perf.route_label("GET", "/api/runs/914238"),
                          "GET /api/runs/*")
 

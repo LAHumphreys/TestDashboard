@@ -64,6 +64,7 @@ import urllib.parse
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type, cast
 
 from testboard import api
+from testboard import metrics as metrics_module
 from testboard import perf as perf_module
 from testboard.storage import DEFAULT_MAX_CONNECTIONS, Storage
 
@@ -211,8 +212,11 @@ class ThreadingHTTPServer(http.server.HTTPServer):
     static_dir = ""  # type: str
     static_cache = None  # type: Dict[str, _CachedFile]
     static_cache_lock = None  # type: threading.Lock
-    #: Optional performance log; None means nothing is measured at all.
+    #: Optional performance log; None means nothing is written to disk.
     perf = None  # type: Optional[perf_module.PerfLog]
+    #: In-memory counters for the Metrics page (WP-37); None means the
+    #: server was asked not to keep any.
+    metrics = None  # type: Optional[metrics_module.Metrics]
     #: Optional path to this site's own What's new notes; None disables
     #: them (the endpoint then reports an empty list, not a 404).
     site_notes_path = None  # type: Optional[str]
@@ -447,8 +451,12 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             # A request is arriving: this is work, not waiting.
             self.connection.settimeout(_ACTIVE_SECONDS)
             started = time.time()
+            # Where this thread's storage totals stand as the request
+            # begins; what it used is the difference (WP-37).
+            counters = getattr(self.server, "metrics", None)
+            mark = None if counters is None else counters.mark()
             self.handle_one_request()
-            self._record_request(started, first=(served == 0))
+            self._record_request(started, first=(served == 0), mark=mark)
             served += 1
             if self.close_connection:
                 return
@@ -557,7 +565,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 except OSError:
                     return False    # connection reset while idle
 
-    def _record_request(self, started: float, first: bool) -> None:
+    def _record_request(
+        self, started: float, first: bool,
+        mark: Optional[Tuple[int, float]] = None,
+    ) -> None:
         """Log how long this request took, and how long it queued.
 
         The queue wait belongs to the CONNECTION, so it is attributed to
@@ -569,12 +580,19 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         It is the field worth having. "This request took 4 seconds" does
         not distinguish a slow query from a server with no free worker;
         "3.9 of those 4 seconds were spent queued" does.
+
+        The same figures go to the in-memory counters (WP-37) when the
+        server keeps them, whether or not there is a log: *mark* is
+        where this thread's storage totals stood as the request began.
         """
         server = cast(ThreadingHTTPServer, self.server)
         log = getattr(server, "perf", None)
-        if log is None:
+        counters = getattr(server, "metrics", None)
+        if log is None and counters is None:
             return
+        elapsed = time.time() - started
         extra = {}  # type: Dict[str, Any]
+        waited = None  # type: Optional[float]
         if first:
             arrival = getattr(server, "_arrival", None)
             waited = getattr(arrival, "waited", None) if arrival else None
@@ -597,8 +615,18 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         else:
             raw_path = getattr(self, "path", None) or "/"
             path = raw_path.split("?", 1)[0]
-        log.record("request", perf_module.route_label(method, path),
-                   time.time() - started, extra)
+        if counters is not None:
+            try:
+                counters.record_request(
+                    metrics_module.route_label(method, path), elapsed,
+                    status, waited, mark,
+                    getattr(self, "path", None) or path)
+            except Exception:                        # pragma: no cover
+                # A counter must never be why a request failed.
+                pass
+        if log is not None:
+            log.record("request", perf_module.route_label(method, path),
+                       elapsed, extra)
 
     def _pool_is_contended(self) -> bool:
         """True when another connection is queued for a worker."""
@@ -747,7 +775,8 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         server = cast(ThreadingHTTPServer, self.server)
         response = api.handle_api(
             server.storage, request,
-            site_notes_path=getattr(server, "site_notes_path", None))
+            site_notes_path=getattr(server, "site_notes_path", None),
+            metrics=getattr(server, "metrics", None))
         self._write_response(response.status, response.headers, response.body)
 
     # ------------------------------------------------------------------
@@ -1019,6 +1048,7 @@ def create_server(
     perf: Optional[perf_module.PerfLog] = None,
     site_notes_path: Optional[str] = None,
     url_prefix: str = DEFAULT_URL_PREFIX,
+    metrics: Optional[metrics_module.Metrics] = None,
 ) -> ThreadingHTTPServer:
     """Create (and bind) the dashboard HTTP server; caller serves/closes it.
 
@@ -1031,6 +1061,10 @@ def create_server(
     :mod:`testboard.perf`). Instrumenting *storage* is the caller's job,
     not done here: a Storage may be shared with something that should not
     be measured, and wrapping it twice would double every record.
+
+    *metrics*, when given, is tallied into per request and served by
+    ``GET /api/metrics`` (see :mod:`testboard.metrics`). As with *perf*,
+    instrumenting *storage* is the caller's job.
 
     *site_notes_path* points at this site's own What's new notes (see
     :mod:`testboard.site_notes`). It is read per request, so a note added
@@ -1060,6 +1094,7 @@ def create_server(
     server.static_cache = {}
     server.static_cache_lock = threading.Lock()
     server.perf = perf
+    server.metrics = metrics
     server.site_notes_path = site_notes_path
     server.url_prefix = url_prefix.strip("/")
     return server

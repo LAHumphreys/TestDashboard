@@ -259,7 +259,46 @@ both `null` exactly when `stream_result` is (nothing to review on that side);
 `assignee` is the triple's current, UNPARTITIONED assignee (the same value a
 mainline view of the same test would show — assigning is never scoped to a
 stream, only annotated with where it was made, see the assignee endpoint
-below).
+below). `environment=<name>` (WP-33) narrows the whole comparison — the six
+counts and the `category=` page alike — to that one environment. The response
+echoes the filter it applied as `environment` (`null` when unfiltered) and
+lists the environments the unfiltered comparison spans as `environments` (the
+stream's own product's; never narrowed by the filter, since it is what a
+filter control offers). An `environment` that is not one of them is not an
+error: it matches nothing, every count is zero, and the echo plus the list let
+the caller say why.
+
+`counts=0` (WP-36), on a request with no `category=`, returns the two
+identities and the environment list with `counts: null` and runs no comparison
+— what a build's page asks before it draws its header. Any other value, and
+any request naming a category, is answered in full.
+
+`GET /api/products` (WP-36) is the declared products by name,
+`{"products": [{"product": "Atlas"}, ...]}`, sorted, from one read of the
+declarations and no read of any test result. It exists for pages that want the
+product list and nothing else; `/api/summary`'s own `products` field is
+unchanged and carries the same names with their counts.
+
+`GET /api/streams/<id>/environments` (WP-34) reports what one stream holds, per
+environment: `{stream, deletable, environments: [{environment, tests, runs,
+last_run}]}`. It is read from the stream's own partitions of the derived
+tables, so it costs the build's size and never scans `runs`. `deletable` is
+`false` for mainline. `POST /api/streams/<id>/environments/<environment>/delete`
+deletes what that build holds for that one environment — runs, their output,
+and the build's partitions of the three derived tables — and **cannot be
+undone**. The body is `{"username", "reason", "confirm"}`, all required;
+`confirm` must be the build's name exactly (the dashboard has no login, so
+typing the name back is what separates a decision from a slip). Mainline is
+refused (`400`), as is a wrong `confirm` (`400`) and an environment the build
+holds nothing for (`404`). The response is `{deleted: {<table>: <rows>},
+stream_deleted, stream, environment, deleted_by, reason}`; `stream_deleted` is
+`true` when that was the build's only environment, in which case the build
+itself is gone and its id is `404` from then on. Comments and assignments are
+never deleted. Who deleted what, and why, is written to the server log at
+`WARNING`; nothing in the database records it. **A delete does not block a
+re-import**: a feeder still sending those records will put them back. The
+whole-build equivalent remains `tools/drop_stream.py`, run with the server
+stopped.
 `GET /api/dashboard`, test detail and test history all accept an optional
 `stream=<id>` (default: mainline).
 
@@ -734,7 +773,11 @@ endpoint, a different way of saying which tests to act on. Body carries
   bad shape is a bug worth surfacing immediately rather than skipping the
   row silently. An unknown `stream_id` is a `404`, same index-naming.
 - `"username"`/`"assigned_by"`/`"comment"` follow the identical rules
-  filter mode uses above.
+  filter mode uses above. In list mode the comment is recorded as posted
+  from each entry's own `stream_id` (WP-35) — a note typed while assigning
+  from a build's page is a comment on that build. Before WP-35 it was
+  written with no origin whatever the entry said. Filter mode still writes
+  none, for the reason given above.
 - A triple absent from `latest_runs` (on ANY stream) is **not** a failure
   — the page that built the selection may be stale (a retirement, or the
   test simply never having reported) — it is counted in the response
@@ -745,6 +788,35 @@ Response: `{"updated": 3, "unknown": 1}` — a **different shape** from
 filter mode's `{"updated": N}` (filter mode has no "unknown": a match is
 always current, read in the same transaction it acts on).
 `updated + unknown` is the count of DISTINCT triples named in `"tests"`.
+
+### POST /api/comments/bulk — one comment on each of a list of tests
+
+Added WP-35, for the multi-select bar's "Comment only": the thirty failures
+that share one cause. It changes no assignment.
+
+```json
+{
+  "username": "amy", "text": "feature flag is off on this branch",
+  "tests": [
+    {"environment": "linux-sim", "script": "suite/alpha.py",
+     "test_name": "test_x", "stream_id": 7}
+  ]
+}
+```
+
+`"username"` and `"text"` are required, validated as `POST .../comments`
+validates them. `"tests"` is the same list the endpoint above takes in list
+mode, validated the same way and as a whole before anything is written;
+an empty list is a `400`. Each entry's optional `"stream_id"` is where THAT
+comment is recorded as posted from. Response: `{"commented": 3, "unknown":
+1}`, with `unknown` meaning what it means above.
+
+A comment posted from a build — by this endpoint, by the note on a list-mode
+bulk assignment, by `POST .../comments` with a `stream_id` — is what
+`GET /api/compare` returns as that row's `stream_comment`: the newest comment
+posted FROM the stream being compared, `{author, created_at, text}` or
+`null`. A comment posted from anywhere else never appears there; the test's
+own thread (`GET .../comments`) always carries every comment with its origin.
 
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 
@@ -1466,6 +1538,55 @@ A note whose date matches a release section appears inside it; every note is
 visibly attributed to the site rather than blended into testboard's own notes,
 because a tester who cannot tell "testboard changed" from "our environment
 changed" cannot tell who to ask about it.
+
+### What the server is doing now — the Metrics page
+
+`metrics.html` (linked from every page's nav bar) shows, without anyone logging
+on to the server: every request route and every storage method since the
+process started — count, mean, the time 95% of them finished within, the
+slowest, the **time queued for a worker**, and how many storage calls a request
+made and how long they took; the twenty slowest requests with what they asked
+for; how the summary memo is doing (served from it, computed instead, and how
+many times a write has cleared it); and the database — engine, schema version,
+size on disk, rows per table, tests per stream, and the date range of the runs
+on record.
+
+**On unless asked not to be** (`run_server.py --no-metrics`), because it was
+built to cost nothing a request would notice:
+
+- The counters are in memory. There is no file and no query behind them.
+- **Nothing a request does takes a lock to be counted.** Each worker tallies
+  into its own dictionaries; only reading the page merges them.
+  `tests/test_metrics.py::NoLockOnTheRequestPathTest` replaces the lock with
+  one that counts and fails the build if that stops being true.
+- Measured on the development machine: 1.3 millionths of a second per storage
+  call and per request. Against an untallied copy of the same database, the
+  same requests issued alternately sixty times: a warm home-page summary 0.630
+  ms against 0.647, a cold one 30.3 ms against 30.6 — inside the variation
+  between runs.
+- The database figures are read **when the page asks**, kept for a minute, and
+  at no other time. None of them scans `runs`: its row count is the sum of the
+  hourly activity table (0.3 ms, against 55 ms to count 656,680 runs on the
+  dev-scale estate), and `run_outputs` is not counted at all.
+- The page makes one request when it is opened and one each time Refresh is
+  pressed. It has no timer.
+
+**Reset counters** starts the counting again from nothing and changes no data.
+Totals since the process started are an average over everything; "reset, do
+the thing that feels slow, look" is how to see the last five minutes.
+
+`GET /api/metrics` returns `{activity, memo, database}`; `POST
+/api/metrics/reset` returns `{"reset": true}`. With `--no-metrics`, `activity`
+is `{"collecting": false}` and the rest is unchanged. A storage method's time
+is **inclusive** — it contains the time of any other storage method it called —
+so that column does not add up to the time spent in storage; a request's "in
+storage" figure counts the outermost call only, and does. On MariaDB the
+per-table sizes are the server's own (`information_schema`), and its row
+estimates are reported as estimates beside the exact counts.
+
+This is not the performance log below and does not replace it. The log keeps
+every record, on disk, with its time, so a stall at 03:14 can be read at 09:00;
+these are totals, in memory, gone when the process stops.
 
 ### Finding out where the time went, after the fact
 

@@ -19,6 +19,7 @@ Covers, per the build-spec checklist:
 
 import datetime
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -2830,10 +2831,20 @@ class TestSummary(ApiCase):
         # (same join, same predicate, but stream_id is its LAST AND,
         # not its WHERE) that legitimately still runs once, for the
         # headline's status.assigned_open field, not a queue total.
+        # WIDENED for WP-38, not weakened: test_counts_by_environment
+        # now counts one environment per statement ("SELECT COUNT(*)
+        # ... WHERE lr.stream_id = ? AND lr.environment = ?", no result
+        # predicate) so a push into one environment re-counts that one.
+        # A per-kind count is told apart by what a queue predicate
+        # reads -- a result, a previous result, a start time, an
+        # assignee -- which a plain test count never mentions.
         per_kind_counts = [
             s for s in seen
             if s.strip().upper().startswith("SELECT COUNT(*)")
             and "WHERE lr.stream_id = " in s
+            and any(token in s for token in (
+                "lr.result", "lr.prev_result", "lr.start_time",
+                "ca.assignee"))
         ]
         self.assertEqual(
             per_kind_counts, [],
@@ -5582,6 +5593,611 @@ class TestStreamsEndpoint(ApiCase):
         withempty = self.call(
             "GET", "/api/streams", query={"product": [""]})["streams"]
         self.assertEqual(without, withempty)
+
+
+class TestPerformancePassEndpoints(ApiCase):
+    """WP-36: the two requests that exist so a page can ask for less,
+    and the one that stopped asking for a list to look up one name."""
+
+    BRANCH_TIMES = {
+        "start_time": "2026-07-25T03:00:00.000000",
+        "end_time": "2026-07-25T03:00:03.000000",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a"),
+            record(environment="win-sim", test_name="test_a"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def _traced(self, method: str, path: str,
+                query: Dict[str, List[str]]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        conn.set_trace_callback(lambda statement: seen.append(statement))
+        try:
+            self.call(method, path, query=query)
+        finally:
+            conn.set_trace_callback(None)
+        return seen
+
+    # -- /api/products ------------------------------------------------
+
+    def test_no_products_is_an_empty_list(self) -> None:
+        self.assertEqual(
+            self.call("GET", "/api/products"), {"products": []})
+
+    def test_products_are_listed_by_name_in_order(self) -> None:
+        for environment, product in (("win-sim", "Zephyr"),
+                                     ("linux-sim", "Atlas")):
+            self.call(
+                "PUT", "/api/environments/{}/product".format(environment),
+                body={"product": product, "username": "amy"})
+        data = self.call("GET", "/api/products")
+        self.assertEqual(
+            data, {"products": [{"product": "Atlas"},
+                                {"product": "Zephyr"}]})
+        summary = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        self.assertEqual(
+            [entry["product"] for entry in summary["products"]],
+            [entry["product"] for entry in data["products"]])
+
+    def test_the_product_list_reads_no_test_results(self) -> None:
+        """The point of it: a page that wants the names must not make
+        the server count the estate to get them."""
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        statements = self._traced("GET", "/api/products", {})
+        self.assertEqual(len(statements), 1, statements)
+        self.assertNotIn("latest_runs", statements[0])
+        self.assertNotIn(" runs", statements[0])
+
+    def test_products_accepts_get_only(self) -> None:
+        self.call("POST", "/api/products", body={}, expect=405)
+
+    # -- /api/compare?counts=0 ----------------------------------------
+
+    def test_identity_only_names_both_sides_and_counts_nothing(
+            self) -> None:
+        full = self.call(
+            "GET", "/api/compare", query={"stream": [str(self.stream_id)]})
+        lean = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)], "counts": ["0"]})
+        self.assertIsNone(lean["counts"])
+        self.assertEqual(lean["tests"], [])
+        for field in ("stream", "baseline", "environment",
+                      "environments", "category"):
+            self.assertEqual(lean[field], full[field], field)
+        self.assertEqual(full["counts"]["new_failures"], 1)
+
+    def test_identity_only_runs_no_comparison(self) -> None:
+        statements = self._traced(
+            "GET", "/api/compare",
+            {"stream": [str(self.stream_id)], "counts": ["0"]})
+        for statement in statements:
+            self.assertNotIn("UNION ALL", statement)
+            self.assertNotIn("new_failures", statement)
+
+    def test_identity_only_still_refuses_what_a_comparison_refuses(
+            self) -> None:
+        self.call(
+            "GET", "/api/compare", query={"counts": ["0"]}, expect=400)
+        self.call(
+            "GET", "/api/compare",
+            query={"stream": ["999999"], "counts": ["0"]}, expect=404)
+        self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)], "counts": ["0"],
+                   "baseline": ["999999"]}, expect=404)
+
+    def test_a_category_is_always_answered_in_full(self) -> None:
+        """counts=0 with a category would be a list without its total;
+        the parameter is ignored rather than half-obeyed."""
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)], "counts": ["0"],
+                   "category": ["new_failures"]})
+        self.assertEqual(data["counts"]["new_failures"], 1)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(len(data["tests"]), 1)
+
+    def test_any_other_value_is_the_full_answer(self) -> None:
+        for value in ("1", "", "false"):
+            data = self.call(
+                "GET", "/api/compare",
+                query={"stream": [str(self.stream_id)],
+                       "counts": [value]})
+            self.assertEqual(data["counts"]["new_failures"], 1, value)
+
+    # -- /api/timeline ------------------------------------------------
+
+    def test_the_timeline_checks_one_name_not_the_whole_list(
+            self) -> None:
+        statements = self._traced(
+            "GET", "/api/timeline", {"environment": ["linux-sim"]})
+        for statement in statements:
+            self.assertNotIn("UNION", statement.upper(), statement)
+
+    def test_an_unknown_environment_is_still_404(self) -> None:
+        error = self.call(
+            "GET", "/api/timeline",
+            query={"environment": ["no-such-rig"]}, expect=404)
+        self.assertIn("no-such-rig", error["error"])
+
+    def test_a_declared_but_silent_environment_is_still_known(
+            self) -> None:
+        """known_environments() counted an environment that carries a
+        declaration and has never run; so does environment_exists()."""
+        self.call(
+            "PUT", "/api/environments/linux-sim/product",
+            body={"product": "Atlas", "username": "amy"})
+        self.storage.set_environment_product(
+            "quiet-rig", "Atlas", "amy", fixed_now())
+        self.call(
+            "GET", "/api/timeline", query={"environment": ["quiet-rig"]})
+
+
+class TestBuildComments(ApiCase):
+    """WP-35: /api/compare's per-row ``stream_comment`` and
+    POST /api/comments/bulk."""
+
+    BRANCH_TIMES = {
+        "start_time": "2026-07-25T03:00:00.000000",
+        "end_time": "2026-07-25T03:00:03.000000",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a"), record(test_name="test_b"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+            record(test_name="test_b", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def _entry(self, test_name: str, **extra: Any) -> Dict[str, Any]:
+        entry = {
+            "environment": "linux-sim", "script": "suite/alpha.py",
+            "test_name": test_name, "stream_id": self.stream_id,
+        }  # type: Dict[str, Any]
+        entry.update(extra)
+        return entry
+
+    def _body(self, **overrides: Any) -> Dict[str, Any]:
+        body = {
+            "username": "amy", "text": "flag off on this branch",
+            "tests": [self._entry("test_a"), self._entry("test_b")],
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return body
+
+    def _rows(self) -> Dict[str, Any]:
+        data = self.call(
+            "GET", "/api/compare",
+            query={"stream": [str(self.stream_id)],
+                   "category": ["new_failures"]})
+        return {row["test_name"]: row["stream_comment"]
+                for row in data["tests"]}
+
+    def _thread(self, test_name: str) -> List[Dict[str, Any]]:
+        return self.call("GET", test_path(
+            "linux-sim", "suite/alpha.py", test_name, "/comments")
+        )["comments"]
+
+    def test_rows_carry_null_until_someone_comments(self) -> None:
+        self.assertEqual(self._rows(), {"test_a": None, "test_b": None})
+
+    def test_a_comment_posted_from_the_build_appears_on_its_row(
+            self) -> None:
+        self.call(
+            "POST",
+            test_path("linux-sim", "suite/alpha.py", "test_a",
+                      "/comments"),
+            body={"username": "amy", "text": "API changed",
+                  "stream_id": self.stream_id},
+            expect=201)
+        self.call(
+            "POST",
+            test_path("linux-sim", "suite/alpha.py", "test_b",
+                      "/comments"),
+            body={"username": "bob", "text": "a mainline remark"},
+            expect=201)
+        rows = self._rows()
+        self.assertEqual(rows["test_a"], {
+            "author": "amy", "text": "API changed",
+            "created_at": format_iso(fixed_now()),
+        })
+        self.assertIsNone(rows["test_b"])
+
+    def test_a_bulk_comment_appears_on_every_row(self) -> None:
+        data = self.call("POST", "/api/comments/bulk", body=self._body())
+        self.assertEqual(data, {"commented": 2, "unknown": 0})
+        rows = self._rows()
+        for name in ("test_a", "test_b"):
+            self.assertEqual(rows[name]["text"], "flag off on this branch")
+            self.assertEqual(rows[name]["author"], "amy")
+            thread = self._thread(name)
+            self.assertEqual(len(thread), 1)
+            self.assertEqual(thread[0]["stream_id"], self.stream_id)
+
+    def test_an_entry_without_a_stream_is_a_plain_comment(self) -> None:
+        entry = self._entry("test_a")
+        del entry["stream_id"]
+        self.call(
+            "POST", "/api/comments/bulk", body=self._body(tests=[entry]))
+        self.assertIsNone(self._thread("test_a")[0]["stream_id"])
+        self.assertIsNone(self._rows()["test_a"])
+
+    def test_a_bulk_assign_note_is_tagged_with_the_build(self) -> None:
+        self.call("POST", "/api/assignments/bulk", body={
+            "username": "alice", "assigned_by": "amy",
+            "comment": "yours, same cause",
+            "tests": [self._entry("test_a")],
+        })
+        self.assertEqual(
+            self._thread("test_a")[0]["stream_id"], self.stream_id)
+        self.assertEqual(
+            self._rows()["test_a"]["text"], "yours, same cause")
+
+    def test_a_vanished_test_is_counted_not_fatal(self) -> None:
+        data = self.call("POST", "/api/comments/bulk", body=self._body(
+            tests=[self._entry("test_a"), self._entry("gone")]))
+        self.assertEqual(data, {"commented": 1, "unknown": 1})
+
+    def test_who_and_what_are_required(self) -> None:
+        for field in ("username", "text", "tests"):
+            body = self._body()
+            del body[field]
+            error = self.call(
+                "POST", "/api/comments/bulk", body=body, expect=400)
+            self.assertIn(field, error["error"])
+        for field in ("username", "text"):
+            error = self.call(
+                "POST", "/api/comments/bulk",
+                body=self._body(**{field: "  "}), expect=400)
+            self.assertIn(field, error["error"])
+        self.assertEqual(self._rows(), {"test_a": None, "test_b": None})
+
+    def test_a_comment_on_nothing_is_refused(self) -> None:
+        error = self.call(
+            "POST", "/api/comments/bulk", body=self._body(tests=[]),
+            expect=400)
+        self.assertIn("tests", error["error"])
+
+    def test_a_malformed_selection_writes_nothing(self) -> None:
+        """Validated whole, before the first write: a bad last entry
+        must not leave the first one commented."""
+        for bad in ("not-an-object", self._entry(""),
+                    self._entry("test_b", stream_id="5"),
+                    {"environment": "linux-sim"}):
+            self.call(
+                "POST", "/api/comments/bulk",
+                body=self._body(tests=[self._entry("test_a"), bad]),
+                expect=400)
+        self.call(
+            "POST", "/api/comments/bulk", body=self._body(
+                tests=[self._entry("test_a"),
+                       self._entry("test_b", stream_id=999999)]),
+            expect=404)
+        self.call(
+            "POST", "/api/comments/bulk",
+            body=self._body(tests="test_a"), expect=400)
+        self.assertEqual(self._rows(), {"test_a": None, "test_b": None})
+
+    def test_only_post_is_accepted(self) -> None:
+        self.call("GET", "/api/comments/bulk", expect=405)
+        self.call(
+            "PUT", "/api/comments/bulk", body=self._body(), expect=405)
+
+
+class TestStreamEnvironmentDelete(ApiCase):
+    """GET /api/streams/{id}/environments and the delete beside it
+    (WP-34)."""
+
+    BRANCH_TIMES = {
+        "start_time": "2026-07-25T03:00:00.000000",
+        "end_time": "2026-07-25T03:00:03.000000",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        # A successful delete logs at WARNING by design; keep that out
+        # of the test run's own output. assertLogs() swaps the handlers
+        # for its own and puts these back, so the tests that read the
+        # log are unaffected.
+        logger = logging.getLogger("testboard.api")
+        silence = logging.NullHandler()
+        propagate = logger.propagate
+        logger.addHandler(silence)
+        logger.propagate = False
+        self.addCleanup(setattr, logger, "propagate", propagate)
+        self.addCleanup(logger.removeHandler, silence)
+        self.import_runs([
+            record(test_name="test_a"),
+            record(environment="win-sim", test_name="test_a"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+            record(test_name="test_b", build="feat/x",
+                   **self.BRANCH_TIMES),
+            record(environment="win-sim", test_name="test_a",
+                   build="feat/x", **self.BRANCH_TIMES),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+        self.base = "/api/streams/{}/environments".format(self.stream_id)
+
+    def _body(self, **overrides: Any) -> Dict[str, Any]:
+        body = {
+            "username": "amy", "reason": "uploaded against the wrong rig",
+            "confirm": "feat/x",
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return body
+
+    def _delete(self, environment: str, body: Dict[str, Any],
+                expect: int = 200) -> Dict[str, Any]:
+        return self.call(
+            "POST", "{}/{}/delete".format(self.base, environment),
+            body=body, expect=expect)
+
+    def _held(self) -> Dict[str, int]:
+        return {
+            row["environment"]: row["runs"]
+            for row in self.call("GET", self.base)["environments"]}
+
+    def test_the_listing_is_what_the_build_holds(self) -> None:
+        data = self.call("GET", self.base)
+        self.assertEqual(data["stream"]["name"], "feat/x")
+        self.assertTrue(data["deletable"])
+        self.assertEqual(data["environments"], [
+            {"environment": "linux-sim", "tests": 2, "runs": 2,
+             "last_run": "2026-07-25T03:00:00.000000"},
+            {"environment": "win-sim", "tests": 1, "runs": 1,
+             "last_run": "2026-07-25T03:00:00.000000"},
+        ])
+
+    def test_mainline_is_listed_but_not_deletable(self) -> None:
+        data = self.call("GET", "/api/streams/1/environments")
+        self.assertFalse(data["deletable"])
+        self.assertEqual(
+            [row["environment"] for row in data["environments"]],
+            ["linux-sim", "win-sim"])
+
+    def test_an_unknown_stream_is_404_on_both(self) -> None:
+        for raw in ("999999", "not-a-number"):
+            self.call(
+                "GET", "/api/streams/{}/environments".format(raw),
+                expect=404)
+            self.call(
+                "POST",
+                "/api/streams/{}/environments/win-sim/delete".format(raw),
+                body=self._body(), expect=404)
+
+    def test_only_the_documented_methods_are_accepted(self) -> None:
+        self.call("POST", self.base, body={}, expect=405)
+        self.call("GET", self.base + "/win-sim/delete", expect=405)
+        self.call(
+            "PUT", self.base + "/win-sim/delete", body=self._body(),
+            expect=405)
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_deleting_one_environment_leaves_the_rest(self) -> None:
+        data = self._delete("win-sim", self._body())
+        self.assertEqual(data["deleted"]["runs"], 1)
+        self.assertEqual(data["deleted"]["latest_runs"], 1)
+        self.assertEqual(data["deleted"]["run_outputs"], 1)
+        self.assertEqual(data["deleted"]["streams"], 0)
+        self.assertFalse(data["stream_deleted"])
+        self.assertEqual(data["stream"]["id"], self.stream_id)
+        self.assertEqual(data["environment"], "win-sim")
+        self.assertEqual(data["deleted_by"], "amy")
+        self.assertEqual(self._held(), {"linux-sim": 2})
+        # Mainline's own run of the same test, same environment.
+        detail = self.call(
+            "GET", test_path("win-sim", "suite/alpha.py", "test_a"))
+        self.assertEqual(detail["latest"]["result"], "PASS")
+
+    def test_deleting_the_last_environment_deletes_the_build(
+            self) -> None:
+        self._delete("win-sim", self._body())
+        data = self._delete("linux-sim", self._body())
+        self.assertTrue(data["stream_deleted"])
+        self.assertIsNone(data["stream"])
+        self.assertEqual(data["deleted"]["streams"], 1)
+        self.call("GET", self.base, expect=404)
+        self.assertEqual(self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"],
+            [])
+
+    def test_the_name_must_be_typed_back_exactly(self) -> None:
+        for confirm in ("feat/X", " feat/x", "feat/x ", "", "feat",
+                        None, 7, ["feat/x"]):
+            error = self._delete(
+                "win-sim", self._body(confirm=confirm), expect=400)
+            self.assertIn("confirm", error["error"])
+            self.assertIn("nothing was deleted", error["error"])
+        body = self._body()
+        del body["confirm"]
+        self._delete("win-sim", body, expect=400)
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_who_and_why_are_both_required(self) -> None:
+        for field in ("username", "reason"):
+            body = self._body()
+            del body[field]
+            error = self._delete("win-sim", body, expect=400)
+            self.assertIn(field, error["error"])
+            error = self._delete(
+                "win-sim", self._body(**{field: "   "}), expect=400)
+            self.assertIn(field, error["error"])
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_mainline_is_refused_whatever_is_typed(self) -> None:
+        error = self.call(
+            "POST", "/api/streams/1/environments/win-sim/delete",
+            body=self._body(confirm=""), expect=400)
+        self.assertIn("mainline", error["error"])
+        detail = self.call(
+            "GET", test_path("win-sim", "suite/alpha.py", "test_a"))
+        self.assertEqual(detail["latest"]["result"], "PASS")
+
+    def test_an_environment_the_build_is_not_on_is_404(self) -> None:
+        error = self._delete("mac-sim", self._body(), expect=404)
+        self.assertIn("mac-sim", error["error"])
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_an_environment_name_is_decoded_from_the_path(self) -> None:
+        self.import_runs([
+            record(environment="rig/7 east", test_name="test_a",
+                   build="feat/x", **self.BRANCH_TIMES),
+        ])
+        self.assertIn("rig/7 east", self._held())
+        self._delete(
+            urllib.parse.quote("rig/7 east", safe=""), self._body())
+        self.assertEqual(self._held(), {"linux-sim": 2, "win-sim": 1})
+
+    def test_the_delete_is_logged_with_who_and_why(self) -> None:
+        with self.assertLogs("testboard.api", level="WARNING") as logs:
+            self._delete("win-sim", self._body())
+        line = "\n".join(logs.output)
+        for expected in ("amy", "uploaded against the wrong rig",
+                         "feat/x", "win-sim", "runs=1"):
+            self.assertIn(expected, line)
+
+    def test_a_refused_delete_is_not_logged_as_one(self) -> None:
+        with self.assertRaises(AssertionError):
+            with self.assertLogs("testboard.api", level="WARNING"):
+                self._delete(
+                    "win-sim", self._body(confirm="nope"), expect=400)
+
+    def test_disagreeing_tables_are_409_and_delete_nothing(self) -> None:
+        self.storage._conn().execute(
+            "UPDATE activity_hours SET count = count + 1 "
+            "WHERE stream_id = ? AND environment = ?",
+            (self.stream_id, "win-sim"))
+        with self.assertLogs("testboard.api", level="ERROR"):
+            error = self._delete("win-sim", self._body(), expect=409)
+        self.assertIn("nothing was deleted", error["error"])
+        self.assertEqual(
+            sorted(self._held()), ["linux-sim", "win-sim"])
+
+
+class TestCompareEnvironmentFilter(ApiCase):
+    """GET /api/compare?environment= (WP-33): one environment of the
+    comparison, echoed back, with the list the filter is built from."""
+
+    BRANCH_TIMES = {
+        "start_time": "2026-07-25T03:00:00.000000",
+        "end_time": "2026-07-25T03:00:03.000000",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([
+            record(test_name="test_a", result="PASS"),
+            record(test_name="test_c", result="PASS"),
+            record(environment="win-sim", test_name="test_a",
+                   result="FAIL"),
+            record(environment="win-sim", test_name="test_b",
+                   result="FAIL"),
+        ])
+        self.import_runs([
+            record(test_name="test_a", result="FAIL", build="feat/x",
+                   **self.BRANCH_TIMES),
+            record(environment="win-sim", test_name="test_a",
+                   result="FAIL", build="feat/x", **self.BRANCH_TIMES),
+            record(environment="win-sim", test_name="test_b",
+                   result="PASS", build="feat/x", **self.BRANCH_TIMES),
+        ])
+        streams = self.call(
+            "GET", "/api/streams", query={"product": [""]})["streams"]
+        self.stream_id = streams[0]["id"]
+
+    def _compare(self, **extra: str) -> Dict[str, Any]:
+        query = {"stream": [str(self.stream_id)]}
+        for name, value in extra.items():
+            query[name] = [value]
+        return self.call("GET", "/api/compare", query=query)
+
+    def test_no_filter_echoes_null_and_lists_the_environments(
+            self) -> None:
+        data = self._compare()
+        self.assertIsNone(data["environment"])
+        self.assertEqual(
+            data["environments"], [record()["environment"], "win-sim"])
+        self.assertEqual(data["counts"]["new_failures"], 1)
+        self.assertEqual(data["counts"]["both_failing"], 1)
+        self.assertEqual(data["counts"]["new_passes"], 1)
+        self.assertEqual(data["counts"]["no_result"], 1)
+
+    def test_the_filter_narrows_the_counts_and_is_echoed(self) -> None:
+        data = self._compare(environment="win-sim")
+        self.assertEqual(data["environment"], "win-sim")
+        self.assertEqual(data["counts"], {
+            "new_failures": 0, "new_passes": 1, "both_failing": 1,
+            "new_tests": 0, "no_result": 0, "agree": 0,
+        })
+
+    def test_the_environment_list_is_not_narrowed_by_the_filter(
+            self) -> None:
+        """The list is what the control offers: narrowing it to the
+        current choice would leave nothing to switch to."""
+        unfiltered = self._compare()
+        filtered = self._compare(environment="win-sim")
+        self.assertEqual(
+            filtered["environments"], unfiltered["environments"])
+
+    def test_the_filter_narrows_the_page_and_its_total_together(
+            self) -> None:
+        mainline_env = record()["environment"]
+        data = self._compare(
+            environment=mainline_env, category="new_failures")
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(
+            [(row["environment"], row["test_name"])
+             for row in data["tests"]],
+            [(mainline_env, "test_a")])
+        data = self._compare(
+            environment="win-sim", category="new_failures")
+        self.assertEqual(data["total"], 0)
+        self.assertEqual(data["tests"], [])
+
+    def test_an_environment_outside_the_comparison_is_empty_not_an_error(
+            self) -> None:
+        """urls.js has always carried a page's `environment=` onto this
+        request, and the handler used to ignore it -- so a 4xx here
+        would break links that load today. Zero counts plus the echo
+        is what lets the page say what happened."""
+        data = self._compare(environment="no-such-environment")
+        self.assertEqual(data["environment"], "no-such-environment")
+        self.assertNotIn("no-such-environment", data["environments"])
+        self.assertEqual(sorted(set(data["counts"].values())), [0])
+
+    def test_an_empty_value_is_no_filter(self) -> None:
+        data = self._compare(environment="")
+        self.assertIsNone(data["environment"])
+        self.assertEqual(data["counts"]["new_passes"], 1)
+        self.assertEqual(data["counts"]["no_result"], 1)
 
 
 class TestCompareEndpoint(ApiCase):

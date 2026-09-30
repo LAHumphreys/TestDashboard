@@ -32,7 +32,7 @@
 
 "use strict";
 
-import { clearNode, el, fetchJson } from "./api.js";
+import { clearNode, el, fetchProducts } from "./api.js";
 import { withProduct } from "./urls.js";
 
 /** localStorage key holding the selected product ("" = All products). */
@@ -176,7 +176,7 @@ async function init() {
               // be a second request for data the page already has
   }
   try {
-    const data = await fetchJson("api/summary?parts=headline");
+    const data = await fetchProducts();
     renderSwitcher(container, data.products || []);
   } catch (err) {
     /* Decoration: a failed fetch leaves the page exactly as it shipped. */

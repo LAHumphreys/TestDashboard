@@ -1456,6 +1456,32 @@ class Stream(NamedTuple):
     failing: int
 
 
+class StreamEnvironment(NamedTuple):
+    """What one build holds for one environment (WP-34) — the figures a
+    person is shown before deleting it, all read from the build's own
+    partitions of the derived tables, never from ``runs``.
+
+    ``tests`` is the partition's ``latest_runs`` row count; ``runs`` is
+    the sum of its ``activity_hours`` counts, which the writing
+    transaction keeps byte-equal to a ``GROUP BY`` over ``runs``;
+    ``last_run`` is the newest start time among its tests.
+    """
+
+    environment: str
+    tests: int
+    runs: int
+    last_run: datetime.datetime
+
+
+class DerivedTablesDisagree(Exception):
+    """The derived tables do not describe the runs actually stored.
+
+    Raised by :meth:`Storage.delete_stream_environment`, which finds the
+    runs to delete THROUGH ``activity_hours`` and checks what it found
+    against it. Nothing has been deleted when this is raised.
+    """
+
+
 class CompareCounts(NamedTuple):
     """The six headline counts of :meth:`Storage.compare_streams`.
 
@@ -1500,6 +1526,11 @@ class CompareRow(NamedTuple):
     deep-link correctly. ``assignee`` is the triple's CURRENT assignee,
     unpartitioned by stream (docs/STREAMS_PLAN.md §3.4: assigning from a
     branch row assigns the same test everyone else sees).
+    ``stream_comment`` (WP-35) is the newest comment POSTED FROM the
+    stream being compared — what somebody said about this test on this
+    build — or ``None``. Never a comment posted from anywhere else: the
+    test's whole thread, with every comment's origin, is the test
+    page's to show.
     """
 
     environment: str
@@ -1510,6 +1541,7 @@ class CompareRow(NamedTuple):
     stream_run_id: Optional[int]
     stream_start_time: Optional[datetime.datetime]
     assignee: Optional[str]
+    stream_comment: Optional["LatestComment"]
 
 
 class StreamResult(NamedTuple):
@@ -1697,6 +1729,10 @@ _ENVIRONMENT_TABLES = (
 #: and ``ca`` (current_assignments). These are the SQL half of the same
 #: definitions :func:`testboard.analytics.summarize_rollup` applies to the
 #: rollup counts — ``tests/test_storage.py`` asserts the two agree.
+#: How long :meth:`Storage.size_report` is kept. Sizes move slowly, and
+#: unlike the summary memo this one is NOT cleared by a write.
+_SIZE_REPORT_TTL_SECONDS = 60
+
 QUEUE_KINDS = (
     "new_failures",
     "still_failing",
@@ -1874,6 +1910,21 @@ _LATEST_COMMENT_COLUMNS = (
     " AND c.test_name = lr.test_name ORDER BY c.id DESC LIMIT 1)"
 )
 
+#: The same lookup restricted to comments POSTED FROM one stream
+#: (WP-35), for :meth:`Storage.compare_category`. ``{alias}`` is the row
+#: being described; each of the three subqueries binds the stream id
+#: once, in SELECT-list order. Still ``idx_comments_triple``, walked
+#: from its high end until a comment from that stream turns up — a
+#: test's thread is a handful of rows.
+_STREAM_COMMENT_COLUMNS = ", ".join(
+    "(SELECT c.{column} FROM comments AS c "
+    " WHERE c.environment = {{alias}}.environment "
+    " AND c.script = {{alias}}.script "
+    " AND c.test_name = {{alias}}.test_name AND c.stream_id = ? "
+    " ORDER BY c.id DESC LIMIT 1)".format(column=column)
+    for column in ("author", "created_at", "text")
+)
+
 #: The columns of a status row, in TestSummaryRow field order. Anything
 #: selected AFTER them is indexed from len(_STATUS_COLUMN_NAMES), so
 #: adding a column here cannot silently shift a later one.
@@ -2028,6 +2079,65 @@ class _SqliteBackend(object):
         """Rebuild the file. SQLite-shaped maintenance; see Storage.vacuum."""
         conn.execute("VACUUM")
 
+    #: What the Metrics page calls this engine.
+    engine_name = "SQLite"
+
+    def size_report(self, conn: sqlite3.Connection) -> Dict[str, Any]:
+        """What the database weighs on disk, without reading it.
+
+        Three pragmas and two ``stat`` calls. SQLite cannot say what
+        one TABLE weighs without the ``dbstat`` virtual table, which
+        the interpreter's bundled library is not guaranteed to have, so
+        ``tables`` is empty here and the page shows row counts alone.
+        """
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        free = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        parts = [
+            {"label": "Database (pages in use and free)",
+             "bytes": pages * page_size},
+            {"label": "of which free: reusable, not returned to the "
+                      "file system until VACUUM",
+             "bytes": free * page_size},
+        ]  # type: List[Dict[str, Any]]
+        total = pages * page_size
+        try:
+            wal = os.path.getsize(self._path + "-wal")
+        except OSError:
+            wal = 0
+        parts.append({"label": "Write-ahead log", "bytes": wal})
+        return {
+            "engine": self.engine_name,
+            "version": sqlite3.sqlite_version,
+            "bytes": total + wal,
+            "parts": parts,
+            "tables": {},
+        }
+
+    def suspend_foreign_keys(self, conn: sqlite3.Connection) -> None:
+        """Stop enforcing foreign keys on *conn* until
+        :meth:`restore_foreign_keys` — for ONE caller,
+        :meth:`Storage.delete_stream_environment`, which re-establishes
+        by explicit check what it asks not to have enforced.
+
+        Why it exists: ``latest_runs.run_id`` references ``runs(id)``
+        and has no index, so deleting a run makes SQLite scan
+        ``latest_runs`` for a row that points at it — once per run
+        deleted. Measured on the dev-scale seeded estate (605,050 runs,
+        33,378 ``latest_runs`` rows): 2,036 runs took 6.8 s and 22,245
+        took 64.7 s with enforcement on, 37 ms and 345 ms with it off.
+        The index that would make this unnecessary is a schema change.
+
+        Must be called OUTSIDE a transaction: inside one the pragma is
+        silently ignored. Per connection, so no other thread's
+        connection is affected.
+        """
+        conn.execute("PRAGMA foreign_keys=OFF")
+
+    def restore_foreign_keys(self, conn: sqlite3.Connection) -> None:
+        """Undo :meth:`suspend_foreign_keys`. Outside a transaction."""
+        conn.execute("PRAGMA foreign_keys=ON")
+
 
 class Storage:
     """Backend-agnostic storage with per-thread connections.
@@ -2102,6 +2212,11 @@ class Storage:
         # finished using them.
         self._streak_cache = {}  # type: Dict[Tuple[Any, ...], Tuple[float, Any]]
         self._streak_lock = threading.Lock()
+        # WP-37: how the summary memo is doing, for the Metrics page --
+        # [hits, misses, clears]. Stepped under _summary_lock, which
+        # every one of those paths already holds.
+        self._memo_counts = [0, 0, 0]
+        self._size_memo = None  # type: Optional[Tuple[float, Dict[str, Any]]]
         self._migrate()
 
     @classmethod
@@ -2603,8 +2718,22 @@ class Storage:
             # true; clearing it would make the feeder's 10-minute no-op
             # re-push defeat the memo forever. Same reasoning for the
             # summary/watch memo (WP-23 "ONE MORE PERF SLICE").
-            self._invalidate_trend_cache()
-            self._invalidate_summary_cache()
+            #
+            # WP-38: only the streams this batch WROTE. `deltas`,
+            # `grown` and `recompute` are keyed by stream and hold one
+            # entry per changed cell -- already computed for the
+            # derived tables, so this costs the push nothing new. A
+            # changed row that touched none of them (a source link
+            # alone, say) has no cell to name; that batch drops
+            # everything, as every batch used to.
+            written = set(
+                (key[0], key[1]) for key in deltas
+            )  # type: Set[Tuple[int, str]]
+            written.update((key[0], key[1]) for key in grown)
+            written.update((key[0], key[1]) for key in recompute)
+            self._invalidate_trend_cache(
+                set(pair[0] for pair in written) if written else None)
+            self._invalidate_summary_cache_for(written or None)
         return UpsertCounts(
             inserted=inserted, updated=updated, unchanged=unchanged,
             rejections=rejections,
@@ -3239,6 +3368,16 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
+        # WP-36: mainline's partition has usually just been walked for
+        # the rollup; the environments in it are that pass's own keys.
+        shared = self._any_partition_rollup(MAINLINE_STREAM_ID)
+        if shared is not None:
+            allowed = None if environments is None else set(environments)
+            derived = sorted(
+                name for name in shared[1]
+                if allowed is None or name in allowed)
+            self._store_summary(key, derived, MAINLINE_STREAM_ID)
+            return derived
         clause, clause_params = self._environments_clause(
             environments, column="environment"
         )
@@ -3252,7 +3391,7 @@ class Storage:
         sql += " ORDER BY environment"
         rows = self._conn().execute(sql, params).fetchall()
         result = [row[0] for row in rows]
-        self._store_summary(key, result)
+        self._store_summary(key, result, MAINLINE_STREAM_ID)
         return result
 
     def scripts(
@@ -3278,20 +3417,41 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
-        clause, clause_params = self._environments_clause(
-            environments, column="environment"
-        )
-        sql = "SELECT DISTINCT script FROM latest_runs WHERE stream_id = ?"
-        params = [MAINLINE_STREAM_ID]  # type: List[Any]
-        if environment is not None:
-            sql += " AND environment = ?"
-            params.append(environment)
-        if clause is not None:
-            sql += " AND " + clause
-            params.extend(clause_params)
-        sql += " ORDER BY script"
-        result = [row[0] for row in self._conn().execute(sql, params)]
-        self._store_summary(key, result)
+        # WP-38: the union of one memoized list per environment, so a
+        # push into one environment re-reads that environment's scripts
+        # and the others are served. Filters are applied to the NAMES,
+        # not to the query: an environment outside the allow-list
+        # contributes nothing, exactly as the IN clause left it out.
+        allowed = None if environments is None else set(environments)
+        names = [
+            name for name in self._stream_environment_names(
+                MAINLINE_STREAM_ID)
+            if (environment is None or name == environment)
+            and (allowed is None or name in allowed)
+        ]
+        scripts = set()  # type: Set[str]
+        for name in names:
+            scripts.update(self._environment_scripts(name))
+        result = sorted(scripts)
+        self._store_summary(key, result, MAINLINE_STREAM_ID)
+        return result
+
+    def _environment_scripts(self, environment: str) -> List[str]:
+        """Every script with a mainline test on *environment*, sorted.
+        A prefix of the partition's primary key; memoized per
+        environment (WP-38)."""
+        key = ("environment_scripts", environment)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        result = [
+            row[0] for row in self._conn().execute(
+                "SELECT DISTINCT script FROM latest_runs "
+                "WHERE stream_id = ? AND environment = ? ORDER BY script",
+                (MAINLINE_STREAM_ID, environment),
+            )
+        ]
+        self._store_summary(key, result, MAINLINE_STREAM_ID, environment)
         return result
 
     def assignees(self) -> List[str]:
@@ -3362,43 +3522,128 @@ class Storage:
         ``summary_rollup`` call (see ``_handle_watch``), so the two
         endpoints share one cache entry on the common unscoped load.
         """
-        envs_key = (
-            None if environments is None else tuple(sorted(environments))
-        )
-        key = (
-            "summary_rollup", recent_cutoff, environment, envs_key,
-            stream_id,
-        )
+        # WP-36: every scope of one stream at one cutoff is a FILTER of
+        # the same few dozen cells, because the cells are grouped by
+        # environment. See _partition_rollup for what that saves.
+        cells, _latest = self._partition_rollup(stream_id, recent_cutoff)
+        allowed = None if environments is None else set(environments)
+        return [
+            cell for cell in cells
+            if (environment is None or cell.environment == environment)
+            and (allowed is None or cell.environment in allowed)
+        ]
+
+    def _partition_rollup(
+        self, stream_id: int, recent_cutoff: datetime.datetime,
+    ) -> Tuple[List[RollupCount], Dict[str, datetime.datetime]]:
+        """ONE grouped read of a stream's whole ``latest_runs``
+        partition, and everything a summary needs from it (WP-36).
+
+        Returns the rollup cells for EVERY environment of the stream,
+        and each environment's newest start time. Memoized per
+        ``(stream, cutoff)``.
+
+        Why it exists. A cold ``/api/summary?parts=headline`` read
+        mainline's partition five separate times — the rollup, the
+        queue counts, the per-environment "last reported", and twice
+        more for the product switcher and the environment list — each a
+        full pass for an answer the others had already walked past.
+        Measured on the dev-scale estate (24,854 mainline tests): 77 ms
+        cold, 76 of them in those statements. It was also cold far more
+        often than when it was written: the site now pushes results
+        DURING a run, and any import that changes a row clears every
+        memo here, so for the hours a run lasts nothing is served from
+        one.
+
+        What shares it:
+
+        - :meth:`summary_rollup`, for any ``environment``/
+          ``environments`` scope — a filter of these cells;
+        - :meth:`queue_counts`, whose five result-shaped queues are sums
+          over the same cells;
+        - :meth:`latest_run_time_by_environment`, from the second
+          return value;
+        - the product switcher's estate-wide counts, which a scoped
+          request used to fetch as a second rollup of its own.
+
+        The pass is over the whole partition even when the request
+        names one environment. That costs a single-environment request
+        more than its own scoped query did — and saves it the
+        estate-wide rollup every summary ran as well, for the product
+        list, scoped or not.
+        """
+        key = ("partition_rollup", recent_cutoff, stream_id)
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
-        sql = (
+        # WP-38: one memoized pass PER ENVIRONMENT, assembled here. The
+        # environments run one after another, so a push writes one of
+        # them and drops one entry; the others are served. The
+        # assembled result is memoized too (tagged with the stream, so
+        # any push to it drops it) — a warm summary still costs one
+        # lookup, and a cold one costs one query per environment
+        # written since, not one per environment.
+        cells = []  # type: List[RollupCount]
+        latest = {}  # type: Dict[str, datetime.datetime]
+        for environment in self._stream_environment_names(stream_id):
+            part_cells, part_latest = self._environment_rollup(
+                stream_id, environment, recent_cutoff)
+            cells.extend(part_cells)
+            latest.update(part_latest)
+        result = (cells, latest)
+        self._store_summary(key, result, stream_id)
+        return result
+
+    def _stream_environment_names(self, stream_id: int) -> List[str]:
+        """The environments *stream_id* has rows for, sorted — the
+        order :meth:`_partition_rollup` assembles in, which is the order
+        the whole-partition query returned. Memoized per stream: one
+        read of the partition's key on a push to that stream, none
+        otherwise.
+        """
+        key = ("stream_environment_names", stream_id)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        names = [
+            row[0] for row in self._conn().execute(
+                "SELECT DISTINCT environment FROM latest_runs "
+                "WHERE stream_id = ? ORDER BY environment",
+                (stream_id,),
+            ).fetchall()
+        ]
+        self._store_summary(key, names, stream_id)
+        return names
+
+    def _environment_rollup(
+        self, stream_id: int, environment: str,
+        recent_cutoff: datetime.datetime,
+    ) -> Tuple[List[RollupCount], Dict[str, datetime.datetime]]:
+        """One environment's cells of :meth:`_partition_rollup`, and its
+        newest start. The partition's primary key leads with
+        ``(stream_id, environment)``, so this reads that environment's
+        rows and no other. Memoized per ``(stream, environment,
+        cutoff)`` — the entry a push into that environment drops.
+        """
+        key = ("environment_rollup", recent_cutoff, stream_id, environment)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        rows = self._conn().execute(
             "SELECT lr.environment, lr.result, lr.prev_result, "
             "CASE WHEN lr.start_time >= ? THEN 1 ELSE 0 END AS recent, "
             "CASE WHEN tr.retired_at IS NULL THEN 0 ELSE 1 END AS retired, "
-            "COUNT(*) "
+            "COUNT(*), MAX(lr.start_time) "
             "FROM latest_runs AS lr "
             "LEFT JOIN test_retirements AS tr "
             "  ON tr.environment = lr.environment "
-            " AND tr.script = lr.script AND tr.test_name = lr.test_name"
-        )
-        params = [model.format_iso(recent_cutoff)]  # type: List[Any]
-        where = ["lr.stream_id = ?"]  # type: List[str]
-        params.append(stream_id)
-        if environment is not None:
-            where.append("lr.environment = ?")
-            params.append(environment)
-        envs_clause, envs_params = self._environments_clause(environments)
-        if envs_clause is not None:
-            where.append(envs_clause)
-            params.extend(envs_params)
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += (
-            " GROUP BY lr.environment, lr.result, lr.prev_result, recent, "
-            "retired ORDER BY lr.environment, lr.result"
-        )
-        result = [
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE lr.stream_id = ? AND lr.environment = ? "
+            "GROUP BY lr.environment, lr.result, lr.prev_result, recent, "
+            "retired ORDER BY lr.environment, lr.result",
+            (model.format_iso(recent_cutoff), stream_id, environment),
+        ).fetchall()
+        cells = [
             RollupCount(
                 environment=row[0],
                 result=Result(row[1]),
@@ -3407,10 +3652,36 @@ class Storage:
                 retired=bool(row[4]),
                 count=int(row[5]),
             )
-            for row in self._conn().execute(sql, params).fetchall()
+            for row in rows
         ]
-        self._store_summary(key, result)
+        latest = {}  # type: Dict[str, datetime.datetime]
+        for row in rows:
+            if row[6] is None:
+                continue
+            when = model.parse_iso(row[6])
+            if row[0] not in latest or when > latest[row[0]]:
+                latest[row[0]] = when
+        result = (cells, latest)
+        self._store_summary(key, result, stream_id, environment)
         return result
+
+    def _any_partition_rollup(
+        self, stream_id: int,
+    ) -> Optional[Tuple[List[RollupCount], Dict[str, datetime.datetime]]]:
+        """A memoized :meth:`_partition_rollup` of *stream_id* at ANY
+        cutoff, or None — for callers whose answer does not depend on
+        the cutoff (an environment's newest start time is the same
+        whichever window the cells were counted for). Never computes
+        one: a caller with no cutoff has no business choosing it.
+        """
+        now = time.time()
+        with self._summary_lock:
+            for key, entry in self._summary_cache.items():
+                if (len(key) == 3 and key[0] == "partition_rollup"
+                        and key[2] == stream_id
+                        and now - entry[0] <= _TREND_CACHE_TTL_SECONDS):
+                    return entry[1]
+        return None
 
     def assigned_open_count(
         self,
@@ -3618,18 +3889,28 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
-        rows = self._conn().execute(
-            "SELECT lr.environment, COUNT(*) FROM latest_runs AS lr "
-            "LEFT JOIN test_retirements AS tr "
-            "  ON tr.environment = lr.environment "
-            " AND tr.script = lr.script "
-            " AND tr.test_name = lr.test_name "
-            "WHERE lr.stream_id = ? AND " + self._NOT_RETIRED
-            + " GROUP BY lr.environment",
-            (stream_id,),
-        ).fetchall()
-        result = {row[0]: int(row[1]) for row in rows}
-        self._store_summary(key, result)
+        # WP-38: assembled from one memoized count per environment, so
+        # a push into one environment re-counts that one (its rows are
+        # a prefix of the primary key) and the rest are served.
+        result = {}  # type: Dict[str, int]
+        for environment in self._stream_environment_names(stream_id):
+            one = ("test_count", stream_id, environment)
+            count = self._cached_summary(one)
+            if count is None:
+                count = int(self._conn().execute(
+                    "SELECT COUNT(*) FROM latest_runs AS lr "
+                    "LEFT JOIN test_retirements AS tr "
+                    "  ON tr.environment = lr.environment "
+                    " AND tr.script = lr.script "
+                    " AND tr.test_name = lr.test_name "
+                    "WHERE lr.stream_id = ? AND lr.environment = ? AND "
+                    + self._NOT_RETIRED,
+                    (stream_id, environment),
+                ).fetchone()[0])
+                self._store_summary(one, count, stream_id, environment)
+            if count:
+                result[environment] = count
+        self._store_summary(key, result, stream_id)
         return result
 
     # ------------------------------------------------------------------
@@ -3993,20 +4274,7 @@ class Storage:
         deleted = {}  # type: Dict[str, int]
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                "UPDATE comments SET stream_id = NULL WHERE stream_id = ?",
-                (stream_id,),
-            )
-            conn.execute(
-                "UPDATE assignments SET stream_id = NULL "
-                "WHERE stream_id = ?",
-                (stream_id,),
-            )
-            conn.execute(
-                "UPDATE current_assignments SET stream_id = NULL "
-                "WHERE stream_id = ?",
-                (stream_id,),
-            )
+            self._clear_stream_origin_tags(conn, stream_id)
             cursor = conn.execute(
                 "DELETE FROM run_outputs WHERE run_id IN "
                 "(SELECT id FROM runs WHERE stream_id = ?)", (stream_id,)
@@ -4044,6 +4312,291 @@ class Storage:
         self._invalidate_trend_cache()
         self._invalidate_summary_cache()
         return deleted
+
+    @staticmethod
+    def _clear_stream_origin_tags(
+        conn: sqlite3.Connection, stream_id: int,
+    ) -> None:
+        """Clear every "posted/made from *stream_id*" tag, inside the
+        caller's transaction — what has to happen before a ``streams``
+        row is deleted. The rows themselves stay: a comment or an
+        assignment annotates the test, not the stream. See
+        :meth:`delete_stream` for why this is an explicit UPDATE and
+        not an ``ON DELETE SET NULL``.
+        """
+        conn.execute(
+            "UPDATE comments SET stream_id = NULL WHERE stream_id = ?",
+            (stream_id,),
+        )
+        conn.execute(
+            "UPDATE assignments SET stream_id = NULL "
+            "WHERE stream_id = ?",
+            (stream_id,),
+        )
+        conn.execute(
+            "UPDATE current_assignments SET stream_id = NULL "
+            "WHERE stream_id = ?",
+            (stream_id,),
+        )
+
+    def stream_environments(self, stream_id: int) -> List["StreamEnvironment"]:
+        """What *stream_id* holds, per environment, sorted by name.
+
+        Two grouped reads over the stream's OWN partitions —
+        ``latest_runs`` and ``activity_hours``, both keyed
+        ``(stream_id, environment, ...)`` — so the cost is the build's
+        own size, never the estate's or its history's. ``runs`` carries
+        no index that leads with ``stream_id``; counting there would
+        walk every run the environment has ever recorded.
+        """
+        conn = self._conn()
+        latest = conn.execute(
+            "SELECT environment, COUNT(*), MAX(start_time) "
+            "FROM latest_runs WHERE stream_id = ? "
+            "GROUP BY environment ORDER BY environment",
+            (stream_id,),
+        ).fetchall()
+        runs = {
+            row[0]: int(row[1]) for row in conn.execute(
+                "SELECT environment, SUM(count) FROM activity_hours "
+                "WHERE stream_id = ? GROUP BY environment",
+                (stream_id,),
+            ).fetchall()
+        }
+        return [
+            StreamEnvironment(
+                environment=row[0],
+                tests=int(row[1]),
+                runs=runs.get(row[0], 0),
+                last_run=model.parse_iso(row[2]),
+            )
+            for row in latest
+        ]
+
+    #: Ids per ``DELETE ... WHERE id IN (...)`` — under SQLite's
+    #: default limit of 999 bound parameters.
+    _DELETE_CHUNK = 500
+
+    def delete_stream_environment(
+        self, stream_id: int, environment: str,
+    ) -> Dict[str, int]:
+        """Delete what ONE build holds for ONE environment (WP-34).
+        Cannot be undone.
+
+        For the upload that should not have happened: a build pushed
+        against the wrong environment, or a run of it that was broken
+        from the start. The build's results on every other environment
+        are untouched. If this was the only environment it had, the
+        build has nothing left and its ``streams`` row goes too
+        (``deleted["streams"]`` is 1), exactly as
+        :meth:`delete_stream` would have left it; otherwise its
+        ``first_seen``/``last_seen`` are re-derived from what remains,
+        so "last ran" never quotes a run that no longer exists.
+
+        Refuses mainline. Comments and assignments are never deleted —
+        they annotate the test — and keep their origin tag while the
+        build survives.
+
+        Nothing here prevents the same records being imported again.
+        A feeder that is still sending them will put them back.
+
+        HOW THE RUNS ARE FOUND. ``runs`` has no index leading with
+        ``stream_id``, and its one index on ``environment`` is the
+        frozen UNIQUE from migration 1 — through it, this delete would
+        visit every run the environment has recorded in a year to find
+        one build's. Instead the build's own ``activity_hours``
+        partition names the hours it ran in, and each hour is read
+        through ``idx_runs_start_time_result``: the rows visited are the
+        runs that STARTED in those hours, on any environment, bounded
+        by the build's own activity. The derived tables are maintained in the writing
+        transaction and asserted byte-equal to ``runs`` by the suite,
+        but this is a delete, so what they say is checked rather than
+        trusted: each hour must yield exactly the count it records, and
+        every ``latest_runs`` row of the partition must point at a run
+        that was found. Any disagreement raises
+        :class:`DerivedTablesDisagree` and deletes nothing.
+
+        FOREIGN KEYS are not enforced for the length of this one
+        transaction (see the SQLite backend's ``suspend_foreign_keys``
+        for the measurement that made that necessary). What they would
+        have guaranteed is checked instead, before the commit: the
+        outputs are deleted by the same ids as their runs, and no
+        ``latest_runs`` row in ANY partition may still point at a
+        deleted run. MariaDB declares no foreign keys, so there the
+        check is the only guarantee there has ever been.
+
+        Safe with the server running: one transaction, and unlike
+        :meth:`delete_stream` no statement in it scans ``runs``.
+        """
+        if stream_id == MAINLINE_STREAM_ID:
+            raise ValueError("refusing to delete from the mainline stream")
+        conn = self._conn()
+        self._backend.suspend_foreign_keys(conn)
+        try:
+            return self._delete_stream_environment(
+                conn, stream_id, environment)
+        finally:
+            self._backend.restore_foreign_keys(conn)
+
+    def _delete_stream_environment(
+        self, conn: sqlite3.Connection, stream_id: int, environment: str,
+    ) -> Dict[str, int]:
+        """The transaction of :meth:`delete_stream_environment`."""
+        deleted = {}  # type: Dict[str, int]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            run_ids = self._stream_environment_run_ids(
+                conn, stream_id, environment)
+            outputs = 0
+            runs = 0
+            for at in range(0, len(run_ids), self._DELETE_CHUNK):
+                chunk = run_ids[at:at + self._DELETE_CHUNK]
+                marks = ", ".join("?" for _ in chunk)
+                cursor = conn.execute(
+                    "DELETE FROM run_outputs WHERE run_id IN ({})".format(
+                        marks), chunk)
+                outputs += int(cursor.rowcount)
+            for table in ("latest_runs", "activity_hours", "script_hours"):
+                cursor = conn.execute(
+                    "DELETE FROM {} WHERE stream_id = ? "
+                    "AND environment = ?".format(table),
+                    (stream_id, environment),
+                )
+                deleted[table] = int(cursor.rowcount)
+            for at in range(0, len(run_ids), self._DELETE_CHUNK):
+                chunk = run_ids[at:at + self._DELETE_CHUNK]
+                marks = ", ".join("?" for _ in chunk)
+                dangling = conn.execute(
+                    "SELECT COUNT(*) FROM latest_runs "
+                    "WHERE run_id IN ({})".format(marks), chunk,
+                ).fetchone()[0]
+                if int(dangling):
+                    raise DerivedTablesDisagree(
+                        "{0} latest_runs row(s) outside stream {1} / "
+                        "{2!r} point at runs inside it".format(
+                            int(dangling), stream_id, environment))
+                cursor = conn.execute(
+                    "DELETE FROM runs WHERE id IN ({})".format(marks),
+                    chunk)
+                runs += int(cursor.rowcount)
+            deleted["run_outputs"] = outputs
+            deleted["runs"] = runs
+            deleted["streams"] = self._settle_stream_after_delete(
+                conn, stream_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        self._invalidate_trend_cache()
+        self._invalidate_summary_cache()
+        return deleted
+
+    @staticmethod
+    def _stream_environment_run_ids(
+        conn: sqlite3.Connection, stream_id: int, environment: str,
+    ) -> List[int]:
+        """Every run id *stream_id* holds for *environment*, found
+        through its ``activity_hours`` partition and checked against it.
+        See :meth:`delete_stream_environment`.
+        """
+        expected = {}  # type: Dict[str, int]
+        for row in conn.execute(
+            "SELECT hour, SUM(count) FROM activity_hours "
+            "WHERE stream_id = ? AND environment = ? GROUP BY hour",
+            (stream_id, environment),
+        ).fetchall():
+            expected[row[0]] = int(row[1])
+        found = []  # type: List[int]
+        for hour in sorted(expected):
+            # Full-width bounds, so every comparison is between two
+            # timestamps of the same shape — no reliance on how a
+            # collation orders a prefix against a longer string.
+            begins = model.parse_iso(hour + ":00:00.000000")
+            ends = begins + datetime.timedelta(hours=1)
+            # The environment is matched HERE, not in the WHERE clause.
+            # Given `environment = ?` the planner takes the frozen
+            # UNIQUE index that leads with it, an equality beating a
+            # range, and walks the environment's whole history after
+            # all (measured: that is the plan SQLite chose, and
+            # DeleteStreamEnvironmentQueryPlanTest is what caught it).
+            # Without it, the start-time range is the only index the
+            # statement can use, on either backend.
+            rows = [
+                row for row in conn.execute(
+                    "SELECT id, environment FROM runs "
+                    "WHERE start_time >= ? AND start_time < ? "
+                    "AND stream_id = ?",
+                    (model.format_iso(begins), model.format_iso(ends),
+                     stream_id),
+                ).fetchall()
+                if row[1] == environment
+            ]
+            if len(rows) != expected[hour]:
+                raise DerivedTablesDisagree(
+                    "activity_hours records {0} run(s) for stream {1} on "
+                    "{2!r} in hour {3}, but runs holds {4}".format(
+                        expected[hour], stream_id, environment, hour,
+                        len(rows)))
+            found.extend(int(row[0]) for row in rows)
+        known = set(found)
+        for row in conn.execute(
+            "SELECT run_id, script, test_name FROM latest_runs "
+            "WHERE stream_id = ? AND environment = ?",
+            (stream_id, environment),
+        ).fetchall():
+            if int(row[0]) not in known:
+                raise DerivedTablesDisagree(
+                    "latest_runs points at run {0} for {1!r} / {2!r} / "
+                    "{3!r} on stream {4}, which activity_hours does not "
+                    "account for".format(
+                        int(row[0]), environment, row[1], row[2],
+                        stream_id))
+        return found
+
+    def _settle_stream_after_delete(
+        self, conn: sqlite3.Connection, stream_id: int,
+    ) -> int:
+        """Leave *stream_id* truthful after part of it was deleted:
+        remove the row if nothing is left (returns 1), else re-derive
+        ``first_seen``/``last_seen`` from what remains (returns 0).
+
+        Both bounds are start times (:meth:`upsert_runs` widens them
+        from each record's start). The newest is the newest
+        ``latest_runs`` start; the oldest lies in the stream's earliest
+        active hour, which is read through the same index the delete
+        itself uses.
+        """
+        newest = conn.execute(
+            "SELECT MAX(start_time) FROM latest_runs WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0]
+        if newest is None:
+            self._clear_stream_origin_tags(conn, stream_id)
+            cursor = conn.execute(
+                "DELETE FROM streams WHERE id = ?", (stream_id,))
+            return int(cursor.rowcount)
+        oldest = None  # type: Optional[str]
+        hour = conn.execute(
+            "SELECT MIN(hour) FROM activity_hours WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0]
+        if hour is not None:
+            begins = model.parse_iso(hour + ":00:00.000000")
+            ends = begins + datetime.timedelta(hours=1)
+            oldest = conn.execute(
+                "SELECT MIN(start_time) FROM runs WHERE start_time >= ? "
+                "AND start_time < ? AND stream_id = ?",
+                (model.format_iso(begins), model.format_iso(ends),
+                 stream_id),
+            ).fetchone()[0]
+        if oldest is None:
+            oldest = newest
+        conn.execute(
+            "UPDATE streams SET first_seen = ?, last_seen = ? "
+            "WHERE id = ?",
+            (oldest, newest, stream_id),
+        )
+        return 0
 
     def assignments_referencing_stream(self, stream_id: int) -> int:
         """How many CURRENT assignments carry *stream_id* as their origin,
@@ -4214,8 +4767,33 @@ class Storage:
         "ELSE 'agree' END"
     ).format(fail=Result.FAIL.value)
 
+    def _compare_environments(
+        self, product: str, environment: Optional[str],
+    ) -> List[str]:
+        """The environments one comparison spans (WP-33).
+
+        Always the stream's own product's environments — the rule every
+        comparison has followed since WP-21 — narrowed to *environment*
+        alone when one is named. An *environment* OUTSIDE the product
+        narrows to nothing rather than widening to it: the comparison
+        then matches no rows (see :meth:`_environments_clause`'s empty
+        list), which is the truthful answer to "how does this build
+        differ on an environment its product does not have", and the
+        API echoes the name it applied so the page can say so. Raising
+        instead would turn a stale filter in a shared link into a page
+        that cannot load at all — including the control that would
+        correct it.
+        """
+        environments = self.environments_for_product(product)
+        if environment is None:
+            return environments
+        if environment in environments:
+            return [environment]
+        return []
+
     def compare_counts(
         self, stream_id: int, baseline_id: int = MAINLINE_STREAM_ID,
+        environment: Optional[str] = None,
     ) -> "CompareCounts":
         """The five headline counts of a stream-vs-baseline comparison.
 
@@ -4223,12 +4801,15 @@ class Storage:
         joins of two ``latest_runs`` partitions (see
         :meth:`_compare_pairs_sql`) — never a scan of ``runs``, and
         bounded by the stream's own product's test count (a few
-        thousand to ~12k), not by history.
+        thousand to ~12k), not by history. *environment* (WP-33)
+        narrows BOTH sides to that one environment — see
+        :meth:`_compare_environments`.
         """
         stream = self.get_stream(stream_id)
         if stream is None:
             raise KeyError(stream_id)
-        environments = self.environments_for_product(stream.product)
+        environments = self._compare_environments(
+            stream.product, environment)
         pairs_sql, params = self._compare_pairs_sql(
             stream_id, baseline_id, environments
         )
@@ -4257,8 +4838,13 @@ class Storage:
         baseline_id: int = MAINLINE_STREAM_ID,
         limit: int = 250,
         offset: int = 0,
+        environment: Optional[str] = None,
     ) -> List["CompareRow"]:
         """ONE PAGE of one comparison category, paginated in SQL.
+
+        *environment* (WP-33) narrows the comparison exactly as it does
+        for :meth:`compare_counts` — the two must always be given the
+        same value, or a page's rows and its own total disagree.
 
         *category* must be one of :data:`_COMPARE_CATEGORIES` — like
         :data:`DASHBOARD_SORTS`, callers choose from a whitelist and
@@ -4276,7 +4862,8 @@ class Storage:
         stream = self.get_stream(stream_id)
         if stream is None:
             raise KeyError(stream_id)
-        environments = self.environments_for_product(stream.product)
+        environments = self._compare_environments(
+            stream.product, environment)
         pairs_sql, params = self._compare_pairs_sql(
             stream_id, baseline_id, environments
         )
@@ -4285,11 +4872,16 @@ class Storage:
         # shape as every other page-only join in this module (e.g. the
         # dashboard's `ca` join), not a cost that grows with the
         # comparison's size.
+        # The comment lookup sits in the OUTER select list, so it runs
+        # for the rows of the returned page and no others. Its three
+        # bound parameters come first: qmark binds in the order the
+        # placeholders appear in the statement.
         sql = (
             "SELECT categorized.environment, categorized.script, "
             "categorized.test_name, categorized.stream_result, "
             "categorized.baseline_result, categorized.stream_run_id, "
-            "categorized.stream_start_time, ca.assignee "
+            "categorized.stream_start_time, ca.assignee, "
+            + _STREAM_COMMENT_COLUMNS.format(alias="categorized") + " "
             "FROM (SELECT environment, script, test_name, "
             "stream_result, baseline_result, stream_run_id, "
             "stream_start_time, {0} AS category "
@@ -4304,7 +4896,7 @@ class Storage:
             "LIMIT ? OFFSET ?"
         ).format(self._COMPARE_CASE, pairs_sql)
         rows = self._conn().execute(
-            sql, params + [category, limit, offset]
+            sql, [stream_id] * 3 + params + [category, limit, offset]
         ).fetchall()
         return [
             CompareRow(
@@ -4318,6 +4910,13 @@ class Storage:
                     None if row[6] is None else model.parse_iso(row[6])
                 ),
                 assignee=row[7],
+                stream_comment=(
+                    None if row[8] is None else LatestComment(
+                        author=row[8],
+                        created_at=model.parse_iso(row[9]),
+                        text=row[10],
+                    )
+                ),
             )
             for row in rows
         ]
@@ -4327,6 +4926,7 @@ class Storage:
         stream_id: int,
         category: str,
         baseline_id: int = MAINLINE_STREAM_ID,
+        environment: Optional[str] = None,
     ) -> int:
         """Exact size of one comparison category, ignoring any display cap."""
         if category not in self._COMPARE_CATEGORIES:
@@ -4338,7 +4938,8 @@ class Storage:
         stream = self.get_stream(stream_id)
         if stream is None:
             raise KeyError(stream_id)
-        environments = self.environments_for_product(stream.product)
+        environments = self._compare_environments(
+            stream.product, environment)
         pairs_sql, params = self._compare_pairs_sql(
             stream_id, baseline_id, environments
         )
@@ -4718,6 +5319,18 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
+        # WP-36: a summary has usually just walked this partition for
+        # its rollup, and kept each environment's newest start as it
+        # went (retired tests included there too, flagged not dropped).
+        shared = self._any_partition_rollup(stream_id)
+        if shared is not None:
+            allowed = None if environments is None else set(environments)
+            derived = {
+                name: when for name, when in shared[1].items()
+                if allowed is None or name in allowed
+            }
+            self._store_summary(key, derived, stream_id)
+            return derived
         clause, clause_params = self._environments_clause(
             environments, column="environment"
         )
@@ -4734,7 +5347,7 @@ class Storage:
             row[0]: model.parse_iso(row[1])
             for row in rows if row[1] is not None
         }
-        self._store_summary(key, result)
+        self._store_summary(key, result, stream_id)
         return result
 
     def unassigned_failing_by_environment(
@@ -4818,9 +5431,20 @@ class Storage:
         every test in the estate quietly going stale. *stream_id*
         (WP-23, default mainline) — see
         :meth:`latest_run_time_by_environment`.
+
+        Read from ``latest_runs`` (WP-36), where it is the high end of
+        ``idx_latest_runs_start_time`` for the stream: one seek. It was
+        ``MAX(start_time) FROM runs WHERE stream_id = ?``, and ``runs``
+        has no index that leads with the stream — the planner walked
+        ``idx_runs_start_time_result`` backwards from the newest run on
+        record until it met one of this stream's. Instant for whichever
+        stream ran last; for a build that last ran two months ago, a
+        walk through two months of everyone else's runs. The two agree
+        by construction: a test's ``latest_runs`` row IS its newest
+        run, so the newest of those is the stream's newest.
         """
         row = self._conn().execute(
-            "SELECT MAX(start_time) FROM runs WHERE stream_id = ?",
+            "SELECT MAX(start_time) FROM latest_runs WHERE stream_id = ?",
             (stream_id,),
         ).fetchone()
         if row is None or row[0] is None:
@@ -5118,7 +5742,7 @@ class Storage:
             )
             for row in self._conn().execute(sql, params).fetchall()
         ]
-        self._store_summary(key, result)
+        self._store_summary(key, result, stream_id)
         return result
 
     def status_queue_count(
@@ -5193,50 +5817,63 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
-        # not_run's predicate carries the one parameterised placeholder
-        # among QUEUE_KINDS (`lr.start_time < ?`) -- its bind value is
-        # appended in the same left-to-right order the columns
-        # themselves are built in, so select_params ends up matching
-        # the SELECT-list's ?s positionally.
-        select_params = []  # type: List[Any]
-        ordered_columns = []  # type: List[str]
-        for kind in QUEUE_KINDS:
-            ordered_columns.append(
-                "SUM(CASE WHEN {} THEN 1 ELSE 0 END)".format(
-                    _QUEUE_PREDICATES[kind]))
-            if kind in _STALE_QUEUES:
-                select_params.append(model.format_iso(stale_before))
-        include_mine = bool(assignee)
-        if include_mine:
-            ordered_columns.append(
-                "SUM(CASE WHEN {} AND ca.assignee = ? "
-                "THEN 1 ELSE 0 END)".format(_QUEUE_PREDICATES["assigned"])
-            )
-            select_params.append(assignee)
+        # WP-36. The five result-shaped queues are sums over the rollup
+        # cells the same summary has already computed (same stream,
+        # same cutoff, same scope) -- each predicate below is
+        # _QUEUE_PREDICATES' own, restated over a cell's fields, and
+        # QueueCountsTest pins both against status_queue_count, which
+        # still runs the SQL. `not_run` is `start_time < stale_before`;
+        # a cell's `recent` is `start_time >= recent_cutoff`; the two
+        # are one test when the cutoffs are one value, which is how
+        # every caller has always passed them.
+        fail = Result.FAIL
+        counts = {kind: 0 for kind in QUEUE_KINDS}
+        for cell in self.summary_rollup(
+                stale_before, environment, environments=environments,
+                stream_id=stream_id):
+            if cell.retired:
+                continue
+            if cell.result == fail and cell.prev_result != fail:
+                counts["new_failures"] += cell.count
+            if cell.result == fail and cell.prev_result == fail:
+                counts["still_failing"] += cell.count
+            if cell.prev_result == fail and cell.result != fail:
+                counts["fixed"] += cell.count
+            if cell.result == Result.UNEXPECTED_PASS:
+                counts["unexpected_passes"] += cell.count
+            if not cell.recent:
+                counts["not_run"] += cell.count
+        # `assigned` and `mine` are the two that read who owns a test,
+        # which no cell carries. Driven FROM current_assignments -- a
+        # row per assigned test, a handful against the partition's
+        # thousands -- with latest_runs reached by its primary key.
+        # As a SUM(CASE) column of the old single statement it made
+        # that statement a pass over the whole partition.
         sql = (
-            "SELECT " + ", ".join(ordered_columns) + " "
-            + self._LATEST_COUNT_JOIN
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN ca.assignee = ? THEN 1 ELSE 0 END) "
+            "FROM current_assignments AS ca "
+            "JOIN latest_runs AS lr "
+            "  ON lr.stream_id = ? AND lr.environment = ca.environment "
+            " AND lr.script = ca.script AND lr.test_name = ca.test_name "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE " + _QUEUE_PREDICATES["assigned"]
+            + " AND " + self._NOT_RETIRED
         )
-        where = ["lr.stream_id = ?", self._NOT_RETIRED]
-        where_params = [stream_id]  # type: List[Any]
+        params = [assignee or "", stream_id]  # type: List[Any]
         if environment is not None:
-            where.append("lr.environment = ?")
-            where_params.append(environment)
+            sql += " AND lr.environment = ?"
+            params.append(environment)
         envs_clause, envs_params = self._environments_clause(environments)
         if envs_clause is not None:
-            where.append(envs_clause)
-            where_params.extend(envs_params)
-        sql += " WHERE " + " AND ".join(where)
-        row = self._conn().execute(
-            sql, select_params + where_params
-        ).fetchone()
-        counts = {
-            kind: int(row[i] or 0) for i, kind in enumerate(QUEUE_KINDS)
-        }
-        counts["mine"] = (
-            int(row[len(QUEUE_KINDS)] or 0) if include_mine else 0
-        )
-        self._store_summary(key, counts)
+            sql += " AND " + envs_clause
+            params.extend(envs_params)
+        row = self._conn().execute(sql, params).fetchone()
+        counts["assigned"] = int(row[0] or 0)
+        counts["mine"] = int(row[1] or 0) if assignee else 0
+        self._store_summary(key, counts, stream_id)
         return counts
 
     def recent_results(
@@ -5765,10 +6402,22 @@ class Storage:
                 self._trend_cache.clear()
             self._trend_cache[key] = (time.time(), counts)
 
-    def _invalidate_trend_cache(self) -> None:
-        """Drop memoized trends: the runs they were computed from changed."""
+    def _invalidate_trend_cache(
+        self, stream_ids: Optional[Set[int]] = None,
+    ) -> None:
+        """Drop memoized trends: the runs they were computed from changed.
+
+        *stream_ids* (WP-38) narrows it to the streams whose runs did;
+        a trend key's first element is its stream. ``None`` drops all.
+        """
         with self._trend_lock:
-            self._trend_cache.clear()
+            if stream_ids is None:
+                self._trend_cache.clear()
+                return
+            for key in [
+                    key for key in self._trend_cache
+                    if key[0] in stream_ids]:
+                del self._trend_cache[key]
 
     def _cached_summary(self, key: Tuple[Any, ...]) -> Optional[Any]:
         """Return a memoized summary/watch component for *key*, or None.
@@ -5784,19 +6433,35 @@ class Storage:
         with self._summary_lock:
             entry = self._summary_cache.get(key)
             if entry is None:
+                self._memo_counts[1] += 1
                 return None
-            stored_at, value = entry
+            stored_at, value = entry[0], entry[1]
             if now - stored_at > _TREND_CACHE_TTL_SECONDS:
                 del self._summary_cache[key]
+                self._memo_counts[1] += 1
                 return None
+            self._memo_counts[0] += 1
             return value
 
-    def _store_summary(self, key: Tuple[Any, ...], value: Any) -> None:
-        """Memoize a computed summary/watch component, bounding cache size."""
+    def _store_summary(self, key: Tuple[Any, ...], value: Any,
+                       stream_id: int = MAINLINE_STREAM_ID,
+                       environment: Optional[str] = None) -> None:
+        """Memoize a computed summary/watch component, bounding cache size.
+
+        *stream_id* (WP-38) is the ONE stream whose ``latest_runs``
+        partition the value was computed from, and *environment* the
+        one environment of it when the value reads no other — what a
+        targeted invalidation matches on. Every caller names the
+        stream; the default is for the two catalogue methods that are
+        mainline by definition. An entry computed from more than one
+        stream must not be memoized here at all: there is no way to
+        say so, and a wrong tag is a stale page.
+        """
         with self._summary_lock:
             if len(self._summary_cache) >= _SUMMARY_CACHE_MAX_ENTRIES:
                 self._summary_cache.clear()
-            self._summary_cache[key] = (time.time(), value)
+            self._summary_cache[key] = (
+                time.time(), value, stream_id, environment)
 
     def _cached_streak(self, key: Tuple[Any, ...]) -> Optional[Any]:
         """Return a memoized failure streak for *key*, or None.
@@ -5857,10 +6522,184 @@ class Storage:
         existing entry wrong -- the old entry is simply never looked up
         again, not served stale.
         """
+        self._invalidate_summary_cache_for(None)
+
+    @staticmethod
+    def _names_still_hold(
+        key: Tuple[Any, ...], entry: Tuple[Any, ...],
+        written: Set[Tuple[int, str]],
+    ) -> bool:
+        """True for a stream's environment-name list when every
+        environment the push wrote is already in it: a push can only
+        ADD an environment, so the list is wrong only when one is new.
+        Every other whole-stream entry answers False and is dropped.
+        Called under the summary lock."""
+        if key[0] != "stream_environment_names":
+            return False
+        names = entry[1]
+        return all(
+            environment in names
+            for stream_id, environment in written if stream_id == key[1])
+
+    def _invalidate_summary_cache_for(
+        self, written: Optional[Set[Tuple[int, str]]],
+    ) -> None:
+        """Drop the memoized components computed from *stream_ids*'
+        partitions of ``latest_runs`` — or every component, for
+        ``None`` (WP-38).
+
+        Why the narrowing exists. Results are pushed DURING a run:
+        mainline's through the morning, then builds' well into the
+        afternoon. Every one of those pushes used to drop every memo,
+        so for most of the working day nobody was served from one —
+        and a build's push cleared the home page's memos, which the
+        build's rows had not changed. Each entry now records the one
+        stream it was computed from, and the one environment when it
+        reads no other (:meth:`_store_summary`). *written* is the set
+        of ``(stream_id, environment)`` pairs an import wrote. An
+        entry is dropped when its stream is among them and it is
+        either whole-stream (no environment) or that environment's.
+        So a build's push leaves mainline's home page served, and a
+        mainline push into one environment leaves the other
+        environments' cells served.
+
+        Why it is safe. A memoized component reads ONE stream's
+        partition of ``latest_runs`` (and the derived tables partitioned
+        the same way) — that is what the tag names. What crosses
+        streams is not memoized here: ``compare_counts*`` are computed
+        per request; ``stream_identities``/``list_streams`` read
+        ``streams`` directly; ``assignment_streams`` reads
+        ``current_assignments`` directly. The writes that reach EVERY
+        stream's components — an assignment, a comment, a retirement,
+        an environment or stream delete — still pass ``None`` and drop
+        everything, as before; they are human-rate.
+
+        What it costs the push: one pass over at most
+        :data:`_SUMMARY_CACHE_MAX_ENTRIES` (128) keys, under a lock the
+        push already took for nothing longer — measured below the
+        resolution of the import's own timing.
+
+        The streak memo is keyed by stream too (``("failure_streak",
+        stream_id, ...)``) and is narrowed the same way.
+        """
+        stream_ids = (
+            None if written is None else set(pair[0] for pair in written))
         with self._summary_lock:
-            self._summary_cache.clear()
+            if written is None:
+                self._summary_cache.clear()
+            else:
+                for key in [
+                        key for key, entry in self._summary_cache.items()
+                        if entry[2] in stream_ids
+                        and (entry[3] is None
+                             or (entry[2], entry[3]) in written)
+                        and not self._names_still_hold(key, entry, written)]:
+                    del self._summary_cache[key]
+            self._memo_counts[2] += 1
         with self._streak_lock:
-            self._streak_cache.clear()
+            if stream_ids is None:
+                self._streak_cache.clear()
+            else:
+                for key in [
+                        key for key in self._streak_cache
+                        if len(key) > 1 and key[1] in stream_ids]:
+                    del self._streak_cache[key]
+
+    #: Tables small enough to count exactly whenever the Metrics page
+    #: asks. ``runs`` and ``run_outputs`` are deliberately not here.
+    _COUNTED_TABLES = (
+        "latest_runs", "activity_hours", "script_hours", "streams",
+        "comments", "assignments", "current_assignments", "users",
+        "test_retirements", "environment_products",
+        "environment_expectations",
+    )
+
+    def memo_report(self) -> Dict[str, int]:
+        """How the summary memo has done since the counters were last
+        reset (WP-37): served from it, computed instead, and how many
+        times a write cleared some of it. With results pushed during a
+        run, ``clears`` is the number to watch — since WP-38 a push
+        clears only the streams it wrote, so ``hits`` should stay high
+        through a build's run.
+        """
+        with self._summary_lock:
+            return {
+                "hits": self._memo_counts[0],
+                "misses": self._memo_counts[1],
+                "clears": self._memo_counts[2],
+                "entries": len(self._summary_cache),
+            }
+
+    def reset_memo_counts(self) -> None:
+        """Zero :meth:`memo_report`'s counters. The memo is untouched."""
+        with self._summary_lock:
+            self._memo_counts = [0, 0, 0]
+
+    def size_report(self) -> Dict[str, Any]:
+        """How big the database is and what is in it, for the Metrics
+        page (WP-37). Read when that page asks and at no other time,
+        and kept for :data:`_SIZE_REPORT_TTL_SECONDS` so a page left
+        refreshing itself costs one read a minute.
+
+        Nothing here scans ``runs``. Its row count is the sum of
+        ``activity_hours``, which the writing transaction keeps equal
+        to it (measured on the dev-scale estate: 0.3 ms, against 55 ms
+        for ``COUNT(*)`` over 656,680 runs — and production holds
+        several times that). Its oldest and newest start times are two
+        statements, each one end of ``idx_runs_start_time_result``;
+        asked for together they are a scan (95 ms here). ``run_outputs``
+        is not counted at all: there is one row per run, and counting
+        them means walking the largest table in the file.
+        """
+        with self._summary_lock:
+            kept = self._size_memo
+        if kept is not None and time.time() - kept[0] <= (
+                _SIZE_REPORT_TTL_SECONDS):
+            return kept[1]
+        conn = self._conn()
+        report = self._backend.size_report(conn)
+        rows = {}  # type: Dict[str, Optional[int]]
+        total = conn.execute(
+            "SELECT SUM(count) FROM activity_hours").fetchone()[0]
+        rows["runs"] = int(total or 0)
+        for table in self._COUNTED_TABLES:
+            rows[table] = int(conn.execute(
+                "SELECT COUNT(*) FROM {}".format(table)).fetchone()[0])
+        oldest = conn.execute(
+            "SELECT MIN(start_time) FROM runs").fetchone()[0]
+        newest = conn.execute(
+            "SELECT MAX(start_time) FROM runs").fetchone()[0]
+        names = {
+            int(row[0]): (row[1], row[2], row[3]) for row in conn.execute(
+                "SELECT id, product, kind, name FROM streams").fetchall()
+        }
+        streams = []  # type: List[Dict[str, Any]]
+        for row in conn.execute(
+            "SELECT stream_id, COUNT(*), COUNT(DISTINCT environment) "
+            "FROM latest_runs GROUP BY stream_id ORDER BY stream_id"
+        ).fetchall():
+            product, kind, name = names.get(int(row[0]), ("", "?", "?"))
+            streams.append({
+                "id": int(row[0]), "product": product, "kind": kind,
+                "name": name, "tests": int(row[1]),
+                "environments": int(row[2]),
+            })
+        version = conn.execute(
+            "SELECT MAX(version) FROM schema_version").fetchone()[0]
+        report.update({
+            "as_of": model.format_iso(model.utcnow()),
+            "kept_seconds": _SIZE_REPORT_TTL_SECONDS,
+            "schema_version": None if version is None else int(version),
+            "connections": self._max_connections,
+            "rows": rows,
+            "rows_not_counted": ["run_outputs"],
+            "oldest_run": oldest,
+            "newest_run": newest,
+            "streams": streams,
+        })
+        with self._summary_lock:
+            self._size_memo = (time.time(), report)
+        return report
 
     def test_exists(
         self, environment: str, script: str, test_name: str
@@ -6561,6 +7400,72 @@ class Storage:
         )
         return int(cursor.lastrowid)
 
+    def bulk_add_comment(
+        self,
+        author: str,
+        text: str,
+        created_at: datetime.datetime,
+        triples: Sequence[Tuple[str, str, str, Optional[int]]],
+    ) -> Tuple[int, int]:
+        """Post ONE comment on each of the given tests (WP-35) — the
+        multi-select bar's "Comment", for the thirty failures that
+        share one cause. Changes no assignment.
+
+        *triples* is ``(environment, script, test_name, stream_id)``,
+        the shape :meth:`bulk_set_assignee_for_triples` takes, and
+        *stream_id* is that one test's own "posted from". Returns
+        ``(commented, unknown)`` with that method's meaning: *unknown*
+        counts tests with no row in ``latest_runs`` on any stream,
+        skipped rather than failed; both are over the de-duplicated
+        set. One transaction, existence resolved a chunk at a time.
+        """
+        by_triple = {}  # type: Dict[Tuple[str, str, str], Optional[int]]
+        for env, scr, test, origin in triples:
+            by_triple[(env, scr, test)] = origin
+        unique_triples = list(by_triple.keys())
+        if not unique_triples:
+            return 0, 0
+
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            found = []  # type: List[Tuple[str, str, str]]
+            for start in range(0, len(unique_triples), _RECENT_CHUNK):
+                chunk = unique_triples[start:start + _RECENT_CHUNK]
+                clause = " OR ".join(
+                    "(environment = ? AND script = ? AND test_name = ?)"
+                    for _ in chunk
+                )
+                params = []  # type: List[str]
+                for triple in chunk:
+                    params.extend(triple)
+                rows = conn.execute(
+                    "SELECT DISTINCT environment, script, test_name "
+                    "FROM latest_runs WHERE ({0})".format(clause),
+                    tuple(params),
+                ).fetchall()
+                found.extend((row[0], row[1], row[2]) for row in rows)
+            if found:
+                self.ensure_user(author, created_at)
+                created_at_iso = model.format_iso(created_at)
+                conn.executemany(
+                    "INSERT INTO comments (environment, script, "
+                    "test_name, author, created_at, text, stream_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (env, scr, test, author, created_at_iso, text,
+                         by_triple[(env, scr, test)])
+                        for (env, scr, test) in found
+                    ],
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if found:
+            self._invalidate_summary_cache()
+        return len(found), len(unique_triples) - len(found)
+
     def comments(
         self, environment: str, script: str, test_name: str
     ) -> List[Comment]:
@@ -6712,6 +7617,13 @@ class Storage:
         already have a ``current_assignments`` row — SELECT-then-
         UPDATE-or-INSERT, never ``INSERT OR REPLACE``, same rule as
         every other upsert in this module.
+
+        The optional comment carries each entry's OWN origin too
+        (WP-35). Until then it was written with ``stream_id NULL``
+        whatever the entry said, so a note typed while assigning from a
+        build's page was recorded as if it had been posted from
+        nowhere — while the assignment beside it, from the same click,
+        was tagged.
         """
         conn.executemany(
             "INSERT INTO assignments (environment, script, "
@@ -6755,11 +7667,11 @@ class Storage:
             conn.executemany(
                 "INSERT INTO comments (environment, script, "
                 "test_name, author, created_at, text, stream_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [
                     (env, scr, test, assigned_by, assigned_at_iso,
-                     comment_text)
-                    for (env, scr, test, _origin) in entries
+                     comment_text, origin)
+                    for (env, scr, test, origin) in entries
                 ],
             )
 

@@ -109,6 +109,13 @@ def build_parser():
               "already running. The file is capped and rolled over, so "
               "leaving it on is safe"))
     parser.add_argument(
+        "--no-metrics", action="store_true",
+        help=("do not keep the in-memory counters the Metrics page "
+              "reads. They are ON unless this is given: no file, no "
+              "query, and no lock taken to record anything. With this "
+              "the page still shows the database's size and says the "
+              "rest is not being collected."))
+    parser.add_argument(
         "--perf-max-mb", type=int, default=None, metavar="MB",
         help=("roll --perf-log over at this size (default: 128). At most "
               "twice this is ever on disk: the live file and one "
@@ -256,6 +263,18 @@ def main(argv=None):
                 traceback.print_exc()
             return 2
 
+    # The counters are applied BEFORE the performance log's wrappers, so
+    # the log times the tallied call and not the other way round.
+    metrics = None
+    if args.no_metrics:
+        print("metrics: not collected (--no-metrics)")
+    else:
+        import testboard.metrics
+        metrics = testboard.metrics.Metrics()
+        tallied = testboard.metrics.instrument_storage(storage, metrics)
+        print("metrics: in memory ({0} storage methods tallied); see "
+              "metrics.html".format(len(tallied)))
+
     perf_log = None
     if args.perf_log:
         import testboard.perf
@@ -300,7 +319,8 @@ def main(argv=None):
     try:
         server = testboard.server.create_server(
             args.host, args.port, storage, args.static, perf=perf_log,
-            site_notes_path=site_notes_path, url_prefix=url_prefix)
+            site_notes_path=site_notes_path, url_prefix=url_prefix,
+            metrics=metrics)
     except OSError as exc:
         storage.close()
         if perf_log is not None:

@@ -1680,6 +1680,819 @@ class DeltaViewTest(unittest.TestCase):
         self.assertIn("reviewEntry(row, streamId)", row_body)
 
 
+class DeltaEnvironmentFilterTest(unittest.TestCase):
+    """WP-33: the Environment filter on a build's "Difference from" tab.
+
+    The filter is the toolbar's existing select, shared with "Its own
+    results" -- which is what makes it one control in one place, and
+    also what makes it dangerous: app.js wired that select (and the
+    Refresh button beside it) for the dashboard, those listeners
+    outlive a tab switch, and on the difference tab state.streamId is
+    null. Left unguarded, changing the filter there loads MAINLINE's
+    dashboard and un-hides it under the comparison. Most of this class
+    is about that hand-over, not about the filter.
+    """
+
+    def test_the_filter_is_no_longer_hidden_on_the_difference_tab(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "export async function initDeltaView("))
+        self.assertNotIn("env-filter-field", body)
+        self.assertIn("renderEnvironmentFilter(data, streamId)", body)
+
+    def test_options_and_selection_come_from_the_response(self) -> None:
+        """The list the server compared across and the filter it
+        applied -- never a list or a value the page worked out."""
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        self.assertIn("data.environments", body)
+        self.assertIn("data.environment ", body)
+        self.assertIn("select.value = applied", body)
+        self.assertNotIn("location.search", body)
+        self.assertNotIn("currentScope(", body)
+
+    def test_a_server_without_the_list_keeps_the_field_hidden(
+            self) -> None:
+        """Static files are read from disk per request; Python is not.
+        A process that was not restarted serves this script against a
+        handler that ignores `environment=` -- the control would then
+        change the address bar and nothing else."""
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        guard_at = body.index("Array.isArray(data.environments)")
+        hide_at = body.index("field.hidden = true", guard_at)
+        show_at = body.index("field.hidden = false")
+        self.assertLess(guard_at, hide_at)
+        self.assertLess(hide_at, show_at)
+        self.assertIn("return", body[hide_at:show_at])
+
+    def test_a_filter_outside_the_comparison_is_never_shown_as_all(
+            self) -> None:
+        """select.value falls back to the first option when nothing
+        matches -- "All environments", over a filter that is in force
+        and matching nothing. The stray value gets its own option."""
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        stray_at = body.index("applied && !covered")
+        assign_at = body.index("select.value = applied")
+        self.assertLess(stray_at, assign_at)
+        self.assertIn("stray.value = applied", body[stray_at:assign_at])
+
+    def test_changing_it_rewrites_the_address_bar_through_urls_js(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        self.assertIn(
+            "replaceState(null, \"\", withEnvironment(select.value))",
+            body)
+        self.assertIsNone(_ENVIRONMENT_PARAM_RE.search(
+            _strip_comments(read("compare.js"))))
+
+    def test_changing_it_keeps_the_category_tab(self) -> None:
+        change = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        self.assertIn(
+            "initDeltaView(streamId, { keepCategory: true })", change)
+        init = _strip_comments(_function_body(
+            read("compare.js"), "export async function initDeltaView("))
+        reset_at = init.index("deltaState.category = CATEGORY_ORDER[0]")
+        guard_at = init.rindex("if (", 0, reset_at)
+        self.assertIn("keepCategory", init[guard_at:reset_at])
+
+    def test_with_environment_changes_that_level_and_no_other(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("urls.js"), "export function withEnvironment("))
+        self.assertIn("currentUrlWithScope(", body)
+        self.assertIn("environment:", body)
+        for level in ("product", "stream", "baseline"):
+            self.assertNotIn(level + ":", body)
+
+    def test_the_change_handler_stands_down_off_the_difference_tab(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        handler = body[body.index("select.onchange"):]
+        guard_at = handler.index("!deltaState.active")
+        act_at = handler.index("replaceState(")
+        self.assertLess(guard_at, act_at)
+        self.assertIn("return", handler[guard_at:act_at])
+
+    def _guarded(self, listener: str, action: str) -> None:
+        self.assertIn("isDeltaViewActive()", listener)
+        guard_at = listener.index("isDeltaViewActive()")
+        act_at = listener.index(action)
+        self.assertLess(guard_at, act_at)
+        self.assertIn("return", listener[guard_at:act_at])
+
+    def test_the_dashboards_own_listeners_stand_down_on_that_tab(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function wireMainlineControls("))
+        env_at = body.index('envSelect.addEventListener("change"')
+        self._guarded(
+            body[env_at:body.index("scriptSelect.addEventListener")],
+            "setEnvironment(")
+        reload_at = body.index('getElementById("reload-btn")')
+        self._guarded(
+            body[reload_at:body.index('getElementById("show-more")')],
+            "refreshAll(")
+
+    def test_own_results_takes_the_controls_back(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function activateOwnResultsTab("))
+        self.assertIn("leaveDeltaView()", body)
+        self.assertLess(
+            body.index("leaveDeltaView()"), body.index("refreshAll("))
+        leave = _strip_comments(_function_body(
+            read("compare.js"), "export function leaveDeltaView("))
+        self.assertIn("deltaState.active = false", leave)
+        self.assertIn("reload.onclick = null", leave)
+
+    def test_own_results_rereads_the_filter_on_every_activation(
+            self) -> None:
+        """wireMainlineControls() reads the address bar once, the first
+        time it runs. The difference tab can have changed it since."""
+        body = _strip_comments(_function_body(
+            read("app.js"), "function activateOwnResultsTab("))
+        wired_at = body.index("wireMainlineControls()")
+        read_at = body.index(
+            "state.environment = currentScope().environment")
+        load_at = body.index("refreshAll(")
+        self.assertLess(wired_at, read_at)
+        self.assertLess(read_at, load_at)
+
+    def test_switching_to_the_difference_abandons_a_load_in_flight(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function activateDiffTab("))
+        self.assertLess(
+            body.index("state.requestSeq++"),
+            body.index("initDeltaView("))
+        self.assertIn("state.browseSeq++", body)
+
+    def test_the_filter_in_force_is_stated_from_the_servers_echo(
+            self) -> None:
+        html = read("index.html")
+        note_at = html.index('id="delta-environment-note"')
+        self.assertIn("hidden", html[note_at:note_at + 60])
+        self.assertLess(note_at, html.index('id="delta-tiles"'))
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderEnvironmentFilter("))
+        self.assertIn("note.hidden = true", body)
+        shown_at = body.index("note.hidden = false")
+        guard_at = body.rindex("if (", 0, shown_at)
+        self.assertIn("applied", body[guard_at:shown_at])
+        self.assertIn("applied +", body[guard_at:shown_at])
+
+
+class BuildDeleteControlTest(unittest.TestCase):
+    """WP-34: deleting what a build holds for one environment, from the
+    page. The dashboard has no login, so the control is the safeguard a
+    login would otherwise be -- and each part of it is something a
+    later tidy-up could remove without anything looking broken."""
+
+    def _body(self, signature: str) -> str:
+        return _strip_comments(
+            _function_body(read("buildadmin.js"), signature))
+
+    def test_the_section_ships_hidden_and_collapsed(self) -> None:
+        html = read("index.html")
+        at = html.index('id="build-admin"')
+        tag = html[html.rindex("<", 0, at):html.index(">", at)]
+        self.assertIn("<details", tag)
+        self.assertIn("hidden", tag)
+        self.assertNotIn(" open", tag)
+        self.assertIn('src="buildadmin.js"', html)
+
+    def test_the_delete_button_ships_disabled(self) -> None:
+        html = read("index.html")
+        at = html.index('id="build-admin-delete"')
+        self.assertIn("disabled", html[at:html.index(">", at)])
+
+    def test_a_mainline_page_never_shows_it_or_fetches_for_it(
+            self) -> None:
+        body = self._body("function init()")
+        guard_at = body.index("streamId === null")
+        shown_at = body.index("section.hidden = false")
+        self.assertLess(guard_at, shown_at)
+        self.assertIn("return", body[guard_at:shown_at])
+        self.assertNotIn("fetchJson(", body)
+        self.assertNotIn("postJson(", body)
+
+    def test_nothing_is_fetched_until_it_is_opened(self) -> None:
+        body = self._body("function init()")
+        toggle_at = body.index('addEventListener("toggle"')
+        handler = body[toggle_at:body.index("});", toggle_at)]
+        self.assertIn("section.open", handler)
+        self.assertIn("load()", handler)
+        self.assertEqual(body.count("load()"), 1)
+        code = _strip_comments(read("buildadmin.js"))
+        self.assertEqual(code.count("fetchJson("), 1)
+        self.assertIn(
+            "fetchJson(", self._body("async function load()"))
+
+    def test_the_button_needs_a_target_a_reason_and_the_exact_name(
+            self) -> None:
+        body = self._body("function readyToDelete()")
+        self.assertIn("state.target !== null", body)
+        self.assertIn('"build-admin-reason").value.trim() !== ""', body)
+        self.assertIn(
+            '"build-admin-confirm").value === state.stream.name', body)
+        self.assertNotIn("toLowerCase", body)
+        self.assertNotIn("||", body)
+        sync = self._body("function syncDeleteButton()")
+        self.assertIn("disabled = !readyToDelete()", sync)
+
+    def test_the_button_is_rechecked_as_either_field_changes(
+            self) -> None:
+        body = self._body("function init()")
+        for field in ("build-admin-reason", "build-admin-confirm"):
+            self.assertIn(
+                '"' + field + '").addEventListener("input", '
+                'syncDeleteButton)', body)
+
+    def test_a_click_is_rechecked_before_anything_is_sent(self) -> None:
+        body = self._body("async function submit()")
+        guard_at = body.index("!readyToDelete()")
+        post_at = body.index("postJson(")
+        self.assertLess(guard_at, post_at)
+        self.assertIn("return", body[guard_at:post_at])
+
+    def test_a_name_is_required_and_sent(self) -> None:
+        body = self._body("async function submit()")
+        name_at = body.index("requireUsername()")
+        post_at = body.index("postJson(")
+        self.assertLess(name_at, post_at)
+        self.assertIn("return", body[name_at:post_at])
+        sent = body[post_at:body.index("});", post_at)]
+        for field in ("username:", "reason:", "confirm:"):
+            self.assertIn(field, sent)
+
+    def test_the_request_names_one_environment_and_carries_no_scope(
+            self) -> None:
+        body = self._body("function deleteUrl(")
+        self.assertIn("encodeURIComponent(environment)", body)
+        self.assertIn('"/delete"', body)
+        self.assertIn("NO_SCOPE", body)
+        self.assertIn("NO_SCOPE", self._body("function environmentsUrl()"))
+        code = _strip_comments(read("buildadmin.js"))
+        block = code[code.index("const NO_SCOPE"):]
+        block = block[:block.index("};")]
+        for level in ("product", "stream", "baseline", "environment"):
+            self.assertIn(level + ": null", block)
+
+    def test_what_will_go_is_stated_from_the_servers_counts(self) -> None:
+        body = self._body("function openForm(")
+        for source in ("row.tests", "row.runs", "row.environment",
+                       "state.stream.name"):
+            self.assertIn(source, body)
+        self.assertIn("cannot be undone", body)
+
+    def test_it_says_a_feeder_will_put_the_results_back(self) -> None:
+        """The delete does not block a re-import. A person who does not
+        know that deletes, sees the build return ten minutes later, and
+        reports the delete as broken."""
+        body = self._body("function openForm(")
+        self.assertIn("feeder", body)
+        self.assertIn("come back", body)
+
+    def test_the_last_environment_is_called_out(self) -> None:
+        body = self._body("function openForm(")
+        self.assertIn("state.environments.length === 1", body)
+        self.assertIn("build itself will disappear", body)
+
+    def test_after_a_delete_the_page_is_not_left_stale(self) -> None:
+        body = self._body("async function submit()")
+        gone_at = body.index("result.stream_deleted")
+        self.assertIn("withStream(null)", body[gone_at:])
+        self.assertIn('byId("reload-btn")', body[gone_at:])
+        self.assertIn("await load()", body[gone_at:])
+
+    def test_every_word_reaches_the_page_as_text(self) -> None:
+        code = _strip_comments(read("buildadmin.js"))
+        self.assertNotIn("innerHTML", code)
+        self.assertNotIn("insertAdjacentHTML", code)
+
+
+class BuildCommentTest(unittest.TestCase):
+    """WP-35: a comment made from a build's page is recorded against
+    that build however it is made, and the build's difference list
+    shows it.
+
+    Three ways to comment from a build's row existed or now exist --
+    the Review panel, the note on a bulk assignment, the bulk "Comment
+    only" -- and before this work package only a fourth, the test
+    page's own box, said where the comment came from. Each is pinned
+    separately because each was, or would be, silently untagged.
+    """
+
+    def test_the_review_panel_says_where_a_comment_was_posted_from(
+            self) -> None:
+        code = _strip_comments(read("review.js"))
+        post_at = code.index('"/comments"')
+        block = code[code.rindex("const body", 0, post_at):post_at]
+        self.assertIn("entry.stream_id", block)
+        self.assertIn("body.stream_id = entry.stream_id", block)
+        sent = code[post_at:code.index(";", post_at)]
+        self.assertIn("body", sent)
+        self.assertNotIn("{ username: me, text: text }", sent)
+
+    def test_a_mainline_rows_comment_still_carries_no_origin(
+            self) -> None:
+        """Guarded, not unconditional: an absent stream_id must stay
+        absent rather than become `stream_id: undefined` or null."""
+        code = _strip_comments(read("review.js"))
+        assign_at = code.index("body.stream_id = entry.stream_id")
+        guard_at = code.rindex("if (", 0, assign_at)
+        self.assertIn("entry.stream_id", code[guard_at:assign_at])
+
+    def test_the_panel_reports_the_servers_own_timestamp(self) -> None:
+        code = _strip_comments(read("review.js"))
+        at = code.index('kind: "commented"')
+        self.assertIn(
+            "posted.comment.created_at", code[at:at + 300])
+
+    def test_the_difference_list_has_a_comment_column(self) -> None:
+        html = read("index.html")
+        head = html[html.index('id="delta-table"'):]
+        head = head[:head.index("</thead>")]
+        self.assertLess(
+            head.index('id="delta-col-stream"'),
+            head.index('id="delta-col-comment"'))
+        row = _strip_comments(_function_body(
+            read("compare.js"), "function buildDeltaRow("))
+        self.assertIn(
+            "fillDeltaCommentCell(commentTd, row.stream_comment)", row)
+
+    def test_the_column_shows_the_builds_comment_and_no_other(
+            self) -> None:
+        code = _strip_comments(read("compare.js"))
+        self.assertNotIn("latest_comment", code)
+        fill = _function_body(code, "function fillDeltaCommentCell(")
+        self.assertNotIn("no comments", fill)
+        self.assertIn("comment.text", fill)
+        self.assertIn("comment.author", fill)
+
+    def test_the_heading_names_what_is_being_compared(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderBaselineCard("))
+        self.assertIn('"Comment on this " + streamNoun', body)
+
+    def test_a_posted_comment_updates_its_row_in_place(self) -> None:
+        """Reloading the page of rows would close every open panel on
+        a list that is being worked down."""
+        row = _strip_comments(_function_body(
+            read("compare.js"), "function buildDeltaRow("))
+        handler = row[row.index("const onCommented"):]
+        handler = handler[:handler.index("renderCommentedLine();") + 22]
+        self.assertIn("row.stream_comment =", handler)
+        self.assertIn("fillDeltaCommentCell(", handler)
+        self.assertIn("renderCommentedLine()", handler)
+        self.assertNotIn("loadCategory(", handler)
+        self.assertEqual(
+            row.count("deltaReviewOptions(onCommented)"), 2)
+
+    def test_an_open_panel_is_reopened_only_once_the_row_is_attached(
+            self) -> None:
+        """Reopening inserts the panel as the row's next sibling, which
+        needs a parent. buildDeltaRow() returns a row that has none, and
+        called reopenIfOpen() itself -- so Refresh, or any bulk action,
+        with a panel open threw and left the list cut short. A bulk
+        comment makes that re-render routine."""
+        code = _strip_comments(read("compare.js"))
+        build = _function_body(code, "function buildDeltaRow(")
+        self.assertEqual(build.count("reopenIfOpen("), 1)
+        self.assertIn("reopenAfterAttach.set(tr, () => reopenIfOpen(",
+                      build)
+        load = _function_body(code, "async function loadCategory(")
+        attach_at = load.index("body.appendChild(tr)")
+        reopen_at = load.index("reopenAfterAttach.get(tr)")
+        self.assertLess(attach_at, reopen_at)
+
+    def test_delta_review_options_still_offer_no_retirement(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function deltaReviewOptions("))
+        self.assertNotIn("staleBefore", body)
+        self.assertNotIn("onRetired", body)
+        self.assertIn('change.kind === "commented"', body)
+
+    def test_the_count_is_worded_from_the_rows_on_the_page(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "function renderCommentedLine("))
+        self.assertIn("deltaState.rows", body)
+        self.assertIn("row.stream_comment", body)
+        self.assertIn("shown >= deltaState.total", body)
+        self.assertIn("shown so far", body)
+        self.assertIn("deltaState.total", body)
+        html = read("index.html")
+        at = html.index('id="delta-commented"')
+        self.assertIn("hidden", html[at:at + 60])
+
+    def test_the_count_follows_the_rows_as_they_load(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "async function loadCategory("))
+        reset = body[body.index("if (reset)"):]
+        reset = reset[:reset.index("}")]
+        self.assertIn("deltaState.rows = []", reset)
+        self.assertIn("deltaState.rows.push(row)", body)
+        self.assertIn("renderCommentedLine()", body)
+
+    def test_comment_only_needs_a_note_and_a_selection(self) -> None:
+        body = _strip_comments(_function_body(
+            read("selection.js"), "function updateCommentButtonState("))
+        self.assertIn('noteInputEl.value.trim() === ""', body)
+        self.assertIn("selected.size === 0", body)
+        self.assertIn("||", body)
+        bar = _strip_comments(_function_body(
+            read("selection.js"), "function ensureBar("))
+        self.assertIn("commentBtnEl.disabled = true", bar)
+        self.assertIn(
+            'noteInputEl.addEventListener("input", '
+            'updateCommentButtonState)', bar)
+
+    def test_comment_only_is_rechecked_with_the_selection(self) -> None:
+        """The bar re-renders as boxes are ticked; the button has to
+        follow a selection that empties as well as a note that does."""
+        body = _strip_comments(_function_body(
+            read("selection.js"), "function updateAssignButtonState("))
+        self.assertIn("updateCommentButtonState()", body)
+
+    def test_comment_only_posts_the_selection_and_no_assignment(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("selection.js"), "async function doComment("))
+        self.assertIn("requireUsername()", body)
+        post_at = body.index("postJson(")
+        sent = body[post_at:body.index(");", post_at)]
+        self.assertIn("bulkCommentsUrl()", sent)
+        self.assertIn("tests: testsPayload()", sent)
+        self.assertIn("text: note", sent)
+        self.assertNotIn("assigned_by", sent)
+        self.assertNotIn("bulkAssignmentsUrl", body)
+        self.assertIn("notifyChanged()", body)
+
+    def test_each_selected_test_carries_its_own_origin(self) -> None:
+        body = _strip_comments(_function_body(
+            read("selection.js"), "function testsPayload("))
+        self.assertIn("out.stream_id = entry.stream_id", body)
+
+    def test_the_bulk_comment_request_carries_no_page_scope(self) -> None:
+        body = _strip_comments(_function_body(
+            read("selection.js"), "function bulkCommentsUrl("))
+        self.assertIn('"api/comments/bulk"', body)
+        for level in ("product", "stream", "baseline", "environment"):
+            self.assertIn(level + ": null", body)
+
+
+class AskForLessTest(unittest.TestCase):
+    """WP-36: pages that were asking the server for far more than they
+    read. Each of these still WORKS if it is reverted -- it is just
+    slow again, on every page load, for everyone -- so each is pinned
+    the way SummaryPartsFetchTest pins the split it guards."""
+
+    def test_the_product_list_is_fetched_as_a_product_list(self) -> None:
+        for name in ("products.js", "watch.js"):
+            code = _strip_comments(read(name))
+            self.assertIn("fetchProducts()", code, name)
+            self.assertNotIn("api/summary", code, name)
+
+    def test_it_falls_back_for_a_server_not_yet_restarted(self) -> None:
+        """Static files are read from disk per request; Python is not.
+        This script can arrive before the endpoint it asks for."""
+        body = _strip_comments(_function_body(
+            read("api.js"), "export async function fetchProducts("))
+        first = body.index('"api/products"')
+        caught = body.index("catch", first)
+        self.assertIn(
+            '"api/summary?parts=headline"', body[caught:])
+        self.assertEqual(body.count("fetchJson("), 2)
+
+    def test_importing_the_helper_has_no_side_effects(self) -> None:
+        """It lives in api.js, not products.js: importing products.js
+        adopts ?product= from the address bar, which the Watch page --
+        whose URL is its own grammar -- must not start doing."""
+        self.assertNotIn(
+            "products.js", _strip_comments(read("watch.js")))
+        self.assertNotIn(
+            "function fetchProducts", _strip_comments(read("products.js")))
+
+    def test_a_builds_page_asks_who_before_it_asks_how_many(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "async function initBranchDashboard("))
+        self.assertIn("fetchCompareIdentity(", body)
+        self.assertNotIn("fetchCompare(", body)
+        identity = _strip_comments(_function_body(
+            read("compare.js"),
+            "export async function fetchCompareIdentity("))
+        self.assertIn('counts: "0"', identity)
+        self.assertIn("stream: streamId", identity)
+        self.assertIn("baseline:", identity)
+
+    def test_its_own_results_never_runs_a_comparison(self) -> None:
+        code = _strip_comments(read("app.js"))
+        self.assertNotIn("fetchCompare(", code)
+        body = _function_body(code, "function activateOwnResultsTab(")
+        self.assertNotIn("initDeltaView(", body)
+
+    def test_the_difference_tab_opens_on_one_request(self) -> None:
+        """The header and the first page of rows come from the same
+        answer. Asked separately, the comparison behind the counts ran
+        twice, in sequence, before a row was shown."""
+        body = _strip_comments(_function_body(
+            read("compare.js"), "export async function initDeltaView("))
+        first = body[body.index("fetchCompare("):]
+        first = first[:first.index(");")]
+        self.assertIn("deltaState.category", first)
+        self.assertNotIn("null, 0", first)
+        self.assertIn("loadCategory(true, data)", body)
+        load = _strip_comments(_function_body(
+            read("compare.js"), "async function loadCategory("))
+        self.assertIn("fetched || await fetchCompare(", load)
+
+    def test_later_pages_and_tabs_still_fetch_their_own(self) -> None:
+        code = _strip_comments(read("compare.js"))
+        self.assertIn("loadCategory(false)", code)
+        tabs = _function_body(code, "function renderTabs(")
+        self.assertIn("loadCategory(true)", tabs)
+        self.assertNotIn("loadCategory(true, ", tabs)
+
+    def test_the_difference_tab_runs_it_once_itself(self) -> None:
+        body = _strip_comments(_function_body(
+            read("compare.js"), "export async function initDeltaView("))
+        self.assertEqual(body.count("fetchCompare("), 1)
+        self.assertNotIn("fetchCompareIdentity(", body)
+
+
+class MetricsPageTest(unittest.TestCase):
+    """WP-37: the Metrics page. It was asked for on one condition --
+    that it not cost response time -- and the half of that the front
+    end owns is that the page asks once and then leaves the server
+    alone."""
+
+    #: Every page with the site's nav bar.
+    _PAGES = (
+        "actions.html", "index.html", "metrics.html", "script.html",
+        "test.html", "time.html", "timeline.html", "watch.html",
+        "whatsnew.html",
+    )
+
+    def test_there_is_no_timer_on_the_page(self) -> None:
+        """A page of counters that polled would be traffic of its own
+        in the figures it shows, and the sizes behind it are queries."""
+        code = _strip_comments(read("metrics.js"))
+        for name in ("setInterval", "setTimeout", "requestAnimationFrame",
+                     "visibilitychange"):
+            self.assertNotIn(name, code, name)
+
+    def test_one_request_fills_it(self) -> None:
+        code = _strip_comments(read("metrics.js"))
+        self.assertEqual(code.count("fetchJson("), 1)
+        self.assertEqual(len(fetch_sites(code, "api/metrics")), 2)
+        load = _function_body(code, "async function load()")
+        self.assertIn('"api/metrics"', load)
+        self.assertEqual(code.count("postJson("), 1)
+
+    def test_it_is_asked_for_on_open_and_on_refresh_only(self) -> None:
+        code = _strip_comments(read("metrics.js"))
+        init = _function_body(code, "function init()")
+        self.assertIn('byId("reload-btn").addEventListener("click", load)',
+                      init)
+        self.assertEqual(init.count("load()"), 1)
+        callers = [
+            line for line in code.split("\n")
+            if "load()" in line and "function load" not in line]
+        self.assertEqual(len(callers), 2, callers)
+
+    def test_its_requests_carry_no_page_scope(self) -> None:
+        code = _strip_comments(read("metrics.js"))
+        block = code[code.index("const NO_SCOPE"):]
+        block = block[:block.index("};")]
+        for level in ("product", "stream", "baseline", "environment"):
+            self.assertIn(level + ": null", block)
+        self.assertEqual(code.count("NO_SCOPE)"), 2)
+
+    def test_a_requests_target_reaches_the_page_as_text(self) -> None:
+        """It carries search text and test names typed by users."""
+        code = _strip_comments(read("metrics.js"))
+        self.assertNotIn("innerHTML", code)
+        self.assertNotIn("insertAdjacentHTML", code)
+        self.assertIn("entry.target", code)
+
+    def test_reset_asks_again_afterwards(self) -> None:
+        body = _strip_comments(_function_body(
+            read("metrics.js"), "async function reset()"))
+        post_at = body.index('"api/metrics/reset"')
+        self.assertLess(post_at, body.index("await load()"))
+
+    def test_a_server_that_is_not_collecting_is_said_to_be(self) -> None:
+        body = _strip_comments(_function_body(
+            read("metrics.js"), "function renderActivity("))
+        guard_at = body.index("!activity.collecting")
+        self.assertIn("--no-metrics", body[guard_at:])
+        self.assertIn("return", body[guard_at:])
+        self.assertIn(
+            'byId("metrics-reset").disabled = !activity.collecting', body)
+
+    def test_nothing_about_the_server_is_assumed(self) -> None:
+        """Workers, engine, schema version and the histogram's edges
+        are the response's to say."""
+        code = _strip_comments(read("metrics.js"))
+        for source in ("database.engine", "database.version",
+                       "database.schema_version", "database.connections",
+                       "database.kept_seconds",
+                       "activity.bucket_edges_ms"):
+            self.assertIn(source, code, source)
+        for literal in ("SQLite", "MariaDB", "5000"):
+            self.assertNotIn(literal, code, literal)
+
+    def test_the_page_says_what_the_run_count_is(self) -> None:
+        body = _strip_comments(_function_body(
+            read("metrics.js"), "function renderDatabase("))
+        self.assertIn("database.rows_not_counted", body)
+        self.assertIn("not counted", body)
+
+    def test_every_page_links_to_it(self) -> None:
+        for name in self._PAGES:
+            html = read(name)
+            nav = html[html.index('<nav class="site-nav">'):]
+            nav = nav[:nav.index("</nav>")]
+            self.assertEqual(nav.count('href="metrics.html"'), 1, name)
+            self.assertLess(
+                nav.index('href="metrics.html"'),
+                nav.index('href="whatsnew.html"'), name)
+
+    def test_the_link_is_current_on_its_own_page_only(self) -> None:
+        for name in self._PAGES:
+            html = read(name)
+            at = html.index('href="metrics.html"')
+            tag = html[html.rindex("<a", 0, at):html.index(">", at)]
+            self.assertEqual(
+                "aria-current" in tag, name == "metrics.html", name)
+
+    def test_the_page_is_not_a_scoped_nav_target(self) -> None:
+        """It is about the server. A product or a build carried onto it
+        would be a filter it silently ignores."""
+        code = _strip_comments(read("urls.js"))
+        block = code[code.index("NAV_SCOPE_PAGES = ["):]
+        block = block[:block.index("];")]
+        self.assertNotIn("metrics", block)
+
+
+def _module_imports(name: str) -> List[str]:
+    source = _strip_comments(read(name))
+    return sorted(set(
+        re.findall(r'from\s+"\./([a-z_]+\.js)"', source)
+        + re.findall(r'import\s+"\./([a-z_]+\.js)"', source)))
+
+
+def _module_closure(scripts: List[str]) -> List[str]:
+    seen = []  # type: List[str]
+    frontier = list(scripts)
+    while frontier:
+        name = frontier.pop(0)
+        if name in seen:
+            continue
+        seen.append(name)
+        frontier.extend(_module_imports(name))
+    return seen
+
+
+class ModulePreloadTest(unittest.TestCase):
+    """WP-38: every page names, up front, every module it will import.
+
+    Without it a browser discovers the import graph a level at a time:
+    the page's own scripts, then what they import, then what those
+    import -- one dependent round trip per level, each needing a free
+    worker, before the first request for data can be made. With it the
+    whole graph is fetched at once. The list is only worth having if it
+    is complete and current, so it is pinned to the import graph
+    itself, on every page.
+    """
+
+    def _pages(self) -> List[str]:
+        return sorted(
+            name for name in os.listdir(STATIC_DIR)
+            if name.endswith(".html"))
+
+    def test_the_preload_list_is_the_import_closure(self) -> None:
+        for page in self._pages():
+            html = read(page)
+            scripts = re.findall(
+                r'<script type="module" src="([^"]+)"', html)
+            preloads = re.findall(
+                r'<link rel="modulepreload" href="([^"]+)"', html)
+            self.assertEqual(
+                sorted(preloads), sorted(_module_closure(scripts)), page)
+            self.assertEqual(len(preloads), len(set(preloads)), page)
+
+    def test_it_is_in_the_head_before_any_script(self) -> None:
+        for page in self._pages():
+            html = read(page)
+            first_preload = html.index('rel="modulepreload"')
+            self.assertLess(first_preload, html.index("</head>"), page)
+            self.assertLess(
+                first_preload, html.index('<script type="module"'), page)
+
+    def test_the_closure_helper_sees_a_real_graph(self) -> None:
+        """The detector must be able to fail: app.js imports plenty."""
+        self.assertGreater(len(_module_closure(["app.js"])), 6)
+        self.assertIn("api.js", _module_closure(["app.js"]))
+
+
+class FirstPaintTest(unittest.TestCase):
+    """WP-38: the home page has a frame on screen before any script
+    has loaded -- "hangs for a few hundred ms before rendering
+    anything" was the report from production."""
+
+    def test_every_mainline_section_ships_visible(self) -> None:
+        """The frame, all of it: a section that appeared only when its
+        data landed would push everything under it down."""
+        html = read("index.html")
+        for section in ("status-section", "charts-section",
+                        "triage-section", "browse-section"):
+            at = html.index('id="' + section + '"')
+            tag = html[html.rindex("<section", 0, at):html.index(">", at)]
+            self.assertNotIn("hidden", tag, section)
+
+    def test_the_queue_renders_when_it_lands_not_when_the_headline_does(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "async function loadQueue("))
+        self.assertNotIn("if (state.summary)", body)
+        self.assertIn("renderQueueTabs()", body)
+        self.assertIn("renderQueueTable()", body)
+        self.assertIn(
+            'getElementById("triage-section").hidden = false', body)
+        self.assertIn("payload.queue.stale_before = payload.stale_before",
+                      body)
+
+    def test_the_browse_page_renders_when_it_lands(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "async function refreshAll("))
+        browse_at = body.index("renderBrowse(state.browseRows, false)")
+        self.assertIn(
+            'getElementById("browse-section").hidden = false',
+            body[browse_at:browse_at + 200])
+
+    def test_a_badge_that_is_not_yet_known_is_not_a_zero(self) -> None:
+        tabs = _strip_comments(_function_body(
+            read("app.js"), "function renderQueueTabs()"))
+        self.assertIn('queueCountKnown(tab.id) ? String(count) : "…"', tabs)
+        self.assertIn("every(queueCountKnown)", tabs)
+        known = _strip_comments(_function_body(
+            read("app.js"), "function queueCountKnown("))
+        self.assertIn("state.queues[queueId]", known)
+        self.assertIn("state.summary.queue_totals", known)
+
+    def test_the_queue_table_needs_nothing_from_the_headline(self) -> None:
+        code = _strip_comments(read("app.js"))
+        table = _function_body(code, "function renderQueueTable()")
+        columns = _function_body(code, "function queueColumns(")
+        options = _function_body(code, "function reviewOptions()")
+        for body, name in ((table, "renderQueueTable"),
+                           (columns, "queueColumns")):
+            self.assertNotIn("state.summary.", body, name)
+        self.assertIn("serverClock()", columns)
+        # The cutoff: the headline's when it has landed, else the
+        # queue's own -- never a read of the headline that assumes it.
+        self.assertIn("state.summary ? state.summary.stale_before", options)
+        self.assertIn("queue.stale_before", options)
+
+    def test_the_placeholders_are_the_real_tiles(self) -> None:
+        """Same labels, same order, same classes: the numbers replace
+        the placeholders and nothing on the page moves."""
+        html = read("index.html")
+        row = html[html.index('id="stat-tiles"'):]
+        row = row[:row.index("</div>\n    </section>")]
+        placeholders = re.findall(
+            r'<span class="tile-label">([^<]+)</span>', row)
+        code = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        real = re.findall(r'label: "([^"]+)"', code)
+        self.assertEqual(placeholders, real)
+        self.assertEqual(row.count('class="tile '), len(real))
+        self.assertIn('class="tile tile-hero tile-skeleton"', row)
+        self.assertEqual(row.count("tile-skeleton"), len(real))
+
+    def test_the_numbers_replace_the_placeholders(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        self.assertIn("clearNode(container)", body)
+        self.assertLess(
+            body.index("clearNode(container)"),
+            body.index("buildTile("))
+
+    def test_a_builds_page_hides_the_frame_before_its_first_request(
+            self) -> None:
+        body = _strip_comments(_function_body(read("app.js"), "function init()"))
+        guard_at = body.index("streamId !== null")
+        hide_at = body.index("hidden = true", guard_at)
+        fetch_at = body.index("initBranchDashboard(", guard_at)
+        self.assertLess(hide_at, fetch_at)
+        self.assertIn("SECTIONS", body[guard_at:fetch_at])
+
+
 class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     """PART A of a follow-up link-matrix audit (after the F1-F7
     usability sweep): three more test.html links that only became

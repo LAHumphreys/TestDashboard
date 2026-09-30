@@ -329,3 +329,13 @@ export function withBaseline(baselineIdOrMainline) {
 export function withProduct(productOrEmpty) {
   return currentUrlWithScope({ product: productOrEmpty || "" });
 }
+
+/** The current page with ONLY its `environment` filter changed ("" or
+ * null = every environment). `environment` contains no other level, so
+ * nothing is reset: product, stream and baseline all carry, as does
+ * every non-scope param the page's own URL already has. For a page
+ * that changes its filter IN PLACE (history.replaceState) rather than
+ * navigating -- the build dashboard's "Difference from" tab (WP-33). */
+export function withEnvironment(environmentOrEmpty) {
+  return currentUrlWithScope({ environment: environmentOrEmpty || null });
+}

@@ -3294,3 +3294,299 @@ clients hammering it: 238 req/s sustained, p95 71 ms, max 111 ms. At
 10000; the title, tests and driver derive from it; the drop note's
 "Load, stated" carries the numbers. Suite and the 43-check driver
 re-run at the new value — see the commit.
+
+## 2026-09-29 — WP-32 is in production and Follow has been used on real runs (admin only, branch `docs-handover-2026-09-29`)
+
+**No code in this entry.** It records what happened to the 2026-09-24
+drop after the previous entry was written, and closes what that entry
+left open.
+
+**What is deployed.** `origin/master` is `91d5cd3` — WP-32 squash-merged
+as PR #11 on 2026-09-24 (13:36 UTC). The user states that GitHub
+`master` is the currently deployed software. The squash carries all
+three branch commits: master's tree and the branch tip `5972fc4` are the
+same tree object (`623d579`), so the ten-second cadence
+(`FOLLOW_POLL_MS = 10000`) is what production serves, not the first
+draft's sixty. CI on the master push: success (run 36008385377, 4m1s).
+The drop shipped on its provisional date, so neither `whatsnew.html` nor
+`docs/drops/2026-09-24.md` needed re-dating.
+
+**WP-31 deployment, left open by the previous entry:** closed by
+construction. WP-31 (`158fbcd`, #10) is the parent of the WP-32 commit
+on `master`, and `master` is what is deployed.
+
+**Follow in real use.** The user's report, 2026-09-29, verbatim: "Follow
+is working beautifully". That is the first observation of the timer
+ticking on its own — every earlier check invoked the poll by hand in the
+DOM shim. What the report does NOT itemise, and so what this entry does
+not claim: scroll restoration specifically, the failure stepper
+restarting after a changed refresh, or a run pausing past six hours and
+splitting into two blocks. No complaint has been raised about any of
+them; none has been separately confirmed either. Observed in the user's
+browser, not by this project's tooling — there is still no browser here.
+
+**Still owed from the WP-32 addendum** (Python, so it was out of scope
+for a static-only drop): `/api/timeline` validates its environment with
+`environment not in storage.known_environments()` (`api.py`, the
+timeline handler) — a scan of the `latest_runs` primary key, measured at
+6–12 ms of a 27 ms request on the dev-scale copy — where
+`storage.environment_exists()` is three seeks and is already what the
+neighbouring handlers use. At a ten-second poll this is the one cost in
+the request that is proportional to the estate. Not yet changed; a
+candidate for the next drop.
+
+**Suite on `master`'s tree, this session: 2270 OK (skipped 1)**, 144 s,
+SQLite-only, on the development machine. The dual-backend variants were
+not run here (no MariaDB option file on this machine); CI's MariaDB legs
+are green on the same commit.
+
+**Repository state found, not changed.** PR #9 (`wp-30-java-feeder`,
+Java micro client) is still open, all fourteen checks green, last
+touched 2026-09-08; it is one commit ahead of `master` and two behind.
+Twenty-odd merged branches and six sibling worktrees remain, local and
+remote; none was pruned in this session — pruning deletes, and was not
+asked for.
+
+## 2026-09-29→30 — the drop of 2026-09-30: WP-33 … WP-37 (branch `drop-2026-09-30`)
+
+**How it was asked for.** One evening, in pieces, as the user thought of
+them, to be built overnight and deployed the next day as ONE drop: an
+environment filter on a build's comparison; the ability to delete a
+build ("we have a dodgy build that got uploaded for one of our envs");
+a way of acknowledging a build's failures; then comments on why a test
+is broken in a build; then a performance pass ("a little bit of
+slowness creep back into the home page", at ~13,000 tests a night,
+mainline and then again for one build); then a metrics page, "but not
+at a cost of a reduction in response time". Five work packages, one
+commit each; the commit messages carry the reasoning and the numbers,
+and this entry summarises them and records what they do not.
+
+**Decided by the user, before building.**
+- Delete: ONE environment of a build, not the whole build; from the UI,
+  not the command line; guarded.
+- "Acknowledge failures so they leave Open actions": DROPPED, by the
+  user, on being told that Open Actions lists a build's failure only
+  if it was ASSIGNED from that build — so unassigning already does it.
+  No work package was opened for it.
+- Build comments: build it if it holds together, drop it and workshop
+  the workflow if it feels janky.
+
+**WP-33 — environment filter on "Difference from"** (`bc73f1e`).
+`/api/compare?environment=`; the toolbar's existing select, shared with
+"Its own results", its value in the address bar. An environment outside
+the comparison is not an error — this endpoint had been SENT
+`environment=` since WP-24 and ignored it. Sharing the control is what
+made it more than a select: app.js's listeners outlive a tab switch,
+and on the difference tab `state.streamId` is null. Found and fixed on
+the way, present on master: Refresh on that tab drew mainline's
+dashboard underneath it. Suite 2270 → 2296; 89 live checks.
+
+**WP-34 — delete a build's results for one environment** (`e7e5a86`).
+Two things measurement changed, both on the dev-scale estate:
+1. `runs` has no index leading with `stream_id`, so the runs are found
+   through the build's own `activity_hours` partition, an hour at a
+   time. The first version still named the environment in that WHERE
+   and SQLite took the frozen UNIQUE index anyway; the query-plan test
+   written for the purpose caught it before it ran at scale.
+2. With that fixed it was still 6.8 s for 2,036 runs and 64.7 s for
+   22,245: `latest_runs.run_id` references `runs(id)` with no index, so
+   SQLite scans `latest_runs` once per deleted run. Foreign keys are
+   not enforced for that one transaction — 50 ms and 532 ms — and what
+   they guaranteed is checked by hand before the commit.
+Suite → 2345; 47 live checks.
+
+**WP-35 — comments on a build** (`04f2537`). The finding that shaped
+it: of four ways to comment from a build's page, ONE recorded the
+build. The Review panel did not; the bulk-assign note was written with
+`stream_id NULL` whatever the row said. (The session had told the user
+the opposite earlier the same evening, from reading app.js's comment
+rather than review.js's code; corrected to the user in the final
+report.) Both now tag; `POST /api/comments/bulk` and "Comment only"
+are new; the comparison's rows carry the newest comment posted FROM
+the build. A guard did its job: a server-side count of commented tests
+was a third run of the pairs query and
+`test_a_category_request_runs_the_pairs_sql_twice_not_thrice` failed;
+the count moved to the page. Found by the live driver, not by reading:
+compare.js reopened a Review panel before its row had a parent.
+Suite → 2387; 40 live checks.
+
+**WP-36 — performance pass** (`1131b56`). Why it crept back: nothing
+got slower per statement. Results are pushed DURING a run and every
+changing import clears every memo, so for the hours a run lasts the
+cold cost is the cost; and a full-size build now sits beside mainline.
+Measured cold, in-process, master and the drop alternately (over HTTP
+on the development machine an unchanged request varied 2–3× between
+runs minutes apart, more than the change being measured):
+
+| request | master | drop |
+|---|---|---|
+| home headline, all products | 76.2 ms | 35.7 ms |
+| home headline, one product | 55.3 ms | 34.3 ms |
+| home headline, one environment | 49.0 ms | 32.9 ms |
+| build's page: header | 32.9 ms | 0.1 ms |
+| product list, non-dashboard pages | 76.1 ms | 0.0 ms |
+| timeline | 17.2 ms | 10.6 ms |
+| watch, three cards | 96.6 ms | 83.7 ms |
+
+Estate: the dev seed, newest night moved to last night, plus a build of
+10,326 tests run five nights beside mainline's 24,854 — 656,680 runs,
+297 MB SQLite. NOT measured on MariaDB; NOT production data.
+One guard WIDENED, not weakened
+(`test_one_query_regardless_of_assignee`; the commit says how).
+Suite → 2421.
+
+**WP-37 — the Metrics page** (`3aadcf9`, `9b97ce4`). In-memory counters,
+per thread, merged to read; no lock taken to record, asserted by
+replacing the lock with one that counts. 1.3 millionths of a second per
+storage call and per request. The first commit is marked unfinished
+because the session ran out of allowance mid-package; the second
+completes it. Suite → 2501; 36 live checks.
+
+**Found, not changed — each a question for the user, not a defect
+someone forgot.**
+1. **Every memo is cleared by every changing import.**
+   `_invalidate_summary_cache`'s docstring records that as a decision
+   ("no value in selective invalidation, only risk"), made when the
+   cold cost was paid a few times a night. Clearing per stream would
+   keep mainline's pages warm while a build runs.
+2. **Open Actions' rows: 45 ms, never memoized.** The OR across result
+   and owner defeats both indexes.
+3. **A comparison page runs the pairs query twice**, pinned at two by
+   WP-23: 58 ms for a full-size build.
+4. **`compare_counts_many` classifies in Python** on the stated premise
+   that a build is "dozens, not thousands of tests". It fetched 20,652
+   rows for one Watch card.
+5. **`delete_stream` and `prune_runs_before` pay the per-run
+   foreign-key scan** that WP-34 measured, on SQLite. Both are tools
+   run with the server stopped.
+6. **There is no switch that turns the delete off**, and no login.
+7. **Build comments, left open on purpose:** mainline lists show a
+   test's newest comment of ANY origin, unlabelled; deleting a build
+   clears the tag on its comments; nothing carries to the next build;
+   "has a comment" is not "acknowledged".
+8. **A delete does not block a re-import.** A lasting block needs a
+   table, which needs migration 11.
+
+**Scratch tooling, for whoever measures next.** The HTTP harness's
+first page capture over-counted: the DOM shim builds bare elements, so
+`products.js` never saw `data-host-managed` and fetched a summary the
+real page does not; and importing a module with a cache-buster made a
+second instance of it. Both corrected in the scratch capture before
+any number in this entry was taken. Also: a server killed rather than
+shut down leaves its last writes in the WAL, and copying the `.db`
+file alone silently loses them — the first seeded copy was short by
+one stream for exactly that reason.
+
+**Dual-backend suite, local MariaDB 12.3:** 3380 OK (skipped 56).
+Production is 10.3; CI's legs are the authority.
+
+**The standing sanity net** (`.scratch/net/run_net.py`, its worktree
+re-pointed at the drop and the pin restored): 5 failing checks — and
+the SAME 5 on `origin/master` (`91d5cd3`), run straight afterwards. All
+five are the seed's age, not the code: its nights are dated August, so
+no build has a covered pass in the last fortnight, every build opens on
+the difference, and the checks that expect a cadenced build to open on
+"Its own results" (and to find its quick links there) cannot pass on
+any commit. The net needs re-seeding with dates that move; until then
+its verdict is "no new failure", not "green".
+
+**Not verified:** see `docs/drops/2026-09-30.md`. No browser has
+rendered any of it.
+
+## 2026-09-30 — WP-38: a push drops only the memos of what it wrote; the home page paints its frame first (branch `drop-2026-09-30`)
+
+**The ask, the morning after the drop was built.** Pushes now happen
+throughout the day — mainline's through the morning, builds' well into
+the afternoon — so "minimise the blast radius to the cache", with one
+hard limit: nothing that slows the push, because that slows the test
+runs themselves. And where the cache cannot be preserved, load the home
+page in stages: in production it "frequently hangs for a few hundred
+ms before rendering anything".
+
+**What was true.** `_invalidate_summary_cache` dropped every memo on
+every changing import, by a recorded decision ("no value in selective
+invalidation, only risk") made when the cold cost was paid a few times
+a night. With two runs a day pushing continuously, that decision meant
+nobody was served from a memo during working hours — and a build's
+push cleared the home page's memos, which the build's rows had not
+changed. Item 1 of the previous entry's "found, not changed" list.
+
+**What changed.**
+1. Every memo entry now names the stream, and the environment when it
+   reads no other, that it was computed from (`_store_summary(key,
+   value, stream_id, environment)`). An import drops the `(stream,
+   environment)` pairs it wrote — taken from the `activity_hours` /
+   `script_hours` cells it already maintains, so the push path gains
+   nothing. Assignments, comments, retirements and deletes still drop
+   everything: human-rate.
+2. The partition pass (WP-36) is memoized PER ENVIRONMENT and
+   assembled; so are the test counts and the script catalogue. A
+   mainline push into one environment re-reads that environment's
+   rows (a prefix of the primary key) and the others are served. The
+   stream's environment-name list survives a push into an environment
+   it already names — a push can only add one.
+3. Every page names its whole module graph up front
+   (`<link rel="modulepreload">`, pinned to the import graph by
+   `ModulePreloadTest`), so the browser fetches it in one go instead of
+   a layer at a time — two to three dependent round trips, each needing
+   a free worker, before the first request for data could be made.
+4. The home page ships all four sections' frames — "Latest results"
+   with seven placeholder tiles carrying the real tiles' labels —
+   visible in the markup, on screen before any script runs; a build's
+   page hides them synchronously before its first request.
+5. Each section fills in when its OWN request lands. The user asked,
+   watching the play server: "still showing no results at all until it
+   has its summary results? Are there not things we can load whilst
+   the summary is still in flight?" — right: the queue rows and the
+   browse page were fetched in parallel with the headline and then
+   held behind it, because `loadQueue` rendered only `if
+   (state.summary)` and both sections stayed hidden until
+   `renderHeadline` un-hid them. The queue payload already carries
+   the clock and the cutoff the table needs; it renders on landing,
+   the browse page likewise, and a tab badge not yet known reads "…"
+   rather than 0. Driven live with the headline held back: 250 browse
+   rows and the queue's rendering on screen while it was in flight.
+
+**Measured.** The day's pattern replayed over HTTP on the dev estate
+(`push_pattern.py`: a push of 200 records, then a home-page load,
+twenty times):
+
+| | before | after |
+|---|---|---|
+| afternoon: pushes into a build | 63.7 ms median | 14.4 ms; memo hits 120, misses 0 |
+| morning: pushes into mainline's largest environment (7,416 tests) | 66.0 ms median | 32.3 ms |
+
+The push itself, 500 records into the build and into mainline, before
+and after, alternated over five rounds: 42–54 ms per batch either way
+(one 375 ms outlier in one round, on the machine, not the code — the
+same run's other figures were normal and it did not recur). In-process
+after a push into one mainline environment: the headline is that
+environment's cell pass (11–20 ms for the largest) plus its test count
+and script list (~4 ms); nothing else is re-read.
+
+**Guards.** `TargetedInvalidationTest` +14, every "still served"
+paired with a "still right" against a cold computation; per-environment
+tests in `PartitionRollupTest`; two count-shaped guards WIDENED, not
+weakened (`test_one_query_regardless_of_assignee` now derives its
+expected count from the fixture's environments; the full-payload
+queue-count guard tells a per-environment test count apart from a
+per-kind count by what a queue predicate reads). `ModulePreloadTest`
++3, `FirstPaintTest` +4. Suite 2501 → 2522.
+
+**Not changed, and why.** The pool. A browser opens up to six
+connections to load a page and every pushing feeder holds one; the pool
+is eight; a request queued for a worker is the one delay none of the
+above shortens. `--workers 16` on MariaDB costs a thread and a daemon
+connection per worker. Recommended to the operator as a decision to
+take from the Metrics page's "Waited, mean", not made here.
+
+**Not verified.** No browser has shown the frame appearing before the
+scripts load, or the preloads collapsing the waterfall; both were
+checked in the markup and the shim, not in a rendering engine. Not
+measured on MariaDB or on production data.
+
+**The user edited `whatsnew.html` by hand between the drop's first
+build and this package** (the Metrics bullet and the "Faster"
+paragraph). Their wording was kept; one factual slip corrected in
+place, and told to them: the Metrics page does not read the
+`--perf-log`, it keeps its own counters in memory.
