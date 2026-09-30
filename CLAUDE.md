@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project State
 
 **testboard is live in production and has been since 2026-07-26.** It is no longer
-greenfield: ~25k lines, 2,240 tests (3,016 with the MariaDB variants active),
+greenfield: ~25k lines, 2,501 tests (3,380 with the MariaDB variants active),
 schema at migration 10, deployed and in daily use by a small group of testers.
 **Production serves MariaDB**; the old SQLite box is now staging. SQLite and
 MariaDB remain equal, permanently supported backends — see "Commands".
@@ -103,6 +103,9 @@ The other documents, and what each is for:
   it is safe to leave on — and an intermittent fault cannot be caught by logging
   started after it. The queue-wait column is what separates "slow query" from "no free
   worker"; they are opposite diagnoses.
+- See what the server is doing without logging on to it: `metrics.html`. In-memory
+  counters, ON by default (`--no-metrics` turns them off). Not the perf log: that
+  keeps every record on disk; this keeps totals in memory.
 - Delete a bogus environment: `python tools/drop_environment.py --db <path> -e NAME`
   (`--dry-run` first; it cannot be undone)
 - Add a site-specific What's new note: `python tools/add_site_note.py --db <path>
@@ -113,7 +116,7 @@ The other documents, and what each is for:
 
 ## Architecture (dashboard)
 
-Layout as built: `testboard/` package with `model.py` (NamedTuples, `Result` enum, ISO time parse/format), `storage.py` (all SQL, sqlite migrations, the `_SqliteBackend` half of the backend seam), `mariadb.py` (the MariaDB backend — the ONE serving-path module that touches the vendored driver), `dbconfig.py` (mysql option-file parsing, shared with the migration tool), `analytics.py` (pure functions), `api.py` (framework-free routing/handlers), `server.py` (http.server glue + static files); `static/` for the UI; `tests/` for unittest suites. The SQL in `storage.py` is qmark-canonical permanently; the MariaDB wrapper translates at execute time, and the app NEVER runs DDL on MariaDB (schema comes from the migration tooling; `schema_version` equality is verified, both mismatch directions refuse).
+Layout as built: `testboard/` package with `model.py` (NamedTuples, `Result` enum, ISO time parse/format), `storage.py` (all SQL, sqlite migrations, the `_SqliteBackend` half of the backend seam), `mariadb.py` (the MariaDB backend — the ONE serving-path module that touches the vendored driver), `dbconfig.py` (mysql option-file parsing, shared with the migration tool), `analytics.py` (pure functions), `api.py` (framework-free routing/handlers), `server.py` (http.server glue + static files), `perf.py` (the optional on-disk timing log), `metrics.py` (in-memory counters for the Metrics page); `static/` for the UI; `tests/` for unittest suites. The SQL in `storage.py` is qmark-canonical permanently; the MariaDB wrapper translates at execute time, and the app NEVER runs DDL on MariaDB (schema comes from the migration tooling; `schema_version` equality is verified, both mismatch directions refuse).
 
 Key design decisions. The first few came from the brief; the rest were bought
 with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
@@ -145,6 +148,25 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
   (`"python: <name>"`). A database whose version exceeds the code's is refused, not
   used — so a rollback needs a copy of the file taken beforehand.
 - **Scale is the design constraint**: ~12,000 tests a night, kept for a year (~4.4M runs). No endpoint may be proportional to the size of the estate — *or of its history*. Three derived tables are maintained inside the writing transaction: `latest_runs` (one row per test, carrying its latest and previous result), `current_assignments`, and `activity_hours` (run counts per environment × UTC hour × result — what the staleness cutoff and the trend read; migration 6). Estate-wide reads go through them, list endpoints are paginated in SQL, and only the returned page joins `runs`. Nothing may scan a window of `runs` at request time — the bucket query that did was 3.5s mean on production and grew every night. `ORDER BY` cannot be parameterized — sort keys come from the `DASHBOARD_SORTS` whitelist.
+- **The cold cost is the cost.** Results are pushed DURING a run, there are two runs a
+  night, and every import that changes a row clears every memo in `Storage`. For the
+  hours a run lasts nothing is served from one — so measure with the memos cleared
+  before every call, and never quote a warm number as what a page costs. A summary
+  reads a stream's partition of `latest_runs` ONCE (`Storage._partition_rollup`) and
+  every scope of it is a filter of those cells; a new figure for the headline is a new
+  column on that pass or a sum over its cells, not another pass. Compare two code
+  trees in-process and alternated: over HTTP on the development machine an unchanged
+  request varies 2-3x between runs.
+- **Nothing a request does may take a lock to be counted.** `testboard/metrics.py`
+  tallies per thread and merges to read; `tests/test_metrics.py::NoLockOnTheRequestPathTest`
+  replaces the lock with one that counts. A counter every worker queues for is a new
+  way for requests to wait on each other, introduced by the thing meant to find those.
+  The Metrics page's database figures are read when the page asks and never scan
+  `runs` — its count is `SUM(activity_hours.count)`.
+- **A comment belongs to a test and records the stream it was posted FROM.** Every
+  way of commenting from a build's page must send that stream — the Review panel and
+  the bulk-assign note did not until WP-35. A build's "Difference from" list shows the
+  newest comment posted from that build and no other.
 - **A byte-identical re-import writes nothing.** The site feeder re-pushes its whole recent window every 10 minutes whether anything ran or not; `runs.output_fingerprint` is how an unchanged record is recognised without reading the stored blob. The skip is also what lets a retirement survive the next push — before it, ANY re-import un-retired the test. On the wire, the import response's `updated` still includes unchanged records (deployed feeders sum it); `unchanged` refines it.
 - **A run belongs to a test, not to a batch** — the import contract has no session/batch id. A *suite execution* is therefore inferred from run timings by `analytics.group_executions` (new execution when a run starts more than 60 min after the latest end seen). A suite can run more than once a day, so anything bucketed by calendar day (the home trend) must not be described as "per night".
 - **"Recently run" is derived from the suite, not from the wall clock.** Environments run

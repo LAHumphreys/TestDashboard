@@ -3346,3 +3346,149 @@ touched 2026-09-08; it is one commit ahead of `master` and two behind.
 Twenty-odd merged branches and six sibling worktrees remain, local and
 remote; none was pruned in this session — pruning deletes, and was not
 asked for.
+
+## 2026-09-29→30 — the drop of 2026-09-30: WP-33 … WP-37 (branch `drop-2026-09-30`)
+
+**How it was asked for.** One evening, in pieces, as the user thought of
+them, to be built overnight and deployed the next day as ONE drop: an
+environment filter on a build's comparison; the ability to delete a
+build ("we have a dodgy build that got uploaded for one of our envs");
+a way of acknowledging a build's failures; then comments on why a test
+is broken in a build; then a performance pass ("a little bit of
+slowness creep back into the home page", at ~13,000 tests a night,
+mainline and then again for one build); then a metrics page, "but not
+at a cost of a reduction in response time". Five work packages, one
+commit each; the commit messages carry the reasoning and the numbers,
+and this entry summarises them and records what they do not.
+
+**Decided by the user, before building.**
+- Delete: ONE environment of a build, not the whole build; from the UI,
+  not the command line; guarded.
+- "Acknowledge failures so they leave Open actions": DROPPED, by the
+  user, on being told that Open Actions lists a build's failure only
+  if it was ASSIGNED from that build — so unassigning already does it.
+  No work package was opened for it.
+- Build comments: build it if it holds together, drop it and workshop
+  the workflow if it feels janky.
+
+**WP-33 — environment filter on "Difference from"** (`bc73f1e`).
+`/api/compare?environment=`; the toolbar's existing select, shared with
+"Its own results", its value in the address bar. An environment outside
+the comparison is not an error — this endpoint had been SENT
+`environment=` since WP-24 and ignored it. Sharing the control is what
+made it more than a select: app.js's listeners outlive a tab switch,
+and on the difference tab `state.streamId` is null. Found and fixed on
+the way, present on master: Refresh on that tab drew mainline's
+dashboard underneath it. Suite 2270 → 2296; 89 live checks.
+
+**WP-34 — delete a build's results for one environment** (`e7e5a86`).
+Two things measurement changed, both on the dev-scale estate:
+1. `runs` has no index leading with `stream_id`, so the runs are found
+   through the build's own `activity_hours` partition, an hour at a
+   time. The first version still named the environment in that WHERE
+   and SQLite took the frozen UNIQUE index anyway; the query-plan test
+   written for the purpose caught it before it ran at scale.
+2. With that fixed it was still 6.8 s for 2,036 runs and 64.7 s for
+   22,245: `latest_runs.run_id` references `runs(id)` with no index, so
+   SQLite scans `latest_runs` once per deleted run. Foreign keys are
+   not enforced for that one transaction — 50 ms and 532 ms — and what
+   they guaranteed is checked by hand before the commit.
+Suite → 2345; 47 live checks.
+
+**WP-35 — comments on a build** (`04f2537`). The finding that shaped
+it: of four ways to comment from a build's page, ONE recorded the
+build. The Review panel did not; the bulk-assign note was written with
+`stream_id NULL` whatever the row said. (The session had told the user
+the opposite earlier the same evening, from reading app.js's comment
+rather than review.js's code; corrected to the user in the final
+report.) Both now tag; `POST /api/comments/bulk` and "Comment only"
+are new; the comparison's rows carry the newest comment posted FROM
+the build. A guard did its job: a server-side count of commented tests
+was a third run of the pairs query and
+`test_a_category_request_runs_the_pairs_sql_twice_not_thrice` failed;
+the count moved to the page. Found by the live driver, not by reading:
+compare.js reopened a Review panel before its row had a parent.
+Suite → 2387; 40 live checks.
+
+**WP-36 — performance pass** (`1131b56`). Why it crept back: nothing
+got slower per statement. Results are pushed DURING a run and every
+changing import clears every memo, so for the hours a run lasts the
+cold cost is the cost; and a full-size build now sits beside mainline.
+Measured cold, in-process, master and the drop alternately (over HTTP
+on the development machine an unchanged request varied 2–3× between
+runs minutes apart, more than the change being measured):
+
+| request | master | drop |
+|---|---|---|
+| home headline, all products | 76.2 ms | 35.7 ms |
+| home headline, one product | 55.3 ms | 34.3 ms |
+| home headline, one environment | 49.0 ms | 32.9 ms |
+| build's page: header | 32.9 ms | 0.1 ms |
+| product list, non-dashboard pages | 76.1 ms | 0.0 ms |
+| timeline | 17.2 ms | 10.6 ms |
+| watch, three cards | 96.6 ms | 83.7 ms |
+
+Estate: the dev seed, newest night moved to last night, plus a build of
+10,326 tests run five nights beside mainline's 24,854 — 656,680 runs,
+297 MB SQLite. NOT measured on MariaDB; NOT production data.
+One guard WIDENED, not weakened
+(`test_one_query_regardless_of_assignee`; the commit says how).
+Suite → 2421.
+
+**WP-37 — the Metrics page** (`3aadcf9`, `9b97ce4`). In-memory counters,
+per thread, merged to read; no lock taken to record, asserted by
+replacing the lock with one that counts. 1.3 millionths of a second per
+storage call and per request. The first commit is marked unfinished
+because the session ran out of allowance mid-package; the second
+completes it. Suite → 2501; 36 live checks.
+
+**Found, not changed — each a question for the user, not a defect
+someone forgot.**
+1. **Every memo is cleared by every changing import.**
+   `_invalidate_summary_cache`'s docstring records that as a decision
+   ("no value in selective invalidation, only risk"), made when the
+   cold cost was paid a few times a night. Clearing per stream would
+   keep mainline's pages warm while a build runs.
+2. **Open Actions' rows: 45 ms, never memoized.** The OR across result
+   and owner defeats both indexes.
+3. **A comparison page runs the pairs query twice**, pinned at two by
+   WP-23: 58 ms for a full-size build.
+4. **`compare_counts_many` classifies in Python** on the stated premise
+   that a build is "dozens, not thousands of tests". It fetched 20,652
+   rows for one Watch card.
+5. **`delete_stream` and `prune_runs_before` pay the per-run
+   foreign-key scan** that WP-34 measured, on SQLite. Both are tools
+   run with the server stopped.
+6. **There is no switch that turns the delete off**, and no login.
+7. **Build comments, left open on purpose:** mainline lists show a
+   test's newest comment of ANY origin, unlabelled; deleting a build
+   clears the tag on its comments; nothing carries to the next build;
+   "has a comment" is not "acknowledged".
+8. **A delete does not block a re-import.** A lasting block needs a
+   table, which needs migration 11.
+
+**Scratch tooling, for whoever measures next.** The HTTP harness's
+first page capture over-counted: the DOM shim builds bare elements, so
+`products.js` never saw `data-host-managed` and fetched a summary the
+real page does not; and importing a module with a cache-buster made a
+second instance of it. Both corrected in the scratch capture before
+any number in this entry was taken. Also: a server killed rather than
+shut down leaves its last writes in the WAL, and copying the `.db`
+file alone silently loses them — the first seeded copy was short by
+one stream for exactly that reason.
+
+**Dual-backend suite, local MariaDB 12.3:** 3380 OK (skipped 56).
+Production is 10.3; CI's legs are the authority.
+
+**The standing sanity net** (`.scratch/net/run_net.py`, its worktree
+re-pointed at the drop and the pin restored): 5 failing checks — and
+the SAME 5 on `origin/master` (`91d5cd3`), run straight afterwards. All
+five are the seed's age, not the code: its nights are dated August, so
+no build has a covered pass in the last fortnight, every build opens on
+the difference, and the checks that expect a cadenced build to open on
+"Its own results" (and to find its quick links there) cannot pass on
+any commit. The net needs re-seeding with dates that move; until then
+its verdict is "no new failure", not "green".
+
+**Not verified:** see `docs/drops/2026-09-30.md`. No browser has
+rendered any of it.
