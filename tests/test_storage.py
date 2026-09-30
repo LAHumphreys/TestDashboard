@@ -6964,6 +6964,91 @@ class DeleteStreamEnvironmentQueryPlanTest(_StreamEnvironmentFixture):
         self.assertIn("SQLITE_AUTOINDEX_RUNS_1", plan)
 
 
+class SizeReportTest(StorageTestBase):
+    """Storage.size_report / memo_report on whichever backend is under
+    test (WP-37). The engine-specific half — what the file weighs, what
+    the server's catalogue says — comes through the backend seam, so
+    this is the class that proves the MariaDB half runs at all."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([
+            make_record(test_name="test_a"),
+            make_record(test_name="test_b"),
+            make_record(test_name="test_a",
+                        start=BASE + datetime.timedelta(days=1)),
+            make_record(test_name="test_a", build="feat/x",
+                        start=BASE + datetime.timedelta(days=2)),
+        ])
+
+    def test_the_counts_are_the_real_ones(self) -> None:
+        report = self.store.size_report()
+        conn = self.store._conn()
+        self.assertEqual(report["rows"]["runs"], int(conn.execute(
+            "SELECT COUNT(*) FROM runs").fetchone()[0]))
+        self.assertEqual(report["rows"]["runs"], 4)
+        self.assertEqual(report["rows"]["latest_runs"], 3)
+        self.assertEqual(report["rows"]["streams"], 2)
+        self.assertEqual(report["rows"]["environment_products"], 1)
+        self.assertEqual(report["rows_not_counted"], ["run_outputs"])
+
+    def test_the_range_and_the_streams(self) -> None:
+        report = self.store.size_report()
+        self.assertEqual(report["oldest_run"], model.format_iso(BASE))
+        self.assertEqual(
+            report["newest_run"],
+            model.format_iso(BASE + datetime.timedelta(days=2)))
+        self.assertEqual(
+            [(s["kind"], s["name"], s["product"], s["tests"],
+              s["environments"]) for s in report["streams"]],
+            [("mainline", "", "", 2, 1), ("build", "feat/x", "Atlas", 1, 1)])
+
+    def test_the_engine_describes_itself(self) -> None:
+        report = self.store.size_report()
+        self.assertIn(report["engine"], ("SQLite", "MariaDB"))
+        self.assertEqual(
+            report["engine"], self.store._backend.engine_name)
+        self.assertTrue(report["version"])
+        self.assertGreater(report["bytes"], 0)
+        self.assertEqual(report["schema_version"], len(storage.MIGRATIONS))
+        for part in report["parts"]:
+            self.assertIsInstance(part["label"], str)
+            self.assertGreaterEqual(part["bytes"], 0)
+        for name, table in report["tables"].items():
+            self.assertIsInstance(name, str)
+            self.assertGreaterEqual(table["bytes"], 0)
+            self.assertGreaterEqual(table["rows_estimate"], 0)
+        if report["engine"] == "MariaDB":
+            for name in ("runs", "run_outputs", "latest_runs"):
+                self.assertIn(name, report["tables"])
+
+    def test_it_is_plain_json(self) -> None:
+        import json
+        decoded = json.loads(json.dumps(self.store.size_report()))
+        self.assertEqual(decoded["rows"]["runs"], 4)
+
+    def test_an_empty_database_has_a_report_too(self) -> None:
+        for environment in self.store.known_environments():
+            self.store.delete_environment(environment)
+        self.store._size_memo = None
+        report = self.store.size_report()
+        self.assertEqual(report["rows"]["runs"], 0)
+        self.assertIsNone(report["oldest_run"])
+        self.assertIsNone(report["newest_run"])
+
+    def test_the_memo_report_counts(self) -> None:
+        self.store.reset_memo_counts()
+        self.store.summary_rollup(BASE)
+        self.store.summary_rollup(BASE)
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "seen", CREATED)
+        self.assertEqual(
+            self.store.memo_report(),
+            {"hits": 1, "misses": 1, "clears": 1, "entries": 0})
+
+
 class DropStreamTest(StorageTestBase):
     """count_stream_rows / delete_stream — the storage half of
     tools/drop_stream.py."""

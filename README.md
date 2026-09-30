@@ -1539,6 +1539,55 @@ visibly attributed to the site rather than blended into testboard's own notes,
 because a tester who cannot tell "testboard changed" from "our environment
 changed" cannot tell who to ask about it.
 
+### What the server is doing now — the Metrics page
+
+`metrics.html` (linked from every page's nav bar) shows, without anyone logging
+on to the server: every request route and every storage method since the
+process started — count, mean, the time 95% of them finished within, the
+slowest, the **time queued for a worker**, and how many storage calls a request
+made and how long they took; the twenty slowest requests with what they asked
+for; how the summary memo is doing (served from it, computed instead, and how
+many times a write has cleared it); and the database — engine, schema version,
+size on disk, rows per table, tests per stream, and the date range of the runs
+on record.
+
+**On unless asked not to be** (`run_server.py --no-metrics`), because it was
+built to cost nothing a request would notice:
+
+- The counters are in memory. There is no file and no query behind them.
+- **Nothing a request does takes a lock to be counted.** Each worker tallies
+  into its own dictionaries; only reading the page merges them.
+  `tests/test_metrics.py::NoLockOnTheRequestPathTest` replaces the lock with
+  one that counts and fails the build if that stops being true.
+- Measured on the development machine: 1.3 millionths of a second per storage
+  call and per request. Against an untallied copy of the same database, the
+  same requests issued alternately sixty times: a warm home-page summary 0.630
+  ms against 0.647, a cold one 30.3 ms against 30.6 — inside the variation
+  between runs.
+- The database figures are read **when the page asks**, kept for a minute, and
+  at no other time. None of them scans `runs`: its row count is the sum of the
+  hourly activity table (0.3 ms, against 55 ms to count 656,680 runs on the
+  dev-scale estate), and `run_outputs` is not counted at all.
+- The page makes one request when it is opened and one each time Refresh is
+  pressed. It has no timer.
+
+**Reset counters** starts the counting again from nothing and changes no data.
+Totals since the process started are an average over everything; "reset, do
+the thing that feels slow, look" is how to see the last five minutes.
+
+`GET /api/metrics` returns `{activity, memo, database}`; `POST
+/api/metrics/reset` returns `{"reset": true}`. With `--no-metrics`, `activity`
+is `{"collecting": false}` and the rest is unchanged. A storage method's time
+is **inclusive** — it contains the time of any other storage method it called —
+so that column does not add up to the time spent in storage; a request's "in
+storage" figure counts the outermost call only, and does. On MariaDB the
+per-table sizes are the server's own (`information_schema`), and its row
+estimates are reported as estimates beside the exact counts.
+
+This is not the performance log below and does not replace it. The log keeps
+every record, on disk, with its time, so a stall at 03:14 can be read at 09:00;
+these are totals, in memory, gone when the process stops.
+
 ### Finding out where the time went, after the fact
 
 Stalls are intermittent, which is exactly what a live `top` never catches. The

@@ -2224,6 +2224,121 @@ class AskForLessTest(unittest.TestCase):
         self.assertNotIn("fetchCompareIdentity(", body)
 
 
+class MetricsPageTest(unittest.TestCase):
+    """WP-37: the Metrics page. It was asked for on one condition --
+    that it not cost response time -- and the half of that the front
+    end owns is that the page asks once and then leaves the server
+    alone."""
+
+    #: Every page with the site's nav bar.
+    _PAGES = (
+        "actions.html", "index.html", "metrics.html", "script.html",
+        "test.html", "time.html", "timeline.html", "watch.html",
+        "whatsnew.html",
+    )
+
+    def test_there_is_no_timer_on_the_page(self) -> None:
+        """A page of counters that polled would be traffic of its own
+        in the figures it shows, and the sizes behind it are queries."""
+        code = _strip_comments(read("metrics.js"))
+        for name in ("setInterval", "setTimeout", "requestAnimationFrame",
+                     "visibilitychange"):
+            self.assertNotIn(name, code, name)
+
+    def test_one_request_fills_it(self) -> None:
+        code = _strip_comments(read("metrics.js"))
+        self.assertEqual(code.count("fetchJson("), 1)
+        self.assertEqual(len(fetch_sites(code, "api/metrics")), 2)
+        load = _function_body(code, "async function load()")
+        self.assertIn('"api/metrics"', load)
+        self.assertEqual(code.count("postJson("), 1)
+
+    def test_it_is_asked_for_on_open_and_on_refresh_only(self) -> None:
+        code = _strip_comments(read("metrics.js"))
+        init = _function_body(code, "function init()")
+        self.assertIn('byId("reload-btn").addEventListener("click", load)',
+                      init)
+        self.assertEqual(init.count("load()"), 1)
+        callers = [
+            line for line in code.split("\n")
+            if "load()" in line and "function load" not in line]
+        self.assertEqual(len(callers), 2, callers)
+
+    def test_its_requests_carry_no_page_scope(self) -> None:
+        code = _strip_comments(read("metrics.js"))
+        block = code[code.index("const NO_SCOPE"):]
+        block = block[:block.index("};")]
+        for level in ("product", "stream", "baseline", "environment"):
+            self.assertIn(level + ": null", block)
+        self.assertEqual(code.count("NO_SCOPE)"), 2)
+
+    def test_a_requests_target_reaches_the_page_as_text(self) -> None:
+        """It carries search text and test names typed by users."""
+        code = _strip_comments(read("metrics.js"))
+        self.assertNotIn("innerHTML", code)
+        self.assertNotIn("insertAdjacentHTML", code)
+        self.assertIn("entry.target", code)
+
+    def test_reset_asks_again_afterwards(self) -> None:
+        body = _strip_comments(_function_body(
+            read("metrics.js"), "async function reset()"))
+        post_at = body.index('"api/metrics/reset"')
+        self.assertLess(post_at, body.index("await load()"))
+
+    def test_a_server_that_is_not_collecting_is_said_to_be(self) -> None:
+        body = _strip_comments(_function_body(
+            read("metrics.js"), "function renderActivity("))
+        guard_at = body.index("!activity.collecting")
+        self.assertIn("--no-metrics", body[guard_at:])
+        self.assertIn("return", body[guard_at:])
+        self.assertIn(
+            'byId("metrics-reset").disabled = !activity.collecting', body)
+
+    def test_nothing_about_the_server_is_assumed(self) -> None:
+        """Workers, engine, schema version and the histogram's edges
+        are the response's to say."""
+        code = _strip_comments(read("metrics.js"))
+        for source in ("database.engine", "database.version",
+                       "database.schema_version", "database.connections",
+                       "database.kept_seconds",
+                       "activity.bucket_edges_ms"):
+            self.assertIn(source, code, source)
+        for literal in ("SQLite", "MariaDB", "5000"):
+            self.assertNotIn(literal, code, literal)
+
+    def test_the_page_says_what_the_run_count_is(self) -> None:
+        body = _strip_comments(_function_body(
+            read("metrics.js"), "function renderDatabase("))
+        self.assertIn("database.rows_not_counted", body)
+        self.assertIn("not counted", body)
+
+    def test_every_page_links_to_it(self) -> None:
+        for name in self._PAGES:
+            html = read(name)
+            nav = html[html.index('<nav class="site-nav">'):]
+            nav = nav[:nav.index("</nav>")]
+            self.assertEqual(nav.count('href="metrics.html"'), 1, name)
+            self.assertLess(
+                nav.index('href="metrics.html"'),
+                nav.index('href="whatsnew.html"'), name)
+
+    def test_the_link_is_current_on_its_own_page_only(self) -> None:
+        for name in self._PAGES:
+            html = read(name)
+            at = html.index('href="metrics.html"')
+            tag = html[html.rindex("<a", 0, at):html.index(">", at)]
+            self.assertEqual(
+                "aria-current" in tag, name == "metrics.html", name)
+
+    def test_the_page_is_not_a_scoped_nav_target(self) -> None:
+        """It is about the server. A product or a build carried onto it
+        would be a filter it silently ignores."""
+        code = _strip_comments(read("urls.js"))
+        block = code[code.index("NAV_SCOPE_PAGES = ["):]
+        block = block[:block.index("];")]
+        self.assertNotIn("metrics", block)
+
+
 class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     """PART A of a follow-up link-matrix audit (after the F1-F7
     usability sweep): three more test.html links that only became

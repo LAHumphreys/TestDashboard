@@ -320,7 +320,13 @@ class Metrics:
         return None
 
     def _iso(self, when: float) -> str:
-        return model.format_iso(datetime.datetime.utcfromtimestamp(when))
+        # Not utcfromtimestamp(): deprecated on the interpreters this is
+        # developed on. Not fromtimestamp(when, timezone.utc): the rest
+        # of this project's timestamps carry no zone, and format_iso is
+        # given one that matches.
+        return model.format_iso(
+            datetime.datetime(1970, 1, 1)
+            + datetime.timedelta(seconds=when))
 
     def snapshot(self) -> Dict[str, Any]:
         """Everything counted since the start (or the last reset), as
