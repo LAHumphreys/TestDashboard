@@ -3614,3 +3614,78 @@ the questions for the next session, not this entry's to answer. This is
 also the first drop for which production can measure itself — any
 figure quoted from the Metrics page from now on is the first production
 number this project has had.
+
+## 2026-09-30 (evening) — WP-39: an empty build no longer lingers in the Build picker (branch `drop-2026-10-01`)
+
+**Two answers to the previous entry's questions, from the user the same
+evening:** production now runs `--workers 16`; the dodgy environment
+has been deleted. Not yet reported: whether the counters were left on,
+and what "Waited, mean" reads during a run.
+
+**How it was asked for.** "The dodgy env was deleted, but it's now
+showing up as an orphaned empty build on the builds drop down which is
+kinda annoying. Point 1 for tonight's drop is to have something that
+auto prunes empty builds."
+
+**Cause, from the code.** `Storage.delete_environment` (the tool
+`tools/drop_environment.py` calls) deletes the environment's rows from
+every table in `_ENVIRONMENT_TABLES` — and `streams` is not keyed by
+environment, so the table-list guard that asks the schema could never
+have seen it. A build that had only ever run on the environment kept
+its `streams` row with no `latest_runs` partition behind it, and
+`list_streams` lists the table. WP-34's per-build delete
+(`delete_stream_environment`) has always settled the build's row
+through `_settle_stream_after_delete`; the environment tool predates
+streams and was never taught to. The retention prune cannot empty a
+build (it never deletes a test's newest run) and an import cannot
+(the row is created in the transaction that writes the first run), so
+this was the one path.
+
+**What was built.**
+
+1. `delete_environment` reads the affected builds from `latest_runs`
+   BEFORE deleting (one seek per build through the derived table's
+   key — never a pass over `runs`) and settles each afterwards inside
+   the same transaction: row removed if empty (`deleted["streams"]`),
+   clock re-derived otherwise. `count_environment_rows` reports the
+   same `streams` figure, so the dry run and the delete still describe
+   the same thing (`test_the_counts_returned_match_what_the_dry_run_reported`
+   holds; a new test pins the key to a non-zero case so the equality is
+   not two zeros agreeing). Mainline is excluded from the settle: it is
+   not a build, and settling it with nothing left would delete row 1.
+2. `Storage.prune_empty_streams()` — every non-mainline build with no
+   `latest_runs` partition is removed, origin tags cleared, returned as
+   a list of `Stream`. The SELECT and the DELETEs share one
+   transaction, and each DELETE re-checks emptiness in its own WHERE,
+   so an import landing between them on MariaDB (no table lock there)
+   keeps its build. `run_server.py` calls it after opening the
+   database and before building the server, and prints
+   `empty builds: none` or `empty builds: removed N (kind:name, …)`.
+   A failure there is exit 2 with the reason, like every other
+   start-up refusal. Cost: one seek per `streams` row, every start.
+3. Retired-only builds are kept: retirement keeps the `latest_runs`
+   row, so "empty" means "no results", not "nothing shown".
+
+**Guards.** `EnvironmentDeleteTest` +6 (only-there build removed;
+also-elsewhere build keeps its other results with both ends of its
+clock moved; mainline never settled; the removed build's comment on
+another environment's test survives untagged — a first draft of that
+test put the comment on the deleted environment and found it deleted
+with it, which is the behaviour it has always had; dry run names the
+builds; no build left empty). `PruneEmptyStreamsTest` +5, the orphan
+planted by SQL the way production got its own. `TestDropEnvironmentCLI`
++1. `StartupSweepTest` +2 in `test_run_server_cli.py` — the one test
+in the suite that runs `run_server.py` as a real process and reads its
+stdout, because the sweep lives in `main()` between the database and
+the server, where nothing else looked. All dual-backend classes ran
+green against the local MariaDB 12.3 as well as SQLite.
+
+**Not changed.** `list_streams` does not filter empties defensively:
+the invariant is now maintained by every writer and restored at every
+start, and a filter would hide the row rather than remove it. No
+frontend change; the picker lists what the API returns.
+
+**Not verified.** No browser. Not run against MariaDB 10.3 here (CI's
+legs). The production orphan's origin is inferred, not observed — the
+operator note says what to report if the start-up line names a
+different build.

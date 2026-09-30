@@ -4,9 +4,11 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-09-30, evening**. The drop of 2026-09-30 (WP-33 …
-WP-38) was merged and deployed to production the same day it was cut. The
-user reports it "worked beautifully". Nothing is in flight.
+Last rewritten: **2026-09-30, late evening**. The drop of 2026-09-30
+(WP-33 … WP-38) was merged and deployed to production the same day it was
+cut; the user reports it "worked beautifully". **The next drop,
+`drop-2026-10-01`, is being built tonight from the first day's use**: its
+point 1 (WP-39) is done; more points may follow from the user.
 
 ## Where things stand
 
@@ -20,23 +22,32 @@ user reports it "worked beautifully". Nothing is in flight.
   `(stream, environment)` memos it wrote (WP-38), so pages are served from
   memos for most of the day; what remains is a wait for a free worker,
   which no memo shortens.
-- **Not reported back from the deploy** — ask before assuming any of them:
-  whether `--workers` was raised from 8; whether the counters were left on;
-  what "Waited, mean" reads during a run; whether the dodgy build's
-  environment has been deleted (WP-34 was built for it).
+- **Production runs `--workers 16`** (raised from 8 the day of the deploy).
+  **The dodgy environment has been deleted** — and left the build that
+  only ran on it as an empty entry in the Build picker, which is WP-39.
+- **Not reported back from the deploy** — ask before assuming either:
+  whether the counters were left on; what "Waited, mean" reads during a
+  run.
+- **`drop-2026-10-01` holds WP-39** (empty builds pruned: the environment
+  delete settles the builds it touches, and the server sweeps at start).
+  Python changed, no migration. Operator note written:
+  `docs/drops/2026-10-01.md`; tester note in `whatsnew.html`.
 
 ## Next session's plan
 
-1. **Get the four answers above.** If "Waited, mean" on `GET (static
-   files)` or `GET /api/summary` is tens of milliseconds during a run, the
-   pool is the bottleneck and `--workers 16` is the fix; if it is near
-   zero, the next pass is the query cost table below.
-2. **Tidy the branches.** PR #12 (`docs-handover-2026-09-29`) is redundant
+1. **Finish `drop-2026-10-01`**: any further points the user adds, then
+   merge and deploy per its operator note. The start-up line
+   `empty builds: removed 1 (build:…)` is the check that WP-39 did what
+   the drop was for.
+2. **Get the two answers above.** With 16 workers, "Waited, mean" during
+   a run says whether the pool was the bottleneck; if it is near zero,
+   the next pass is the query cost table below.
+3. **Tidy the branches.** PR #12 (`docs-handover-2026-09-29`) is redundant
    — its commit rode inside the drop — close it. `drop-2026-09-30` is
    merged in content but, being squash-merged, is not an ancestor of
    `master`; delete it by name, not from `--merged`.
-3. **Decide the Java client's fate** (PR #9), open since 2026-09-08.
-4. Then whatever the testers report from the first days of the delete, the
+4. **Decide the Java client's fate** (PR #9), open since 2026-09-08.
+5. Then whatever the testers report from the first days of the delete, the
    build comments and the environment filter.
 
 ## Where the code is
@@ -44,7 +55,7 @@ user reports it "worked beautifully". Nothing is in flight.
 | | |
 |---|---|
 | `origin/master` | `a6f59d2` — **deployed** |
-| `docs-handover-2026-09-30` | this rewrite and the log entry; docs only |
+| **`drop-2026-10-01`** | **THE branch.** The deploy record (docs) and WP-39; tonight's further points go here |
 | `drop-2026-09-30` | shipped as PR #13 (squash). Delete when convenient |
 | `docs-handover-2026-09-29` | PR #12 **open**, redundant — close it |
 | `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, green, untouched since 2026-09-08; one commit ahead of `master`, now three behind |
@@ -59,8 +70,8 @@ There is **no local `master` branch** in this checkout; work from
 Questions the drop raised and deliberately did not answer. The status log
 entries for 2026-09-29→30 and 2026-09-30 have the numbers behind each.
 
-1. **`--workers 16` on production?** Decide from the Metrics page's
-   "Waited, mean", not from here.
+1. ~~`--workers 16` on production?~~ **Done, 2026-09-30.** Whether it
+   was needed is what "Waited, mean" now says.
 2. **Should there be a switch that turns the delete off**, or anything in
    front of it beyond a typed name? And should a delete block re-import —
    which needs a table, so migration 11? Now that it is deployed, the
@@ -122,9 +133,9 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 
 ```bash
 git fetch origin --prune
-git log --oneline -3 origin/master   # a6f59d2 on top means nothing has shipped since
+git log --oneline -3 origin/master   # a6f59d2 on top means drop-2026-10-01 has NOT shipped
 gh pr list --state open              # expect #9 and, until closed, #12
-python -m unittest discover          # expect 2526 OK (skipped 1) on master, SQLite
+python -m unittest discover          # expect 2540 OK (skipped 1) on drop-2026-10-01, SQLite
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,

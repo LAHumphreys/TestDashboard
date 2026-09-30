@@ -4741,6 +4741,105 @@ class EnvironmentDeleteTest(StorageTestBase):
         self.assertEqual(
             sorted(self.store.environments()), ["UNKNOWN-2", "unknown"])
 
+    # -- WP-39: the builds the environment was part of ------------------
+
+    def _seed_builds(self) -> Dict[str, int]:
+        """Mainline on both environments; a build that ran ONLY on
+        UNKNOWN; a build that ran on both, with its UNKNOWN runs both
+        older and newer than its linux-sim ones, so both ends of its
+        clock have to move when they go. Returns name -> stream id."""
+        self._seed()
+        hour = datetime.timedelta(hours=1)
+        second = datetime.timedelta(seconds=1)
+        self.store.upsert_runs([
+            make_record(environment="UNKNOWN", test_name="c",
+                        build="only-here", start=BASE + 5 * hour),
+            make_record(environment="UNKNOWN", test_name="c",
+                        build="both", start=BASE + second),
+            make_record(environment="linux-sim", test_name="c",
+                        build="both", start=BASE + hour + second),
+            make_record(environment="UNKNOWN", test_name="c",
+                        build="both", start=BASE + 2 * hour + second),
+        ])
+        ids = {
+            stream.name: stream.stream_id
+            for stream in self.store.list_streams("")}
+        # Posted FROM the only-here build, about a test on the OTHER
+        # environment: the comment outlives the environment (a comment
+        # on UNKNOWN's own tests goes with it, as it always has).
+        self.store.add_comment(
+            "linux-sim", "suite.py", "c", "alice", "from the build",
+            CREATED, stream_id=ids["only-here"])
+        return ids
+
+    def test_a_build_that_only_ran_there_is_removed_with_it(self) -> None:
+        """The production finding: the Build picker kept listing a
+        build whose only environment had been dropped, as an empty
+        build, for ever. `streams` is not keyed by environment, so
+        the table-list guard above could not see it."""
+        ids = self._seed_builds()
+        deleted = self.store.delete_environment("UNKNOWN")
+        self.assertEqual(deleted["streams"], 1)
+        self.assertIsNone(self.store.get_stream(ids["only-here"]))
+        self.assertEqual(
+            [stream.name for stream in self.store.list_streams("")],
+            ["both"])
+
+    def test_a_build_that_also_ran_elsewhere_keeps_its_other_results(
+            self) -> None:
+        ids = self._seed_builds()
+        self.store.delete_environment("UNKNOWN")
+        both = self.store.get_stream(ids["both"])
+        self.assertIsNotNone(both)
+        self.assertEqual(
+            self.store.environments_for_stream(ids["both"]),
+            ["linux-sim"])
+        # Both ends of its clock were UNKNOWN runs; re-derived from
+        # the one linux-sim run that remains.
+        remaining = BASE + datetime.timedelta(hours=1, seconds=1)
+        self.assertEqual(both.first_seen, remaining)
+        self.assertEqual(both.last_seen, remaining)
+
+    def test_mainline_is_never_settled(self) -> None:
+        """Mainline is not a build. Its row stays even when this was
+        its only environment, and its clock is left alone."""
+        self.store.upsert_runs([make_record(environment="UNKNOWN")])
+        before = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        deleted = self.store.delete_environment("UNKNOWN")
+        self.assertEqual(deleted["streams"], 0)
+        after = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        self.assertIsNotNone(after)
+        self.assertEqual(after.first_seen, before.first_seen)
+        self.assertEqual(after.last_seen, before.last_seen)
+
+    def test_a_removed_builds_comments_survive_untagged(self) -> None:
+        """As with every other stream removal: the comment annotates
+        the test, and a dangling origin id would differ between the
+        backends (SQLite's FK would null it, MariaDB has none)."""
+        self._seed_builds()
+        self.store.delete_environment("UNKNOWN")
+        comments = self.store._conn().execute(
+            "SELECT text, stream_id FROM comments "
+            "WHERE text = 'from the build'").fetchall()
+        self.assertEqual(len(comments), 1)
+        self.assertIsNone(comments[0][1])
+
+    def test_the_dry_run_names_the_builds_that_would_go(self) -> None:
+        """`test_the_counts_returned_match_what_the_dry_run_reported`
+        holds for every key; this pins the one WP-39 added to a
+        non-zero case, so the equality is not two zeros agreeing."""
+        self._seed_builds()
+        counted = self.store.count_environment_rows("UNKNOWN")
+        self.assertEqual(counted["streams"], 1)
+        self.assertEqual(
+            self.store.delete_environment("UNKNOWN")["streams"], 1)
+
+    def test_no_build_is_left_empty(self) -> None:
+        """The invariant WP-39 restores, stated directly."""
+        self._seed_builds()
+        self.store.delete_environment("UNKNOWN")
+        self.assertEqual(self.store.prune_empty_streams(), [])
+
     def test_the_trend_cache_is_invalidated(self) -> None:
         """A memoized chart of an environment that no longer exists.
 
@@ -4760,6 +4859,78 @@ class EnvironmentDeleteTest(StorageTestBase):
         self.assertEqual(
             sum(row.count for row in counts), 0,
             "the trend still reports runs from a deleted environment")
+
+
+class PruneEmptyStreamsTest(StorageTestBase):
+    """Storage.prune_empty_streams (WP-39): the start-up sweep for a
+    build whose results went before its row did.
+
+    An empty build cannot be made through this module any more, so the
+    fixture plants one the way production got its own: a row in
+    `streams` with no partition anywhere else.
+    """
+
+    def _plant(self, name: str) -> int:
+        conn = self.store._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO streams (product, kind, name, first_seen, "
+            "last_seen) VALUES (?, 'build', ?, ?, ?)",
+            ("", name, model.format_iso(BASE), model.format_iso(BASE)))
+        conn.execute("COMMIT")
+        return {
+            stream.name: stream.stream_id
+            for stream in self.store.list_streams("")}[name]
+
+    def test_removes_the_empty_build_and_reports_it(self) -> None:
+        self.store.upsert_runs([make_record(build="live")])
+        orphan = self._plant("orphan")
+        removed = self.store.prune_empty_streams()
+        self.assertEqual(
+            [(stream.stream_id, stream.name) for stream in removed],
+            [(orphan, "orphan")])
+        self.assertEqual(
+            [stream.name for stream in self.store.list_streams("")],
+            ["live"])
+        self.assertIsNotNone(
+            self.store.get_stream(storage.MAINLINE_STREAM_ID))
+
+    def test_a_clean_database_is_a_no_op(self) -> None:
+        self.store.upsert_runs([make_record(build="live")])
+        self.assertEqual(self.store.prune_empty_streams(), [])
+        self._plant("orphan")
+        self.assertEqual(len(self.store.prune_empty_streams()), 1)
+        self.assertEqual(self.store.prune_empty_streams(), [])
+
+    def test_a_build_of_only_retired_tests_is_not_empty(self) -> None:
+        """Retirement keeps the latest_runs row; the build still has
+        results, they are just not in the estate views."""
+        self.store.upsert_runs([make_record(build="parked")])
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "alice", "done",
+            CREATED)
+        self.assertEqual(self.store.prune_empty_streams(), [])
+        self.assertEqual(
+            [stream.name for stream in self.store.list_streams("")],
+            ["parked"])
+
+    def test_the_orphans_comments_survive_untagged(self) -> None:
+        orphan = self._plant("orphan")
+        self.store.upsert_runs([make_record()])
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "alice", "why", CREATED,
+            stream_id=orphan)
+        self.store.prune_empty_streams()
+        comments = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertEqual([c.text for c in comments], ["why"])
+        self.assertIsNone(comments[0].stream_id)
+
+    def test_mainline_with_no_results_is_kept(self) -> None:
+        """A fresh database: mainline has no partition yet and must
+        not be swept away before its first import."""
+        self.assertEqual(self.store.prune_empty_streams(), [])
+        self.assertIsNotNone(
+            self.store.get_stream(storage.MAINLINE_STREAM_ID))
 
 
 class ActivityHoursTest(StorageTestBase):

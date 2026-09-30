@@ -44,6 +44,27 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-10-01">
+      <div class="section-head">
+        <h2 class="eyebrow">1 October 2026</h2>
+        <span class="muted">Fixed: an empty build no longer lingers in the Build box</span>
+      </div>
+
+      <h3>Fixed</h3>
+      <ul>
+        <li><strong>A build with no results left disappears from the
+          Build box.</strong> When an environment was removed from the
+          database, a build that had only ever run on that environment
+          stayed in the Build box as an empty entry &mdash; a page with
+          nothing on it. Removing an environment now takes such builds
+          with it, and the dashboard also checks for empty builds each
+          time it starts, so the one already there goes at the next
+          restart. A build that also ran on other environments keeps
+          those results and stays. Nothing changes for a build that has
+          results.</li>
+      </ul>
+    </section>
+
     <section class="release" data-drop-date="2026-09-30">
       <div class="section-head">
         <h2 class="eyebrow">30 September 2026</h2>

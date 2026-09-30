@@ -4598,6 +4598,68 @@ class Storage:
         )
         return 0
 
+    def prune_empty_streams(self) -> List["Stream"]:
+        """Remove every build that has nothing left, and return them.
+        Cannot be undone — but there is nothing to undo.
+
+        A build exists by having results: its ``streams`` row is
+        created inside the import transaction that writes its first
+        run (:meth:`_find_or_create_stream`), so the only way to get a
+        row with no ``latest_runs`` partition is for something to have
+        deleted the results and not the row. Every delete path in this
+        module now settles the rows it empties (WP-34's per-environment
+        delete always did; WP-39 taught :meth:`delete_environment` to);
+        this is for a database one of them touched BEFORE that, or
+        that someone tidied by hand — production had one such build in
+        its picker on 2026-09-30. The server runs it once at start-up,
+        which is also the one moment an operator's own SQL can be
+        assumed to have finished.
+
+        The cost is a seek into ``latest_runs`` per build — the
+        ``streams`` table is dozens of rows — so it is cheap enough to
+        run every start whether or not there is anything to do.
+        Retired tests keep their ``latest_runs`` rows, so a build
+        whose every test is retired is NOT empty and is kept. Mainline
+        is never a candidate. Comments and assignments posted from a
+        removed build keep their rows and lose their origin tag, as
+        with every other stream removal.
+        """
+        conn = self._conn()
+        removed = []  # type: List[Stream]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                "SELECT id, product, kind, name, first_seen, last_seen "
+                "FROM streams AS s WHERE s.id != ? AND NOT EXISTS "
+                "(SELECT 1 FROM latest_runs WHERE stream_id = s.id) "
+                "ORDER BY id",
+                (MAINLINE_STREAM_ID,),
+            ).fetchall()
+            for row in rows:
+                stream_id = int(row[0])
+                # The emptiness is re-checked by the DELETE itself, so
+                # a build that gained a result between the SELECT and
+                # here (an import landing on MariaDB, where the
+                # transaction takes no table lock) is kept, tags intact.
+                cursor = conn.execute(
+                    "DELETE FROM streams WHERE id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM latest_runs WHERE stream_id = ?)",
+                    (stream_id, stream_id))
+                if int(cursor.rowcount) != 1:
+                    continue
+                self._clear_stream_origin_tags(conn, stream_id)
+                removed.append(Stream(
+                    stream_id=stream_id, product=row[1], kind=row[2],
+                    name=row[3], first_seen=model.parse_iso(row[4]),
+                    last_seen=model.parse_iso(row[5]), failing=0))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if removed:
+            self._invalidate_summary_cache()
+        return removed
+
     def assignments_referencing_stream(self, stream_id: int) -> int:
         """How many CURRENT assignments carry *stream_id* as their origin,
         RIGHT NOW — call this BEFORE :meth:`delete_stream`, not after.
@@ -7094,6 +7156,17 @@ class Storage:
             "(SELECT id FROM runs WHERE environment = ?)",
             (environment,),
         ).fetchone()[0])
+        # WP-39: the builds this environment is the whole of. Their
+        # `streams` rows go with it (see delete_environment); reported
+        # here so the operator sees "streams 1" before typing the name.
+        counts["streams"] = int(conn.execute(
+            "SELECT COUNT(*) FROM streams AS s WHERE s.id != ? "
+            "AND EXISTS (SELECT 1 FROM latest_runs "
+            "            WHERE stream_id = s.id AND environment = ?) "
+            "AND NOT EXISTS (SELECT 1 FROM latest_runs "
+            "                WHERE stream_id = s.id AND environment != ?)",
+            (MAINLINE_STREAM_ID, environment, environment),
+        ).fetchone()[0])
         return counts
 
     def delete_environment(self, environment: str) -> Dict[str, int]:
@@ -7118,11 +7191,32 @@ class Storage:
 
         Returns the per-table row counts deleted. An environment that
         does not exist is not an error: every count is zero.
+
+        WP-39: every build that had results on the environment is then
+        settled the way :meth:`delete_stream_environment` settles the
+        one it deletes from — its ``streams`` row removed if nothing
+        is left of it (``deleted["streams"]`` counts those), else its
+        clock re-derived from what remains. Before this, a build that
+        had only ever run on the dropped environment kept its row, and
+        the Build picker listed it for ever as an empty build: found
+        in production the first time this tool was used on a build's
+        environment (2026-09-30). Mainline is never settled here; it
+        is not a build and its row is never removed.
         """
         conn = self._conn()
         deleted = {}  # type: Dict[str, int]
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # Which builds are affected is only knowable BEFORE their
+            # rows go. Read from the derived table: one seek per build
+            # through latest_runs' key, never a pass over `runs`.
+            touched = [
+                int(row[0]) for row in conn.execute(
+                    "SELECT DISTINCT stream_id FROM latest_runs "
+                    "WHERE environment = ? AND stream_id != ?",
+                    (environment, MAINLINE_STREAM_ID),
+                ).fetchall()
+            ]
             cursor = conn.execute(
                 "DELETE FROM run_outputs WHERE run_id IN "
                 "(SELECT id FROM runs WHERE environment = ?)",
@@ -7135,6 +7229,10 @@ class Storage:
                     (environment,),
                 )
                 deleted[table] = int(cursor.rowcount)
+            deleted["streams"] = 0
+            for stream_id in sorted(touched):
+                deleted["streams"] += self._settle_stream_after_delete(
+                    conn, stream_id)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
