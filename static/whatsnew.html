@@ -6,6 +6,14 @@
   <title>testboard — what's new</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
+  <!-- WP-38: every module this page will import, named up
+       front so the browser fetches them all at once instead
+       of discovering each level as the one before it parses.
+       Kept equal to the import graph by
+       tests/test_frontend_calls.py::ModulePreloadTest. -->
+  <link rel="modulepreload" href="whatsnew.js">
+  <link rel="modulepreload" href="nav.js">
+  <link rel="modulepreload" href="urls.js">
 </head>
 <body class="home">
   <header class="site-header">
@@ -83,27 +91,45 @@
           disappears. <strong>It cannot be undone</strong>, and if
           whatever uploaded the results is still sending them, they
           will come back the next time it does.</li>
-        <li><strong>A Metrics page</strong>, in the bar at the top of
-          every page. It shows what the dashboard has been doing since
-          it was last started — which pages' requests took the time,
-          the slowest ones and what they asked for — and how big the
-          database is. If something feels slow: press <strong>Reset
-          counters</strong>, do the slow thing, press
-          <strong>Refresh</strong>, and send us what it says.</li>
+        <li><strong>A Metrics page</strong>. The page shows a summary
+           level view of what the dashboard has been doing since it was
+           last started — counters it keeps in memory, separate from
+           testboard's --perf-log option. It is intended for an administrator to spot
+           an issue so they can enable detailed metric capture (--perf-log) if required.
+           It is expected this will add little overhead to the board's
+           response time - but can be disabled from command line if required.</li>
       </ul>
 
       <h3>Faster</h3>
       <ul>
         <li><strong>Pages load faster while a run is in
-          progress.</strong> Results now arrive during a run, and every
-          batch that arrives makes the dashboard work its summaries out
-          again for the next person to open a page. That work is now
+          progress.</strong> The previous drop added first class support
+          for incremental updates to the dashboard. Each results push
+          that arrives clear's the server cache, and summaries are recomputed
+          again for the next person to open a page.
+
+          That work is now
           done in one pass over the results instead of five. The
           Dashboard's headline figures take about half as long to work
           out as they did; the Time, Timeline and Watch pages no longer
           ask for the whole estate's summary just to fill in the
           Product box; and a build's page no longer runs a full
           comparison before it can draw its heading.</li>
+        <li><strong>A build's results arriving no longer slows the
+          mainline Dashboard, and one environment's arriving no longer
+          slows the others.</strong> The dashboard used to throw away
+          everything it had worked out whenever any results arrived
+          from anywhere. Now it keeps what a batch did not touch: a
+          batch for a build leaves mainline's figures ready; a batch
+          for one environment leaves the other environments' ready.
+          Pushing results costs the same as before.</li>
+        <li><strong>The Dashboard shows its frame at once.</strong> The
+          "Latest results" heading and its row of tiles appear the
+          moment the page arrives, with placeholders, and the numbers
+          fill in when they are ready — instead of a blank page with
+          "Loading…" until everything is. Every page also tells the
+          browser up front which scripts it needs, so they are all
+          fetched together rather than one layer at a time.</li>
       </ul>
 
       <h3>Fixed</h3>

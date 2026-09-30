@@ -2718,8 +2718,22 @@ class Storage:
             # true; clearing it would make the feeder's 10-minute no-op
             # re-push defeat the memo forever. Same reasoning for the
             # summary/watch memo (WP-23 "ONE MORE PERF SLICE").
-            self._invalidate_trend_cache()
-            self._invalidate_summary_cache()
+            #
+            # WP-38: only the streams this batch WROTE. `deltas`,
+            # `grown` and `recompute` are keyed by stream and hold one
+            # entry per changed cell -- already computed for the
+            # derived tables, so this costs the push nothing new. A
+            # changed row that touched none of them (a source link
+            # alone, say) has no cell to name; that batch drops
+            # everything, as every batch used to.
+            written = set(
+                (key[0], key[1]) for key in deltas
+            )  # type: Set[Tuple[int, str]]
+            written.update((key[0], key[1]) for key in grown)
+            written.update((key[0], key[1]) for key in recompute)
+            self._invalidate_trend_cache(
+                set(pair[0] for pair in written) if written else None)
+            self._invalidate_summary_cache_for(written or None)
         return UpsertCounts(
             inserted=inserted, updated=updated, unchanged=unchanged,
             rejections=rejections,
@@ -3362,7 +3376,7 @@ class Storage:
             derived = sorted(
                 name for name in shared[1]
                 if allowed is None or name in allowed)
-            self._store_summary(key, derived)
+            self._store_summary(key, derived, MAINLINE_STREAM_ID)
             return derived
         clause, clause_params = self._environments_clause(
             environments, column="environment"
@@ -3377,7 +3391,7 @@ class Storage:
         sql += " ORDER BY environment"
         rows = self._conn().execute(sql, params).fetchall()
         result = [row[0] for row in rows]
-        self._store_summary(key, result)
+        self._store_summary(key, result, MAINLINE_STREAM_ID)
         return result
 
     def scripts(
@@ -3403,20 +3417,41 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
-        clause, clause_params = self._environments_clause(
-            environments, column="environment"
-        )
-        sql = "SELECT DISTINCT script FROM latest_runs WHERE stream_id = ?"
-        params = [MAINLINE_STREAM_ID]  # type: List[Any]
-        if environment is not None:
-            sql += " AND environment = ?"
-            params.append(environment)
-        if clause is not None:
-            sql += " AND " + clause
-            params.extend(clause_params)
-        sql += " ORDER BY script"
-        result = [row[0] for row in self._conn().execute(sql, params)]
-        self._store_summary(key, result)
+        # WP-38: the union of one memoized list per environment, so a
+        # push into one environment re-reads that environment's scripts
+        # and the others are served. Filters are applied to the NAMES,
+        # not to the query: an environment outside the allow-list
+        # contributes nothing, exactly as the IN clause left it out.
+        allowed = None if environments is None else set(environments)
+        names = [
+            name for name in self._stream_environment_names(
+                MAINLINE_STREAM_ID)
+            if (environment is None or name == environment)
+            and (allowed is None or name in allowed)
+        ]
+        scripts = set()  # type: Set[str]
+        for name in names:
+            scripts.update(self._environment_scripts(name))
+        result = sorted(scripts)
+        self._store_summary(key, result, MAINLINE_STREAM_ID)
+        return result
+
+    def _environment_scripts(self, environment: str) -> List[str]:
+        """Every script with a mainline test on *environment*, sorted.
+        A prefix of the partition's primary key; memoized per
+        environment (WP-38)."""
+        key = ("environment_scripts", environment)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        result = [
+            row[0] for row in self._conn().execute(
+                "SELECT DISTINCT script FROM latest_runs "
+                "WHERE stream_id = ? AND environment = ? ORDER BY script",
+                (MAINLINE_STREAM_ID, environment),
+            )
+        ]
+        self._store_summary(key, result, MAINLINE_STREAM_ID, environment)
         return result
 
     def assignees(self) -> List[str]:
@@ -3541,6 +3576,59 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
+        # WP-38: one memoized pass PER ENVIRONMENT, assembled here. The
+        # environments run one after another, so a push writes one of
+        # them and drops one entry; the others are served. The
+        # assembled result is memoized too (tagged with the stream, so
+        # any push to it drops it) — a warm summary still costs one
+        # lookup, and a cold one costs one query per environment
+        # written since, not one per environment.
+        cells = []  # type: List[RollupCount]
+        latest = {}  # type: Dict[str, datetime.datetime]
+        for environment in self._stream_environment_names(stream_id):
+            part_cells, part_latest = self._environment_rollup(
+                stream_id, environment, recent_cutoff)
+            cells.extend(part_cells)
+            latest.update(part_latest)
+        result = (cells, latest)
+        self._store_summary(key, result, stream_id)
+        return result
+
+    def _stream_environment_names(self, stream_id: int) -> List[str]:
+        """The environments *stream_id* has rows for, sorted — the
+        order :meth:`_partition_rollup` assembles in, which is the order
+        the whole-partition query returned. Memoized per stream: one
+        read of the partition's key on a push to that stream, none
+        otherwise.
+        """
+        key = ("stream_environment_names", stream_id)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        names = [
+            row[0] for row in self._conn().execute(
+                "SELECT DISTINCT environment FROM latest_runs "
+                "WHERE stream_id = ? ORDER BY environment",
+                (stream_id,),
+            ).fetchall()
+        ]
+        self._store_summary(key, names, stream_id)
+        return names
+
+    def _environment_rollup(
+        self, stream_id: int, environment: str,
+        recent_cutoff: datetime.datetime,
+    ) -> Tuple[List[RollupCount], Dict[str, datetime.datetime]]:
+        """One environment's cells of :meth:`_partition_rollup`, and its
+        newest start. The partition's primary key leads with
+        ``(stream_id, environment)``, so this reads that environment's
+        rows and no other. Memoized per ``(stream, environment,
+        cutoff)`` — the entry a push into that environment drops.
+        """
+        key = ("environment_rollup", recent_cutoff, stream_id, environment)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
         rows = self._conn().execute(
             "SELECT lr.environment, lr.result, lr.prev_result, "
             "CASE WHEN lr.start_time >= ? THEN 1 ELSE 0 END AS recent, "
@@ -3550,10 +3638,10 @@ class Storage:
             "LEFT JOIN test_retirements AS tr "
             "  ON tr.environment = lr.environment "
             " AND tr.script = lr.script AND tr.test_name = lr.test_name "
-            "WHERE lr.stream_id = ? "
+            "WHERE lr.stream_id = ? AND lr.environment = ? "
             "GROUP BY lr.environment, lr.result, lr.prev_result, recent, "
             "retired ORDER BY lr.environment, lr.result",
-            (model.format_iso(recent_cutoff), stream_id),
+            (model.format_iso(recent_cutoff), stream_id, environment),
         ).fetchall()
         cells = [
             RollupCount(
@@ -3574,7 +3662,7 @@ class Storage:
             if row[0] not in latest or when > latest[row[0]]:
                 latest[row[0]] = when
         result = (cells, latest)
-        self._store_summary(key, result)
+        self._store_summary(key, result, stream_id, environment)
         return result
 
     def _any_partition_rollup(
@@ -3801,18 +3889,28 @@ class Storage:
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
-        rows = self._conn().execute(
-            "SELECT lr.environment, COUNT(*) FROM latest_runs AS lr "
-            "LEFT JOIN test_retirements AS tr "
-            "  ON tr.environment = lr.environment "
-            " AND tr.script = lr.script "
-            " AND tr.test_name = lr.test_name "
-            "WHERE lr.stream_id = ? AND " + self._NOT_RETIRED
-            + " GROUP BY lr.environment",
-            (stream_id,),
-        ).fetchall()
-        result = {row[0]: int(row[1]) for row in rows}
-        self._store_summary(key, result)
+        # WP-38: assembled from one memoized count per environment, so
+        # a push into one environment re-counts that one (its rows are
+        # a prefix of the primary key) and the rest are served.
+        result = {}  # type: Dict[str, int]
+        for environment in self._stream_environment_names(stream_id):
+            one = ("test_count", stream_id, environment)
+            count = self._cached_summary(one)
+            if count is None:
+                count = int(self._conn().execute(
+                    "SELECT COUNT(*) FROM latest_runs AS lr "
+                    "LEFT JOIN test_retirements AS tr "
+                    "  ON tr.environment = lr.environment "
+                    " AND tr.script = lr.script "
+                    " AND tr.test_name = lr.test_name "
+                    "WHERE lr.stream_id = ? AND lr.environment = ? AND "
+                    + self._NOT_RETIRED,
+                    (stream_id, environment),
+                ).fetchone()[0])
+                self._store_summary(one, count, stream_id, environment)
+            if count:
+                result[environment] = count
+        self._store_summary(key, result, stream_id)
         return result
 
     # ------------------------------------------------------------------
@@ -5231,7 +5329,7 @@ class Storage:
                 name: when for name, when in shared[1].items()
                 if allowed is None or name in allowed
             }
-            self._store_summary(key, derived)
+            self._store_summary(key, derived, stream_id)
             return derived
         clause, clause_params = self._environments_clause(
             environments, column="environment"
@@ -5249,7 +5347,7 @@ class Storage:
             row[0]: model.parse_iso(row[1])
             for row in rows if row[1] is not None
         }
-        self._store_summary(key, result)
+        self._store_summary(key, result, stream_id)
         return result
 
     def unassigned_failing_by_environment(
@@ -5644,7 +5742,7 @@ class Storage:
             )
             for row in self._conn().execute(sql, params).fetchall()
         ]
-        self._store_summary(key, result)
+        self._store_summary(key, result, stream_id)
         return result
 
     def status_queue_count(
@@ -5775,7 +5873,7 @@ class Storage:
         row = self._conn().execute(sql, params).fetchone()
         counts["assigned"] = int(row[0] or 0)
         counts["mine"] = int(row[1] or 0) if assignee else 0
-        self._store_summary(key, counts)
+        self._store_summary(key, counts, stream_id)
         return counts
 
     def recent_results(
@@ -6304,10 +6402,22 @@ class Storage:
                 self._trend_cache.clear()
             self._trend_cache[key] = (time.time(), counts)
 
-    def _invalidate_trend_cache(self) -> None:
-        """Drop memoized trends: the runs they were computed from changed."""
+    def _invalidate_trend_cache(
+        self, stream_ids: Optional[Set[int]] = None,
+    ) -> None:
+        """Drop memoized trends: the runs they were computed from changed.
+
+        *stream_ids* (WP-38) narrows it to the streams whose runs did;
+        a trend key's first element is its stream. ``None`` drops all.
+        """
         with self._trend_lock:
-            self._trend_cache.clear()
+            if stream_ids is None:
+                self._trend_cache.clear()
+                return
+            for key in [
+                    key for key in self._trend_cache
+                    if key[0] in stream_ids]:
+                del self._trend_cache[key]
 
     def _cached_summary(self, key: Tuple[Any, ...]) -> Optional[Any]:
         """Return a memoized summary/watch component for *key*, or None.
@@ -6325,7 +6435,7 @@ class Storage:
             if entry is None:
                 self._memo_counts[1] += 1
                 return None
-            stored_at, value = entry
+            stored_at, value = entry[0], entry[1]
             if now - stored_at > _TREND_CACHE_TTL_SECONDS:
                 del self._summary_cache[key]
                 self._memo_counts[1] += 1
@@ -6333,12 +6443,25 @@ class Storage:
             self._memo_counts[0] += 1
             return value
 
-    def _store_summary(self, key: Tuple[Any, ...], value: Any) -> None:
-        """Memoize a computed summary/watch component, bounding cache size."""
+    def _store_summary(self, key: Tuple[Any, ...], value: Any,
+                       stream_id: int = MAINLINE_STREAM_ID,
+                       environment: Optional[str] = None) -> None:
+        """Memoize a computed summary/watch component, bounding cache size.
+
+        *stream_id* (WP-38) is the ONE stream whose ``latest_runs``
+        partition the value was computed from, and *environment* the
+        one environment of it when the value reads no other — what a
+        targeted invalidation matches on. Every caller names the
+        stream; the default is for the two catalogue methods that are
+        mainline by definition. An entry computed from more than one
+        stream must not be memoized here at all: there is no way to
+        say so, and a wrong tag is a stale page.
+        """
         with self._summary_lock:
             if len(self._summary_cache) >= _SUMMARY_CACHE_MAX_ENTRIES:
                 self._summary_cache.clear()
-            self._summary_cache[key] = (time.time(), value)
+            self._summary_cache[key] = (
+                time.time(), value, stream_id, environment)
 
     def _cached_streak(self, key: Tuple[Any, ...]) -> Optional[Any]:
         """Return a memoized failure streak for *key*, or None.
@@ -6399,11 +6522,88 @@ class Storage:
         existing entry wrong -- the old entry is simply never looked up
         again, not served stale.
         """
+        self._invalidate_summary_cache_for(None)
+
+    @staticmethod
+    def _names_still_hold(
+        key: Tuple[Any, ...], entry: Tuple[Any, ...],
+        written: Set[Tuple[int, str]],
+    ) -> bool:
+        """True for a stream's environment-name list when every
+        environment the push wrote is already in it: a push can only
+        ADD an environment, so the list is wrong only when one is new.
+        Every other whole-stream entry answers False and is dropped.
+        Called under the summary lock."""
+        if key[0] != "stream_environment_names":
+            return False
+        names = entry[1]
+        return all(
+            environment in names
+            for stream_id, environment in written if stream_id == key[1])
+
+    def _invalidate_summary_cache_for(
+        self, written: Optional[Set[Tuple[int, str]]],
+    ) -> None:
+        """Drop the memoized components computed from *stream_ids*'
+        partitions of ``latest_runs`` — or every component, for
+        ``None`` (WP-38).
+
+        Why the narrowing exists. Results are pushed DURING a run:
+        mainline's through the morning, then builds' well into the
+        afternoon. Every one of those pushes used to drop every memo,
+        so for most of the working day nobody was served from one —
+        and a build's push cleared the home page's memos, which the
+        build's rows had not changed. Each entry now records the one
+        stream it was computed from, and the one environment when it
+        reads no other (:meth:`_store_summary`). *written* is the set
+        of ``(stream_id, environment)`` pairs an import wrote. An
+        entry is dropped when its stream is among them and it is
+        either whole-stream (no environment) or that environment's.
+        So a build's push leaves mainline's home page served, and a
+        mainline push into one environment leaves the other
+        environments' cells served.
+
+        Why it is safe. A memoized component reads ONE stream's
+        partition of ``latest_runs`` (and the derived tables partitioned
+        the same way) — that is what the tag names. What crosses
+        streams is not memoized here: ``compare_counts*`` are computed
+        per request; ``stream_identities``/``list_streams`` read
+        ``streams`` directly; ``assignment_streams`` reads
+        ``current_assignments`` directly. The writes that reach EVERY
+        stream's components — an assignment, a comment, a retirement,
+        an environment or stream delete — still pass ``None`` and drop
+        everything, as before; they are human-rate.
+
+        What it costs the push: one pass over at most
+        :data:`_SUMMARY_CACHE_MAX_ENTRIES` (128) keys, under a lock the
+        push already took for nothing longer — measured below the
+        resolution of the import's own timing.
+
+        The streak memo is keyed by stream too (``("failure_streak",
+        stream_id, ...)``) and is narrowed the same way.
+        """
+        stream_ids = (
+            None if written is None else set(pair[0] for pair in written))
         with self._summary_lock:
-            self._summary_cache.clear()
+            if written is None:
+                self._summary_cache.clear()
+            else:
+                for key in [
+                        key for key, entry in self._summary_cache.items()
+                        if entry[2] in stream_ids
+                        and (entry[3] is None
+                             or (entry[2], entry[3]) in written)
+                        and not self._names_still_hold(key, entry, written)]:
+                    del self._summary_cache[key]
             self._memo_counts[2] += 1
         with self._streak_lock:
-            self._streak_cache.clear()
+            if stream_ids is None:
+                self._streak_cache.clear()
+            else:
+                for key in [
+                        key for key in self._streak_cache
+                        if len(key) > 1 and key[1] in stream_ids]:
+                    del self._streak_cache[key]
 
     #: Tables small enough to count exactly whenever the Metrics page
     #: asks. ``runs`` and ``run_outputs`` are deliberately not here.
@@ -6417,9 +6617,10 @@ class Storage:
     def memo_report(self) -> Dict[str, int]:
         """How the summary memo has done since the counters were last
         reset (WP-37): served from it, computed instead, and how many
-        times a write cleared it. With results pushed during a run,
-        ``clears`` is the number to watch — every one puts the next
-        load of every page back to its cold cost.
+        times a write cleared some of it. With results pushed during a
+        run, ``clears`` is the number to watch — since WP-38 a push
+        clears only the streams it wrote, so ``hits`` should stay high
+        through a build's run.
         """
         with self._summary_lock:
             return {

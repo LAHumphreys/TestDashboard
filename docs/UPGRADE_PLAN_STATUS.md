@@ -3492,3 +3492,89 @@ its verdict is "no new failure", not "green".
 
 **Not verified:** see `docs/drops/2026-09-30.md`. No browser has
 rendered any of it.
+
+## 2026-09-30 — WP-38: a push drops only the memos of what it wrote; the home page paints its frame first (branch `drop-2026-09-30`)
+
+**The ask, the morning after the drop was built.** Pushes now happen
+throughout the day — mainline's through the morning, builds' well into
+the afternoon — so "minimise the blast radius to the cache", with one
+hard limit: nothing that slows the push, because that slows the test
+runs themselves. And where the cache cannot be preserved, load the home
+page in stages: in production it "frequently hangs for a few hundred
+ms before rendering anything".
+
+**What was true.** `_invalidate_summary_cache` dropped every memo on
+every changing import, by a recorded decision ("no value in selective
+invalidation, only risk") made when the cold cost was paid a few times
+a night. With two runs a day pushing continuously, that decision meant
+nobody was served from a memo during working hours — and a build's
+push cleared the home page's memos, which the build's rows had not
+changed. Item 1 of the previous entry's "found, not changed" list.
+
+**What changed.**
+1. Every memo entry now names the stream, and the environment when it
+   reads no other, that it was computed from (`_store_summary(key,
+   value, stream_id, environment)`). An import drops the `(stream,
+   environment)` pairs it wrote — taken from the `activity_hours` /
+   `script_hours` cells it already maintains, so the push path gains
+   nothing. Assignments, comments, retirements and deletes still drop
+   everything: human-rate.
+2. The partition pass (WP-36) is memoized PER ENVIRONMENT and
+   assembled; so are the test counts and the script catalogue. A
+   mainline push into one environment re-reads that environment's
+   rows (a prefix of the primary key) and the others are served. The
+   stream's environment-name list survives a push into an environment
+   it already names — a push can only add one.
+3. Every page names its whole module graph up front
+   (`<link rel="modulepreload">`, pinned to the import graph by
+   `ModulePreloadTest`), so the browser fetches it in one go instead of
+   a layer at a time — two to three dependent round trips, each needing
+   a free worker, before the first request for data could be made.
+4. The home page ships its "Latest results" frame — heading and seven
+   placeholder tiles with the real tiles' labels — visible in the
+   markup, on screen before any script runs; a build's page hides it
+   synchronously before its first request.
+
+**Measured.** The day's pattern replayed over HTTP on the dev estate
+(`push_pattern.py`: a push of 200 records, then a home-page load,
+twenty times):
+
+| | before | after |
+|---|---|---|
+| afternoon: pushes into a build | 63.7 ms median | 14.4 ms; memo hits 120, misses 0 |
+| morning: pushes into mainline's largest environment (7,416 tests) | 66.0 ms median | 32.3 ms |
+
+The push itself, 500 records into the build and into mainline, before
+and after, alternated over five rounds: 42–54 ms per batch either way
+(one 375 ms outlier in one round, on the machine, not the code — the
+same run's other figures were normal and it did not recur). In-process
+after a push into one mainline environment: the headline is that
+environment's cell pass (11–20 ms for the largest) plus its test count
+and script list (~4 ms); nothing else is re-read.
+
+**Guards.** `TargetedInvalidationTest` +14, every "still served"
+paired with a "still right" against a cold computation; per-environment
+tests in `PartitionRollupTest`; two count-shaped guards WIDENED, not
+weakened (`test_one_query_regardless_of_assignee` now derives its
+expected count from the fixture's environments; the full-payload
+queue-count guard tells a per-environment test count apart from a
+per-kind count by what a queue predicate reads). `ModulePreloadTest`
++3, `FirstPaintTest` +4. Suite 2501 → 2522.
+
+**Not changed, and why.** The pool. A browser opens up to six
+connections to load a page and every pushing feeder holds one; the pool
+is eight; a request queued for a worker is the one delay none of the
+above shortens. `--workers 16` on MariaDB costs a thread and a daemon
+connection per worker. Recommended to the operator as a decision to
+take from the Metrics page's "Waited, mean", not made here.
+
+**Not verified.** No browser has shown the frame appearing before the
+scripts load, or the preloads collapsing the waterfall; both were
+checked in the markup and the shim, not in a rendering engine. Not
+measured on MariaDB or on production data.
+
+**The user edited `whatsnew.html` by hand between the drop's first
+build and this package** (the Metrics bullet and the "Faster"
+paragraph). Their wording was kept; one factual slip corrected in
+place, and told to them: the Metrics page does not read the
+`--perf-log`, it keeps its own counters in memory.

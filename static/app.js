@@ -1873,6 +1873,14 @@ function init() {
   // visible change.
   const streamId = getSelectedStreamId();
   if (streamId !== null) {
+    // WP-38: index.html ships the status section VISIBLE, as the
+    // page's frame before any request is answered. A build's page
+    // opens on one of its own tabs instead, so the frame goes now --
+    // synchronously, before the first fetch -- not when the tab
+    // decision lands.
+    for (const id of SECTIONS) {
+      document.getElementById(id).hidden = true;
+    }
     initBranchDashboard(streamId);
     return;
   }

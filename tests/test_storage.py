@@ -2948,7 +2948,12 @@ class TestQueueCounts(EstateTestBase):
         cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
         cold = self._selects(lambda: self.store.queue_counts(
             assignee="alice", stale_before=cutoff))
-        self.assertEqual(len(cold), 2, cold)
+        # The ownership count, plus the rollup pass: the environment
+        # names and one query per environment this fixture holds on
+        # mainline (WP-38 split the pass per environment).
+        names = self.store._stream_environment_names(
+            storage.MAINLINE_STREAM_ID)
+        self.assertEqual(len(cold), 1 + (1 + len(names)), cold)
         self.store._invalidate_summary_cache()
         anonymous = self._selects(lambda: self.store.queue_counts(
             stale_before=cutoff))
@@ -3135,10 +3140,15 @@ class PartitionRollupTest(StorageTestBase):
         keys = [(row.environment, row.result.value) for row in rows]
         self.assertEqual(keys, sorted(keys))
 
+    #: A cold pass over this fixture's partition: the environment
+    #: names, then one query per environment (WP-38 split the pass so
+    #: a push into one environment leaves the others served).
+    COLD_PASS = 1 + 3
+
     def test_a_second_scope_costs_no_query(self) -> None:
         self.assertEqual(
             self._selects(lambda: self.store.summary_rollup(self.CUTOFF)),
-            1)
+            self.COLD_PASS)
         for call in (
             lambda: self.store.summary_rollup(
                 self.CUTOFF, environment="win-sim"),
@@ -3153,12 +3163,40 @@ class PartitionRollupTest(StorageTestBase):
     def test_another_stream_or_cutoff_is_its_own_pass(self) -> None:
         """Shared within a partition and a window; never across."""
         self.store.summary_rollup(self.CUTOFF)
+        # The build has one environment: its names, then that one.
         self.assertEqual(self._selects(
             lambda: self.store.summary_rollup(
-                self.CUTOFF, stream_id=self.stream_id)), 1)
+                self.CUTOFF, stream_id=self.stream_id)), 1 + 1)
+        # Another cutoff re-reads every environment; the names are
+        # the stream's, not the window's, and are served.
         self.assertEqual(self._selects(
             lambda: self.store.summary_rollup(
-                self.CUTOFF + datetime.timedelta(seconds=1))), 1)
+                self.CUTOFF + datetime.timedelta(seconds=1))), 3)
+
+    def test_a_push_into_one_environment_re_reads_that_one(self) -> None:
+        """WP-38: the point of the split."""
+        self.store.summary_rollup(self.CUTOFF)
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_0",
+            start=BASE + datetime.timedelta(days=5))])
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            after = self.store.summary_rollup(self.CUTOFF)
+        finally:
+            conn.set_trace_callback(None)
+        selects = [
+            s for s in seen if s.strip().upper().startswith("SELECT")]
+        # win-sim's cells, and nothing else: the environment-name list
+        # survives a push into an environment it already names.
+        self.assertEqual(len(selects), 1, selects)
+        self.assertTrue(any("'win-sim'" in s for s in selects), selects)
+        self.assertFalse(any("DISTINCT environment" in s for s in selects))
+        self.assertFalse(any("'linux-sim'" in s for s in selects), selects)
+        self.assertEqual(
+            self._cells(after),
+            self._ordered(self._oracle(storage.MAINLINE_STREAM_ID, None)))
 
     def test_a_write_discards_it(self) -> None:
         before = self._cells(self.store.summary_rollup(self.CUTOFF))
@@ -7041,12 +7079,264 @@ class SizeReportTest(StorageTestBase):
     def test_the_memo_report_counts(self) -> None:
         self.store.reset_memo_counts()
         self.store.summary_rollup(BASE)
+        misses = self.store.memo_report()["misses"]
+        self.assertGreater(misses, 0)
+        self.assertEqual(self.store.memo_report()["entries"], misses)
         self.store.summary_rollup(BASE)
         self.store.add_comment(
             "linux-sim", "suite.py", "test_a", "amy", "seen", CREATED)
         self.assertEqual(
             self.store.memo_report(),
-            {"hits": 1, "misses": 1, "clears": 1, "entries": 0})
+            {"hits": 1, "misses": misses, "clears": 1, "entries": 0})
+
+
+class TargetedInvalidationTest(StorageTestBase):
+    """WP-38: a push drops the memos of the streams it wrote, and no
+    other. Mainline pushes through the morning and builds push well
+    into the afternoon; a build's push used to put the home page back
+    to its cold cost.
+
+    Every "still served" assertion here is paired with a "and still
+    right" one against a fresh computation, because a memo that
+    survives a write it should not have survived is exactly the bug a
+    narrowed invalidation can introduce.
+    """
+
+    CUTOFF = BASE - datetime.timedelta(hours=1)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_environment_product(
+            "linux-sim", "Atlas", "alice", CREATED)
+        self.store.upsert_runs([
+            make_record(test_name="test_a", result=Result.FAIL),
+            make_record(test_name="test_b"),
+            make_record(test_name="test_a", result=Result.FAIL,
+                        build="feat/x",
+                        start=BASE + datetime.timedelta(hours=2)),
+            make_record(test_name="test_b", build="feat/x",
+                        start=BASE + datetime.timedelta(hours=2)),
+        ])
+        self.build = self.store.list_streams("Atlas")[0].stream_id
+        self.mainline = storage.MAINLINE_STREAM_ID
+
+    def _warm(self, stream_id: int) -> Dict[str, Any]:
+        """Every memoized component of one stream, and its values."""
+        return {
+            "rollup": self.store.summary_rollup(
+                self.CUTOFF, stream_id=stream_id),
+            "queue_counts": self.store.queue_counts(
+                stale_before=self.CUTOFF, stream_id=stream_id),
+            "last_by_env": self.store.latest_run_time_by_environment(
+                stream_id),
+            "test_counts": self.store.test_counts_by_environment(
+                stream_id),
+            "queue": self.store.status_queue(
+                "new_failures", stale_before=self.CUTOFF,
+                stream_id=stream_id),
+            "trend": self.store.daily_result_counts(
+                BASE - datetime.timedelta(days=1), stream_id=stream_id),
+            "streaks": self.store.failure_streak_bounds_many(
+                [("linux-sim", "suite.py", "test_a",
+                  BASE + datetime.timedelta(
+                      hours=2 if stream_id != self.mainline else 0))],
+                stream_id=stream_id),
+        }
+
+    def _selects(self, call: Callable[[], Any]) -> int:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            call()
+        finally:
+            conn.set_trace_callback(None)
+        return len([
+            s for s in seen if s.strip().upper().startswith("SELECT")])
+
+    def _push(self, build: Optional[str], test_name: str = "test_new",
+              result: Result = Result.FAIL) -> None:
+        counts = self.store.upsert_runs([make_record(
+            test_name=test_name, result=result, build=build,
+            start=BASE + datetime.timedelta(hours=5))])
+        self.assertEqual(counts.inserted + counts.updated, 1)
+
+    # -- what survives ------------------------------------------------
+
+    def test_a_builds_push_leaves_mainlines_memos_served(self) -> None:
+        self._warm(self.mainline)
+        self._warm(self.build)
+        self._push("feat/x")
+        self.assertEqual(self._selects(lambda: self._warm(self.mainline)), 0)
+
+    def test_a_builds_push_drops_the_builds_own(self) -> None:
+        self._warm(self.build)
+        self._push("feat/x")
+        self.assertGreater(self._selects(lambda: self._warm(self.build)), 0)
+
+    def test_mainlines_push_leaves_the_builds_memos_served(self) -> None:
+        self._warm(self.mainline)
+        self._warm(self.build)
+        self._push(None)
+        self.assertEqual(self._selects(lambda: self._warm(self.build)), 0)
+        self.assertGreater(
+            self._selects(lambda: self._warm(self.mainline)), 0)
+
+    def test_the_catalogues_are_mainlines(self) -> None:
+        """environments() and scripts() read mainline only, and are
+        tagged so: a build's push leaves them, mainline's drops them."""
+        self.store.environments()
+        self.store.scripts(None)
+        self._push("feat/x", test_name="only_on_the_build")
+        self.assertEqual(self._selects(lambda: (
+            self.store.environments(), self.store.scripts(None))), 0)
+        self._push(None, test_name="new_on_mainline")
+        self.assertGreater(self._selects(lambda: (
+            self.store.environments(), self.store.scripts(None))), 0)
+
+    # -- and what is still right --------------------------------------
+
+    def test_what_survives_is_still_true(self) -> None:
+        """The values a build's push leaves memoized are the values a
+        cold computation gives -- checked cell by cell, not by
+        counting queries."""
+        before = self._warm(self.mainline)
+        self._push("feat/x")
+        served = self._warm(self.mainline)
+        self.store._invalidate_summary_cache()
+        self.store._invalidate_trend_cache()
+        cold = self._warm(self.mainline)
+        self.assertEqual(served, cold)
+        self.assertEqual(served, before)
+
+    def test_what_is_dropped_is_recomputed_right(self) -> None:
+        self._warm(self.build)
+        self._push("feat/x")
+        fresh = self._warm(self.build)
+        self.assertEqual(fresh["queue_counts"]["new_failures"], 2)
+        self.assertEqual(
+            fresh["queue_counts"]["new_failures"],
+            self.store.status_queue_count(
+                "new_failures", stale_before=self.CUTOFF,
+                stream_id=self.build))
+        self.assertIn(
+            "test_new", [row.test_name for row in fresh["queue"]])
+        self.assertEqual(
+            fresh["last_by_env"]["linux-sim"],
+            BASE + datetime.timedelta(hours=5))
+        self.assertEqual(sum(
+            cell.count for cell in fresh["rollup"]), 3)
+
+    # -- the writes that still drop everything -----------------------
+
+    def test_a_change_with_no_cell_to_name_drops_everything(self) -> None:
+        """A source link changed and nothing else: no hour cell moved,
+        so the batch cannot say which stream it wrote, and drops all."""
+        self._warm(self.mainline)
+        self._warm(self.build)
+        counts = self.store.upsert_runs([make_record(
+            test_name="test_b", build="feat/x",
+            start=BASE + datetime.timedelta(hours=2),
+            source_link="https://example.com/moved")])
+        self.assertEqual(counts.updated, 1)
+        self.assertGreater(
+            self._selects(lambda: self._warm(self.mainline)), 0)
+
+    def test_an_unchanged_push_drops_nothing(self) -> None:
+        self._warm(self.mainline)
+        self._warm(self.build)
+        counts = self.store.upsert_runs([make_record(
+            test_name="test_b", build="feat/x",
+            start=BASE + datetime.timedelta(hours=2))])
+        self.assertEqual(counts.unchanged, 1)
+        self.assertEqual(self._selects(lambda: (
+            self._warm(self.mainline), self._warm(self.build))), 0)
+
+    def test_an_assignment_a_comment_and_a_retirement_drop_everything(
+            self) -> None:
+        """Each reaches every stream's components (queue counts read
+        current_assignments for any stream; a retirement flags a test
+        on every stream; a comment is on the row of every list)."""
+        writes = [
+            lambda: self.store.set_assignee(
+                "linux-sim", "suite.py", "test_a", "alice", "amy",
+                CREATED, stream_id=self.build),
+            lambda: self.store.add_comment(
+                "linux-sim", "suite.py", "test_a", "amy", "seen",
+                CREATED, stream_id=self.build),
+            lambda: self.store.set_retired(
+                "linux-sim", "suite.py", "test_b", True, "amy", "gone",
+                CREATED),
+        ]
+        for write in writes:
+            self._warm(self.mainline)
+            self._warm(self.build)
+            write()
+            self.assertGreater(
+                self._selects(lambda: self._warm(self.mainline)), 0)
+            self.assertGreater(
+                self._selects(lambda: self._warm(self.build)), 0)
+
+    def test_deleting_a_builds_environment_drops_everything(self) -> None:
+        """Rare, and the build's identity itself may go: not narrowed."""
+        self._warm(self.mainline)
+        self.store.delete_stream_environment(self.build, "linux-sim")
+        self.assertGreater(
+            self._selects(lambda: self._warm(self.mainline)), 0)
+
+    def test_every_memo_entry_names_its_stream(self) -> None:
+        """A two-argument _store_summary would be tagged mainline by
+        default -- wrong for anything computed from a build, and a
+        wrong tag is a stale page. Every call site names one."""
+        import io
+        import re
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "testboard", "storage.py")
+        with io.open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        calls = re.findall(r"_store_summary\(([^)]*)\)", source)
+        self.assertGreater(len(calls), 5)
+        for call in calls:
+            if call.startswith("self, key"):
+                continue     # the definition
+            parts = [part for part in call.split(",") if part.strip()]
+            self.assertIn(len(parts), (3, 4), call)
+            self.assertNotIn("=", parts[2], call)
+
+    def test_a_push_into_one_environment_leaves_the_others_cells(
+            self) -> None:
+        """WP-38's second level: mainline's morning pushes go into one
+        environment at a time. The other environments' cells are
+        served; the whole-stream entries (queue counts, the assembled
+        pass, the test counts) are dropped and re-derived."""
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_w", result=Result.FAIL)])
+        self._warm(self.mainline)
+        self._push(None)     # linux-sim
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            after = self._warm(self.mainline)
+        finally:
+            conn.set_trace_callback(None)
+        selects = [s for s in seen if s.strip().upper().startswith("SELECT")]
+        self.assertTrue(any("'linux-sim'" in s for s in selects), selects)
+        self.assertFalse(
+            any("'win-sim'" in s and "environment_rollup" not in s
+                and "lr.environment = " in s for s in selects), selects)
+        self.assertEqual(after["queue_counts"]["new_failures"], 3)
+        self.store._invalidate_summary_cache()
+        self.store._invalidate_trend_cache()
+        self.assertEqual(after["rollup"], self._warm(self.mainline)["rollup"])
+
+    def test_the_memo_report_counts_a_narrowed_clear(self) -> None:
+        self.store.reset_memo_counts()
+        self._warm(self.mainline)
+        self._push("feat/x")
+        self.assertEqual(self.store.memo_report()["clears"], 1)
+        self.assertGreater(self.store.memo_report()["entries"], 0)
 
 
 class DropStreamTest(StorageTestBase):
@@ -7416,8 +7706,9 @@ class SummaryCacheTest(StorageTestBase):
         DIFFERENT process, which this process's own invalidation calls
         cannot see, so only the TTL bound catches it."""
         too_old = storage._TREND_CACHE_TTL_SECONDS + 1.0
-        for key, (stored_at, value) in list(self.store._summary_cache.items()):
-            self.store._summary_cache[key] = (stored_at - too_old, value)
+        for key, entry in list(self.store._summary_cache.items()):
+            self.store._summary_cache[key] = (
+                (entry[0] - too_old,) + tuple(entry[1:]))
 
     # -- repeat call is a genuine cache hit (no new SQL) -----------------
 

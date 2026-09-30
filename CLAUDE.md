@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project State
 
 **testboard is live in production and has been since 2026-07-26.** It is no longer
-greenfield: ~25k lines, 2,501 tests (3,380 with the MariaDB variants active),
+greenfield: ~25k lines, 2,522 tests (3,415 with the MariaDB variants active),
 schema at migration 10, deployed and in daily use by a small group of testers.
 **Production serves MariaDB**; the old SQLite box is now staging. SQLite and
 MariaDB remain equal, permanently supported backends — see "Commands".
@@ -148,15 +148,23 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
   (`"python: <name>"`). A database whose version exceeds the code's is refused, not
   used — so a rollback needs a copy of the file taken beforehand.
 - **Scale is the design constraint**: ~12,000 tests a night, kept for a year (~4.4M runs). No endpoint may be proportional to the size of the estate — *or of its history*. Three derived tables are maintained inside the writing transaction: `latest_runs` (one row per test, carrying its latest and previous result), `current_assignments`, and `activity_hours` (run counts per environment × UTC hour × result — what the staleness cutoff and the trend read; migration 6). Estate-wide reads go through them, list endpoints are paginated in SQL, and only the returned page joins `runs`. Nothing may scan a window of `runs` at request time — the bucket query that did was 3.5s mean on production and grew every night. `ORDER BY` cannot be parameterized — sort keys come from the `DASHBOARD_SORTS` whitelist.
-- **The cold cost is the cost.** Results are pushed DURING a run, there are two runs a
-  night, and every import that changes a row clears every memo in `Storage`. For the
-  hours a run lasts nothing is served from one — so measure with the memos cleared
-  before every call, and never quote a warm number as what a page costs. A summary
-  reads a stream's partition of `latest_runs` ONCE (`Storage._partition_rollup`) and
-  every scope of it is a filter of those cells; a new figure for the headline is a new
-  column on that pass or a sum over its cells, not another pass. Compare two code
-  trees in-process and alternated: over HTTP on the development machine an unchanged
-  request varies 2-3x between runs.
+- **The cold cost is the cost.** Results are pushed DURING a run, throughout the day —
+  mainline's through the morning, builds' into the afternoon — and a push drops the
+  memos of what it wrote. So measure with the memos cleared before every call, and
+  never quote a warm number as what a page costs. A summary reads a stream's partition
+  of `latest_runs` in one pass PER ENVIRONMENT (`Storage._environment_rollup`,
+  assembled by `_partition_rollup`) and every scope of it is a filter of those cells;
+  a new figure for the headline is a new column on that pass or a sum over its cells,
+  not another pass. Compare two code trees in-process and alternated: over HTTP on the
+  development machine an unchanged request varies 2-3x between runs.
+- **A memo entry names the stream, and the environment, it was computed from**
+  (`_store_summary(key, value, stream_id, environment)`), and an import drops only the
+  `(stream, environment)` pairs it wrote (WP-38). An entry computed from more than one
+  stream may not be memoized there at all; a wrong tag is a stale page. Assignments,
+  comments, retirements and deletes still drop everything — they are human-rate. Never
+  add cost to the push path to pay for this: the pairs come from the cells the import
+  already maintains. `tests/test_storage.py::TargetedInvalidationTest` pairs every
+  "still served" with a "still right".
 - **Nothing a request does may take a lock to be counted.** `testboard/metrics.py`
   tallies per thread and merges to read; `tests/test_metrics.py::NoLockOnTheRequestPathTest`
   replaces the lock with one that counts. A counter every worker queues for is a new

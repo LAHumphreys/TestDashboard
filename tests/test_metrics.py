@@ -671,12 +671,13 @@ class SizeAndMemoReportTest(unittest.TestCase):
         self.store.summary_rollup(cutoff)
         after_miss = self.store.memo_report()
         self.assertEqual(after_miss["hits"], 0)
-        self.assertEqual(after_miss["misses"], 1)
-        self.assertEqual(after_miss["entries"], 1)
+        # The assembled pass, the environment names, one per environment.
+        self.assertEqual(after_miss["misses"], 1 + 1 + 2)
+        self.assertEqual(after_miss["entries"], 4)
         self.store.summary_rollup(cutoff)
         self.store.summary_rollup(cutoff, environment="win-sim")
         self.assertEqual(self.store.memo_report()["hits"], 2)
-        self.assertEqual(self.store.memo_report()["misses"], 1)
+        self.assertEqual(self.store.memo_report()["misses"], 4)
 
     def test_every_clearing_write_is_counted(self) -> None:
         self.store.reset_memo_counts()
@@ -709,7 +710,7 @@ class SizeAndMemoReportTest(unittest.TestCase):
         self.store.reset_memo_counts()
         self.assertEqual(
             self.store.memo_report(),
-            {"hits": 0, "misses": 0, "clears": 0, "entries": 1})
+            {"hits": 0, "misses": 0, "clears": 0, "entries": 4})
         self.assertEqual(self._traced(
             lambda: self.store.summary_rollup(cutoff)), [])
 

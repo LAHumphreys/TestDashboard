@@ -90,6 +90,32 @@ EXCLUDED_TESTS = {
         "test_every_kind_still_agrees_with_its_own_query.",
     "TestQueueCounts.test_the_ownership_count_reaches_latest_runs_by_its_key":
         "asserts EXPLAIN QUERY PLAN output — SQLite's planner.",
+    "PartitionRollupTest.test_a_push_into_one_environment_re_reads_that_one":
+        "counts statements with sqlite3's set_trace_callback; the value "
+        "is compared against the oracle in the same test, which the "
+        "SQLite run performs.",
+    "TargetedInvalidationTest"
+    ".test_a_push_into_one_environment_leaves_the_others_cells":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TargetedInvalidationTest.test_a_builds_push_leaves_mainlines_memos_served":
+        "counts statements with sqlite3's set_trace_callback; the "
+        "value it guards is compared cold-against-served by "
+        "test_what_survives_is_still_true, which runs here.",
+    "TargetedInvalidationTest.test_a_builds_push_drops_the_builds_own":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TargetedInvalidationTest.test_mainlines_push_leaves_the_builds_memos_served":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TargetedInvalidationTest.test_the_catalogues_are_mainlines":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TargetedInvalidationTest.test_a_change_with_no_cell_to_name_drops_everything":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TargetedInvalidationTest.test_an_unchanged_push_drops_nothing":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TargetedInvalidationTest"
+    ".test_an_assignment_a_comment_and_a_retirement_drop_everything":
+        "counts statements with sqlite3's set_trace_callback.",
+    "TargetedInvalidationTest.test_deleting_a_builds_environment_drops_everything":
+        "counts statements with sqlite3's set_trace_callback.",
     "PartitionRollupTest.test_a_second_scope_costs_no_query":
         "counts statements with sqlite3's set_trace_callback.",
     "PartitionRollupTest.test_another_stream_or_cutoff_is_its_own_pass":

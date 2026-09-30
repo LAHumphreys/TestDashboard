@@ -2831,10 +2831,20 @@ class TestSummary(ApiCase):
         # (same join, same predicate, but stream_id is its LAST AND,
         # not its WHERE) that legitimately still runs once, for the
         # headline's status.assigned_open field, not a queue total.
+        # WIDENED for WP-38, not weakened: test_counts_by_environment
+        # now counts one environment per statement ("SELECT COUNT(*)
+        # ... WHERE lr.stream_id = ? AND lr.environment = ?", no result
+        # predicate) so a push into one environment re-counts that one.
+        # A per-kind count is told apart by what a queue predicate
+        # reads -- a result, a previous result, a start time, an
+        # assignee -- which a plain test count never mentions.
         per_kind_counts = [
             s for s in seen
             if s.strip().upper().startswith("SELECT COUNT(*)")
             and "WHERE lr.stream_id = " in s
+            and any(token in s for token in (
+                "lr.result", "lr.prev_result", "lr.start_time",
+                "ca.assignee"))
         ]
         self.assertEqual(
             per_kind_counts, [],

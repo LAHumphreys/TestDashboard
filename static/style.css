@@ -516,6 +516,12 @@ button.tile:focus-visible {
 .tile.accent-warn { border-top-color: var(--c-fae); }
 .tile.accent-zero { border-top-color: var(--border); }
 
+/* The placeholders index.html ships in the tile row (WP-38): the frame
+   of the page before its numbers arrive. Same size as the tiles that
+   replace them, so nothing moves when they do. */
+.tile-skeleton { border-top-color: var(--border); }
+.tile-skeleton .tile-value { color: var(--muted); }
+
 /* ---------- Chart cards ---------- */
 
 .chart-grid {

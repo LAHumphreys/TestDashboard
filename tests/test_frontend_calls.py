@@ -2339,6 +2339,116 @@ class MetricsPageTest(unittest.TestCase):
         self.assertNotIn("metrics", block)
 
 
+def _module_imports(name: str) -> List[str]:
+    source = _strip_comments(read(name))
+    return sorted(set(
+        re.findall(r'from\s+"\./([a-z_]+\.js)"', source)
+        + re.findall(r'import\s+"\./([a-z_]+\.js)"', source)))
+
+
+def _module_closure(scripts: List[str]) -> List[str]:
+    seen = []  # type: List[str]
+    frontier = list(scripts)
+    while frontier:
+        name = frontier.pop(0)
+        if name in seen:
+            continue
+        seen.append(name)
+        frontier.extend(_module_imports(name))
+    return seen
+
+
+class ModulePreloadTest(unittest.TestCase):
+    """WP-38: every page names, up front, every module it will import.
+
+    Without it a browser discovers the import graph a level at a time:
+    the page's own scripts, then what they import, then what those
+    import -- one dependent round trip per level, each needing a free
+    worker, before the first request for data can be made. With it the
+    whole graph is fetched at once. The list is only worth having if it
+    is complete and current, so it is pinned to the import graph
+    itself, on every page.
+    """
+
+    def _pages(self) -> List[str]:
+        return sorted(
+            name for name in os.listdir(STATIC_DIR)
+            if name.endswith(".html"))
+
+    def test_the_preload_list_is_the_import_closure(self) -> None:
+        for page in self._pages():
+            html = read(page)
+            scripts = re.findall(
+                r'<script type="module" src="([^"]+)"', html)
+            preloads = re.findall(
+                r'<link rel="modulepreload" href="([^"]+)"', html)
+            self.assertEqual(
+                sorted(preloads), sorted(_module_closure(scripts)), page)
+            self.assertEqual(len(preloads), len(set(preloads)), page)
+
+    def test_it_is_in_the_head_before_any_script(self) -> None:
+        for page in self._pages():
+            html = read(page)
+            first_preload = html.index('rel="modulepreload"')
+            self.assertLess(first_preload, html.index("</head>"), page)
+            self.assertLess(
+                first_preload, html.index('<script type="module"'), page)
+
+    def test_the_closure_helper_sees_a_real_graph(self) -> None:
+        """The detector must be able to fail: app.js imports plenty."""
+        self.assertGreater(len(_module_closure(["app.js"])), 6)
+        self.assertIn("api.js", _module_closure(["app.js"]))
+
+
+class FirstPaintTest(unittest.TestCase):
+    """WP-38: the home page has a frame on screen before any script
+    has loaded -- "hangs for a few hundred ms before rendering
+    anything" was the report from production."""
+
+    def test_the_status_section_ships_visible(self) -> None:
+        html = read("index.html")
+        at = html.index('id="status-section"')
+        tag = html[html.rindex("<section", 0, at):html.index(">", at)]
+        self.assertNotIn("hidden", tag)
+        for other in ("charts-section", "triage-section", "browse-section"):
+            at = html.index('id="' + other + '"')
+            tag = html[html.rindex("<section", 0, at):html.index(">", at)]
+            self.assertIn("hidden", tag, other)
+
+    def test_the_placeholders_are_the_real_tiles(self) -> None:
+        """Same labels, same order, same classes: the numbers replace
+        the placeholders and nothing on the page moves."""
+        html = read("index.html")
+        row = html[html.index('id="stat-tiles"'):]
+        row = row[:row.index("</div>\n    </section>")]
+        placeholders = re.findall(
+            r'<span class="tile-label">([^<]+)</span>', row)
+        code = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        real = re.findall(r'label: "([^"]+)"', code)
+        self.assertEqual(placeholders, real)
+        self.assertEqual(row.count('class="tile '), len(real))
+        self.assertIn('class="tile tile-hero tile-skeleton"', row)
+        self.assertEqual(row.count("tile-skeleton"), len(real))
+
+    def test_the_numbers_replace_the_placeholders(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        self.assertIn("clearNode(container)", body)
+        self.assertLess(
+            body.index("clearNode(container)"),
+            body.index("buildTile("))
+
+    def test_a_builds_page_hides_the_frame_before_its_first_request(
+            self) -> None:
+        body = _strip_comments(_function_body(read("app.js"), "function init()"))
+        guard_at = body.index("streamId !== null")
+        hide_at = body.index("hidden = true", guard_at)
+        fetch_at = body.index("initBranchDashboard(", guard_at)
+        self.assertLess(hide_at, fetch_at)
+        self.assertIn("SECTIONS", body[guard_at:fetch_at])
+
+
 class ScopeCarriageLinkMatrixTest(unittest.TestCase):
     """PART A of a follow-up link-matrix audit (after the F1-F7
     usability sweep): three more test.html links that only became

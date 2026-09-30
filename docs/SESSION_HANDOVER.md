@@ -44,9 +44,10 @@ merged and deployed. Nothing in it has been deployed.
 | WP-35 | A comment made from a build's page is a comment on that build | `04f2537` |
 | WP-36 | Performance pass: the summary reads its partition once | `1131b56` |
 | WP-37 | The Metrics page | `3aadcf9` (unfinished) + `9b97ce4` (completes it) |
+| WP-38 | A push drops only the memos of what it wrote; the home page paints its frame first | see `git log` |
 
-**Suite on the ship branch: 2501 OK (skipped 1), SQLite.** Dual-backend,
-local MariaDB 12.3: 3380 OK (skipped 56).
+**Suite on the ship branch: 2522 OK (skipped 1), SQLite.** Dual-backend,
+local MariaDB 12.3: 3415 OK (skipped 66).
 
 ## Where the code is
 
@@ -67,11 +68,10 @@ There is **no local `master` branch** in this checkout; work from
 Questions the drop raised and deliberately did not answer. The status log
 entry for 2026-09-29→30 has the numbers behind each.
 
-1. **Should a changing import clear only its own stream's memos?** It
-   clears all of them, by a recorded decision made before results were
-   pushed during a run. Per-stream clearing would keep mainline's pages
-   warm while the build runs. This is the largest remaining win and the
-   one with a correctness risk attached.
+1. ~~Should a changing import clear only its own stream's memos?~~
+   **Done, WP-38**, one level further: per `(stream, environment)`.
+   The question that remains is the pool: **`--workers 16` on
+   production?** — decide from the Metrics page's "Waited, mean".
 2. **Should there be a switch that turns the delete off**, or anything in
    front of it beyond a typed name? And should a delete block re-import —
    which needs a table, so migration 11?
