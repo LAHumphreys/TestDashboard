@@ -4,59 +4,50 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-09-30**. A five-package drop, built overnight from
-requests made the evening before, is on `drop-2026-09-30` waiting to be
-merged and deployed. Nothing in it has been deployed.
+Last rewritten: **2026-09-30, evening**. The drop of 2026-09-30 (WP-33 …
+WP-38) was merged and deployed to production the same day it was cut. The
+user reports it "worked beautifully". Nothing is in flight.
 
 ## Where things stand
 
-- **Production is MariaDB, schema v10, serving `master` at `91d5cd3`** —
-  the 2026-09-24 drop (WP-32). The user states GitHub `master` is what is
-  deployed. Follow works on real runs ("working beautifully", 2026-09-29).
+- **Production is MariaDB, schema v10, serving `master` at `a6f59d2`** —
+  the 2026-09-30 drop, PR #13, squash-merged 06:15 UTC. No migration ran.
+- **Production can now measure itself.** `metrics.html` is live there.
+  Every timing this project has ever quoted was SQLite on a development
+  machine; the first production number will come from that page.
 - **The site pushes results DURING a run, and runs twice a night** —
-  mainline, then one build, ~13,000 tests each. Both facts are now the
-  design load: every changing import clears every memo, so for the hours
-  a run lasts, a page's COLD cost is its cost.
-- **`drop-2026-09-30` is built, tested and not deployed.** WP-33 … WP-37.
-  No migration. Python changed in every package.
+  mainline, then one build, ~13,000 tests each. A push now drops only the
+  `(stream, environment)` memos it wrote (WP-38), so pages are served from
+  memos for most of the day; what remains is a wait for a free worker,
+  which no memo shortens.
+- **Not reported back from the deploy** — ask before assuming any of them:
+  whether `--workers` was raised from 8; whether the counters were left on;
+  what "Waited, mean" reads during a run; whether the dodgy build's
+  environment has been deleted (WP-34 was built for it).
 
-## Today's plan
+## Next session's plan
 
-1. **Read `docs/drops/2026-09-30.md`** — in particular "The decision you
-   have to make" and the three things there is no switch for. The delete
-   has no login in front of it and no flag to turn it off.
-2. **Merge and deploy** per that note: stop, checkout, start. If it ships
-   on a later day, re-date the note, the `whatsnew.html` heading and its
-   `data-drop-date` together.
-3. **Open the Metrics page on production during a run.** It is the first
-   measurement this project will have of production itself. Look at
-   "Waited, mean" (should be near zero), at the home headline's mean, and
-   at how fast the memo's "cleared N times" climbs.
-4. **Delete the dodgy build's environment** — after stopping whatever is
-   still sending it, or it will come back at the next push.
-
-## What the drop is
-
-| | | |
-|---|---|---|
-| WP-33 | Environment filter on a build's "Difference from" tab | `bc73f1e` |
-| WP-34 | Delete what a build holds for ONE environment, from its page | `e7e5a86` |
-| WP-35 | A comment made from a build's page is a comment on that build | `04f2537` |
-| WP-36 | Performance pass: the summary reads its partition once | `1131b56` |
-| WP-37 | The Metrics page | `3aadcf9` (unfinished) + `9b97ce4` (completes it) |
-| WP-38 | A push drops only the memos of what it wrote; the home page paints its frame first | see `git log` |
-
-**Suite on the ship branch: 2526 OK (skipped 1), SQLite.** Dual-backend,
-local MariaDB 12.3: 3419 OK (skipped 66).
+1. **Get the four answers above.** If "Waited, mean" on `GET (static
+   files)` or `GET /api/summary` is tens of milliseconds during a run, the
+   pool is the bottleneck and `--workers 16` is the fix; if it is near
+   zero, the next pass is the query cost table below.
+2. **Tidy the branches.** PR #12 (`docs-handover-2026-09-29`) is redundant
+   — its commit rode inside the drop — close it. `drop-2026-09-30` is
+   merged in content but, being squash-merged, is not an ancestor of
+   `master`; delete it by name, not from `--merged`.
+3. **Decide the Java client's fate** (PR #9), open since 2026-09-08.
+4. Then whatever the testers report from the first days of the delete, the
+   build comments and the environment filter.
 
 ## Where the code is
 
 | | |
 |---|---|
-| **`drop-2026-09-30`** | **THE branch. Ship this.** Cut from `docs-handover-2026-09-29`, so it contains that branch's one commit too |
-| `origin/master` | `91d5cd3` — deployed |
-| `docs-handover-2026-09-29` | PR #12, docs only, green. Merging the drop makes it redundant: close it, or merge it first — either order works, the content is identical |
-| `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, green, untouched since 2026-09-08; one commit ahead of `master`, two behind |
+| `origin/master` | `a6f59d2` — **deployed** |
+| `docs-handover-2026-09-30` | this rewrite and the log entry; docs only |
+| `drop-2026-09-30` | shipped as PR #13 (squash). Delete when convenient |
+| `docs-handover-2026-09-29` | PR #12 **open**, redundant — close it |
+| `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, green, untouched since 2026-09-08; one commit ahead of `master`, now three behind |
 | `wp-14-in-run-progress` | parked WIP; its migration renumbers to **11** before merging (registry §1) |
 | `wp-32-timeline-follow`, `wp-31-own-results-always`, `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*`, `wp-17`…`wp-25` | merged; prune when convenient. Six sibling worktrees (`TestDashboard-*-wt`) hold some of them — remove the worktree before the branch |
 
@@ -66,15 +57,14 @@ There is **no local `master` branch** in this checkout; work from
 ## Needs a person, not a commit
 
 Questions the drop raised and deliberately did not answer. The status log
-entry for 2026-09-29→30 has the numbers behind each.
+entries for 2026-09-29→30 and 2026-09-30 have the numbers behind each.
 
-1. ~~Should a changing import clear only its own stream's memos?~~
-   **Done, WP-38**, one level further: per `(stream, environment)`.
-   The question that remains is the pool: **`--workers 16` on
-   production?** — decide from the Metrics page's "Waited, mean".
+1. **`--workers 16` on production?** Decide from the Metrics page's
+   "Waited, mean", not from here.
 2. **Should there be a switch that turns the delete off**, or anything in
    front of it beyond a typed name? And should a delete block re-import —
-   which needs a table, so migration 11?
+   which needs a table, so migration 11? Now that it is deployed, the
+   testers' first use will say whether either matters.
 3. **Build comments — the workshop the user offered:**
    - mainline lists show a test's newest comment of any origin, unlabelled;
    - deleting a build clears the tag on its comments;
@@ -94,7 +84,8 @@ entry for 2026-09-29→30 has the numbers behind each.
 ## Known slow, measured, not changed
 
 Dev-scale SQLite, cold, in-process. Candidates for the next pass, in the
-order the numbers suggest:
+order the numbers suggest — but read the Metrics page first: if the wait
+is for a worker, none of these is the problem.
 
 | | |
 |---|---|
@@ -109,18 +100,21 @@ There is still no browser here; every drop's operator note says so.
 
 - `.scratch/net/run_net.py` — the six-class sanity net (~18 s, port 8931).
   Boots the pinned worktree `.scratch/net-wt` (`b816151`); re-point it to
-  verify a branch and restore the pin afterwards.
-- `.scratch/net/drop-2026-09-30/` — this drop's drivers (212 checks, 13
-  scenarios: `wp33_`, `wp34_`, `wp35_`, `wp37_drive.mjs`), its two seeded
-  databases, and the benchmark scripts. Its `README.txt` has the command
-  lines. They import the WORKING TREE's `static/`, one node process per
-  scenario (module state is a singleton). **To compare two code trees use
+  verify a branch and restore the pin afterwards. **It fails 5 checks on
+  `master` and did before the drop**: its seed is dated August, so no
+  build in it has run in the last fortnight. Re-seed it before trusting a
+  pass.
+- `.scratch/net/drop-2026-09-30/` — the shipped drop's drivers (212 checks,
+  13 scenarios), its two seeded databases, and the benchmark scripts. Its
+  `README.txt` has the command lines. They import the WORKING TREE's
+  `static/`, one node process per scenario. **To compare two code trees use
   `bench_ab.py`** — in-process, alternated — because HTTP timings on this
   machine vary 2–3× between runs minutes apart.
 - A local MariaDB 12.3 lives in `.scratch/mariadb-data` (port 3307,
   option file `.scratch/mariadb-test.cnf`): start `mariadbd.exe` with
   `--defaults-file=.scratch/mariadb-data/my.ini --port=3307`, then set
-  `TESTBOARD_TEST_DB_CNF`. It is not 10.3.
+  `TESTBOARD_TEST_DB_CNF`. It is not 10.3; CI's two 10.3 legs are the
+  authority for production's stream.
 
 All of `.scratch/` is gitignored — it exists on this machine only.
 
@@ -128,9 +122,9 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 
 ```bash
 git fetch origin --prune
-git log --oneline -3 origin/master   # 91d5cd3 on top means the drop has NOT merged
-gh pr list --state open
-python -m unittest discover          # expect 2501 OK (skipped 1) on the drop branch
+git log --oneline -3 origin/master   # a6f59d2 on top means nothing has shipped since
+gh pr list --state open              # expect #9 and, until closed, #12
+python -m unittest discover          # expect 2526 OK (skipped 1) on master, SQLite
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,

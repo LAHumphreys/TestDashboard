@@ -3590,3 +3590,27 @@ build and this package** (the Metrics bullet and the "Faster"
 paragraph). Their wording was kept; one factual slip corrected in
 place, and told to them: the Metrics page does not read the
 `--perf-log`, it keeps its own counters in memory.
+
+## 2026-09-30 — the drop of 2026-09-30 is in production (admin only, branch `docs-handover-2026-09-30`)
+
+**Deployed the same day it was cut.** PR #13 squash-merged to `master` as
+`a6f59d2` at 06:15 UTC; the user deployed it during the day and reports
+"worked beautifully". No migration ran; schema stays at 10 on both
+backends. `whatsnew.html`'s heading and `data-drop-date` already read
+2026-09-30, so nothing was re-dated.
+
+**What that means for the record.** The squash merge means the six
+`drop-2026-09-30` commits are not ancestors of `master`; the branch is
+merged in content and can be deleted, but `git branch --merged` will not
+say so. PR #12 (`docs-handover-2026-09-29`) is now redundant: its one
+commit was carried inside the drop.
+
+**What is NOT known.** Whether `--workers` was raised from 8, whether
+the counters were left on (the recommendation) or the server started
+with `--no-metrics`, what the Metrics page's "Waited, mean" reads during
+a run, and whether the dodgy build's environment has been deleted. The
+operator note asked for all four; none has been reported back. They are
+the questions for the next session, not this entry's to answer. This is
+also the first drop for which production can measure itself — any
+figure quoted from the Metrics page from now on is the first production
+number this project has had.
