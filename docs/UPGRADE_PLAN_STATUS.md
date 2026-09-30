@@ -3805,3 +3805,140 @@ modules. Local MariaDB 12.3: the tool's 21 tests OK, the dry run
 printing `SERVER: STOP IT FIRST … runs (step to 9), … latest_runs
 (step to 9), activity_hours (step to 10), script_hours (step to 10)`
 for the v7 fixture, as it should.
+
+## 2026-10-01 — WP-40 spec: acknowledged failures (replaces the candidate-environments proposal; migration 11)
+
+**The problem, restated.** New products are being let in on the
+proviso that they burn their failures down quickly; the first one
+arrived with 65 and the estate headline, now shared with senior
+colleagues, shows them all. The 2026-09-30 proposal was a per-
+environment "candidate" state hidden by default. The user dropped it
+this morning for a per-test model, and the review agreed it is the
+better one: it hides only what a person has looked at, it decays, and
+it closes an item already on the open list (the build-comments
+workshop's "'has a comment' is not 'acknowledged'").
+
+**Decisions (user, 2026-10-01, from an interactive walk through the
+open questions):**
+
+1. **Name: "acknowledged".** Never "known failure" — that is the
+   feeder-declared `known_failure_reason`/`FAILED_AS_EXPECTED` already
+   on the wire and the test page, which analytics treat as a
+   non-failure. A person acknowledging is a different, temporary act.
+2. **Unit: one test on one environment on one stream** — the triple
+   plus `stream_id`, like comments/assignments/retirement. Many
+   environments means many rows; the bulk action covers a selection in
+   one click.
+3. **A pass inside the window does not end it.** Any test that is
+   failing NOW and has a live acknowledgment is acknowledged, whatever
+   happened in between. (Considered and declined: surfacing a
+   pass-then-fail as new. Simpler rule wins; nothing on the push path.)
+4. **Headline: failing EXCLUDES acknowledged, and the count is shown
+   beside it everywhere a failing count appears** — home tiles,
+   Open Actions, Watch cards, product cards, a build's own tiles.
+   "12 failing · 65 acknowledged". Never subtracted silently.
+5. **Duration on mainline: any whole number of days 1–7, default 7,**
+   refused above 7 by the API AND by storage. On a build: the same, or
+   "until the build goes" (NULL), which mainline refuses.
+6. **Extension from an expiring list, history kept.** Open Actions
+   lists acknowledgments expiring within a day with one-click extend;
+   acknowledging an already-acknowledged test IS an extension; every
+   act is a history row and the extension count shows on the test —
+   four in a row is visible, which is what makes the ratchet bite.
+7. **Reason required, free text**, on a fresh acknowledgment; optional
+   on an extension (the old reason stands unless replaced).
+8. **One drop.** Everything below ships together, with migration 11.
+
+**Schema — migration 11 (claimed in `UPGRADE_PLAN.md` §1; WP-15's
+reservation moves to 12, the sixth time).** Creates only; touches no
+existing table; so the MariaDB step's `alters` is empty and the dry
+run will say the server may keep running.
+
+- `test_acknowledgments` — the CURRENT acknowledgment per
+  `(stream_id, environment, script, test_name)` (PK): `reason`,
+  `acknowledged_at`, `until` (ISO, NULL = until the build goes),
+  `acknowledged_by`, `extensions INTEGER NOT NULL DEFAULT 0`. An
+  expired row stays (it feeds the expiring/expired list and keeps the
+  extension count); it is simply not LIVE.
+- `acknowledgment_history` — one row per act (`acknowledge`,
+  `extend`, `clear`), with who/when/until/reason; the record.
+- Both join `_ENVIRONMENT_TABLES` (the environment delete removes
+  them; the schema-asking guard insists) and `delete_stream`/the WP-39
+  prune delete them by `stream_id`.
+
+**Predicate, one definition used everywhere:** a test is
+*acknowledged* iff its `latest_runs` row on that stream has
+`result = FAIL` AND a `test_acknowledgments` row exists for the same
+key with `until IS NULL OR until > now`. `now` is the request's, never
+memoized: the acknowledged set is small and human-rate, so it is read
+at request time and expiry is exact to the second.
+
+**Reads — the cold cost is the cost, nothing on the push path:**
+
+- The headline rollup stays ONE pass. Acknowledged counts come from a
+  second, tiny query — `test_acknowledgments` joined to `latest_runs`
+  by PK, grouped by environment — bounded by the number of
+  acknowledgments, never the estate, subtracted from the memoized
+  cells' failing figure at request time. `failing` (and
+  `new_failures`/`still_failing`) exclude them; `acknowledged` is a
+  new figure beside them, in `/api/summary`'s status and per-
+  environment blocks and in every summary the Watch/product/build
+  paths derive from the same cells.
+- The dashboard list: failing categories gain `AND NOT EXISTS (live
+  acknowledgment)` — an indexed PK probe per candidate row, applied to
+  the count and the page alike; a new category `acknowledged`; every
+  returned row carries `acknowledgment: {until, reason, by,
+  acknowledged_at, extensions}` when one exists (live or expired,
+  flagged), joined on the page only.
+- Open Actions: a new queue, **Expiring** — live acknowledgments with
+  `until` within 24 h, plus expired ones still failing — each with
+  extend.
+- Memos: an acknowledgment write drops everything, like assignments
+  (human-rate).
+
+**API:**
+
+- `POST /api/acknowledgments/bulk` — `{"username", "reason"?, "days":
+  int|null, "tests": [{environment, script, test_name, stream_id?}]}`,
+  the same `tests` list the two existing bulk endpoints take. A test
+  without a current row needs `reason`; one with a current row is
+  extended (`extensions + 1`, new `until`, reason kept unless given).
+  `days` 1–7; `null` only where `stream_id` is not mainline. Response:
+  `{acknowledged: n, extended: n}`.
+- `POST /api/acknowledgments/clear` — `{"username", "tests": [...]}`;
+  removes the current row, history records the clear.
+- `GET /api/acknowledgments?stream_id=&expiring_within_hours=24` —
+  the Expiring list, with the row's latest result so "still failing"
+  is filterable.
+
+**UI (the tester's view; `whatsnew.html` says this in its words):**
+
+- Home: the Failing tile reads "12 failing" with "65 acknowledged"
+  beside it; the triage section gains an **Acknowledged** queue next
+  to Still failing, rows showing reason, who, "expires in N days",
+  and the extension count. The selection bar gains **Acknowledge**
+  (reason, days, and on a build the "until the build goes" tick).
+- Test page: the current acknowledgment, its history, and an
+  Acknowledge/Extend/Clear control with the same fields.
+- Build dashboards: identical, scoped by `stream_id`; a mainline
+  acknowledgment does not reach builds and vice versa.
+- Open Actions: the Expiring queue with Extend (bulk).
+- Watch/product cards: "failing N · acknowledged M".
+
+**Guards:** storage tests on both backends (`StorageTestBase`), API
+tests, the one-predicate rule pinned (the list's exclusion, the
+count's subtraction and the queue agree on a seeded estate), mainline
+refuses `null`/`>7` in storage as well as API, the two table lists,
+migration tests (fresh == stepwise), `LedgerTest` (step 10→11 + the
+exporter's two tables), and a frontend-calls guard that every page
+showing a failing count also shows the acknowledged one.
+
+**Operator:** migration 11 on both backends; on MariaDB via the
+ledger (runbook §G) — creates-only, server may keep running, feeders
+untouched; rollback is a table drop. Drop note to be written before
+shipping.
+
+**Explicitly not in this package:** acknowledging across environments
+in one row; ending an acknowledgment on a pass; any change to
+`FAILED_AS_EXPECTED` handling; a sweep of expired rows (tiny, human-
+rate; revisit if it ever matters).

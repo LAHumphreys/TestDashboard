@@ -102,8 +102,9 @@ after a merge.
 | 8 | WP-20 | `environment_products` table *(took 8 from WP-15 — see below)* | No |
 | 9 | WP-21 | `streams` table, `runs.stream_id`, `comments.stream_id`, `assignments.stream_id`, `current_assignments.stream_id`, `latest_runs` rebuilt with `stream_id` *(took 9 from WP-15 — see below; the two `assignments`/`current_assignments` columns were folded in after this entry first landed but before this branch shipped anywhere; then WP-25 (docs/ONE_KIND_PLAN.md) amended it AGAIN IN PLACE, same precedent, to narrow `streams.kind` from {mainline, branch, build} to {mainline, build} — the `branch` kind died before it ever shipped anywhere, so this is deletion, not migration. `kind` was never CHECK-constrained, so the DDL is unchanged; only the comment and the application-level validation moved. See the entry's own comment in `storage.py`)* | Yes — see §1.2 (`latest_runs` rebuild; ~12k rows) |
 | 10 | WP-23 | `activity_hours`/`script_hours` rebuilt with `stream_id` in their PRIMARY KEY *(took 10 from WP-15 — see below)* | Yes — see §1.2 (both tables rebuilt; a straight copy, not a `runs` re-aggregate — ~1k + ~22k rows on the dev copy) |
-| 11 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8, then 9, then 10 — see below)* | No |
-| 12+ | *unallocated* | Claim by editing this table in the same commit | — |
+| 11 | WP-40 | `test_acknowledgments` and `acknowledgment_history` tables *(took 11 from WP-15 — see below)*. Creates only; no existing table touched | No |
+| 12 | WP-15 | `run_progress` table *(renumbered from 6, then 7, then 8, then 9, then 10, then 11 — see below)* | No |
+| 13+ | *unallocated* | Claim by editing this table in the same commit | — |
 
 **Why 6 and 7 swapped (2026-07-30).** Versions must ship contiguously —
 `tests/test_migrations.py` enforces it, and a database at version 7 with no 6
@@ -146,9 +147,16 @@ reads in order.)
 time, same day: WP-23 (long-running branch streams, drop 4 of
 `docs/STREAMS_PLAN.md`) shipped while `wp-14-in-run-progress` was still
 parked, so the ship-first package took the next contiguous number (10) and
-the parked claim moved back one (11). This is the CURRENT instruction:
+the parked claim moved back one (11). (This note originally said the WIP
+branch must renumber its migration entry to 11 before merging — **superseded
+by the next note**, which moved that target to 12.)
+
+**And why 11 and 12 swapped too (2026-10-01).** The same situation a sixth
+time: WP-40 (acknowledged failures) ships while `wp-14-in-run-progress` is
+still parked, so the ship-first package takes the next contiguous number (11)
+and the parked claim moves back one (12). This is the CURRENT instruction:
 **when the WIP branch comes back it must renumber its migration entry to
-11 before merging.**
+12 before merging** — and, since the ledger rule below, add its MariaDB step.
 
 **Claiming a version means editing this table in the same commit as the
 migration.** An entry here with no migration is fine; a migration with no entry

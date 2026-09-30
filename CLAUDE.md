@@ -138,9 +138,9 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
   table (`schema_version`). **`MIGRATIONS` holds ten entries and entry 1 describes a
   database that exists in production — never edit it.** Every schema change is a new
   appended entry whose version is claimed from the registry in `docs/UPGRADE_PLAN.md`
-  §1 *in the same commit*; version 11 is claimed by WP-15 (renumbered five times now,
-  as WP-17, WP-18, WP-20, WP-21 and WP-23 each shipped first — the parked WIP branch
-  must renumber before merging). **The app never runs DDL on MariaDB**: there, the
+  §1 *in the same commit*; version 11 is WP-40's, and 12 is claimed by WP-15
+  (renumbered six times now, as WP-17, WP-18, WP-20, WP-21, WP-23 and WP-40 each
+  shipped first — the parked WIP branch must renumber before merging). **The app never runs DDL on MariaDB**: there, the
   schema is moved by `tools/upgrade_mariadb_schema.py` (WP-27; a ledger since
   WP-40 — every migration above 7 needs a step there and a table in the exporter's
   `ddl()`, in the same commit; `LedgerTest` fails the suite otherwise, no server
