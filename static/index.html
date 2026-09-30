@@ -100,7 +100,12 @@
          app.js's init(), before its first request, so the frame shows
          there for the time it takes the script to run and no longer.
          The placeholder labels are the real tiles' labels, pinned to
-         them by tests/test_frontend_calls.py::FirstPaintTest. -->
+         them by tests/test_frontend_calls.py::FirstPaintTest. The
+         three sections below it ship visible for the same reason:
+         each fills in when its OWN request lands -- the queue rows and
+         the browse page usually before the headline -- and a section
+         that appeared only then would push everything under it down.
+         -->
     <section id="status-section" aria-labelledby="status-heading">
       <div class="section-head">
         <h2 id="status-heading" class="eyebrow">Latest results</h2>
@@ -123,7 +128,7 @@
     </section>
 
     <!-- ============ Charts ============ -->
-    <section id="charts-section" aria-label="Charts" hidden>
+    <section id="charts-section" aria-label="Charts">
       <div class="chart-grid">
         <div class="card">
           <!-- Per DAY, not per night: a suite can run more than once in
@@ -162,7 +167,7 @@
     </section>
 
     <!-- ============ Triage queues ============ -->
-    <section id="triage-section" aria-labelledby="triage-heading" hidden>
+    <section id="triage-section" aria-labelledby="triage-heading">
       <div class="section-head">
         <h2 id="triage-heading" class="eyebrow">Triage</h2>
         <span id="triage-meta" class="muted"></span>
@@ -191,7 +196,7 @@
     </section>
 
     <!-- ============ All tests (browse) ============ -->
-    <section id="browse-section" aria-labelledby="browse-heading" hidden>
+    <section id="browse-section" aria-labelledby="browse-heading">
       <div class="section-head">
         <h2 id="browse-heading" class="eyebrow">All tests</h2>
         <span id="browse-meta" class="muted"></span>

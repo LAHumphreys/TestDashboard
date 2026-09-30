@@ -123,13 +123,16 @@
           batch for a build leaves mainline's figures ready; a batch
           for one environment leaves the other environments' ready.
           Pushing results costs the same as before.</li>
-        <li><strong>The Dashboard shows its frame at once.</strong> The
-          "Latest results" heading and its row of tiles appear the
-          moment the page arrives, with placeholders, and the numbers
-          fill in when they are ready — instead of a blank page with
-          "Loading…" until everything is. Every page also tells the
-          browser up front which scripts it needs, so they are all
-          fetched together rather than one layer at a time.</li>
+        <li><strong>The Dashboard shows its frame at once, and fills
+          it in part by part.</strong> The page's sections appear the
+          moment it arrives, with placeholders, and each fills in as
+          its own data lands: the test list and the triage queue
+          usually first, the headline tiles and charts when the
+          summary is ready — instead of a blank page with "Loading…"
+          until everything is. A tab count that is not yet known reads
+          "…" rather than 0. Every page also tells the browser up front
+          which scripts it needs, so they are all fetched together
+          rather than one layer at a time.</li>
       </ul>
 
       <h3>Fixed</h3>

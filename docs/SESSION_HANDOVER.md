@@ -46,8 +46,8 @@ merged and deployed. Nothing in it has been deployed.
 | WP-37 | The Metrics page | `3aadcf9` (unfinished) + `9b97ce4` (completes it) |
 | WP-38 | A push drops only the memos of what it wrote; the home page paints its frame first | see `git log` |
 
-**Suite on the ship branch: 2522 OK (skipped 1), SQLite.** Dual-backend,
-local MariaDB 12.3: 3415 OK (skipped 66).
+**Suite on the ship branch: 2526 OK (skipped 1), SQLite.** Dual-backend,
+local MariaDB 12.3: 3419 OK (skipped 66).
 
 ## Where the code is
 

@@ -3530,10 +3530,22 @@ changed. Item 1 of the previous entry's "found, not changed" list.
    `ModulePreloadTest`), so the browser fetches it in one go instead of
    a layer at a time — two to three dependent round trips, each needing
    a free worker, before the first request for data could be made.
-4. The home page ships its "Latest results" frame — heading and seven
-   placeholder tiles with the real tiles' labels — visible in the
-   markup, on screen before any script runs; a build's page hides it
-   synchronously before its first request.
+4. The home page ships all four sections' frames — "Latest results"
+   with seven placeholder tiles carrying the real tiles' labels —
+   visible in the markup, on screen before any script runs; a build's
+   page hides them synchronously before its first request.
+5. Each section fills in when its OWN request lands. The user asked,
+   watching the play server: "still showing no results at all until it
+   has its summary results? Are there not things we can load whilst
+   the summary is still in flight?" — right: the queue rows and the
+   browse page were fetched in parallel with the headline and then
+   held behind it, because `loadQueue` rendered only `if
+   (state.summary)` and both sections stayed hidden until
+   `renderHeadline` un-hid them. The queue payload already carries
+   the clock and the cutoff the table needs; it renders on landing,
+   the browse page likewise, and a tab badge not yet known reads "…"
+   rather than 0. Driven live with the headline held back: 250 browse
+   rows and the queue's rendering on screen while it was in flight.
 
 **Measured.** The day's pattern replayed over HTTP on the dev estate
 (`push_pattern.py`: a push of 200 records, then a home-page load,

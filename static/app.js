@@ -297,6 +297,7 @@ async function refreshAll() {
       state.browseRows = tagStream(page.tests);
       state.browseTotal = page.total;
       renderBrowse(state.browseRows, false);
+      document.getElementById("browse-section").hidden = false;
     } catch (err) {
       if (seq === state.requestSeq) {
         showError(err.message);
@@ -325,13 +326,18 @@ async function loadQueue(kind, seq) {
       return;
     }
     tagStream(payload.queue.tests);
+    // WP-38: the queue's own payload carries the clock and the cutoff
+    // the table needs, so it renders the moment it lands rather than
+    // waiting for the headline -- which is the slowest of the three
+    // requests and used to gate all of them.
+    payload.queue.generated_at = payload.generated_at;
+    payload.queue.stale_before = payload.stale_before;
     state.queues[kind] = payload.queue;
-    if (state.summary) {
-      renderQueueTabs();
-      if (state.activeQueue === kind) {
-        renderQueueTable();
-      }
+    renderQueueTabs();
+    if (state.activeQueue === kind) {
+      renderQueueTable();
     }
+    document.getElementById("triage-section").hidden = false;
   } catch (err) {
     if (seq === state.requestSeq) {
       showError(err.message);
@@ -856,6 +862,25 @@ function queueCount(queueId) {
   return totals ? (totals[queueId] || 0) : 0;
 }
 
+/** True once SOMETHING can say how big `queueId` is. Before that a
+ * badge reads "…", not "0": a zero that is really "not yet known" is
+ * exactly the kind of number people act on. */
+function queueCountKnown(queueId) {
+  return Boolean(state.queues[queueId])
+    || Boolean(state.summary && state.summary.queue_totals);
+}
+
+/** The server's clock for the rows on screen: the headline's once it
+ * has landed, else the active queue's own. Both are the same server
+ * clock; the queue merely arrived first. */
+function serverClock() {
+  if (state.summary) {
+    return state.summary.generated_at;
+  }
+  const queue = state.queues[state.activeQueue];
+  return queue ? queue.generated_at : null;
+}
+
 function openQueue(queueId) {
   state.activeQueue = queueId;
   renderQueues();
@@ -902,7 +927,7 @@ function renderQueueTabs() {
     btn.appendChild(el("span",
       "tab-count" + (tab.id === "new_failures" && count > 0
         ? " tab-count-hot" : ""),
-      String(count)));
+      queueCountKnown(tab.id) ? String(count) : "…"));
     btn.addEventListener("click", () => {
       state.activeQueue = tab.id;
       renderQueues();
@@ -916,9 +941,13 @@ function renderQueueTabs() {
   const problems = queueCount("new_failures")
     + queueCount("still_failing")
     + queueCount("unexpected_passes");
-  document.getElementById("all-clear").hidden = problems !== 0;
+  // "All clear" is a claim about three queues; it waits until all
+  // three are known, which the headline is the first to say.
+  const known = ["new_failures", "still_failing", "unexpected_passes"]
+    .every(queueCountKnown);
+  document.getElementById("all-clear").hidden = !known || problems !== 0;
   document.getElementById("triage-meta").textContent =
-    problems === 0 ? "" : problems.toLocaleString() + " open items";
+    !known || problems === 0 ? "" : problems.toLocaleString() + " open items";
 }
 
 /** Column sets per queue: header + cell builder. */
@@ -1005,8 +1034,7 @@ function queueColumns(queueId) {
       }
       cell.appendChild(document.createTextNode(
         formatNight(entry.failing_since)));
-      const nights = nightsBetween(entry.failing_since,
-        state.summary.generated_at);
+      const nights = nightsBetween(entry.failing_since, serverClock());
       if (nights >= 1) {
         cell.appendChild(el("span", "row-sub",
           nights + (nights === 1 ? " night" : " nights")));
@@ -1125,8 +1153,10 @@ function reviewOptions() {
   // value gates the offer to retire a test. Recomputing it here from
   // recent_hours would re-introduce the bug where every test looks
   // abandoned on a Monday.
+  const queue = state.queues[state.activeQueue];
   return {
-    staleBefore: state.summary ? state.summary.stale_before : null,
+    staleBefore: state.summary ? state.summary.stale_before
+      : (queue ? queue.stale_before : null),
     onChanged: () => refreshQueueCounts(),
     onRetired: () => refreshSummary(),
   };

@@ -2405,15 +2405,59 @@ class FirstPaintTest(unittest.TestCase):
     has loaded -- "hangs for a few hundred ms before rendering
     anything" was the report from production."""
 
-    def test_the_status_section_ships_visible(self) -> None:
+    def test_every_mainline_section_ships_visible(self) -> None:
+        """The frame, all of it: a section that appeared only when its
+        data landed would push everything under it down."""
         html = read("index.html")
-        at = html.index('id="status-section"')
-        tag = html[html.rindex("<section", 0, at):html.index(">", at)]
-        self.assertNotIn("hidden", tag)
-        for other in ("charts-section", "triage-section", "browse-section"):
-            at = html.index('id="' + other + '"')
+        for section in ("status-section", "charts-section",
+                        "triage-section", "browse-section"):
+            at = html.index('id="' + section + '"')
             tag = html[html.rindex("<section", 0, at):html.index(">", at)]
-            self.assertIn("hidden", tag, other)
+            self.assertNotIn("hidden", tag, section)
+
+    def test_the_queue_renders_when_it_lands_not_when_the_headline_does(
+            self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "async function loadQueue("))
+        self.assertNotIn("if (state.summary)", body)
+        self.assertIn("renderQueueTabs()", body)
+        self.assertIn("renderQueueTable()", body)
+        self.assertIn(
+            'getElementById("triage-section").hidden = false', body)
+        self.assertIn("payload.queue.stale_before = payload.stale_before",
+                      body)
+
+    def test_the_browse_page_renders_when_it_lands(self) -> None:
+        body = _strip_comments(_function_body(
+            read("app.js"), "async function refreshAll("))
+        browse_at = body.index("renderBrowse(state.browseRows, false)")
+        self.assertIn(
+            'getElementById("browse-section").hidden = false',
+            body[browse_at:browse_at + 200])
+
+    def test_a_badge_that_is_not_yet_known_is_not_a_zero(self) -> None:
+        tabs = _strip_comments(_function_body(
+            read("app.js"), "function renderQueueTabs()"))
+        self.assertIn('queueCountKnown(tab.id) ? String(count) : "…"', tabs)
+        self.assertIn("every(queueCountKnown)", tabs)
+        known = _strip_comments(_function_body(
+            read("app.js"), "function queueCountKnown("))
+        self.assertIn("state.queues[queueId]", known)
+        self.assertIn("state.summary.queue_totals", known)
+
+    def test_the_queue_table_needs_nothing_from_the_headline(self) -> None:
+        code = _strip_comments(read("app.js"))
+        table = _function_body(code, "function renderQueueTable()")
+        columns = _function_body(code, "function queueColumns(")
+        options = _function_body(code, "function reviewOptions()")
+        for body, name in ((table, "renderQueueTable"),
+                           (columns, "queueColumns")):
+            self.assertNotIn("state.summary.", body, name)
+        self.assertIn("serverClock()", columns)
+        # The cutoff: the headline's when it has landed, else the
+        # queue's own -- never a read of the headline that assumes it.
+        self.assertIn("state.summary ? state.summary.stale_before", options)
+        self.assertIn("queue.stale_before", options)
 
     def test_the_placeholders_are_the_real_tiles(self) -> None:
         """Same labels, same order, same classes: the numbers replace
