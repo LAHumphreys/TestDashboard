@@ -154,6 +154,14 @@ the parked claim moved back one (11). This is the CURRENT instruction:
 migration.** An entry here with no migration is fine; a migration with no entry
 here is a merge conflict waiting to happen.
 
+**And a migration has two halves (2026-10-01, WP-40).** Production is MariaDB
+and the app never runs DDL there, so every entry above 7 in `storage.MIGRATIONS`
+needs its MariaDB step in `tools/upgrade_mariadb_schema.py`'s `LEDGER`, in the
+same commit, plus the new table(s) in `tools/export_for_mariadb.py`'s `ddl()`.
+`tests/test_upgrade_mariadb_schema.py::LedgerTest` fails the suite, with no
+server needed, when the two halves disagree. The procedure is
+`docs/MARIADB_MIGRATION.md` §G.5.
+
 ### 1.1 Required test (WP-0)
 
 `tests/test_migrations.py` must assert:

@@ -141,8 +141,11 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
   §1 *in the same commit*; version 11 is claimed by WP-15 (renumbered five times now,
   as WP-17, WP-18, WP-20, WP-21 and WP-23 each shipped first — the parked WIP branch
   must renumber before merging). **The app never runs DDL on MariaDB**: there, the
-  schema is moved by `tools/upgrade_mariadb_schema.py` (WP-27) and the backend only
-  verifies the recorded version matches, refusing in both directions.
+  schema is moved by `tools/upgrade_mariadb_schema.py` (WP-27; a ledger since
+  WP-40 — every migration above 7 needs a step there and a table in the exporter's
+  `ddl()`, in the same commit; `LedgerTest` fails the suite otherwise, no server
+  needed; runbook §G.5) and the backend only verifies the recorded version
+  matches, refusing in both directions.
   `tests/test_migrations.py` freezes entry 1 by hash and asserts the fresh-install and
   incremental paths produce identical schemas. A migration may contain a Python step
   (`"python: <name>"`). A database whose version exceeds the code's is refused, not

@@ -1185,12 +1185,18 @@ a perf pin) are skipped there, each with its reason recorded in
 ## forward without a full reload
 
 Everything above (§A–§F) is the one-time SQLite → MariaDB move. This
-section is different: it is for a MariaDB database that is **already**
-serving production and needs to move to a **newer schema_version** —
-exactly the 2026-08-11 situation, where prod cut over to MariaDB at
-schema v7 and the streams drop (migrations 8, 9, 10) shipped in code
-before the database caught up. `tools/upgrade_mariadb_schema.py` is the
-tool; read its own module docstring too, it is shorter than this section.
+section is the **procedure for every schema migration since**: a MariaDB
+database that is already serving production and needs to move to a
+newer `schema_version`. It applies whenever a drop's operator note says
+a migration runs; when the note says none does, nothing in this section
+happens. `tools/upgrade_mariadb_schema.py` is the tool. It is a
+**ledger**: one hand-written, hand-verified MariaDB step per SQLite
+migration since the cutover (v7), and everything it knows about
+versions — where it can start, where it ends, what an interrupted run
+looks like — is derived from that ledger rather than restated. It was
+written for the 2026-08-11 situation (prod cut over at v7 while the
+streams drop shipped migrations 8–10) and generalised on 2026-10-01
+(WP-40) so that every later migration takes the same road.
 
 **Say this first, because it is the one fact that changes the plan: DDL
 is AUTOCOMMIT on MariaDB.** Unlike the SQLite migrations (one
@@ -1198,7 +1204,7 @@ transaction, rolled back whole on any failure), every `CREATE TABLE`/
 `ALTER TABLE` statement this tool runs commits itself the instant it
 succeeds. There is no wrapping transaction and nothing this tool can
 "roll back" for you if it stops partway. **The pre-upgrade `mysqldump` is
-the entire rollback plan.** Take it before step 2 below, not after.
+the entire rollback plan.** Take it before step G.3, not after.
 
 ### G.1 Recreate `testboard_migrate` — it does not survive between uses
 
@@ -1209,9 +1215,9 @@ an incremental upgrade, root recreates it exactly as §A.4 first created
 it — same `CREATE USER` + `GRANT` block, a **fresh** password (never
 reuse an old one that might be written down somewhere) — and the
 operator writes a fresh `~/.testboard-migrate.cnf` per §A.9 (mind the
-inline-`#` note just added there). **Delete both the account and the cnf
-file again once the upgrade is verified**, the same as §E.6 already says
-for a full migration.
+inline-`#` note there). **Delete both the account and the cnf file again
+once the upgrade is verified**, the same as §E.6 already says for a full
+migration.
 
 ### G.2 The pre-upgrade dump — THE rollback
 
@@ -1228,43 +1234,53 @@ partway looks like a rollback plan right up until the moment it is
 needed. Keep it until the upgrade has been live and quiet for at least a
 day, the same as the full-migration export directory (§E.6).
 
-### G.3 Dry run, then live
+### G.3 Stop, dry run, live, verify
+
+Stop the feeder, then the service, first. The app checks
+`schema_version` only when it starts, so a running server would in fact
+keep serving old code through the upgrade (that is how the 2026-08-11
+run went) — but its connections wait at most ten seconds for a lock,
+and an `ALTER TABLE` holds one for as long as it takes; a push arriving
+mid-step is a failed push, not a queued one. The drop needs the restart
+anyway, so stopping first costs the seconds the steps take and buys a
+dump with nothing written after it and no request meeting a
+half-changed schema.
 
 ```bash
+# systemctl stop testboard          # and the feeder's timer/cron, as in §E.2
 $ python3 tools/upgrade_mariadb_schema.py upgrade \
     --config ~/.testboard-migrate.cnf --dry-run
 ```
 
-Prints every statement the upgrade would run, in order, plus the row
-counts of every table an `ALTER TABLE` step touches (a proxy for how
-long each step takes, not a timing estimate — MariaDB rewrites the whole
-table for a column add or a `PRIMARY KEY` change). Runs nothing. Read it
-before the live run — this is the version of "read the plan before you
-execute it" that a person tired at 2am skips if it is not the tool's own
-default behaviour, which is why `--dry-run` exists as a separate,
-harmless step rather than a flag nobody remembers to pass.
+The dry run prints, in this order: the rollback command with real values
+filled in; the recorded `schema_version`; the identity-column sizes read
+from the live schema; the row counts of every table some step's
+`ALTER TABLE` rewrites (`runs` first, always); the list of steps it will
+run, from the recorded version to the current code's, each with the
+package that wrote it; then every statement, in order. It runs nothing.
+Read it before the live run — this is the version of "read the plan
+before you execute it" that a person tired at 2am skips if it is not the
+tool's own default behaviour, which is why `--dry-run` exists as a
+separate, harmless step rather than a flag nobody remembers to pass.
 
 **Read the `runs` row count the dry run prints, specifically.** Every
-other table this tool touches is thousands of rows at most; `runs` is
-production's ~4.4M-row table, and the whole "bounded by tests, not by run
-history" claim for this upgrade rests on
-`ALTER TABLE runs ADD COLUMN stream_id BIGINT NOT NULL DEFAULT 1`
-(step 8→9) qualifying for MariaDB's **instant** ADD COLUMN — a real
-InnoDB feature since 10.3.2 that this statement satisfies by construction
-(the column is appended last, carries a constant default, the table is
-`ROW_FORMAT=DYNAMIC`), verified LOCALLY at 500,000 synthetic rows
-(sub-second, and forcing `ALGORITHM=INSTANT` explicitly succeeded rather
-than being refused) — but **not yet confirmed on production's 10.3
-stream**, only on this development box's newer server. If it does not
-take the instant path on 10.3 for some reason this box cannot surface,
-MariaDB falls back to an online rebuild (the dashboard stays readable and
-writable during it) whose cost should be assumed comparable to this
-runbook's own measured full-load benchmark (§0/§E.1 — "tens of minutes
-at best" for a ~950 MB database), not the sub-second number this dry run
-prints. The live run's per-statement timer watches this FOR you and
-prints a loud (but non-alarming — the statement has already committed
-successfully either way) notice if the `runs` step takes more than five
-seconds.
+other table any step touches is thousands of rows at most; `runs` is
+production's ~4.4M-row table. A step that alters `runs` is fast only if
+it qualifies for MariaDB's **instant** ADD COLUMN (a real InnoDB feature
+since 10.3.2: the column appended last, a constant default,
+`ROW_FORMAT=DYNAMIC`). Step 8→9's `runs` statement was built to qualify
+and was verified locally at 500,000 synthetic rows (sub-second, and
+forcing `ALGORITHM=INSTANT` explicitly succeeded rather than being
+refused), but **not on production's 10.3 stream** — CI's `mariadb:10.3`
+legs are the evidence at that version. If a `runs` step does not take the
+instant path, MariaDB falls back to an online rebuild whose cost should
+be assumed comparable to this runbook's measured full-load benchmark
+(§0/§E.1 — "tens of minutes at best" for a ~950 MB database). The live
+run's per-statement timer watches this FOR you and prints a loud (but
+non-alarming — the statement has already committed either way) notice if
+any `ALTER TABLE runs` takes more than five seconds. **A future step that
+must touch `runs` keeps to the same shape, or its operator note says why
+not and what the window is.**
 
 Then, for real:
 
@@ -1273,55 +1289,61 @@ $ python3 tools/upgrade_mariadb_schema.py upgrade \
     --config ~/.testboard-migrate.cnf
 ```
 
-It refuses to run at all unless `schema_version` is 7, 8 or 9 (resumable
-mid-sequence — see the next paragraph for why) and **also** checks, in
-both directions, that the actual tables/columns on the server agree with
-what the recorded version implies. If they disagree, it refuses with a
-message that names the mysqldump above rather than guessing what to do —
-**do not re-run it against a database that refusal describes; restore
-from the dump and start again.** Every step ends by bumping
-`schema_version` as its last statement; because DDL autocommits, an
-upgrade interrupted mid-step is exactly the shape that consistency check
-exists to catch (schema_version still says 7, but `streams` already
-exists because that was the first statement of the 8→9 step) — which is
-also why the tool accepts 8 and 9 as valid starting points, not only 7:
-a resumed run after a transient failure (a dropped connection, a lock
+Before connecting, the tool checks its own ledger against the SQLite
+migrations in the checkout and refuses to run if they disagree (the same
+check `LedgerTest` makes on every suite run — this is for a checkout
+nobody ran the suite on). Then it refuses unless `schema_version` is one
+a step starts from — a version below the cutover predates MariaDB here
+entirely; a version above the code's was written by newer code, and the
+answer is to deploy that code — and **also** checks, in both directions,
+that the actual tables/columns on the server agree with what the
+recorded version implies. If they disagree, it refuses with a message
+that names the mysqldump above rather than guessing what to do — **do
+not re-run it against a database that refusal describes; restore from
+the dump and start again.** Every step ends by bumping `schema_version`
+as its last statement (the tool appends that; a step cannot forget it);
+because DDL autocommits, an upgrade interrupted mid-step is exactly the
+shape that consistency check exists to catch (`schema_version` still
+says N, but something step N→N+1 creates already exists) — which is also
+why the tool accepts any step's starting version, not only the oldest: a
+resumed run after a transient failure (a dropped connection, a lock
 wait) should not have to explain itself as an error.
 
-It then runs its own `verify` automatically: a fresh, empty schema is
-built from `tools/export_for_mariadb.py`'s own DDL generator — the SAME
-generator a full migration's `schema.sql` comes from — as `TEMPORARY`
-tables inside the SAME database (the `testboard_migrate` grant is scoped
-to `testboard.*`, with no `CREATE DATABASE` privilege, so this is
-deliberate rather than a workaround), and every table's `SHOW CREATE
-TABLE` is diffed against it. Agreement across all fourteen tables is
-what "upgraded correctly" means here; a mismatch is printed loud, with
-the two `SHOW CREATE TABLE` texts side by side, and the tool exits
-non-zero. **Do not restart the server against a database that failed
-this check** — restore from the dump.
+It then runs its own `verify` automatically: a fresh, empty schema at
+the current version is built from `tools/export_for_mariadb.py`'s own
+DDL generator — the SAME generator a full migration's `schema.sql` comes
+from and the SAME one the dual-backend test suite runs on — as
+`TEMPORARY` tables inside the SAME database (the `testboard_migrate`
+grant is scoped to `testboard.*`, with no `CREATE DATABASE` privilege,
+so this is deliberate rather than a workaround), and every table's
+`SHOW CREATE TABLE` is diffed against it. Agreement across every table
+is what "upgraded correctly" means here; a mismatch is printed loud,
+with the two `SHOW CREATE TABLE` texts side by side, and the tool exits
+non-zero. **Do not start the server against a database that failed this
+check** — restore from the dump.
 
-### G.4 Restart, verify, first hour
+### G.4 Start, verify, first hour
 
 Same discipline as §E.4's cutover restart:
 
 ```bash
-# systemctl restart testboard
+# systemctl start testboard
 ```
 
-Then, by hand: open the dashboard, load a test detail page, read a run's
-output, post a comment, make an assignment — and, specific to this drop,
-open the Build picker on an environment that has ever reported a
-non-mainline result and confirm it lists what you expect. Watch the
-first hour of logs for anything from `testboard/mariadb.py`'s schema
-check (it would mean the restart raced the upgrade, or hit the wrong
-database).
+Then the drop's own operator note (`docs/drops/<date>.md`, "Check it
+came up"): it names what that drop's migration was for, which is what
+to look at first. The generic part, every time: open the dashboard, load
+a test detail page, read a run's output, post a comment, make an
+assignment. Watch the first hour of logs for anything from
+`testboard/mariadb.py`'s schema check (it would mean the start raced the
+upgrade, or hit the wrong database).
 
-**Rollback**, if anything above fails before the restart: nothing has
+**Rollback**, if anything above fails before the start: nothing has
 been written by a human yet, so there is nothing to lose — restore
-`testboard` from the dump (G.2) and leave the old code running. **After
-the restart**, the same rule as §E.6 applies: rollback is clean only
-until the first human write, because comments/assignments/retirements
-made after the restart exist only in the upgraded database.
+`testboard` from the dump (G.2) and leave the old code deployed. **After
+the start**, the same rule as §E.6 applies: rollback is clean only until
+the first human write, because comments/assignments/retirements made
+after the restart exist only in the upgraded database.
 
 **One correction to older wording:** the full-migration §E.6 and the
 Appendix below both say "a v10 file is refused by v7 code" as the
@@ -1331,6 +1353,38 @@ is refused at open). It does not apply here: MariaDB has no "file" to
 copy back, and the equivalent protection is `testboard/mariadb.py`'s own
 startup check refusing a version *mismatch* in either direction — which
 is exactly why the dump, not a file swap, is this section's rollback.
+
+### G.5 For the developer: adding a migration means adding a step
+
+A schema migration is not written until both halves exist, in the same
+commit. `docs/UPGRADE_PLAN.md` §1 says the same at the registry.
+
+1. Claim the version in `docs/UPGRADE_PLAN.md` §1; write the SQLite
+   entry in `storage.MIGRATIONS`, as ever.
+2. Add a `Step` to `LEDGER` in `tools/upgrade_mariadb_schema.py`: the
+   MariaDB DDL as a function of the live sizes (`discover_sizes` reads
+   them; a new table's identity columns must match `runs`'s exactly,
+   §B.1), a `Probe` for each thing it creates (a table, or a column of
+   one — what the consistency check tests in both directions), and the
+   existing tables its `ALTER TABLE`s rewrite (what the dry run counts).
+   Do not bump `schema_version` inside the step. Translate by hand,
+   per §B — a PRIMARY KEY is widened in one `ALTER` here where SQLite
+   rebuilds the table; see step 8→9 for the worked example.
+3. Add the new table(s) to `tools/export_for_mariadb.py`'s `ddl()` and
+   `TABLE_ORDER`: that is the fresh-install schema, the oracle `verify`
+   diffs against, and what the dual-backend suite runs on.
+4. Run the suite. `tests/test_upgrade_mariadb_schema.py::LedgerTest`
+   (no server needed) fails until 1 and 2 agree: a migration without a
+   step, a step without a migration, a gap, a step with no probe, a
+   probe its own DDL does not mention, a step that bumps the version
+   itself — each named. With `TESTBOARD_TEST_DB_CNF` set, the same file
+   upgrades a frozen v7 fixture through **every** step and diffs the
+   result against the oracle; with `TESTBOARD_TEST_DB_VIA_UPGRADE=1` as
+   well, the whole dual-backend suite serves from a database built that
+   way. CI runs both on `mariadb:10.3`, production's stream.
+5. The drop's operator note says **"a migration runs"**, names the
+   version, and points here. Its rollback section says "restore the
+   dump", not "git checkout".
 
 ---
 

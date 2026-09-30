@@ -3689,3 +3689,71 @@ frontend change; the picker lists what the API returns.
 legs). The production orphan's origin is inferred, not observed — the
 operator note says what to report if the start-up line names a
 different build.
+
+## 2026-10-01 — WP-40 (1 of n): the MariaDB upgrade tool is a ledger (branch `wp-40-candidate-environments`)
+
+**Why first.** WP-40 (candidate environments — the proposal reviewed
+the evening of 2026-09-30, spec to follow) needs migration 11, the
+first schema change since production moved to MariaDB. The tool that
+moves production's schema, `tools/upgrade_mariadb_schema.py` (WP-27),
+was written as a one-off: its docstring said v7→v10, the versions it
+resumed from, the target and the interrupted-run markers were three
+hand-listed constants, and the one test pinning it to
+`MIGRATIONS[-1][0]` failed with "extend the tool" and no shape to
+extend it into. The user called it tech debt to pay before building
+on it, and it is.
+
+**What the debt was NOT.** The three-way split — SQLite migrations as
+the source of truth, the exporter's full DDL as the fresh-install
+schema and the verify oracle, hand-written MariaDB steps diffed against
+that oracle — is sound and is kept exactly. Hand translation is right
+(the dialects differ where it matters; runbook §B). The dual-backend
+suite proves SQLite and the fresh MariaDB schema agree; `verify` proves
+the steps reach the fresh schema. Nothing about that changed.
+
+**What changed.**
+- The three steps are now a `LEDGER` of `Step` records, each carrying
+  the package, a one-line summary, its DDL as a function of the live
+  sizes, its `Probe`s (a table, or a column of one — what the
+  bidirectional consistency check tests), and the tables its `ALTER`s
+  rewrite (what the dry run counts). `EXPECTED_FROM_VERSIONS`,
+  `TARGET_VERSION`, the markers and the row-count tables are derived
+  from it. `CUTOVER_VERSION = 7` is the one constant left.
+- `plan()` appends each step's `schema_version` bump; a step that
+  bumps it itself is a ledger error. The bump-is-last invariant the
+  consistency check depends on is now enforced, not remembered.
+- `ledger_gaps(migration_versions, ledger)` is the whole rule, pure
+  and server-free: every SQLite migration above 7 has a step; every
+  step has a migration; contiguous; every step has a probe; every
+  probe names something the step's own DDL mentions; no step bumps
+  the version. `LedgerTest` runs it on every suite run (12 tests, six
+  of them planted regressions proving each clause can fail), and the
+  tool runs it before connecting and refuses to proceed on a mismatch.
+- Messages and help no longer say v10 anywhere; the dry run lists the
+  steps it will run with their packages. The version-above-target
+  refusal says what it means: newer code wrote this, deploy that code.
+- Runbook §G rewritten as the procedure for any migration, not the
+  memoir of August: stop the feeder and the service first (the app
+  checks the version only at start, but its ten-second lock wait
+  meets an `ALTER` holding the table — the August run upgraded under a
+  running server and got away with it); dry run; live; verify; start;
+  and a new §G.5 for the developer — the five steps of adding a
+  migration, both halves. `UPGRADE_PLAN.md` §1 gains the rule under
+  the registry table (the table itself untouched); `CLAUDE.md`'s
+  architecture line says it in one breath.
+
+**Not changed.** The three steps' DDL, byte for byte (only the bump
+moved out of each). The exporter. The v7 fixture (frozen by design; a
+new step is exercised by upgrading it through every step before).
+`tests/backends.py`'s VIA_UPGRADE path, which already ran `plan()`.
+
+**Measured.** SQLite: 2540 → **2550 OK (skipped 1)**, 152 s. Local MariaDB 12.3
+(`.scratch/mariadb-data`, port 3307): `tests.test_upgrade_mariadb_schema`
+20 tests OK (the full v7→10 upgrade, verify clean across 14 tables,
+the three refusals, the interrupted-run refusal, ALGORITHM=INSTANT
+accepted); with `TESTBOARD_TEST_DB_VIA_UPGRADE=1`, `EnvironmentDeleteTest`,
+`PruneEmptyStreamsTest` and `TestUpsertRuns` MariaDB variants green on
+a schema `plan()` built. CI's two 10.3 legs are the authority.
+
+**Next.** Migration 11 for WP-40 is the first step written into this
+shape; the spec for the package itself follows in the next entry.
