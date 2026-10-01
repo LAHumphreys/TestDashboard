@@ -43,10 +43,11 @@ is pushed or deployed yet.
 
 ## What remains before shipping
 
-1. **The performance A/B against `master`** is being measured by another
-   agent; its numbers are appended to the log as the next entry. Read it
-   before shipping; if a cold figure regressed, that is a finding, not a
-   footnote.
+1. ~~The performance A/B against `master`~~ **Done** (log, "WP-40
+   performance"): yesterday's gains intact; the one regression it found
+   (the browse page's count carrying the acknowledgment join) is fixed in
+   `dbb5523` and re-measured. Left for a later pass, found on `master`
+   too: 65 `current_assignments` rows cost the browse page's count ~8 ms.
 2. **Fast-forward `wp-40-acknowledged-failures` into `drop-2026-10-01`**
    (`drop-2026-10-01` holds only WP-39 and the deploy record; WP-40 was
    branched from it, so it is a fast-forward), then check the drop date in

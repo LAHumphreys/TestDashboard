@@ -4103,3 +4103,26 @@ version — the Metrics page does.
 
 The performance A/B against `master` is being measured separately and is
 recorded in the next entry.
+
+## 2026-10-01 — WP-40 performance: the acknowledgment join and the dashboard count
+
+Measured by the performance agent (Sonnet) against the shipped master,
+in-process; appended verbatim.
+
+Method. Compared origin/master (a6f59d2) with the WP-40 branch in-process on SQLite copies of the seeded production-scale dev estate (Atlas, about 12k tests across 5 environments; not production data). Each of the three or four configurations ran in a fresh process on a fresh copy, alternated with the order rotated each round, with every memo cleared before each cold call, the same `now` for both trees, and statements counted with set_trace_callback. Acknowledged state is 65 failing mainline tests on atlas-lab-alpha for 7 days. Because acknowledging also assigns the tests, tree A with the same 65 tests assigned and no acknowledgments is run as the control.
+
+Run 2 (c85957e; 48 samples per cell; cold median ms, A / B no acks / B with acks; statements A/Bn/Ba cold, warm statements identical to A in every row):
+
+headline unscoped 222.7 / 203.0 / 213.7 (37/38/39); headline product 213.0 / 191.2 / 210.2 (32/33/34); headline environment 211.3 / 188.4 / 200.6 (31/32/33); headline stream 244.3 / 243.7 / 219.5 (31/33/34); queue new_failures 29.7 / 30.4 / 30.7 (14/15/15); queue still_failing 99.3 / 101.2 / 71.0 (23/24/21); queue acknowledged n/a / 26.8 / 33.0 (-/15/15); dashboard default 33.0 / 47.8 / 64.6 (3/3/3); Open Actions 72.1 / 85.3 / 84.8 (259/259/259); watch 3 cards 384.9 / 406.5 / 323.3 (26/27/28). Warm medians of the headlines, queues and watch were within 0.3 ms of A except the unmemoized pages: dashboard default 32.5 / 49.0 / 64.3 and Open Actions 73.6 / 84.5 / 86.5. The first run used a fixed order and was biased by machine noise (cold medians moved about 2x between runs); only the rotated runs are quoted here.
+
+The regression. In run 2 the unfiltered dashboard page was +15 ms with no acknowledgments and +31 ms with 65. Cause: _LATEST_COUNT_JOIN in testboard/storage.py appended the acknowledgment join to the dashboard's COUNT(*), which reads no column from it. The count therefore made 25 to 35 thousand primary-key probes into test_acknowledgments per call. Per statement, in process: the count was 27.6 ms on A, 34.9 on the branch with no acknowledgments and 52 to 54 with 65. The same SQL with the join removed measured 27.2 to 27.8 ms (none) and 34.8 (with acknowledgments). Commit dbb5523 made the count join retirement-only and appends the acknowledgment join only where the WHERE reads it.
+
+Run 3 (dbb5523; 64 samples per cell; cold median ms): headline unscoped 227.5 / 227.4 / 229.7 / 228.3 (A / B none / B ack / A with 65 assignments); queue new_failures 32.1 / 32.2 / 32.6 / 31.9; queue still_failing 100.8 / 101.6 / 74.8 / 101.6; queue acknowledged n/a / 26.5 / 34.2; dashboard default 40.4 / 41.7 / 49.6 / 48.1; Open Actions 84.7 / 85.0 / 96.3 / 94.2. Without acknowledgments the dashboard is +1.3 ms (3%) over A, the 250-row page query keeping the join, and Open Actions +0.3. With acknowledgments the dashboard is +9.2 ms and Open Actions +11.6 ms over A, but +1.4 and +2.1 ms over the assignment control. Dashboard count with 65 acknowledgments is the same SQL and plan as with none, 35 ms against 27.5, and is equally 35 ms on tree A with 65 assignments and no acknowledgments; the extra cost is the assignment rows an acknowledgment implies and exists on master. Not investigated: why 65 assignment rows cost about 8 ms on this count — a property of master, a candidate for the next pass. Statements: +1 per cold headline with no acknowledgments, +2 with them; warm calls run the same SQL as A in every scenario.
+
+Push path (about 2,000 records, handler ms median): identical re-push 118.0 on A, 120.5 on the branch with no acknowledgments, 119.1 with them (2003 statements each, unchanged=2000); changed results 445.8, 451.0, 454.6 (10402 statements each). Differences are inside the p90 spread. Migration 11 on first open of a copy took 8 to 48 ms (median about 30) against 4 to 6 ms for a no-migration open.
+
+Caveats. SQLite only; no MariaDB timings. In-process handler time, not HTTP; this machine varies by 2x between runs minutes apart, so differences under about 1 ms are not claimed. One acknowledgment set (65 tests, one environment). Post-push figures use a one-record push into the same stream and environment. The seed's output fingerprints are NULL, so a stamping push was done before the identical re-push timings. Not checked: acknowledgment sets spread over many environments or streams, expiry crossing during a request, and the other callers of the count join apart from the dashboard.
+
+Raw numbers and scripts: `.scratch/net/drop-2026-09-30/wp40_ab.txt`, `wp40_ab.py`, `wp40_bench.py`, `wp40_dash.py`, `wp40_fixcheck.py` (this machine only, gitignored).
+
+**Verdict.** The 2026-09-30 drop's work is intact: headline, queues, watch and the push path are flat within noise, warm calls run no SQL master's did not, and the targeted memo drop still holds. The one regression found was fixed before shipping.
