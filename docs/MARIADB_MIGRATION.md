@@ -578,7 +578,7 @@ breaks you will not know which change did it.
 
 | SQLite | MariaDB | Note |
 |---|---|---|
-| `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT AUTO_INCREMENT PRIMARY KEY` | `BIGINT`, not `INT`: ids are consumed by re-imports (§B.5), so they run ahead of the row count. |
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT AUTO_INCREMENT PRIMARY KEY` | `BIGINT`, not `INT`: ids are consumed by re-imports (§B.5), so they run ahead of the row count. Five sites: `runs`, `comments`, `assignments`, `streams` (migration 9) and `acknowledgment_history` (migration 11); `tests/test_sql_portability.py::InventoryTest` pins the count. |
 | `TEXT` (identity) | `VARCHAR(n)` per §B.1 | Bounded, or it cannot be indexed. |
 | `TEXT` (`result`) | `VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin` | Values are `PASS`, `FAIL`, `FAILED_AS_EXPECTED`, `UNEXPECTED_PASS`. Do **not** use a MariaDB `ENUM` — the Python `Result` enum is the authority and an ENUM would give you two definitions that can drift. |
 | `TEXT` (`source_link`) | `VARCHAR(1024)` | Not indexed. The audit checks nothing exceeds it. |
