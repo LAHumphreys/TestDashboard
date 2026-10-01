@@ -31,6 +31,8 @@
 
 import {
   RESULTS,
+  acknowledgedTag,
+  acknowledgmentDetail,
   clearError,
   clearNode,
   el,
@@ -715,6 +717,14 @@ function renderStatus() {
     sub: "failed before too",
     onClick: () => openQueue("still_failing"),
   }));
+  const acked = status.acknowledged || 0;
+  container.appendChild(buildTile({
+    label: "Acknowledged",
+    value: acked.toLocaleString(),
+    accent: acked > 0 ? "accent-warn" : "accent-zero",
+    sub: acked > 0 ? "owned, time-boxed" : "none",
+    onClick: () => openQueue("acknowledged"),
+  }));
   container.appendChild(buildTile({
     label: "Newly fixed",
     value: status.fixed.toLocaleString(),
@@ -779,6 +789,8 @@ function renderCharts() {
           value: entry.failed.toLocaleString() },
         { swatchClass: "", label: "new failures",
           value: entry.new_failures.toLocaleString() },
+        { swatchClass: "", label: "acknowledged",
+          value: (entry.acknowledged || 0).toLocaleString() },
         { swatchClass: "", label: "tests",
           value: entry.total_tests.toLocaleString() },
       ],
@@ -827,6 +839,7 @@ function openScriptInBrowse(entry) {
 const QUEUE_TABS = [
   { id: "new_failures", label: "New failures" },
   { id: "still_failing", label: "Still failing" },
+  { id: "acknowledged", label: "Acknowledged" },
   { id: "fixed", label: "Fixed" },
   { id: "unexpected_passes", label: "Stale annotations" },
   { id: "not_run", label: "Not run" },
@@ -836,6 +849,7 @@ const QUEUE_TABS = [
 const QUEUE_EMPTY_TEXT = {
   new_failures: "No new failures — nothing broke that was passing before.",
   still_failing: "Nothing is stuck failing.",
+  acknowledged: "No acknowledged failures.",
   fixed: "No tests have gone from failing to passing.",
   unexpected_passes:
     "No stale annotations — every known failure still fails.",
@@ -1065,6 +1079,26 @@ function queueColumns(queueId) {
     },
   };
 
+  // Why a failure is not counted as failing, who owns it, and when the
+  // acknowledgment runs out. No sortKey: the summary carries no
+  // ordering by any of these.
+  const ackCol = {
+    header: "Acknowledged",
+    cell: (entry) => {
+      const cell = el("td", "wrap comment-cell");
+      const ack = entry.acknowledgment;
+      if (!ack) {
+        cell.appendChild(el("span", "muted", "—"));
+        return cell;
+      }
+      cell.appendChild(el("span", "comment-text", ack.reason));
+      cell.appendChild(el("span",
+        "row-sub" + (ack.live ? "" : " ack-expired"),
+        acknowledgmentDetail(ack)));
+      return cell;
+    },
+  };
+
   const resultCol = {
     header: "Result",
     sortKey: "result",
@@ -1102,6 +1136,8 @@ function queueColumns(queueId) {
         when("Last pass", "last_pass_time"),
         commentCol,
         assigneeCol];
+    case "acknowledged":
+      return [testCol, ackCol, commentCol, assigneeCol];
     case "fixed":
       // No "failing since" here: these tests are passing now, so the
       // summary reports no streak for them.
@@ -1158,6 +1194,8 @@ function reviewOptions() {
     staleBefore: state.summary ? state.summary.stale_before
       : (queue ? queue.stale_before : null),
     onChanged: () => refreshQueueCounts(),
+    // An acknowledgment moves a test between queues, not just a count.
+    onAcknowledged: () => refreshAll(),
     onRetired: () => refreshSummary(),
   };
 }
@@ -1451,6 +1489,10 @@ function buildRow(row) {
     chip.title = "Known failure: " + row.known_failure_reason;
   }
   resultCell.appendChild(chip);
+  const ackTag = acknowledgedTag(row);
+  if (ackTag) {
+    resultCell.appendChild(ackTag);
+  }
   tr.appendChild(resultCell);
 
   tr.appendChild(el("td", "", formatTime(row.start_time)));
