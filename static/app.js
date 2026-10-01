@@ -795,9 +795,7 @@ function renderCharts() {
       extra: entry.muted || 0,
       tooltipRows: [
         { swatchClass: "swatch-fail", label: "failing",
-          value: withMutedSuffix(
-            entry.failed.toLocaleString(), entry.muted)
-            .replace(" · +", " (+").replace(/ muted$/, " muted)") },
+          value: failingWithMuted(entry.failed, entry.muted) },
         { swatchClass: "", label: "new failures",
           value: entry.new_failures.toLocaleString() },
         { swatchClass: "", label: "tests",
