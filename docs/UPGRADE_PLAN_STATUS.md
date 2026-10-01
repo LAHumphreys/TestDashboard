@@ -3994,10 +3994,10 @@ Python. The integration was the two merges and one full run.
 **Measured** (this branch, development machine, a modern interpreter and
 not 3.6):
 
-- SQLite: `python -m unittest discover` — **2611 tests, OK (skipped=1)**,
+- SQLite: `python -m unittest discover` — **2620 tests, OK (skipped=1)**,
   from 2550 before WP-40.
 - With a local MariaDB 12.3 (port 3307, sacrificial database), the full
-  suite: **3585 tests, OK (skipped=71)**, from 3419 (2526 SQLite) at the 2026-09-30 drop.
+  suite: **3594 tests, OK (skipped=71)**, from 3419 (2526 SQLite) at the 2026-09-30 drop.
 - `tests.test_mariadb_backend` + `tests.test_upgrade_mariadb_schema`
   alone: **986 tests OK (skipped=70)**; the upgrade tool's full v7 -> v11
   run verifies clean, every table matching the v11 oracle.

@@ -23,8 +23,8 @@ is pushed or deployed yet.
   ledger step 10 to 11, `154a201` frontend, merged by `c85957e` and
   `0dfa121`; plus the docs commit on top (operator note, log entry, this
   file, CLAUDE.md's three numbers).
-- **Measured on this branch:** SQLite **2611 OK (skipped 1)**, from 2550;
-  MariaDB 12.3 full suite: **3585 OK (skipped 71)**; the two MariaDB suites
+- **Measured on this branch:** SQLite **2620 OK (skipped 1)**, from 2550;
+  MariaDB 12.3 full suite: **3594 OK (skipped 71)**; the two MariaDB suites
   alone 986 OK (skipped 70). Production is 10.3: CI's legs are the authority.
 - **What WP-40 is, in one screen** (the log's "WP-40 spec", its addendum and
   "WP-40 built" are the contract): a person acknowledges a failing test on
@@ -149,7 +149,7 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 git fetch origin --prune
 git log --oneline -3 origin/master   # a6f59d2 on top means the 2026-10-01 drop has NOT shipped
 gh pr list --state open              # expect #9 and, until closed, #12; plus the drop's PR once opened
-python -m unittest discover          # expect 2611 OK (skipped 1) on wp-40-acknowledged-failures, SQLite
+python -m unittest discover          # expect 2620 OK (skipped 1) on wp-40-acknowledged-failures, SQLite
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,
