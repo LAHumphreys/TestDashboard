@@ -52,6 +52,8 @@ TABLE_ORDER = (
     "assignments",
     "current_assignments",
     "test_retirements",
+    "test_mutes",
+    "mute_history",
     "environment_expectations",
     "environment_products",
     "activity_hours",
@@ -233,6 +235,33 @@ CREATE TABLE test_retirements (
   PRIMARY KEY (environment, script, test_name)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
+CREATE TABLE test_mutes (
+  stream_id       BIGINT NOT NULL,
+  environment     {env} NOT NULL,
+  script          {script} NOT NULL,
+  test_name       {name} NOT NULL,
+  reason          TEXT NOT NULL,
+  muted_at {stamp} NOT NULL,
+  expires_at      {stamp} NOT NULL,
+  muted_by {user} NOT NULL,
+  extensions      INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (stream_id, environment, script, test_name)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE mute_history (
+  id          BIGINT NOT NULL AUTO_INCREMENT,
+  stream_id   BIGINT NOT NULL,
+  environment {env} NOT NULL,
+  script      {script} NOT NULL,
+  test_name   {name} NOT NULL,
+  action      VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  reason      TEXT NULL,
+  expires_at  {stamp} NULL,
+  actor       {user} NOT NULL,
+  acted_at    {stamp} NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
 CREATE TABLE environment_expectations (
   environment    {env} NOT NULL,
   expected_tests INT NOT NULL,
@@ -299,6 +328,10 @@ CREATE INDEX idx_assignments_triple
   ON assignments (environment, script, test_name, id);
 CREATE INDEX idx_current_assignments_assignee
   ON current_assignments (assignee);
+CREATE INDEX idx_test_mutes_expiry
+  ON test_mutes (expires_at);
+CREATE INDEX idx_mute_history_triple
+  ON mute_history (environment, script, test_name, id);
 """
 
 

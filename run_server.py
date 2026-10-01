@@ -263,6 +263,28 @@ def main(argv=None):
                 traceback.print_exc()
             return 2
 
+    # WP-39: a build with no results left is removed before serving
+    # starts. Every delete path now settles the builds it empties; this
+    # catches a database one of them touched before that, or that was
+    # tidied by hand. Dozens of rows, one seek each -- runs every start.
+    try:
+        pruned = storage.prune_empty_streams()
+    except Exception as exc:
+        storage.close()
+        sys.stderr.write(
+            "Cannot tidy the streams table:\n  {0}\n".format(exc))
+        if args.verbose:
+            traceback.print_exc()
+        return 2
+    if pruned:
+        print("empty builds: removed {0} ({1})".format(
+            len(pruned),
+            ", ".join(
+                "{0}:{1}".format(stream.kind, stream.name)
+                for stream in pruned)))
+    else:
+        print("empty builds: none")
+
     # The counters are applied BEFORE the performance log's wrappers, so
     # the log times the tallied call and not the other way round.
     metrics = None

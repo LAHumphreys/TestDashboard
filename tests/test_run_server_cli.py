@@ -10,6 +10,7 @@ look applied, and that is how misconfiguration hides.
 Python 3.6 compatible; standard library only.
 """
 
+import datetime
 import io
 import os
 import shutil
@@ -123,6 +124,94 @@ class MainRejectionTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("Cannot read --db-config", err)
         self.assertIn("A.9", err)
+
+
+class StartupSweepTest(unittest.TestCase):
+    """WP-39: the server removes empty builds before it serves.
+
+    The one test in the suite that runs ``run_server.py`` as the
+    operator does — a real process, its stdout read line by line —
+    because the sweep lives in ``main()`` between opening the database
+    and building the server, and nothing else exercises that stretch.
+    """
+
+    def _boot(self, db: str) -> List[str]:
+        """Start the server on an ephemeral port and return its
+        start-up lines up to the "serving at" line, then stop it."""
+        import socket
+        import subprocess
+        import threading
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        process = subprocess.Popen(
+            [sys.executable, os.path.join(root, "run_server.py"),
+             "--db", db, "--port", str(port), "--host", "127.0.0.1",
+             "--workers", "1"],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True)
+        lines = []  # type: List[str]
+        done = threading.Event()
+
+        def pump() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                lines.append(line.rstrip("\n"))
+                if "serving at" in line:
+                    break
+            done.set()
+
+        reader = threading.Thread(target=pump)
+        reader.daemon = True
+        reader.start()
+        try:
+            done.wait(30)
+        finally:
+            process.kill()
+            process.wait()
+        return lines
+
+    def test_an_empty_build_is_removed_and_named(self) -> None:
+        from testboard import model
+        from testboard.model import Result, RunRecord
+        from testboard.storage import Storage
+        tmp = tempfile.mkdtemp(prefix="testboard_sweep_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        db = os.path.join(tmp, "t.db")
+        store = Storage(db)
+        when = datetime.datetime(2026, 7, 1, 2, 0, 0)
+        store.upsert_runs([RunRecord(
+            environment="linux-sim", script="suite.py",
+            test_name="test_a", result=Result.PASS, start_time=when,
+            end_time=when + datetime.timedelta(seconds=1), output="",
+            source_link="", known_failure_reason=None, build="live")])
+        conn = store._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO streams (product, kind, name, first_seen, "
+            "last_seen) VALUES ('', 'build', 'orphan', ?, ?)",
+            (model.format_iso(when), model.format_iso(when)))
+        conn.execute("COMMIT")
+        store.close()
+
+        lines = self._boot(db)
+        self.assertIn("empty builds: removed 1 (build:orphan)", lines,
+                      "\n".join(lines))
+        self.assertTrue(
+            any("serving at" in line for line in lines),
+            "the server did not come up:\n" + "\n".join(lines))
+        store = Storage(db)
+        self.addCleanup(store.close)
+        self.assertEqual(
+            [stream.name for stream in store.list_streams("")], ["live"])
+
+    def test_a_clean_database_says_so(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="testboard_sweep_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        lines = self._boot(os.path.join(tmp, "t.db"))
+        self.assertIn("empty builds: none", lines, "\n".join(lines))
 
 
 if __name__ == "__main__":

@@ -298,6 +298,23 @@ function currentUrlWithScope(overrides) {
   return url.pathname + (query ? "?" + query : "");
 }
 
+/* Muted failures (WP-40). Like every bulk POST these name all four
+ * scope levels null: where each test was muted FROM travels per
+ * test, inside the body (stream_id), never in the page's own query. */
+export function bulkMutesUrl() {
+  return apiUrl(
+    "api/mutes/bulk", null,
+    { product: null, stream: null, baseline: null, environment: null },
+  );
+}
+
+export function unmuteUrl() {
+  return apiUrl(
+    "api/mutes/unmute", null,
+    { product: null, stream: null, baseline: null, environment: null },
+  );
+}
+
 /** The current page, scoped to a different stream (null = mainline).
  * Resets `baseline` (a stream's own comparison choice belongs to THAT
  * stream) per the hierarchy rule; leaves `product`/`environment` alone,

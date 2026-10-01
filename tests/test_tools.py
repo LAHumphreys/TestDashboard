@@ -687,6 +687,33 @@ class TestDropEnvironmentCLI(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.environments(), ["linux-sim"])
 
+    def test_a_build_whose_only_environment_it_was_goes_with_it(
+            self) -> None:
+        """WP-39: the production finding. The build's row used to stay,
+        and the Build picker listed an empty build for ever."""
+        store = Storage(self.db)
+        store.upsert_runs([
+            RunRecord(
+                environment="UNKNOWN", script="suite.py",
+                test_name="test_b", result=Result.PASS,
+                start_time=NOW, end_time=NOW + datetime.timedelta(seconds=1),
+                output="out", source_link="", known_failure_reason=None,
+                build="dodgy")])
+        store.close()
+        rc, out = self.run_cli(
+            ["--db", self.db, "-e", "UNKNOWN", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertRegex(out, r"streams\s+1\b")
+        out_io = io.StringIO()
+        with contextlib.redirect_stdout(out_io):
+            rc = drop_environment.main(
+                ["--db", self.db, "-e", "UNKNOWN", "--yes"])
+        self.assertEqual(rc, 0)
+        store = Storage(self.db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.list_streams(""), [])
+        self.assertEqual(store.prune_empty_streams(), [])
+
     def test_an_unknown_name_is_reported_not_deleted(self) -> None:
         """Says what IS there, because the usual cause is a typo."""
         out = io.StringIO()

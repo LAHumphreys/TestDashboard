@@ -23,14 +23,15 @@ on MariaDB; this harness is not the app.
 ``TESTBOARD_TEST_DB_CNF`` and the ONE-TIME schema build above is
 replaced: a v7 schema (``tests/mariadb_v7_fixture.py``) is loaded, then
 ``tools/upgrade_mariadb_schema.py``'s own ``plan()`` — the exact
-statements a live operator run executes, not a re-derivation of them —
-is run against it to reach v10. Everything downstream (TRUNCATE-based
-per-test reset, ``schema_version``/mainline-stream reseeding) is
-UNCHANGED, because it does not care how the schema it is truncating came
-to exist. The point: with this set, the ENTIRE dual-backend suite (every
-existing test in ``tests/test_mariadb_backend.py``, ~2,900 cases) runs
-against a database that reached v10 by upgrading a v7 database, not by a
-fresh v10 load — the one thing ``upgrade_mariadb_schema.py``'s own
+statements a live operator run executes, every step of its ledger, not
+a re-derivation of them — is run against it to reach the current
+version. Everything downstream (TRUNCATE-based per-test reset,
+``schema_version``/mainline-stream reseeding) is UNCHANGED, because it
+does not care how the schema it is truncating came to exist. The
+point: with this set, the ENTIRE dual-backend suite (every existing
+test in ``tests/test_mariadb_backend.py``, ~2,900 cases) runs against
+a database that reached the current version by upgrading a v7
+database, not by a fresh load — the one thing ``upgrade_mariadb_schema.py``'s own
 schema-diff proves is STRUCTURALLY identical but cannot prove behaves
 identically under real queries. Off by default, including in CI: the
 same suite runs about twice as long with it on, and turning it on is a

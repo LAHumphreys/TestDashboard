@@ -44,6 +44,46 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-10-01">
+      <div class="section-head">
+        <h2 class="eyebrow">1 October 2026</h2>
+        <span class="muted">New: mute a failure for up to a week &middot; Fixed: an empty build no longer lingers in the Build box</span>
+      </div>
+
+      <h3>What's new</h3>
+      <ul>
+        <li><strong>Mute a failure you already know about.</strong> Tick
+          failing tests and use <em>Mute</em> in the bar at the bottom
+          &mdash; an owner, a note, and how long (twelve hours to seven
+          days) &mdash; or do it from a row's Review panel or the test's
+          own page. A muted failure is left out of the failing counts and
+          shown beside them as &ldquo;+3 muted&rdquo; (grey, on the
+          charts); Home has a Muted tab listing every mute.</li>
+        <li><strong>Mutes are owned, and they run out.</strong> Muting
+          assigns the test and posts your note as a comment; unassigning
+          it unmutes it. When the time is up the test counts as failing
+          again. Open Actions lists mutes about to run out, with
+          one-click Extend; extensions are counted and shown.</li>
+        <li><strong>Builds mute separately from mainline.</strong>
+          &ldquo;Known failure&rdquo; still means what the test suite
+          itself declares.</li>
+      </ul>
+
+      <h3>Fixed</h3>
+      <ul>
+        <li><strong>A build with no results left disappears from the
+          Build box.</strong> When an environment was removed from the
+          database, a build that had only ever run on that environment
+          stayed in the Build box as an empty entry &mdash; a page with
+          nothing on it. Removing an environment now takes such builds
+          with it, and the dashboard also checks for empty builds each
+          time it starts, so the one already there goes at the next
+          restart. A build that also ran on other environments keeps
+          those results and stays. Nothing changes for a build that has
+          results.</li>
+      </ul>
+    </section>
+
     <section class="release" data-drop-date="2026-09-30">
       <div class="section-head">
         <h2 class="eyebrow">30 September 2026</h2>

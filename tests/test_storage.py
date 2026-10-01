@@ -2944,6 +2944,12 @@ class TestQueueCounts(EstateTestBase):
         handler calls it; two at most from nothing; the same number
         with or without an assignee; and the one that is this method's
         own must not be a pass over latest_runs.
+
+        WIDENED for WP-40, not weakened: the FIRST read after a write
+        also asks the mute epoch (one indexed
+        ``SELECT MIN(expires_at)`` on the stream's mutes,
+        memoized with everything else), so a cold call is one statement
+        longer. The repeat is still ZERO statements, asserted last.
         """
         cutoff = self.NIGHT_2 - datetime.timedelta(hours=1)
         cold = self._selects(lambda: self.store.queue_counts(
@@ -2953,7 +2959,8 @@ class TestQueueCounts(EstateTestBase):
         # mainline (WP-38 split the pass per environment).
         names = self.store._stream_environment_names(
             storage.MAINLINE_STREAM_ID)
-        self.assertEqual(len(cold), 1 + (1 + len(names)), cold)
+        self.assertEqual(len(cold), 1 + (1 + len(names)) + 1, cold)
+        self.assertIn("MIN(EXPIRES_AT)", " ".join(cold[-1].split()).upper())
         self.store._invalidate_summary_cache()
         anonymous = self._selects(lambda: self.store.queue_counts(
             stale_before=cutoff))
@@ -2963,9 +2970,11 @@ class TestQueueCounts(EstateTestBase):
         self.store.summary_rollup(cutoff)
         within = self._selects(lambda: self.store.queue_counts(
             assignee="alice", stale_before=cutoff))
-        self.assertEqual(len(within), 1, within)
+        self.assertEqual(len(within), 2, within)
         own = " ".join(within[0].split()).upper()
         self.assertIn("FROM CURRENT_ASSIGNMENTS AS CA JOIN LATEST_RUNS", own)
+        self.assertIn(
+            "MIN(EXPIRES_AT)", " ".join(within[1].split()).upper())
         self.assertEqual(
             self._selects(lambda: self.store.queue_counts(
                 assignee="alice", stale_before=cutoff)), [])
@@ -4741,6 +4750,105 @@ class EnvironmentDeleteTest(StorageTestBase):
         self.assertEqual(
             sorted(self.store.environments()), ["UNKNOWN-2", "unknown"])
 
+    # -- WP-39: the builds the environment was part of ------------------
+
+    def _seed_builds(self) -> Dict[str, int]:
+        """Mainline on both environments; a build that ran ONLY on
+        UNKNOWN; a build that ran on both, with its UNKNOWN runs both
+        older and newer than its linux-sim ones, so both ends of its
+        clock have to move when they go. Returns name -> stream id."""
+        self._seed()
+        hour = datetime.timedelta(hours=1)
+        second = datetime.timedelta(seconds=1)
+        self.store.upsert_runs([
+            make_record(environment="UNKNOWN", test_name="c",
+                        build="only-here", start=BASE + 5 * hour),
+            make_record(environment="UNKNOWN", test_name="c",
+                        build="both", start=BASE + second),
+            make_record(environment="linux-sim", test_name="c",
+                        build="both", start=BASE + hour + second),
+            make_record(environment="UNKNOWN", test_name="c",
+                        build="both", start=BASE + 2 * hour + second),
+        ])
+        ids = {
+            stream.name: stream.stream_id
+            for stream in self.store.list_streams("")}
+        # Posted FROM the only-here build, about a test on the OTHER
+        # environment: the comment outlives the environment (a comment
+        # on UNKNOWN's own tests goes with it, as it always has).
+        self.store.add_comment(
+            "linux-sim", "suite.py", "c", "alice", "from the build",
+            CREATED, stream_id=ids["only-here"])
+        return ids
+
+    def test_a_build_that_only_ran_there_is_removed_with_it(self) -> None:
+        """The production finding: the Build picker kept listing a
+        build whose only environment had been dropped, as an empty
+        build, for ever. `streams` is not keyed by environment, so
+        the table-list guard above could not see it."""
+        ids = self._seed_builds()
+        deleted = self.store.delete_environment("UNKNOWN")
+        self.assertEqual(deleted["streams"], 1)
+        self.assertIsNone(self.store.get_stream(ids["only-here"]))
+        self.assertEqual(
+            [stream.name for stream in self.store.list_streams("")],
+            ["both"])
+
+    def test_a_build_that_also_ran_elsewhere_keeps_its_other_results(
+            self) -> None:
+        ids = self._seed_builds()
+        self.store.delete_environment("UNKNOWN")
+        both = self.store.get_stream(ids["both"])
+        self.assertIsNotNone(both)
+        self.assertEqual(
+            self.store.environments_for_stream(ids["both"]),
+            ["linux-sim"])
+        # Both ends of its clock were UNKNOWN runs; re-derived from
+        # the one linux-sim run that remains.
+        remaining = BASE + datetime.timedelta(hours=1, seconds=1)
+        self.assertEqual(both.first_seen, remaining)
+        self.assertEqual(both.last_seen, remaining)
+
+    def test_mainline_is_never_settled(self) -> None:
+        """Mainline is not a build. Its row stays even when this was
+        its only environment, and its clock is left alone."""
+        self.store.upsert_runs([make_record(environment="UNKNOWN")])
+        before = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        deleted = self.store.delete_environment("UNKNOWN")
+        self.assertEqual(deleted["streams"], 0)
+        after = self.store.get_stream(storage.MAINLINE_STREAM_ID)
+        self.assertIsNotNone(after)
+        self.assertEqual(after.first_seen, before.first_seen)
+        self.assertEqual(after.last_seen, before.last_seen)
+
+    def test_a_removed_builds_comments_survive_untagged(self) -> None:
+        """As with every other stream removal: the comment annotates
+        the test, and a dangling origin id would differ between the
+        backends (SQLite's FK would null it, MariaDB has none)."""
+        self._seed_builds()
+        self.store.delete_environment("UNKNOWN")
+        comments = self.store._conn().execute(
+            "SELECT text, stream_id FROM comments "
+            "WHERE text = 'from the build'").fetchall()
+        self.assertEqual(len(comments), 1)
+        self.assertIsNone(comments[0][1])
+
+    def test_the_dry_run_names_the_builds_that_would_go(self) -> None:
+        """`test_the_counts_returned_match_what_the_dry_run_reported`
+        holds for every key; this pins the one WP-39 added to a
+        non-zero case, so the equality is not two zeros agreeing."""
+        self._seed_builds()
+        counted = self.store.count_environment_rows("UNKNOWN")
+        self.assertEqual(counted["streams"], 1)
+        self.assertEqual(
+            self.store.delete_environment("UNKNOWN")["streams"], 1)
+
+    def test_no_build_is_left_empty(self) -> None:
+        """The invariant WP-39 restores, stated directly."""
+        self._seed_builds()
+        self.store.delete_environment("UNKNOWN")
+        self.assertEqual(self.store.prune_empty_streams(), [])
+
     def test_the_trend_cache_is_invalidated(self) -> None:
         """A memoized chart of an environment that no longer exists.
 
@@ -4760,6 +4868,78 @@ class EnvironmentDeleteTest(StorageTestBase):
         self.assertEqual(
             sum(row.count for row in counts), 0,
             "the trend still reports runs from a deleted environment")
+
+
+class PruneEmptyStreamsTest(StorageTestBase):
+    """Storage.prune_empty_streams (WP-39): the start-up sweep for a
+    build whose results went before its row did.
+
+    An empty build cannot be made through this module any more, so the
+    fixture plants one the way production got its own: a row in
+    `streams` with no partition anywhere else.
+    """
+
+    def _plant(self, name: str) -> int:
+        conn = self.store._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO streams (product, kind, name, first_seen, "
+            "last_seen) VALUES (?, 'build', ?, ?, ?)",
+            ("", name, model.format_iso(BASE), model.format_iso(BASE)))
+        conn.execute("COMMIT")
+        return {
+            stream.name: stream.stream_id
+            for stream in self.store.list_streams("")}[name]
+
+    def test_removes_the_empty_build_and_reports_it(self) -> None:
+        self.store.upsert_runs([make_record(build="live")])
+        orphan = self._plant("orphan")
+        removed = self.store.prune_empty_streams()
+        self.assertEqual(
+            [(stream.stream_id, stream.name) for stream in removed],
+            [(orphan, "orphan")])
+        self.assertEqual(
+            [stream.name for stream in self.store.list_streams("")],
+            ["live"])
+        self.assertIsNotNone(
+            self.store.get_stream(storage.MAINLINE_STREAM_ID))
+
+    def test_a_clean_database_is_a_no_op(self) -> None:
+        self.store.upsert_runs([make_record(build="live")])
+        self.assertEqual(self.store.prune_empty_streams(), [])
+        self._plant("orphan")
+        self.assertEqual(len(self.store.prune_empty_streams()), 1)
+        self.assertEqual(self.store.prune_empty_streams(), [])
+
+    def test_a_build_of_only_retired_tests_is_not_empty(self) -> None:
+        """Retirement keeps the latest_runs row; the build still has
+        results, they are just not in the estate views."""
+        self.store.upsert_runs([make_record(build="parked")])
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_a", True, "alice", "done",
+            CREATED)
+        self.assertEqual(self.store.prune_empty_streams(), [])
+        self.assertEqual(
+            [stream.name for stream in self.store.list_streams("")],
+            ["parked"])
+
+    def test_the_orphans_comments_survive_untagged(self) -> None:
+        orphan = self._plant("orphan")
+        self.store.upsert_runs([make_record()])
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "alice", "why", CREATED,
+            stream_id=orphan)
+        self.store.prune_empty_streams()
+        comments = self.store.comments("linux-sim", "suite.py", "test_a")
+        self.assertEqual([c.text for c in comments], ["why"])
+        self.assertIsNone(comments[0].stream_id)
+
+    def test_mainline_with_no_results_is_kept(self) -> None:
+        """A fresh database: mainline has no partition yet and must
+        not be swept away before its first import."""
+        self.assertEqual(self.store.prune_empty_streams(), [])
+        self.assertIsNotNone(
+            self.store.get_stream(storage.MAINLINE_STREAM_ID))
 
 
 class ActivityHoursTest(StorageTestBase):
@@ -7971,3 +8151,1019 @@ class SummaryCacheTest(StorageTestBase):
         self.store.summary_rollup(cutoff)
         cost = self._query_count(lambda: self.store.summary_rollup(cutoff))
         self.assertEqual(cost, 0)
+
+
+class MuteTest(StorageTestBase):
+    """WP-40: muted failures (migration 11).
+
+    The storage layer's contract: ONE predicate ("live" is
+    ``expires_at > now``) read the same way by the dashboard, the
+    queues, the counts and the rollup; a mute is OWNED, so
+    muting assigns and unassigning drops it; hours are 1..168 on
+    every stream; a stream's mutes go with the stream.
+    """
+
+    NOW = datetime.datetime(2026, 7, 2, 12, 0, 0)
+    #: Every seeded run starts after this, so all of them "ran recently".
+    CUTOFF = BASE - datetime.timedelta(hours=1)
+    ENV = "linux-sim"
+    SCRIPT = "suite.py"
+
+    def _seed(self) -> None:
+        """Two new failures, two still-failing, one pass, one
+        unexpected pass; all on mainline."""
+        later = BASE + datetime.timedelta(hours=1)
+        records = [
+            make_record(test_name="f_new1", result=Result.FAIL, start=later),
+            make_record(test_name="f_new2", result=Result.FAIL, start=later),
+            make_record(test_name="f_still1", result=Result.FAIL),
+            make_record(test_name="f_still1", result=Result.FAIL,
+                        start=later),
+            make_record(test_name="f_still2", result=Result.FAIL),
+            make_record(test_name="f_still2", result=Result.FAIL,
+                        start=later),
+            make_record(test_name="p1", result=Result.PASS, start=later),
+            make_record(test_name="up1", result=Result.UNEXPECTED_PASS,
+                        start=later),
+        ]
+        self.store.upsert_runs(records)
+
+    def _key(self, test: str, sid: int = storage.MAINLINE_STREAM_ID,
+             env: Optional[str] = None) -> Tuple[str, str, str, int]:
+        return (env or self.ENV, self.SCRIPT, test, sid)
+
+    def _mute(
+        self,
+        tests: Sequence[str],
+        reason: Optional[str] = "known issue",
+        hours: int = 72,
+        assignee: str = "alice",
+        by: str = "bob",
+        when: Optional[datetime.datetime] = None,
+        sid: int = storage.MAINLINE_STREAM_ID,
+    ) -> "storage.MuteResult":
+        return self.store.mute_tests(
+            [self._key(t, sid) for t in tests], reason, hours, assignee, by,
+            when or self.NOW)
+
+    def _build_id(self, name: str) -> int:
+        return {
+            stream.name: stream.stream_id
+            for stream in self.store.list_streams("")}[name]
+
+    def _count(self, table: str, where: str = "1 = 1",
+               params: Sequence[Any] = ()) -> int:
+        return int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM {0} WHERE {1}".format(table, where),
+            tuple(params)).fetchone()[0])
+
+    def _names(self, rows: Sequence[Any]) -> List[str]:
+        return sorted(row.test_name for row in rows)
+
+    def _cells(self, now: Optional[datetime.datetime] = None) -> Any:
+        return self.store.muted_cells(now or self.NOW, self.CUTOFF)
+
+    # -- muting ------------------------------------------------
+
+    def test_mute_records_it_and_assigns_the_owner(self) -> None:
+        self._seed()
+        result = self._mute(["f_new1"], reason="flaky rig", hours=72)
+        self.assertEqual(
+            (result.muted, result.extended, result.unknown),
+            (1, 0, 0))
+        mute = self.store.mute_for(
+            storage.MAINLINE_STREAM_ID, self.ENV, self.SCRIPT, "f_new1")
+        assert mute is not None
+        self.assertEqual(mute.reason, "flaky rig")
+        self.assertEqual(mute.extensions, 0)
+        self.assertEqual(mute.muted_by, "bob")
+        self.assertEqual(mute.muted_at, self.NOW)
+        self.assertEqual(
+            mute.expires_at, self.NOW + datetime.timedelta(days=3))
+        self.assertEqual(
+            self.store.current_assignee(self.ENV, self.SCRIPT, "f_new1"),
+            "alice")
+        history = self.store.mute_history(
+            self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual([h.action for h in history], ["mute"])
+        self.assertEqual(history[0].actor, "bob")
+        self.assertEqual(history[0].reason, "flaky rig")
+        self.assertEqual(history[0].expires_at, mute.expires_at)
+
+    def test_the_assignment_origin_is_the_stream_for_a_build_only(
+        self,
+    ) -> None:
+        self.store.upsert_runs([
+            make_record(test_name="m", result=Result.FAIL),
+            make_record(test_name="b", result=Result.FAIL, build="b1"),
+        ])
+        sid = self._build_id("b1")
+        self._mute(["m"])
+        self._mute(["b"], sid=sid)
+        rows = {
+            row.test_name: row for row in self.store.dashboard(
+                assigned_only=True, now=self.NOW)}
+        self.assertIsNone(rows["m"].assignment_stream_id)
+        build_rows = self.store.dashboard(
+            assigned_only=True, stream_id=sid, now=self.NOW)
+        self.assertEqual(
+            [(r.test_name, r.assignment_stream_id) for r in build_rows],
+            [("b", sid)])
+
+    def test_hours_must_be_a_whole_number_of_one_to_168(self) -> None:
+        self._seed()
+        for bad in (0, 169, -1, True, False, 2.5, "3", None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self._mute(["f_new1"], hours=bad)  # type: ignore
+        self.assertEqual(self._count("test_mutes"), 0)
+        for good in (1, 12, 168):
+            self._mute(["f_new1"], hours=good)
+
+    def test_an_empty_assignee_is_refused(self) -> None:
+        self._seed()
+        for bad in ("", None):
+            with self.assertRaises(ValueError):
+                self._mute(["f_new1"], assignee=bad)  # type: ignore
+        self.assertEqual(self._count("test_mutes"), 0)
+
+    def test_a_fresh_key_with_no_reason_writes_nothing(self) -> None:
+        self._seed()
+        for bad in (None, ""):
+            with self.assertRaises(ValueError):
+                self._mute(["f_new1", "f_new2"], reason=bad)
+        self.assertEqual(self._count("test_mutes"), 0)
+        self.assertEqual(self._count("mute_history"), 0)
+        self.assertIsNone(
+            self.store.current_assignee(self.ENV, self.SCRIPT, "f_new1"))
+        self.assertEqual(self._count("assignments"), 0)
+
+    def test_one_fresh_key_without_a_reason_blocks_the_whole_batch(
+        self,
+    ) -> None:
+        self._seed()
+        self._mute(["f_new1"])
+        before = self.store.mute_for(
+            1, self.ENV, self.SCRIPT, "f_new1")
+        with self.assertRaises(ValueError):
+            self._mute(["f_new1", "f_new2"], reason=None, hours=120)
+        self.assertEqual(
+            self.store.mute_for(
+                1, self.ENV, self.SCRIPT, "f_new1"), before)
+        self.assertIsNone(self.store.mute_for(
+            1, self.ENV, self.SCRIPT, "f_new2"))
+
+    def test_unknown_keys_are_counted_and_skipped(self) -> None:
+        self._seed()
+        result = self.store.mute_tests(
+            [self._key("f_new1"), self._key("no_such_test"),
+             self._key("f_new2", sid=999)],
+            "why", 48, "alice", "bob", self.NOW)
+        self.assertEqual(
+            (result.muted, result.extended, result.unknown),
+            (1, 0, 2))
+        self.assertEqual(self._count("test_mutes"), 1)
+        self.assertEqual(self._count("assignments"), 1)
+        only_unknown = self.store.mute_tests(
+            [self._key("no_such_test")], "why", 48, "alice", "bob", self.NOW)
+        self.assertEqual(
+            (only_unknown.muted, only_unknown.unknown), (0, 1))
+
+    def test_an_empty_selection_is_a_no_op(self) -> None:
+        result = self.store.mute_tests(
+            [], "why", 48, "alice", "bob", self.NOW)
+        self.assertEqual(
+            (result.muted, result.extended, result.unknown),
+            (0, 0, 0))
+
+    def test_muting_again_extends(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], reason="first", hours=72, by="bob")
+        later = self.NOW + datetime.timedelta(days=1)
+        result = self._mute(
+            ["f_new1"], reason=None, hours=48, by="carol", when=later)
+        self.assertEqual(
+            (result.muted, result.extended), (0, 1))
+        mute = self.store.mute_for(1, self.ENV, self.SCRIPT,
+                                            "f_new1")
+        assert mute is not None
+        self.assertEqual(mute.extensions, 1)
+        self.assertEqual(mute.reason, "first")
+        self.assertEqual(mute.muted_by, "carol")
+        self.assertEqual(mute.expires_at, later + datetime.timedelta(days=2))
+        # The original moment of mute is kept.
+        self.assertEqual(mute.muted_at, self.NOW)
+        self._mute(
+            ["f_new1"], reason="second", hours=24, by="bob",
+            when=later + datetime.timedelta(days=1))
+        mute = self.store.mute_for(1, self.ENV, self.SCRIPT,
+                                            "f_new1")
+        assert mute is not None
+        self.assertEqual((mute.extensions, mute.reason), (2, "second"))
+        history = self.store.mute_history(
+            self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual(
+            [h.action for h in history], ["extend", "extend", "mute"])
+
+    def test_a_mixed_batch_mutes_and_extends(self) -> None:
+        self._seed()
+        self._mute(["f_new1"])
+        result = self._mute(["f_new1", "f_new2"], reason="both")
+        self.assertEqual(
+            (result.muted, result.extended), (1, 1))
+
+    # -- the one predicate --------------------------------------------
+
+    def _mute_some(self) -> None:
+        self._mute(["f_new1", "f_still1"])
+
+    def test_the_rollup_is_unchanged_and_the_cells_subtract_exactly(
+        self,
+    ) -> None:
+        self._seed()
+        base_cells = self.store.summary_rollup(self.CUTOFF)
+        plain = analytics.summarize_rollup(base_cells)
+        self.assertEqual(
+            (plain.status.new_failures, plain.status.still_failing,
+             plain.status.results[Result.FAIL]), (2, 2, 4))
+        self._mute_some()
+        self.assertEqual(self.store.summary_rollup(self.CUTOFF), base_cells)
+        cells = self._cells()
+        summary = analytics.summarize_rollup(base_cells, muted=cells)
+        status = summary.status
+        self.assertEqual(status.muted, 2)
+        self.assertEqual(status.muted_total, 2)
+        self.assertEqual(status.muted_new_failures, 1)
+        self.assertEqual(status.muted_still_failing, 1)
+        self.assertEqual(status.new_failures, 1)
+        self.assertEqual(status.still_failing, 1)
+        # Conserved against the unmuted estate: a muted failure moves
+        # from the failing figure to the "+N muted" beside it ...
+        self.assertEqual(
+            status.new_failures + status.muted_new_failures,
+            plain.status.new_failures)
+        self.assertEqual(
+            status.still_failing + status.muted_still_failing,
+            plain.status.still_failing)
+        # ... and is still a failure: the pass rate's inputs do not move.
+        self.assertEqual(status.results, plain.status.results)
+        self.assertEqual(
+            status.recent_results, plain.status.recent_results)
+        self.assertEqual(status.total_tests, plain.status.total_tests)
+        self.assertEqual(summary.by_environment[0].muted, 2)
+
+    def _scripts_estate(self) -> None:
+        """big.py: 3 failing; two.py: 2 failing (all on mainline)."""
+        self.store.upsert_runs([
+            make_record(script=script, test_name=name,
+                        result=Result.FAIL, start=BASE)
+            for script, names in (
+                ("big.py", ("b1", "b2", "b3")), ("two.py", ("t1", "t2")))
+            for name in names])
+
+    def test_top_failing_scripts_split_failing_from_muted(self) -> None:
+        self._scripts_estate()
+        top = lambda: [  # noqa: E731
+            (s.script, s.failing, s.muted)
+            for s in self.store.top_failing_scripts(now=self.NOW)]
+        self.assertEqual(
+            top(), [("big.py", 3, 0), ("two.py", 2, 0)])
+        self.store.mute_tests(
+            [(self.ENV, "big.py", "b1", 1), (self.ENV, "big.py", "b2", 1)],
+            "known", 72, "alice", "bob", self.NOW)
+        # 3 failing of which 2 muted: failing 1, muted 2 -- so it sorts
+        # BELOW the script with 2 unmuted failures.
+        self.assertEqual(
+            top(), [("two.py", 2, 0), ("big.py", 1, 2)])
+
+    def test_a_script_whose_failures_are_all_muted_still_appears(
+        self,
+    ) -> None:
+        self._scripts_estate()
+        self.store.mute_tests(
+            [(self.ENV, "two.py", "t1", 1), (self.ENV, "two.py", "t2", 1)],
+            "known", 72, "alice", "bob", self.NOW)
+        self.assertEqual(
+            [(s.script, s.failing, s.muted)
+             for s in self.store.top_failing_scripts(now=self.NOW)],
+            [("big.py", 3, 0), ("two.py", 0, 2)])
+
+    def test_top_failing_scripts_follow_expiry_without_a_write(
+        self,
+    ) -> None:
+        self._scripts_estate()
+        self.store.mute_tests(
+            [(self.ENV, "two.py", "t1", 1)],
+            "known", 24, "alice", "bob", self.NOW)
+        def two(when: datetime.datetime) -> Tuple[int, int]:
+            row = [s for s in self.store.top_failing_scripts(now=when)
+                   if s.script == "two.py"][0]
+            return (row.failing, row.muted)
+        self.assertEqual(two(self.NOW), (1, 1))
+        # Memoized now; the epoch in the key still lets expiry through.
+        self.assertEqual(two(self.NOW + datetime.timedelta(hours=1)), (1, 1))
+        self.assertEqual(two(self.NOW + datetime.timedelta(hours=25)), (2, 0))
+        # A write drops the memo: unmuting is seen at once.
+        self.store.mute_tests(
+            [(self.ENV, "two.py", "t2", 1)],
+            "known", 24, "alice", "bob", self.NOW)
+        self.assertEqual(two(self.NOW), (0, 2))
+        self.store.unmute_tests(
+            [(self.ENV, "two.py", "t2", 1)], "bob", self.NOW)
+        self.assertEqual(two(self.NOW), (1, 1))
+
+    def test_muted_total_counts_a_passing_mute_but_muted_does_not(
+        self,
+    ) -> None:
+        self._seed()
+        base_cells = self.store.summary_rollup(self.CUTOFF)
+        plain = analytics.summarize_rollup(base_cells)
+        self._mute(["p1", "f_new1"])
+        summary = analytics.summarize_rollup(
+            base_cells, muted=self._cells())
+        status = summary.status
+        # muted_total is every live mute; muted (the figure taken off
+        # failing) is only the one that is failing.
+        self.assertEqual((status.muted, status.muted_total), (1, 2))
+        self.assertEqual(status.results, plain.status.results)
+        self.assertEqual(
+            status.recent_results, plain.status.recent_results)
+        self.assertEqual(summary.by_environment[0].muted, 1)
+        by_product = analytics.summarize_by_product(
+            base_cells, {self.ENV: "prod"}, muted=self._cells())
+        self.assertEqual(
+            (by_product[0].failing, by_product[0].muted),
+            (plain.status.results[Result.FAIL] - 1, 1))
+
+    # -- the reason is also a comment ---------------------------------
+
+    def test_a_fresh_mute_posts_its_reason_as_a_comment(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], reason="flaky rig", by="bob")
+        comments = self.store.comments(self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual(
+            [(c.text, c.author, c.stream_id) for c in comments],
+            [("flaky rig", "bob", None)])
+
+    def test_a_plain_extension_posts_no_comment(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], reason="first", by="bob")
+        self._mute(["f_new1"], reason=None, hours=48, by="carol",
+                   when=self.NOW + datetime.timedelta(hours=1))
+        comments = self.store.comments(self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual([c.text for c in comments], ["first"])
+
+    def test_an_extension_with_a_new_reason_posts_it(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], reason="first", by="bob")
+        self._mute(["f_new1"], reason="still broken", hours=48, by="carol",
+                   when=self.NOW + datetime.timedelta(hours=1))
+        comments = self.store.comments(self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual(
+            [(c.text, c.author) for c in comments],
+            [("first", "bob"), ("still broken", "carol")])
+
+    def test_a_build_mutes_comment_is_tagged_with_that_build(self) -> None:
+        self._seed()
+        self.store.upsert_runs([
+            make_record(test_name="f_new1", result=Result.FAIL,
+                        build="b1")])
+        sid = self._build_id("b1")
+        self._mute(["f_new1"], reason="build only", sid=sid)
+        comments = self.store.comments(self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual(
+            [(c.text, c.stream_id) for c in comments],
+            [("build only", sid)])
+
+    def test_queue_counts_conserve_the_failures(self) -> None:
+        self._seed()
+        before = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(before["muted"], 0)
+        self._mute_some()
+        after = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(after["muted"], 2)
+        self.assertEqual(after["new_failures"], 1)
+        self.assertEqual(after["still_failing"], 1)
+        self.assertEqual(
+            after["new_failures"] + after["still_failing"]
+            + after["muted"],
+            before["new_failures"] + before["still_failing"])
+        for kind in ("fixed", "unexpected_passes", "not_run"):
+            self.assertEqual(after[kind], before[kind], kind)
+        # Calling again (memo hit) gives the same answer, and the memo's
+        # own dict was not corrupted by the subtraction.
+        self.assertEqual(
+            self.store.queue_counts(stale_before=self.CUTOFF, now=self.NOW),
+            after)
+
+    def test_the_queues_agree_with_the_counts_and_each_other(self) -> None:
+        self._seed()
+        self._mute_some()
+        counts = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        names = {
+            kind: self._names(self.store.status_queue(
+                kind, stale_before=self.CUTOFF, now=self.NOW))
+            for kind in storage.QUEUE_KINDS}
+        self.assertEqual(names["muted"], ["f_new1", "f_still1"])
+        self.assertEqual(names["new_failures"], ["f_new2"])
+        self.assertEqual(names["still_failing"], ["f_still2"])
+        for kind in storage.QUEUE_KINDS:
+            self.assertEqual(
+                self.store.status_queue_count(
+                    kind, stale_before=self.CUTOFF, now=self.NOW),
+                len(names[kind]), kind)
+            self.assertEqual(counts[kind], len(names[kind]), kind)
+
+    def test_the_dashboard_agrees_with_the_queues(self) -> None:
+        self._seed()
+        self._mute_some()
+        yes = self.store.dashboard(muted=True, now=self.NOW)
+        no = self.store.dashboard(muted=False, now=self.NOW)
+        everything = self.store.dashboard(now=self.NOW)
+        self.assertEqual(self._names(yes), ["f_new1", "f_still1"])
+        self.assertEqual(len(yes) + len(no), len(everything))
+        self.assertEqual(
+            self.store.dashboard_count(muted=True, now=self.NOW),
+            len(yes))
+        self.assertEqual(
+            self.store.dashboard_count(muted=False, now=self.NOW),
+            len(no))
+        self.assertEqual(
+            self.store.dashboard_count(now=self.NOW), len(everything))
+        queue = self._names(self.store.status_queue(
+            "muted", stale_before=self.CUTOFF, now=self.NOW))
+        self.assertEqual(self._names(yes), queue)
+        self.assertNotIn("f_new1", self._names(no))
+
+    def test_rows_carry_their_mute(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], reason="rig", hours=96, by="bob")
+        rows = {r.test_name: r for r in self.store.dashboard(now=self.NOW)}
+        mute = rows["f_new1"].mute
+        assert mute is not None
+        self.assertEqual(
+            (mute.reason, mute.muted_by, mute.extensions, mute.stream_id,
+             mute.expires_at),
+            ("rig", "bob", 0, storage.MAINLINE_STREAM_ID,
+             self.NOW + datetime.timedelta(days=4)))
+        self.assertIsNone(rows["f_new2"].mute)
+        self.assertIsNone(rows["p1"].mute)
+        queued = self.store.status_queue(
+            "muted", stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].mute, mute)
+        other = self.store.status_queue(
+            "new_failures", stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(self._names(other), ["f_new2"])
+        self.assertIsNone(other[0].mute)
+
+    # -- expiry -------------------------------------------------------
+
+    def test_an_expired_mute_stops_counting(self) -> None:
+        self._seed()
+        self._mute_some()
+        later = self.NOW + datetime.timedelta(days=3, seconds=1)
+        counts = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=later)
+        self.assertEqual(
+            (counts["muted"], counts["new_failures"],
+             counts["still_failing"]), (0, 2, 2))
+        self.assertEqual(
+            self._names(self.store.status_queue(
+                "new_failures", stale_before=self.CUTOFF, now=later)),
+            ["f_new1", "f_new2"])
+        self.assertEqual(
+            self.store.status_queue(
+                "muted", stale_before=self.CUTOFF, now=later), [])
+        self.assertEqual(
+            self.store.dashboard_count(muted=True, now=later), 0)
+        self.assertEqual(self._cells(later), [])
+        # On record, though expired.
+        mute = self.store.mute_for(1, self.ENV, self.SCRIPT,
+                                            "f_new1")
+        assert mute is not None
+        self.assertLess(mute.expires_at, later)
+        row = [r for r in self.store.dashboard(now=later)
+               if r.test_name == "f_new1"][0]
+        self.assertEqual(row.mute, mute)
+
+    def test_the_boundary_second_is_expired(self) -> None:
+        """live iff expires_at > now: AT the expiry it is gone."""
+        self._seed()
+        self._mute(["f_new1"], hours=24)
+        edge = self.NOW + datetime.timedelta(days=1)
+        self.assertEqual(
+            self.store.status_queue_count(
+                "muted", stale_before=self.CUTOFF, now=edge), 0)
+        just = edge - datetime.timedelta(seconds=1)
+        self.assertEqual(
+            self.store.status_queue_count(
+                "muted", stale_before=self.CUTOFF, now=just), 1)
+
+    def test_the_epoch_is_the_next_future_expiry(self) -> None:
+        self._seed()
+        sid = storage.MAINLINE_STREAM_ID
+        self.assertIsNone(self.store.mute_epoch(sid, self.NOW))
+        self._mute(["f_new1"], hours=120)
+        self._mute(["f_new2"], hours=48)
+        self.assertEqual(
+            self.store.mute_epoch(sid, self.NOW),
+            model.format_iso(self.NOW + datetime.timedelta(days=2)))
+        mid = self.NOW + datetime.timedelta(days=3)
+        self.assertEqual(
+            self.store.mute_epoch(sid, mid),
+            model.format_iso(self.NOW + datetime.timedelta(days=5)))
+        end = self.NOW + datetime.timedelta(days=6)
+        self.assertIsNone(self.store.mute_epoch(sid, end))
+        self.assertIsNone(self.store.mute_epoch(999, self.NOW))
+
+    def test_a_pass_in_between_changes_nothing(self) -> None:
+        self._seed()
+        self._mute(["f_new1"])
+        hour = datetime.timedelta(hours=1)
+        base = self.NOW - datetime.timedelta(hours=10)
+        self.store.upsert_runs([
+            make_record(test_name="f_new1", result=Result.PASS,
+                        start=base)])
+        # While it passes it is STILL muted (the Muted tab lists every
+        # live mute), but its cell says PASS and nothing is subtracted.
+        self.assertEqual(
+            self.store.status_queue_count(
+                "muted", stale_before=self.CUTOFF, now=self.NOW), 1)
+        self.assertEqual(
+            [(c.result, c.count) for c in self._cells()],
+            [(Result.PASS, 1)])
+        self.store.upsert_runs([
+            make_record(test_name="f_new1", result=Result.FAIL,
+                        start=base + hour)])
+        self.assertEqual(
+            self._names(self.store.status_queue(
+                "muted", stale_before=self.CUTOFF, now=self.NOW)),
+            ["f_new1"])
+        self.assertEqual(
+            [(c.result, c.count) for c in self._cells()],
+            [(Result.FAIL, 1)])
+
+    def test_a_passing_muted_test_is_listed_and_subtracts_nothing(
+        self,
+    ) -> None:
+        self._seed()
+        before = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        self._mute(["p1", "f_new1"])
+        # Every live mute is a cell, carrying its REAL result.
+        self.assertEqual(
+            sorted((c.result.value, c.count) for c in self._cells()),
+            sorted([(Result.PASS.value, 1), (Result.FAIL.value, 1)]))
+        counts = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        # The tab badge is the row count; only the FAIL one came off
+        # the failing queue.
+        self.assertEqual(counts["muted"], 2)
+        self.assertEqual(
+            counts["new_failures"], before["new_failures"] - 1)
+        self.assertEqual(counts["still_failing"], before["still_failing"])
+        rows = self.store.status_queue(
+            "muted", stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(self._names(rows), ["f_new1", "p1"])
+        self.assertEqual(
+            {row.test_name: row.result for row in rows},
+            {"f_new1": Result.FAIL, "p1": Result.PASS})
+        self.assertEqual(
+            counts["muted"],
+            self.store.status_queue_count(
+                "muted", stale_before=self.CUTOFF, now=self.NOW))
+        self.assertEqual(counts["muted"], len(rows))
+
+    def test_a_retired_test_is_not_counted(self) -> None:
+        self._seed()
+        self._mute_some()
+        self.store.set_retired(
+            self.ENV, self.SCRIPT, "f_new1", True, "alice", "gone", CREATED)
+        self.assertEqual(sum(c.count for c in self._cells()), 1)
+        counts = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(counts["muted"], 1)
+        self.assertEqual(
+            self._names(self.store.status_queue(
+                "muted", stale_before=self.CUTOFF, now=self.NOW)),
+            ["f_still1"])
+
+    # -- streams ------------------------------------------------------
+
+    def test_a_builds_mutes_do_not_touch_mainline(self) -> None:
+        self._seed()
+        self.store.upsert_runs([
+            make_record(test_name="f_new1", result=Result.FAIL,
+                        build="b1")])
+        sid = self._build_id("b1")
+        mainline_before = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        self._mute(["f_new1"], sid=sid)
+        # Assignment is per test, not per stream, so `assigned` moves;
+        # every figure about FAILURES must not.
+        after = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        for kind in ("new_failures", "still_failing", "muted",
+                     "fixed", "unexpected_passes", "not_run"):
+            self.assertEqual(after[kind], mainline_before[kind], kind)
+        build = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW, stream_id=sid)
+        self.assertEqual(
+            (build["muted"], build["new_failures"]), (1, 0))
+        self.assertIsNone(self.store.mute_for(
+            1, self.ENV, self.SCRIPT, "f_new1"))
+        self.assertEqual(self._cells(), [])
+        self.assertEqual(
+            sum(c.count for c in self.store.muted_cells(
+                self.NOW, self.CUTOFF, stream_id=sid)), 1)
+
+    def test_mainlines_mutes_do_not_touch_a_build(self) -> None:
+        self._seed()
+        self.store.upsert_runs([
+            make_record(test_name="f_new1", result=Result.FAIL,
+                        build="b1")])
+        sid = self._build_id("b1")
+        self._mute(["f_new1"])
+        build = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW, stream_id=sid)
+        self.assertEqual(
+            (build["muted"], build["new_failures"]), (0, 1))
+        self.assertEqual(
+            self.store.dashboard_count(
+                muted=True, now=self.NOW, stream_id=sid), 0)
+
+    def _history_count(self, sid: int) -> int:
+        return self._count("mute_history", "stream_id = ?", [sid])
+
+    def test_delete_stream_removes_its_mutes_and_history(
+        self,
+    ) -> None:
+        self._seed()
+        self.store.upsert_runs([
+            make_record(test_name="f_new1", result=Result.FAIL,
+                        build="b1"),
+            make_record(test_name="f_new2", result=Result.FAIL,
+                        build="b1")])
+        sid = self._build_id("b1")
+        self._mute(["f_new1", "f_new2"], sid=sid)
+        self._mute(["f_new1"])
+        self.assertEqual(self._history_count(sid), 2)
+        deleted = self.store.delete_stream(sid)
+        self.assertEqual(deleted["test_mutes"], 2)
+        self.assertEqual(
+            self._count("test_mutes", "stream_id = ?", [sid]), 0)
+        self.assertEqual(self._history_count(sid), 0)
+        # Mainline's own mute and history are untouched.
+        self.assertEqual(self._count("test_mutes"), 1)
+        self.assertEqual(self._history_count(1), 1)
+
+    def test_prune_empty_streams_takes_stray_mutes(self) -> None:
+        self.store.upsert_runs([make_record(build="live")])
+        conn = self.store._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO streams (product, kind, name, first_seen, "
+            "last_seen) VALUES (?, 'build', ?, ?, ?)",
+            ("", "orphan", model.format_iso(BASE), model.format_iso(BASE)))
+        conn.execute("COMMIT")
+        orphan = self._build_id("orphan")
+        self.store.ensure_user("bob", CREATED)
+        stamp = model.format_iso(BASE)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO test_mutes (stream_id, environment, "
+            "script, test_name, reason, muted_at, expires_at, "
+            "muted_by, extensions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (orphan, self.ENV, self.SCRIPT, "gone", "r", stamp, stamp, "bob"))
+        conn.execute(
+            "INSERT INTO mute_history (stream_id, environment, "
+            "script, test_name, action, reason, expires_at, actor, "
+            "acted_at) VALUES (?, ?, ?, ?, 'mute', 'r', ?, 'bob', ?)",
+            (orphan, self.ENV, self.SCRIPT, "gone", stamp, stamp))
+        conn.execute("COMMIT")
+        removed = self.store.prune_empty_streams()
+        self.assertEqual([s.name for s in removed], ["orphan"])
+        self.assertEqual(self._count("test_mutes"), 0)
+        self.assertEqual(self._count("mute_history"), 0)
+
+    # -- unassigning --------------------------------------------------
+
+    def _two_streams(self) -> int:
+        self.store.upsert_runs([
+            make_record(test_name="x", result=Result.FAIL),
+            make_record(test_name="x", result=Result.FAIL, build="b1",
+                        start=BASE + datetime.timedelta(hours=2))])
+        sid = self._build_id("b1")
+        self._mute(["x"])
+        self._mute(["x"], sid=sid)
+        self.assertEqual(self._count("test_mutes"), 2)
+        return sid
+
+    def test_unassigning_drops_the_mute_on_every_stream(
+        self,
+    ) -> None:
+        sid = self._two_streams()
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "x", None, "bob", self.NOW)
+        self.assertEqual(self._count("test_mutes"), 0)
+        clears = [
+            h for h in self.store.mute_history(
+                self.ENV, self.SCRIPT, "x") if h.action == "unmute"]
+        self.assertEqual(sorted(h.stream_id for h in clears), [1, sid])
+        for h in clears:
+            self.assertEqual(h.reason, "unassigned")
+            self.assertEqual(h.actor, "bob")
+            self.assertIsNone(h.expires_at)
+
+    def test_bulk_unassign_drops_it_too(self) -> None:
+        self._two_streams()
+        self.store.bulk_set_assignee_for_triples(
+            None, "bob", self.NOW, [(self.ENV, self.SCRIPT, "x", None)])
+        self.assertEqual(self._count("test_mutes"), 0)
+        self.assertEqual(
+            self._count("mute_history", "action = 'unmute'"), 2)
+
+    def test_filtered_bulk_unassign_drops_it_too(self) -> None:
+        self._seed()
+        self._mute_some()
+        count = self.store.bulk_set_assignee(
+            None, "bob", self.NOW, assigned_only=True, now=self.NOW)
+        self.assertEqual(count, 2)
+        self.assertEqual(self._count("test_mutes"), 0)
+
+    def test_reassigning_keeps_the_mute(self) -> None:
+        self._two_streams()
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "x", "carol", "bob", self.NOW)
+        self.assertEqual(self._count("test_mutes"), 2)
+        self.store.bulk_set_assignee_for_triples(
+            "dave", "bob", self.NOW, [(self.ENV, self.SCRIPT, "x", None)])
+        self.assertEqual(self._count("test_mutes"), 2)
+        self.assertEqual(
+            self._count("mute_history", "action = 'unmute'"), 0)
+
+    def test_unassigning_another_test_leaves_the_rest(self) -> None:
+        self._seed()
+        self._mute(["f_new1"])
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "f_new2", "alice", "bob", self.NOW)
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "f_new2", None, "bob", self.NOW)
+        self.assertEqual(self._count("test_mutes"), 1)
+
+    # -- clearing -----------------------------------------------------
+
+    def test_clear_keeps_the_assignment_and_is_idempotent(self) -> None:
+        self._seed()
+        self._mute_some()
+        keys = [self._key("f_new1")]
+        self.assertEqual(
+            self.store.unmute_tests(keys, "carol", self.NOW), 1)
+        self.assertIsNone(self.store.mute_for(
+            1, self.ENV, self.SCRIPT, "f_new1"))
+        self.assertEqual(
+            self.store.current_assignee(self.ENV, self.SCRIPT, "f_new1"),
+            "alice")
+        history = self.store.mute_history(
+            self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual(
+            [(h.action, h.actor, h.reason) for h in history],
+            [("unmute", "carol", None), ("mute", "bob", "known issue")])
+        self.assertEqual(
+            self.store.unmute_tests(keys, "carol", self.NOW), 0)
+        self.assertEqual(len(self.store.mute_history(
+            self.ENV, self.SCRIPT, "f_new1")), 2)
+        # Cleared, so the failure is back in its queue; the other stays.
+        counts = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(
+            (counts["muted"], counts["new_failures"]), (1, 2))
+
+    def test_clear_names_a_stream(self) -> None:
+        sid = self._two_streams()
+        removed = self.store.unmute_tests(
+            [self._key("x", sid)], "carol", self.NOW)
+        self.assertEqual(removed, 1)
+        self.assertIsNotNone(self.store.mute_for(
+            1, self.ENV, self.SCRIPT, "x"))
+        self.assertIsNone(self.store.mute_for(
+            sid, self.ENV, self.SCRIPT, "x"))
+
+    # -- expiring -----------------------------------------------------
+
+    def test_expiring_mutes(self) -> None:
+        self._seed()
+        day = datetime.timedelta(days=1)
+        hours = datetime.timedelta(hours=2)
+        # Expires in 2 hours.
+        self._mute(["f_new1"], hours=72, when=self.NOW - 3 * day + hours)
+        # Expired yesterday.
+        self._mute(["f_new2"], hours=24, when=self.NOW - 2 * day, assignee="eve")
+        # Expires in 3 days.
+        self._mute(["f_still1"], hours=72)
+        # Would be in the window, but the test passes now.
+        self._mute(["p1"], hours=72, when=self.NOW - 3 * day + hours)
+        expiring = self.store.expiring_mutes(self.NOW, 1 * day)
+        self.assertEqual(
+            [e.mute.test_name for e in expiring],
+            ["f_new2", "f_new1"])
+        first = expiring[0]
+        self.assertEqual(
+            (first.stream_kind, first.stream_name, first.result,
+             first.assignee),
+            ("mainline", "", Result.FAIL, "eve"))
+        self.assertEqual(
+            first.mute.expires_at, self.NOW - day)
+        self.assertEqual(expiring[1].assignee, "alice")
+
+    def test_expiring_filters_by_stream_and_carries_the_build(self) -> None:
+        self._seed()
+        self.store.upsert_runs([
+            make_record(test_name="f_new1", result=Result.FAIL,
+                        build="b1")])
+        sid = self._build_id("b1")
+        self._mute(["f_new1"], hours=24)
+        self._mute(["f_new1"], hours=24, sid=sid)
+        within = datetime.timedelta(days=2)
+        both = self.store.expiring_mutes(self.NOW, within)
+        self.assertEqual(sorted(e.mute.stream_id for e in both),
+                         [1, sid])
+        only = self.store.expiring_mutes(
+            self.NOW, within, stream_id=sid)
+        self.assertEqual(len(only), 1)
+        self.assertEqual(
+            (only[0].stream_kind, only[0].stream_name), ("build", "b1"))
+
+    def test_expiring_leaves_out_a_retired_test(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], hours=24)
+        self.store.set_retired(
+            self.ENV, self.SCRIPT, "f_new1", True, "alice", "gone", CREATED)
+        self.assertEqual(self.store.expiring_mutes(
+            self.NOW, datetime.timedelta(days=2)), [])
+
+    # -- the memo: a repeat read is free -------------------------------
+
+    def _statements(self, call: Callable[[], Any]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            call()
+        finally:
+            conn.set_trace_callback(None)
+        return seen
+
+    def _mute_cell_keys(self) -> List[Tuple[Any, ...]]:
+        return sorted(
+            key for key in self.store._summary_cache
+            if key[0] == "mute_cells")
+
+    def test_a_repeat_muted_cells_read_is_a_memo_hit(self) -> None:
+        self._seed()
+        self._mute_some()
+        first = self._cells()
+        self.assertEqual(sum(c.count for c in first), 2)
+        self.assertEqual(self._statements(self._cells), [])
+        self.assertEqual(self._cells(), first)
+        # A scoped read is a filter of the same entries.
+        self.assertEqual(
+            self._statements(lambda: self.store.muted_cells(
+                self.NOW, self.CUTOFF, environment=self.ENV)), [])
+        self.assertEqual(
+            self.store.muted_cells(
+                self.NOW, self.CUTOFF, environment="elsewhere"), [])
+        self.assertEqual(
+            self.store.muted_cells(
+                self.NOW, self.CUTOFF, environments=[]), [])
+
+    def test_a_stream_with_no_mutes_costs_nothing_once_known(
+        self,
+    ) -> None:
+        self._seed()
+        sid = storage.MAINLINE_STREAM_ID
+        self.assertEqual(self._cells(), [])
+        self.assertIsNone(self.store.mute_epoch(sid, self.NOW))
+        for call in (
+                self._cells,
+                lambda: self.store.mute_epoch(sid, self.NOW),
+                lambda: self.store.muted_cells(
+                    self.NOW + datetime.timedelta(days=30), self.CUTOFF)):
+            self.assertEqual(self._statements(call), [])
+
+    def test_the_epoch_read_is_a_memo_hit_and_never_serves_a_past_clock(
+        self,
+    ) -> None:
+        self._seed()
+        sid = storage.MAINLINE_STREAM_ID
+        self._mute(["f_new1"], hours=48)
+        expected = model.format_iso(self.NOW + datetime.timedelta(days=2))
+        self.assertEqual(
+            self.store.mute_epoch(sid, self.NOW), expected)
+        later = self.NOW + datetime.timedelta(days=1)
+        self.assertEqual(self._statements(
+            lambda: self.store.mute_epoch(sid, later)), [])
+        # Past the epoch: recomputed, and now there is none.
+        past = self.NOW + datetime.timedelta(days=2, seconds=1)
+        self.assertEqual(self._statements(
+            lambda: self.assertIsNone(
+                self.store.mute_epoch(sid, past))) != [], True)
+        # An EARLIER clock than the one the memo holds is not served
+        # the memo (it would say None while the row was still live).
+        self.assertEqual(
+            self.store.mute_epoch(sid, self.NOW), expected)
+
+    def test_passing_the_epoch_recomputes_the_cells(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], hours=48)
+        self._mute(["f_still1"], hours=120)
+        self.assertEqual(sum(c.count for c in self._cells()), 2)
+        mid = self.NOW + datetime.timedelta(days=3)
+        self.assertEqual(self._statements(lambda: self._cells(mid)) != [],
+                         True)
+        self.assertEqual(sum(c.count for c in self._cells(mid)), 1)
+        self.assertEqual(self._statements(lambda: self._cells(mid)), [])
+        end = self.NOW + datetime.timedelta(days=6)
+        self.assertEqual(self._cells(end), [])
+        # And back: a clock before the epoch the memo now holds.
+        self.assertEqual(sum(c.count for c in self._cells()), 2)
+
+    def test_every_mute_write_invalidates_the_cells(self) -> None:
+        self._seed()
+        total = lambda: sum(c.count for c in self._cells())  # noqa: E731
+        self._mute(["f_new1"])
+        self.assertEqual(total(), 1)
+        self._mute(["f_still1"])                       # mute
+        self.assertEqual(total(), 2)
+        self._mute(["f_still1"], hours=168)               # extend
+        self.assertEqual(total(), 2)
+        self.assertEqual(
+            self.store.mute_epoch(1, self.NOW),
+            model.format_iso(self.NOW + datetime.timedelta(days=3)))
+        self.store.unmute_tests(
+            [self._key("f_new1")], "carol", self.NOW)  # clear
+        self.assertEqual(total(), 1)
+        self.assertEqual(
+            self.store.mute_epoch(1, self.NOW),
+            model.format_iso(self.NOW + datetime.timedelta(days=7)))
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "f_still1", None, "bob",
+            self.NOW)                                  # unassign
+        self.assertEqual(total(), 0)
+        self.assertIsNone(self.store.mute_epoch(1, self.NOW))
+
+    def test_a_push_into_one_environment_drops_only_its_cells(self) -> None:
+        later = BASE + datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(environment=env, test_name=name,
+                        result=Result.FAIL, start=later)
+            for env in ("env-x", "env-y") for name in ("a", "b")])
+        self.store.mute_tests(
+            [("env-x", self.SCRIPT, "a", 1), ("env-y", self.SCRIPT, "a", 1)],
+            "why", 72, "alice", "bob", self.NOW)
+        cells = self._cells()
+        self.assertEqual(sum(c.count for c in cells), 2)
+        self.assertEqual(
+            [key[2] for key in self._mute_cell_keys()], ["env-x", "env-y"])
+        # env-x's muted test now passes (still muted, but its cell is
+        # different): a push into env-x only.
+        self.store.upsert_runs([
+            make_record(environment="env-x", test_name="a",
+                        result=Result.PASS,
+                        start=later + datetime.timedelta(hours=1))])
+        self.assertEqual(
+            [key[2] for key in self._mute_cell_keys()], ["env-y"])
+        again = self._cells()
+        self.assertEqual(
+            [(c.environment, c.result, c.count) for c in again],
+            [("env-x", Result.PASS, 1), ("env-y", Result.FAIL, 1)])
+        self.assertEqual(
+            [key[2] for key in self._mute_cell_keys()], ["env-x", "env-y"])
+        self.assertEqual(self._statements(self._cells), [])
+
+    # -- environment delete -------------------------------------------
+
+    def test_deleting_an_environment_takes_its_mutes(self) -> None:
+        for environment in (self.ENV, "UNKNOWN"):
+            self.store.upsert_runs([
+                make_record(environment=environment, test_name="f",
+                            result=Result.FAIL)])
+        self.store.mute_tests(
+            [self._key("f"), self._key("f", env="UNKNOWN")],
+            "why", 48, "alice", "bob", self.NOW)
+        self.store.delete_environment("UNKNOWN")
+        self.assertEqual(
+            self._count("test_mutes", "environment = ?",
+                        ["UNKNOWN"]), 0)
+        self.assertEqual(
+            self._count("mute_history", "environment = ?",
+                        ["UNKNOWN"]), 0)
+        self.assertEqual(
+            self._count("test_mutes", "environment = ?",
+                        [self.ENV]), 1)
+        self.assertEqual(
+            self._count("mute_history", "environment = ?",
+                        [self.ENV]), 1)

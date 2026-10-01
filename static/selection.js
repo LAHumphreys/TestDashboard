@@ -49,6 +49,7 @@
 import {
   clearNode,
   el,
+  muteDurationSelect,
   postJson,
   rememberUser,
   requireUsername,
@@ -56,7 +57,7 @@ import {
   userPickerSelect,
 } from "./api.js";
 import { entryKey } from "./review.js";
-import { apiUrl } from "./urls.js";
+import { apiUrl, bulkMutesUrl, unmuteUrl } from "./urls.js";
 
 /**
  * The bulk endpoint's URL, EVERY scope level explicitly cleared.
@@ -105,6 +106,9 @@ let noteInputEl = null;
 let assignBtnEl = null;
 let unassignBtnEl = null;
 let commentBtnEl = null;
+let muteDurationEl = null;
+let muteBtnEl = null;
+let unmuteBtnEl = null;
 
 function selectionEntries() {
   return Array.from(selected.values());
@@ -185,6 +189,22 @@ function updateCommentButtonState() {
   }
   commentBtnEl.disabled =
     noteInputEl.value.trim() === "" || selected.size === 0;
+  updateMuteButtonState();
+}
+
+/** Mute needs all three: an owner (the "Assign to" box), a reason (the
+ * note box -- also posted as the comment) and a duration. Gated here
+ * so the button cannot be clicked into a server-side 400. Called from
+ * the comment updater, which the picker's and the note's own listeners
+ * both reach, and from the duration select's own change. */
+function updateMuteButtonState() {
+  if (!muteBtnEl) {
+    return;
+  }
+  muteBtnEl.disabled = selected.size === 0
+    || !userSelectEl.value
+    || noteInputEl.value.trim() === ""
+    || !muteDurationEl.value;
 }
 
 /**
@@ -218,6 +238,47 @@ async function doComment() {
     showError(err.message);
   } finally {
     updateCommentButtonState();
+  }
+}
+
+/**
+ * Mute every selected failure (WP-40): not counted as failing for the
+ * chosen time (12 hours to 7 days), owned by someone. The owner is the
+ * "Assign to" box, the reason is the note box -- the same two fields
+ * Assign uses, so there is one place to type each -- and the duration
+ * is the select beside the button. All three are required (the button
+ * stays disabled until they are set), and the reason is also posted as
+ * a comment on each test, exactly as Assign-with-a-note does.
+ */
+async function doMute() {
+  const me = requireUsername();
+  if (!me) {
+    showError(
+      "Set a username first (the “Change” button, top right) "
+      + "— mutes are recorded against a name.");
+    return;
+  }
+  const owner = userSelectEl.value;
+  const reason = noteInputEl.value.trim();
+  const hours = Number(muteDurationEl.value);
+  if (!owner || !reason || !hours || selected.size === 0) {
+    return;
+  }
+  muteBtnEl.disabled = true;
+  try {
+    await postJson(bulkMutesUrl(), {
+      username: me, reason: reason, hours: hours, assignee: owner,
+      tests: testsPayload(),
+    });
+    rememberUser(owner);
+    noteInputEl.value = "";
+    muteDurationEl.value = "";
+    clearSelection();
+    notifyChanged();
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    updateAssignButtonState();
   }
 }
 
@@ -283,6 +344,35 @@ async function doUnassign() {
   }
 }
 
+/**
+ * Unmute every selected test (WP-40). Needs only a selection: the
+ * server removes the mutes that exist and leaves the rest alone, so a
+ * mixed selection is fine, and nothing else about the tests changes
+ * (they stay assigned). Mirrors doUnassign.
+ */
+async function doUnmute() {
+  const me = requireUsername();
+  if (!me) {
+    showError(
+      "Set a username first (the “Change” button, top right) "
+      + "— this is recorded against your name.");
+    return;
+  }
+  if (selected.size === 0) {
+    return;
+  }
+  unmuteBtnEl.disabled = true;
+  try {
+    await postJson(unmuteUrl(), { username: me, tests: testsPayload() });
+    clearSelection();
+    notifyChanged();
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    unmuteBtnEl.disabled = selected.size === 0;
+  }
+}
+
 function ensureBar() {
   if (barEl) {
     return;
@@ -331,6 +421,36 @@ function ensureBar() {
   commentBtnEl.addEventListener("click", doComment);
   barEl.appendChild(commentBtnEl);
 
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
+  muteDurationEl = muteDurationSelect("selection-duration-select");
+  muteDurationEl.addEventListener("change", updateMuteButtonState);
+  barEl.appendChild(document.createTextNode("Mute "));
+  barEl.appendChild(muteDurationEl);
+
+  muteBtnEl = el("button", "selection-mute-btn", "Mute");
+  muteBtnEl.type = "button";
+  muteBtnEl.disabled = true;
+  muteBtnEl.title = "Stop counting the selected failures as failing for "
+    + "the time chosen. Needs an owner (“Assign to”), a reason "
+    + "(the note box) and a duration. The reason is also posted as a "
+    + "comment; the tests are assigned to the owner.";
+  muteBtnEl.addEventListener("click", doMute);
+  barEl.appendChild(muteBtnEl);
+
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
+  unmuteBtnEl = el("button", "selection-unmute-btn", "Unmute");
+  unmuteBtnEl.type = "button";
+  unmuteBtnEl.disabled = true;
+  unmuteBtnEl.title = "Stop muting the selected tests; their failures "
+    + "count as failing again. They stay assigned. Rows that were not "
+    + "muted are left alone.";
+  unmuteBtnEl.addEventListener("click", doUnmute);
+  barEl.appendChild(unmuteBtnEl);
+
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
   const clearBtn = el("button", "selection-clear-btn", "Clear selection");
   clearBtn.type = "button";
   clearBtn.addEventListener("click", clearSelection);
@@ -355,6 +475,7 @@ function renderBar() {
   countEl.textContent = count.toLocaleString();
   updateAssignButtonState();
   unassignBtnEl.disabled = false;
+  unmuteBtnEl.disabled = false;
 }
 
 /**

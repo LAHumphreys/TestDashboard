@@ -23,19 +23,28 @@
 "use strict";
 
 import {
+  muteDetail,
+  muteDurationSelect,
   assigneeSelect,
   clearNode,
   el,
   fetchJson,
   fillOutput,
+  getUsername,
   runStrip,
   postJson,
+  preselectUser,
   putJson,
   requireUsername,
   showError,
   testApiPath,
+  userPickerSelect,
 } from "./api.js";
-import { pageUrl } from "./urls.js";
+import {
+  bulkMutesUrl,
+  unmuteUrl,
+  pageUrl,
+} from "./urls.js";
 
 /*
  * Which panels are open, keyed by test identity.
@@ -183,6 +192,155 @@ async function buildReviewPanel(entry, container, opts) {
   }
 }
 
+/** This one test, in the shape the mute endpoints take. */
+function muteTests(entry) {
+  const test = {
+    environment: entry.environment, script: entry.script,
+    test_name: entry.test_name,
+  };
+  if (entry.stream_id) {
+    test.stream_id = entry.stream_id;
+  }
+  return [test];
+}
+
+/**
+ * The Mute group (WP-40), for a FAILING test or one with a live mute:
+ * muting is a statement about a failure. Already muted -> who, until
+ * when, why, with a duration (7 days preselected), "Extend" and
+ * "Unmute"; otherwise a reason, a duration and an owner. Durations come
+ * from api.js's muteDurationSelect(), in hours. Everything arrives via
+ * entry/opts.
+ */
+function buildMuteGroup(entry, opts) {
+  const group = el("div", "review-group review-group-wide");
+  group.appendChild(el("label", "review-label", "Mute"));
+  const done = () => {
+    if (opts.onMuted) {
+      opts.onMuted();
+    } else if (opts.onChanged) {
+      opts.onChanged();
+    }
+  };
+  const needUser = () => {
+    const me = requireUsername();
+    if (!me) {
+      showError(
+        "Set a username first (the “Change” button, top right) "
+        + "— mutes are recorded against a name.");
+    }
+    return me;
+  };
+  const mute = entry.mute;
+  if (mute && mute.live) {
+    group.appendChild(el("span", "mute-line",
+      "Muted " + muteDetail(mute, true)));
+    const extendFor = muteDurationSelect("review-duration-select", 168);
+    const extend = el("button", "", "Extend");
+    extend.type = "button";
+    const unmute = el("button", "", "Unmute");
+    unmute.type = "button";
+    unmute.title = "Stop muting this failure; it counts as "
+      + "failing again. It stays assigned.";
+    extend.addEventListener("click", async () => {
+      const me = needUser();
+      if (!me) {
+        return;
+      }
+      const hours = Number(extendFor.value);
+      if (!hours) {
+        extendFor.focus();
+        showError("Choose how long to extend the mute for.");
+        return;
+      }
+      extend.disabled = true;
+      unmute.disabled = true;
+      try {
+        await postJson(bulkMutesUrl(), {
+          username: me, hours: hours, assignee: entry.assignee || me,
+          tests: muteTests(entry),
+        });
+        done();
+      } catch (err) {
+        showError(err.message);
+        extend.disabled = false;
+        unmute.disabled = false;
+      }
+    });
+    unmute.addEventListener("click", async () => {
+      const me = needUser();
+      if (!me) {
+        return;
+      }
+      extend.disabled = true;
+      unmute.disabled = true;
+      try {
+        await postJson(unmuteUrl(), {
+          username: me, tests: muteTests(entry),
+        });
+        done();
+      } catch (err) {
+        showError(err.message);
+        extend.disabled = false;
+        unmute.disabled = false;
+      }
+    });
+    group.appendChild(extendFor);
+    group.appendChild(extend);
+    group.appendChild(unmute);
+    return group;
+  }
+
+  const reason = document.createElement("input");
+  reason.type = "text";
+  reason.className = "review-input";
+  reason.placeholder = "Why is this failure muted? (required)";
+  const duration = muteDurationSelect("review-duration-select");
+  const owner = userPickerSelect("review-owner-select");
+  owner.title = "Who owns this failure while it is muted";
+  preselectUser(owner, entry.assignee || getUsername());
+  const go = el("button", "", "Mute");
+  go.type = "button";
+  go.title = "Stop counting this failure as failing for the time chosen "
+    + "(up to 7 days). It is assigned to the owner chosen, listed as "
+    + "muted, and your reason is posted as a comment.";
+  go.addEventListener("click", async () => {
+    const me = needUser();
+    if (!me) {
+      return;
+    }
+    const text = reason.value.trim();
+    if (!text) {
+      reason.focus();
+      showError("Say why this failure is muted — the reason is "
+        + "kept with it.");
+      return;
+    }
+    const hours = Number(duration.value);
+    if (!hours) {
+      duration.focus();
+      showError("Choose how long to mute this failure for.");
+      return;
+    }
+    go.disabled = true;
+    try {
+      await postJson(bulkMutesUrl(), {
+        username: me, reason: text, hours: hours,
+        assignee: owner.value || me, tests: muteTests(entry),
+      });
+      done();
+    } catch (err) {
+      showError(err.message);
+      go.disabled = false;
+    }
+  });
+  group.appendChild(reason);
+  group.appendChild(duration);
+  group.appendChild(owner);
+  group.appendChild(go);
+  return group;
+}
+
 function buildReviewActions(entry, opts) {
   const actions = el("div", "review-actions");
   const changed = opts.onChanged || (() => {});
@@ -273,6 +431,13 @@ function buildReviewActions(entry, opts) {
   commentGroup.appendChild(input);
   commentGroup.appendChild(post);
   actions.appendChild(commentGroup);
+
+  /* --- mute: a failing test, or any test whose mute is still live
+     (the Muted tab lists passing ones too, and they need Extend and
+     Unmute) --- */
+  if (entry.result === "FAIL" || (entry.mute && entry.mute.live)) {
+    actions.appendChild(buildMuteGroup(entry, opts));
+  }
 
   /* --- retire: only offered where it makes sense --- */
   // Offered for any test that has stopped reporting, wherever it is

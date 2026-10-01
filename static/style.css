@@ -660,6 +660,17 @@ button.bar-row:focus-visible {
 
 .fill-fail { background: var(--c-fail); }
 
+/* WP-40: the muted failures, as a grey extension of a failing bar. The
+   track becomes a flex row only when there is one, so every other bar
+   chart is untouched; the 2px gap is the chart rules' surface gap. */
+.bar-track-split { display: flex; gap: 2px; }
+
+.bar-track-split .bar-fill { flex: none; }
+
+.bar-fill-open { border-radius: 0; }
+
+.bar-muted { background: var(--muted); opacity: 0.55; }
+
 .bar-value {
   font-size: 12px;
   font-weight: 600;
@@ -941,6 +952,53 @@ button.bar-row:focus-visible {
 }
 
 .kf-reason { font-size: 13px; color: var(--ink); }
+
+/* Muted tests (WP-40): the same annotation shape as a known
+ * failure, in the "owned, time-boxed" accent so the two never read as
+ * one thing. */
+.known-failure.is-muted {
+  flex-wrap: wrap;
+  border-color: var(--grid);
+  border-left-color: #b8860b;
+}
+
+.mute-reason-input {
+  flex: 1 1 220px;
+  min-width: 160px;
+}
+
+.review-duration-select,
+.selection-duration-select {
+  font: inherit;
+  padding: 4px 6px;
+}
+
+.mute-line {
+  font-size: 13px;
+  margin-right: 8px;
+}
+
+/* A small pill beside a result chip: this failure is muted. */
+.mute-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--grid);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* A mute that has run out while the test still fails. */
+.mute-expired {
+  color: var(--c-fail);
+  font-weight: 600;
+}
+
+#expiring-section .section-head select {
+  margin-left: auto;
+}
 
 /* ---------------- inline assignment ---------------- */
 
@@ -2119,6 +2177,13 @@ a.watch-hero-value { text-decoration: underline; }
 
 .watch-stat-label { font-size: 11px; color: var(--muted); }
 
+/* "(+3 muted)" beside a failing figure (WP-40). */
+.watch-stat-muted {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
 /* A stream card's "N failing in <name>" headline, between the hero
    and the supporting stats. */
 .watch-card-headline {
@@ -2370,6 +2435,8 @@ body.has-selection-bar { padding-bottom: 60px; }
 
 .selection-assign-btn:disabled,
 .selection-comment-btn:disabled,
+.selection-mute-btn:disabled,
+.selection-unmute-btn:disabled,
 .selection-unassign-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;

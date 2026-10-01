@@ -17,10 +17,12 @@ driver, neither of which the test harness has any reason to depend on
 for a dozen rows).
 
 This is what "the existing export/load path" produced for a real
-database at v7 — not a guess at what v7 "should" have looked like. If
-``tools/upgrade_mariadb_schema.py`` is ever extended past migration 10,
-this file stays frozen: it describes the *starting* point the tool
-upgrades FROM, which does not change.
+database at v7 — not a guess at what v7 "should" have looked like. As
+``tools/upgrade_mariadb_schema.py``'s ledger grows past migration 10,
+this file stays frozen: it describes the *starting* point the ledger
+upgrades FROM (``upgrade.CUTOVER_VERSION``), which does not change; a
+new step is exercised by upgrading this fixture through every step
+before it.
 
 Python 3.6 compatible; standard library only.
 """

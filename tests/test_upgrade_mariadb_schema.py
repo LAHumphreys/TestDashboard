@@ -1,20 +1,22 @@
 """tools/upgrade_mariadb_schema.py, against a real MariaDB server.
 
-**Why this file exists.** Production is a live MariaDB database at
-schema v7 with real data, and this tool is what makes it possible to
-bring it to v10 without a full SQLite export/load — the app itself
-refuses to serve a version mismatch in either direction
-(``testboard/mariadb.py``), so without this tool tomorrow's code simply
-does not start against prod.
+**Why this file exists.** Production is a live MariaDB database with
+real data, and this tool is what moves it to each newer schema version
+without a full SQLite export/load — the app itself refuses to serve a
+version mismatch in either direction (``testboard/mariadb.py``), so
+without the tool's step for a migration, the code that carries that
+migration simply does not start against prod. ``LedgerTest`` (server-
+free, runs on every suite run) is what makes a missing step fail
+before that: see its docstring.
 
 **Gated exactly like ``tests/backends.py``** — module-level, not a
 per-test skip: with ``TESTBOARD_TEST_DB_CNF`` unset this file defines
-NOTHING beyond the version-pin test at the bottom (which needs no
-server), so the collected count does not move and no skip noise
-appears. Point it at your OWN sacrificial database, not the shared one
-``tests/backends.py`` uses — this file builds a schema from scratch
-(v7, then upgrades it) and would otherwise race or collide with every
-other dual-backend test class sharing that database.
+NOTHING beyond ``LedgerTest`` (which needs no server), so the collected
+count does not move and no skip noise appears. Point it at your OWN
+sacrificial database, not the shared one ``tests/backends.py`` uses —
+this file builds a schema from scratch (v7, then upgrades it through
+EVERY step of the ledger) and would otherwise race or collide with
+every other dual-backend test class sharing that database.
 
 **The v7 fixture is derived, not hand-written, in two separate senses
 that meet in the middle:**
@@ -75,19 +77,164 @@ SIZES = v7.Sizes(64, 255, 255)
 _SUFFIX = "_schema_upgrade_test"
 
 
-class TargetVersionPinTest(unittest.TestCase):
-    """Needs no server: fails loudly the day migration 11 ships without
-    this tool being extended to match. See the module docstring of
-    tools/upgrade_mariadb_schema.py."""
+class LedgerTest(unittest.TestCase):
+    """Needs no server: the MariaDB half of every migration exists.
 
-    def test_target_matches_the_latest_migration(self) -> None:
+    WP-40 (2026-10-01). Before this, a single pin compared the tool's
+    hard-coded target with ``MIGRATIONS[-1][0]`` and failed with
+    "extend the tool" — true, but it named no shape to extend into,
+    and the tool's own docstring called itself a one-off. Now the
+    tool is a ledger (``upgrade.LEDGER``) and ``upgrade.ledger_gaps``
+    is the whole rule: every SQLite migration above the cutover has a
+    step, the steps are contiguous, each declares what it creates, and
+    the declaration matches its own DDL. A migration written for
+    SQLite without its MariaDB step fails HERE, on the developer's
+    machine, on the same commit — not at deployment, when
+    ``testboard/mariadb.py`` refuses to start against the version gap.
+    """
+
+    def _versions(self) -> List[int]:
+        return [version for version, _ in MIGRATIONS]
+
+    def test_the_ledger_matches_the_sqlite_migrations(self) -> None:
+        self.assertEqual(upgrade.ledger_gaps(self._versions()), [])
+
+    def test_target_is_derived_and_matches_the_latest_migration(
+            self) -> None:
+        self.assertEqual(upgrade.TARGET_VERSION, MIGRATIONS[-1][0])
         self.assertEqual(
-            upgrade.TARGET_VERSION, MIGRATIONS[-1][0],
-            "storage.MIGRATIONS has grown past what "
-            "tools/upgrade_mariadb_schema.py knows how to reach. Add a "
-            "new step_N_to_M() mirroring the new SQLite migration, "
-            "extend upgrade.plan()/EXPECTED_FROM_VERSIONS/_MARKERS, and "
-            "raise TARGET_VERSION to match before this can pass again.")
+            upgrade.EXPECTED_FROM_VERSIONS,
+            tuple(range(upgrade.CUTOVER_VERSION, upgrade.TARGET_VERSION)))
+
+    def test_plan_ends_every_step_with_its_version_bump(self) -> None:
+        """The consistency check's whole premise: the bump is the LAST
+        statement of a step, appended by plan(), never by a step."""
+        steps = upgrade.plan(exporter.Sizes(64, 255, 255),
+                             "2026-01-01T00:00:00.000000")
+        self.assertEqual([v for v, _ in steps],
+                         list(upgrade.EXPECTED_FROM_VERSIONS))
+        for from_version, statements in steps:
+            self.assertEqual(
+                statements[-1],
+                "UPDATE schema_version SET version = {0}".format(
+                    from_version + 1))
+            self.assertEqual(
+                [s for s in statements[:-1]
+                 if s.lower().startswith("update schema_version")], [])
+
+    def test_whether_the_server_must_stop_is_read_from_the_ledger(
+            self) -> None:
+        """Runbook §G.3: the feeders are never stopped (a dozen servers;
+        their contract defers a push that meets a stopped server), and
+        the SERVER stops only for a step that rewrites an existing
+        table. The dry run's advice comes from the steps' own
+        declarations, so a creates-only step says "may keep running"
+        and the streams steps say "stop it first", naming the tables."""
+        self.assertEqual(upgrade.rewritten_tables([]), [])
+        creates_only = upgrade.Step(
+            from_version=upgrade.TARGET_VERSION, package="planted",
+            summary="planted",
+            statements=lambda sizes, now: ["CREATE TABLE planted (x INT)"],
+            probes=(upgrade.Probe("planted table", "planted", None),),
+            alters=())
+        self.assertEqual(upgrade.rewritten_tables([creates_only]), [])
+        streams = [s for s in upgrade.LEDGER if s.from_version == 8][0]
+        self.assertIn((9, "latest_runs"),
+                      upgrade.rewritten_tables([streams]))
+        self.assertIn((9, "runs"), upgrade.rewritten_tables([streams]))
+
+    def test_row_count_tables_are_the_altered_ones_runs_first(
+            self) -> None:
+        self.assertEqual(upgrade._ROW_COUNT_TABLES[0], "runs")
+        altered = {t for step in upgrade.LEDGER for t in step.alters}
+        self.assertEqual(set(upgrade._ROW_COUNT_TABLES), altered | {"runs"})
+
+    # -- planted regressions: the guard can actually fail ----------------
+
+    def test_a_migration_without_a_step_is_named(self) -> None:
+        missing = upgrade.TARGET_VERSION + 1
+        problems = upgrade.ledger_gaps(self._versions() + [missing])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("migration {0}".format(missing), problems[0])
+        self.assertIn("no step from {0} to {1}".format(
+            missing - 1, missing), problems[0])
+
+    def test_a_step_without_a_migration_is_named(self) -> None:
+        extra = upgrade.Step(
+            from_version=upgrade.TARGET_VERSION, package="planted",
+            summary="planted",
+            statements=lambda sizes, now: ["CREATE TABLE planted (x INT)"],
+            probes=(upgrade.Probe("planted table", "planted", None),),
+            alters=())
+        problems = upgrade.ledger_gaps(
+            self._versions(), ledger=upgrade.LEDGER + (extra,))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("no migration {0}".format(
+            upgrade.TARGET_VERSION + 1), problems[0])
+
+    def test_a_gap_in_the_steps_is_named(self) -> None:
+        problems = upgrade.ledger_gaps(
+            self._versions(), ledger=upgrade.LEDGER[1:])
+        self.assertTrue(
+            any("no step from 7 to 8" in p for p in problems), problems)
+        self.assertTrue(
+            any("not contiguous" in p for p in problems), problems)
+
+    def test_a_probe_the_ddl_does_not_mention_is_named(self) -> None:
+        last = upgrade.LEDGER[-1]
+        broken = last._replace(probes=last.probes + (
+            upgrade.Probe("phantom.column column", "phantom", "column"),))
+        problems = upgrade.ledger_gaps(
+            self._versions(), ledger=upgrade.LEDGER[:-1] + (broken,))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("never mention table phantom", problems[0])
+
+    def test_a_step_with_no_probe_is_named(self) -> None:
+        last = upgrade.LEDGER[-1]
+        problems = upgrade.ledger_gaps(
+            self._versions(),
+            ledger=upgrade.LEDGER[:-1] + (last._replace(probes=()),))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("declares no probe", problems[0])
+
+    def test_a_step_that_bumps_the_version_itself_is_named(self) -> None:
+        last = upgrade.LEDGER[-1]
+        original = last.statements
+        broken = last._replace(statements=lambda sizes, now: (
+            original(sizes, now)
+            + ["UPDATE schema_version SET version = 99"]))
+        problems = upgrade.ledger_gaps(
+            self._versions(), ledger=upgrade.LEDGER[:-1] + (broken,))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("bumps schema_version itself", problems[0])
+
+    def test_the_tool_refuses_to_run_a_ledger_with_gaps(self) -> None:
+        """cmd_upgrade/cmd_verify self-check before connecting, so a
+        checkout nobody ran the suite on still cannot half-upgrade."""
+        import contextlib
+        original = upgrade.LEDGER
+        upgrade.LEDGER = original[:-1]
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = upgrade.cmd_upgrade(_args(config="unused.cnf"))
+            self.assertEqual(code, upgrade.EXIT_GATE_FAILED)
+            self.assertIn("ledger does not match", buf.getvalue())
+            self.assertIn("no step from {0} to {1}".format(
+                upgrade.TARGET_VERSION - 1, upgrade.TARGET_VERSION),
+                buf.getvalue())
+        finally:
+            upgrade.LEDGER = original
+
+
+def _args(**kwargs: Any) -> Any:
+    class _NS(object):
+        pass
+    ns = _NS()
+    ns.dry_run = False
+    for key, value in kwargs.items():
+        setattr(ns, key, value)
+    return ns
 
 
 if backends.MARIADB_AVAILABLE:
@@ -393,7 +540,8 @@ if backends.MARIADB_AVAILABLE:
             return path
 
     class FullUpgradeTest(UpgradeTestBase):
-        """The whole 7 -> 10 path, then a functional smoke test."""
+        """The whole path from the cutover version to the latest, then
+        a functional smoke test."""
 
         def test_dry_run_changes_nothing(self) -> None:
             args = _ns(config=self._cnf_path(), dry_run=True)
@@ -408,7 +556,8 @@ if backends.MARIADB_AVAILABLE:
             finally:
                 db.close()
 
-        def test_upgrade_reaches_v10_and_verifies_clean(self) -> None:
+        def test_upgrade_reaches_the_latest_version_and_verifies_clean(
+                self) -> None:
             before = _table_counts(self.settings)
             args = _ns(config=self._cnf_path(), dry_run=False)
             code = upgrade.cmd_upgrade(args)
@@ -416,8 +565,10 @@ if backends.MARIADB_AVAILABLE:
 
             db = migrate.connect(self.settings)
             try:
-                self.assertEqual(upgrade.current_version(db), 10)
-                self.assertEqual(upgrade.consistency_check(db, 10), [])
+                self.assertEqual(upgrade.current_version(db),
+                                 MIGRATIONS[-1][0])
+                self.assertEqual(
+                    upgrade.consistency_check(db, MIGRATIONS[-1][0]), [])
             finally:
                 db.close()
 
@@ -457,7 +608,8 @@ if backends.MARIADB_AVAILABLE:
             dual-backend suite: that suite already runs, in CI, against
             a schema this SAME exporter DDL produces (tests/backends.py
             uses the identical tools.export_for_mariadb.ddl()), and
-            test_upgrade_reaches_v10_and_verifies_clean above proves
+            test_upgrade_reaches_the_latest_version_and_verifies_clean
+            above proves
             the upgraded schema is structurally identical to that. This
             test's job is the part that proof does not cover: real
             writes through real Storage code, on the actual upgraded
@@ -498,11 +650,12 @@ if backends.MARIADB_AVAILABLE:
     class RefusalTest(UpgradeTestBase):
         """Every way a live run must stop rather than guess."""
 
-        def test_refuses_v6(self) -> None:
+        def test_refuses_a_version_below_the_cutover(self) -> None:
             db = migrate.connect(self.settings)
             try:
                 migrate.execute(
-                    db, "UPDATE schema_version SET version = 6")
+                    db, "UPDATE schema_version SET version = {0}".format(
+                        upgrade.CUTOVER_VERSION - 1))
             finally:
                 db.close()
             code, output = _run_capturing(
@@ -511,9 +664,26 @@ if backends.MARIADB_AVAILABLE:
             self.assertEqual(code, upgrade.EXIT_GATE_FAILED)
             self.assertIn("only resumes from", output)
 
-        def test_refuses_already_v10(self) -> None:
+        def test_refuses_a_version_above_the_target(self) -> None:
+            """Newer code wrote this database; the answer is to deploy
+            that code, and the refusal says so."""
+            db = migrate.connect(self.settings)
+            try:
+                migrate.execute(
+                    db, "UPDATE schema_version SET version = {0}".format(
+                        upgrade.TARGET_VERSION + 1))
+            finally:
+                db.close()
+            code, output = _run_capturing(
+                upgrade.cmd_upgrade,
+                _ns(config=self._cnf_path(), dry_run=False))
+            self.assertEqual(code, upgrade.EXIT_GATE_FAILED)
+            self.assertIn("NEWER code", output)
+
+        def test_refuses_already_at_the_target(self) -> None:
             # Reuse the SAME exporter DDL tests/backends.py uses: a
-            # fresh v10 schema is the state this refusal must recognise.
+            # fresh schema at the latest version is the state this
+            # refusal must recognise.
             _recreate_database()
             db = migrate.connect(self.settings)
             try:
@@ -525,14 +695,15 @@ if backends.MARIADB_AVAILABLE:
                     migrate.execute(db, statement)
                 migrate.execute(
                     db, "INSERT INTO schema_version (version) "
-                        "VALUES (10)")
+                        "VALUES ({0})".format(upgrade.TARGET_VERSION))
             finally:
                 db.close()
             code, output = _run_capturing(
                 upgrade.cmd_upgrade,
                 _ns(config=self._cnf_path(), dry_run=False))
             self.assertEqual(code, upgrade.EXIT_GATE_FAILED)
-            self.assertIn("already at schema version 10", output)
+            self.assertIn("already at schema version {0}".format(
+                upgrade.TARGET_VERSION), output)
 
         def test_refuses_half_upgraded_state(self) -> None:
             """DDL autocommits and the version bump is the LAST
@@ -625,21 +796,21 @@ if backends.MARIADB_AVAILABLE:
             # The EXACT statement tools/upgrade_mariadb_schema.py's
             # step_8_to_9() emits for runs -- found by the same
             # predicate the tool itself uses to recognise it
-            # (upgrade._touches_runs_stream_id), not retyped by hand,
-            # so this test cannot silently drift from what a live
-            # upgrade actually runs.
+            # (upgrade._touches_runs), not retyped by hand, so this
+            # test cannot silently drift from what a live upgrade
+            # actually runs.
             now_iso = "2026-08-11T00:00:00.000000"
             runs_statement = None
             for statement in upgrade.step_8_to_9(now_iso):
-                if upgrade._touches_runs_stream_id(statement):
+                if upgrade._touches_runs(statement):
                     runs_statement = statement
                     break
             self.assertIsNotNone(
                 runs_statement,
                 "step_8_to_9() no longer emits a statement "
-                "upgrade._touches_runs_stream_id recognises -- this "
-                "test cannot find what to probe; fix the mismatch "
-                "before trusting either side")
+                "upgrade._touches_runs recognises -- this test cannot "
+                "find what to probe; fix the mismatch before trusting "
+                "either side")
 
             forced = runs_statement + ", ALGORITHM=INSTANT"
             db = migrate.connect(self.settings)

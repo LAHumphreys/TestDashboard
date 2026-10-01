@@ -3590,3 +3590,712 @@ build and this package** (the Metrics bullet and the "Faster"
 paragraph). Their wording was kept; one factual slip corrected in
 place, and told to them: the Metrics page does not read the
 `--perf-log`, it keeps its own counters in memory.
+
+## 2026-09-30 — the drop of 2026-09-30 is in production (admin only, branch `docs-handover-2026-09-30`)
+
+**Deployed the same day it was cut.** PR #13 squash-merged to `master` as
+`a6f59d2` at 06:15 UTC; the user deployed it during the day and reports
+"worked beautifully". No migration ran; schema stays at 10 on both
+backends. `whatsnew.html`'s heading and `data-drop-date` already read
+2026-09-30, so nothing was re-dated.
+
+**What that means for the record.** The squash merge means the six
+`drop-2026-09-30` commits are not ancestors of `master`; the branch is
+merged in content and can be deleted, but `git branch --merged` will not
+say so. PR #12 (`docs-handover-2026-09-29`) is now redundant: its one
+commit was carried inside the drop.
+
+**What is NOT known.** Whether `--workers` was raised from 8, whether
+the counters were left on (the recommendation) or the server started
+with `--no-metrics`, what the Metrics page's "Waited, mean" reads during
+a run, and whether the dodgy build's environment has been deleted. The
+operator note asked for all four; none has been reported back. They are
+the questions for the next session, not this entry's to answer. This is
+also the first drop for which production can measure itself — any
+figure quoted from the Metrics page from now on is the first production
+number this project has had.
+
+## 2026-09-30 (evening) — WP-39: an empty build no longer lingers in the Build picker (branch `drop-2026-10-01`)
+
+**Two answers to the previous entry's questions, from the user the same
+evening:** production now runs `--workers 16`; the dodgy environment
+has been deleted. Not yet reported: whether the counters were left on,
+and what "Waited, mean" reads during a run.
+
+**How it was asked for.** "The dodgy env was deleted, but it's now
+showing up as an orphaned empty build on the builds drop down which is
+kinda annoying. Point 1 for tonight's drop is to have something that
+auto prunes empty builds."
+
+**Cause, from the code.** `Storage.delete_environment` (the tool
+`tools/drop_environment.py` calls) deletes the environment's rows from
+every table in `_ENVIRONMENT_TABLES` — and `streams` is not keyed by
+environment, so the table-list guard that asks the schema could never
+have seen it. A build that had only ever run on the environment kept
+its `streams` row with no `latest_runs` partition behind it, and
+`list_streams` lists the table. WP-34's per-build delete
+(`delete_stream_environment`) has always settled the build's row
+through `_settle_stream_after_delete`; the environment tool predates
+streams and was never taught to. The retention prune cannot empty a
+build (it never deletes a test's newest run) and an import cannot
+(the row is created in the transaction that writes the first run), so
+this was the one path.
+
+**What was built.**
+
+1. `delete_environment` reads the affected builds from `latest_runs`
+   BEFORE deleting (one seek per build through the derived table's
+   key — never a pass over `runs`) and settles each afterwards inside
+   the same transaction: row removed if empty (`deleted["streams"]`),
+   clock re-derived otherwise. `count_environment_rows` reports the
+   same `streams` figure, so the dry run and the delete still describe
+   the same thing (`test_the_counts_returned_match_what_the_dry_run_reported`
+   holds; a new test pins the key to a non-zero case so the equality is
+   not two zeros agreeing). Mainline is excluded from the settle: it is
+   not a build, and settling it with nothing left would delete row 1.
+2. `Storage.prune_empty_streams()` — every non-mainline build with no
+   `latest_runs` partition is removed, origin tags cleared, returned as
+   a list of `Stream`. The SELECT and the DELETEs share one
+   transaction, and each DELETE re-checks emptiness in its own WHERE,
+   so an import landing between them on MariaDB (no table lock there)
+   keeps its build. `run_server.py` calls it after opening the
+   database and before building the server, and prints
+   `empty builds: none` or `empty builds: removed N (kind:name, …)`.
+   A failure there is exit 2 with the reason, like every other
+   start-up refusal. Cost: one seek per `streams` row, every start.
+3. Retired-only builds are kept: retirement keeps the `latest_runs`
+   row, so "empty" means "no results", not "nothing shown".
+
+**Guards.** `EnvironmentDeleteTest` +6 (only-there build removed;
+also-elsewhere build keeps its other results with both ends of its
+clock moved; mainline never settled; the removed build's comment on
+another environment's test survives untagged — a first draft of that
+test put the comment on the deleted environment and found it deleted
+with it, which is the behaviour it has always had; dry run names the
+builds; no build left empty). `PruneEmptyStreamsTest` +5, the orphan
+planted by SQL the way production got its own. `TestDropEnvironmentCLI`
++1. `StartupSweepTest` +2 in `test_run_server_cli.py` — the one test
+in the suite that runs `run_server.py` as a real process and reads its
+stdout, because the sweep lives in `main()` between the database and
+the server, where nothing else looked. All dual-backend classes ran
+green against the local MariaDB 12.3 as well as SQLite.
+
+**Not changed.** `list_streams` does not filter empties defensively:
+the invariant is now maintained by every writer and restored at every
+start, and a filter would hide the row rather than remove it. No
+frontend change; the picker lists what the API returns.
+
+**Not verified.** No browser. Not run against MariaDB 10.3 here (CI's
+legs). The production orphan's origin is inferred, not observed — the
+operator note says what to report if the start-up line names a
+different build.
+
+## 2026-10-01 — WP-40 (1 of n): the MariaDB upgrade tool is a ledger (branch `wp-40-candidate-environments`)
+
+**Why first.** WP-40 (candidate environments — the proposal reviewed
+the evening of 2026-09-30, spec to follow) needs migration 11, the
+first schema change since production moved to MariaDB. The tool that
+moves production's schema, `tools/upgrade_mariadb_schema.py` (WP-27),
+was written as a one-off: its docstring said v7→v10, the versions it
+resumed from, the target and the interrupted-run markers were three
+hand-listed constants, and the one test pinning it to
+`MIGRATIONS[-1][0]` failed with "extend the tool" and no shape to
+extend it into. The user called it tech debt to pay before building
+on it, and it is.
+
+**What the debt was NOT.** The three-way split — SQLite migrations as
+the source of truth, the exporter's full DDL as the fresh-install
+schema and the verify oracle, hand-written MariaDB steps diffed against
+that oracle — is sound and is kept exactly. Hand translation is right
+(the dialects differ where it matters; runbook §B). The dual-backend
+suite proves SQLite and the fresh MariaDB schema agree; `verify` proves
+the steps reach the fresh schema. Nothing about that changed.
+
+**What changed.**
+- The three steps are now a `LEDGER` of `Step` records, each carrying
+  the package, a one-line summary, its DDL as a function of the live
+  sizes, its `Probe`s (a table, or a column of one — what the
+  bidirectional consistency check tests), and the tables its `ALTER`s
+  rewrite (what the dry run counts). `EXPECTED_FROM_VERSIONS`,
+  `TARGET_VERSION`, the markers and the row-count tables are derived
+  from it. `CUTOVER_VERSION = 7` is the one constant left.
+- `plan()` appends each step's `schema_version` bump; a step that
+  bumps it itself is a ledger error. The bump-is-last invariant the
+  consistency check depends on is now enforced, not remembered.
+- `ledger_gaps(migration_versions, ledger)` is the whole rule, pure
+  and server-free: every SQLite migration above 7 has a step; every
+  step has a migration; contiguous; every step has a probe; every
+  probe names something the step's own DDL mentions; no step bumps
+  the version. `LedgerTest` runs it on every suite run (12 tests, six
+  of them planted regressions proving each clause can fail), and the
+  tool runs it before connecting and refuses to proceed on a mismatch.
+- Messages and help no longer say v10 anywhere; the dry run lists the
+  steps it will run with their packages. The version-above-target
+  refusal says what it means: newer code wrote this, deploy that code.
+- Runbook §G rewritten as the procedure for any migration, not the
+  memoir of August: stop the feeder and the service first (the app
+  checks the version only at start, but its ten-second lock wait
+  meets an `ALTER` holding the table — the August run upgraded under a
+  running server and got away with it); dry run; live; verify; start;
+  and a new §G.5 for the developer — the five steps of adding a
+  migration, both halves. `UPGRADE_PLAN.md` §1 gains the rule under
+  the registry table (the table itself untouched); `CLAUDE.md`'s
+  architecture line says it in one breath.
+
+**Not changed.** The three steps' DDL, byte for byte (only the bump
+moved out of each). The exporter. The v7 fixture (frozen by design; a
+new step is exercised by upgrading it through every step before).
+`tests/backends.py`'s VIA_UPGRADE path, which already ran `plan()`.
+
+**Measured.** SQLite: 2540 → **2550 OK (skipped 1)**, 152 s. Local MariaDB 12.3
+(`.scratch/mariadb-data`, port 3307): `tests.test_upgrade_mariadb_schema`
+20 tests OK (the full v7→10 upgrade, verify clean across 14 tables,
+the three refusals, the interrupted-run refusal, ALGORITHM=INSTANT
+accepted); with `TESTBOARD_TEST_DB_VIA_UPGRADE=1`, `EnvironmentDeleteTest`,
+`PruneEmptyStreamsTest` and `TestUpsertRuns` MariaDB variants green on
+a schema `plan()` built. CI's two 10.3 legs are the authority.
+
+**Next.** Migration 11 for WP-40 is the first step written into this
+shape; the spec for the package itself follows in the next entry.
+
+## 2026-10-01 — WP-40 (1, correction): feeders are never stopped; the ledger says whether the server is
+
+**The user's constraint, the same morning.** "It's now no longer
+possible for us to shut down all feeders before an upgrade — that
+would require coordination across over a dozen servers. If that's
+required, the server needs a way of putting itself into a pre-upgrade
+state." The entry above had imported the August drop note's "stop the
+feeder" step into runbook §G.3. Withdrawn.
+
+**Why no server-side pre-upgrade state is needed.** Checked against
+the feeders as deployed, not assumed: `run_feeder.py` advances its
+high-water mark only when no batch failed (`run_feeder.py`, the
+`failed_batches == 0` guard before `advance_high_water_mark`), keeps a
+one-day overlap, and re-pushes its whole window every ten minutes
+regardless; `clients/feeder.py`/`feeder.tcl` write a replay file after
+under a minute of retries and resend it automatically at their next
+invocation; `clients/feeder_micro.py` writes nothing and exits 1
+meaning "re-invoke me", which is safe because the server upserts. A
+push that meets a stopped server is therefore deferred, not lost, for
+every feeder in the field, with one honest caveat: a micro-client run
+nobody re-invokes is a visible gap on the board until its next run. A
+server that accepted and spooled imports it could not write would be a
+new persistence layer, a new failure class (acknowledged data not yet
+stored), and would cover a gap the clients already cover. Not built.
+
+**What was built instead.** The question that remains is whether the
+SERVER must stop, and that depends on the step: one that only creates
+tables (migration 11's shape) touches nothing the running server
+reads or writes, so old code serves through it — the app checks
+`schema_version` only at start — and the only gap is the drop's own
+restart; one that rewrites an existing table holds its lock while the
+app's connections wait ten seconds at most, so a push mid-step fails
+(and is deferred by its feeder) and a page read mid-step errors. The
+ledger already declares which tables a step rewrites, so
+`rewritten_tables(steps)` reads it and the dry run prints one of two
+lines — `SERVER: may keep running` or `SERVER: STOP IT FIRST`, naming
+the tables and the step — with "feeders need no action" on both.
+Pinned by `LedgerTest` (13 tests now). §G.3 rewritten around the two
+cases with the per-feeder table; §G.4 now includes deploying the code
+between the stop and the start, which the August wording had left to
+the drop note.
+
+**Measured.** Server-free: 35 tests OK across the ledger and 3.6
+modules. Local MariaDB 12.3: the tool's 21 tests OK, the dry run
+printing `SERVER: STOP IT FIRST … runs (step to 9), … latest_runs
+(step to 9), activity_hours (step to 10), script_hours (step to 10)`
+for the v7 fixture, as it should.
+
+## 2026-10-01 — WP-40 spec: acknowledged failures (replaces the candidate-environments proposal; migration 11)
+
+**The problem, restated.** New products are being let in on the
+proviso that they burn their failures down quickly; the first one
+arrived with 65 and the estate headline, now shared with senior
+colleagues, shows them all. The 2026-09-30 proposal was a per-
+environment "candidate" state hidden by default. The user dropped it
+this morning for a per-test model, and the review agreed it is the
+better one: it hides only what a person has looked at, it decays, and
+it closes an item already on the open list (the build-comments
+workshop's "'has a comment' is not 'acknowledged'").
+
+**Decisions (user, 2026-10-01, from an interactive walk through the
+open questions):**
+
+1. **Name: "acknowledged".** Never "known failure" — that is the
+   feeder-declared `known_failure_reason`/`FAILED_AS_EXPECTED` already
+   on the wire and the test page, which analytics treat as a
+   non-failure. A person acknowledging is a different, temporary act.
+2. **Unit: one test on one environment on one stream** — the triple
+   plus `stream_id`, like comments/assignments/retirement. Many
+   environments means many rows; the bulk action covers a selection in
+   one click.
+3. **A pass inside the window does not end it.** Any test that is
+   failing NOW and has a live acknowledgment is acknowledged, whatever
+   happened in between. (Considered and declined: surfacing a
+   pass-then-fail as new. Simpler rule wins; nothing on the push path.)
+4. **Headline: failing EXCLUDES acknowledged, and the count is shown
+   beside it everywhere a failing count appears** — home tiles,
+   Open Actions, Watch cards, product cards, a build's own tiles.
+   "12 failing · 65 acknowledged". Never subtracted silently.
+5. **Duration on mainline: any whole number of days 1–7, default 7,**
+   refused above 7 by the API AND by storage. On a build: the same, or
+   "until the build goes" (NULL), which mainline refuses.
+6. **Extension from an expiring list, history kept.** Open Actions
+   lists acknowledgments expiring within a day with one-click extend;
+   acknowledging an already-acknowledged test IS an extension; every
+   act is a history row and the extension count shows on the test —
+   four in a row is visible, which is what makes the ratchet bite.
+7. **Reason required, free text**, on a fresh acknowledgment; optional
+   on an extension (the old reason stands unless replaced).
+8. **One drop.** Everything below ships together, with migration 11.
+
+**Schema — migration 11 (claimed in `UPGRADE_PLAN.md` §1; WP-15's
+reservation moves to 12, the sixth time).** Creates only; touches no
+existing table; so the MariaDB step's `alters` is empty and the dry
+run will say the server may keep running.
+
+- `test_acknowledgments` — the CURRENT acknowledgment per
+  `(stream_id, environment, script, test_name)` (PK): `reason`,
+  `acknowledged_at`, `until` (ISO, NULL = until the build goes),
+  `acknowledged_by`, `extensions INTEGER NOT NULL DEFAULT 0`. An
+  expired row stays (it feeds the expiring/expired list and keeps the
+  extension count); it is simply not LIVE.
+- `acknowledgment_history` — one row per act (`acknowledge`,
+  `extend`, `clear`), with who/when/until/reason; the record.
+- Both join `_ENVIRONMENT_TABLES` (the environment delete removes
+  them; the schema-asking guard insists) and `delete_stream`/the WP-39
+  prune delete them by `stream_id`.
+
+**Predicate, one definition used everywhere:** a test is
+*acknowledged* iff its `latest_runs` row on that stream has
+`result = FAIL` AND a `test_acknowledgments` row exists for the same
+key with `until IS NULL OR until > now`. `now` is the request's, never
+memoized: the acknowledged set is small and human-rate, so it is read
+at request time and expiry is exact to the second.
+
+**Reads — the cold cost is the cost, nothing on the push path:**
+
+- The headline rollup stays ONE pass. Acknowledged counts come from a
+  second, tiny query — `test_acknowledgments` joined to `latest_runs`
+  by PK, grouped by environment — bounded by the number of
+  acknowledgments, never the estate, subtracted from the memoized
+  cells' failing figure at request time. `failing` (and
+  `new_failures`/`still_failing`) exclude them; `acknowledged` is a
+  new figure beside them, in `/api/summary`'s status and per-
+  environment blocks and in every summary the Watch/product/build
+  paths derive from the same cells.
+- The dashboard list: failing categories gain `AND NOT EXISTS (live
+  acknowledgment)` — an indexed PK probe per candidate row, applied to
+  the count and the page alike; a new category `acknowledged`; every
+  returned row carries `acknowledgment: {until, reason, by,
+  acknowledged_at, extensions}` when one exists (live or expired,
+  flagged), joined on the page only.
+- Open Actions: a new queue, **Expiring** — live acknowledgments with
+  `until` within 24 h, plus expired ones still failing — each with
+  extend.
+- Memos: an acknowledgment write drops everything, like assignments
+  (human-rate).
+
+**API:**
+
+- `POST /api/acknowledgments/bulk` — `{"username", "reason"?, "days":
+  int|null, "tests": [{environment, script, test_name, stream_id?}]}`,
+  the same `tests` list the two existing bulk endpoints take. A test
+  without a current row needs `reason`; one with a current row is
+  extended (`extensions + 1`, new `until`, reason kept unless given).
+  `days` 1–7; `null` only where `stream_id` is not mainline. Response:
+  `{acknowledged: n, extended: n}`.
+- `POST /api/acknowledgments/clear` — `{"username", "tests": [...]}`;
+  removes the current row, history records the clear.
+- `GET /api/acknowledgments?stream_id=&expiring_within_hours=24` —
+  the Expiring list, with the row's latest result so "still failing"
+  is filterable.
+
+**UI (the tester's view; `whatsnew.html` says this in its words):**
+
+- Home: the Failing tile reads "12 failing" with "65 acknowledged"
+  beside it; the triage section gains an **Acknowledged** queue next
+  to Still failing, rows showing reason, who, "expires in N days",
+  and the extension count. The selection bar gains **Acknowledge**
+  (reason, days, and on a build the "until the build goes" tick).
+- Test page: the current acknowledgment, its history, and an
+  Acknowledge/Extend/Clear control with the same fields.
+- Build dashboards: identical, scoped by `stream_id`; a mainline
+  acknowledgment does not reach builds and vice versa.
+- Open Actions: the Expiring queue with Extend (bulk).
+- Watch/product cards: "failing N · acknowledged M".
+
+**Guards:** storage tests on both backends (`StorageTestBase`), API
+tests, the one-predicate rule pinned (the list's exclusion, the
+count's subtraction and the queue agree on a seeded estate), mainline
+refuses `null`/`>7` in storage as well as API, the two table lists,
+migration tests (fresh == stepwise), `LedgerTest` (step 10→11 + the
+exporter's two tables), and a frontend-calls guard that every page
+showing a failing count also shows the acknowledged one.
+
+**Operator:** migration 11 on both backends; on MariaDB via the
+ledger (runbook §G) — creates-only, server may keep running, feeders
+untouched; rollback is a table drop. Drop note to be written before
+shipping.
+
+**Explicitly not in this package:** acknowledging across environments
+in one row; ending an acknowledgment on a pass; any change to
+`FAILED_AS_EXPECTED` handling; a sweep of expired rows (tiny, human-
+rate; revisit if it ever matters).
+
+## 2026-10-01 — WP-40 spec addendum: four more decisions before the build (user, going to bed)
+
+Asked and answered interactively, same night. These amend the spec
+entry above; where they conflict, these win.
+
+1. **Ships in the drop of 2026-10-01, alongside WP-39.** One drop, one
+   operator note (`docs/drops/2026-10-01.md`, re-written to say a
+   migration runs), one `whatsnew` section. The WP-40 branch is
+   fast-forwarded into `drop-2026-10-01` when green.
+2. **An acknowledgment is owned.** Acknowledging assigns: the form has
+   an assignee box, defaulting to the test's current assignee if it has
+   one, else to the acknowledger; the bulk action assigns the whole
+   selection to that one person, in the same transaction as the
+   acknowledgment, through the existing assignment path (history +
+   current, stream provenance as WP-35).
+3. **Unassigning drops the acknowledgment.** In the same transaction,
+   with a history row (`clear`, reason "unassigned"); the test
+   reappears as failing. Assignment is per triple and acknowledgment
+   per triple+stream, so an unassign drops every stream's
+   acknowledgment of that triple. Reassigning to another person keeps
+   it. The acknowledgment expiring leaves the assignment alone.
+4. **No indefinite acknowledgment anywhere.** `until` is NOT NULL on
+   both tables; `days` is 1–7 on every stream, builds included; `null`
+   is a 400 and storage raises. One number, one rule.
+
+## 2026-10-01 — WP-40 built: acknowledged failures (branch `wp-40-acknowledged-failures`, ships in the drop of 2026-10-01)
+
+**What exists now.** The spec and addendum above, built in four layers
+and merged. Nothing is deployed. The drop of 2026-10-01 now carries
+WP-39 AND WP-40, and **migration 11 runs on both backends**.
+
+| Layer | Commit | What it is |
+|---|---|---|
+| Storage | `a8f3b30` | Migration 11 (`test_acknowledgments`, `acknowledgment_history`), the one predicate, `acknowledge_tests` / `clear_acknowledgments` / readers, the unassign-drops-acknowledgment rule, both tables in the environment/stream delete paths and the WP-39 prune; exporter DDL. Committed untested on purpose so the API could branch from it |
+| API | `c5c2b87` | `POST /api/acknowledgments/bulk`, `POST /api/acknowledgments/clear`, `GET /api/acknowledgments`; `acknowledged` beside every failing figure in `/api/summary` and `/api/watch`; `acknowledgment` on every row; `acknowledged=` on `/api/dashboard`; 27 `AcknowledgmentApiTest` tests |
+| Storage tests + MariaDB ledger | `6f7831d` | `step_10_to_11` and its ledger entry (`alters=()`); `AcknowledgmentTest` (36 tests, each with a MariaDB variant); the AUTOINCREMENT inventory 4 -> 5; the memoization below |
+| Frontend | `154a201` | Selection-bar Acknowledge, Review-panel group, test-page banner and history, Home tile and queue, Watch stat, Open Actions' Expiring list with Extend |
+| Merges | `c85957e`, `0dfa121` | The storage-test and frontend branches into `wp-40-acknowledged-failures` |
+
+**How it was built.** Fable wrote the specs; Sonnet agents built each
+layer in their own worktrees, in parallel, each against its own
+sacrificial MariaDB database (the user's cost directive: no Fable-priced
+implementation, and no shared database for agents that each drop and
+recreate it). Until the storage-test commit landed, the API agent's tree
+had 14 failures that all came from migration 11 itself (the memo
+guards, the ledger, the SQL inventory); the frontend agent touched no
+Python. The integration was the two merges and one full run.
+
+**Measured** (this branch, development machine, a modern interpreter and
+not 3.6):
+
+- SQLite: `python -m unittest discover` — **2620 tests, OK (skipped=1)**,
+  from 2550 before WP-40.
+- With a local MariaDB 12.3 (port 3307, sacrificial database), the full
+  suite: **3594 tests, OK (skipped=71)**, from 3419 (2526 SQLite) at the 2026-09-30 drop.
+- `tests.test_mariadb_backend` + `tests.test_upgrade_mariadb_schema`
+  alone: **986 tests OK (skipped=70)**; the upgrade tool's full v7 -> v11
+  run verifies clean, every table matching the v11 oracle.
+- Production is MariaDB 10.3; this machine's 12.3 is not it. CI's two
+  10.3 legs are the authority and have not run on this branch yet.
+
+**Memoization design (what the six statement-counting guards forced).**
+The acknowledged set is small and human-rate, so it is read at request
+time, but a read that costs a statement on every call fails the guards
+that say a repeat costs zero. Final shape:
+
+- `acknowledgment_epoch(stream, now)` is the NEXT expiry after `now`
+  (one indexed `MIN(expires_at)`), memoized per stream as
+  `(computed_for, epoch)`. It is served to any later `now` before the
+  epoch, which is exact — nothing can have expired before it, and every
+  acknowledgment write drops the memo — and is recomputed for an
+  EARLIER clock, so a request with a clock behind the memo is never
+  handed an epoch that has since moved past a row still live then.
+- `acknowledged_cells` reads the epoch first. **No live acknowledgment
+  on the stream (the common case) returns `[]` with zero statements.**
+  Otherwise one grouped read of the stream's acknowledgments is split by
+  environment and stored per environment under
+  `("ack_cells", stream, env, cutoff, epoch)`, tagged `(stream, env)`
+  exactly as `_environment_rollup`'s entries are (WP-38), an entry for
+  EVERY environment including empty ones. A push into one environment
+  drops only that environment's entry.
+- The queues that depend on `now` (`new_failures`, `still_failing`,
+  `acknowledged`) memoize on the epoch; `queue_counts` subtracts the
+  cells from a COPY of its memoized dict.
+- Nothing on the push path; the headline's one-pass rollup is
+  untouched; the extra read is `acknowledged_cells`, bounded by the
+  number of acknowledgments and never by the estate.
+- Cache guards stayed strict: `SummaryCacheTest` and
+  `TargetedInvalidationTest` pass UNCHANGED.
+
+**Guards widened, and why (none weakened).**
+`tests/test_storage.py::TestQueueCounts.test_one_query_regardless_of_assignee`
+counts COLD statements; the first call after a write now includes the
+epoch read (cold 3 -> 4, within-rollup 1 -> 2) and the test asserts that
+statement is the extra one; its final assertion, that a repeat costs
+zero, is untouched. In `tests/test_api.py` the three pinned key sets
+(dashboard row, queue entry, test detail) gained the new fields.
+`_DASHBOARD_FILTER_QUERY_PARAMS` gained `"acknowledged"` so list-mode
+bulk assignment still refuses it. `test_sql_portability`'s AUTOINCREMENT
+inventory went 4 -> 5 (`acknowledgment_history.id`) and
+`MARIADB_MIGRATION.md` B.2 lists the fifth, as the test demands. The
+new statement-counting memo tests sit on `test_mariadb_backend`'s
+`EXCLUDED_TESTS` with a reason, like the existing counters (they count
+with sqlite3's trace callback). `CompareStripTest`'s count pin of 3 for
+`stream: streamApiScope()` was NOT widened: the test page's detail
+request moved into `detailUrl()` instead.
+
+**Design observations — recorded, NOT changed.** Reported by the
+storage-test agent while writing the tests. Each is how the code
+behaves; each is either as decided or small enough to wait for use.
+
+1. `acknowledge_tests` accepts a key whose test is PASSING now: the row
+   is written and sits dormant, then goes live if the test fails again
+   inside the window (decision 3: a pass in between changes nothing).
+   The UI only offers Acknowledge on FAIL rows, so only a direct API
+   caller reaches this.
+2. The `assigned` queue and `assigned_open` still include acknowledged
+   tests, because acknowledging assigns. "My actions" therefore shows
+   what you own, which is intended — but the Assigned and Acknowledged
+   tabs overlap.
+3. Assignment is per triple, acknowledgment per triple + stream.
+   Acknowledging a BUILD's failure assigns the test everywhere, and
+   unassigning it from mainline drops the build's acknowledgment too
+   (addendum decision 3, taken at face value).
+4. Expired rows stay until cleared and `acknowledgment_history` grows
+   without bound. Tiny and human-rate; nothing prunes either (the
+   spec's "not in this package"). Revisit if it ever matters.
+5. Extending sets `acknowledged_by` to the extender but keeps the
+   ORIGINAL `acknowledged_at`. The UI therefore shows "by X · expires
+   …", never "X acknowledged at T"; the history table is where the
+   original act lives.
+6. The acknowledgment-epoch memo is tagged whole-stream, so every push
+   into a stream costs the NEXT reader one indexed `MIN` query (the
+   cells themselves are per-environment). Bounded and cheap; it is the
+   price of not tagging an epoch that spans environments.
+
+**Frontend notes.** "Extend 7 days for all" makes one POST per distinct
+owner, because the bulk endpoint takes a single assignee. A review-panel
+Acknowledge from Open Actions posts without a stream id, i.e. mainline,
+which is right because that page lists mainline results.
+`GET /api/acknowledgments` rows carry `stream_kind`/`stream_name` but
+not the stream's product. Spec drift worth knowing: the spec entry
+spells the expiry column `until`; the code and both DDLs spell it
+`expires_at` (NOT NULL on both tables, per the addendum) and the API
+returns `expires_at`. The operator-facing documents use the code's name.
+
+**Not verified.** No browser has rendered any of this: the frontend
+agent ran `node --check` on the modules, the source-text guards and a
+server smoke test that served the pages with 200. The pass-then-fail-
+inside-the-window behaviour is as decided and has not been seen by a
+tester. MariaDB here is 12.3; production is 10.3.
+
+**Operator note** — `docs/drops/2026-10-01.md`, rewritten for the
+combined drop. Two things its first draft's brief assumed that are not
+so: migration 11 has no Python step, so on SQLite it prints NO progress
+line (it is two `CREATE TABLE`s); and no start-up line names the schema
+version — the Metrics page does.
+
+The performance A/B against `master` is being measured separately and is
+recorded in the next entry.
+
+## 2026-10-01 — WP-40 performance: the acknowledgment join and the dashboard count
+
+Measured by the performance agent (Sonnet) against the shipped master,
+in-process; appended verbatim.
+
+Method. Compared origin/master (a6f59d2) with the WP-40 branch in-process on SQLite copies of the seeded production-scale dev estate (Atlas, about 12k tests across 5 environments; not production data). Each of the three or four configurations ran in a fresh process on a fresh copy, alternated with the order rotated each round, with every memo cleared before each cold call, the same `now` for both trees, and statements counted with set_trace_callback. Acknowledged state is 65 failing mainline tests on atlas-lab-alpha for 7 days. Because acknowledging also assigns the tests, tree A with the same 65 tests assigned and no acknowledgments is run as the control.
+
+Run 2 (c85957e; 48 samples per cell; cold median ms, A / B no acks / B with acks; statements A/Bn/Ba cold, warm statements identical to A in every row):
+
+headline unscoped 222.7 / 203.0 / 213.7 (37/38/39); headline product 213.0 / 191.2 / 210.2 (32/33/34); headline environment 211.3 / 188.4 / 200.6 (31/32/33); headline stream 244.3 / 243.7 / 219.5 (31/33/34); queue new_failures 29.7 / 30.4 / 30.7 (14/15/15); queue still_failing 99.3 / 101.2 / 71.0 (23/24/21); queue acknowledged n/a / 26.8 / 33.0 (-/15/15); dashboard default 33.0 / 47.8 / 64.6 (3/3/3); Open Actions 72.1 / 85.3 / 84.8 (259/259/259); watch 3 cards 384.9 / 406.5 / 323.3 (26/27/28). Warm medians of the headlines, queues and watch were within 0.3 ms of A except the unmemoized pages: dashboard default 32.5 / 49.0 / 64.3 and Open Actions 73.6 / 84.5 / 86.5. The first run used a fixed order and was biased by machine noise (cold medians moved about 2x between runs); only the rotated runs are quoted here.
+
+The regression. In run 2 the unfiltered dashboard page was +15 ms with no acknowledgments and +31 ms with 65. Cause: _LATEST_COUNT_JOIN in testboard/storage.py appended the acknowledgment join to the dashboard's COUNT(*), which reads no column from it. The count therefore made 25 to 35 thousand primary-key probes into test_acknowledgments per call. Per statement, in process: the count was 27.6 ms on A, 34.9 on the branch with no acknowledgments and 52 to 54 with 65. The same SQL with the join removed measured 27.2 to 27.8 ms (none) and 34.8 (with acknowledgments). Commit dbb5523 made the count join retirement-only and appends the acknowledgment join only where the WHERE reads it.
+
+Run 3 (dbb5523; 64 samples per cell; cold median ms): headline unscoped 227.5 / 227.4 / 229.7 / 228.3 (A / B none / B ack / A with 65 assignments); queue new_failures 32.1 / 32.2 / 32.6 / 31.9; queue still_failing 100.8 / 101.6 / 74.8 / 101.6; queue acknowledged n/a / 26.5 / 34.2; dashboard default 40.4 / 41.7 / 49.6 / 48.1; Open Actions 84.7 / 85.0 / 96.3 / 94.2. Without acknowledgments the dashboard is +1.3 ms (3%) over A, the 250-row page query keeping the join, and Open Actions +0.3. With acknowledgments the dashboard is +9.2 ms and Open Actions +11.6 ms over A, but +1.4 and +2.1 ms over the assignment control. Dashboard count with 65 acknowledgments is the same SQL and plan as with none, 35 ms against 27.5, and is equally 35 ms on tree A with 65 assignments and no acknowledgments; the extra cost is the assignment rows an acknowledgment implies and exists on master. Not investigated: why 65 assignment rows cost about 8 ms on this count — a property of master, a candidate for the next pass. Statements: +1 per cold headline with no acknowledgments, +2 with them; warm calls run the same SQL as A in every scenario.
+
+Push path (about 2,000 records, handler ms median): identical re-push 118.0 on A, 120.5 on the branch with no acknowledgments, 119.1 with them (2003 statements each, unchanged=2000); changed results 445.8, 451.0, 454.6 (10402 statements each). Differences are inside the p90 spread. Migration 11 on first open of a copy took 8 to 48 ms (median about 30) against 4 to 6 ms for a no-migration open.
+
+Caveats. SQLite only; no MariaDB timings. In-process handler time, not HTTP; this machine varies by 2x between runs minutes apart, so differences under about 1 ms are not claimed. One acknowledgment set (65 tests, one environment). Post-push figures use a one-record push into the same stream and environment. The seed's output fingerprints are NULL, so a stamping push was done before the identical re-push timings. Not checked: acknowledgment sets spread over many environments or streams, expiry crossing during a request, and the other callers of the count join apart from the dashboard.
+
+Raw numbers and scripts: `.scratch/net/drop-2026-09-30/wp40_ab.txt`, `wp40_ab.py`, `wp40_bench.py`, `wp40_dash.py`, `wp40_fixcheck.py` (this machine only, gitignored).
+
+**Verdict.** The 2026-09-30 drop's work is intact: headline, queues, watch and the push path are flat within noise, warm calls run no SQL master's did not, and the targeted memo drop still holds. The one regression found was fixed before shipping.
+
+## 2026-10-01 — WP-40 amended after the first walkthrough: muted, hours, the bar, the Muted tab
+
+The user tried WP-40 and changed it. Recorded here in substance as given;
+the earlier WP-40 entries above are history and say "acknowledged", which is
+the word this entry retires.
+
+**The user's three changes.**
+
+1. **"Muted", not "acknowledged".** The state is *muted*; the verbs are
+   *Mute*, *Unmute* and *Extend*; the record is "a mute". Renamed end to
+   end — tables `test_mutes` and `mute_history` (columns `muted_at`,
+   `muted_by`; history actions `mute` / `extend` / `unmute`), indexes,
+   migration 11's SQL, the exporter's `ddl()` and the ledger's
+   `step_10_to_11` (kept column-for-column identical), the storage types and
+   methods (`mute_tests`, `unmute_tests`, `mute_for`, `mute_history`,
+   `muted_cells`, `mute_epoch`, `expiring_mutes`), the memo keys, the queue
+   kind `muted`, the API (`/api/mutes/bulk`, `/api/mutes/unmute`,
+   `GET /api/mutes`; `mute`, `mute_history`, `muted` in the payloads), the
+   frontend's every word and identifier, the README, the operator note and
+   the handover. **The rename is complete, not layered, because nothing had
+   shipped**: no database anywhere has the old table names (migration 11 has
+   never run outside tests and scratch copies), so entry 11 was edited in
+   place and there is one vocabulary. (The branch is still called
+   `wp-40-acknowledged-failures`; a branch name is not shipped.)
+2. **Duration is a dropdown of hours.** The wire takes `hours` (whole,
+   1..168; anything else is `400 "hours: must be a whole number from 1 to
+   168"`), storage validates the same (`MUTE_MAX_HOURS = 168`, replacing
+   `ACKNOWLEDGMENT_MAX_DAYS`) and sets `expires_at = when +
+   timedelta(hours=hours)`. Every UI duration control is a `<select>` with
+   the placeholder "for…" and 12 hours, 1, 2, 3, 5, 7 days, built by ONE
+   helper (`muteDurationSelect` in `api.js`) so the bar, the Review panel,
+   the test page and Open Actions cannot drift. Extend controls use the same
+   select defaulting to 7 days so it is still one click; the "Extend 7 days"
+   labels are now "Extend".
+3. **The selection bar reuses what is there.** No separate reason or days
+   input: Mute takes the owner from "Assign to", the reason from the note
+   box, the duration from a new select after "Comment only" — `· Mute
+   [duration] [Mute]`. The button is disabled unless all three are set (the
+   comment updater, which the picker's and the note's listeners both reach,
+   and the select's own `change` drive it). After a mute the note is
+   cleared, the select resets to the placeholder and the selection clears.
+
+**Decisions taken with those (mine, for the user to veto).**
+
+- **A fresh mute also posts its reason as a comment** on each test, tagged
+  with the key's stream, author the muter — `_write_bulk_assignments` is
+  now passed `comment_text=reason`. An extension posts one only when a NEW
+  reason came with it; a plain extension posts nothing. (Storage and API
+  tests pin all three.)
+- **The Muted tab lists every live mute, passing or failing, with a State
+  column** (the was -> now transition the New failures tab uses). The queue
+  predicate is `_MUTE_LIVE` alone. `muted_cells()` groups by (environment,
+  result, previous result, recent) and each cell carries its REAL result.
+  `expiring_mutes` keeps its "still failing" gate: a passing muted test needs
+  no action. `queue_counts["muted"]` is the sum of ALL cells, so the tab badge
+  equals `status_queue_count("muted")` equals `len(status_queue("muted"))`
+  (tested). The Review panel now offers Extend / Unmute for a live mute on a
+  passing row too, or the Muted tab would list rows it cannot act on.
+- **`status.muted` vs `status.muted_total`.** `muted` is the muted tests that
+  are FAILING (the number taken off New / Still failing; each environment's
+  and product's `muted` is the same kind); `muted_total` is every live mute.
+
+**The user's addendum, same day: "we agreed we'd have a (+X muted) everywhere
+we have a 'failing'".** And the correction that goes with it, which is a
+correction of my first cut: **muted failures had been leaving the pass rate**
+(`summarize_rollup` subtracted them from `results[FAIL]` and
+`recent_results[FAIL]`). A muted failure is still a failure. Now:
+
+- **A. The pass rate counts them.** `results[FAIL]` / `recent_results[FAIL]`
+  are NOT reduced. The subtraction stays only for `new_failures`,
+  `still_failing`, each environment's `failed` / `new_failures` and
+  `ProductRollup.failing` / `new_failures`. `SummaryStatus` carries
+  `muted_new_failures`, `muted_still_failing`, `muted` (their sum) and
+  `muted_total`; `/api/summary`'s status block exposes all four. Tests pin
+  that muting leaves the pass-rate inputs unchanged and that `new_failures +
+  muted_new_failures` and `still_failing + muted_still_failing` are conserved
+  against the unmuted estate.
+- **B. No Muted tile.** Removed from `renderStatus` and from the skeleton in
+  `index.html` (`FirstPaintTest` pins the two equal). The Muted queue tab and
+  its badge stay. "New failures" and "Still failing" append " · +X muted" to
+  their sub-lines when `muted_new_failures` / `muted_still_failing` is > 0.
+- **C. Charts.** "Failing by environment": each bar is the unmuted `failed`
+  with a grey segment of `muted` appended (`barRows` takes an optional
+  `extra`; callers that pass none draw what they always drew), sorted by the
+  unmuted number; tooltip "N (+M muted)"; an environment with failed 0 and
+  muted > 0 still shows, grey only.
+- **D. Most failures by script.** `top_failing_scripts` takes `now` and
+  returns `failing` (FAIL, no live mute) and `muted` (FAIL under one), ranked
+  by failing, then muted, then the old tiebreak; a script whose failures are
+  all muted still appears. It is memoized, keyed on the mute epoch like the
+  mute-aware queues, and joins `test_mutes` only while the stream has a live
+  mute at all (the epoch read is one memoized indexed `MIN`), so an estate
+  with no mutes runs the statement it always ran. Tested: 3 failing of which
+  2 muted reports failing 1, muted 2 and sorts below a script with 2 unmuted;
+  expiry is seen with no write; a write is seen at once.
+- **E. Everywhere else a failing number is shown**, "N (+X muted)": Watch's
+  Failing stat (the separate Muted stat is gone; `card.muted` is the
+  suffix). **The nightly trend chart is unchanged**: its FAIL counts come
+  from `activity_hours` and include muted failures, which is now consistent
+  with the pass rate.
+
+**What the tester note says.** `whatsnew.html`'s 2026-10-01 list was cut to
+three bullets (it had been "an absolute wall of text for a single new
+feature"); it says Home has a Muted tab, not a tile.
+
+**Guards widened, none weakened.** `WatchUnassignedStatLinkTest.
+test_the_supporting_stats_are_plain_numbers_again` pinned `buildStat(label,
+value)`; the signature may now take one more argument (the muted count) and
+the test now pins that exact signature, still forbids `href`, and now also
+forbids an anchor in the stat. Two new guard classes in
+`test_frontend_calls.py` (`MuteControlsTest`, `MutedBesideFailingTest`) pin
+the shared duration select, hours on the wire, the bar's three-way gate and
+the "+X muted" placement. No selection guard named the old reason/days
+inputs.
+
+**Measured.** SQLite `python -m unittest discover`: **2640 tests OK (skipped=1), from 2620 before the amendment**. MariaDB 12.3 (local, port
+3307, sacrificial database) `tests.test_mariadb_backend` +
+`tests.test_upgrade_mariadb_schema`: **998 tests OK (skipped=70); the full suite with the MariaDB variants active was not re-run, so the earlier 3594 is stale**, the ledger's v7 -> v11 upgrade
+verifying clean against the renamed tables. No browser has rendered any of
+this; `node --check` on the touched modules and the source-text guards only.
+No timing was taken: the new reads are the muted-cells grouped read (now also
+grouped by result) and one memoized epoch read ahead of the scripts query.
+
+**Left alone, noticed.** The home "New failures" tile's delta line ("N more
+failing than before") is `new_failures - fixed` and so ignores muted new
+failures; whether it should add them back is the user's call.
+
+## 2026-10-01 — WP-40 walkthrough polish, Unmute in the bar, and the final numbers (ready to deploy)
+
+**The lead's walkthrough** of every new surface after the rename (no
+browser; the diff of `static/` read end to end, the flow driven against
+a play server through the API): three fixes (`ddd7fe4`) — the
+environment chart's tooltip built "(+N muted)" by string-replacing the
+tile helper's output instead of calling `failingWithMuted()`; the test
+page's button said "Mute…" where the bar and the Review panel say
+"Mute"; a `.review-unit` rule with no user. Judged fit otherwise.
+
+**The user's first question in use: "how do I unmute via bulk
+select?"** There was no way; the bar had Mute only (`3748436`): an
+Unmute button after Mute, enabled whenever something is selected,
+posting the selection to `api/mutes/unmute`, which removes the mutes
+that exist and leaves the rest alone — checked with a mixed selection
+(5 selected, 4 muted → `unmuted: 4`). Tests stay assigned.
+
+**Driven end to end on the play server** (dev data, SQLite): mute 3
+still-failing tests (two for 7 days, one for 12 hours); `hours: 200`
+→ 400 naming the rule; a fresh mute without a reason → 400 naming the
+count; the headline moved by exactly 3 (`still_failing` 93 → 90,
+`muted_still_failing` 3, `muted_total` 3, pass-rate inputs unchanged);
+the Muted queue listed the three with prev/current result; an extension
+counted (`extensions` 1) and moved the mute into the 24-hour expiring
+list; unassigning dropped the mute with an `unmute`/`unassigned`
+history row; the fresh mute's reason was on the test as a comment.
+
+**Final counts, main checkout:** SQLite **2640 OK (skipped 1)**;
+whole suite with the MariaDB variants active, local 12.3: **3626 OK
+(skipped 71)**. **CI green on every leg for `3748436`** (PR #14),
+including both `mariadb:10.3` legs — the dual-backend suite and the
+suite on a database the ledger upgraded from v7. The operator note is
+current; the deploy is the user's, per that note.
+
+## 2026-10-01 — staging decommissioned
+
+The user: "We have now decommissioned staging." The old SQLite box — the
+original production host, then the staging instance that took the
+streams drop (v7→v10) on 2026-08-10 before production did — is gone.
+**Production (MariaDB) is now the only deployment**, and the drop of
+2026-10-01 is the first to go there without a rehearsal. SQLite is
+unchanged as a backend: equal, permanent, zero-setup, the development
+and CI default; what has gone is a *deployment*, not a *backend*. The
+operator note's staging step and staging rollback are reduced to a
+for-the-record paragraph; CLAUDE.md and the handover say the same.

@@ -22,6 +22,11 @@ Run it with the server STOPPED. The delete takes one transaction, and
 the derived tables it rewrites (``latest_runs``,
 ``current_assignments``) are what every estate-wide read goes through.
 
+A build that had only ever run on this environment has nothing left
+afterwards, so its entry goes too and the Build picker stops listing it
+(the ``streams`` line of the report counts those). A build that also
+ran elsewhere keeps its other environments' results.
+
 Space is not returned to the file system until a ``VACUUM``; pass
 ``--vacuum`` to do that here, in a maintenance window (it rewrites the
 whole file and takes an exclusive lock).

@@ -21,6 +21,7 @@ import {
   fetchJson,
   fetchProducts,
   formatTime,
+  mutedSuffix,
   showError,
 } from "./api.js";
 import { CATEGORY_LABELS, CATEGORY_ORDER, ageText } from "./compare.js";
@@ -165,13 +166,21 @@ function cardLink(card) {
  * call site omits it and gets the exact unlinked stat this page has
  * always rendered.
  */
-function buildStat(label, value) {
-  // The optional third (href) argument died with its one caller when
-  // the 2026-08-10 redesign moved the unassigned-failing count — and
-  // its F4 link — into the hero (buildHero above): the supporting
-  // stats below the hero are plain numbers again.
+function buildStat(label, value, muted) {
+  // The optional third argument is the count of muted failures (WP-40)
+  // left out of `value`: drawn "(+3 muted)" beside it, so a number that
+  // had failures taken out of it says so wherever it is shown. (The
+  // earlier third argument, an href, died with its one caller when the
+  // 2026-08-10 redesign moved the unassigned-failing count into the
+  // hero (buildHero above).)
   const stat = el("div", "watch-stat");
-  stat.appendChild(el("span", "watch-stat-value", String(value)));
+  const valueEl = el("span", "watch-stat-value", String(value));
+  const mutedText = mutedSuffix(muted || 0);
+  if (mutedText) {
+    valueEl.appendChild(
+      el("span", "watch-stat-muted", " (" + mutedText + ")"));
+  }
+  stat.appendChild(valueEl);
   stat.appendChild(el("span", "watch-stat-label", label));
   return stat;
 }
@@ -355,7 +364,10 @@ function buildOkCard(card, index, total) {
   div.appendChild(buildHero(card, nowMs));
 
   const verdict = el("div", "watch-card-verdict");
-  verdict.appendChild(buildStat("Failing", card.failing));
+  // Muted failures (WP-40) are not in "Failing"; named beside it as
+  // "(+3 muted)" so the subtraction is never silent. Absent on a server
+  // that does not send it, in which case nothing is drawn.
+  verdict.appendChild(buildStat("Failing", card.failing, card.muted));
   verdict.appendChild(buildStat("New failures", card.new_failures));
   verdict.appendChild(buildStat("Fixed", card.fixed));
   div.appendChild(verdict);

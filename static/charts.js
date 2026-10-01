@@ -329,11 +329,19 @@ export function stackedColumnChart(container, nights, series, options) {
  * items: [{label, sublabel, value, tooltipRows, onClick}] — bars scale to
  * the max value; every bar carries its value as a direct end label, so the
  * tooltip only adds context. Rows with onClick become real buttons.
+ *
+ * `item.extra` (optional, a count) is a SECOND segment appended to the
+ * end of the bar in the muted grey (WP-40: the muted failures beside
+ * the unmuted ones). The scale takes the longest value + extra, so the
+ * grey part is drawn to the same scale as the bar it extends; the end
+ * label stays the item's own `value`. Callers that never pass `extra`
+ * draw exactly what they always drew.
  */
 export function barRows(container, items, options) {
   clearNode(container);
   const opts = options || {};
-  const max = Math.max(1, ...items.map((item) => item.value));
+  const max = Math.max(
+    1, ...items.map((item) => item.value + (item.extra || 0)));
 
   for (const item of items) {
     const row = el(item.onClick ? "button" : "div", "bar-row");
@@ -354,6 +362,16 @@ export function barRows(container, items, options) {
     const pct = (item.value / max) * 100;
     fill.style.width = (item.value > 0 ? Math.max(pct, 1.5) : 0) + "%";
     track.appendChild(fill);
+    if (item.extra > 0) {
+      // The failing fill gives up its rounded end to the grey segment,
+      // which takes it over.
+      track.classList.add("bar-track-split");
+      fill.classList.add("bar-fill-open");
+      const extraFill = el("div", "bar-fill bar-muted");
+      extraFill.style.width =
+        Math.max((item.extra / max) * 100, 1.5) + "%";
+      track.appendChild(extraFill);
+    }
     row.appendChild(track);
 
     // valueText lets a caller print the value in its own units — "4m 12s"

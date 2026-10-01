@@ -98,9 +98,10 @@ jobs:
         run: python3 -m unittest discover -v
 
   python36-mariadb-upgraded:
-    # The SAME suite, against a database that reached v10 by running
-    # tools/upgrade_mariadb_schema.py over a v7 fixture instead of being
-    # created at v10 — which is exactly how production gets there.
+    # The SAME suite, against a database that reached the current schema
+    # version by running every step of tools/upgrade_mariadb_schema.py's
+    # ledger over a v7 fixture instead of being created at the current
+    # version — which is exactly how production gets there.
     #
     # Why this is a separate job rather than a flag on the one above: it
     # roughly doubles that job's runtime, and the two answer different
@@ -108,8 +109,8 @@ jobs:
     # one asks "does the app work on a database the upgrade tool built",
     # and it is the only place the upgrade path meets the whole suite on
     # PROD'S VERSION. tests/test_upgrade_mariadb_schema.py already proves
-    # 7→10 plus a schema diff on 10.3; this proves the result is not
-    # merely shaped right but actually serves.
+    # the whole ledger plus a schema diff on 10.3; this proves the result
+    # is not merely shaped right but actually serves.
     name: Python 3.6.8 + MariaDB 10.3 (suite on an UPGRADED database)
     runs-on: ubuntu-latest
     container: registry.access.redhat.com/ubi8/python-36

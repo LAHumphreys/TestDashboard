@@ -63,6 +63,7 @@ DASHBOARD_ROW_KEYS = {
     "assignment_stream_id",
     "retired_at",
     "retired_by",
+    "mute",
 }
 IMPORT_ERROR_KEYS = {
     "index",
@@ -634,6 +635,8 @@ class TestDetail(ApiCase):
                 "analytics",
                 "stream",
                 "stream_identity",
+                "mute",
+                "mute_history",
             },
         )
         self.assertEqual(data["environment"], self.ENV)
@@ -2496,6 +2499,7 @@ SUMMARY_QUEUE_ENTRY_KEYS = {
     "latest_comment",
     "failing_since",
     "last_pass_time",
+    "mute",
 }
 
 
@@ -2634,7 +2638,8 @@ class TestSummary(ApiCase):
         )
         self.assertEqual(
             data["top_failing_scripts"],
-            [{"environment": "env2", "script": "smoke.py", "failing": 1}],
+            [{"environment": "env2", "script": "smoke.py", "failing": 1,
+              "muted": 0}],
         )
         # The environments list stays unfiltered (it feeds the picker).
         self.assertEqual(data["environments"], ["env2", "linux-sim"])
@@ -2655,7 +2660,7 @@ class TestSummary(ApiCase):
         self.assertEqual(
             data["top_failing_scripts"][0],
             {"environment": "linux-sim", "script": "suite/alpha.py",
-             "failing": 2},
+             "failing": 2, "muted": 0},
         )
 
     def test_assigned_queue_after_assignment(self) -> None:
@@ -6601,3 +6606,554 @@ class TestCommentStreamId(ApiCase):
             "POST", self.path + "/comments",
             body={"username": "amy", "text": "hi", "stream_id": "nope"},
             expect=400)
+
+
+class MuteApiTest(ApiCase):
+    """WP-40: muted failures over HTTP — the three endpoints and
+    every place the mute shows up (summary headline and
+    queues, products, watch, dashboard, test detail).
+
+    Borrows TestSummary's seeded estate: linux-sim has a new failure
+    (test_new_fail) and a still-failing test (test_still_fail); env2
+    has a new failure (test_first, script smoke.py).
+    """
+
+    seed = TestSummary.seed
+
+    STILL = ("linux-sim", "suite/alpha.py", "test_still_fail")
+    FIRST = ("env2", "smoke.py", "test_first")
+    NEW = ("linux-sim", "suite/alpha.py", "test_new_fail")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.seed()
+
+    @staticmethod
+    def entry(key: Any, **extra: Any) -> Dict[str, Any]:
+        item = {
+            "environment": key[0], "script": key[1], "test_name": key[2],
+        }  # type: Dict[str, Any]
+        item.update(extra)
+        return item
+
+    def mute(
+        self, keys: List[Any], expect: int = 200, **overrides: Any
+    ) -> Dict[str, Any]:
+        body = {
+            "username": "amy", "reason": "known, JIRA-9", "hours": 24,
+            "assignee": "bob",
+            "tests": [self.entry(k) for k in keys],
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return self.call(
+            "POST", "/api/mutes/bulk", body=body, expect=expect)
+
+    def call_at(
+        self, when: datetime.datetime, method: str, path: str,
+        query: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, Any]:
+        """Like :meth:`call`, but with the request's clock at *when*."""
+        response = api.handle_api(
+            self.storage,
+            api.Request(method=method, path=path, query=query or {},
+                        body=b""),
+            now=lambda: when,
+        )
+        self.assertEqual(200, response.status, response.body)
+        return json.loads(response.body.decode("utf-8"))
+
+    # -- POST /api/mutes/bulk --------------------------------
+
+    def test_bulk_happy_path_and_extension(self) -> None:
+        self.assertEqual(
+            self.mute([self.STILL, self.FIRST]),
+            {"muted": 2, "extended": 0, "unknown": 0})
+        # Muting again IS an extension, and needs no reason.
+        again = self.call(
+            "POST", "/api/mutes/bulk",
+            body={"username": "amy", "hours": 72, "assignee": "bob",
+                  "tests": [self.entry(self.STILL)]})
+        self.assertEqual(
+            again, {"muted": 0, "extended": 1, "unknown": 0})
+
+    def test_bulk_counts_an_unknown_test(self) -> None:
+        data = self.mute([self.STILL, ("env2", "smoke.py", "nope")])
+        self.assertEqual(data["muted"], 1)
+        self.assertEqual(data["unknown"], 1)
+
+    def test_bulk_missing_stream_id_means_mainline(self) -> None:
+        self.mute([self.STILL])
+        detail = self.call("GET", test_path(*self.STILL))
+        self.assertEqual(
+            detail["mute"]["stream_id"], MAINLINE_STREAM_ID)
+
+    def test_bulk_hours_must_be_one_to_168(self) -> None:
+        for bad in (0, 169, -1, None, "7", True, 1.5):
+            error = self.mute([self.STILL], expect=400, hours=bad)
+            self.assertEqual(
+                error["error"],
+                "hours: must be a whole number from 1 to 168", repr(bad))
+        body = {
+            "username": "amy", "reason": "r", "assignee": "bob",
+            "tests": [self.entry(self.STILL)],
+        }  # type: Dict[str, Any]
+        error = self.call(
+            "POST", "/api/mutes/bulk", body=body, expect=400)
+        self.assertIn("hours", error["error"])
+        for good in (1, 12, 168):
+            self.mute([self.STILL], hours=good)
+
+    def test_bulk_assignee_is_required_and_validated(self) -> None:
+        body = {
+            "username": "amy", "reason": "r", "hours": 24,
+            "tests": [self.entry(self.STILL)],
+        }  # type: Dict[str, Any]
+        error = self.call(
+            "POST", "/api/mutes/bulk", body=body, expect=400)
+        self.assertIn("assignee", error["error"])
+        for bad in ("", "   ", 5, None):
+            error = self.mute([self.STILL], expect=400, assignee=bad)
+            self.assertIn("assignee", error["error"])
+
+    def test_bulk_a_deactivated_assignee_is_refused(self) -> None:
+        self.call("POST", "/api/users", body={"username": "gone"},
+                  expect=201)
+        self.call("PUT", "/api/users/gone/active",
+                  body={"active": False, "changed_by": "amy"})
+        error = self.mute([self.STILL], expect=400, assignee="gone")
+        self.assertIn("assignee", error["error"])
+
+    def test_bulk_username_is_required(self) -> None:
+        error = self.mute([self.STILL], expect=400, username="")
+        self.assertIn("username", error["error"])
+
+    def test_bulk_reason_is_needed_for_a_fresh_test_only(self) -> None:
+        error = self.mute([self.STILL], expect=400, reason=None)
+        self.assertTrue(error["error"].startswith("reason:"), error)
+        # Nothing was written by the refused request.
+        detail = self.call("GET", test_path(*self.STILL))
+        self.assertIsNone(detail["mute"])
+        error = self.mute([self.STILL], expect=400, reason=7)
+        self.assertIn("reason", error["error"])
+
+    def test_bulk_tests_validation(self) -> None:
+        error = self.mute([], expect=400)
+        self.assertIn("tests", error["error"])
+        error = self.call(
+            "POST", "/api/mutes/bulk", expect=400,
+            body={"username": "amy", "reason": "r", "hours": 24,
+                  "assignee": "bob"})
+        self.assertIn("tests", error["error"])
+        error = self.mute([self.STILL], expect=400, tests="x")
+        self.assertIn("tests", error["error"])
+        error = self.mute(
+            [self.STILL], expect=400,
+            tests=[{"environment": "e", "script": "s"}])
+        self.assertIn("tests[0].test_name", error["error"])
+
+    def test_bulk_on_a_build_mutes_that_stream_only(self) -> None:
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL",
+                   build="1.0",
+                   start_time="2026-07-26T04:00:00.000000",
+                   end_time="2026-07-26T04:00:03.000000"),
+        ])
+        build_id = self.call(
+            "GET", "/api/streams", query={"product": [""]}
+        )["streams"][0]["id"]
+        self.call(
+            "POST", "/api/mutes/bulk", body={
+                "username": "amy", "reason": "r", "hours": 48,
+                "assignee": "bob",
+                "tests": [self.entry(self.STILL, stream_id=build_id)],
+            })
+        path = test_path(*self.STILL)
+        on_build = self.call(
+            "GET", path, query={"stream": [str(build_id)]})
+        self.assertEqual(on_build["mute"]["stream_id"], build_id)
+        self.assertIsNone(self.call("GET", path)["mute"])
+        error = self.mute(
+            [self.STILL], expect=404,
+            tests=[self.entry(self.STILL, stream_id=999999)])
+        self.assertIn("stream", error["error"])
+
+    def test_wrong_method_is_405(self) -> None:
+        self.assert_405("GET", "/api/mutes/bulk", "POST")
+        self.assert_405("GET", "/api/mutes/unmute", "POST")
+        self.assert_405("POST", "/api/mutes", "GET")
+
+    # -- POST /api/mutes/unmute -------------------------------
+
+    def test_unmute_removes_the_mute_not_the_assignment(
+        self
+    ) -> None:
+        self.mute([self.STILL, self.FIRST])
+        data = self.call(
+            "POST", "/api/mutes/unmute",
+            body={"username": "amy",
+                  "tests": [self.entry(self.STILL),
+                            self.entry(self.NEW)]})
+        self.assertEqual(data, {"unmuted": 1})
+        detail = self.call("GET", test_path(*self.STILL))
+        self.assertIsNone(detail["mute"])
+        self.assertEqual(detail["assignee"], "bob")
+        self.assertEqual(
+            detail["mute_history"][0]["action"], "unmute")
+
+    def test_unmute_validation(self) -> None:
+        self.call("POST", "/api/mutes/unmute", expect=400,
+                  body={"tests": [self.entry(self.STILL)]})
+        self.call("POST", "/api/mutes/unmute", expect=400,
+                  body={"username": "amy", "tests": []})
+        self.call("POST", "/api/mutes/unmute", expect=400,
+                  body={"username": "amy"})
+
+    # -- /api/summary --------------------------------------------------
+
+    def test_headline_carries_muted_and_reduced_failing(
+        self
+    ) -> None:
+        self.mute([self.STILL, self.FIRST])
+        head = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        status = head["status"]
+        self.assertEqual(status["muted"], 2)
+        self.assertEqual(status["muted_total"], 2)
+        self.assertEqual(status["muted_new_failures"], 1)
+        self.assertEqual(status["muted_still_failing"], 1)
+        self.assertEqual(status["new_failures"], 1)
+        self.assertEqual(status["still_failing"], 0)
+        # Conserved against an unmuted estate (new 2, still 1) ...
+        self.assertEqual(
+            status["new_failures"] + status["muted_new_failures"], 2)
+        self.assertEqual(
+            status["still_failing"] + status["muted_still_failing"], 1)
+        # ... and muted failures still count as failures: 3 FAIL.
+        self.assertEqual(status["results"]["FAIL"], 3)
+        by_env = {e["environment"]: e for e in head["by_environment"]}
+        self.assertEqual(by_env["linux-sim"]["muted"], 1)
+        self.assertEqual(by_env["env2"]["muted"], 1)
+        self.assertEqual(by_env["env2"]["failed"], 0)
+        self.assertEqual(by_env["env2"]["new_failures"], 0)
+        self.assertEqual(by_env["linux-sim"]["failed"], 1)
+        totals = head["queue_totals"]
+        self.assertEqual(totals["muted"], 2)
+        self.assertEqual(totals["new_failures"], 1)
+        self.assertEqual(totals["still_failing"], 0)
+
+    def test_products_carry_muted(self) -> None:
+        self.call("PUT", "/api/environments/env2/product",
+                  body={"product": "Atlas", "username": "amy"})
+        before = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        atlas = [p for p in before["products"] if p["product"] == "Atlas"]
+        self.assertEqual(atlas[0]["failing"], 1)
+        self.assertEqual(atlas[0]["muted"], 0)
+        self.mute([self.FIRST])
+        for query in ({"parts": ["headline"]},
+                      {"parts": ["headline"], "product": ["Atlas"]},
+                      {"parts": ["headline"], "environment": ["env2"]}):
+            head = self.call("GET", "/api/summary", query=query)
+            atlas = [p for p in head["products"]
+                     if p["product"] == "Atlas"][0]
+            self.assertEqual(atlas["failing"], 0, query)
+            self.assertEqual(atlas["new_failures"], 0, query)
+            self.assertEqual(atlas["muted"], 1, query)
+
+    def test_the_muted_queue_and_its_rows(self) -> None:
+        self.mute([self.STILL, self.FIRST])
+        part = self.call(
+            "GET", "/api/summary",
+            query={"parts": ["queue"], "queue": ["muted"]})
+        self.assertEqual(part["kind"], "muted")
+        self.assertEqual(part["queue"]["total"], 2)
+        rows = {r["test_name"]: r for r in part["queue"]["tests"]}
+        self.assertEqual(set(rows), {"test_still_fail", "test_first"})
+        mute = rows["test_still_fail"]["mute"]
+        self.assertEqual(
+            set(mute),
+            {"reason", "muted_at", "expires_at", "muted_by",
+             "extensions", "live", "stream_id"})
+        self.assertTrue(mute["live"])
+        self.assertEqual(mute["reason"], "known, JIRA-9")
+        self.assertEqual(mute["muted_by"], "amy")
+        self.assertEqual(mute["extensions"], 0)
+        self.assertEqual(
+            mute["expires_at"],
+            format_iso(NOW + datetime.timedelta(days=1)))
+        # Ownership: muting assigned them.
+        self.assertEqual(rows["test_first"]["assignee"], "bob")
+        # The muted tests are no longer in the failing queues,
+        # and the rows of every other queue carry a null.
+        full = self.call("GET", "/api/summary")
+        self.assertEqual(
+            [r["test_name"] for r in full["queues"]["new_failures"]["tests"]],
+            ["test_new_fail"])
+        self.assertEqual(full["queues"]["still_failing"]["tests"], [])
+        self.assertIsNone(
+            full["queues"]["new_failures"]["tests"][0]["mute"])
+
+    FIXED = ("linux-sim", "suite/alpha.py", "test_fixed")
+
+    def test_a_passing_muted_test_is_listed_with_its_result(self) -> None:
+        before = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        self.mute([self.STILL, self.FIXED])
+        head = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        status = head["status"]
+        # Only the failing one comes off the failing figures (still_failing
+        # here) and is counted beside them ...
+        self.assertEqual(status["muted"], 1)
+        self.assertEqual(status["muted_still_failing"], 1)
+        self.assertEqual(status["muted_new_failures"], 0)
+        self.assertEqual(status["muted_total"], 2)
+        self.assertEqual(
+            status["still_failing"], before["status"]["still_failing"] - 1)
+        # ... and a muted failure is still a failure: the pass rate's
+        # inputs are exactly what they were.
+        self.assertEqual(
+            status["results"], before["status"]["results"])
+        self.assertEqual(
+            status["recent_results"], before["status"]["recent_results"])
+        by_env = {e["environment"]: e for e in head["by_environment"]}
+        self.assertEqual(by_env["linux-sim"]["muted"], 1)
+        # ... but the tab badge counts every live mute, and so does
+        # the queue.
+        part = self.call(
+            "GET", "/api/summary",
+            query={"parts": ["queue"], "queue": ["muted"]})
+        self.assertEqual(head["queue_totals"]["muted"], 2)
+        self.assertEqual(part["queue"]["total"], 2)
+        rows = {r["test_name"]: r for r in part["queue"]["tests"]}
+        self.assertEqual(
+            {name: row["result"] for name, row in rows.items()},
+            {"test_still_fail": "FAIL", "test_fixed": "PASS"})
+
+    def test_top_scripts_carry_muted_beside_failing(self) -> None:
+        self.mute([self.STILL])
+        data = self.call("GET", "/api/summary", query={"parts": ["headline"]})
+        top = {(e["environment"], e["script"]): e
+               for e in data["top_failing_scripts"]}
+        self.assertEqual(
+            top[("linux-sim", "suite/alpha.py")]["failing"], 1)
+        self.assertEqual(
+            top[("linux-sim", "suite/alpha.py")]["muted"], 1)
+        self.assertEqual(top[("env2", "smoke.py")]["muted"], 0)
+
+    def test_hours_set_the_expiry_exactly(self) -> None:
+        self.mute([self.STILL], hours=12)
+        mute = self.call("GET", test_path(*self.STILL))["mute"]
+        self.assertEqual(
+            mute["expires_at"],
+            format_iso(NOW + datetime.timedelta(hours=12)))
+
+    def test_the_reason_is_posted_as_a_comment(self) -> None:
+        self.mute([self.STILL], reason="rig is flaky")
+        comments = self.call(
+            "GET", test_path(*self.STILL) + "/comments")["comments"]
+        self.assertEqual([c["text"] for c in comments], ["rig is flaky"])
+        self.assertEqual(comments[0]["author"], "amy")
+
+    def test_expiry_returns_the_tests_to_the_failing_figures(self) -> None:
+        self.mute([self.STILL, self.FIRST])
+        later = NOW + datetime.timedelta(hours=25)
+        head = self.call_at(
+            later, "GET", "/api/summary", {"parts": ["headline"]})
+        self.assertEqual(head["status"]["muted"], 0)
+        self.assertEqual(head["status"]["new_failures"], 2)
+        self.assertEqual(head["status"]["still_failing"], 1)
+        self.assertEqual(head["queue_totals"]["muted"], 0)
+        full = self.call_at(later, "GET", "/api/summary")
+        self.assertEqual(full["queues"]["muted"]["tests"], [])
+        self.assertIn(
+            "test_still_fail",
+            [r["test_name"] for r in full["queues"]["still_failing"]["tests"]])
+        self.assertIn(
+            "test_first",
+            [r["test_name"] for r in full["queues"]["new_failures"]["tests"]])
+
+    def test_full_payload_and_split_parts_agree(self) -> None:
+        self.mute([self.STILL, self.FIRST])
+        full = self.call("GET", "/api/summary")
+        head = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        self.assertEqual(full["status"]["muted"], 2)
+        self.assertEqual(
+            head, {k: v for k, v in full.items() if k != "queues"})
+        self.assertEqual(
+            full["queue_totals"],
+            {k: q["total"] for k, q in full["queues"].items()})
+        for kind in QUEUE_KINDS:
+            part = self.call(
+                "GET", "/api/summary",
+                query={"parts": ["queue"], "queue": [kind]})
+            self.assertEqual(part["queue"], full["queues"][kind], kind)
+        self.assertEqual(
+            full["status"]["muted_total"],
+            full["queues"]["muted"]["total"])
+        self.assertEqual(
+            sum(e["muted"] for e in full["by_environment"]),
+            full["status"]["muted"])
+
+    # -- /api/watch ----------------------------------------------------
+
+    def test_watch_cards_report_muted(self) -> None:
+        self.call("PUT", "/api/environments/env2/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.mute([self.FIRST])
+        cards = self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:env2", "p:Atlas", "e:linux-sim"]})["cards"]
+        by_spec = {c["spec"]: c for c in cards}
+        for spec in ("e:env2", "p:Atlas"):
+            self.assertEqual(by_spec[spec]["failing"], 0, spec)
+            self.assertEqual(by_spec[spec]["new_failures"], 0, spec)
+            self.assertEqual(by_spec[spec]["muted"], 1, spec)
+        self.assertEqual(by_spec["e:linux-sim"]["muted"], 0)
+        self.assertGreater(by_spec["e:linux-sim"]["failing"], 0)
+
+    # -- /api/dashboard ------------------------------------------------
+
+    def test_dashboard_muted_filter_and_row_field(self) -> None:
+        self.mute([self.STILL])
+        failing = {"result": ["FAIL"]}
+        everything = self.call("GET", "/api/dashboard", query=failing)
+        by_name = {t["test_name"]: t for t in everything["tests"]}
+        self.assertIsNotNone(by_name["test_still_fail"]["mute"])
+        self.assertTrue(by_name["test_still_fail"]["mute"]["live"])
+        self.assertIsNone(by_name["test_new_fail"]["mute"])
+
+        only = self.call(
+            "GET", "/api/dashboard",
+            query={"muted": ["true"]})
+        self.assertEqual(only["total"], 1)
+        self.assertEqual(
+            [t["test_name"] for t in only["tests"]], ["test_still_fail"])
+        rest = self.call(
+            "GET", "/api/dashboard",
+            query={"muted": ["false"], "result": ["FAIL"]})
+        self.assertNotIn(
+            "test_still_fail", [t["test_name"] for t in rest["tests"]])
+        self.assertEqual(rest["total"], len(rest["tests"]))
+        error = self.call(
+            "GET", "/api/dashboard",
+            query={"muted": ["maybe"]}, expect=400)
+        self.assertIn("muted", error["error"])
+
+    def test_dashboard_expired_mute_is_flagged_not_live(
+        self
+    ) -> None:
+        self.mute([self.STILL])
+        later = NOW + datetime.timedelta(hours=25)
+        data = self.call_at(
+            later, "GET", "/api/dashboard",
+            {"muted": ["true"]})
+        self.assertEqual(data["total"], 0)
+        data = self.call_at(
+            later, "GET", "/api/dashboard", {"result": ["FAIL"]})
+        row = [t for t in data["tests"]
+               if t["test_name"] == "test_still_fail"][0]
+        self.assertFalse(row["mute"]["live"])
+
+    # -- test detail ---------------------------------------------------
+
+    def test_detail_mute_and_history(self) -> None:
+        path = test_path(*self.STILL)
+        detail = self.call("GET", path)
+        self.assertIsNone(detail["mute"])
+        self.assertEqual(detail["mute_history"], [])
+        self.mute([self.STILL])
+        self.mute([self.STILL], hours=48, reason="still looking")
+        detail = self.call("GET", path)
+        self.assertEqual(detail["mute"]["extensions"], 1)
+        self.assertEqual(detail["mute"]["reason"], "still looking")
+        history = detail["mute_history"]
+        self.assertEqual([h["action"] for h in history],
+                         ["extend", "mute"])
+        self.assertEqual(
+            set(history[0]),
+            {"id", "stream_id", "action", "reason", "expires_at", "actor",
+             "acted_at"})
+        self.assertEqual(history[0]["actor"], "amy")
+        self.assertEqual(
+            history[0]["expires_at"],
+            format_iso(NOW + datetime.timedelta(days=2)))
+
+    def test_unassigning_drops_the_mute(self) -> None:
+        self.mute([self.STILL])
+        path = test_path(*self.STILL)
+        self.call(
+            "PUT", path + "/assignee",
+            body={"username": None, "assigned_by": "amy"})
+        detail = self.call("GET", path)
+        self.assertIsNone(detail["mute"])
+        self.assertIsNone(detail["assignee"])
+        self.assertEqual(detail["mute_history"][0]["action"],
+                         "unmute")
+        self.assertEqual(detail["mute_history"][0]["reason"],
+                         "unassigned")
+        head = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        self.assertEqual(head["status"]["muted"], 0)
+
+    def test_reassigning_keeps_the_mute(self) -> None:
+        self.mute([self.STILL])
+        path = test_path(*self.STILL)
+        self.call(
+            "PUT", path + "/assignee",
+            body={"username": "carol", "assigned_by": "amy"})
+        self.assertIsNotNone(self.call("GET", path)["mute"])
+
+    # -- GET /api/mutes --------------------------------------
+
+    def test_expiring_list(self) -> None:
+        self.mute([self.STILL], hours=24)
+        self.mute([self.FIRST], hours=120)
+        data = self.call("GET", "/api/mutes")
+        self.assertEqual(data["generated_at"], format_iso(NOW))
+        self.assertEqual(data["within_hours"], 24)
+        (item,) = data["mutes"]
+        self.assertEqual(item["test_name"], "test_still_fail")
+        self.assertEqual(
+            set(item),
+            {"environment", "script", "test_name", "stream_id",
+             "stream_kind", "stream_name", "reason", "muted_at",
+             "expires_at", "muted_by", "extensions", "live",
+             "result", "assignee"})
+        self.assertEqual(item["stream_id"], MAINLINE_STREAM_ID)
+        self.assertEqual(item["stream_kind"], "mainline")
+        self.assertTrue(item["live"])
+        self.assertEqual(item["result"], "FAIL")
+        self.assertEqual(item["assignee"], "bob")
+        wide = self.call(
+            "GET", "/api/mutes",
+            query={"expiring_within_hours": ["168"]})
+        self.assertEqual(
+            [i["test_name"] for i in wide["mutes"]],
+            ["test_still_fail", "test_first"])
+        self.assertEqual(wide["within_hours"], 168)
+
+    def test_expiring_list_includes_the_already_expired(self) -> None:
+        self.mute([self.STILL], hours=24)
+        data = self.call_at(
+            NOW + datetime.timedelta(hours=25), "GET",
+            "/api/mutes")
+        (item,) = data["mutes"]
+        self.assertFalse(item["live"])
+
+    def test_expiring_list_stream_filter_and_validation(self) -> None:
+        self.mute([self.STILL], hours=24)
+        data = self.call(
+            "GET", "/api/mutes",
+            query={"stream": [str(MAINLINE_STREAM_ID)]})
+        self.assertEqual(len(data["mutes"]), 1)
+        self.call("GET", "/api/mutes",
+                  query={"stream": ["999999"]}, expect=404)
+        self.call("GET", "/api/mutes",
+                  query={"stream": ["x"]}, expect=400)
+        for bad in ("0", "169", "x"):
+            error = self.call(
+                "GET", "/api/mutes",
+                query={"expiring_within_hours": [bad]}, expect=400)
+            self.assertIn("expiring_within_hours", error["error"])

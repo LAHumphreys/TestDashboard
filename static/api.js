@@ -507,6 +507,135 @@ export function formatTime(iso) {
 }
 
 /**
+ * "in 3 days" / "in 5 hours" / "in 20 minutes" / "expired" for a
+ * mute's expires_at (WP-40). DISPLAY ONLY: whether one is still
+ * in force is the server's `live` flag, computed against the server's own
+ * clock; this reads the browser's, so it can disagree by a few minutes
+ * and must never decide anything.
+ */
+export function relativeExpiry(expiresAt, nowMs) {
+  if (typeof expiresAt !== "string" || expiresAt.length < 19) {
+    return "—";
+  }
+  // The server's timestamps are UTC with no zone suffix.
+  const then = Date.parse(expiresAt.slice(0, 19) + "Z");
+  if (isNaN(then)) {
+    return formatTime(expiresAt);
+  }
+  const ms = then - (nowMs === undefined ? Date.now() : nowMs);
+  if (ms <= 0) {
+    return "expired";
+  }
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) {
+    return "in " + Math.max(minutes, 1) + (minutes <= 1 ? " minute"
+      : " minutes");
+  }
+  const hours = Math.round(ms / 3600000);
+  if (hours < 48) {
+    return "in " + hours + (hours === 1 ? " hour" : " hours");
+  }
+  const days = Math.round(ms / 86400000);
+  return "in " + days + " days";
+}
+
+/** "by alice · expires in 3 days · extended 2×" — the small print under
+ * a mute's reason (or the whole line when `withReason`). */
+export function muteDetail(mute, withReason) {
+  const parts = [];
+  parts.push("by " + mute.muted_by);
+  parts.push(mute.live === false ? "expired"
+    : "expires " + relativeExpiry(mute.expires_at));
+  if (withReason && mute.reason) {
+    parts.push(mute.reason);
+  }
+  if (mute.extensions > 0) {
+    parts.push("extended " + mute.extensions + "×");
+  }
+  return parts.join(" · ");
+}
+
+/** "+3 muted", or "" for none: the wording every place that shows a
+ * failing number uses for the muted failures left out of it (WP-40).
+ * One helper so the format cannot drift between the tiles, the Watch
+ * cards and the chart tooltips. */
+export function mutedSuffix(count) {
+  return count > 0 ? "+" + count.toLocaleString() + " muted" : "";
+}
+
+/** "12" or "12 (+3 muted)": a failing figure with the muted failures
+ * left out of it named beside it. */
+export function failingWithMuted(count, muted) {
+  const suffix = mutedSuffix(muted || 0);
+  return count.toLocaleString() + (suffix ? " (" + suffix + ")" : "");
+}
+
+/** The ONE list of mute durations, in hours (the wire unit; the server
+ * accepts any whole number 1..168, the UI offers these). Every control
+ * that sets a duration -- the selection bar, the review panel, the test
+ * page, the Expiring list's Extend -- builds its <select> from
+ * muteDurationSelect() so the choices cannot drift apart. */
+export const MUTE_DURATIONS = [
+  { hours: 12, label: "12 hours" },
+  { hours: 24, label: "1 day" },
+  { hours: 48, label: "2 days" },
+  { hours: 72, label: "3 days" },
+  { hours: 120, label: "5 days" },
+  { hours: 168, label: "7 days" },
+];
+
+/**
+ * A <select> of MUTE_DURATIONS behind a placeholder option "for…"
+ * (value ""). `defaultValue` is the hours to start on, as a number or
+ * string -- the Extend controls pass 168 so one click still works; the
+ * Mute controls pass nothing and start on the placeholder, which is
+ * what keeps their button disabled until a duration is chosen.
+ * Read the choice with Number(select.value) (0 when none).
+ */
+export function muteDurationSelect(className, defaultValue) {
+  const select = el("select", className);
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "for…";
+  select.appendChild(placeholder);
+  for (const choice of MUTE_DURATIONS) {
+    const option = document.createElement("option");
+    option.value = String(choice.hours);
+    option.textContent = choice.label;
+    select.appendChild(option);
+  }
+  select.value = defaultValue === undefined || defaultValue === null
+    ? "" : String(defaultValue);
+  select.setAttribute("aria-label", "How long to mute for");
+  return select;
+}
+
+/** The small "muted" pill for a row whose test is currently
+ * muted, or null. An expired mute shows nothing. */
+export function mutedTag(entry) {
+  const mute = entry && entry.mute;
+  if (!mute || !mute.live) {
+    return null;
+  }
+  const tag = el("span", "mute-tag", "muted");
+  tag.title = mute.reason + " — " + muteDetail(mute);
+  return tag;
+}
+
+/** Select `name` in a userPickerSelect once its options exist. */
+export function preselectUser(select, name) {
+  if (!name) {
+    return;
+  }
+  select.value = name;
+  loadUsers().then(() => {
+    if (!select.value) {
+      select.value = name;
+    }
+  });
+}
+
+/**
  * Human-friendly duration from seconds (e.g. "1.9s", "2m 05s", "8h 40m").
  *
  * Hours matter now that whole suites are being totalled: "520m 22s" is
