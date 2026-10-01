@@ -3942,3 +3942,28 @@ shipping.
 in one row; ending an acknowledgment on a pass; any change to
 `FAILED_AS_EXPECTED` handling; a sweep of expired rows (tiny, human-
 rate; revisit if it ever matters).
+
+## 2026-10-01 — WP-40 spec addendum: four more decisions before the build (user, going to bed)
+
+Asked and answered interactively, same night. These amend the spec
+entry above; where they conflict, these win.
+
+1. **Ships in the drop of 2026-10-01, alongside WP-39.** One drop, one
+   operator note (`docs/drops/2026-10-01.md`, re-written to say a
+   migration runs), one `whatsnew` section. The WP-40 branch is
+   fast-forwarded into `drop-2026-10-01` when green.
+2. **An acknowledgment is owned.** Acknowledging assigns: the form has
+   an assignee box, defaulting to the test's current assignee if it has
+   one, else to the acknowledger; the bulk action assigns the whole
+   selection to that one person, in the same transaction as the
+   acknowledgment, through the existing assignment path (history +
+   current, stream provenance as WP-35).
+3. **Unassigning drops the acknowledgment.** In the same transaction,
+   with a history row (`clear`, reason "unassigned"); the test
+   reappears as failing. Assignment is per triple and acknowledgment
+   per triple+stream, so an unassign drops every stream's
+   acknowledgment of that triple. Reassigning to another person keeps
+   it. The acknowledgment expiring leaves the assignment alone.
+4. **No indefinite acknowledgment anywhere.** `until` is NOT NULL on
+   both tables; `days` is 1–7 on every stream, builds included; `null`
+   is a 400 and storage raises. One number, one rule.

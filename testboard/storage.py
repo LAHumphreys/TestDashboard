@@ -853,7 +853,71 @@ MIGRATIONS = [
             "python: rebuild_script_hours_with_stream",
         ],
     ),
+    (
+        11,
+        [
+            # WP-40: acknowledged failures. A person acknowledges a
+            # FAILING test on one stream, with a reason, for 1..7 days
+            # (ACKNOWLEDGMENT_MAX_DAYS — never indefinite, builds
+            # included), and the failing counts everywhere exclude it
+            # and show the acknowledged count beside them. Human-
+            # entered state on the triple PLUS stream_id — unlike
+            # comments/assignments/retirement (stream-agnostic), an
+            # acknowledgment is of THIS stream's failure.
+            #
+            # `test_acknowledgments` is the CURRENT acknowledgment per
+            # (stream, triple); an expired row stays (it feeds the
+            # expiring list and keeps the extension count) and is
+            # simply not LIVE — live means expires_at > now, compared
+            # at request time. `acknowledgment_history` is one row per
+            # act (acknowledge / extend / clear), the record.
+            #
+            # Creates only; touches no existing table — so on MariaDB
+            # (tools/upgrade_mariadb_schema.py's ledger, step 10->11,
+            # alters=()) the server may keep running through it.
+            # Takes 11 from WP-15's parked reservation, which moves to
+            # 12 — the sixth time (UPGRADE_PLAN.md §1).
+            """
+            CREATE TABLE test_acknowledgments (
+                stream_id INTEGER NOT NULL,
+                environment TEXT NOT NULL,
+                script TEXT NOT NULL,
+                test_name TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                acknowledged_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                acknowledged_by TEXT NOT NULL REFERENCES users(username),
+                extensions INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (stream_id, environment, script, test_name)
+            )
+            """,
+            # The expiring list reads by time; everything else reads
+            # by the primary key.
+            "CREATE INDEX idx_test_acknowledgments_expiry "
+            "ON test_acknowledgments (expires_at)",
+            """
+            CREATE TABLE acknowledgment_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stream_id INTEGER NOT NULL,
+                environment TEXT NOT NULL,
+                script TEXT NOT NULL,
+                test_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT,
+                expires_at TEXT,
+                actor TEXT NOT NULL REFERENCES users(username),
+                acted_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX idx_acknowledgment_history_triple "
+            "ON acknowledgment_history (environment, script, test_name, id)",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
+
+#: WP-40: the longest an acknowledgment can run, on any stream. Refused
+#: above this by the API AND by storage (:meth:`Storage.acknowledge_tests`).
+ACKNOWLEDGMENT_MAX_DAYS = 7
 
 #: Prefix marking a migration step that runs Python instead of SQL.
 #:
@@ -1241,6 +1305,10 @@ class TestSummaryRow(NamedTuple):
     #: Newest comment on this test — only populated when the caller asked
     #: for it (``with_latest_comment``), otherwise None.
     latest_comment: Optional["LatestComment"]
+    #: WP-40: this stream's CURRENT acknowledgment of the test, live or
+    #: expired (the reader compares ``expires_at`` with its own now);
+    #: None when there has never been one, or it was cleared.
+    acknowledgment: Optional["Acknowledgment"]
 
 
 class TestStatusRow(NamedTuple):
@@ -1266,7 +1334,68 @@ class TestStatusRow(NamedTuple):
     retired_at: Optional[datetime.datetime]
     retired_by: Optional[str]
     latest_comment: Optional["LatestComment"]
+    acknowledgment: Optional["Acknowledgment"]
     prev_result: Optional[Result]
+
+
+class Acknowledgment(NamedTuple):
+    """WP-40: one stream's current acknowledgment of a failing test.
+
+    ``expires_at`` is compared with the READER's now — a row is "live"
+    while ``expires_at > now`` and is otherwise merely on record (it
+    keeps its ``extensions`` count and feeds the expiring list).
+    """
+
+    stream_id: int
+    environment: str
+    script: str
+    test_name: str
+    reason: str
+    acknowledged_at: datetime.datetime
+    expires_at: datetime.datetime
+    acknowledged_by: str
+    #: How many times it has been extended since it was first made.
+    #: Four in a row is visible on purpose — that is the ratchet.
+    extensions: int
+
+
+class AcknowledgmentAct(NamedTuple):
+    """One row of ``acknowledgment_history``: who did what, when."""
+
+    id: int
+    stream_id: int
+    environment: str
+    script: str
+    test_name: str
+    #: ``acknowledge``, ``extend`` or ``clear``.
+    action: str
+    reason: Optional[str]
+    expires_at: Optional[datetime.datetime]
+    actor: str
+    acted_at: datetime.datetime
+
+
+class AcknowledgeResult(NamedTuple):
+    """What :meth:`Storage.acknowledge_tests` did with a selection."""
+
+    #: Tests acknowledged afresh.
+    acknowledged: int
+    #: Tests that already had an acknowledgment on that stream, extended.
+    extended: int
+    #: Requested keys with no ``latest_runs`` row on that stream —
+    #: skipped, never a hard failure (a stale page).
+    unknown: int
+
+
+class ExpiringAcknowledgment(NamedTuple):
+    """One row of the Open Actions "Expiring" queue: an acknowledgment
+    running out (or run out) on a test that is still failing."""
+
+    acknowledgment: Acknowledgment
+    stream_kind: str
+    stream_name: str
+    result: Result
+    assignee: Optional[str]
 
 
 class DailyResultCount(NamedTuple):
@@ -1718,6 +1847,8 @@ _ENVIRONMENT_TABLES = (
     "assignments",
     "comments",
     "test_retirements",
+    "test_acknowledgments",
+    "acknowledgment_history",
     "environment_expectations",
     "environment_products",
     "activity_hours",
@@ -1736,11 +1867,31 @@ _SIZE_REPORT_TTL_SECONDS = 60
 QUEUE_KINDS = (
     "new_failures",
     "still_failing",
+    "acknowledged",
     "fixed",
     "unexpected_passes",
     "not_run",
     "assigned",
 )
+
+#: WP-40: the row's own stream's current acknowledgment, reached by
+#: its primary key — one seek per row, on a table of human-rate size.
+#: Part of every dashboard/queue join so a row can carry its
+#: acknowledgment and a predicate can ask whether it is live.
+_ACKNOWLEDGMENT_JOIN = (
+    "LEFT JOIN test_acknowledgments AS ta "
+    "  ON ta.stream_id = lr.stream_id "
+    " AND ta.environment = lr.environment "
+    " AND ta.script = lr.script "
+    " AND ta.test_name = lr.test_name"
+)
+
+#: WP-40: the ONE definition of "acknowledged", as SQL over the join
+#: above — live iff ``expires_at > now``, ``now`` bound as a parameter
+#: (never a database clock: both backends compare the same ISO text).
+#: :meth:`Storage.acknowledged_cells` is the same rule for the rollup.
+_ACK_LIVE = "(ta.expires_at IS NOT NULL AND ta.expires_at > ?)"
+_NOT_ACK_LIVE = "(ta.expires_at IS NULL OR ta.expires_at <= ?)"
 
 #: The five categories a stream-vs-baseline comparison classifies every
 #: test into (docs/STREAMS_PLAN.md §3.5), plus the implicit "agree"
@@ -1760,12 +1911,22 @@ COMPARE_CATEGORIES = (
 #: Queues whose predicate needs the recency cutoff bound to it.
 _STALE_QUEUES = ("not_run",)
 
+#: Queues whose predicate needs the request's ``now`` bound to it (WP-40):
+#: the two failing queues EXCLUDE live acknowledgments, the acknowledged
+#: queue IS them. Same rule, three spellings, one parameter each.
+_NOW_QUEUES = ("new_failures", "still_failing", "acknowledged")
+
 _QUEUE_PREDICATES = {
     "new_failures": (
         "lr.result = '{fail}' AND "
-        "(lr.prev_result IS NULL OR lr.prev_result <> '{fail}')"
+        "(lr.prev_result IS NULL OR lr.prev_result <> '{fail}') AND "
+        + _NOT_ACK_LIVE
     ),
-    "still_failing": "lr.result = '{fail}' AND lr.prev_result = '{fail}'",
+    "still_failing": (
+        "lr.result = '{fail}' AND lr.prev_result = '{fail}' AND "
+        + _NOT_ACK_LIVE
+    ),
+    "acknowledged": "lr.result = '{fail}' AND " + _ACK_LIVE,
     "fixed": "lr.prev_result = '{fail}' AND lr.result <> '{fail}'",
     "unexpected_passes": "lr.result = '{up}'",
     # Stopped reporting. The cutoff is bound as a parameter, not
@@ -1933,6 +2094,10 @@ _STATUS_COLUMN_NAMES = (
     "lr.result", "lr.start_time", "r.end_time", "r.source_link",
     "r.known_failure_reason", "ca.assignee", "ca.stream_id",
     "tr.retired_at", "tr.retired_by",
+    # WP-40: the row's own stream's current acknowledgment, via the
+    # LEFT JOIN on its primary key in _LATEST_JOIN.
+    "ta.reason", "ta.acknowledged_at", "ta.expires_at",
+    "ta.acknowledged_by", "ta.extensions", "ta.stream_id",
 )
 
 #: Index of the first latest-comment column in a row that includes them,
@@ -1974,6 +2139,17 @@ def _summary_row_from(
         retired_at=None if row[11] is None else model.parse_iso(row[11]),
         retired_by=row[12],
         latest_comment=latest_comment,
+        acknowledgment=(
+            None if row[15] is None else Acknowledgment(
+                stream_id=int(row[18]),
+                environment=row[0], script=row[1], test_name=row[2],
+                reason=row[13],
+                acknowledged_at=model.parse_iso(row[14]),
+                expires_at=model.parse_iso(row[15]),
+                acknowledged_by=row[16],
+                extensions=int(row[17]),
+            )
+        ),
     )
 
 
@@ -3021,7 +3197,8 @@ class Storage:
         "LEFT JOIN test_retirements AS tr "
         "  ON tr.environment = lr.environment "
         " AND tr.script = lr.script "
-        " AND tr.test_name = lr.test_name"
+        " AND tr.test_name = lr.test_name "
+        + _ACKNOWLEDGMENT_JOIN
     )
 
     #: The same retirement join for queries that count rather than return
@@ -3035,7 +3212,8 @@ class Storage:
         "LEFT JOIN test_retirements AS tr "
         "  ON tr.environment = lr.environment "
         " AND tr.script = lr.script "
-        " AND tr.test_name = lr.test_name"
+        " AND tr.test_name = lr.test_name "
+        + _ACKNOWLEDGMENT_JOIN
     )
 
     #: Excludes tests approved as no longer in the suite.
@@ -3084,6 +3262,8 @@ class Storage:
         assignment_origin: Optional[str] = None,
         assigned_only: bool = False,
         open_items: bool = False,
+        acknowledged: Optional[bool] = None,
+        now: Optional[datetime.datetime] = None,
     ) -> Tuple[List[str], List[Any]]:
         """Build the shared WHERE clauses for the dashboard list and count.
 
@@ -3187,6 +3367,13 @@ class Storage:
             params.extend(
                 [Result.FAIL.value, Result.UNEXPECTED_PASS.value])
 
+        # WP-40: True keeps only tests under a live acknowledgment,
+        # False excludes them; None (every caller before WP-40) does
+        # not look. A row carries its acknowledgment either way.
+        if acknowledged is not None:
+            clauses.append(_ACK_LIVE if acknowledged else _NOT_ACK_LIVE)
+            params.append(model.format_iso(now or model.utcnow()))
+
         if assignment_origin == "build":
             clauses.append("(ca.stream_id IS NOT NULL AND ca.stream_id != ?)")
             params.append(MAINLINE_STREAM_ID)
@@ -3237,8 +3424,12 @@ class Storage:
         assignment_origin: Optional[str] = None,
         assigned_only: bool = False,
         open_items: bool = False,
+        acknowledged: Optional[bool] = None,
+        now: Optional[datetime.datetime] = None,
     ) -> List[TestSummaryRow]:
         """Return ONE PAGE of the latest run per test, never with ``output``.
+
+        *acknowledged*/*now* (WP-40) — see :meth:`_dashboard_filters`.
 
         Filters: exact *environment*, exact *script*, ``result IN``
         *results* (an explicitly empty sequence matches nothing), *q* as a
@@ -3281,6 +3472,7 @@ class Storage:
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
             stream_id, assignment_origin, assigned_only, open_items,
+            acknowledged, now,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -3317,6 +3509,8 @@ class Storage:
         assignment_origin: Optional[str] = None,
         assigned_only: bool = False,
         open_items: bool = False,
+        acknowledged: Optional[bool] = None,
+        now: Optional[datetime.datetime] = None,
     ) -> int:
         """Exact number of tests matching the same filters as :meth:`dashboard`."""
         result_values = (
@@ -3328,6 +3522,7 @@ class Storage:
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
             stream_id, assignment_origin, assigned_only, open_items,
+            acknowledged, now,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
         if clauses:
@@ -4275,6 +4470,8 @@ class Storage:
         conn.execute("BEGIN IMMEDIATE")
         try:
             self._clear_stream_origin_tags(conn, stream_id)
+            deleted["test_acknowledgments"] = (
+                self._delete_stream_acknowledgments(conn, stream_id))
             cursor = conn.execute(
                 "DELETE FROM run_outputs WHERE run_id IN "
                 "(SELECT id FROM runs WHERE stream_id = ?)", (stream_id,)
@@ -4572,6 +4769,7 @@ class Storage:
         ).fetchone()[0]
         if newest is None:
             self._clear_stream_origin_tags(conn, stream_id)
+            self._delete_stream_acknowledgments(conn, stream_id)
             cursor = conn.execute(
                 "DELETE FROM streams WHERE id = ?", (stream_id,))
             return int(cursor.rowcount)
@@ -4648,6 +4846,7 @@ class Storage:
                 if int(cursor.rowcount) != 1:
                     continue
                 self._clear_stream_origin_tags(conn, stream_id)
+                self._delete_stream_acknowledgments(conn, stream_id)
                 removed.append(Stream(
                     stream_id=stream_id, product=row[1], kind=row[2],
                     name=row[3], first_seen=model.parse_iso(row[4]),
@@ -5676,8 +5875,13 @@ class Storage:
         stale_before: Optional[datetime.datetime] = None,
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
+        now: Optional[datetime.datetime] = None,
     ) -> Tuple[str, List[Any]]:
         """Build the WHERE clause for one triage queue.
+
+        *now* (WP-40) is bound into the three :data:`_NOW_QUEUES`
+        predicates — "live" is ``expires_at > now`` and nothing else.
+        ``None`` means the wall clock; the API always passes its own.
 
         Retired tests are always excluded: approving a test as no longer
         in the suite is precisely a statement that it should stop
@@ -5709,6 +5913,8 @@ class Storage:
                     "queue {!r} needs stale_before".format(kind)
                 )
             params.append(model.format_iso(stale_before))
+        if kind in _NOW_QUEUES:
+            params.append(model.format_iso(now or model.utcnow()))
         if environment is not None:
             sql += " AND lr.environment = ?"
             params.append(environment)
@@ -5733,8 +5939,17 @@ class Storage:
         with_latest_comment: bool = False,
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
+        now: Optional[datetime.datetime] = None,
     ) -> List[TestStatusRow]:
         """Return one triage queue (see :data:`QUEUE_KINDS`), newest info first.
+
+        *now* (WP-40) — see :meth:`_queue_clause`. For the three queues
+        that read acknowledgments the memo is keyed on the
+        ACKNOWLEDGMENT EPOCH (:meth:`acknowledgment_epoch`, the next
+        expiry after *now*) rather than on *now* itself: the live set
+        cannot change between now and that moment except by a write,
+        which drops the memo anyway — so the entry is exact for as
+        long as it is served, and repeat loads still hit.
 
         *kind* selects the membership predicate; *assignee* narrows the
         queue to one person's tests (the "my actions" view, which must be
@@ -5763,16 +5978,20 @@ class Storage:
         envs_key = (
             None if environments is None else tuple(sorted(environments))
         )
+        epoch = (
+            self.acknowledgment_epoch(stream_id, now)
+            if kind in _NOW_QUEUES else None
+        )
         key = (
             "status_queue", kind, environment, limit, assignee,
-            stale_before, with_latest_comment, envs_key, stream_id,
+            stale_before, with_latest_comment, envs_key, stream_id, epoch,
         )
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
-            stream_id,
+            stream_id, now,
         )
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
@@ -5815,14 +6034,16 @@ class Storage:
         stale_before: Optional[datetime.datetime] = None,
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
+        now: Optional[datetime.datetime] = None,
     ) -> int:
         """Exact size of a triage queue, ignoring any display cap.
 
-        *stream_id* (WP-23, default mainline) — see :meth:`_queue_clause`.
+        *stream_id* (WP-23, default mainline) and *now* (WP-40) — see
+        :meth:`_queue_clause`.
         """
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
-            stream_id,
+            stream_id, now,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN + where
         return int(self._conn().execute(sql, params).fetchone()[0])
@@ -5834,8 +6055,15 @@ class Storage:
         stale_before: Optional[datetime.datetime] = None,
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
+        now: Optional[datetime.datetime] = None,
     ) -> Dict[str, int]:
         """Exact size of EVERY triage queue, in one grouped pass.
+
+        WP-40: the memoized counts are the base figures; the live
+        acknowledgments (:meth:`acknowledged_cells`, read fresh — tiny,
+        time-dependent) are subtracted from ``new_failures``/
+        ``still_failing`` and summed into ``acknowledged`` on every
+        call, so expiry is exact without touching the memo.
 
         WP-23 perf pass: ``/api/summary``'s full payload used to call
         :meth:`status_queue_count` once per :data:`QUEUE_KINDS` entry for
@@ -5878,7 +6106,9 @@ class Storage:
         )
         cached = self._cached_summary(key)
         if cached is not None:
-            return cached
+            return self._subtract_acknowledged(
+                dict(cached), now, stale_before, environment, environments,
+                stream_id)
         # WP-36. The five result-shaped queues are sums over the rollup
         # cells the same summary has already computed (same stream,
         # same cutoff, same scope) -- each predicate below is
@@ -5936,7 +6166,9 @@ class Storage:
         counts["assigned"] = int(row[0] or 0)
         counts["mine"] = int(row[1] or 0) if assignee else 0
         self._store_summary(key, counts, stream_id)
-        return counts
+        return self._subtract_acknowledged(
+            dict(counts), now, stale_before, environment, environments,
+            stream_id)
 
     def recent_results(
         self,
@@ -7593,6 +7825,457 @@ class Storage:
     # Assignments
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Acknowledged failures (migration 11, WP-40)
+    # ------------------------------------------------------------------
+
+    def acknowledge_tests(
+        self,
+        keys: Sequence[Tuple[str, str, str, int]],
+        reason: Optional[str],
+        days: int,
+        assignee: str,
+        acknowledged_by: str,
+        when: datetime.datetime,
+    ) -> AcknowledgeResult:
+        """Acknowledge (or extend) EXACTLY the given tests, each on the
+        stream named in its key, and assign them all to *assignee* —
+        one transaction.
+
+        *keys* is ``(environment, script, test_name, stream_id)``: an
+        acknowledgment is of THIS stream's failure (unlike comments/
+        assignments/retirement, which are stream-agnostic), so a build
+        and mainline are acknowledged separately. A key with no
+        ``latest_runs`` row on that stream is counted ``unknown`` and
+        skipped — the page that built the selection may be stale —
+        never a hard failure.
+
+        *days* is 1..:data:`ACKNOWLEDGMENT_MAX_DAYS` on EVERY stream;
+        anything else is a ``ValueError`` (the API refuses first, this
+        refuses regardless). A key that already has a current row is
+        EXTENDED: ``expires_at`` moves to now + days, ``extensions``
+        goes up by one, the extender becomes ``acknowledged_by``, and
+        *reason* replaces the old one only when given. A key with no
+        current row needs *reason* — ``ValueError`` names how many did
+        not have one, and nothing is written.
+
+        **Ownership.** An acknowledgment is owned (user, 2026-10-01):
+        every acknowledged test is assigned to *assignee* through the
+        same write phase the bulk-assign endpoints use
+        (:meth:`_write_bulk_assignments`), with each key's stream as
+        the assignment's origin (``None`` for mainline, the WP-21
+        convention). Unassigning later drops the acknowledgment
+        (:meth:`_drop_acknowledgments_on_unassign`).
+
+        Every act is a row of ``acknowledgment_history``. Drops every
+        memo (human-rate), like the assignment writes.
+        """
+        if (not isinstance(days, int) or isinstance(days, bool)
+                or days < 1 or days > ACKNOWLEDGMENT_MAX_DAYS):
+            raise ValueError(
+                "days must be a whole number from 1 to {0}, got {1!r}"
+                .format(ACKNOWLEDGMENT_MAX_DAYS, days))
+        if not assignee:
+            raise ValueError(
+                "an acknowledgment must be owned: assignee is required")
+        unique = []  # type: List[Tuple[str, str, str, int]]
+        seen = set()  # type: Set[Tuple[str, str, str, int]]
+        for env, scr, test, sid in keys:
+            key = (env, scr, test, int(sid))
+            if key not in seen:
+                seen.add(key)
+                unique.append(key)
+        if not unique:
+            return AcknowledgeResult(acknowledged=0, extended=0, unknown=0)
+        when_iso = model.format_iso(when)
+        expires_iso = model.format_iso(
+            when + datetime.timedelta(days=days))
+
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # (has a current assignment, has a current acknowledgment)
+            found = {}  # type: Dict[Tuple[str, str, str, int], Tuple[bool, bool]]
+            for start in range(0, len(unique), _RECENT_CHUNK):
+                chunk = unique[start:start + _RECENT_CHUNK]
+                clause = " OR ".join(
+                    "(lr.stream_id = ? AND lr.environment = ? "
+                    "AND lr.script = ? AND lr.test_name = ?)"
+                    for _ in chunk)
+                params = []  # type: List[Any]
+                for env, scr, test, sid in chunk:
+                    params.extend([sid, env, scr, test])
+                rows = conn.execute(
+                    "SELECT lr.stream_id, lr.environment, lr.script, "
+                    "lr.test_name, ca.environment IS NOT NULL, "
+                    "ta.stream_id IS NOT NULL "
+                    "FROM latest_runs AS lr "
+                    "LEFT JOIN current_assignments AS ca "
+                    "  ON ca.environment = lr.environment "
+                    " AND ca.script = lr.script "
+                    " AND ca.test_name = lr.test_name "
+                    + _ACKNOWLEDGMENT_JOIN
+                    + " WHERE " + clause,
+                    tuple(params),
+                ).fetchall()
+                for row in rows:
+                    found[(row[1], row[2], row[3], int(row[0]))] = (
+                        bool(row[4]), bool(row[5]))
+            fresh = [k for k in unique if k in found and not found[k][1]]
+            extended = [k for k in unique if k in found and found[k][1]]
+            if fresh and not reason:
+                raise ValueError(
+                    "reason is required: {0} of these tests {1} not yet "
+                    "acknowledged".format(
+                        len(fresh), "is" if len(fresh) == 1 else "are"))
+            if not found:
+                conn.execute("COMMIT")
+                return AcknowledgeResult(
+                    acknowledged=0, extended=0, unknown=len(unique))
+
+            self.ensure_user(acknowledged_by, when)
+            self.ensure_user(assignee, when)
+            if fresh:
+                conn.executemany(
+                    "INSERT INTO test_acknowledgments (stream_id, "
+                    "environment, script, test_name, reason, "
+                    "acknowledged_at, expires_at, acknowledged_by, "
+                    "extensions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    [(sid, env, scr, test, reason, when_iso, expires_iso,
+                      acknowledged_by) for (env, scr, test, sid) in fresh])
+            if extended and reason:
+                conn.executemany(
+                    "UPDATE test_acknowledgments SET reason = ?, "
+                    "expires_at = ?, acknowledged_by = ?, "
+                    "extensions = extensions + 1 "
+                    "WHERE stream_id = ? AND environment = ? "
+                    "AND script = ? AND test_name = ?",
+                    [(reason, expires_iso, acknowledged_by, sid, env, scr,
+                      test) for (env, scr, test, sid) in extended])
+            elif extended:
+                conn.executemany(
+                    "UPDATE test_acknowledgments SET expires_at = ?, "
+                    "acknowledged_by = ?, extensions = extensions + 1 "
+                    "WHERE stream_id = ? AND environment = ? "
+                    "AND script = ? AND test_name = ?",
+                    [(expires_iso, acknowledged_by, sid, env, scr, test)
+                     for (env, scr, test, sid) in extended])
+            conn.executemany(
+                "INSERT INTO acknowledgment_history (stream_id, "
+                "environment, script, test_name, action, reason, "
+                "expires_at, actor, acted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(sid, env, scr, test, "acknowledge", reason, expires_iso,
+                  acknowledged_by, when_iso)
+                 for (env, scr, test, sid) in fresh]
+                + [(sid, env, scr, test, "extend", reason, expires_iso,
+                    acknowledged_by, when_iso)
+                   for (env, scr, test, sid) in extended])
+
+            # Ownership: one assignment per TRIPLE (assignments are
+            # stream-agnostic), carrying the key's stream as origin.
+            origins = {}  # type: Dict[Tuple[str, str, str], Optional[int]]
+            existing_current = set()  # type: Set[Tuple[str, str, str]]
+            for env, scr, test, sid in unique:
+                if (env, scr, test, sid) not in found:
+                    continue
+                origins[(env, scr, test)] = (
+                    None if sid == MAINLINE_STREAM_ID else sid)
+                if found[(env, scr, test, sid)][0]:
+                    existing_current.add((env, scr, test))
+            self._write_bulk_assignments(
+                conn, assignee, acknowledged_by, when_iso, None,
+                [(env, scr, test, origin)
+                 for (env, scr, test), origin in origins.items()],
+                existing_current)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        self._invalidate_summary_cache()
+        return AcknowledgeResult(
+            acknowledged=len(fresh), extended=len(extended),
+            unknown=len(unique) - len(found))
+
+    def clear_acknowledgments(
+        self,
+        keys: Sequence[Tuple[str, str, str, int]],
+        cleared_by: str,
+        when: datetime.datetime,
+        reason: Optional[str] = None,
+    ) -> int:
+        """Remove the current acknowledgment of each key that has one;
+        the assignment stays. Returns how many went. Each removal is a
+        ``clear`` history row with *reason* (``None`` for a plain
+        clear; :meth:`_drop_acknowledgments_on_unassign` says
+        ``unassigned``)."""
+        conn = self._conn()
+        when_iso = model.format_iso(when)
+        removed = 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.ensure_user(cleared_by, when)
+            seen = set()  # type: Set[Tuple[str, str, str, int]]
+            for env, scr, test, sid in keys:
+                key = (env, scr, test, int(sid))
+                if key in seen:
+                    continue
+                seen.add(key)
+                cursor = conn.execute(
+                    "DELETE FROM test_acknowledgments WHERE stream_id = ? "
+                    "AND environment = ? AND script = ? AND test_name = ?",
+                    (key[3], env, scr, test))
+                if int(cursor.rowcount) != 1:
+                    continue
+                removed += 1
+                conn.execute(
+                    "INSERT INTO acknowledgment_history (stream_id, "
+                    "environment, script, test_name, action, reason, "
+                    "expires_at, actor, acted_at) "
+                    "VALUES (?, ?, ?, ?, 'clear', ?, NULL, ?, ?)",
+                    (key[3], env, scr, test, reason, cleared_by, when_iso))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if removed:
+            self._invalidate_summary_cache()
+        return removed
+
+    def _drop_acknowledgments_on_unassign(
+        self,
+        conn: sqlite3.Connection,
+        triples: Sequence[Tuple[str, str, str]],
+        actor: str,
+        when_iso: str,
+    ) -> None:
+        """Inside the caller's transaction: an acknowledgment is owned,
+        so a triple being UNASSIGNED loses its acknowledgment on EVERY
+        stream (assignment is per triple; acknowledgment per triple and
+        stream). Each one is a ``clear`` history row saying
+        ``unassigned``. Reassigning to someone else never reaches here."""
+        for env, scr, test in triples:
+            rows = conn.execute(
+                "SELECT stream_id FROM test_acknowledgments "
+                "WHERE environment = ? AND script = ? AND test_name = ?",
+                (env, scr, test)).fetchall()
+            if not rows:
+                continue
+            conn.executemany(
+                "INSERT INTO acknowledgment_history (stream_id, "
+                "environment, script, test_name, action, reason, "
+                "expires_at, actor, acted_at) "
+                "VALUES (?, ?, ?, ?, 'clear', 'unassigned', NULL, ?, ?)",
+                [(int(row[0]), env, scr, test, actor, when_iso)
+                 for row in rows])
+            conn.execute(
+                "DELETE FROM test_acknowledgments "
+                "WHERE environment = ? AND script = ? AND test_name = ?",
+                (env, scr, test))
+
+    @staticmethod
+    def _delete_stream_acknowledgments(
+        conn: sqlite3.Connection, stream_id: int,
+    ) -> int:
+        """Inside the caller's transaction: a stream's acknowledgments
+        and their history go with the stream (they are OF its failures,
+        unlike comments/assignments, which merely carry its tag).
+        Returns how many current acknowledgments went."""
+        conn.execute(
+            "DELETE FROM acknowledgment_history WHERE stream_id = ?",
+            (stream_id,))
+        cursor = conn.execute(
+            "DELETE FROM test_acknowledgments WHERE stream_id = ?",
+            (stream_id,))
+        return int(cursor.rowcount)
+
+    def acknowledgment_for(
+        self, stream_id: int, environment: str, script: str,
+        test_name: str,
+    ) -> Optional[Acknowledgment]:
+        """The current acknowledgment of one test on one stream, live or
+        expired (compare ``expires_at`` yourself); None if none."""
+        row = self._conn().execute(
+            "SELECT reason, acknowledged_at, expires_at, acknowledged_by, "
+            "extensions FROM test_acknowledgments WHERE stream_id = ? "
+            "AND environment = ? AND script = ? AND test_name = ?",
+            (stream_id, environment, script, test_name)).fetchone()
+        if row is None:
+            return None
+        return Acknowledgment(
+            stream_id=stream_id, environment=environment, script=script,
+            test_name=test_name, reason=row[0],
+            acknowledged_at=model.parse_iso(row[1]),
+            expires_at=model.parse_iso(row[2]), acknowledged_by=row[3],
+            extensions=int(row[4]))
+
+    def acknowledgment_history(
+        self, environment: str, script: str, test_name: str,
+        stream_id: Optional[int] = None,
+    ) -> List[AcknowledgmentAct]:
+        """Every act on one test, newest first — all streams unless
+        *stream_id* is given. An index seek (``idx_acknowledgment_history_triple``)."""
+        sql = (
+            "SELECT id, stream_id, environment, script, test_name, action, "
+            "reason, expires_at, actor, acted_at FROM acknowledgment_history "
+            "WHERE environment = ? AND script = ? AND test_name = ?")
+        params = [environment, script, test_name]  # type: List[Any]
+        if stream_id is not None:
+            sql += " AND stream_id = ?"
+            params.append(stream_id)
+        sql += " ORDER BY id DESC"
+        return [
+            AcknowledgmentAct(
+                id=int(row[0]), stream_id=int(row[1]), environment=row[2],
+                script=row[3], test_name=row[4], action=row[5],
+                reason=row[6],
+                expires_at=(None if row[7] is None
+                            else model.parse_iso(row[7])),
+                actor=row[8], acted_at=model.parse_iso(row[9]))
+            for row in self._conn().execute(sql, params).fetchall()
+        ]
+
+    def acknowledged_cells(
+        self,
+        now: Optional[datetime.datetime],
+        recent_cutoff: datetime.datetime,
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+    ) -> List[RollupCount]:
+        """The acknowledged subset of :meth:`summary_rollup`'s cells:
+        tests on *stream_id* failing NOW under a live acknowledgment,
+        grouped by (environment, previous result, ran-recently), retired
+        excluded — so :func:`analytics.summarize_rollup` can subtract
+        them cell for cell.
+
+        NEVER memoized, on purpose: it is bounded by the number of
+        acknowledgments (driven from ``test_acknowledgments`` by its
+        stream prefix, each row reaching ``latest_runs`` by primary
+        key), and it depends on *now*, so reading it fresh is what
+        makes expiry exact to the second. The one-pass rollup it is
+        subtracted from stays memoized, untouched.
+        """
+        sql = (
+            "SELECT ta.environment, lr.prev_result, "
+            "CASE WHEN lr.start_time >= ? THEN 1 ELSE 0 END AS recent, "
+            "COUNT(*) FROM test_acknowledgments AS ta "
+            "JOIN latest_runs AS lr "
+            "  ON lr.stream_id = ta.stream_id "
+            " AND lr.environment = ta.environment "
+            " AND lr.script = ta.script AND lr.test_name = ta.test_name "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+            "WHERE ta.stream_id = ? AND ta.expires_at > ? "
+            "AND lr.result = ? AND " + self._NOT_RETIRED)
+        params = [
+            model.format_iso(recent_cutoff), stream_id,
+            model.format_iso(now or model.utcnow()), Result.FAIL.value,
+        ]  # type: List[Any]
+        if environment is not None:
+            sql += " AND ta.environment = ?"
+            params.append(environment)
+        envs_clause, envs_params = self._environments_clause(
+            environments, column="ta.environment")
+        if envs_clause is not None:
+            sql += " AND " + envs_clause
+            params.extend(envs_params)
+        sql += " GROUP BY ta.environment, lr.prev_result, recent"
+        return [
+            RollupCount(
+                environment=row[0], result=Result.FAIL,
+                prev_result=None if row[1] is None else Result(row[1]),
+                recent=bool(row[2]), retired=False, count=int(row[3]))
+            for row in self._conn().execute(sql, params).fetchall()
+        ]
+
+    def _subtract_acknowledged(
+        self,
+        counts: Dict[str, int],
+        now: Optional[datetime.datetime],
+        stale_before: datetime.datetime,
+        environment: Optional[str],
+        environments: Optional[Sequence[str]],
+        stream_id: int,
+    ) -> Dict[str, int]:
+        """:meth:`queue_counts`' last step, on a COPY of the memoized
+        dict: the live acknowledgments come off ``new_failures``/
+        ``still_failing`` and become ``acknowledged``."""
+        counts["acknowledged"] = 0
+        for cell in self.acknowledged_cells(
+                now, stale_before, environment, environments, stream_id):
+            if cell.prev_result is Result.FAIL:
+                counts["still_failing"] -= cell.count
+            else:
+                counts["new_failures"] -= cell.count
+            counts["acknowledged"] += cell.count
+        return counts
+
+    def acknowledgment_epoch(
+        self, stream_id: int, now: Optional[datetime.datetime],
+    ) -> Optional[str]:
+        """The next expiry after *now* on *stream_id* (ISO text), or
+        None. The live set of acknowledgments cannot change before that
+        moment except by a write, which drops every memo — so a memo
+        keyed on this value is exact for as long as it is served."""
+        row = self._conn().execute(
+            "SELECT MIN(expires_at) FROM test_acknowledgments "
+            "WHERE stream_id = ? AND expires_at > ?",
+            (stream_id, model.format_iso(now or model.utcnow()))
+        ).fetchone()
+        return None if row is None or row[0] is None else str(row[0])
+
+    def expiring_acknowledgments(
+        self,
+        now: datetime.datetime,
+        within: datetime.timedelta,
+        stream_id: Optional[int] = None,
+    ) -> List[ExpiringAcknowledgment]:
+        """Open Actions' "Expiring" queue: every acknowledgment whose
+        ``expires_at`` is within *within* of *now* — INCLUDING ones
+        already expired — on a test that is still failing (one that
+        now passes needs nothing), retired excluded; every stream
+        unless *stream_id* is given. Soonest first."""
+        sql = (
+            "SELECT ta.stream_id, ta.environment, ta.script, ta.test_name, "
+            "ta.reason, ta.acknowledged_at, ta.expires_at, "
+            "ta.acknowledged_by, ta.extensions, s.kind, s.name, lr.result, "
+            "ca.assignee FROM test_acknowledgments AS ta "
+            "JOIN latest_runs AS lr "
+            "  ON lr.stream_id = ta.stream_id "
+            " AND lr.environment = ta.environment "
+            " AND lr.script = ta.script AND lr.test_name = ta.test_name "
+            "JOIN streams AS s ON s.id = ta.stream_id "
+            "LEFT JOIN current_assignments AS ca "
+            "  ON ca.environment = ta.environment "
+            " AND ca.script = ta.script AND ca.test_name = ta.test_name "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = ta.environment "
+            " AND tr.script = ta.script AND tr.test_name = ta.test_name "
+            "WHERE ta.expires_at <= ? AND lr.result = ? AND "
+            + self._NOT_RETIRED)
+        params = [
+            model.format_iso(now + within), Result.FAIL.value,
+        ]  # type: List[Any]
+        if stream_id is not None:
+            sql += " AND ta.stream_id = ?"
+            params.append(stream_id)
+        sql += (" ORDER BY ta.expires_at, ta.environment, ta.script, "
+                "ta.test_name")
+        return [
+            ExpiringAcknowledgment(
+                acknowledgment=Acknowledgment(
+                    stream_id=int(row[0]), environment=row[1],
+                    script=row[2], test_name=row[3], reason=row[4],
+                    acknowledged_at=model.parse_iso(row[5]),
+                    expires_at=model.parse_iso(row[6]),
+                    acknowledged_by=row[7], extensions=int(row[8])),
+                stream_kind=row[9], stream_name=row[10],
+                result=Result(row[11]), assignee=row[12])
+            for row in self._conn().execute(sql, params).fetchall()
+        ]
+
     def set_assignee(
         self,
         environment: str,
@@ -7659,6 +8342,11 @@ class Storage:
                     "AND test_name = ?",
                     (assignee, stream_id) + triple,
                 )
+            if assignee is None:
+                # WP-40: an acknowledgment is owned; unassigning drops it.
+                self._drop_acknowledgments_on_unassign(
+                    conn, [triple], assigned_by,
+                    model.format_iso(assigned_at))
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -7772,6 +8460,11 @@ class Storage:
                     for (env, scr, test, origin) in entries
                 ],
             )
+        if assignee is None:
+            # WP-40: an acknowledgment is owned; unassigning drops it.
+            self._drop_acknowledgments_on_unassign(
+                conn, [(env, scr, test) for (env, scr, test, _o) in entries],
+                assigned_by, assigned_at_iso)
 
     def bulk_set_assignee(
         self,
@@ -7792,6 +8485,8 @@ class Storage:
         assignment_origin: Optional[str] = None,
         assigned_only: bool = False,
         open_items: bool = False,
+        acknowledged: Optional[bool] = None,
+        now: Optional[datetime.datetime] = None,
     ) -> int:
         """Assign or clear EVERY test matching the SAME filters
         :meth:`dashboard` would return, in one transaction. Returns the
@@ -7851,6 +8546,7 @@ class Storage:
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
             stream_id, assignment_origin, assigned_only, open_items,
+            acknowledged, now,
         )
         sql = (
             "SELECT lr.environment, lr.script, lr.test_name, "

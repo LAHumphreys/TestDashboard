@@ -460,6 +460,11 @@ class SummaryStatus(NamedTuple):
     still_failing: int
     fixed: int
     assigned_open: int
+    #: WP-40: tests failing now under a live acknowledgment. EXCLUDED
+    #: from ``results[FAIL]``/``recent_results[FAIL]``/``new_failures``/
+    #: ``still_failing`` above and reported here beside them — "12
+    #: failing · 65 acknowledged", never a silent subtraction.
+    acknowledged: int
 
 
 class EnvironmentRollup(NamedTuple):
@@ -471,6 +476,9 @@ class EnvironmentRollup(NamedTuple):
     new_failures: int
     unexpected_passes: int
     not_run: int
+    #: WP-40 — see SummaryStatus.acknowledged; ``failed``/``new_failures``
+    #: exclude these.
+    acknowledged: int
 
 
 class ProductRollup(NamedTuple):
@@ -489,10 +497,14 @@ class ProductRollup(NamedTuple):
     new_failures: int
     fixed: int
     unexpected_passes: int
+    #: WP-40 — see SummaryStatus.acknowledged; ``failing``/``new_failures``
+    #: exclude these.
+    acknowledged: int
 
 
 def summarize_by_product(
-    counts: Sequence[RollupCount], env_to_product: Dict[str, str]
+    counts: Sequence[RollupCount], env_to_product: Dict[str, str],
+    acknowledged: Sequence[RollupCount] = (),
 ) -> List[ProductRollup]:
     """Aggregate rollup cells into one row per DECLARED product.
 
@@ -511,6 +523,12 @@ def summarize_by_product(
     estate-wide rollup (any *recent_cutoff* works; it only affects a
     column this function ignores) serves every product with no window
     to mislabel.
+
+    *acknowledged* (WP-40) is :meth:`Storage.acknowledged_cells` — the
+    same cell shape, but only the tests failing now under a live
+    acknowledgment. They are subtracted from ``failing``/
+    ``new_failures`` and reported as ``acknowledged``, the one rule
+    every failing count in the system follows (docs, WP-40 spec).
     """
     buckets = {}  # type: Dict[str, List[int]]
     for cell in counts:
@@ -519,7 +537,7 @@ def summarize_by_product(
         product = env_to_product.get(cell.environment)
         if product is None:
             continue
-        bucket = buckets.setdefault(product, [0, 0, 0, 0])
+        bucket = buckets.setdefault(product, [0, 0, 0, 0, 0])
         is_fail = cell.result is Result.FAIL
         was_fail = cell.prev_result is Result.FAIL
         if is_fail:
@@ -530,10 +548,20 @@ def summarize_by_product(
             bucket[2] += cell.count
         if cell.result is Result.UNEXPECTED_PASS:
             bucket[3] += cell.count
+    for cell in acknowledged:
+        product = env_to_product.get(cell.environment)
+        if product is None or product not in buckets:
+            continue
+        bucket = buckets[product]
+        bucket[0] -= cell.count
+        if cell.prev_result is not Result.FAIL:
+            bucket[1] -= cell.count
+        bucket[4] += cell.count
     return [
         ProductRollup(
             product=product, failing=bucket[0], new_failures=bucket[1],
             fixed=bucket[2], unexpected_passes=bucket[3],
+            acknowledged=bucket[4],
         )
         for product, bucket in sorted(buckets.items())
     ]
@@ -893,7 +921,8 @@ class EstateSummary(NamedTuple):
 
 
 def summarize_rollup(
-    counts: Sequence[RollupCount], assigned_open: int = 0
+    counts: Sequence[RollupCount], assigned_open: int = 0,
+    acknowledged: Sequence[RollupCount] = (),
 ) -> EstateSummary:
     """Derive the estate headline from grouped counts.
 
@@ -914,6 +943,16 @@ def summarize_rollup(
 
     *assigned_open* is counted separately (it depends on the assignment
     tables, not on the result pair) and is passed straight through.
+
+    *acknowledged* (WP-40) is :meth:`Storage.acknowledged_cells`: cells
+    of the same shape holding only the tests failing NOW under a live
+    acknowledgment, read at request time (expiry is exact, nothing
+    memoized). They are subtracted from every failing figure —
+    ``results[FAIL]``, ``recent_results[FAIL]``, ``new_failures``,
+    ``still_failing``, each environment's ``failed``/``new_failures`` —
+    and reported as ``acknowledged`` beside them. A test still counts
+    in ``total_tests`` and ``ran_recently``: it exists and it ran; it
+    is its failure that has been acknowledged.
     """
     results = {result: 0 for result in Result}
     recent_results = {result: 0 for result in Result}
@@ -923,8 +962,10 @@ def summarize_rollup(
     still_failing = 0
     fixed = 0
     retired = 0
+    acknowledged_total = 0
 
-    # Per environment: [total, failed, new_failures, unexpected, not_run]
+    # Per environment: [total, failed, new_failures, unexpected, not_run,
+    # acknowledged]
     env_totals = collections.OrderedDict()  # type: Dict[str, List[int]]
 
     for cell in counts:
@@ -952,7 +993,7 @@ def summarize_rollup(
             fixed += cell.count
 
         if cell.environment not in env_totals:
-            env_totals[cell.environment] = [0, 0, 0, 0, 0]
+            env_totals[cell.environment] = [0, 0, 0, 0, 0, 0]
         bucket = env_totals[cell.environment]
         bucket[0] += cell.count
         if is_fail:
@@ -963,6 +1004,25 @@ def summarize_rollup(
             bucket[3] += cell.count
         if not cell.recent:
             bucket[4] += cell.count
+
+    # WP-40: the acknowledged cells are a subset of the FAIL cells
+    # above (same stream, same scope, retired excluded), so subtracting
+    # them per (environment, prev_result, recent) is exact.
+    for cell in acknowledged:
+        acknowledged_total += cell.count
+        results[Result.FAIL] -= cell.count
+        if cell.recent:
+            recent_results[Result.FAIL] -= cell.count
+        if cell.prev_result is Result.FAIL:
+            still_failing -= cell.count
+        else:
+            new_failures -= cell.count
+        if cell.environment in env_totals:
+            bucket = env_totals[cell.environment]
+            bucket[1] -= cell.count
+            if cell.prev_result is not Result.FAIL:
+                bucket[2] -= cell.count
+            bucket[5] += cell.count
 
     status = SummaryStatus(
         total_tests=total,
@@ -975,6 +1035,7 @@ def summarize_rollup(
         still_failing=still_failing,
         fixed=fixed,
         assigned_open=assigned_open,
+        acknowledged=acknowledged_total,
     )
     by_environment = [
         EnvironmentRollup(
@@ -984,6 +1045,7 @@ def summarize_rollup(
             new_failures=bucket[2],
             unexpected_passes=bucket[3],
             not_run=bucket[4],
+            acknowledged=bucket[5],
         )
         for environment, bucket in sorted(env_totals.items())
     ]
