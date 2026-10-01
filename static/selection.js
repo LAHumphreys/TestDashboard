@@ -57,7 +57,7 @@ import {
   userPickerSelect,
 } from "./api.js";
 import { entryKey } from "./review.js";
-import { apiUrl, bulkMutesUrl } from "./urls.js";
+import { apiUrl, bulkMutesUrl, unmuteUrl } from "./urls.js";
 
 /**
  * The bulk endpoint's URL, EVERY scope level explicitly cleared.
@@ -108,6 +108,7 @@ let unassignBtnEl = null;
 let commentBtnEl = null;
 let muteDurationEl = null;
 let muteBtnEl = null;
+let unmuteBtnEl = null;
 
 function selectionEntries() {
   return Array.from(selected.values());
@@ -343,6 +344,35 @@ async function doUnassign() {
   }
 }
 
+/**
+ * Unmute every selected test (WP-40). Needs only a selection: the
+ * server removes the mutes that exist and leaves the rest alone, so a
+ * mixed selection is fine, and nothing else about the tests changes
+ * (they stay assigned). Mirrors doUnassign.
+ */
+async function doUnmute() {
+  const me = requireUsername();
+  if (!me) {
+    showError(
+      "Set a username first (the “Change” button, top right) "
+      + "— this is recorded against your name.");
+    return;
+  }
+  if (selected.size === 0) {
+    return;
+  }
+  unmuteBtnEl.disabled = true;
+  try {
+    await postJson(unmuteUrl(), { username: me, tests: testsPayload() });
+    clearSelection();
+    notifyChanged();
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    unmuteBtnEl.disabled = selected.size === 0;
+  }
+}
+
 function ensureBar() {
   if (barEl) {
     return;
@@ -410,6 +440,17 @@ function ensureBar() {
 
   barEl.appendChild(el("span", "selection-sep", "·"));
 
+  unmuteBtnEl = el("button", "selection-unmute-btn", "Unmute");
+  unmuteBtnEl.type = "button";
+  unmuteBtnEl.disabled = true;
+  unmuteBtnEl.title = "Stop muting the selected tests; their failures "
+    + "count as failing again. They stay assigned. Rows that were not "
+    + "muted are left alone.";
+  unmuteBtnEl.addEventListener("click", doUnmute);
+  barEl.appendChild(unmuteBtnEl);
+
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
   const clearBtn = el("button", "selection-clear-btn", "Clear selection");
   clearBtn.type = "button";
   clearBtn.addEventListener("click", clearSelection);
@@ -434,6 +475,7 @@ function renderBar() {
   countEl.textContent = count.toLocaleString();
   updateAssignButtonState();
   unassignBtnEl.disabled = false;
+  unmuteBtnEl.disabled = false;
 }
 
 /**

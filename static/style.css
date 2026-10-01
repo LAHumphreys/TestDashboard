@@ -2436,6 +2436,7 @@ body.has-selection-bar { padding-bottom: 60px; }
 .selection-assign-btn:disabled,
 .selection-comment-btn:disabled,
 .selection-mute-btn:disabled,
+.selection-unmute-btn:disabled,
 .selection-unassign-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
