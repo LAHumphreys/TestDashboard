@@ -44,8 +44,8 @@ is the operator's, per the drop note.
   has `alters=()`, so the upgrade tool's dry run prints `SERVER: may keep
   running`. Six design observations are recorded (not changed) in the log.
   The spec spells the expiry column `until`; the code is `expires_at`.
-- **The operator note is written**: `docs/drops/2026-10-01.md` (staging SQLite
-  and production MariaDB procedures, rollback for each). The tester note is in
+- **The operator note is written**: `docs/drops/2026-10-01.md` (the production MariaDB
+  procedure and its rollback; staging is gone). The tester note is in
   `whatsnew.html`. The date is provisional in both.
 
 ## Ready to deploy — what is left is the operator's
@@ -54,9 +54,9 @@ is the operator's, per the drop note.
    `3748436`, including both MariaDB 10.3 legs (the dual-backend suite and
    the suite on a database the ledger upgraded from v7). Merge it when
    deploying (squash, as the previous drops were).
-2. **Deploy per `docs/drops/2026-10-01.md`** — staging first (SQLite: stop,
-   copy the file aside, pull, start; the file migrates on open), then
-   production (MariaDB, runbook §G: credential, dump, dry run — read the
+2. **Deploy per `docs/drops/2026-10-01.md`** — straight to production;
+   **staging was decommissioned on 2026-10-01**, so there is no rehearsal
+   box any more (MariaDB, runbook §G: credential, dump, dry run — read the
    `SERVER:` line — upgrade with the server up, then the restart). Then the
    note's "Check it came up" list, which includes muting one test and
    unmuting it again.

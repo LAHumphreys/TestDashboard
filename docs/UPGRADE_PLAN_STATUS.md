@@ -4287,3 +4287,15 @@ whole suite with the MariaDB variants active, local 12.3: **3626 OK
 including both `mariadb:10.3` legs — the dual-backend suite and the
 suite on a database the ledger upgraded from v7. The operator note is
 current; the deploy is the user's, per that note.
+
+## 2026-10-01 — staging decommissioned
+
+The user: "We have now decommissioned staging." The old SQLite box — the
+original production host, then the staging instance that took the
+streams drop (v7→v10) on 2026-08-10 before production did — is gone.
+**Production (MariaDB) is now the only deployment**, and the drop of
+2026-10-01 is the first to go there without a rehearsal. SQLite is
+unchanged as a backend: equal, permanent, zero-setup, the development
+and CI default; what has gone is a *deployment*, not a *backend*. The
+operator note's staging step and staging rollback are reduced to a
+for-the-record paragraph; CLAUDE.md and the handover say the same.
