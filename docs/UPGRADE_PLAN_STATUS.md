@@ -3967,3 +3967,139 @@ entry above; where they conflict, these win.
 4. **No indefinite acknowledgment anywhere.** `until` is NOT NULL on
    both tables; `days` is 1–7 on every stream, builds included; `null`
    is a 400 and storage raises. One number, one rule.
+
+## 2026-10-01 — WP-40 built: acknowledged failures (branch `wp-40-acknowledged-failures`, ships in the drop of 2026-10-01)
+
+**What exists now.** The spec and addendum above, built in four layers
+and merged. Nothing is deployed. The drop of 2026-10-01 now carries
+WP-39 AND WP-40, and **migration 11 runs on both backends**.
+
+| Layer | Commit | What it is |
+|---|---|---|
+| Storage | `a8f3b30` | Migration 11 (`test_acknowledgments`, `acknowledgment_history`), the one predicate, `acknowledge_tests` / `clear_acknowledgments` / readers, the unassign-drops-acknowledgment rule, both tables in the environment/stream delete paths and the WP-39 prune; exporter DDL. Committed untested on purpose so the API could branch from it |
+| API | `c5c2b87` | `POST /api/acknowledgments/bulk`, `POST /api/acknowledgments/clear`, `GET /api/acknowledgments`; `acknowledged` beside every failing figure in `/api/summary` and `/api/watch`; `acknowledgment` on every row; `acknowledged=` on `/api/dashboard`; 27 `AcknowledgmentApiTest` tests |
+| Storage tests + MariaDB ledger | `6f7831d` | `step_10_to_11` and its ledger entry (`alters=()`); `AcknowledgmentTest` (36 tests, each with a MariaDB variant); the AUTOINCREMENT inventory 4 -> 5; the memoization below |
+| Frontend | `154a201` | Selection-bar Acknowledge, Review-panel group, test-page banner and history, Home tile and queue, Watch stat, Open Actions' Expiring list with Extend |
+| Merges | `c85957e`, `0dfa121` | The storage-test and frontend branches into `wp-40-acknowledged-failures` |
+
+**How it was built.** Fable wrote the specs; Sonnet agents built each
+layer in their own worktrees, in parallel, each against its own
+sacrificial MariaDB database (the user's cost directive: no Fable-priced
+implementation, and no shared database for agents that each drop and
+recreate it). Until the storage-test commit landed, the API agent's tree
+had 14 failures that all came from migration 11 itself (the memo
+guards, the ledger, the SQL inventory); the frontend agent touched no
+Python. The integration was the two merges and one full run.
+
+**Measured** (this branch, development machine, a modern interpreter and
+not 3.6):
+
+- SQLite: `python -m unittest discover` — **2611 tests, OK (skipped=1)**,
+  from 2550 before WP-40.
+- With a local MariaDB 12.3 (port 3307, sacrificial database), the full
+  suite: **3585 tests, OK (skipped=71)**, from 3419 (2526 SQLite) at the 2026-09-30 drop.
+- `tests.test_mariadb_backend` + `tests.test_upgrade_mariadb_schema`
+  alone: **986 tests OK (skipped=70)**; the upgrade tool's full v7 -> v11
+  run verifies clean, every table matching the v11 oracle.
+- Production is MariaDB 10.3; this machine's 12.3 is not it. CI's two
+  10.3 legs are the authority and have not run on this branch yet.
+
+**Memoization design (what the six statement-counting guards forced).**
+The acknowledged set is small and human-rate, so it is read at request
+time, but a read that costs a statement on every call fails the guards
+that say a repeat costs zero. Final shape:
+
+- `acknowledgment_epoch(stream, now)` is the NEXT expiry after `now`
+  (one indexed `MIN(expires_at)`), memoized per stream as
+  `(computed_for, epoch)`. It is served to any later `now` before the
+  epoch, which is exact — nothing can have expired before it, and every
+  acknowledgment write drops the memo — and is recomputed for an
+  EARLIER clock, so a request with a clock behind the memo is never
+  handed an epoch that has since moved past a row still live then.
+- `acknowledged_cells` reads the epoch first. **No live acknowledgment
+  on the stream (the common case) returns `[]` with zero statements.**
+  Otherwise one grouped read of the stream's acknowledgments is split by
+  environment and stored per environment under
+  `("ack_cells", stream, env, cutoff, epoch)`, tagged `(stream, env)`
+  exactly as `_environment_rollup`'s entries are (WP-38), an entry for
+  EVERY environment including empty ones. A push into one environment
+  drops only that environment's entry.
+- The queues that depend on `now` (`new_failures`, `still_failing`,
+  `acknowledged`) memoize on the epoch; `queue_counts` subtracts the
+  cells from a COPY of its memoized dict.
+- Nothing on the push path; the headline's one-pass rollup is
+  untouched; the extra read is `acknowledged_cells`, bounded by the
+  number of acknowledgments and never by the estate.
+- Cache guards stayed strict: `SummaryCacheTest` and
+  `TargetedInvalidationTest` pass UNCHANGED.
+
+**Guards widened, and why (none weakened).**
+`tests/test_storage.py::TestQueueCounts.test_one_query_regardless_of_assignee`
+counts COLD statements; the first call after a write now includes the
+epoch read (cold 3 -> 4, within-rollup 1 -> 2) and the test asserts that
+statement is the extra one; its final assertion, that a repeat costs
+zero, is untouched. In `tests/test_api.py` the three pinned key sets
+(dashboard row, queue entry, test detail) gained the new fields.
+`_DASHBOARD_FILTER_QUERY_PARAMS` gained `"acknowledged"` so list-mode
+bulk assignment still refuses it. `test_sql_portability`'s AUTOINCREMENT
+inventory went 4 -> 5 (`acknowledgment_history.id`) and
+`MARIADB_MIGRATION.md` B.2 lists the fifth, as the test demands. The
+new statement-counting memo tests sit on `test_mariadb_backend`'s
+`EXCLUDED_TESTS` with a reason, like the existing counters (they count
+with sqlite3's trace callback). `CompareStripTest`'s count pin of 3 for
+`stream: streamApiScope()` was NOT widened: the test page's detail
+request moved into `detailUrl()` instead.
+
+**Design observations — recorded, NOT changed.** Reported by the
+storage-test agent while writing the tests. Each is how the code
+behaves; each is either as decided or small enough to wait for use.
+
+1. `acknowledge_tests` accepts a key whose test is PASSING now: the row
+   is written and sits dormant, then goes live if the test fails again
+   inside the window (decision 3: a pass in between changes nothing).
+   The UI only offers Acknowledge on FAIL rows, so only a direct API
+   caller reaches this.
+2. The `assigned` queue and `assigned_open` still include acknowledged
+   tests, because acknowledging assigns. "My actions" therefore shows
+   what you own, which is intended — but the Assigned and Acknowledged
+   tabs overlap.
+3. Assignment is per triple, acknowledgment per triple + stream.
+   Acknowledging a BUILD's failure assigns the test everywhere, and
+   unassigning it from mainline drops the build's acknowledgment too
+   (addendum decision 3, taken at face value).
+4. Expired rows stay until cleared and `acknowledgment_history` grows
+   without bound. Tiny and human-rate; nothing prunes either (the
+   spec's "not in this package"). Revisit if it ever matters.
+5. Extending sets `acknowledged_by` to the extender but keeps the
+   ORIGINAL `acknowledged_at`. The UI therefore shows "by X · expires
+   …", never "X acknowledged at T"; the history table is where the
+   original act lives.
+6. The acknowledgment-epoch memo is tagged whole-stream, so every push
+   into a stream costs the NEXT reader one indexed `MIN` query (the
+   cells themselves are per-environment). Bounded and cheap; it is the
+   price of not tagging an epoch that spans environments.
+
+**Frontend notes.** "Extend 7 days for all" makes one POST per distinct
+owner, because the bulk endpoint takes a single assignee. A review-panel
+Acknowledge from Open Actions posts without a stream id, i.e. mainline,
+which is right because that page lists mainline results.
+`GET /api/acknowledgments` rows carry `stream_kind`/`stream_name` but
+not the stream's product. Spec drift worth knowing: the spec entry
+spells the expiry column `until`; the code and both DDLs spell it
+`expires_at` (NOT NULL on both tables, per the addendum) and the API
+returns `expires_at`. The operator-facing documents use the code's name.
+
+**Not verified.** No browser has rendered any of this: the frontend
+agent ran `node --check` on the modules, the source-text guards and a
+server smoke test that served the pages with 200. The pass-then-fail-
+inside-the-window behaviour is as decided and has not been seen by a
+tester. MariaDB here is 12.3; production is 10.3.
+
+**Operator note** — `docs/drops/2026-10-01.md`, rewritten for the
+combined drop. Two things its first draft's brief assumed that are not
+so: migration 11 has no Python step, so on SQLite it prints NO progress
+line (it is two `CREATE TABLE`s); and no start-up line names the schema
+version — the Metrics page does.
+
+The performance A/B against `master` is being measured separately and is
+recorded in the next entry.
