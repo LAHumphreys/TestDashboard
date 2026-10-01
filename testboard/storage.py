@@ -3212,9 +3212,14 @@ class Storage:
         "LEFT JOIN test_retirements AS tr "
         "  ON tr.environment = lr.environment "
         " AND tr.script = lr.script "
-        " AND tr.test_name = lr.test_name "
-        + _ACKNOWLEDGMENT_JOIN
+        " AND tr.test_name = lr.test_name"
     )
+    # WP-40 perf A/B (log, 2026-10-01): the acknowledgment join is NOT
+    # part of the count join. A COUNT(*) reads no `ta` column, and
+    # carrying the join cost the browse page's count ~25k primary-key
+    # probes per call (+15 ms empty, +31 ms with 65 rows, measured).
+    # A count whose WHERE actually asks about acknowledgments appends
+    # it (see dashboard_count / status_queue_count).
 
     #: Excludes tests approved as no longer in the suite.
     _NOT_RETIRED = "tr.retired_at IS NULL"
@@ -3525,6 +3530,9 @@ class Storage:
             acknowledged, now,
         )
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
+        if acknowledged is not None:
+            # The only filter that reads `ta`; see _LATEST_COUNT_JOIN.
+            sql += " " + _ACKNOWLEDGMENT_JOIN
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         row = self._conn().execute(sql, params).fetchone()
@@ -6045,7 +6053,11 @@ class Storage:
             kind, environment, assignee, stale_before, environments,
             stream_id, now,
         )
-        sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN + where
+        sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
+        if kind in _NOW_QUEUES:
+            # These three predicates read `ta`; see _LATEST_COUNT_JOIN.
+            sql += " " + _ACKNOWLEDGMENT_JOIN
+        sql += where
         return int(self._conn().execute(sql, params).fetchone()[0])
 
     def queue_counts(
@@ -8625,6 +8637,9 @@ class Storage:
             "SELECT lr.environment, lr.script, lr.test_name, "
             "ca.environment IS NOT NULL " + self._LATEST_COUNT_JOIN
         )
+        if acknowledged is not None:
+            # The only filter that reads `ta`; see _LATEST_COUNT_JOIN.
+            sql += " " + _ACKNOWLEDGMENT_JOIN
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
 
