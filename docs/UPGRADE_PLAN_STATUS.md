@@ -4299,3 +4299,21 @@ unchanged as a backend: equal, permanent, zero-setup, the development
 and CI default; what has gone is a *deployment*, not a *backend*. The
 operator note's staging step and staging rollback are reduced to a
 for-the-record paragraph; CLAUDE.md and the handover say the same.
+
+## 2026-10-01 — the drop of 2026-10-01 is in production
+
+PR #14 squash-merged to `master` as `49e596d` once CI was green on every
+leg (both MariaDB 10.3 legs included), then deployed to production the
+same day — the first drop to meet production without a rehearsal, staging
+having been decommissioned that morning. The user reported "Deployed" and
+nothing else; the deploy's own facts (the dry run's `SERVER:` line, the
+`empty builds:` start-up line naming the 2026-09-30 orphan, the upgrade
+and restart timings, schema 11 on the Metrics page) are NOT recorded and
+should be asked for, not assumed. Production: MariaDB, schema v11,
+`--workers 16`.
+
+Bookkeeping done the same day: PR #12 closed as redundant; the shipped
+branches (`drop-2026-10-01`, `wp-40-acknowledged-failures`,
+`drop-2026-09-30`, `docs-handover-2026-09-29`) deleted locally and on
+origin; the handover rewritten; the build session's play server stopped.
+Open: PR #9 (the Java client), unchanged since 2026-09-08.
