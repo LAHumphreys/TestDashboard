@@ -818,6 +818,45 @@ posted FROM the stream being compared, `{author, created_at, text}` or
 `null`. A comment posted from anywhere else never appears there; the test's
 own thread (`GET .../comments`) always carries every comment with its origin.
 
+### Acknowledged failures (WP-40) — `/api/acknowledgments/*`
+
+A person looking at a failure can **acknowledge** it: for 1 to 7 days it stops
+counting as failing and is shown beside the failing figure instead ("12
+failing · 65 acknowledged"), never subtracted silently. An acknowledgment is
+of ONE stream's failure (`stream_id`, default mainline), is **owned** (the
+tests are assigned to the named assignee in the same transaction), and
+**unassigning a test drops its acknowledgments**. There is no indefinite
+acknowledgment. Not to be confused with `known_failure_reason` /
+`FAILED_AS_EXPECTED`, which a feeder declares.
+
+`POST /api/acknowledgments/bulk` — body `{"username", "reason"?, "days",
+"assignee", "tests": [{environment, script, test_name, stream_id?}, ...]}`
+(`tests` as in `POST /api/comments/bulk`; a missing `stream_id` is mainline).
+`days` must be a whole number 1..7 (`null`, strings, booleans and out-of-range
+values are a `400`). `reason` is required only for a test with no current
+acknowledgment; one that has one is **extended** (`extensions + 1`). Response
+`{"acknowledged": n, "extended": n, "unknown": n}`.
+
+`POST /api/acknowledgments/clear` — body `{"username", "tests": [...]}`; the
+assignment stays. Response `{"cleared": n}`.
+
+`GET /api/acknowledgments?expiring_within_hours=24&stream=<id>` — the Expiring
+list: acknowledgments expiring within 1..168 hours (default 24), including
+ones already expired, on tests still failing; every stream unless `stream=` is
+given. Each entry: `environment, script, test_name, stream_id, stream_kind,
+stream_name, reason, acknowledged_at, expires_at, acknowledged_by, extensions,
+live, result, assignee`.
+
+Elsewhere: `/api/summary` gains `status.acknowledged`, `by_environment[].
+acknowledged`, `products[].acknowledged` and an `acknowledged` queue (and
+`queue_totals.acknowledged`), with `failing`/`new_failures`/`still_failing`
+reduced; `/api/watch` environment and product cards gain `acknowledged`;
+`GET /api/dashboard` takes `acknowledged=true|false` and every row (and every
+queue row) carries `acknowledgment` (null, or `{reason, acknowledged_at,
+expires_at, acknowledged_by, extensions, live, stream_id}`); test detail
+carries the stream's current `acknowledgment` and the `acknowledgment_history`
+across streams, newest first.
+
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 
 A test that stops being reported shows up as "not run" forever. Retiring it is a

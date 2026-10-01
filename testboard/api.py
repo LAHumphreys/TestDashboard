@@ -50,10 +50,12 @@ from testboard import analytics, model, site_notes
 from testboard.metrics import Metrics
 from testboard.model import Result, RunRecord, StoredRun, ValidationError
 from testboard.storage import (
+    ACKNOWLEDGMENT_MAX_DAYS,
     COMPARE_CATEGORIES,
     DASHBOARD_SORTS,
     MAINLINE_STREAM_ID,
     QUEUE_KINDS,
+    Acknowledgment,
     Comment,
     CompareCounts,
     CompareRow,
@@ -375,8 +377,32 @@ def _run_json(run: StoredRun) -> Dict[str, Any]:
     }
 
 
+def _acknowledgment_json(
+    ack: Optional[Acknowledgment], now_value: datetime.datetime,
+) -> Optional[Dict[str, Any]]:
+    """Serialize a current acknowledgment (WP-40), or None.
+
+    ``live`` is computed HERE, from the request's own clock: an expired
+    row stays on record (it keeps its extension count) and is returned
+    with ``live: false`` so a page can say "expired" rather than
+    nothing.
+    """
+    if ack is None:
+        return None
+    return {
+        "reason": ack.reason,
+        "acknowledged_at": model.format_iso(ack.acknowledged_at),
+        "expires_at": model.format_iso(ack.expires_at),
+        "acknowledged_by": ack.acknowledged_by,
+        "extensions": ack.extensions,
+        "live": ack.expires_at > now_value,
+        "stream_id": ack.stream_id,
+    }
+
+
 def _summary_row_json(
-    row: TestSummaryRow, product: str = ""
+    row: TestSummaryRow, product: str = "",
+    now_value: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
     """Serialize one dashboard row to its JSON shape.
 
@@ -412,6 +438,8 @@ def _summary_row_json(
             else model.format_iso(row.retired_at)
         ),
         "retired_by": row.retired_by,
+        "acknowledgment": _acknowledgment_json(
+            row.acknowledgment, now_value or model.utcnow()),
     }  # type: Dict[str, Any]
     if row.latest_comment is not None:
         payload["latest_comment"] = {
@@ -910,6 +938,20 @@ def _parse_dashboard_filters(
             "origin: must be 'build' or 'mainline', got '{}'".format(
                 assignment_origin),
         )
+    # WP-40: acknowledged=true keeps only live-acknowledged failures,
+    # acknowledged=false only the ones that are not; absent, the
+    # filter is off (the failing categories still EXCLUDE acknowledged
+    # failures — storage's rule, which needs the request's clock).
+    acknowledged = None  # type: Optional[bool]
+    raw_acknowledged = _query_single(request.query, "acknowledged")
+    if raw_acknowledged is not None:
+        if raw_acknowledged not in ("true", "false"):
+            raise _HttpError(
+                400,
+                "acknowledged: must be 'true' or 'false', got "
+                "'{}'".format(raw_acknowledged),
+            )
+        acknowledged = raw_acknowledged == "true"
 
     filters = {
         "environment": environment,
@@ -925,6 +967,8 @@ def _parse_dashboard_filters(
         "assignment_origin": assignment_origin,
         "assigned_only": assigned_only,
         "open_items": open_items,
+        "acknowledged": acknowledged,
+        "now": now(),
     }  # type: Dict[str, Any]
     return _DashboardFilters(
         filters=filters, product=product, with_comment=with_comment,
@@ -980,7 +1024,8 @@ def _handle_dashboard(
     # product-aware endpoint reads from environment_products.
     env_to_product = storage.environment_products_map()
     payload = [
-        _summary_row_json(row, env_to_product.get(row.environment, ""))
+        _summary_row_json(
+            row, env_to_product.get(row.environment, ""), filters["now"])
         for row in rows
     ]
     if with_streak:
@@ -1114,6 +1159,7 @@ def _status_row_json(
     row: TestStatusRow,
     streak: Optional[FailureStreak],
     product: str = "",
+    now_value: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
     """Serialize one queue entry (a status row plus optional streak info).
 
@@ -1157,6 +1203,8 @@ def _status_row_json(
         "last_pass_time": (
             None if last_pass is None else model.format_iso(last_pass)
         ),
+        "acknowledgment": _acknowledgment_json(
+            row.acknowledgment, now_value or model.utcnow()),
     }
 
 
@@ -1171,6 +1219,7 @@ def _summary_queue_json(
     env_to_product: Optional[Dict[str, str]] = None,
     stream_id: int = MAINLINE_STREAM_ID,
     queue_counts: Optional[Dict[str, int]] = None,
+    now_value: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
     """Serialize one triage queue: exact total plus capped, enriched entries.
 
@@ -1223,7 +1272,7 @@ def _summary_queue_json(
         storage_kind, environment, limit=_SUMMARY_QUEUE_CAP,
         assignee=queue_assignee, stale_before=recent_cutoff,
         with_latest_comment=True, environments=environments,
-        stream_id=stream_id,
+        stream_id=stream_id, now=now_value,
     )
     if with_streaks:
         needed = [
@@ -1244,6 +1293,7 @@ def _summary_queue_json(
                 if with_streaks and row.result is Result.FAIL else None
             ),
             products.get(row.environment, ""),
+            now_value,
         )
         for row in rows
     ]
@@ -1255,7 +1305,7 @@ def _summary_queue_json(
         else storage.status_queue_count(
             storage_kind, environment, assignee=queue_assignee,
             stale_before=recent_cutoff, environments=environments,
-            stream_id=stream_id,
+            stream_id=stream_id, now=now_value,
         )
     )
     return {
@@ -1271,6 +1321,7 @@ def _summary_queue_totals(
     recent_cutoff: datetime.datetime,
     environments: Optional[Sequence[str]] = None,
     stream_id: int = MAINLINE_STREAM_ID,
+    now_value: Optional[datetime.datetime] = None,
 ) -> Dict[str, int]:
     """Exact size of every queue, without fetching a single row.
 
@@ -1283,7 +1334,7 @@ def _summary_queue_totals(
     """
     return storage.queue_counts(
         environment, assignee, stale_before=recent_cutoff,
-        environments=environments, stream_id=stream_id,
+        environments=environments, stream_id=stream_id, now=now_value,
     )
 
 
@@ -1295,6 +1346,7 @@ def _products_summary(
     storage: Storage,
     recent_cutoff: datetime.datetime,
     rollup_rows: Optional[List[RollupCount]] = None,
+    acknowledged: Sequence[RollupCount] = (),
 ) -> List[Dict[str, Any]]:
     """The ``products[]`` breakdown of ``/api/summary`` (WP-20 §2.2).
 
@@ -1321,6 +1373,11 @@ def _products_summary(
     different environment/stream partition), so the caller passes
     ``None`` there and this fetches its own, exactly as before — see
     ``_handle_summary``'s call site for which case is which.
+
+    *acknowledged* (WP-40) is :meth:`Storage.acknowledged_cells` for the
+    SAME estate-wide mainline scope — the caller fetches it once; every
+    product's ``failing``/``new_failures`` exclude it and
+    ``acknowledged`` reports it beside them.
     """
     products = storage.distinct_products()
     if not products:
@@ -1333,10 +1390,12 @@ def _products_summary(
         row.product: row
         for row in analytics.summarize_by_product(
             rows, storage.environment_products_map(),
+            acknowledged=acknowledged,
         )
     }
     zero = analytics.ProductRollup(
-        product="", failing=0, new_failures=0, fixed=0, unexpected_passes=0
+        product="", failing=0, new_failures=0, fixed=0,
+        unexpected_passes=0, acknowledged=0,
     )
     return [
         {
@@ -1346,6 +1405,7 @@ def _products_summary(
             "fixed": by_product.get(product, zero).fixed,
             "unexpected_passes": by_product.get(
                 product, zero).unexpected_passes,
+            "acknowledged": by_product.get(product, zero).acknowledged,
         }
         for product in products
     ]
@@ -1551,6 +1611,7 @@ def _handle_summary(
                     storage, kind, environment, assignee, recent_cutoff,
                     {}, environments=environments,
                     env_to_product=env_to_product, stream_id=stream_id,
+                    now_value=current,
                 ),
             },
         )
@@ -1562,11 +1623,20 @@ def _handle_summary(
         recent_cutoff, environment, environments=environments,
         stream_id=stream_id,
     )
+    # WP-40: ONE small read, bounded by the number of acknowledgments
+    # and never memoized (it depends on `current`), subtracted cell for
+    # cell from the memoized one-pass rollup. The same cells feed the
+    # per-product breakdown when the request is the unscoped one.
+    acknowledged_cells = storage.acknowledged_cells(
+        current, recent_cutoff, environment, environments=environments,
+        stream_id=stream_id,
+    )
     estate = analytics.summarize_rollup(
         estate_rollup,
         storage.assigned_open_count(
             environment, environments=environments, stream_id=stream_id,
         ),
+        acknowledged=acknowledged_cells,
     )
     # WP-23 perf pass: _products_summary always needs the estate-wide
     # MAINLINE rollup, regardless of this request's own scope. When the
@@ -1576,11 +1646,19 @@ def _handle_summary(
     # rather than fetched a second time. A genuinely scoped request
     # (environment=/product=/stream=) reads different data here, so
     # _products_summary fetches its own (pass None -- see its docstring).
-    products_rollup = (
-        estate_rollup
-        if environment is None and environments is None
+    products_scoped = not (
+        environment is None and environments is None
         and stream_id == MAINLINE_STREAM_ID
-        else None
+    )
+    products_rollup = None if products_scoped else estate_rollup
+    # WP-40: _products_summary is ALWAYS estate-wide mainline, so a
+    # scoped request needs its own estate-wide cells (a handful of
+    # rows, bounded by the number of acknowledgments).
+    products_acknowledged = (
+        storage.acknowledged_cells(
+            current, recent_cutoff, None, environments=None,
+            stream_id=MAINLINE_STREAM_ID,
+        ) if products_scoped else acknowledged_cells
     )
 
     # Trend: per-night result counts, zero-filled over the window so the
@@ -1627,7 +1705,7 @@ def _handle_summary(
     # and Storage.queue_counts's docstrings for the measured before/after.
     queue_totals = _summary_queue_totals(
         storage, environment, assignee, recent_cutoff,
-        environments=environments, stream_id=stream_id,
+        environments=environments, stream_id=stream_id, now_value=current,
     )
     payload = {
             "generated_at": model.format_iso(current),
@@ -1652,7 +1730,8 @@ def _handle_summary(
             # products declared, the frontend's signal to show nothing
             # product-shaped at all.
             "products": _products_summary(
-                storage, recent_cutoff, products_rollup),
+                storage, recent_cutoff, products_rollup,
+                products_acknowledged),
             "environments": storage.environments(
                 environments=catalog_environments),
             "scripts": storage.scripts(
@@ -1699,6 +1778,10 @@ def _handle_summary(
                 "still_failing": status.still_failing,
                 "fixed": status.fixed,
                 "assigned_open": status.assigned_open,
+                # WP-40: failing/new_failures/still_failing above
+                # EXCLUDE these; shown beside them, never subtracted
+                # silently.
+                "acknowledged": status.acknowledged,
             },
             "trend": {
                 "days": days,
@@ -1714,6 +1797,7 @@ def _handle_summary(
                     "new_failures": rollup.new_failures,
                     "unexpected_passes": rollup.unexpected_passes,
                     "not_run": rollup.not_run,
+                    "acknowledged": rollup.acknowledged,
                 }
                 for rollup in estate.by_environment
             ],
@@ -1748,6 +1832,7 @@ def _handle_summary(
             storage, kind, environment, None, recent_cutoff, streaks,
             environments=environments, env_to_product=env_to_product,
             stream_id=stream_id, queue_counts=queue_totals,
+            now_value=current,
         )
         for kind in QUEUE_KINDS
     }
@@ -1755,6 +1840,7 @@ def _handle_summary(
         storage, "mine", environment, assignee, recent_cutoff, streaks,
         environments=environments, env_to_product=env_to_product,
         stream_id=stream_id, queue_counts=queue_totals,
+        now_value=current,
     )
     payload["queues"] = queues
     return _json_response(200, payload)
@@ -1818,6 +1904,29 @@ def _handle_test_detail(
             "stream": stream_id,
             "stream_identity": None if stream is None else _stream_json(
                 stream),
+            # WP-40: THIS stream's current acknowledgment (live or
+            # expired, `live` says which) and every act on the test,
+            # across streams, newest first.
+            "acknowledgment": _acknowledgment_json(
+                storage.acknowledgment_for(
+                    stream_id, environment, script, test_name),
+                now_dt,
+            ),
+            "acknowledgment_history": [
+                {
+                    "id": act.id,
+                    "stream_id": act.stream_id,
+                    "action": act.action,
+                    "reason": act.reason,
+                    "expires_at": (
+                        None if act.expires_at is None
+                        else model.format_iso(act.expires_at)),
+                    "actor": act.actor,
+                    "acted_at": model.format_iso(act.acted_at),
+                }
+                for act in storage.acknowledgment_history(
+                    environment, script, test_name)
+            ],
         },
     )
 
@@ -2068,7 +2177,7 @@ def _handle_assignee(
 _DASHBOARD_FILTER_QUERY_PARAMS = (
     "environment", "script", "q", "result", "product", "stream",
     "stale", "retired", "assignee", "unassigned", "assigned", "open",
-    "origin",
+    "origin", "acknowledged",
 )
 
 #: Query-string keys _parse_dashboard_filters reads that are NOT
@@ -2260,6 +2369,162 @@ def _handle_bulk_comments(
         username, text, now(), entries)
     return _json_response(
         200, {"commented": commented, "unknown": unknown})
+
+
+def _acknowledgment_keys(
+    entries: Sequence[Tuple[str, str, str, Optional[int]]],
+) -> List[Tuple[str, str, str, int]]:
+    """``tests[]`` entries as acknowledgment keys: an acknowledgment is
+    always OF a stream's failure, so a missing ``stream_id`` is
+    mainline (unlike comments/assignments, where it is an annotation)."""
+    return [
+        (environment, script, test_name,
+         MAINLINE_STREAM_ID if stream_id is None else stream_id)
+        for environment, script, test_name, stream_id in entries
+    ]
+
+
+def _parse_acknowledgment_days(obj: Dict[str, Any]) -> int:
+    """``days``: a whole number 1..ACKNOWLEDGMENT_MAX_DAYS on every
+    stream. Absent, null, a string, a bool, a float or out of range are
+    all the same 400 — there is no indefinite acknowledgment."""
+    days = obj.get("days")
+    if (not isinstance(days, int) or isinstance(days, bool)
+            or days < 1 or days > ACKNOWLEDGMENT_MAX_DAYS):
+        raise _HttpError(
+            400,
+            "days: must be a whole number from 1 to {}".format(
+                ACKNOWLEDGMENT_MAX_DAYS),
+        )
+    return days
+
+
+def _handle_acknowledgments_bulk(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/acknowledgments/bulk — acknowledge (or extend) a
+    selection of failing tests and assign them all to one owner (WP-40).
+
+    Body: ``{"username", "reason"?, "days", "assignee", "tests":
+    [{environment, script, test_name, stream_id?}, ...]}``. ``days`` is
+    1..7 on every stream; there is no indefinite acknowledgment.
+    ``assignee`` is required — an acknowledgment is owned. ``reason``
+    is optional here (an extension keeps the old one) but storage
+    requires it for a test not yet acknowledged, which comes back as a
+    400 naming the field. A test with no result on its stream is
+    counted ``unknown`` and skipped.
+
+    Response: ``{"acknowledged": n, "extended": n, "unknown": n}``.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    days = _parse_acknowledgment_days(obj)
+    assignee = _validate_username(obj, "assignee")
+    if not storage.is_active_user(assignee):
+        raise _HttpError(
+            400,
+            "assignee: {} has been deactivated and cannot be assigned "
+            "work".format(assignee),
+        )
+    reason = None  # type: Optional[str]
+    if obj.get("reason") is not None:
+        reason = _validate_comment_text(obj, field="reason")
+    if "tests" not in obj:
+        raise _HttpError(400, "tests: required field is missing")
+    entries = _parse_test_entries(storage, obj["tests"])
+    if not entries:
+        raise _HttpError(400, "tests: must name at least one test")
+    try:
+        result = storage.acknowledge_tests(
+            _acknowledgment_keys(entries), reason, days, assignee,
+            username, now(),
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if message.startswith("reason is required"):
+            message = "reason: is required" + message[
+                len("reason is required"):]
+        raise _HttpError(400, message)
+    return _json_response(
+        200,
+        {
+            "acknowledged": result.acknowledged,
+            "extended": result.extended,
+            "unknown": result.unknown,
+        },
+    )
+
+
+def _handle_acknowledgments_clear(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/acknowledgments/clear — remove the current
+    acknowledgment of each listed test (the assignment stays).
+
+    Body: ``{"username", "tests": [...]}``, same list as the bulk
+    endpoint. Response: ``{"cleared": n}``.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    if "tests" not in obj:
+        raise _HttpError(400, "tests: required field is missing")
+    entries = _parse_test_entries(storage, obj["tests"])
+    if not entries:
+        raise _HttpError(400, "tests: must name at least one test")
+    cleared = storage.clear_acknowledgments(
+        _acknowledgment_keys(entries), username, now())
+    return _json_response(200, {"cleared": cleared})
+
+
+def _handle_acknowledgments_list(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """GET /api/acknowledgments?expiring_within_hours=24&stream=<id> —
+    Open Actions' Expiring queue: acknowledgments expiring within the
+    window, INCLUDING ones already expired, on tests still failing.
+    ``stream`` narrows to one stream; absent means every stream.
+    """
+    within_hours = _parse_int_param(
+        request, "expiring_within_hours", 24, 1, 168)
+    stream_id = None  # type: Optional[int]
+    if _query_single(request.query, "stream") is not None:
+        stream_id = _resolve_stream_id(storage, request)
+    now_value = now()
+    rows = storage.expiring_acknowledgments(
+        now_value, datetime.timedelta(hours=within_hours), stream_id)
+    entries = []  # type: List[Dict[str, Any]]
+    for row in rows:
+        ack = row.acknowledgment
+        entry = {
+            "environment": ack.environment,
+            "script": ack.script,
+            "test_name": ack.test_name,
+            "stream_id": ack.stream_id,
+            "stream_kind": row.stream_kind,
+            "stream_name": row.stream_name,
+            "result": row.result.value,
+            "assignee": row.assignee,
+        }  # type: Dict[str, Any]
+        details = _acknowledgment_json(ack, now_value)
+        assert details is not None
+        for key in ("reason", "acknowledged_at", "expires_at",
+                    "acknowledged_by", "extensions", "live"):
+            entry[key] = details[key]
+        entries.append(entry)
+    return _json_response(
+        200,
+        {
+            "generated_at": model.format_iso(now_value),
+            "within_hours": within_hours,
+            "acknowledgments": entries,
+        },
+    )
 
 
 def _handle_bulk_assignments_list(
@@ -3833,20 +4098,29 @@ def _handle_watch(
     # the common unscoped load, instead of missing on a now()-unique key
     # every single request.
     rollup_counts = storage.summary_rollup(estate_cutoff)
+    # WP-40: ONE read of the estate's live acknowledgments (mainline,
+    # unscoped — like the rollup above), shared by every e:/p: card.
+    # s: cards come from compare_counts_many, which has no
+    # acknowledgment input; they are unchanged.
+    watch_acknowledged = storage.acknowledged_cells(
+        now_value, estate_cutoff)
     by_environment = {
         row.product: row
         for row in analytics.summarize_by_product(
-            rollup_counts, {e: e for e in known_environments}
+            rollup_counts, {e: e for e in known_environments},
+            acknowledged=watch_acknowledged,
         )
     }
     by_product = {
         row.product: row
         for row in analytics.summarize_by_product(
-            rollup_counts, env_to_product
+            rollup_counts, env_to_product,
+            acknowledged=watch_acknowledged,
         )
     }
     zero = analytics.ProductRollup(
-        product="", failing=0, new_failures=0, fixed=0, unexpected_passes=0
+        product="", failing=0, new_failures=0, fixed=0,
+        unexpected_passes=0, acknowledged=0,
     )
 
     def card_cutoff(card_environments: Sequence[str]) -> datetime.datetime:
@@ -3881,6 +4155,7 @@ def _handle_watch(
                 "new_failures": verdict.new_failures,
                 "fixed": verdict.fixed,
                 "unexpected_passes": verdict.unexpected_passes,
+                "acknowledged": verdict.acknowledged,
                 "stale_before": model.format_iso(card_cutoff([name])),
                 "last_reported": (
                     None if env_last_reported is None
@@ -3915,6 +4190,7 @@ def _handle_watch(
                 "new_failures": verdict.new_failures,
                 "fixed": verdict.fixed,
                 "unexpected_passes": verdict.unexpected_passes,
+                "acknowledged": verdict.acknowledged,
                 "stale_before": model.format_iso(
                     card_cutoff(product_envs)),
                 # No single "last reported" for a multi-environment
@@ -4192,6 +4468,18 @@ def _route(
     if rest == ["comments", "bulk"]:
         _check_method(request.method, ("POST",))
         return _handle_bulk_comments(storage, request, now)
+
+    if rest == ["acknowledgments", "bulk"]:
+        _check_method(request.method, ("POST",))
+        return _handle_acknowledgments_bulk(storage, request, now)
+
+    if rest == ["acknowledgments", "clear"]:
+        _check_method(request.method, ("POST",))
+        return _handle_acknowledgments_clear(storage, request, now)
+
+    if rest == ["acknowledgments"]:
+        _check_method(request.method, ("GET",))
+        return _handle_acknowledgments_list(storage, request, now)
 
     if rest == ["summary"]:
         _check_method(request.method, ("GET",))
