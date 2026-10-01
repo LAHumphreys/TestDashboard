@@ -6,8 +6,9 @@ is a snapshot, and a snapshot that has been appended to is just a worse log.
 
 Last rewritten: **2026-10-01**. **WP-40 (muted failures) is built and
 merged on `wp-40-acknowledged-failures`**; the drop of 2026-10-01 now carries
-WP-39 **and** WP-40, and **a migration (11) runs on both backends**. Nothing
-is pushed or deployed yet.
+WP-39 **and** WP-40, and **a migration (11) runs on both backends**.
+**Pushed as PR #14, CI green on every leg; NOT deployed yet** — the deploy
+is the operator's, per the drop note.
 
 ## Where things stand
 
@@ -47,24 +48,26 @@ is pushed or deployed yet.
   and production MariaDB procedures, rollback for each). The tester note is in
   `whatsnew.html`. The date is provisional in both.
 
-## What remains before shipping
+## Ready to deploy — what is left is the operator's
 
-1. ~~The performance A/B against `master`~~ **Done** (log, "WP-40
-   performance"): yesterday's gains intact; the one regression it found
-   (the browse page's count carrying the mute join) is fixed in
-   `dbb5523` and re-measured. Left for a later pass, found on `master`
-   too: 65 `current_assignments` rows cost the browse page's count ~8 ms.
-2. **Fast-forward `wp-40-acknowledged-failures` into `drop-2026-10-01`**
-   (`drop-2026-10-01` holds only WP-39 and the deploy record; WP-40 was
-   branched from it, so it is a fast-forward), then check the drop date in
-   `whatsnew.html` and the operator note still agree.
-3. **Push, open the PR, and wait for CI's two MariaDB 10.3 legs** — the only
-   10.3 evidence. Expect the ubi8 leg to read skipped=5.
-4. **Deploy per the operator note**: staging (SQLite) first, then production
-   (MariaDB, runbook §G: dump, dry run and read the `SERVER:` line, upgrade,
-   restart). The restart is not optional.
-5. **Squash merges**: PR merges here are squashes, so after shipping, rebase
-   or delete the working branches by name.
+1. **PR #14** (`drop-2026-10-01` → `master`) is green on every leg for head
+   `3748436`, including both MariaDB 10.3 legs (the dual-backend suite and
+   the suite on a database the ledger upgraded from v7). Merge it when
+   deploying (squash, as the previous drops were).
+2. **Deploy per `docs/drops/2026-10-01.md`** — staging first (SQLite: stop,
+   copy the file aside, pull, start; the file migrates on open), then
+   production (MariaDB, runbook §G: credential, dump, dry run — read the
+   `SERVER:` line — upgrade with the server up, then the restart). Then the
+   note's "Check it came up" list, which includes muting one test and
+   unmuting it again.
+3. **After the deploy:** rewrite this file (production at the merge
+   commit, schema v11), append the log, close PR #12, delete the shipped
+   branches by name (`drop-2026-10-01`, `wp-40-acknowledged-failures`,
+   `drop-2026-09-30` — squash merges, so not from `--merged`).
+4. **Still unanswered from the 2026-09-30 deploy:** counters on? "Waited,
+   mean" during a run?
+5. **A play server may still be running** on 127.0.0.1:8947 from the build
+   session, on a scratch copy of the dev database; stop it if it is.
 
 ## Next session's plan
 

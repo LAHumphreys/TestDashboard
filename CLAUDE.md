@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project State
 
 **testboard is live in production and has been since 2026-07-26.** It is no longer
-greenfield: ~25k lines, 2,640 tests,
+greenfield: ~25k lines, 2,640 tests (3,626 with the MariaDB variants active),
 schema at migration 11, deployed and in daily use by a small group of testers.
 **Production serves MariaDB**; the old SQLite box is now staging. SQLite and
 MariaDB remain equal, permanently supported backends — see "Commands".

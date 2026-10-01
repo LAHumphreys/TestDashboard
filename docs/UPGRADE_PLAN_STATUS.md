@@ -4253,3 +4253,37 @@ grouped by result) and one memoized epoch read ahead of the scripts query.
 **Left alone, noticed.** The home "New failures" tile's delta line ("N more
 failing than before") is `new_failures - fixed` and so ignores muted new
 failures; whether it should add them back is the user's call.
+
+## 2026-10-01 — WP-40 walkthrough polish, Unmute in the bar, and the final numbers (ready to deploy)
+
+**The lead's walkthrough** of every new surface after the rename (no
+browser; the diff of `static/` read end to end, the flow driven against
+a play server through the API): three fixes (`ddd7fe4`) — the
+environment chart's tooltip built "(+N muted)" by string-replacing the
+tile helper's output instead of calling `failingWithMuted()`; the test
+page's button said "Mute…" where the bar and the Review panel say
+"Mute"; a `.review-unit` rule with no user. Judged fit otherwise.
+
+**The user's first question in use: "how do I unmute via bulk
+select?"** There was no way; the bar had Mute only (`3748436`): an
+Unmute button after Mute, enabled whenever something is selected,
+posting the selection to `api/mutes/unmute`, which removes the mutes
+that exist and leaves the rest alone — checked with a mixed selection
+(5 selected, 4 muted → `unmuted: 4`). Tests stay assigned.
+
+**Driven end to end on the play server** (dev data, SQLite): mute 3
+still-failing tests (two for 7 days, one for 12 hours); `hours: 200`
+→ 400 naming the rule; a fresh mute without a reason → 400 naming the
+count; the headline moved by exactly 3 (`still_failing` 93 → 90,
+`muted_still_failing` 3, `muted_total` 3, pass-rate inputs unchanged);
+the Muted queue listed the three with prev/current result; an extension
+counted (`extensions` 1) and moved the mute into the 24-hour expiring
+list; unassigning dropped the mute with an `unmute`/`unassigned`
+history row; the fresh mute's reason was on the test as a comment.
+
+**Final counts, main checkout:** SQLite **2640 OK (skipped 1)**;
+whole suite with the MariaDB variants active, local 12.3: **3626 OK
+(skipped 71)**. **CI green on every leg for `3748436`** (PR #14),
+including both `mariadb:10.3` legs — the dual-backend suite and the
+suite on a database the ledger upgraded from v7. The operator note is
+current; the deploy is the user's, per that note.
