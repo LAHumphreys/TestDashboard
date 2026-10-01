@@ -23,19 +23,27 @@
 "use strict";
 
 import {
+  acknowledgmentDetail,
   assigneeSelect,
   clearNode,
   el,
   fetchJson,
   fillOutput,
+  getUsername,
   runStrip,
   postJson,
+  preselectUser,
   putJson,
   requireUsername,
   showError,
   testApiPath,
+  userPickerSelect,
 } from "./api.js";
-import { pageUrl } from "./urls.js";
+import {
+  bulkAcknowledgmentsUrl,
+  clearAcknowledgmentsUrl,
+  pageUrl,
+} from "./urls.js";
 
 /*
  * Which panels are open, keyed by test identity.
@@ -183,6 +191,150 @@ async function buildReviewPanel(entry, container, opts) {
   }
 }
 
+/** This one test, in the shape the acknowledgment endpoints take. */
+function ackTests(entry) {
+  const test = {
+    environment: entry.environment, script: entry.script,
+    test_name: entry.test_name,
+  };
+  if (entry.stream_id) {
+    test.stream_id = entry.stream_id;
+  }
+  return [test];
+}
+
+/**
+ * The Acknowledge group (WP-40), for a FAILING test only: acknowledging
+ * is a statement about a failure. Already acknowledged -> who, until
+ * when, why, with "Extend 7 days" and "Clear"; otherwise a reason, a
+ * length in days and an owner. Everything arrives via entry/opts.
+ */
+function buildAcknowledgeGroup(entry, opts) {
+  const group = el("div", "review-group review-group-wide");
+  group.appendChild(el("label", "review-label", "Acknowledge"));
+  const done = () => {
+    if (opts.onAcknowledged) {
+      opts.onAcknowledged();
+    } else if (opts.onChanged) {
+      opts.onChanged();
+    }
+  };
+  const needUser = () => {
+    const me = requireUsername();
+    if (!me) {
+      showError(
+        "Set a username first (the “Change” button, top right) "
+        + "— acknowledgments are recorded against a name.");
+    }
+    return me;
+  };
+  const ack = entry.acknowledgment;
+  if (ack && ack.live) {
+    group.appendChild(el("span", "ack-line",
+      "Acknowledged " + acknowledgmentDetail(ack, true)));
+    const extend = el("button", "", "Extend 7 days");
+    extend.type = "button";
+    const clear = el("button", "", "Clear");
+    clear.type = "button";
+    clear.title = "Stop acknowledging this failure; it counts as "
+      + "failing again. It stays assigned.";
+    extend.addEventListener("click", async () => {
+      const me = needUser();
+      if (!me) {
+        return;
+      }
+      extend.disabled = true;
+      clear.disabled = true;
+      try {
+        await postJson(bulkAcknowledgmentsUrl(), {
+          username: me, days: 7, assignee: entry.assignee || me,
+          tests: ackTests(entry),
+        });
+        done();
+      } catch (err) {
+        showError(err.message);
+        extend.disabled = false;
+        clear.disabled = false;
+      }
+    });
+    clear.addEventListener("click", async () => {
+      const me = needUser();
+      if (!me) {
+        return;
+      }
+      extend.disabled = true;
+      clear.disabled = true;
+      try {
+        await postJson(clearAcknowledgmentsUrl(), {
+          username: me, tests: ackTests(entry),
+        });
+        done();
+      } catch (err) {
+        showError(err.message);
+        extend.disabled = false;
+        clear.disabled = false;
+      }
+    });
+    group.appendChild(extend);
+    group.appendChild(clear);
+    return group;
+  }
+
+  const reason = document.createElement("input");
+  reason.type = "text";
+  reason.className = "review-input";
+  reason.placeholder = "Why is this failure acknowledged? (required)";
+  const days = document.createElement("input");
+  days.type = "text";
+  days.inputMode = "numeric";
+  days.className = "review-days-input";
+  days.value = "7";
+  days.setAttribute("aria-label", "Days to acknowledge for, 1 to 7");
+  const owner = userPickerSelect("review-owner-select");
+  owner.title = "Who owns this failure while it is acknowledged";
+  preselectUser(owner, entry.assignee || getUsername());
+  const go = el("button", "", "Acknowledge");
+  go.type = "button";
+  go.title = "Stop counting this failure as failing for 1-7 days. It is "
+    + "assigned to the owner chosen and listed as acknowledged.";
+  go.addEventListener("click", async () => {
+    const me = needUser();
+    if (!me) {
+      return;
+    }
+    const text = reason.value.trim();
+    if (!text) {
+      reason.focus();
+      showError("Say why this failure is acknowledged — the reason is "
+        + "kept with it.");
+      return;
+    }
+    if (!/^[0-9]+$/.test(days.value.trim())
+        || parseInt(days.value, 10) < 1 || parseInt(days.value, 10) > 7) {
+      days.focus();
+      showError("Days must be a whole number from 1 to 7.");
+      return;
+    }
+    go.disabled = true;
+    try {
+      await postJson(bulkAcknowledgmentsUrl(), {
+        username: me, reason: text, days: parseInt(days.value, 10),
+        assignee: owner.value || me, tests: ackTests(entry),
+      });
+      done();
+    } catch (err) {
+      showError(err.message);
+      go.disabled = false;
+    }
+  });
+  group.appendChild(reason);
+  group.appendChild(days);
+  group.appendChild(el("span", "review-unit", "days"));
+  group.appendChild(owner);
+  group.appendChild(go);
+  return group;
+}
+
 function buildReviewActions(entry, opts) {
   const actions = el("div", "review-actions");
   const changed = opts.onChanged || (() => {});
@@ -273,6 +425,11 @@ function buildReviewActions(entry, opts) {
   commentGroup.appendChild(input);
   commentGroup.appendChild(post);
   actions.appendChild(commentGroup);
+
+  /* --- acknowledge: a failing test only --- */
+  if (entry.result === "FAIL") {
+    actions.appendChild(buildAcknowledgeGroup(entry, opts));
+  }
 
   /* --- retire: only offered where it makes sense --- */
   // Offered for any test that has stopped reporting, wherever it is

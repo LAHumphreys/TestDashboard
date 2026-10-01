@@ -71,6 +71,13 @@
       <div id="latest-run" class="latest-run"></div>
       <!-- Why this failure is expected, when the import says so. -->
       <div id="known-failure" class="known-failure" hidden></div>
+      <!-- A failure somebody has acknowledged for a few days (WP-40):
+           owned, time-boxed, and counted beside the failing figures
+           rather than in them. Distinct from the known failure above,
+           which the test suite itself declares. When there is no
+           acknowledgment and the test is failing, the same slot offers
+           to make one. -->
+      <div id="ack-banner" class="known-failure acknowledged" hidden></div>
       <!-- Only shown when this page was opened with ?stream=<id> (WP-21,
            docs/STREAMS_PLAN.md §3.6): mainline's own result beside this
            branch's, for the SAME test. Absent entirely on every mainline
@@ -179,6 +186,26 @@
       </form>
       <p id="comments-empty" class="empty-state" hidden>No comments yet. If you work out what is wrong with this test, say so here.</p>
       <div id="comments-list"></div>
+    </section>
+
+    <section id="ack-history-section" hidden>
+      <details id="ack-history-details" class="charts-details">
+        <summary class="charts-summary">Acknowledgment history</summary>
+        <div class="table-wrap">
+          <table class="data-table small">
+            <thead>
+              <tr>
+                <th>Action</th>
+                <th>By</th>
+                <th>When (UTC)</th>
+                <th>Expires (UTC)</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="ack-history-body"></tbody>
+          </table>
+        </div>
+      </details>
     </section>
 
     <section id="run-output-section" hidden>

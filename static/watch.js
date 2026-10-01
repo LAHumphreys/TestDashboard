@@ -356,6 +356,12 @@ function buildOkCard(card, index, total) {
 
   const verdict = el("div", "watch-card-verdict");
   verdict.appendChild(buildStat("Failing", card.failing));
+  // Acknowledged failures (WP-40) are not in "Failing"; shown beside it
+  // so the subtraction is never silent. Absent on a server that does not
+  // send it, in which case nothing is drawn.
+  if (card.acknowledged !== undefined && card.acknowledged !== null) {
+    verdict.appendChild(buildStat("Acknowledged", card.acknowledged));
+  }
   verdict.appendChild(buildStat("New failures", card.new_failures));
   verdict.appendChild(buildStat("Fixed", card.fixed));
   div.appendChild(verdict);

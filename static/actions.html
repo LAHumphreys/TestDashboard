@@ -147,6 +147,34 @@
       </div>
     </section>
 
+    <!-- Acknowledged failures about to run out (WP-40), or already run
+         out while the test still fails. Fetched on its own, after the
+         list above has been asked for, and hidden when there is nothing
+         to say: it never holds the list up. -->
+    <section id="expiring-section" aria-labelledby="expiring-heading" hidden>
+      <div class="section-head">
+        <h2 id="expiring-heading" class="eyebrow">Expiring acknowledgments</h2>
+        <span class="muted">within 24 hours, plus any that have run out while the test still fails</span>
+        <button id="extend-all-btn" type="button">Extend all 7 days</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="expiring-table">
+          <thead>
+            <tr>
+              <th>Test</th>
+              <th>Build</th>
+              <th>Owner</th>
+              <th>Reason</th>
+              <th>Expires</th>
+              <th>Extended</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="expiring-body"></tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- Deactivating a user is rare and administrative, so it is folded
          away rather than given a page of its own. It lives here because
          this is the page where you notice a name that should not be in

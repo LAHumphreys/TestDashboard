@@ -507,6 +507,80 @@ export function formatTime(iso) {
 }
 
 /**
+ * "in 3 days" / "in 5 hours" / "in 20 minutes" / "expired" for an
+ * acknowledgment's expires_at (WP-40). DISPLAY ONLY: whether one is still
+ * in force is the server's `live` flag, computed against the server's own
+ * clock; this reads the browser's, so it can disagree by a few minutes
+ * and must never decide anything.
+ */
+export function relativeExpiry(expiresAt, nowMs) {
+  if (typeof expiresAt !== "string" || expiresAt.length < 19) {
+    return "—";
+  }
+  // The server's timestamps are UTC with no zone suffix.
+  const then = Date.parse(expiresAt.slice(0, 19) + "Z");
+  if (isNaN(then)) {
+    return formatTime(expiresAt);
+  }
+  const ms = then - (nowMs === undefined ? Date.now() : nowMs);
+  if (ms <= 0) {
+    return "expired";
+  }
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) {
+    return "in " + Math.max(minutes, 1) + (minutes <= 1 ? " minute"
+      : " minutes");
+  }
+  const hours = Math.round(ms / 3600000);
+  if (hours < 48) {
+    return "in " + hours + (hours === 1 ? " hour" : " hours");
+  }
+  const days = Math.round(ms / 86400000);
+  return "in " + days + " days";
+}
+
+/** "by alice · expires in 3 days · extended 2×" — the small print under
+ * an acknowledgment's reason (or the whole line when `withReason`). */
+export function acknowledgmentDetail(ack, withReason) {
+  const parts = [];
+  parts.push("by " + ack.acknowledged_by);
+  parts.push(ack.live === false ? "expired"
+    : "expires " + relativeExpiry(ack.expires_at));
+  if (withReason && ack.reason) {
+    parts.push(ack.reason);
+  }
+  if (ack.extensions > 0) {
+    parts.push("extended " + ack.extensions + "×");
+  }
+  return parts.join(" · ");
+}
+
+/** The small "acknowledged" pill for a row whose failure is currently
+ * acknowledged, or null. An expired acknowledgment shows nothing. */
+export function acknowledgedTag(entry) {
+  const ack = entry && entry.acknowledgment;
+  if (!ack || !ack.live) {
+    return null;
+  }
+  const tag = el("span", "ack-tag", "acknowledged");
+  tag.title = ack.reason + " — " + acknowledgmentDetail(ack);
+  return tag;
+}
+
+/** Select `name` in a userPickerSelect once its options exist. */
+export function preselectUser(select, name) {
+  if (!name) {
+    return;
+  }
+  select.value = name;
+  loadUsers().then(() => {
+    if (!select.value) {
+      select.value = name;
+    }
+  });
+}
+
+/**
  * Human-friendly duration from seconds (e.g. "1.9s", "2m 05s", "8h 40m").
  *
  * Hours matter now that whole suites are being totalled: "520m 22s" is

@@ -56,7 +56,7 @@ import {
   userPickerSelect,
 } from "./api.js";
 import { entryKey } from "./review.js";
-import { apiUrl } from "./urls.js";
+import { apiUrl, bulkAcknowledgmentsUrl } from "./urls.js";
 
 /**
  * The bulk endpoint's URL, EVERY scope level explicitly cleared.
@@ -105,6 +105,9 @@ let noteInputEl = null;
 let assignBtnEl = null;
 let unassignBtnEl = null;
 let commentBtnEl = null;
+let ackReasonEl = null;
+let ackDaysEl = null;
+let ackBtnEl = null;
 
 function selectionEntries() {
   return Array.from(selected.values());
@@ -221,6 +224,65 @@ async function doComment() {
   }
 }
 
+/** The acknowledgment length typed in the bar: a whole number 1..7, else
+ * null. The server enforces the same bound; this only gates the button. */
+function ackDays() {
+  const text = ackDaysEl.value.trim();
+  if (!/^[0-9]+$/.test(text)) {
+    return null;
+  }
+  const days = parseInt(text, 10);
+  return days >= 1 && days <= 7 ? days : null;
+}
+
+function updateAckButtonState() {
+  if (!ackBtnEl) {
+    return;
+  }
+  ackBtnEl.disabled = selected.size === 0 || ackDays() === null;
+}
+
+/**
+ * Acknowledge every selected failure (WP-40): not counted as failing for
+ * 1-7 days, owned by someone. The owner is whoever the "Assign to" box
+ * names, else the person clicking. A reason is required for a test not
+ * yet acknowledged and optional for one being extended, so a blank
+ * reason is sent as no reason and the server's own message says which.
+ */
+async function doAcknowledge() {
+  const me = requireUsername();
+  if (!me) {
+    showError(
+      "Set a username first (the “Change” button, top right) "
+      + "— acknowledgments are recorded against a name.");
+    return;
+  }
+  const days = ackDays();
+  if (days === null || selected.size === 0) {
+    return;
+  }
+  const reason = ackReasonEl.value.trim();
+  const body = {
+    username: me, days: days, assignee: userSelectEl.value || me,
+    tests: testsPayload(),
+  };
+  if (reason) {
+    body.reason = reason;
+  }
+  ackBtnEl.disabled = true;
+  try {
+    await postJson(bulkAcknowledgmentsUrl(), body);
+    ackReasonEl.value = "";
+    ackDaysEl.value = "7";
+    clearSelection();
+    notifyChanged();
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    updateAckButtonState();
+  }
+}
+
 async function doAssign() {
   const me = requireUsername();
   if (!me) {
@@ -331,6 +393,39 @@ function ensureBar() {
   commentBtnEl.addEventListener("click", doComment);
   barEl.appendChild(commentBtnEl);
 
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
+  ackReasonEl = document.createElement("input");
+  ackReasonEl.type = "text";
+  ackReasonEl.className = "selection-note-input";
+  ackReasonEl.placeholder = "reason";
+  ackReasonEl.setAttribute(
+    "aria-label", "Why these failures are acknowledged — required for a "
+      + "test not already acknowledged");
+  barEl.appendChild(ackReasonEl);
+
+  ackDaysEl = document.createElement("input");
+  ackDaysEl.type = "text";
+  ackDaysEl.inputMode = "numeric";
+  ackDaysEl.className = "selection-days-input";
+  ackDaysEl.placeholder = "days";
+  ackDaysEl.value = "7";
+  ackDaysEl.setAttribute(
+    "aria-label", "Days to acknowledge for, 1 to 7");
+  ackDaysEl.addEventListener("input", updateAckButtonState);
+  barEl.appendChild(ackDaysEl);
+
+  ackBtnEl = el("button", "selection-ack-btn", "Acknowledge");
+  ackBtnEl.type = "button";
+  ackBtnEl.disabled = true;
+  ackBtnEl.title = "Stop counting the selected failures as failing for "
+    + "1-7 days. They are assigned to the person in “Assign to” "
+    + "(or to you) and listed as acknowledged beside the failing count.";
+  ackBtnEl.addEventListener("click", doAcknowledge);
+  barEl.appendChild(ackBtnEl);
+
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
   const clearBtn = el("button", "selection-clear-btn", "Clear selection");
   clearBtn.type = "button";
   clearBtn.addEventListener("click", clearSelection);
@@ -354,6 +449,7 @@ function renderBar() {
   }
   countEl.textContent = count.toLocaleString();
   updateAssignButtonState();
+  updateAckButtonState();
   unassignBtnEl.disabled = false;
 }
 

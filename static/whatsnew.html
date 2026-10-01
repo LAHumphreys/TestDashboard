@@ -47,8 +47,53 @@
     <section class="release" data-drop-date="2026-10-01">
       <div class="section-head">
         <h2 class="eyebrow">1 October 2026</h2>
-        <span class="muted">Fixed: an empty build no longer lingers in the Build box</span>
+        <span class="muted">New: acknowledge a failure for up to a week &middot; Fixed: an empty build no longer lingers in the Build box</span>
       </div>
+
+      <h3>What's new</h3>
+      <ul>
+        <li><strong>You can acknowledge a failure you already know
+          about.</strong> Pick a failing test, say why, and choose how
+          long &mdash; from one day to seven, never longer. While it is
+          acknowledged the test is left out of the failing counts, and
+          the number you would have seen is shown beside them as
+          &ldquo;acknowledged&rdquo; instead of quietly vanishing: the
+          Home page has an Acknowledged tile and queue, the Watch cards
+          and the failing-by-environment chart show the count, and the
+          rows themselves carry a small &ldquo;acknowledged&rdquo;
+          label.</li>
+        <li><strong>Three places to do it.</strong> Tick tests and use
+          the <em>Acknowledge</em> box in the bar at the bottom (a
+          reason, a number of days, then Acknowledge); open a row's
+          <em>Review</em> panel; or use the Acknowledge line under the
+          result on the test's own page. The test page also keeps an
+          Acknowledgment history, folded away under the discussion.</li>
+        <li><strong>Every acknowledgment has an owner.</strong>
+          Acknowledging assigns the test: to whoever you chose in
+          &ldquo;Assign to&rdquo;, else whoever it was already
+          assigned to, else you. If the test is later unassigned, its
+          acknowledgment is dropped with it, so a failure never sits
+          acknowledged with nobody looking after it.</li>
+        <li><strong>It runs out, and Open Actions tells you
+          first.</strong> When the days are up the test counts as
+          failing again. Open Actions has a new
+          <em>Expiring acknowledgments</em> list &mdash; what runs out
+          within 24 hours, plus anything that already has while the test
+          still fails &mdash; with an <em>Extend 7 days</em> button on
+          each row, or one for the whole list. Extending is allowed
+          again and again, but the number of extensions is counted and
+          shown, on purpose, so a failure that keeps being put off is
+          visible as one.</li>
+        <li><strong>Builds keep their own.</strong> A test acknowledged
+          on mainline is not acknowledged on a build, and the other way
+          round: acknowledge it from the build's own pages, and the
+          build's &ldquo;Its own results&rdquo; tab counts it
+          separately.</li>
+        <li><strong>&ldquo;Acknowledged&rdquo; is not &ldquo;known
+          failure&rdquo;.</strong> A known failure is still what the
+          test suite itself declares about a test. An acknowledgment is
+          what a person here decided, for a limited time.</li>
+      </ul>
 
       <h3>Fixed</h3>
       <ul>
