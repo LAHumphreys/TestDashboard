@@ -4,93 +4,58 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-10-01**. **WP-40 (muted failures) is built and
-merged on `wp-40-acknowledged-failures`**; the drop of 2026-10-01 now carries
-WP-39 **and** WP-40, and **a migration (11) runs on both backends**.
-**Pushed as PR #14, CI green on every leg; NOT deployed yet** — the deploy
-is the operator's, per the drop note.
+Last rewritten: **2026-10-01, after the deploy**. The drop of 2026-10-01
+(WP-39 empty builds pruned; WP-40 muted failures, migration 11) was
+squash-merged as PR #14 and **deployed to production the same day**. The
+user reported only "Deployed"; nothing else from the deploy is recorded yet.
 
 ## Where things stand
 
-- **Production is MariaDB, schema v10, serving `master` at `a6f59d2`** —
-  the 2026-09-30 drop, PR #13. `--workers 16`.
-- **Not reported back from the 2026-09-30 deploy** — ask before assuming
-  either: whether the counters were left on; what "Waited, mean" reads
-  during a run.
-- **`wp-40-acknowledged-failures` is the branch that holds everything for the
-  drop**: WP-39 (`2b8c2ff`), the MariaDB upgrade tool as a ledger (`2098aff`,
-  `f3aaf0f`), the spec (`bc2aed9`), and WP-40 itself:
-  `a8f3b30` migration 11 + storage, `c5c2b87` API, `6f7831d` storage tests +
-  ledger step 10 to 11, `154a201` frontend, merged by `c85957e` and
-  `0dfa121`; plus the docs commit on top (operator note, log entry, this
-  file, CLAUDE.md's three numbers).
-- **Measured on this branch:** SQLite **2640 OK (skipped 1)**, from 2550;
-  MariaDB 12.3, the two MariaDB suites alone: **998 OK (skipped 70)** (the
-  full-variant 3594 predates the 2026-10-01 amendment). Production is 10.3: CI's legs are the authority.
-- **What WP-40 is, in one screen** (the log's "WP-40 spec", its addendum and
-  "WP-40 built" are the contract): a person mutes a failing test on
-  one stream with a reason for **1–168 whole hours** (the UI offers 12
-  hours to 7 days from one shared dropdown; never indefinite; no `null`);
-  the New / Still failing figures exclude live mutes and "+X muted" is shown
-  beside them everywhere a failing count appears (no Muted tile; grey chart
-  extensions; Watch "N (+X muted)"), while the **pass rate still counts muted
-  failures**; muting assigns and posts the reason as a comment, and
-  unassigning drops the mute; the Muted tab lists EVERY live mute, passing
-  or failing, with a State column (`status.muted_total`); Open Actions has an
-  Expiring list with Extend. **Amended after the first walkthrough (log,
-  2026-10-01 "WP-40 amended ..."): the state was renamed "acknowledged" ->
-  "muted" end to end, before anything shipped.** Migration 11 only creates
-  `test_mutes` and `mute_history`. The MariaDB ledger step
-  has `alters=()`, so the upgrade tool's dry run prints `SERVER: may keep
-  running`. Six design observations are recorded (not changed) in the log.
-  The spec spells the expiry column `until`; the code is `expires_at`.
-- **The operator note is written**: `docs/drops/2026-10-01.md` (the production MariaDB
-  procedure and its rollback; staging is gone). The tester note is in
-  `whatsnew.html`. The date is provisional in both.
-
-## Ready to deploy — what is left is the operator's
-
-1. **PR #14** (`drop-2026-10-01` → `master`) is green on every leg for head
-   `3748436`, including both MariaDB 10.3 legs (the dual-backend suite and
-   the suite on a database the ledger upgraded from v7). Merge it when
-   deploying (squash, as the previous drops were).
-2. **Deploy per `docs/drops/2026-10-01.md`** — straight to production;
-   **staging was decommissioned on 2026-10-01**, so there is no rehearsal
-   box any more (MariaDB, runbook §G: credential, dump, dry run — read the
-   `SERVER:` line — upgrade with the server up, then the restart). Then the
-   note's "Check it came up" list, which includes muting one test and
-   unmuting it again.
-3. **After the deploy:** rewrite this file (production at the merge
-   commit, schema v11), append the log, close PR #12, delete the shipped
-   branches by name (`drop-2026-10-01`, `wp-40-acknowledged-failures`,
-   `drop-2026-09-30` — squash merges, so not from `--merged`).
-4. **Still unanswered from the 2026-09-30 deploy:** counters on? "Waited,
-   mean" during a run?
-5. **A play server may still be running** on 127.0.0.1:8947 from the build
-   session, on a scratch copy of the dev database; stop it if it is.
+- **Production is MariaDB, schema v11, serving `master` at `49e596d`** —
+  the 2026-10-01 drop, PR #14. `--workers 16`. **It is the only
+  deployment**: the SQLite staging box was decommissioned on 2026-10-01,
+  so every drop from now on meets production cold.
+- **Not reported back from the deploy — ask, do not assume:** what the
+  upgrade tool's dry run said (`SERVER: may keep running` expected); whether
+  the start-up output named the orphaned build (`empty builds: removed 1
+  (build:…)`); how long the upgrade step and the restart took; whether the
+  Metrics page shows schema 11; whether anyone has muted a test yet.
+  Carried from 2026-09-30, still unanswered: were the counters left on; what
+  "Waited, mean" reads during a run.
+- **Nothing is in flight.** No feature branch exists. PR #12 is closed
+  (redundant). The shipped branches (`drop-2026-10-01`,
+  `wp-40-acknowledged-failures`, `drop-2026-09-30`,
+  `docs-handover-2026-09-29`) are deleted locally and on origin.
+- **The upgrade tool is a ledger** (WP-40): a SQLite migration above 7
+  without its MariaDB step fails the suite (`LedgerTest`); runbook §G.5 is
+  the procedure. Migration 12 is reserved by WP-15 (parked).
+- **Feeders are never stopped for an upgrade** (runbook §G.3); the tool's
+  dry run says whether the SERVER must stop.
 
 ## Next session's plan
 
-1. Finish the list above. After the deploy, the first-hour checks in the
-   operator note, then see what the testers make of the Muted queue.
-2. **Get the two deploy answers** (counters on? "Waited, mean" during a run?).
-3. **Tidy the branches.** PR #12 (`docs-handover-2026-09-29`) is redundant —
-   close it. `drop-2026-09-30` is merged in content but not an ancestor of
-   `master`; delete it by name.
+1. **Get the deploy answers above** into the log; rewrite this paragraph.
+2. **Watch the first days of muting.** The log's WP-40 entries list six
+   recorded edges; the two a tester is likeliest to trip over: the Assigned
+   and Muted tabs overlap (a mute assigns), and unassigning from mainline
+   drops a build's mute of the same test. The "New failures" delta line
+   does not add muted failures back. Change nothing until someone asks.
+3. **The master-side perf finding** from the WP-40 A/B: 65
+   `current_assignments` rows cost the browse page's count ~8 ms, on
+   `master` too. A candidate for the next performance pass, with the
+   "Known slow" table below.
 4. **Decide the Java client's fate** (PR #9), open since 2026-09-08.
+5. Then whatever the testers report.
 
 ## Where the code is
 
 | | |
 |---|---|
-| `origin/master` | `a6f59d2` — **deployed** |
-| **`wp-40-acknowledged-failures`** | **THE drop branch**: WP-39 + the ledger + WP-40, built and merged, docs on top. Not pushed |
-| `drop-2026-10-01` | WP-39 + the deploy record only; receives the fast-forward above |
-| `drop-2026-09-30` | shipped as PR #13 (squash). Delete when convenient |
-| `docs-handover-2026-09-29` | PR #12 **open**, redundant — close it |
+| `origin/master` | `49e596d` — **deployed** |
+| `admin-2026-10-01-deployed` | this handover + the deploy record (docs only); merge when green and delete |
 | `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, green, untouched since 2026-09-08 |
-| `wp-14-in-run-progress` | parked WIP; its migration renumbers to **12** (registry §1) — WP-40 took 11 |
-| `wp-32-timeline-follow`, `wp-31-own-results-always`, `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*`, `wp-17`…`wp-25`, `worktree-agent-*` | merged or throwaway; prune when convenient. Sibling worktrees (`TestDashboard-*-wt`, `.claude/worktrees/*`) hold some of them — remove the worktree before the branch |
+| `wp-14-in-run-progress` | parked WIP; its migration renumbers to **12** before merging (registry §1) and needs a MariaDB ledger step |
+| `wp-32-timeline-follow`, `wp-31-own-results-always`, `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*`, `wp-17`…`wp-25` | merged; prune when convenient. Sibling worktrees (`TestDashboard-*-wt`) hold some of them — remove the worktree before the branch |
 
 There is **no local `master` branch** in this checkout; work from
 `origin/master`.
@@ -102,8 +67,7 @@ There is **no local `master` branch** in this checkout; work from
 2. **Build comments — the workshop the user offered:** mainline lists show a
    test's newest comment of any origin, unlabelled; deleting a build clears
    the tag on its comments; nothing carries from one build to the next of the
-   same branch. ("Has a comment" is not "muted" is now answered by
-   WP-40.)
+   same branch. ("Has a comment" is not "muted" is now answered by WP-40.)
 3. **Decide the Java client's fate** (PR #9): merge or park.
 4. Carried from 2026-08-11, still open: re-retire the tests the un-retire
    bug released (search comments for "Automatically un-retired");
@@ -113,15 +77,15 @@ There is **no local `master` branch** in this checkout; work from
    still an experiment.
 5. Carried from WP-31: a build whose last run is more than 36 hours old
    shows "Reported 0 of N" on its own tiles. **Do not loosen the clamp**.
-6. WP-40's six recorded observations (log): none needs a decision to ship;
-   #2 and #3 (tab overlap; unassign from mainline dropping a build's
-   mute) are the ones a tester is likeliest to trip over.
+6. WP-40's recorded edges (log, "WP-40 built" and "amended"): none needed a
+   decision to ship; see plan item 2.
 
 ## Known slow, measured, not changed
 
 Dev-scale SQLite, cold, in-process. Read the Metrics page first: if the
 wait is for a worker, none of these is the problem. (Taken before WP-40; the
-A/B in the log says what WP-40 did to them.)
+"WP-40 performance" entry in the log says what WP-40 did to them: nothing,
+within noise, after `dbb5523`.)
 
 | | |
 |---|---|
@@ -129,6 +93,7 @@ A/B in the log says what WP-40 did to them.)
 | A comparison page for a full-size build | 58 ms — the pairs query twice, pinned at two by WP-23 |
 | Open Actions' rows | 45 ms, never memoized |
 | Home headline | 36 ms, of which 24 is the one pass that is left |
+| Browse page's count with 65 assignments | +8 ms over none — on `master` too (WP-40 A/B) |
 
 ## Verification tooling (DOM shim, not a browser)
 
@@ -139,17 +104,22 @@ There is still no browser here; every drop's operator note says so.
   verify a branch and restore the pin afterwards. **It fails 5 checks on
   `master` and did before the drop**: its seed is dated August. Re-seed
   it before trusting a pass.
-- `.scratch/net/drop-2026-09-30/` — the shipped drop's drivers, seeded
-  databases and benchmark scripts; `README.txt` has the command lines.
-  **To compare two code trees use `bench_ab.py`** — in-process,
-  alternated — because HTTP timings here vary 2–3× between runs.
+- `.scratch/net/drop-2026-09-30/` — the 2026-09-30 drop's drivers, seeded
+  databases and benchmark scripts, plus the WP-40 A/B scripts and raw
+  numbers (`wp40_ab.txt`, `wp40_ab.py`, `wp40_bench.py`, `wp40_dash.py`);
+  `README.txt` has the command lines. **To compare two code trees use the
+  in-process, alternated method** — HTTP timings here vary 2–3× between runs.
 - A local MariaDB 12.3 lives in `.scratch/mariadb-data` (port 3307,
   option file `.scratch/mariadb-test.cnf`; `.scratch/mariadb-test-via.cnf`
   names a second sacrificial database for `TESTBOARD_TEST_DB_VIA_UPGRADE=1`
-  runs): start `mariadbd.exe` with
+  runs or a second agent): start `mariadbd.exe` with
   `--defaults-file=.scratch/mariadb-data/my.ini --port=3307`, then set
   `TESTBOARD_TEST_DB_CNF` (an absolute path). It is not 10.3; CI's two 10.3
-  legs are the authority for production's stream.
+  legs are the authority for production's stream. It may still be running
+  from the 2026-10-01 session.
+- A play server for trying the UI: `python run_server.py --db <COPY of
+  testboard.db> --port 8947 --host 127.0.0.1 --workers 4`. Never the
+  repo-root file itself.
 
 All of `.scratch/` is gitignored — it exists on this machine only.
 
@@ -157,9 +127,9 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 
 ```bash
 git fetch origin --prune
-git log --oneline -3 origin/master   # a6f59d2 on top means the 2026-10-01 drop has NOT shipped
-gh pr list --state open              # expect #9 and, until closed, #12; plus the drop's PR once opened
-python -m unittest discover          # expect 2640 OK (skipped 1) on wp-40-acknowledged-failures, SQLite
+git log --oneline -3 origin/master   # 49e596d on top = the 2026-10-01 drop; it is deployed
+gh pr list --state open              # expect #9 only (plus this admin PR until merged)
+python -m unittest discover          # expect 2640 OK (skipped 1), SQLite
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,
