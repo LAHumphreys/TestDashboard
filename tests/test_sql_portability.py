@@ -43,8 +43,9 @@ EXPECTED = {
     # means and why these two sites are safe.
     "INSERT OR REPLACE": 2,
     # SQLite spelling; MariaDB wants AUTO_INCREMENT. WP-21 adds one:
-    # streams.id (migration 9).
-    "AUTOINCREMENT": 4,
+    # streams.id (migration 9). WP-40 adds one more:
+    # acknowledgment_history.id (migration 11).
+    "AUTOINCREMENT": 5,
     # Date functions: removed by migration 3 and must stay removed.
     "julianday": 0,
     "strftime": 0,

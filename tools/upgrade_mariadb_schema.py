@@ -285,6 +285,57 @@ def step_9_to_10() -> List[str]:
     ]
 
 
+def step_10_to_11(sizes: exporter.Sizes) -> List[str]:
+    """test_acknowledgments + acknowledgment_history - migration 11.
+
+    Mirrors storage.py's entry 11: two new tables, no backfill, nothing
+    existing touched. Column-for-column identical to ``exporter.ddl()``
+    (the oracle ``verify`` diffs against) - kept literal here for the
+    same reason as step_7_to_8. ``reason`` is TEXT (not indexed, not
+    bounded by the audit); ``action`` shares ``result``'s ascii_bin.
+    """
+    env = "VARCHAR({0})".format(sizes.environment)
+    script = "VARCHAR({0})".format(sizes.script)
+    name = "VARCHAR({0})".format(sizes.test_name)
+    stamp = "VARCHAR(26) CHARACTER SET ascii COLLATE ascii_bin"
+    return [
+        "CREATE TABLE test_acknowledgments (\n"
+        "  stream_id       BIGINT NOT NULL,\n"
+        "  environment     {env} NOT NULL,\n"
+        "  script          {script} NOT NULL,\n"
+        "  test_name       {name} NOT NULL,\n"
+        "  reason          TEXT NOT NULL,\n"
+        "  acknowledged_at {stamp} NOT NULL,\n"
+        "  expires_at      {stamp} NOT NULL,\n"
+        "  acknowledged_by VARCHAR(100) NOT NULL,\n"
+        "  extensions      INT NOT NULL DEFAULT 0,\n"
+        "  PRIMARY KEY (stream_id, environment, script, test_name)\n"
+        ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC".format(
+            env=env, script=script, name=name, stamp=stamp),
+
+        "CREATE TABLE acknowledgment_history (\n"
+        "  id          BIGINT NOT NULL AUTO_INCREMENT,\n"
+        "  stream_id   BIGINT NOT NULL,\n"
+        "  environment {env} NOT NULL,\n"
+        "  script      {script} NOT NULL,\n"
+        "  test_name   {name} NOT NULL,\n"
+        "  action      VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin "
+        "NOT NULL,\n"
+        "  reason      TEXT NULL,\n"
+        "  expires_at  {stamp} NULL,\n"
+        "  actor       VARCHAR(100) NOT NULL,\n"
+        "  acted_at    {stamp} NOT NULL,\n"
+        "  PRIMARY KEY (id)\n"
+        ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC".format(
+            env=env, script=script, name=name, stamp=stamp),
+
+        "CREATE INDEX idx_test_acknowledgments_expiry "
+        "ON test_acknowledgments (expires_at)",
+        "CREATE INDEX idx_acknowledgment_history_triple "
+        "ON acknowledgment_history (environment, script, test_name, id)",
+    ]
+
+
 #: Every MariaDB migration since the cutover, in order. One entry per
 #: ``storage.MIGRATIONS`` entry above CUTOVER_VERSION — a gap fails
 #: ``LedgerTest`` and stops the tool at start-up (see ledger_gaps).
@@ -318,6 +369,16 @@ LEDGER = (
                 Probe("script_hours.stream_id column", "script_hours",
                       "stream_id")),
         alters=("activity_hours", "script_hours"),
+    ),
+    Step(
+        from_version=10, package="WP-40",
+        summary="test_acknowledgments and acknowledgment_history tables",
+        statements=lambda sizes, now_iso: step_10_to_11(sizes),
+        probes=(Probe("test_acknowledgments table",
+                      "test_acknowledgments", None),
+                Probe("acknowledgment_history table",
+                      "acknowledgment_history", None)),
+        alters=(),
     ),
 )  # type: Tuple[Step, ...]
 

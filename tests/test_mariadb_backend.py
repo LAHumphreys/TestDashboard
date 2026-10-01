@@ -76,6 +76,26 @@ EXCLUDED_CLASSES = {
 #: is not — skipped with the reason, so a green MariaDB run cannot be
 #: read as having exercised them.
 EXCLUDED_TESTS = {
+    "AcknowledgmentTest.test_a_repeat_acknowledged_cells_read_is_a_memo_hit":
+        "counts statements with sqlite3's set_trace_callback (WP-40); "
+        "the values are compared on MariaDB by the rest of "
+        "AcknowledgmentTest.",
+    "AcknowledgmentTest.test_a_stream_with_no_acknowledgments_costs_nothing_once_known":
+        "counts statements with sqlite3's set_trace_callback (WP-40); "
+        "the values are compared on MariaDB by the rest of "
+        "AcknowledgmentTest.",
+    "AcknowledgmentTest.test_the_epoch_read_is_a_memo_hit_and_never_serves_a_past_clock":
+        "counts statements with sqlite3's set_trace_callback (WP-40); "
+        "the values are compared on MariaDB by the rest of "
+        "AcknowledgmentTest.",
+    "AcknowledgmentTest.test_passing_the_epoch_recomputes_the_cells":
+        "counts statements with sqlite3's set_trace_callback (WP-40); "
+        "the values are compared on MariaDB by the rest of "
+        "AcknowledgmentTest.",
+    "AcknowledgmentTest.test_a_push_into_one_environment_drops_only_its_cells":
+        "counts statements with sqlite3's set_trace_callback (WP-40); "
+        "the values are compared on MariaDB by the rest of "
+        "AcknowledgmentTest.",
     "TestPerformancePassEndpoints.test_the_product_list_reads_no_test_results":
         "counts statements with sqlite3's set_trace_callback.",
     "TestPerformancePassEndpoints.test_identity_only_runs_no_comparison":

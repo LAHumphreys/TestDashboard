@@ -8149,14 +8149,76 @@ class Storage:
         excluded — so :func:`analytics.summarize_rollup` can subtract
         them cell for cell.
 
-        NEVER memoized, on purpose: it is bounded by the number of
-        acknowledgments (driven from ``test_acknowledgments`` by its
-        stream prefix, each row reaching ``latest_runs`` by primary
-        key), and it depends on *now*, so reading it fresh is what
-        makes expiry exact to the second. The one-pass rollup it is
-        subtracted from stays memoized, untouched.
+        Memoized, and exact to the second. Which acknowledgments are
+        live is a function of *now*, but only through the
+        ACKNOWLEDGMENT EPOCH (:meth:`acknowledgment_epoch`, the next
+        expiry): until then the live set can change only by a write,
+        which drops every memo. So the epoch is read first — memoized
+        itself, and ``None`` (no live acknowledgment on the stream, the
+        common case) answers with NO query at all — and the cells are
+        keyed on it. They are stored PER ENVIRONMENT, tagged with their
+        ``(stream, environment)``, the way :meth:`_environment_rollup`
+        stores its own: one grouped read of the stream's (few)
+        acknowledgments, split by environment, an entry for EVERY
+        environment of the stream (empty ones too, so "known empty" is
+        a hit), and a push into one environment drops only that
+        environment's entry. The query is driven from
+        ``test_acknowledgments`` by its stream prefix, each row
+        reaching ``latest_runs`` by primary key — bounded by the number
+        of acknowledgments, never by the estate.
         """
-        sql = (
+        at = now or model.utcnow()
+        epoch = self.acknowledgment_epoch(stream_id, at)
+        if epoch is None:
+            return []
+        cutoff_iso = model.format_iso(recent_cutoff)
+        names = self._stream_environment_names(stream_id)
+        per_environment = {}  # type: Dict[str, List[RollupCount]]
+        for name in names:
+            cached = self._cached_summary(
+                ("ack_cells", stream_id, name, cutoff_iso, epoch))
+            if cached is None:
+                break
+            per_environment[name] = cached
+        else:
+            cells = []  # type: List[RollupCount]
+            for name in names:
+                cells.extend(per_environment[name])
+            return self._filter_cells(cells, environment, environments)
+        grouped = {}  # type: Dict[str, List[RollupCount]]
+        for cell in self._read_acknowledged_cells(
+                at, recent_cutoff, stream_id):
+            grouped.setdefault(cell.environment, []).append(cell)
+        for name in sorted(set(names) | set(grouped)):
+            key = ("ack_cells", stream_id, name, cutoff_iso, epoch)
+            entry = grouped.get(name, [])
+            self._store_summary(key, entry, stream_id, name)
+        cells = []
+        for name in sorted(grouped):
+            cells.extend(grouped[name])
+        return self._filter_cells(cells, environment, environments)
+
+    @staticmethod
+    def _filter_cells(
+        cells: Sequence[RollupCount], environment: Optional[str],
+        environments: Optional[Sequence[str]],
+    ) -> List[RollupCount]:
+        """The scope filter :meth:`summary_rollup` applies to its cells."""
+        allowed = None if environments is None else set(environments)
+        return [
+            cell for cell in cells
+            if (environment is None or cell.environment == environment)
+            and (allowed is None or cell.environment in allowed)
+        ]
+
+    def _read_acknowledged_cells(
+        self, now: datetime.datetime, recent_cutoff: datetime.datetime,
+        stream_id: int,
+    ) -> List[RollupCount]:
+        """The one grouped read behind :meth:`acknowledged_cells`: the
+        whole stream's live acknowledgments on failing, un-retired
+        tests, for EVERY environment."""
+        rows = self._conn().execute(
             "SELECT ta.environment, lr.prev_result, "
             "CASE WHEN lr.start_time >= ? THEN 1 ELSE 0 END AS recent, "
             "COUNT(*) FROM test_acknowledgments AS ta "
@@ -8168,26 +8230,17 @@ class Storage:
             "  ON tr.environment = lr.environment "
             " AND tr.script = lr.script AND tr.test_name = lr.test_name "
             "WHERE ta.stream_id = ? AND ta.expires_at > ? "
-            "AND lr.result = ? AND " + self._NOT_RETIRED)
-        params = [
-            model.format_iso(recent_cutoff), stream_id,
-            model.format_iso(now or model.utcnow()), Result.FAIL.value,
-        ]  # type: List[Any]
-        if environment is not None:
-            sql += " AND ta.environment = ?"
-            params.append(environment)
-        envs_clause, envs_params = self._environments_clause(
-            environments, column="ta.environment")
-        if envs_clause is not None:
-            sql += " AND " + envs_clause
-            params.extend(envs_params)
-        sql += " GROUP BY ta.environment, lr.prev_result, recent"
+            "AND lr.result = ? AND " + self._NOT_RETIRED
+            + " GROUP BY ta.environment, lr.prev_result, recent",
+            (model.format_iso(recent_cutoff), stream_id,
+             model.format_iso(now), Result.FAIL.value),
+        ).fetchall()
         return [
             RollupCount(
                 environment=row[0], result=Result.FAIL,
                 prev_result=None if row[1] is None else Result(row[1]),
                 recent=bool(row[2]), retired=False, count=int(row[3]))
-            for row in self._conn().execute(sql, params).fetchall()
+            for row in rows
         ]
 
     def _subtract_acknowledged(
@@ -8218,13 +8271,33 @@ class Storage:
         """The next expiry after *now* on *stream_id* (ISO text), or
         None. The live set of acknowledgments cannot change before that
         moment except by a write, which drops every memo — so a memo
-        keyed on this value is exact for as long as it is served."""
+        keyed on this value is exact for as long as it is served.
+
+        Memoized per stream, as ``(computed_for, epoch)``. It is served
+        for any later *now* before the epoch (or at all, when there is
+        none), which is exact: the epoch is the NEXT expiry, so nothing
+        has expired in between, and a write has dropped the entry.
+        *computed_for* is why an EARLIER *now* (a test's fixed clock)
+        recomputes instead of being served an epoch that has since
+        moved past a row that was still live then. Passing the epoch
+        recomputes, and so does the first read after a push to the
+        stream (the entry is whole-stream tagged) — one indexed MIN.
+        """
+        at = model.format_iso(now or model.utcnow())
+        key = ("ack_epoch", stream_id)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            computed_for, epoch = cached
+            if computed_for <= at and (epoch is None or epoch > at):
+                return epoch
         row = self._conn().execute(
             "SELECT MIN(expires_at) FROM test_acknowledgments "
             "WHERE stream_id = ? AND expires_at > ?",
-            (stream_id, model.format_iso(now or model.utcnow()))
-        ).fetchone()
-        return None if row is None or row[0] is None else str(row[0])
+            (stream_id, at)).fetchone()
+        epoch = None if row is None or row[0] is None else str(row[0])
+        entry = (at, epoch)
+        self._store_summary(key, entry, stream_id)
+        return epoch
 
     def expiring_acknowledgments(
         self,
