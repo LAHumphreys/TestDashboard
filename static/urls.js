@@ -298,19 +298,19 @@ function currentUrlWithScope(overrides) {
   return url.pathname + (query ? "?" + query : "");
 }
 
-/* Acknowledged failures (WP-40). Like every bulk POST these name all four
- * scope levels null: where each test was acknowledged FROM travels per
+/* Muted failures (WP-40). Like every bulk POST these name all four
+ * scope levels null: where each test was muted FROM travels per
  * test, inside the body (stream_id), never in the page's own query. */
-export function bulkAcknowledgmentsUrl() {
+export function bulkMutesUrl() {
   return apiUrl(
-    "api/acknowledgments/bulk", null,
+    "api/mutes/bulk", null,
     { product: null, stream: null, baseline: null, environment: null },
   );
 }
 
-export function clearAcknowledgmentsUrl() {
+export function unmuteUrl() {
   return apiUrl(
-    "api/acknowledgments/clear", null,
+    "api/mutes/unmute", null,
     { product: null, stream: null, baseline: null, environment: null },
   );
 }

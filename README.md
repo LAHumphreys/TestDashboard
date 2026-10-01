@@ -818,44 +818,53 @@ posted FROM the stream being compared, `{author, created_at, text}` or
 `null`. A comment posted from anywhere else never appears there; the test's
 own thread (`GET .../comments`) always carries every comment with its origin.
 
-### Acknowledged failures (WP-40) — `/api/acknowledgments/*`
+### Muted tests (WP-40) — `/api/mutes/*`
 
-A person looking at a failure can **acknowledge** it: for 1 to 7 days it stops
+A person looking at a failure can **mute** it: for 12 hours to 7 days it stops
 counting as failing and is shown beside the failing figure instead ("12
-failing · 65 acknowledged"), never subtracted silently. An acknowledgment is
-of ONE stream's failure (`stream_id`, default mainline), is **owned** (the
-tests are assigned to the named assignee in the same transaction), and
-**unassigning a test drops its acknowledgments**. There is no indefinite
-acknowledgment. Not to be confused with `known_failure_reason` /
-`FAILED_AS_EXPECTED`, which a feeder declares.
+failing · 65 muted"), never subtracted silently. A mute is of ONE stream's
+failure (`stream_id`, default mainline), is **owned** (the tests are assigned
+to the named assignee in the same transaction), and **unassigning a test
+drops its mutes**. There is no indefinite mute. The reason is also posted as
+a comment on each test (tagged with the stream it was muted from). Not to be
+confused with `known_failure_reason` / `FAILED_AS_EXPECTED`, which a feeder
+declares.
 
-`POST /api/acknowledgments/bulk` — body `{"username", "reason"?, "days",
+`POST /api/mutes/bulk` — body `{"username", "reason"?, "hours",
 "assignee", "tests": [{environment, script, test_name, stream_id?}, ...]}`
 (`tests` as in `POST /api/comments/bulk`; a missing `stream_id` is mainline).
-`days` must be a whole number 1..7 (`null`, strings, booleans and out-of-range
-values are a `400`). `reason` is required only for a test with no current
-acknowledgment; one that has one is **extended** (`extensions + 1`). Response
-`{"acknowledged": n, "extended": n, "unknown": n}`.
+`hours` must be a whole number 1..168 (`null`, strings, booleans and
+out-of-range values are a `400`: `hours: must be a whole number from 1 to
+168`); the expiry is exactly now + `hours`. `reason` is required only for a
+test with no current mute; one that has one is **extended** (`extensions +
+1`), and a reason given on an extension replaces the old one. The reason is
+posted as a comment for every test it is given for: always for a fresh mute,
+for an extension only when a new reason came with it. Response
+`{"muted": n, "extended": n, "unknown": n}`.
 
-`POST /api/acknowledgments/clear` — body `{"username", "tests": [...]}`; the
-assignment stays. Response `{"cleared": n}`.
+`POST /api/mutes/unmute` — body `{"username", "tests": [...]}`; the
+assignment stays. Response `{"unmuted": n}`.
 
-`GET /api/acknowledgments?expiring_within_hours=24&stream=<id>` — the Expiring
-list: acknowledgments expiring within 1..168 hours (default 24), including
-ones already expired, on tests still failing; every stream unless `stream=` is
-given. Each entry: `environment, script, test_name, stream_id, stream_kind,
-stream_name, reason, acknowledged_at, expires_at, acknowledged_by, extensions,
-live, result, assignee`.
+`GET /api/mutes?expiring_within_hours=24&stream=<id>` — the Expiring
+list: mutes expiring within 1..168 hours (default 24), including
+ones already expired, on tests still failing (a muted test that passes needs
+no action); every stream unless `stream=` is given. Response
+`{generated_at, within_hours, mutes: [...]}`; each entry: `environment,
+script, test_name, stream_id, stream_kind, stream_name, reason, muted_at,
+expires_at, muted_by, extensions, live, result, assignee`.
 
-Elsewhere: `/api/summary` gains `status.acknowledged`, `by_environment[].
-acknowledged`, `products[].acknowledged` and an `acknowledged` queue (and
-`queue_totals.acknowledged`), with `failing`/`new_failures`/`still_failing`
-reduced; `/api/watch` environment and product cards gain `acknowledged`;
-`GET /api/dashboard` takes `acknowledged=true|false` and every row (and every
-queue row) carries `acknowledgment` (null, or `{reason, acknowledged_at,
-expires_at, acknowledged_by, extensions, live, stream_id}`); test detail
-carries the stream's current `acknowledgment` and the `acknowledgment_history`
-across streams, newest first.
+Elsewhere: `/api/summary` gains `status.muted` (the muted tests that are
+FAILING — the number taken off the failing figures), `status.muted_total`
+(every live mute, passing or failing), `by_environment[].muted` and
+`products[].muted` (failing ones), and a `muted` queue listing every live mute
+whatever its result (`queue_totals.muted` is its row count), with `failing`/
+`new_failures`/`still_failing` reduced by the failing ones only;
+`/api/watch` environment and product cards gain `muted` (failing ones);
+`GET /api/dashboard` takes `muted=true|false` and every row (and every
+queue row) carries `mute` (null, or `{reason, muted_at,
+expires_at, muted_by, extensions, live, stream_id}`); test detail
+carries the stream's current `mute` and the `mute_history` across streams,
+newest first (`action` is `mute`, `extend` or `unmute`).
 
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 

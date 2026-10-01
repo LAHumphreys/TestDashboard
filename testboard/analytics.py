@@ -460,11 +460,24 @@ class SummaryStatus(NamedTuple):
     still_failing: int
     fixed: int
     assigned_open: int
-    #: WP-40: tests failing now under a live acknowledgment. EXCLUDED
-    #: from ``results[FAIL]``/``recent_results[FAIL]``/``new_failures``/
-    #: ``still_failing`` above and reported here beside them — "12
-    #: failing · 65 acknowledged", never a silent subtraction.
-    acknowledged: int
+    #: WP-40: tests failing now under a live mute. EXCLUDED from
+    #: ``new_failures``/``still_failing`` above and reported here beside
+    #: them — "12 failing (+65 muted)", never a silent subtraction. A
+    #: muted failure is still a FAILURE, so ``results[FAIL]`` and
+    #: ``recent_results[FAIL]`` (the pass rate's inputs) are NOT reduced:
+    #: only the two failing queues' figures are. ``muted`` is the sum of
+    #: the next two.
+    muted: int
+    #: The muted failures that would be ``new_failures`` (previous result
+    #: not FAIL), and the ones that would be ``still_failing``. The two
+    #: figures the "+X muted" suffix on those tiles reads.
+    muted_new_failures: int
+    muted_still_failing: int
+    #: WP-40: EVERY test under a live mute, whatever its latest result
+    #: (a muted test that has since passed stays on the Muted tab until
+    #: it expires or is unmuted). ``muted_total - muted`` are the muted
+    #: tests no longer failing; nothing is subtracted for them.
+    muted_total: int
 
 
 class EnvironmentRollup(NamedTuple):
@@ -476,9 +489,9 @@ class EnvironmentRollup(NamedTuple):
     new_failures: int
     unexpected_passes: int
     not_run: int
-    #: WP-40 — see SummaryStatus.acknowledged; ``failed``/``new_failures``
-    #: exclude these.
-    acknowledged: int
+    #: WP-40 — see SummaryStatus.muted (failing-and-muted only);
+    #: ``failed``/``new_failures`` exclude these.
+    muted: int
 
 
 class ProductRollup(NamedTuple):
@@ -497,14 +510,14 @@ class ProductRollup(NamedTuple):
     new_failures: int
     fixed: int
     unexpected_passes: int
-    #: WP-40 — see SummaryStatus.acknowledged; ``failing``/``new_failures``
-    #: exclude these.
-    acknowledged: int
+    #: WP-40 — see SummaryStatus.muted (failing-and-muted only);
+    #: ``failing``/``new_failures`` exclude these.
+    muted: int
 
 
 def summarize_by_product(
     counts: Sequence[RollupCount], env_to_product: Dict[str, str],
-    acknowledged: Sequence[RollupCount] = (),
+    muted: Sequence[RollupCount] = (),
 ) -> List[ProductRollup]:
     """Aggregate rollup cells into one row per DECLARED product.
 
@@ -524,11 +537,12 @@ def summarize_by_product(
     column this function ignores) serves every product with no window
     to mislabel.
 
-    *acknowledged* (WP-40) is :meth:`Storage.acknowledged_cells` — the
-    same cell shape, but only the tests failing now under a live
-    acknowledgment. They are subtracted from ``failing``/
-    ``new_failures`` and reported as ``acknowledged``, the one rule
-    every failing count in the system follows (docs, WP-40 spec).
+    *muted* (WP-40) is :meth:`Storage.muted_cells` — the
+    same cell shape, for every test under a live mute. The cells
+    whose result is FAIL are subtracted from ``failing``/
+    ``new_failures`` and reported as ``muted``, the one rule every
+    failing count in the system follows (docs, WP-40 spec); a muted
+    test that is passing is subtracted from nothing.
     """
     buckets = {}  # type: Dict[str, List[int]]
     for cell in counts:
@@ -548,9 +562,11 @@ def summarize_by_product(
             bucket[2] += cell.count
         if cell.result is Result.UNEXPECTED_PASS:
             bucket[3] += cell.count
-    for cell in acknowledged:
+    for cell in muted:
         product = env_to_product.get(cell.environment)
         if product is None or product not in buckets:
+            continue
+        if cell.result is not Result.FAIL:
             continue
         bucket = buckets[product]
         bucket[0] -= cell.count
@@ -561,7 +577,7 @@ def summarize_by_product(
         ProductRollup(
             product=product, failing=bucket[0], new_failures=bucket[1],
             fixed=bucket[2], unexpected_passes=bucket[3],
-            acknowledged=bucket[4],
+            muted=bucket[4],
         )
         for product, bucket in sorted(buckets.items())
     ]
@@ -922,7 +938,7 @@ class EstateSummary(NamedTuple):
 
 def summarize_rollup(
     counts: Sequence[RollupCount], assigned_open: int = 0,
-    acknowledged: Sequence[RollupCount] = (),
+    muted: Sequence[RollupCount] = (),
 ) -> EstateSummary:
     """Derive the estate headline from grouped counts.
 
@@ -944,15 +960,21 @@ def summarize_rollup(
     *assigned_open* is counted separately (it depends on the assignment
     tables, not on the result pair) and is passed straight through.
 
-    *acknowledged* (WP-40) is :meth:`Storage.acknowledged_cells`: cells
-    of the same shape holding only the tests failing NOW under a live
-    acknowledgment, read at request time (expiry is exact, nothing
-    memoized). They are subtracted from every failing figure —
-    ``results[FAIL]``, ``recent_results[FAIL]``, ``new_failures``,
-    ``still_failing``, each environment's ``failed``/``new_failures`` —
-    and reported as ``acknowledged`` beside them. A test still counts
+    *muted* (WP-40) is :meth:`Storage.muted_cells`: cells
+    of the same shape for every test under a live mute — failing or
+    passing — read at request time (expiry is exact, nothing
+    memoized). The cells whose result is FAIL are subtracted from the
+    ``new_failures``/``still_failing`` figures and each environment's
+    ``failed``/``new_failures``, and reported as ``muted_new_failures``/
+    ``muted_still_failing`` (``muted`` is their sum) beside them. They
+    are NOT subtracted from ``results[FAIL]``/``recent_results[FAIL]``:
+    a muted failure is still a failure, so the pass rate counts it
+    (user, 2026-10-01 — the first cut had it leaving the pass rate).
+    EVERY cell is summed into ``muted_total`` (the Muted tab's row
+    count), and a muted test that is passing is subtracted from
+    nothing. A test still counts
     in ``total_tests`` and ``ran_recently``: it exists and it ran; it
-    is its failure that has been acknowledged.
+    is its failure that has been muted.
     """
     results = {result: 0 for result in Result}
     recent_results = {result: 0 for result in Result}
@@ -962,10 +984,12 @@ def summarize_rollup(
     still_failing = 0
     fixed = 0
     retired = 0
-    acknowledged_total = 0
+    muted_new = 0
+    muted_still = 0
+    muted_total = 0
 
     # Per environment: [total, failed, new_failures, unexpected, not_run,
-    # acknowledged]
+    # muted]
     env_totals = collections.OrderedDict()  # type: Dict[str, List[int]]
 
     for cell in counts:
@@ -1005,17 +1029,19 @@ def summarize_rollup(
         if not cell.recent:
             bucket[4] += cell.count
 
-    # WP-40: the acknowledged cells are a subset of the FAIL cells
-    # above (same stream, same scope, retired excluded), so subtracting
-    # them per (environment, prev_result, recent) is exact.
-    for cell in acknowledged:
-        acknowledged_total += cell.count
-        results[Result.FAIL] -= cell.count
-        if cell.recent:
-            recent_results[Result.FAIL] -= cell.count
+    # WP-40: the muted cells are a subset of the cells above (same
+    # stream, same scope, retired excluded), so subtracting the FAIL
+    # ones per (environment, prev_result, recent) is exact. A muted
+    # test that is not failing is only counted, never subtracted.
+    for cell in muted:
+        muted_total += cell.count
+        if cell.result is not Result.FAIL:
+            continue
         if cell.prev_result is Result.FAIL:
+            muted_still += cell.count
             still_failing -= cell.count
         else:
+            muted_new += cell.count
             new_failures -= cell.count
         if cell.environment in env_totals:
             bucket = env_totals[cell.environment]
@@ -1035,7 +1061,10 @@ def summarize_rollup(
         still_failing=still_failing,
         fixed=fixed,
         assigned_open=assigned_open,
-        acknowledged=acknowledged_total,
+        muted=muted_new + muted_still,
+        muted_new_failures=muted_new,
+        muted_still_failing=muted_still,
+        muted_total=muted_total,
     )
     by_environment = [
         EnvironmentRollup(
@@ -1045,7 +1074,7 @@ def summarize_rollup(
             new_failures=bucket[2],
             unexpected_passes=bucket[3],
             not_run=bucket[4],
-            acknowledged=bucket[5],
+            muted=bucket[5],
         )
         for environment, bucket in sorted(env_totals.items())
     ]

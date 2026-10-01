@@ -49,6 +49,7 @@
 import {
   clearNode,
   el,
+  muteDurationSelect,
   postJson,
   rememberUser,
   requireUsername,
@@ -56,7 +57,7 @@ import {
   userPickerSelect,
 } from "./api.js";
 import { entryKey } from "./review.js";
-import { apiUrl, bulkAcknowledgmentsUrl } from "./urls.js";
+import { apiUrl, bulkMutesUrl } from "./urls.js";
 
 /**
  * The bulk endpoint's URL, EVERY scope level explicitly cleared.
@@ -105,9 +106,8 @@ let noteInputEl = null;
 let assignBtnEl = null;
 let unassignBtnEl = null;
 let commentBtnEl = null;
-let ackReasonEl = null;
-let ackDaysEl = null;
-let ackBtnEl = null;
+let muteDurationEl = null;
+let muteBtnEl = null;
 
 function selectionEntries() {
   return Array.from(selected.values());
@@ -188,6 +188,22 @@ function updateCommentButtonState() {
   }
   commentBtnEl.disabled =
     noteInputEl.value.trim() === "" || selected.size === 0;
+  updateMuteButtonState();
+}
+
+/** Mute needs all three: an owner (the "Assign to" box), a reason (the
+ * note box -- also posted as the comment) and a duration. Gated here
+ * so the button cannot be clicked into a server-side 400. Called from
+ * the comment updater, which the picker's and the note's own listeners
+ * both reach, and from the duration select's own change. */
+function updateMuteButtonState() {
+  if (!muteBtnEl) {
+    return;
+  }
+  muteBtnEl.disabled = selected.size === 0
+    || !userSelectEl.value
+    || noteInputEl.value.trim() === ""
+    || !muteDurationEl.value;
 }
 
 /**
@@ -224,62 +240,44 @@ async function doComment() {
   }
 }
 
-/** The acknowledgment length typed in the bar: a whole number 1..7, else
- * null. The server enforces the same bound; this only gates the button. */
-function ackDays() {
-  const text = ackDaysEl.value.trim();
-  if (!/^[0-9]+$/.test(text)) {
-    return null;
-  }
-  const days = parseInt(text, 10);
-  return days >= 1 && days <= 7 ? days : null;
-}
-
-function updateAckButtonState() {
-  if (!ackBtnEl) {
-    return;
-  }
-  ackBtnEl.disabled = selected.size === 0 || ackDays() === null;
-}
-
 /**
- * Acknowledge every selected failure (WP-40): not counted as failing for
- * 1-7 days, owned by someone. The owner is whoever the "Assign to" box
- * names, else the person clicking. A reason is required for a test not
- * yet acknowledged and optional for one being extended, so a blank
- * reason is sent as no reason and the server's own message says which.
+ * Mute every selected failure (WP-40): not counted as failing for the
+ * chosen time (12 hours to 7 days), owned by someone. The owner is the
+ * "Assign to" box, the reason is the note box -- the same two fields
+ * Assign uses, so there is one place to type each -- and the duration
+ * is the select beside the button. All three are required (the button
+ * stays disabled until they are set), and the reason is also posted as
+ * a comment on each test, exactly as Assign-with-a-note does.
  */
-async function doAcknowledge() {
+async function doMute() {
   const me = requireUsername();
   if (!me) {
     showError(
       "Set a username first (the “Change” button, top right) "
-      + "— acknowledgments are recorded against a name.");
+      + "— mutes are recorded against a name.");
     return;
   }
-  const days = ackDays();
-  if (days === null || selected.size === 0) {
+  const owner = userSelectEl.value;
+  const reason = noteInputEl.value.trim();
+  const hours = Number(muteDurationEl.value);
+  if (!owner || !reason || !hours || selected.size === 0) {
     return;
   }
-  const reason = ackReasonEl.value.trim();
-  const body = {
-    username: me, days: days, assignee: userSelectEl.value || me,
-    tests: testsPayload(),
-  };
-  if (reason) {
-    body.reason = reason;
-  }
-  ackBtnEl.disabled = true;
+  muteBtnEl.disabled = true;
   try {
-    await postJson(bulkAcknowledgmentsUrl(), body);
-    ackReasonEl.value = "";
-    ackDaysEl.value = "7";
+    await postJson(bulkMutesUrl(), {
+      username: me, reason: reason, hours: hours, assignee: owner,
+      tests: testsPayload(),
+    });
+    rememberUser(owner);
+    noteInputEl.value = "";
+    muteDurationEl.value = "";
     clearSelection();
     notifyChanged();
   } catch (err) {
     showError(err.message);
   } finally {
-    updateAckButtonState();
+    updateAssignButtonState();
   }
 }
 
@@ -395,34 +393,20 @@ function ensureBar() {
 
   barEl.appendChild(el("span", "selection-sep", "·"));
 
-  ackReasonEl = document.createElement("input");
-  ackReasonEl.type = "text";
-  ackReasonEl.className = "selection-note-input";
-  ackReasonEl.placeholder = "reason";
-  ackReasonEl.setAttribute(
-    "aria-label", "Why these failures are acknowledged — required for a "
-      + "test not already acknowledged");
-  barEl.appendChild(ackReasonEl);
+  muteDurationEl = muteDurationSelect("selection-duration-select");
+  muteDurationEl.addEventListener("change", updateMuteButtonState);
+  barEl.appendChild(document.createTextNode("Mute "));
+  barEl.appendChild(muteDurationEl);
 
-  ackDaysEl = document.createElement("input");
-  ackDaysEl.type = "text";
-  ackDaysEl.inputMode = "numeric";
-  ackDaysEl.className = "selection-days-input";
-  ackDaysEl.placeholder = "days";
-  ackDaysEl.value = "7";
-  ackDaysEl.setAttribute(
-    "aria-label", "Days to acknowledge for, 1 to 7");
-  ackDaysEl.addEventListener("input", updateAckButtonState);
-  barEl.appendChild(ackDaysEl);
-
-  ackBtnEl = el("button", "selection-ack-btn", "Acknowledge");
-  ackBtnEl.type = "button";
-  ackBtnEl.disabled = true;
-  ackBtnEl.title = "Stop counting the selected failures as failing for "
-    + "1-7 days. They are assigned to the person in “Assign to” "
-    + "(or to you) and listed as acknowledged beside the failing count.";
-  ackBtnEl.addEventListener("click", doAcknowledge);
-  barEl.appendChild(ackBtnEl);
+  muteBtnEl = el("button", "selection-mute-btn", "Mute");
+  muteBtnEl.type = "button";
+  muteBtnEl.disabled = true;
+  muteBtnEl.title = "Stop counting the selected failures as failing for "
+    + "the time chosen. Needs an owner (“Assign to”), a reason "
+    + "(the note box) and a duration. The reason is also posted as a "
+    + "comment; the tests are assigned to the owner.";
+  muteBtnEl.addEventListener("click", doMute);
+  barEl.appendChild(muteBtnEl);
 
   barEl.appendChild(el("span", "selection-sep", "·"));
 
@@ -449,7 +433,6 @@ function renderBar() {
   }
   countEl.textContent = count.toLocaleString();
   updateAssignButtonState();
-  updateAckButtonState();
   unassignBtnEl.disabled = false;
 }
 

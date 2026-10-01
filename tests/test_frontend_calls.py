@@ -3450,10 +3450,17 @@ class WatchUnassignedStatLinkTest(unittest.TestCase):
     def test_the_supporting_stats_are_plain_numbers_again(self) -> None:
         """buildStat's optional href argument died with its one caller
         when the link moved to the hero — deleted with the feature, so
-        a second rendering path cannot drift back in."""
+        a second rendering path cannot drift back in.
+
+        Widened for WP-40 (not weakened): the signature may now carry
+        ONE more argument, the count of muted failures to name beside a
+        failing figure -- "(+3 muted)" -- and the href ban stands, as
+        does the rule that a stat is a plain value and a label."""
         body = _function_body(read("watch.js"), "function buildStat(")
-        self.assertIn("function buildStat(label, value)", body)
+        self.assertIn("function buildStat(label, value, muted)", body)
         self.assertNotIn("href", _strip_comments(body))
+        self.assertNotIn("<a", _strip_comments(body))
+        self.assertNotIn("createElement(\"a\")", _strip_comments(body))
     # No dedicated no-innerHTML check here — WatchPageTest already pins
     # that invariant for the whole file (correctly, via _strip_comments
     # — this file's own module docstring literally contains the word
@@ -5601,6 +5608,93 @@ class PlantedRootAbsoluteApiRegressionTest(unittest.TestCase):
             'const real = fetchJson("api/users");\n'
         )
         self.assertEqual(_root_absolute_api_hits(planted), [])
+
+
+class MuteControlsTest(unittest.TestCase):
+    """WP-40 as amended 2026-10-01: durations are a dropdown of HOURS,
+    built in ONE place, and the selection bar's Mute reuses the Assign
+    owner and note inputs instead of owning its own."""
+
+    SURFACES = ("selection.js", "review.js", "test.js", "actions.js")
+
+    def test_every_duration_control_is_the_one_shared_select(self) -> None:
+        for name in self.SURFACES:
+            code = _strip_comments(read(name))
+            self.assertIn("muteDurationSelect(", code, name)
+            self.assertNotIn("inputMode", code, name)
+            self.assertNotIn("days:", code, name)
+        api = _strip_comments(read("api.js"))
+        for label in ("12 hours", "1 day", "2 days", "3 days", "5 days",
+                      "7 days"):
+            self.assertIn('label: "' + label + '"', api)
+        self.assertIn("hours: 168", api)
+
+    def test_the_wire_carries_hours_never_days(self) -> None:
+        for name in self.SURFACES:
+            code = _strip_comments(read(name))
+            self.assertIn("hours:", code, name)
+
+    def test_extend_is_one_click_on_seven_days(self) -> None:
+        for name in ("review.js", "test.js", "actions.js"):
+            code = _strip_comments(read(name))
+            self.assertIn("muteDurationSelect(\"review-duration-select\", 168)",
+                          code, name)
+            self.assertNotIn("Extend 7 days", code, name)
+        self.assertNotIn("Extend all 7 days", read("actions.html"))
+
+    def test_the_bar_mute_is_gated_on_owner_note_and_duration(self) -> None:
+        code = _strip_comments(read("selection.js"))
+        gate = _function_body(code, "function updateMuteButtonState(")
+        for needle in ("selected.size === 0", "userSelectEl.value",
+                       "noteInputEl.value.trim()", "muteDurationEl.value"):
+            self.assertIn(needle, gate)
+        # The bar has no input of its own for the reason or the owner.
+        self.assertNotIn("muteReasonEl", code)
+        do = _function_body(code, "async function doMute(")
+        self.assertIn("reason: reason", do)
+        self.assertIn("assignee: owner", do)
+        self.assertIn("hours: hours", do)
+        self.assertIn("noteInputEl.value = \"\"", do)
+        self.assertIn("muteDurationEl.value = \"\"", do)
+        # Both listeners that already drive the Assign button reach it.
+        self.assertIn("muteDurationEl.addEventListener(\"change\"", code)
+        comment_gate = _function_body(
+            code, "function updateCommentButtonState(")
+        self.assertIn("updateMuteButtonState()", comment_gate)
+
+
+class MutedBesideFailingTest(unittest.TestCase):
+    """The user's rule (2026-10-01): "(+X muted) everywhere we have a
+    'failing'". There is no Muted tile; the tiles, charts and Watch
+    cards carry the muted count beside the failing one."""
+
+    def test_there_is_no_muted_tile_but_the_tab_stays(self) -> None:
+        index = read("index.html")
+        row = index[index.index('id="stat-tiles"'):]
+        row = row[:row.index("</div>\n    </section>")]
+        self.assertNotIn(">Muted<", row)
+        status = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        self.assertNotIn('label: "Muted"', status)
+        self.assertIn('{ id: "muted", label: "Muted" }', read("app.js"))
+
+    def test_the_two_failing_tiles_name_their_muted_failures(self) -> None:
+        status = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        self.assertIn("status.muted_new_failures", status)
+        self.assertIn("status.muted_still_failing", status)
+
+    def test_the_charts_draw_a_grey_extension(self) -> None:
+        app = _strip_comments(read("app.js"))
+        self.assertIn("extra: entry.muted || 0", app)
+        self.assertEqual(app.count("extra: entry.muted || 0"), 2)
+        self.assertIn("item.extra", _strip_comments(read("charts.js")))
+
+    def test_the_watch_failing_stat_carries_the_suffix(self) -> None:
+        card = _strip_comments(_function_body(
+            read("watch.js"), "function buildOkCard("))
+        self.assertIn('buildStat("Failing", card.failing, card.muted)', card)
+        self.assertNotIn('buildStat("Muted"', card)
 
 
 if __name__ == "__main__":

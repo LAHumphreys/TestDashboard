@@ -4126,3 +4126,130 @@ Caveats. SQLite only; no MariaDB timings. In-process handler time, not HTTP; thi
 Raw numbers and scripts: `.scratch/net/drop-2026-09-30/wp40_ab.txt`, `wp40_ab.py`, `wp40_bench.py`, `wp40_dash.py`, `wp40_fixcheck.py` (this machine only, gitignored).
 
 **Verdict.** The 2026-09-30 drop's work is intact: headline, queues, watch and the push path are flat within noise, warm calls run no SQL master's did not, and the targeted memo drop still holds. The one regression found was fixed before shipping.
+
+## 2026-10-01 — WP-40 amended after the first walkthrough: muted, hours, the bar, the Muted tab
+
+The user tried WP-40 and changed it. Recorded here in substance as given;
+the earlier WP-40 entries above are history and say "acknowledged", which is
+the word this entry retires.
+
+**The user's three changes.**
+
+1. **"Muted", not "acknowledged".** The state is *muted*; the verbs are
+   *Mute*, *Unmute* and *Extend*; the record is "a mute". Renamed end to
+   end — tables `test_mutes` and `mute_history` (columns `muted_at`,
+   `muted_by`; history actions `mute` / `extend` / `unmute`), indexes,
+   migration 11's SQL, the exporter's `ddl()` and the ledger's
+   `step_10_to_11` (kept column-for-column identical), the storage types and
+   methods (`mute_tests`, `unmute_tests`, `mute_for`, `mute_history`,
+   `muted_cells`, `mute_epoch`, `expiring_mutes`), the memo keys, the queue
+   kind `muted`, the API (`/api/mutes/bulk`, `/api/mutes/unmute`,
+   `GET /api/mutes`; `mute`, `mute_history`, `muted` in the payloads), the
+   frontend's every word and identifier, the README, the operator note and
+   the handover. **The rename is complete, not layered, because nothing had
+   shipped**: no database anywhere has the old table names (migration 11 has
+   never run outside tests and scratch copies), so entry 11 was edited in
+   place and there is one vocabulary. (The branch is still called
+   `wp-40-acknowledged-failures`; a branch name is not shipped.)
+2. **Duration is a dropdown of hours.** The wire takes `hours` (whole,
+   1..168; anything else is `400 "hours: must be a whole number from 1 to
+   168"`), storage validates the same (`MUTE_MAX_HOURS = 168`, replacing
+   `ACKNOWLEDGMENT_MAX_DAYS`) and sets `expires_at = when +
+   timedelta(hours=hours)`. Every UI duration control is a `<select>` with
+   the placeholder "for…" and 12 hours, 1, 2, 3, 5, 7 days, built by ONE
+   helper (`muteDurationSelect` in `api.js`) so the bar, the Review panel,
+   the test page and Open Actions cannot drift. Extend controls use the same
+   select defaulting to 7 days so it is still one click; the "Extend 7 days"
+   labels are now "Extend".
+3. **The selection bar reuses what is there.** No separate reason or days
+   input: Mute takes the owner from "Assign to", the reason from the note
+   box, the duration from a new select after "Comment only" — `· Mute
+   [duration] [Mute]`. The button is disabled unless all three are set (the
+   comment updater, which the picker's and the note's listeners both reach,
+   and the select's own `change` drive it). After a mute the note is
+   cleared, the select resets to the placeholder and the selection clears.
+
+**Decisions taken with those (mine, for the user to veto).**
+
+- **A fresh mute also posts its reason as a comment** on each test, tagged
+  with the key's stream, author the muter — `_write_bulk_assignments` is
+  now passed `comment_text=reason`. An extension posts one only when a NEW
+  reason came with it; a plain extension posts nothing. (Storage and API
+  tests pin all three.)
+- **The Muted tab lists every live mute, passing or failing, with a State
+  column** (the was -> now transition the New failures tab uses). The queue
+  predicate is `_MUTE_LIVE` alone. `muted_cells()` groups by (environment,
+  result, previous result, recent) and each cell carries its REAL result.
+  `expiring_mutes` keeps its "still failing" gate: a passing muted test needs
+  no action. `queue_counts["muted"]` is the sum of ALL cells, so the tab badge
+  equals `status_queue_count("muted")` equals `len(status_queue("muted"))`
+  (tested). The Review panel now offers Extend / Unmute for a live mute on a
+  passing row too, or the Muted tab would list rows it cannot act on.
+- **`status.muted` vs `status.muted_total`.** `muted` is the muted tests that
+  are FAILING (the number taken off New / Still failing; each environment's
+  and product's `muted` is the same kind); `muted_total` is every live mute.
+
+**The user's addendum, same day: "we agreed we'd have a (+X muted) everywhere
+we have a 'failing'".** And the correction that goes with it, which is a
+correction of my first cut: **muted failures had been leaving the pass rate**
+(`summarize_rollup` subtracted them from `results[FAIL]` and
+`recent_results[FAIL]`). A muted failure is still a failure. Now:
+
+- **A. The pass rate counts them.** `results[FAIL]` / `recent_results[FAIL]`
+  are NOT reduced. The subtraction stays only for `new_failures`,
+  `still_failing`, each environment's `failed` / `new_failures` and
+  `ProductRollup.failing` / `new_failures`. `SummaryStatus` carries
+  `muted_new_failures`, `muted_still_failing`, `muted` (their sum) and
+  `muted_total`; `/api/summary`'s status block exposes all four. Tests pin
+  that muting leaves the pass-rate inputs unchanged and that `new_failures +
+  muted_new_failures` and `still_failing + muted_still_failing` are conserved
+  against the unmuted estate.
+- **B. No Muted tile.** Removed from `renderStatus` and from the skeleton in
+  `index.html` (`FirstPaintTest` pins the two equal). The Muted queue tab and
+  its badge stay. "New failures" and "Still failing" append " · +X muted" to
+  their sub-lines when `muted_new_failures` / `muted_still_failing` is > 0.
+- **C. Charts.** "Failing by environment": each bar is the unmuted `failed`
+  with a grey segment of `muted` appended (`barRows` takes an optional
+  `extra`; callers that pass none draw what they always drew), sorted by the
+  unmuted number; tooltip "N (+M muted)"; an environment with failed 0 and
+  muted > 0 still shows, grey only.
+- **D. Most failures by script.** `top_failing_scripts` takes `now` and
+  returns `failing` (FAIL, no live mute) and `muted` (FAIL under one), ranked
+  by failing, then muted, then the old tiebreak; a script whose failures are
+  all muted still appears. It is memoized, keyed on the mute epoch like the
+  mute-aware queues, and joins `test_mutes` only while the stream has a live
+  mute at all (the epoch read is one memoized indexed `MIN`), so an estate
+  with no mutes runs the statement it always ran. Tested: 3 failing of which
+  2 muted reports failing 1, muted 2 and sorts below a script with 2 unmuted;
+  expiry is seen with no write; a write is seen at once.
+- **E. Everywhere else a failing number is shown**, "N (+X muted)": Watch's
+  Failing stat (the separate Muted stat is gone; `card.muted` is the
+  suffix). **The nightly trend chart is unchanged**: its FAIL counts come
+  from `activity_hours` and include muted failures, which is now consistent
+  with the pass rate.
+
+**What the tester note says.** `whatsnew.html`'s 2026-10-01 list was cut to
+three bullets (it had been "an absolute wall of text for a single new
+feature"); it says Home has a Muted tab, not a tile.
+
+**Guards widened, none weakened.** `WatchUnassignedStatLinkTest.
+test_the_supporting_stats_are_plain_numbers_again` pinned `buildStat(label,
+value)`; the signature may now take one more argument (the muted count) and
+the test now pins that exact signature, still forbids `href`, and now also
+forbids an anchor in the stat. Two new guard classes in
+`test_frontend_calls.py` (`MuteControlsTest`, `MutedBesideFailingTest`) pin
+the shared duration select, hours on the wire, the bar's three-way gate and
+the "+X muted" placement. No selection guard named the old reason/days
+inputs.
+
+**Measured.** SQLite `python -m unittest discover`: **2640 tests OK (skipped=1), from 2620 before the amendment**. MariaDB 12.3 (local, port
+3307, sacrificial database) `tests.test_mariadb_backend` +
+`tests.test_upgrade_mariadb_schema`: **998 tests OK (skipped=70); the full suite with the MariaDB variants active was not re-run, so the earlier 3594 is stale**, the ledger's v7 -> v11 upgrade
+verifying clean against the renamed tables. No browser has rendered any of
+this; `node --check` on the touched modules and the source-text guards only.
+No timing was taken: the new reads are the muted-cells grouped read (now also
+grouped by result) and one memoized epoch read ahead of the scripts query.
+
+**Left alone, noticed.** The home "New failures" tile's delta line ("N more
+failing than before") is `new_failures - fixed` and so ignores muted new
+failures; whether it should add them back is the user's call.

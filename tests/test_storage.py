@@ -2946,8 +2946,8 @@ class TestQueueCounts(EstateTestBase):
         own must not be a pass over latest_runs.
 
         WIDENED for WP-40, not weakened: the FIRST read after a write
-        also asks the acknowledgment epoch (one indexed
-        ``SELECT MIN(expires_at)`` on the stream's acknowledgments,
+        also asks the mute epoch (one indexed
+        ``SELECT MIN(expires_at)`` on the stream's mutes,
         memoized with everything else), so a cold call is one statement
         longer. The repeat is still ZERO statements, asserted last.
         """
@@ -8153,14 +8153,14 @@ class SummaryCacheTest(StorageTestBase):
         self.assertEqual(cost, 0)
 
 
-class AcknowledgmentTest(StorageTestBase):
-    """WP-40: acknowledged failures (migration 11).
+class MuteTest(StorageTestBase):
+    """WP-40: muted failures (migration 11).
 
     The storage layer's contract: ONE predicate ("live" is
     ``expires_at > now``) read the same way by the dashboard, the
-    queues, the counts and the rollup; an acknowledgment is OWNED, so
-    acknowledging assigns and unassigning drops it; days are 1..7 on
-    every stream; a stream's acknowledgments go with the stream.
+    queues, the counts and the rollup; a mute is OWNED, so
+    muting assigns and unassigning drops it; hours are 1..168 on
+    every stream; a stream's mutes go with the stream.
     """
 
     NOW = datetime.datetime(2026, 7, 2, 12, 0, 0)
@@ -8192,18 +8192,18 @@ class AcknowledgmentTest(StorageTestBase):
              env: Optional[str] = None) -> Tuple[str, str, str, int]:
         return (env or self.ENV, self.SCRIPT, test, sid)
 
-    def _ack(
+    def _mute(
         self,
         tests: Sequence[str],
         reason: Optional[str] = "known issue",
-        days: int = 3,
+        hours: int = 72,
         assignee: str = "alice",
         by: str = "bob",
         when: Optional[datetime.datetime] = None,
         sid: int = storage.MAINLINE_STREAM_ID,
-    ) -> "storage.AcknowledgeResult":
-        return self.store.acknowledge_tests(
-            [self._key(t, sid) for t in tests], reason, days, assignee, by,
+    ) -> "storage.MuteResult":
+        return self.store.mute_tests(
+            [self._key(t, sid) for t in tests], reason, hours, assignee, by,
             when or self.NOW)
 
     def _build_id(self, name: str) -> int:
@@ -8221,34 +8221,34 @@ class AcknowledgmentTest(StorageTestBase):
         return sorted(row.test_name for row in rows)
 
     def _cells(self, now: Optional[datetime.datetime] = None) -> Any:
-        return self.store.acknowledged_cells(now or self.NOW, self.CUTOFF)
+        return self.store.muted_cells(now or self.NOW, self.CUTOFF)
 
-    # -- acknowledging ------------------------------------------------
+    # -- muting ------------------------------------------------
 
-    def test_acknowledge_records_it_and_assigns_the_owner(self) -> None:
+    def test_mute_records_it_and_assigns_the_owner(self) -> None:
         self._seed()
-        result = self._ack(["f_new1"], reason="flaky rig", days=3)
+        result = self._mute(["f_new1"], reason="flaky rig", hours=72)
         self.assertEqual(
-            (result.acknowledged, result.extended, result.unknown),
+            (result.muted, result.extended, result.unknown),
             (1, 0, 0))
-        ack = self.store.acknowledgment_for(
+        mute = self.store.mute_for(
             storage.MAINLINE_STREAM_ID, self.ENV, self.SCRIPT, "f_new1")
-        assert ack is not None
-        self.assertEqual(ack.reason, "flaky rig")
-        self.assertEqual(ack.extensions, 0)
-        self.assertEqual(ack.acknowledged_by, "bob")
-        self.assertEqual(ack.acknowledged_at, self.NOW)
+        assert mute is not None
+        self.assertEqual(mute.reason, "flaky rig")
+        self.assertEqual(mute.extensions, 0)
+        self.assertEqual(mute.muted_by, "bob")
+        self.assertEqual(mute.muted_at, self.NOW)
         self.assertEqual(
-            ack.expires_at, self.NOW + datetime.timedelta(days=3))
+            mute.expires_at, self.NOW + datetime.timedelta(days=3))
         self.assertEqual(
             self.store.current_assignee(self.ENV, self.SCRIPT, "f_new1"),
             "alice")
-        history = self.store.acknowledgment_history(
+        history = self.store.mute_history(
             self.ENV, self.SCRIPT, "f_new1")
-        self.assertEqual([h.action for h in history], ["acknowledge"])
+        self.assertEqual([h.action for h in history], ["mute"])
         self.assertEqual(history[0].actor, "bob")
         self.assertEqual(history[0].reason, "flaky rig")
-        self.assertEqual(history[0].expires_at, ack.expires_at)
+        self.assertEqual(history[0].expires_at, mute.expires_at)
 
     def test_the_assignment_origin_is_the_stream_for_a_build_only(
         self,
@@ -8258,8 +8258,8 @@ class AcknowledgmentTest(StorageTestBase):
             make_record(test_name="b", result=Result.FAIL, build="b1"),
         ])
         sid = self._build_id("b1")
-        self._ack(["m"])
-        self._ack(["b"], sid=sid)
+        self._mute(["m"])
+        self._mute(["b"], sid=sid)
         rows = {
             row.test_name: row for row in self.store.dashboard(
                 assigned_only=True, now=self.NOW)}
@@ -8270,29 +8270,29 @@ class AcknowledgmentTest(StorageTestBase):
             [(r.test_name, r.assignment_stream_id) for r in build_rows],
             [("b", sid)])
 
-    def test_days_must_be_a_whole_number_of_one_to_seven(self) -> None:
+    def test_hours_must_be_a_whole_number_of_one_to_168(self) -> None:
         self._seed()
-        for bad in (0, 8, -1, True, False, 2.5, "3", None):
+        for bad in (0, 169, -1, True, False, 2.5, "3", None):
             with self.assertRaises(ValueError, msg=repr(bad)):
-                self._ack(["f_new1"], days=bad)  # type: ignore
-        self.assertEqual(self._count("test_acknowledgments"), 0)
-        for good in (1, 7):
-            self._ack(["f_new1"], days=good)
+                self._mute(["f_new1"], hours=bad)  # type: ignore
+        self.assertEqual(self._count("test_mutes"), 0)
+        for good in (1, 12, 168):
+            self._mute(["f_new1"], hours=good)
 
     def test_an_empty_assignee_is_refused(self) -> None:
         self._seed()
         for bad in ("", None):
             with self.assertRaises(ValueError):
-                self._ack(["f_new1"], assignee=bad)  # type: ignore
-        self.assertEqual(self._count("test_acknowledgments"), 0)
+                self._mute(["f_new1"], assignee=bad)  # type: ignore
+        self.assertEqual(self._count("test_mutes"), 0)
 
     def test_a_fresh_key_with_no_reason_writes_nothing(self) -> None:
         self._seed()
         for bad in (None, ""):
             with self.assertRaises(ValueError):
-                self._ack(["f_new1", "f_new2"], reason=bad)
-        self.assertEqual(self._count("test_acknowledgments"), 0)
-        self.assertEqual(self._count("acknowledgment_history"), 0)
+                self._mute(["f_new1", "f_new2"], reason=bad)
+        self.assertEqual(self._count("test_mutes"), 0)
+        self.assertEqual(self._count("mute_history"), 0)
         self.assertIsNone(
             self.store.current_assignee(self.ENV, self.SCRIPT, "f_new1"))
         self.assertEqual(self._count("assignments"), 0)
@@ -8301,80 +8301,80 @@ class AcknowledgmentTest(StorageTestBase):
         self,
     ) -> None:
         self._seed()
-        self._ack(["f_new1"])
-        before = self.store.acknowledgment_for(
+        self._mute(["f_new1"])
+        before = self.store.mute_for(
             1, self.ENV, self.SCRIPT, "f_new1")
         with self.assertRaises(ValueError):
-            self._ack(["f_new1", "f_new2"], reason=None, days=5)
+            self._mute(["f_new1", "f_new2"], reason=None, hours=120)
         self.assertEqual(
-            self.store.acknowledgment_for(
+            self.store.mute_for(
                 1, self.ENV, self.SCRIPT, "f_new1"), before)
-        self.assertIsNone(self.store.acknowledgment_for(
+        self.assertIsNone(self.store.mute_for(
             1, self.ENV, self.SCRIPT, "f_new2"))
 
     def test_unknown_keys_are_counted_and_skipped(self) -> None:
         self._seed()
-        result = self.store.acknowledge_tests(
+        result = self.store.mute_tests(
             [self._key("f_new1"), self._key("no_such_test"),
              self._key("f_new2", sid=999)],
-            "why", 2, "alice", "bob", self.NOW)
+            "why", 48, "alice", "bob", self.NOW)
         self.assertEqual(
-            (result.acknowledged, result.extended, result.unknown),
+            (result.muted, result.extended, result.unknown),
             (1, 0, 2))
-        self.assertEqual(self._count("test_acknowledgments"), 1)
+        self.assertEqual(self._count("test_mutes"), 1)
         self.assertEqual(self._count("assignments"), 1)
-        only_unknown = self.store.acknowledge_tests(
-            [self._key("no_such_test")], "why", 2, "alice", "bob", self.NOW)
+        only_unknown = self.store.mute_tests(
+            [self._key("no_such_test")], "why", 48, "alice", "bob", self.NOW)
         self.assertEqual(
-            (only_unknown.acknowledged, only_unknown.unknown), (0, 1))
+            (only_unknown.muted, only_unknown.unknown), (0, 1))
 
     def test_an_empty_selection_is_a_no_op(self) -> None:
-        result = self.store.acknowledge_tests(
-            [], "why", 2, "alice", "bob", self.NOW)
+        result = self.store.mute_tests(
+            [], "why", 48, "alice", "bob", self.NOW)
         self.assertEqual(
-            (result.acknowledged, result.extended, result.unknown),
+            (result.muted, result.extended, result.unknown),
             (0, 0, 0))
 
-    def test_acknowledging_again_extends(self) -> None:
+    def test_muting_again_extends(self) -> None:
         self._seed()
-        self._ack(["f_new1"], reason="first", days=3, by="bob")
+        self._mute(["f_new1"], reason="first", hours=72, by="bob")
         later = self.NOW + datetime.timedelta(days=1)
-        result = self._ack(
-            ["f_new1"], reason=None, days=2, by="carol", when=later)
+        result = self._mute(
+            ["f_new1"], reason=None, hours=48, by="carol", when=later)
         self.assertEqual(
-            (result.acknowledged, result.extended), (0, 1))
-        ack = self.store.acknowledgment_for(1, self.ENV, self.SCRIPT,
+            (result.muted, result.extended), (0, 1))
+        mute = self.store.mute_for(1, self.ENV, self.SCRIPT,
                                             "f_new1")
-        assert ack is not None
-        self.assertEqual(ack.extensions, 1)
-        self.assertEqual(ack.reason, "first")
-        self.assertEqual(ack.acknowledged_by, "carol")
-        self.assertEqual(ack.expires_at, later + datetime.timedelta(days=2))
-        # The original moment of acknowledgment is kept.
-        self.assertEqual(ack.acknowledged_at, self.NOW)
-        self._ack(
-            ["f_new1"], reason="second", days=1, by="bob",
+        assert mute is not None
+        self.assertEqual(mute.extensions, 1)
+        self.assertEqual(mute.reason, "first")
+        self.assertEqual(mute.muted_by, "carol")
+        self.assertEqual(mute.expires_at, later + datetime.timedelta(days=2))
+        # The original moment of mute is kept.
+        self.assertEqual(mute.muted_at, self.NOW)
+        self._mute(
+            ["f_new1"], reason="second", hours=24, by="bob",
             when=later + datetime.timedelta(days=1))
-        ack = self.store.acknowledgment_for(1, self.ENV, self.SCRIPT,
+        mute = self.store.mute_for(1, self.ENV, self.SCRIPT,
                                             "f_new1")
-        assert ack is not None
-        self.assertEqual((ack.extensions, ack.reason), (2, "second"))
-        history = self.store.acknowledgment_history(
+        assert mute is not None
+        self.assertEqual((mute.extensions, mute.reason), (2, "second"))
+        history = self.store.mute_history(
             self.ENV, self.SCRIPT, "f_new1")
         self.assertEqual(
-            [h.action for h in history], ["extend", "extend", "acknowledge"])
+            [h.action for h in history], ["extend", "extend", "mute"])
 
-    def test_a_mixed_batch_acknowledges_and_extends(self) -> None:
+    def test_a_mixed_batch_mutes_and_extends(self) -> None:
         self._seed()
-        self._ack(["f_new1"])
-        result = self._ack(["f_new1", "f_new2"], reason="both")
+        self._mute(["f_new1"])
+        result = self._mute(["f_new1", "f_new2"], reason="both")
         self.assertEqual(
-            (result.acknowledged, result.extended), (1, 1))
+            (result.muted, result.extended), (1, 1))
 
     # -- the one predicate --------------------------------------------
 
-    def _ack_some(self) -> None:
-        self._ack(["f_new1", "f_still1"])
+    def _mute_some(self) -> None:
+        self._mute(["f_new1", "f_still1"])
 
     def test_the_rollup_is_unchanged_and_the_cells_subtract_exactly(
         self,
@@ -8385,33 +8385,169 @@ class AcknowledgmentTest(StorageTestBase):
         self.assertEqual(
             (plain.status.new_failures, plain.status.still_failing,
              plain.status.results[Result.FAIL]), (2, 2, 4))
-        self._ack_some()
+        self._mute_some()
         self.assertEqual(self.store.summary_rollup(self.CUTOFF), base_cells)
         cells = self._cells()
-        summary = analytics.summarize_rollup(base_cells, acknowledged=cells)
+        summary = analytics.summarize_rollup(base_cells, muted=cells)
         status = summary.status
-        self.assertEqual(status.acknowledged, 2)
+        self.assertEqual(status.muted, 2)
+        self.assertEqual(status.muted_total, 2)
+        self.assertEqual(status.muted_new_failures, 1)
+        self.assertEqual(status.muted_still_failing, 1)
         self.assertEqual(status.new_failures, 1)
         self.assertEqual(status.still_failing, 1)
-        self.assertEqual(status.results[Result.FAIL], 2)
-        self.assertEqual(status.recent_results[Result.FAIL], 2)
+        # Conserved against the unmuted estate: a muted failure moves
+        # from the failing figure to the "+N muted" beside it ...
+        self.assertEqual(
+            status.new_failures + status.muted_new_failures,
+            plain.status.new_failures)
+        self.assertEqual(
+            status.still_failing + status.muted_still_failing,
+            plain.status.still_failing)
+        # ... and is still a failure: the pass rate's inputs do not move.
+        self.assertEqual(status.results, plain.status.results)
+        self.assertEqual(
+            status.recent_results, plain.status.recent_results)
         self.assertEqual(status.total_tests, plain.status.total_tests)
-        self.assertEqual(summary.by_environment[0].acknowledged, 2)
+        self.assertEqual(summary.by_environment[0].muted, 2)
+
+    def _scripts_estate(self) -> None:
+        """big.py: 3 failing; two.py: 2 failing (all on mainline)."""
+        self.store.upsert_runs([
+            make_record(script=script, test_name=name,
+                        result=Result.FAIL, start=BASE)
+            for script, names in (
+                ("big.py", ("b1", "b2", "b3")), ("two.py", ("t1", "t2")))
+            for name in names])
+
+    def test_top_failing_scripts_split_failing_from_muted(self) -> None:
+        self._scripts_estate()
+        top = lambda: [  # noqa: E731
+            (s.script, s.failing, s.muted)
+            for s in self.store.top_failing_scripts(now=self.NOW)]
+        self.assertEqual(
+            top(), [("big.py", 3, 0), ("two.py", 2, 0)])
+        self.store.mute_tests(
+            [(self.ENV, "big.py", "b1", 1), (self.ENV, "big.py", "b2", 1)],
+            "known", 72, "alice", "bob", self.NOW)
+        # 3 failing of which 2 muted: failing 1, muted 2 -- so it sorts
+        # BELOW the script with 2 unmuted failures.
+        self.assertEqual(
+            top(), [("two.py", 2, 0), ("big.py", 1, 2)])
+
+    def test_a_script_whose_failures_are_all_muted_still_appears(
+        self,
+    ) -> None:
+        self._scripts_estate()
+        self.store.mute_tests(
+            [(self.ENV, "two.py", "t1", 1), (self.ENV, "two.py", "t2", 1)],
+            "known", 72, "alice", "bob", self.NOW)
+        self.assertEqual(
+            [(s.script, s.failing, s.muted)
+             for s in self.store.top_failing_scripts(now=self.NOW)],
+            [("big.py", 3, 0), ("two.py", 0, 2)])
+
+    def test_top_failing_scripts_follow_expiry_without_a_write(
+        self,
+    ) -> None:
+        self._scripts_estate()
+        self.store.mute_tests(
+            [(self.ENV, "two.py", "t1", 1)],
+            "known", 24, "alice", "bob", self.NOW)
+        def two(when: datetime.datetime) -> Tuple[int, int]:
+            row = [s for s in self.store.top_failing_scripts(now=when)
+                   if s.script == "two.py"][0]
+            return (row.failing, row.muted)
+        self.assertEqual(two(self.NOW), (1, 1))
+        # Memoized now; the epoch in the key still lets expiry through.
+        self.assertEqual(two(self.NOW + datetime.timedelta(hours=1)), (1, 1))
+        self.assertEqual(two(self.NOW + datetime.timedelta(hours=25)), (2, 0))
+        # A write drops the memo: unmuting is seen at once.
+        self.store.mute_tests(
+            [(self.ENV, "two.py", "t2", 1)],
+            "known", 24, "alice", "bob", self.NOW)
+        self.assertEqual(two(self.NOW), (0, 2))
+        self.store.unmute_tests(
+            [(self.ENV, "two.py", "t2", 1)], "bob", self.NOW)
+        self.assertEqual(two(self.NOW), (1, 1))
+
+    def test_muted_total_counts_a_passing_mute_but_muted_does_not(
+        self,
+    ) -> None:
+        self._seed()
+        base_cells = self.store.summary_rollup(self.CUTOFF)
+        plain = analytics.summarize_rollup(base_cells)
+        self._mute(["p1", "f_new1"])
+        summary = analytics.summarize_rollup(
+            base_cells, muted=self._cells())
+        status = summary.status
+        # muted_total is every live mute; muted (the figure taken off
+        # failing) is only the one that is failing.
+        self.assertEqual((status.muted, status.muted_total), (1, 2))
+        self.assertEqual(status.results, plain.status.results)
+        self.assertEqual(
+            status.recent_results, plain.status.recent_results)
+        self.assertEqual(summary.by_environment[0].muted, 1)
+        by_product = analytics.summarize_by_product(
+            base_cells, {self.ENV: "prod"}, muted=self._cells())
+        self.assertEqual(
+            (by_product[0].failing, by_product[0].muted),
+            (plain.status.results[Result.FAIL] - 1, 1))
+
+    # -- the reason is also a comment ---------------------------------
+
+    def test_a_fresh_mute_posts_its_reason_as_a_comment(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], reason="flaky rig", by="bob")
+        comments = self.store.comments(self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual(
+            [(c.text, c.author, c.stream_id) for c in comments],
+            [("flaky rig", "bob", None)])
+
+    def test_a_plain_extension_posts_no_comment(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], reason="first", by="bob")
+        self._mute(["f_new1"], reason=None, hours=48, by="carol",
+                   when=self.NOW + datetime.timedelta(hours=1))
+        comments = self.store.comments(self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual([c.text for c in comments], ["first"])
+
+    def test_an_extension_with_a_new_reason_posts_it(self) -> None:
+        self._seed()
+        self._mute(["f_new1"], reason="first", by="bob")
+        self._mute(["f_new1"], reason="still broken", hours=48, by="carol",
+                   when=self.NOW + datetime.timedelta(hours=1))
+        comments = self.store.comments(self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual(
+            [(c.text, c.author) for c in comments],
+            [("first", "bob"), ("still broken", "carol")])
+
+    def test_a_build_mutes_comment_is_tagged_with_that_build(self) -> None:
+        self._seed()
+        self.store.upsert_runs([
+            make_record(test_name="f_new1", result=Result.FAIL,
+                        build="b1")])
+        sid = self._build_id("b1")
+        self._mute(["f_new1"], reason="build only", sid=sid)
+        comments = self.store.comments(self.ENV, self.SCRIPT, "f_new1")
+        self.assertEqual(
+            [(c.text, c.stream_id) for c in comments],
+            [("build only", sid)])
 
     def test_queue_counts_conserve_the_failures(self) -> None:
         self._seed()
         before = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW)
-        self.assertEqual(before["acknowledged"], 0)
-        self._ack_some()
+        self.assertEqual(before["muted"], 0)
+        self._mute_some()
         after = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW)
-        self.assertEqual(after["acknowledged"], 2)
+        self.assertEqual(after["muted"], 2)
         self.assertEqual(after["new_failures"], 1)
         self.assertEqual(after["still_failing"], 1)
         self.assertEqual(
             after["new_failures"] + after["still_failing"]
-            + after["acknowledged"],
+            + after["muted"],
             before["new_failures"] + before["still_failing"])
         for kind in ("fixed", "unexpected_passes", "not_run"):
             self.assertEqual(after[kind], before[kind], kind)
@@ -8423,14 +8559,14 @@ class AcknowledgmentTest(StorageTestBase):
 
     def test_the_queues_agree_with_the_counts_and_each_other(self) -> None:
         self._seed()
-        self._ack_some()
+        self._mute_some()
         counts = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW)
         names = {
             kind: self._names(self.store.status_queue(
                 kind, stale_before=self.CUTOFF, now=self.NOW))
             for kind in storage.QUEUE_KINDS}
-        self.assertEqual(names["acknowledged"], ["f_new1", "f_still1"])
+        self.assertEqual(names["muted"], ["f_new1", "f_still1"])
         self.assertEqual(names["new_failures"], ["f_new2"])
         self.assertEqual(names["still_failing"], ["f_still2"])
         for kind in storage.QUEUE_KINDS:
@@ -8442,57 +8578,57 @@ class AcknowledgmentTest(StorageTestBase):
 
     def test_the_dashboard_agrees_with_the_queues(self) -> None:
         self._seed()
-        self._ack_some()
-        yes = self.store.dashboard(acknowledged=True, now=self.NOW)
-        no = self.store.dashboard(acknowledged=False, now=self.NOW)
+        self._mute_some()
+        yes = self.store.dashboard(muted=True, now=self.NOW)
+        no = self.store.dashboard(muted=False, now=self.NOW)
         everything = self.store.dashboard(now=self.NOW)
         self.assertEqual(self._names(yes), ["f_new1", "f_still1"])
         self.assertEqual(len(yes) + len(no), len(everything))
         self.assertEqual(
-            self.store.dashboard_count(acknowledged=True, now=self.NOW),
+            self.store.dashboard_count(muted=True, now=self.NOW),
             len(yes))
         self.assertEqual(
-            self.store.dashboard_count(acknowledged=False, now=self.NOW),
+            self.store.dashboard_count(muted=False, now=self.NOW),
             len(no))
         self.assertEqual(
             self.store.dashboard_count(now=self.NOW), len(everything))
         queue = self._names(self.store.status_queue(
-            "acknowledged", stale_before=self.CUTOFF, now=self.NOW))
+            "muted", stale_before=self.CUTOFF, now=self.NOW))
         self.assertEqual(self._names(yes), queue)
         self.assertNotIn("f_new1", self._names(no))
 
-    def test_rows_carry_their_acknowledgment(self) -> None:
+    def test_rows_carry_their_mute(self) -> None:
         self._seed()
-        self._ack(["f_new1"], reason="rig", days=4, by="bob")
+        self._mute(["f_new1"], reason="rig", hours=96, by="bob")
         rows = {r.test_name: r for r in self.store.dashboard(now=self.NOW)}
-        ack = rows["f_new1"].acknowledgment
-        assert ack is not None
+        mute = rows["f_new1"].mute
+        assert mute is not None
         self.assertEqual(
-            (ack.reason, ack.acknowledged_by, ack.extensions, ack.stream_id,
-             ack.expires_at),
+            (mute.reason, mute.muted_by, mute.extensions, mute.stream_id,
+             mute.expires_at),
             ("rig", "bob", 0, storage.MAINLINE_STREAM_ID,
              self.NOW + datetime.timedelta(days=4)))
-        self.assertIsNone(rows["f_new2"].acknowledgment)
-        self.assertIsNone(rows["p1"].acknowledgment)
+        self.assertIsNone(rows["f_new2"].mute)
+        self.assertIsNone(rows["p1"].mute)
         queued = self.store.status_queue(
-            "acknowledged", stale_before=self.CUTOFF, now=self.NOW)
+            "muted", stale_before=self.CUTOFF, now=self.NOW)
         self.assertEqual(len(queued), 1)
-        self.assertEqual(queued[0].acknowledgment, ack)
+        self.assertEqual(queued[0].mute, mute)
         other = self.store.status_queue(
             "new_failures", stale_before=self.CUTOFF, now=self.NOW)
         self.assertEqual(self._names(other), ["f_new2"])
-        self.assertIsNone(other[0].acknowledgment)
+        self.assertIsNone(other[0].mute)
 
     # -- expiry -------------------------------------------------------
 
-    def test_an_expired_acknowledgment_stops_counting(self) -> None:
+    def test_an_expired_mute_stops_counting(self) -> None:
         self._seed()
-        self._ack_some()
+        self._mute_some()
         later = self.NOW + datetime.timedelta(days=3, seconds=1)
         counts = self.store.queue_counts(
             stale_before=self.CUTOFF, now=later)
         self.assertEqual(
-            (counts["acknowledged"], counts["new_failures"],
+            (counts["muted"], counts["new_failures"],
              counts["still_failing"]), (0, 2, 2))
         self.assertEqual(
             self._names(self.store.status_queue(
@@ -8500,96 +8636,124 @@ class AcknowledgmentTest(StorageTestBase):
             ["f_new1", "f_new2"])
         self.assertEqual(
             self.store.status_queue(
-                "acknowledged", stale_before=self.CUTOFF, now=later), [])
+                "muted", stale_before=self.CUTOFF, now=later), [])
         self.assertEqual(
-            self.store.dashboard_count(acknowledged=True, now=later), 0)
+            self.store.dashboard_count(muted=True, now=later), 0)
         self.assertEqual(self._cells(later), [])
         # On record, though expired.
-        ack = self.store.acknowledgment_for(1, self.ENV, self.SCRIPT,
+        mute = self.store.mute_for(1, self.ENV, self.SCRIPT,
                                             "f_new1")
-        assert ack is not None
-        self.assertLess(ack.expires_at, later)
+        assert mute is not None
+        self.assertLess(mute.expires_at, later)
         row = [r for r in self.store.dashboard(now=later)
                if r.test_name == "f_new1"][0]
-        self.assertEqual(row.acknowledgment, ack)
+        self.assertEqual(row.mute, mute)
 
     def test_the_boundary_second_is_expired(self) -> None:
         """live iff expires_at > now: AT the expiry it is gone."""
         self._seed()
-        self._ack(["f_new1"], days=1)
+        self._mute(["f_new1"], hours=24)
         edge = self.NOW + datetime.timedelta(days=1)
         self.assertEqual(
             self.store.status_queue_count(
-                "acknowledged", stale_before=self.CUTOFF, now=edge), 0)
+                "muted", stale_before=self.CUTOFF, now=edge), 0)
         just = edge - datetime.timedelta(seconds=1)
         self.assertEqual(
             self.store.status_queue_count(
-                "acknowledged", stale_before=self.CUTOFF, now=just), 1)
+                "muted", stale_before=self.CUTOFF, now=just), 1)
 
     def test_the_epoch_is_the_next_future_expiry(self) -> None:
         self._seed()
         sid = storage.MAINLINE_STREAM_ID
-        self.assertIsNone(self.store.acknowledgment_epoch(sid, self.NOW))
-        self._ack(["f_new1"], days=5)
-        self._ack(["f_new2"], days=2)
+        self.assertIsNone(self.store.mute_epoch(sid, self.NOW))
+        self._mute(["f_new1"], hours=120)
+        self._mute(["f_new2"], hours=48)
         self.assertEqual(
-            self.store.acknowledgment_epoch(sid, self.NOW),
+            self.store.mute_epoch(sid, self.NOW),
             model.format_iso(self.NOW + datetime.timedelta(days=2)))
         mid = self.NOW + datetime.timedelta(days=3)
         self.assertEqual(
-            self.store.acknowledgment_epoch(sid, mid),
+            self.store.mute_epoch(sid, mid),
             model.format_iso(self.NOW + datetime.timedelta(days=5)))
         end = self.NOW + datetime.timedelta(days=6)
-        self.assertIsNone(self.store.acknowledgment_epoch(sid, end))
-        self.assertIsNone(self.store.acknowledgment_epoch(999, self.NOW))
+        self.assertIsNone(self.store.mute_epoch(sid, end))
+        self.assertIsNone(self.store.mute_epoch(999, self.NOW))
 
     def test_a_pass_in_between_changes_nothing(self) -> None:
         self._seed()
-        self._ack(["f_new1"])
+        self._mute(["f_new1"])
         hour = datetime.timedelta(hours=1)
         base = self.NOW - datetime.timedelta(hours=10)
         self.store.upsert_runs([
             make_record(test_name="f_new1", result=Result.PASS,
                         start=base)])
-        # While it passes it is not acknowledged: only FAIL rows count.
+        # While it passes it is STILL muted (the Muted tab lists every
+        # live mute), but its cell says PASS and nothing is subtracted.
         self.assertEqual(
             self.store.status_queue_count(
-                "acknowledged", stale_before=self.CUTOFF, now=self.NOW), 0)
-        self.assertEqual(self._cells(), [])
+                "muted", stale_before=self.CUTOFF, now=self.NOW), 1)
+        self.assertEqual(
+            [(c.result, c.count) for c in self._cells()],
+            [(Result.PASS, 1)])
         self.store.upsert_runs([
             make_record(test_name="f_new1", result=Result.FAIL,
                         start=base + hour)])
         self.assertEqual(
             self._names(self.store.status_queue(
-                "acknowledged", stale_before=self.CUTOFF, now=self.NOW)),
+                "muted", stale_before=self.CUTOFF, now=self.NOW)),
             ["f_new1"])
-        self.assertEqual(sum(c.count for c in self._cells()), 1)
+        self.assertEqual(
+            [(c.result, c.count) for c in self._cells()],
+            [(Result.FAIL, 1)])
 
-    def test_a_passing_test_is_never_counted_as_acknowledged(self) -> None:
+    def test_a_passing_muted_test_is_listed_and_subtracts_nothing(
+        self,
+    ) -> None:
         self._seed()
-        self._ack(["p1", "f_new1"])
-        self.assertEqual(sum(c.count for c in self._cells()), 1)
+        before = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.NOW)
+        self._mute(["p1", "f_new1"])
+        # Every live mute is a cell, carrying its REAL result.
+        self.assertEqual(
+            sorted((c.result.value, c.count) for c in self._cells()),
+            sorted([(Result.PASS.value, 1), (Result.FAIL.value, 1)]))
         counts = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW)
-        self.assertEqual(counts["acknowledged"], 1)
+        # The tab badge is the row count; only the FAIL one came off
+        # the failing queue.
+        self.assertEqual(counts["muted"], 2)
+        self.assertEqual(
+            counts["new_failures"], before["new_failures"] - 1)
+        self.assertEqual(counts["still_failing"], before["still_failing"])
+        rows = self.store.status_queue(
+            "muted", stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(self._names(rows), ["f_new1", "p1"])
+        self.assertEqual(
+            {row.test_name: row.result for row in rows},
+            {"f_new1": Result.FAIL, "p1": Result.PASS})
+        self.assertEqual(
+            counts["muted"],
+            self.store.status_queue_count(
+                "muted", stale_before=self.CUTOFF, now=self.NOW))
+        self.assertEqual(counts["muted"], len(rows))
 
     def test_a_retired_test_is_not_counted(self) -> None:
         self._seed()
-        self._ack_some()
+        self._mute_some()
         self.store.set_retired(
             self.ENV, self.SCRIPT, "f_new1", True, "alice", "gone", CREATED)
         self.assertEqual(sum(c.count for c in self._cells()), 1)
         counts = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW)
-        self.assertEqual(counts["acknowledged"], 1)
+        self.assertEqual(counts["muted"], 1)
         self.assertEqual(
             self._names(self.store.status_queue(
-                "acknowledged", stale_before=self.CUTOFF, now=self.NOW)),
+                "muted", stale_before=self.CUTOFF, now=self.NOW)),
             ["f_still1"])
 
     # -- streams ------------------------------------------------------
 
-    def test_a_builds_acknowledgments_do_not_touch_mainline(self) -> None:
+    def test_a_builds_mutes_do_not_touch_mainline(self) -> None:
         self._seed()
         self.store.upsert_runs([
             make_record(test_name="f_new1", result=Result.FAIL,
@@ -8597,44 +8761,44 @@ class AcknowledgmentTest(StorageTestBase):
         sid = self._build_id("b1")
         mainline_before = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW)
-        self._ack(["f_new1"], sid=sid)
+        self._mute(["f_new1"], sid=sid)
         # Assignment is per test, not per stream, so `assigned` moves;
         # every figure about FAILURES must not.
         after = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW)
-        for kind in ("new_failures", "still_failing", "acknowledged",
+        for kind in ("new_failures", "still_failing", "muted",
                      "fixed", "unexpected_passes", "not_run"):
             self.assertEqual(after[kind], mainline_before[kind], kind)
         build = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW, stream_id=sid)
         self.assertEqual(
-            (build["acknowledged"], build["new_failures"]), (1, 0))
-        self.assertIsNone(self.store.acknowledgment_for(
+            (build["muted"], build["new_failures"]), (1, 0))
+        self.assertIsNone(self.store.mute_for(
             1, self.ENV, self.SCRIPT, "f_new1"))
         self.assertEqual(self._cells(), [])
         self.assertEqual(
-            sum(c.count for c in self.store.acknowledged_cells(
+            sum(c.count for c in self.store.muted_cells(
                 self.NOW, self.CUTOFF, stream_id=sid)), 1)
 
-    def test_mainlines_acknowledgments_do_not_touch_a_build(self) -> None:
+    def test_mainlines_mutes_do_not_touch_a_build(self) -> None:
         self._seed()
         self.store.upsert_runs([
             make_record(test_name="f_new1", result=Result.FAIL,
                         build="b1")])
         sid = self._build_id("b1")
-        self._ack(["f_new1"])
+        self._mute(["f_new1"])
         build = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW, stream_id=sid)
         self.assertEqual(
-            (build["acknowledged"], build["new_failures"]), (0, 1))
+            (build["muted"], build["new_failures"]), (0, 1))
         self.assertEqual(
             self.store.dashboard_count(
-                acknowledged=True, now=self.NOW, stream_id=sid), 0)
+                muted=True, now=self.NOW, stream_id=sid), 0)
 
     def _history_count(self, sid: int) -> int:
-        return self._count("acknowledgment_history", "stream_id = ?", [sid])
+        return self._count("mute_history", "stream_id = ?", [sid])
 
-    def test_delete_stream_removes_its_acknowledgments_and_history(
+    def test_delete_stream_removes_its_mutes_and_history(
         self,
     ) -> None:
         self._seed()
@@ -8644,19 +8808,19 @@ class AcknowledgmentTest(StorageTestBase):
             make_record(test_name="f_new2", result=Result.FAIL,
                         build="b1")])
         sid = self._build_id("b1")
-        self._ack(["f_new1", "f_new2"], sid=sid)
-        self._ack(["f_new1"])
+        self._mute(["f_new1", "f_new2"], sid=sid)
+        self._mute(["f_new1"])
         self.assertEqual(self._history_count(sid), 2)
         deleted = self.store.delete_stream(sid)
-        self.assertEqual(deleted["test_acknowledgments"], 2)
+        self.assertEqual(deleted["test_mutes"], 2)
         self.assertEqual(
-            self._count("test_acknowledgments", "stream_id = ?", [sid]), 0)
+            self._count("test_mutes", "stream_id = ?", [sid]), 0)
         self.assertEqual(self._history_count(sid), 0)
-        # Mainline's own acknowledgment and history are untouched.
-        self.assertEqual(self._count("test_acknowledgments"), 1)
+        # Mainline's own mute and history are untouched.
+        self.assertEqual(self._count("test_mutes"), 1)
         self.assertEqual(self._history_count(1), 1)
 
-    def test_prune_empty_streams_takes_stray_acknowledgments(self) -> None:
+    def test_prune_empty_streams_takes_stray_mutes(self) -> None:
         self.store.upsert_runs([make_record(build="live")])
         conn = self.store._conn()
         conn.execute("BEGIN IMMEDIATE")
@@ -8670,20 +8834,20 @@ class AcknowledgmentTest(StorageTestBase):
         stamp = model.format_iso(BASE)
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
-            "INSERT INTO test_acknowledgments (stream_id, environment, "
-            "script, test_name, reason, acknowledged_at, expires_at, "
-            "acknowledged_by, extensions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            "INSERT INTO test_mutes (stream_id, environment, "
+            "script, test_name, reason, muted_at, expires_at, "
+            "muted_by, extensions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (orphan, self.ENV, self.SCRIPT, "gone", "r", stamp, stamp, "bob"))
         conn.execute(
-            "INSERT INTO acknowledgment_history (stream_id, environment, "
+            "INSERT INTO mute_history (stream_id, environment, "
             "script, test_name, action, reason, expires_at, actor, "
-            "acted_at) VALUES (?, ?, ?, ?, 'acknowledge', 'r', ?, 'bob', ?)",
+            "acted_at) VALUES (?, ?, ?, ?, 'mute', 'r', ?, 'bob', ?)",
             (orphan, self.ENV, self.SCRIPT, "gone", stamp, stamp))
         conn.execute("COMMIT")
         removed = self.store.prune_empty_streams()
         self.assertEqual([s.name for s in removed], ["orphan"])
-        self.assertEqual(self._count("test_acknowledgments"), 0)
-        self.assertEqual(self._count("acknowledgment_history"), 0)
+        self.assertEqual(self._count("test_mutes"), 0)
+        self.assertEqual(self._count("mute_history"), 0)
 
     # -- unassigning --------------------------------------------------
 
@@ -8693,21 +8857,21 @@ class AcknowledgmentTest(StorageTestBase):
             make_record(test_name="x", result=Result.FAIL, build="b1",
                         start=BASE + datetime.timedelta(hours=2))])
         sid = self._build_id("b1")
-        self._ack(["x"])
-        self._ack(["x"], sid=sid)
-        self.assertEqual(self._count("test_acknowledgments"), 2)
+        self._mute(["x"])
+        self._mute(["x"], sid=sid)
+        self.assertEqual(self._count("test_mutes"), 2)
         return sid
 
-    def test_unassigning_drops_the_acknowledgment_on_every_stream(
+    def test_unassigning_drops_the_mute_on_every_stream(
         self,
     ) -> None:
         sid = self._two_streams()
         self.store.set_assignee(
             self.ENV, self.SCRIPT, "x", None, "bob", self.NOW)
-        self.assertEqual(self._count("test_acknowledgments"), 0)
+        self.assertEqual(self._count("test_mutes"), 0)
         clears = [
-            h for h in self.store.acknowledgment_history(
-                self.ENV, self.SCRIPT, "x") if h.action == "clear"]
+            h for h in self.store.mute_history(
+                self.ENV, self.SCRIPT, "x") if h.action == "unmute"]
         self.assertEqual(sorted(h.stream_id for h in clears), [1, sid])
         for h in clears:
             self.assertEqual(h.reason, "unassigned")
@@ -8718,93 +8882,93 @@ class AcknowledgmentTest(StorageTestBase):
         self._two_streams()
         self.store.bulk_set_assignee_for_triples(
             None, "bob", self.NOW, [(self.ENV, self.SCRIPT, "x", None)])
-        self.assertEqual(self._count("test_acknowledgments"), 0)
+        self.assertEqual(self._count("test_mutes"), 0)
         self.assertEqual(
-            self._count("acknowledgment_history", "action = 'clear'"), 2)
+            self._count("mute_history", "action = 'unmute'"), 2)
 
     def test_filtered_bulk_unassign_drops_it_too(self) -> None:
         self._seed()
-        self._ack_some()
+        self._mute_some()
         count = self.store.bulk_set_assignee(
             None, "bob", self.NOW, assigned_only=True, now=self.NOW)
         self.assertEqual(count, 2)
-        self.assertEqual(self._count("test_acknowledgments"), 0)
+        self.assertEqual(self._count("test_mutes"), 0)
 
-    def test_reassigning_keeps_the_acknowledgment(self) -> None:
+    def test_reassigning_keeps_the_mute(self) -> None:
         self._two_streams()
         self.store.set_assignee(
             self.ENV, self.SCRIPT, "x", "carol", "bob", self.NOW)
-        self.assertEqual(self._count("test_acknowledgments"), 2)
+        self.assertEqual(self._count("test_mutes"), 2)
         self.store.bulk_set_assignee_for_triples(
             "dave", "bob", self.NOW, [(self.ENV, self.SCRIPT, "x", None)])
-        self.assertEqual(self._count("test_acknowledgments"), 2)
+        self.assertEqual(self._count("test_mutes"), 2)
         self.assertEqual(
-            self._count("acknowledgment_history", "action = 'clear'"), 0)
+            self._count("mute_history", "action = 'unmute'"), 0)
 
     def test_unassigning_another_test_leaves_the_rest(self) -> None:
         self._seed()
-        self._ack(["f_new1"])
+        self._mute(["f_new1"])
         self.store.set_assignee(
             self.ENV, self.SCRIPT, "f_new2", "alice", "bob", self.NOW)
         self.store.set_assignee(
             self.ENV, self.SCRIPT, "f_new2", None, "bob", self.NOW)
-        self.assertEqual(self._count("test_acknowledgments"), 1)
+        self.assertEqual(self._count("test_mutes"), 1)
 
     # -- clearing -----------------------------------------------------
 
     def test_clear_keeps_the_assignment_and_is_idempotent(self) -> None:
         self._seed()
-        self._ack_some()
+        self._mute_some()
         keys = [self._key("f_new1")]
         self.assertEqual(
-            self.store.clear_acknowledgments(keys, "carol", self.NOW), 1)
-        self.assertIsNone(self.store.acknowledgment_for(
+            self.store.unmute_tests(keys, "carol", self.NOW), 1)
+        self.assertIsNone(self.store.mute_for(
             1, self.ENV, self.SCRIPT, "f_new1"))
         self.assertEqual(
             self.store.current_assignee(self.ENV, self.SCRIPT, "f_new1"),
             "alice")
-        history = self.store.acknowledgment_history(
+        history = self.store.mute_history(
             self.ENV, self.SCRIPT, "f_new1")
         self.assertEqual(
             [(h.action, h.actor, h.reason) for h in history],
-            [("clear", "carol", None), ("acknowledge", "bob", "known issue")])
+            [("unmute", "carol", None), ("mute", "bob", "known issue")])
         self.assertEqual(
-            self.store.clear_acknowledgments(keys, "carol", self.NOW), 0)
-        self.assertEqual(len(self.store.acknowledgment_history(
+            self.store.unmute_tests(keys, "carol", self.NOW), 0)
+        self.assertEqual(len(self.store.mute_history(
             self.ENV, self.SCRIPT, "f_new1")), 2)
         # Cleared, so the failure is back in its queue; the other stays.
         counts = self.store.queue_counts(
             stale_before=self.CUTOFF, now=self.NOW)
         self.assertEqual(
-            (counts["acknowledged"], counts["new_failures"]), (1, 2))
+            (counts["muted"], counts["new_failures"]), (1, 2))
 
     def test_clear_names_a_stream(self) -> None:
         sid = self._two_streams()
-        removed = self.store.clear_acknowledgments(
+        removed = self.store.unmute_tests(
             [self._key("x", sid)], "carol", self.NOW)
         self.assertEqual(removed, 1)
-        self.assertIsNotNone(self.store.acknowledgment_for(
+        self.assertIsNotNone(self.store.mute_for(
             1, self.ENV, self.SCRIPT, "x"))
-        self.assertIsNone(self.store.acknowledgment_for(
+        self.assertIsNone(self.store.mute_for(
             sid, self.ENV, self.SCRIPT, "x"))
 
     # -- expiring -----------------------------------------------------
 
-    def test_expiring_acknowledgments(self) -> None:
+    def test_expiring_mutes(self) -> None:
         self._seed()
         day = datetime.timedelta(days=1)
         hours = datetime.timedelta(hours=2)
         # Expires in 2 hours.
-        self._ack(["f_new1"], days=3, when=self.NOW - 3 * day + hours)
+        self._mute(["f_new1"], hours=72, when=self.NOW - 3 * day + hours)
         # Expired yesterday.
-        self._ack(["f_new2"], days=1, when=self.NOW - 2 * day, assignee="eve")
+        self._mute(["f_new2"], hours=24, when=self.NOW - 2 * day, assignee="eve")
         # Expires in 3 days.
-        self._ack(["f_still1"], days=3)
+        self._mute(["f_still1"], hours=72)
         # Would be in the window, but the test passes now.
-        self._ack(["p1"], days=3, when=self.NOW - 3 * day + hours)
-        expiring = self.store.expiring_acknowledgments(self.NOW, 1 * day)
+        self._mute(["p1"], hours=72, when=self.NOW - 3 * day + hours)
+        expiring = self.store.expiring_mutes(self.NOW, 1 * day)
         self.assertEqual(
-            [e.acknowledgment.test_name for e in expiring],
+            [e.mute.test_name for e in expiring],
             ["f_new2", "f_new1"])
         first = expiring[0]
         self.assertEqual(
@@ -8812,7 +8976,7 @@ class AcknowledgmentTest(StorageTestBase):
              first.assignee),
             ("mainline", "", Result.FAIL, "eve"))
         self.assertEqual(
-            first.acknowledgment.expires_at, self.NOW - day)
+            first.mute.expires_at, self.NOW - day)
         self.assertEqual(expiring[1].assignee, "alice")
 
     def test_expiring_filters_by_stream_and_carries_the_build(self) -> None:
@@ -8821,13 +8985,13 @@ class AcknowledgmentTest(StorageTestBase):
             make_record(test_name="f_new1", result=Result.FAIL,
                         build="b1")])
         sid = self._build_id("b1")
-        self._ack(["f_new1"], days=1)
-        self._ack(["f_new1"], days=1, sid=sid)
+        self._mute(["f_new1"], hours=24)
+        self._mute(["f_new1"], hours=24, sid=sid)
         within = datetime.timedelta(days=2)
-        both = self.store.expiring_acknowledgments(self.NOW, within)
-        self.assertEqual(sorted(e.acknowledgment.stream_id for e in both),
+        both = self.store.expiring_mutes(self.NOW, within)
+        self.assertEqual(sorted(e.mute.stream_id for e in both),
                          [1, sid])
-        only = self.store.expiring_acknowledgments(
+        only = self.store.expiring_mutes(
             self.NOW, within, stream_id=sid)
         self.assertEqual(len(only), 1)
         self.assertEqual(
@@ -8835,10 +8999,10 @@ class AcknowledgmentTest(StorageTestBase):
 
     def test_expiring_leaves_out_a_retired_test(self) -> None:
         self._seed()
-        self._ack(["f_new1"], days=1)
+        self._mute(["f_new1"], hours=24)
         self.store.set_retired(
             self.ENV, self.SCRIPT, "f_new1", True, "alice", "gone", CREATED)
-        self.assertEqual(self.store.expiring_acknowledgments(
+        self.assertEqual(self.store.expiring_mutes(
             self.NOW, datetime.timedelta(days=2)), [])
 
     # -- the memo: a repeat read is free -------------------------------
@@ -8853,40 +9017,40 @@ class AcknowledgmentTest(StorageTestBase):
             conn.set_trace_callback(None)
         return seen
 
-    def _ack_cell_keys(self) -> List[Tuple[Any, ...]]:
+    def _mute_cell_keys(self) -> List[Tuple[Any, ...]]:
         return sorted(
             key for key in self.store._summary_cache
-            if key[0] == "ack_cells")
+            if key[0] == "mute_cells")
 
-    def test_a_repeat_acknowledged_cells_read_is_a_memo_hit(self) -> None:
+    def test_a_repeat_muted_cells_read_is_a_memo_hit(self) -> None:
         self._seed()
-        self._ack_some()
+        self._mute_some()
         first = self._cells()
         self.assertEqual(sum(c.count for c in first), 2)
         self.assertEqual(self._statements(self._cells), [])
         self.assertEqual(self._cells(), first)
         # A scoped read is a filter of the same entries.
         self.assertEqual(
-            self._statements(lambda: self.store.acknowledged_cells(
+            self._statements(lambda: self.store.muted_cells(
                 self.NOW, self.CUTOFF, environment=self.ENV)), [])
         self.assertEqual(
-            self.store.acknowledged_cells(
+            self.store.muted_cells(
                 self.NOW, self.CUTOFF, environment="elsewhere"), [])
         self.assertEqual(
-            self.store.acknowledged_cells(
+            self.store.muted_cells(
                 self.NOW, self.CUTOFF, environments=[]), [])
 
-    def test_a_stream_with_no_acknowledgments_costs_nothing_once_known(
+    def test_a_stream_with_no_mutes_costs_nothing_once_known(
         self,
     ) -> None:
         self._seed()
         sid = storage.MAINLINE_STREAM_ID
         self.assertEqual(self._cells(), [])
-        self.assertIsNone(self.store.acknowledgment_epoch(sid, self.NOW))
+        self.assertIsNone(self.store.mute_epoch(sid, self.NOW))
         for call in (
                 self._cells,
-                lambda: self.store.acknowledgment_epoch(sid, self.NOW),
-                lambda: self.store.acknowledged_cells(
+                lambda: self.store.mute_epoch(sid, self.NOW),
+                lambda: self.store.muted_cells(
                     self.NOW + datetime.timedelta(days=30), self.CUTOFF)):
             self.assertEqual(self._statements(call), [])
 
@@ -8895,27 +9059,27 @@ class AcknowledgmentTest(StorageTestBase):
     ) -> None:
         self._seed()
         sid = storage.MAINLINE_STREAM_ID
-        self._ack(["f_new1"], days=2)
+        self._mute(["f_new1"], hours=48)
         expected = model.format_iso(self.NOW + datetime.timedelta(days=2))
         self.assertEqual(
-            self.store.acknowledgment_epoch(sid, self.NOW), expected)
+            self.store.mute_epoch(sid, self.NOW), expected)
         later = self.NOW + datetime.timedelta(days=1)
         self.assertEqual(self._statements(
-            lambda: self.store.acknowledgment_epoch(sid, later)), [])
+            lambda: self.store.mute_epoch(sid, later)), [])
         # Past the epoch: recomputed, and now there is none.
         past = self.NOW + datetime.timedelta(days=2, seconds=1)
         self.assertEqual(self._statements(
             lambda: self.assertIsNone(
-                self.store.acknowledgment_epoch(sid, past))) != [], True)
+                self.store.mute_epoch(sid, past))) != [], True)
         # An EARLIER clock than the one the memo holds is not served
         # the memo (it would say None while the row was still live).
         self.assertEqual(
-            self.store.acknowledgment_epoch(sid, self.NOW), expected)
+            self.store.mute_epoch(sid, self.NOW), expected)
 
     def test_passing_the_epoch_recomputes_the_cells(self) -> None:
         self._seed()
-        self._ack(["f_new1"], days=2)
-        self._ack(["f_still1"], days=5)
+        self._mute(["f_new1"], hours=48)
+        self._mute(["f_still1"], hours=120)
         self.assertEqual(sum(c.count for c in self._cells()), 2)
         mid = self.NOW + datetime.timedelta(days=3)
         self.assertEqual(self._statements(lambda: self._cells(mid)) != [],
@@ -8927,29 +9091,29 @@ class AcknowledgmentTest(StorageTestBase):
         # And back: a clock before the epoch the memo now holds.
         self.assertEqual(sum(c.count for c in self._cells()), 2)
 
-    def test_every_acknowledgment_write_invalidates_the_cells(self) -> None:
+    def test_every_mute_write_invalidates_the_cells(self) -> None:
         self._seed()
         total = lambda: sum(c.count for c in self._cells())  # noqa: E731
-        self._ack(["f_new1"])
+        self._mute(["f_new1"])
         self.assertEqual(total(), 1)
-        self._ack(["f_still1"])                       # acknowledge
+        self._mute(["f_still1"])                       # mute
         self.assertEqual(total(), 2)
-        self._ack(["f_still1"], days=7)               # extend
+        self._mute(["f_still1"], hours=168)               # extend
         self.assertEqual(total(), 2)
         self.assertEqual(
-            self.store.acknowledgment_epoch(1, self.NOW),
+            self.store.mute_epoch(1, self.NOW),
             model.format_iso(self.NOW + datetime.timedelta(days=3)))
-        self.store.clear_acknowledgments(
+        self.store.unmute_tests(
             [self._key("f_new1")], "carol", self.NOW)  # clear
         self.assertEqual(total(), 1)
         self.assertEqual(
-            self.store.acknowledgment_epoch(1, self.NOW),
+            self.store.mute_epoch(1, self.NOW),
             model.format_iso(self.NOW + datetime.timedelta(days=7)))
         self.store.set_assignee(
             self.ENV, self.SCRIPT, "f_still1", None, "bob",
             self.NOW)                                  # unassign
         self.assertEqual(total(), 0)
-        self.assertIsNone(self.store.acknowledgment_epoch(1, self.NOW))
+        self.assertIsNone(self.store.mute_epoch(1, self.NOW))
 
     def test_a_push_into_one_environment_drops_only_its_cells(self) -> None:
         later = BASE + datetime.timedelta(hours=1)
@@ -8957,47 +9121,49 @@ class AcknowledgmentTest(StorageTestBase):
             make_record(environment=env, test_name=name,
                         result=Result.FAIL, start=later)
             for env in ("env-x", "env-y") for name in ("a", "b")])
-        self.store.acknowledge_tests(
+        self.store.mute_tests(
             [("env-x", self.SCRIPT, "a", 1), ("env-y", self.SCRIPT, "a", 1)],
-            "why", 3, "alice", "bob", self.NOW)
+            "why", 72, "alice", "bob", self.NOW)
         cells = self._cells()
         self.assertEqual(sum(c.count for c in cells), 2)
         self.assertEqual(
-            [key[2] for key in self._ack_cell_keys()], ["env-x", "env-y"])
-        # env-x's acknowledged test now passes: a push into env-x only.
+            [key[2] for key in self._mute_cell_keys()], ["env-x", "env-y"])
+        # env-x's muted test now passes (still muted, but its cell is
+        # different): a push into env-x only.
         self.store.upsert_runs([
             make_record(environment="env-x", test_name="a",
                         result=Result.PASS,
                         start=later + datetime.timedelta(hours=1))])
         self.assertEqual(
-            [key[2] for key in self._ack_cell_keys()], ["env-y"])
+            [key[2] for key in self._mute_cell_keys()], ["env-y"])
         again = self._cells()
         self.assertEqual(
-            [(c.environment, c.count) for c in again], [("env-y", 1)])
+            [(c.environment, c.result, c.count) for c in again],
+            [("env-x", Result.PASS, 1), ("env-y", Result.FAIL, 1)])
         self.assertEqual(
-            [key[2] for key in self._ack_cell_keys()], ["env-x", "env-y"])
+            [key[2] for key in self._mute_cell_keys()], ["env-x", "env-y"])
         self.assertEqual(self._statements(self._cells), [])
 
     # -- environment delete -------------------------------------------
 
-    def test_deleting_an_environment_takes_its_acknowledgments(self) -> None:
+    def test_deleting_an_environment_takes_its_mutes(self) -> None:
         for environment in (self.ENV, "UNKNOWN"):
             self.store.upsert_runs([
                 make_record(environment=environment, test_name="f",
                             result=Result.FAIL)])
-        self.store.acknowledge_tests(
+        self.store.mute_tests(
             [self._key("f"), self._key("f", env="UNKNOWN")],
-            "why", 2, "alice", "bob", self.NOW)
+            "why", 48, "alice", "bob", self.NOW)
         self.store.delete_environment("UNKNOWN")
         self.assertEqual(
-            self._count("test_acknowledgments", "environment = ?",
+            self._count("test_mutes", "environment = ?",
                         ["UNKNOWN"]), 0)
         self.assertEqual(
-            self._count("acknowledgment_history", "environment = ?",
+            self._count("mute_history", "environment = ?",
                         ["UNKNOWN"]), 0)
         self.assertEqual(
-            self._count("test_acknowledgments", "environment = ?",
+            self._count("test_mutes", "environment = ?",
                         [self.ENV]), 1)
         self.assertEqual(
-            self._count("acknowledgment_history", "environment = ?",
+            self._count("mute_history", "environment = ?",
                         [self.ENV]), 1)

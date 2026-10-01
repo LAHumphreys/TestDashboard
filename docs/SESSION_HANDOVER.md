@@ -4,7 +4,7 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-10-01**. **WP-40 (acknowledged failures) is built and
+Last rewritten: **2026-10-01**. **WP-40 (muted failures) is built and
 merged on `wp-40-acknowledged-failures`**; the drop of 2026-10-01 now carries
 WP-39 **and** WP-40, and **a migration (11) runs on both backends**. Nothing
 is pushed or deployed yet.
@@ -23,17 +23,23 @@ is pushed or deployed yet.
   ledger step 10 to 11, `154a201` frontend, merged by `c85957e` and
   `0dfa121`; plus the docs commit on top (operator note, log entry, this
   file, CLAUDE.md's three numbers).
-- **Measured on this branch:** SQLite **2620 OK (skipped 1)**, from 2550;
-  MariaDB 12.3 full suite: **3594 OK (skipped 71)**; the two MariaDB suites
-  alone 986 OK (skipped 70). Production is 10.3: CI's legs are the authority.
+- **Measured on this branch:** SQLite **2640 OK (skipped 1)**, from 2550;
+  MariaDB 12.3, the two MariaDB suites alone: **998 OK (skipped 70)** (the
+  full-variant 3594 predates the 2026-10-01 amendment). Production is 10.3: CI's legs are the authority.
 - **What WP-40 is, in one screen** (the log's "WP-40 spec", its addendum and
-  "WP-40 built" are the contract): a person acknowledges a failing test on
-  one stream with a reason for **1–7 whole days** (never indefinite; no
-  `null`); `failing` excludes live acknowledgments and `acknowledged` is shown
-  beside it everywhere a failing count appears; acknowledging assigns, and
-  unassigning drops the acknowledgment; a pass inside the window does not end
-  it; Open Actions has an Expiring list with Extend. Migration 11 only creates
-  `test_acknowledgments` and `acknowledgment_history`. The MariaDB ledger step
+  "WP-40 built" are the contract): a person mutes a failing test on
+  one stream with a reason for **1–168 whole hours** (the UI offers 12
+  hours to 7 days from one shared dropdown; never indefinite; no `null`);
+  the New / Still failing figures exclude live mutes and "+X muted" is shown
+  beside them everywhere a failing count appears (no Muted tile; grey chart
+  extensions; Watch "N (+X muted)"), while the **pass rate still counts muted
+  failures**; muting assigns and posts the reason as a comment, and
+  unassigning drops the mute; the Muted tab lists EVERY live mute, passing
+  or failing, with a State column (`status.muted_total`); Open Actions has an
+  Expiring list with Extend. **Amended after the first walkthrough (log,
+  2026-10-01 "WP-40 amended ..."): the state was renamed "acknowledged" ->
+  "muted" end to end, before anything shipped.** Migration 11 only creates
+  `test_mutes` and `mute_history`. The MariaDB ledger step
   has `alters=()`, so the upgrade tool's dry run prints `SERVER: may keep
   running`. Six design observations are recorded (not changed) in the log.
   The spec spells the expiry column `until`; the code is `expires_at`.
@@ -45,7 +51,7 @@ is pushed or deployed yet.
 
 1. ~~The performance A/B against `master`~~ **Done** (log, "WP-40
    performance"): yesterday's gains intact; the one regression it found
-   (the browse page's count carrying the acknowledgment join) is fixed in
+   (the browse page's count carrying the mute join) is fixed in
    `dbb5523` and re-measured. Left for a later pass, found on `master`
    too: 65 `current_assignments` rows cost the browse page's count ~8 ms.
 2. **Fast-forward `wp-40-acknowledged-failures` into `drop-2026-10-01`**
@@ -63,7 +69,7 @@ is pushed or deployed yet.
 ## Next session's plan
 
 1. Finish the list above. After the deploy, the first-hour checks in the
-   operator note, then see what the testers make of the Acknowledged queue.
+   operator note, then see what the testers make of the Muted queue.
 2. **Get the two deploy answers** (counters on? "Waited, mean" during a run?).
 3. **Tidy the branches.** PR #12 (`docs-handover-2026-09-29`) is redundant —
    close it. `drop-2026-09-30` is merged in content but not an ancestor of
@@ -93,7 +99,7 @@ There is **no local `master` branch** in this checkout; work from
 2. **Build comments — the workshop the user offered:** mainline lists show a
    test's newest comment of any origin, unlabelled; deleting a build clears
    the tag on its comments; nothing carries from one build to the next of the
-   same branch. ("Has a comment" is not "acknowledged" is now answered by
+   same branch. ("Has a comment" is not "muted" is now answered by
    WP-40.)
 3. **Decide the Java client's fate** (PR #9): merge or park.
 4. Carried from 2026-08-11, still open: re-retire the tests the un-retire
@@ -106,7 +112,7 @@ There is **no local `master` branch** in this checkout; work from
    shows "Reported 0 of N" on its own tiles. **Do not loosen the clamp**.
 6. WP-40's six recorded observations (log): none needs a decision to ship;
    #2 and #3 (tab overlap; unassign from mainline dropping a build's
-   acknowledgment) are the ones a tester is likeliest to trip over.
+   mute) are the ones a tester is likeliest to trip over.
 
 ## Known slow, measured, not changed
 
@@ -150,7 +156,7 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 git fetch origin --prune
 git log --oneline -3 origin/master   # a6f59d2 on top means the 2026-10-01 drop has NOT shipped
 gh pr list --state open              # expect #9 and, until closed, #12; plus the drop's PR once opened
-python -m unittest discover          # expect 2620 OK (skipped 1) on wp-40-acknowledged-failures, SQLite
+python -m unittest discover          # expect 2640 OK (skipped 1) on wp-40-acknowledged-failures, SQLite
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,

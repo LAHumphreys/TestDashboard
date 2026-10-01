@@ -23,7 +23,8 @@
 "use strict";
 
 import {
-  acknowledgmentDetail,
+  muteDetail,
+  muteDurationSelect,
   assigneeSelect,
   clearNode,
   el,
@@ -40,8 +41,8 @@ import {
   userPickerSelect,
 } from "./api.js";
 import {
-  bulkAcknowledgmentsUrl,
-  clearAcknowledgmentsUrl,
+  bulkMutesUrl,
+  unmuteUrl,
   pageUrl,
 } from "./urls.js";
 
@@ -191,8 +192,8 @@ async function buildReviewPanel(entry, container, opts) {
   }
 }
 
-/** This one test, in the shape the acknowledgment endpoints take. */
-function ackTests(entry) {
+/** This one test, in the shape the mute endpoints take. */
+function muteTests(entry) {
   const test = {
     environment: entry.environment, script: entry.script,
     test_name: entry.test_name,
@@ -204,17 +205,19 @@ function ackTests(entry) {
 }
 
 /**
- * The Acknowledge group (WP-40), for a FAILING test only: acknowledging
- * is a statement about a failure. Already acknowledged -> who, until
- * when, why, with "Extend 7 days" and "Clear"; otherwise a reason, a
- * length in days and an owner. Everything arrives via entry/opts.
+ * The Mute group (WP-40), for a FAILING test or one with a live mute:
+ * muting is a statement about a failure. Already muted -> who, until
+ * when, why, with a duration (7 days preselected), "Extend" and
+ * "Unmute"; otherwise a reason, a duration and an owner. Durations come
+ * from api.js's muteDurationSelect(), in hours. Everything arrives via
+ * entry/opts.
  */
-function buildAcknowledgeGroup(entry, opts) {
+function buildMuteGroup(entry, opts) {
   const group = el("div", "review-group review-group-wide");
-  group.appendChild(el("label", "review-label", "Acknowledge"));
+  group.appendChild(el("label", "review-label", "Mute"));
   const done = () => {
-    if (opts.onAcknowledged) {
-      opts.onAcknowledged();
+    if (opts.onMuted) {
+      opts.onMuted();
     } else if (opts.onChanged) {
       opts.onChanged();
     }
@@ -224,79 +227,83 @@ function buildAcknowledgeGroup(entry, opts) {
     if (!me) {
       showError(
         "Set a username first (the “Change” button, top right) "
-        + "— acknowledgments are recorded against a name.");
+        + "— mutes are recorded against a name.");
     }
     return me;
   };
-  const ack = entry.acknowledgment;
-  if (ack && ack.live) {
-    group.appendChild(el("span", "ack-line",
-      "Acknowledged " + acknowledgmentDetail(ack, true)));
-    const extend = el("button", "", "Extend 7 days");
+  const mute = entry.mute;
+  if (mute && mute.live) {
+    group.appendChild(el("span", "mute-line",
+      "Muted " + muteDetail(mute, true)));
+    const extendFor = muteDurationSelect("review-duration-select", 168);
+    const extend = el("button", "", "Extend");
     extend.type = "button";
-    const clear = el("button", "", "Clear");
-    clear.type = "button";
-    clear.title = "Stop acknowledging this failure; it counts as "
+    const unmute = el("button", "", "Unmute");
+    unmute.type = "button";
+    unmute.title = "Stop muting this failure; it counts as "
       + "failing again. It stays assigned.";
     extend.addEventListener("click", async () => {
       const me = needUser();
       if (!me) {
         return;
       }
+      const hours = Number(extendFor.value);
+      if (!hours) {
+        extendFor.focus();
+        showError("Choose how long to extend the mute for.");
+        return;
+      }
       extend.disabled = true;
-      clear.disabled = true;
+      unmute.disabled = true;
       try {
-        await postJson(bulkAcknowledgmentsUrl(), {
-          username: me, days: 7, assignee: entry.assignee || me,
-          tests: ackTests(entry),
+        await postJson(bulkMutesUrl(), {
+          username: me, hours: hours, assignee: entry.assignee || me,
+          tests: muteTests(entry),
         });
         done();
       } catch (err) {
         showError(err.message);
         extend.disabled = false;
-        clear.disabled = false;
+        unmute.disabled = false;
       }
     });
-    clear.addEventListener("click", async () => {
+    unmute.addEventListener("click", async () => {
       const me = needUser();
       if (!me) {
         return;
       }
       extend.disabled = true;
-      clear.disabled = true;
+      unmute.disabled = true;
       try {
-        await postJson(clearAcknowledgmentsUrl(), {
-          username: me, tests: ackTests(entry),
+        await postJson(unmuteUrl(), {
+          username: me, tests: muteTests(entry),
         });
         done();
       } catch (err) {
         showError(err.message);
         extend.disabled = false;
-        clear.disabled = false;
+        unmute.disabled = false;
       }
     });
+    group.appendChild(extendFor);
     group.appendChild(extend);
-    group.appendChild(clear);
+    group.appendChild(unmute);
     return group;
   }
 
   const reason = document.createElement("input");
   reason.type = "text";
   reason.className = "review-input";
-  reason.placeholder = "Why is this failure acknowledged? (required)";
-  const days = document.createElement("input");
-  days.type = "text";
-  days.inputMode = "numeric";
-  days.className = "review-days-input";
-  days.value = "7";
-  days.setAttribute("aria-label", "Days to acknowledge for, 1 to 7");
+  reason.placeholder = "Why is this failure muted? (required)";
+  const duration = muteDurationSelect("review-duration-select");
   const owner = userPickerSelect("review-owner-select");
-  owner.title = "Who owns this failure while it is acknowledged";
+  owner.title = "Who owns this failure while it is muted";
   preselectUser(owner, entry.assignee || getUsername());
-  const go = el("button", "", "Acknowledge");
+  const go = el("button", "", "Mute");
   go.type = "button";
-  go.title = "Stop counting this failure as failing for 1-7 days. It is "
-    + "assigned to the owner chosen and listed as acknowledged.";
+  go.title = "Stop counting this failure as failing for the time chosen "
+    + "(up to 7 days). It is assigned to the owner chosen, listed as "
+    + "muted, and your reason is posted as a comment.";
   go.addEventListener("click", async () => {
     const me = needUser();
     if (!me) {
@@ -305,21 +312,21 @@ function buildAcknowledgeGroup(entry, opts) {
     const text = reason.value.trim();
     if (!text) {
       reason.focus();
-      showError("Say why this failure is acknowledged — the reason is "
+      showError("Say why this failure is muted — the reason is "
         + "kept with it.");
       return;
     }
-    if (!/^[0-9]+$/.test(days.value.trim())
-        || parseInt(days.value, 10) < 1 || parseInt(days.value, 10) > 7) {
-      days.focus();
-      showError("Days must be a whole number from 1 to 7.");
+    const hours = Number(duration.value);
+    if (!hours) {
+      duration.focus();
+      showError("Choose how long to mute this failure for.");
       return;
     }
     go.disabled = true;
     try {
-      await postJson(bulkAcknowledgmentsUrl(), {
-        username: me, reason: text, days: parseInt(days.value, 10),
-        assignee: owner.value || me, tests: ackTests(entry),
+      await postJson(bulkMutesUrl(), {
+        username: me, reason: text, hours: hours,
+        assignee: owner.value || me, tests: muteTests(entry),
       });
       done();
     } catch (err) {
@@ -328,8 +335,7 @@ function buildAcknowledgeGroup(entry, opts) {
     }
   });
   group.appendChild(reason);
-  group.appendChild(days);
-  group.appendChild(el("span", "review-unit", "days"));
+  group.appendChild(duration);
   group.appendChild(owner);
   group.appendChild(go);
   return group;
@@ -426,9 +432,11 @@ function buildReviewActions(entry, opts) {
   commentGroup.appendChild(post);
   actions.appendChild(commentGroup);
 
-  /* --- acknowledge: a failing test only --- */
-  if (entry.result === "FAIL") {
-    actions.appendChild(buildAcknowledgeGroup(entry, opts));
+  /* --- mute: a failing test, or any test whose mute is still live
+     (the Muted tab lists passing ones too, and they need Extend and
+     Unmute) --- */
+  if (entry.result === "FAIL" || (entry.mute && entry.mute.live)) {
+    actions.appendChild(buildMuteGroup(entry, opts));
   }
 
   /* --- retire: only offered where it makes sense --- */

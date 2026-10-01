@@ -31,8 +31,10 @@
 
 import {
   RESULTS,
-  acknowledgedTag,
-  acknowledgmentDetail,
+  mutedTag,
+  muteDetail,
+  failingWithMuted,
+  mutedSuffix,
   clearError,
   clearNode,
   el,
@@ -636,6 +638,15 @@ function windowPhrase(summary) {
   return "since " + formatTime(summary.stale_before);
 }
 
+/** A tile's sub-line with " · +3 muted" appended when some of the
+ * failures were muted (WP-40). There is no Muted tile: the muted ones
+ * ride beside the number they were taken out of, and the Muted queue
+ * tab lists every live mute. */
+function withMutedSuffix(text, muted) {
+  const suffix = mutedSuffix(muted || 0);
+  return suffix ? text + " · " + suffix : text;
+}
+
 function renderStatus() {
   const summary = state.summary;
   const status = summary.status;
@@ -707,23 +718,16 @@ function renderStatus() {
     label: "New failures",
     value: status.new_failures.toLocaleString(),
     accent: status.new_failures > 0 ? "accent-fail" : "accent-zero",
-    sub: "were passing before",
+    sub: withMutedSuffix(
+      "were passing before", status.muted_new_failures),
     onClick: () => openQueue("new_failures"),
   }));
   container.appendChild(buildTile({
     label: "Still failing",
     value: status.still_failing.toLocaleString(),
     accent: status.still_failing > 0 ? "accent-fail-soft" : "accent-zero",
-    sub: "failed before too",
+    sub: withMutedSuffix("failed before too", status.muted_still_failing),
     onClick: () => openQueue("still_failing"),
-  }));
-  const acked = status.acknowledged || 0;
-  container.appendChild(buildTile({
-    label: "Acknowledged",
-    value: acked.toLocaleString(),
-    accent: acked > 0 ? "accent-warn" : "accent-zero",
-    sub: acked > 0 ? "owned, time-boxed" : "none",
-    onClick: () => openQueue("acknowledged"),
   }));
   container.appendChild(buildTile({
     label: "Newly fixed",
@@ -777,20 +781,25 @@ function renderCharts() {
     twin.appendChild(tr);
   }
 
-  // 2. Failing tests by environment (click to scope).
+  // 2. Failing tests by environment (click to scope). The bar is the
+  // UNMUTED failing count with the muted failures as a grey extension
+  // of it (WP-40), sorted by the unmuted number; an environment whose
+  // failures are all muted still shows, grey only.
   const envItems = summary.by_environment
-    .filter((entry) => entry.failed > 0)
-    .sort((a, b) => b.failed - a.failed)
+    .filter((entry) => entry.failed > 0 || (entry.muted || 0) > 0)
+    .sort((a, b) => (b.failed - a.failed)
+      || ((b.muted || 0) - (a.muted || 0)))
     .map((entry) => ({
       label: entry.environment,
       value: entry.failed,
+      extra: entry.muted || 0,
       tooltipRows: [
         { swatchClass: "swatch-fail", label: "failing",
-          value: entry.failed.toLocaleString() },
+          value: withMutedSuffix(
+            entry.failed.toLocaleString(), entry.muted)
+            .replace(" · +", " (+").replace(/ muted$/, " muted)") },
         { swatchClass: "", label: "new failures",
           value: entry.new_failures.toLocaleString() },
-        { swatchClass: "", label: "acknowledged",
-          value: (entry.acknowledged || 0).toLocaleString() },
         { swatchClass: "", label: "tests",
           value: entry.total_tests.toLocaleString() },
       ],
@@ -805,10 +814,13 @@ function renderCharts() {
   const scriptItems = summary.top_failing_scripts.slice(0, 7).map((entry) => ({
     label: entry.script,
     sublabel: entry.environment,
+    // The server ranks by the UNMUTED count; the muted failures of the
+    // script ride as a grey extension of the bar (WP-40).
     value: entry.failing,
+    extra: entry.muted || 0,
     tooltipRows: [
       { swatchClass: "swatch-fail", label: "failing tests",
-        value: entry.failing.toLocaleString() },
+        value: failingWithMuted(entry.failing, entry.muted) },
     ],
     onClick: () => openScriptInBrowse(entry),
   }));
@@ -839,7 +851,7 @@ function openScriptInBrowse(entry) {
 const QUEUE_TABS = [
   { id: "new_failures", label: "New failures" },
   { id: "still_failing", label: "Still failing" },
-  { id: "acknowledged", label: "Acknowledged" },
+  { id: "muted", label: "Muted" },
   { id: "fixed", label: "Fixed" },
   { id: "unexpected_passes", label: "Stale annotations" },
   { id: "not_run", label: "Not run" },
@@ -849,7 +861,7 @@ const QUEUE_TABS = [
 const QUEUE_EMPTY_TEXT = {
   new_failures: "No new failures — nothing broke that was passing before.",
   still_failing: "Nothing is stuck failing.",
-  acknowledged: "No acknowledged failures.",
+  muted: "Nothing is muted.",
   fixed: "No tests have gone from failing to passing.",
   unexpected_passes:
     "No stale annotations — every known failure still fails.",
@@ -1079,22 +1091,21 @@ function queueColumns(queueId) {
     },
   };
 
-  // Why a failure is not counted as failing, who owns it, and when the
-  // acknowledgment runs out. No sortKey: the summary carries no
-  // ordering by any of these.
-  const ackCol = {
-    header: "Acknowledged",
+  // Why a test is muted, who muted it, and when the mute runs out. No
+  // sortKey: the summary carries no ordering by any of these.
+  const muteCol = {
+    header: "Muted",
     cell: (entry) => {
       const cell = el("td", "wrap comment-cell");
-      const ack = entry.acknowledgment;
-      if (!ack) {
+      const mute = entry.mute;
+      if (!mute) {
         cell.appendChild(el("span", "muted", "—"));
         return cell;
       }
-      cell.appendChild(el("span", "comment-text", ack.reason));
+      cell.appendChild(el("span", "comment-text", mute.reason));
       cell.appendChild(el("span",
-        "row-sub" + (ack.live ? "" : " ack-expired"),
-        acknowledgmentDetail(ack)));
+        "row-sub" + (mute.live ? "" : " mute-expired"),
+        muteDetail(mute)));
       return cell;
     },
   };
@@ -1123,6 +1134,14 @@ function queueColumns(queueId) {
     cell: (entry) => resultTransition(
       el("td"), entry.prev_result, entry.result),
   };
+  // The Muted tab lists passing mutes as well as failing ones, so it
+  // needs the same was -> now column under the name a reader looks for.
+  const stateCol = {
+    header: "State",
+    sortKey: "result",
+    cell: (entry) => resultTransition(
+      el("td"), entry.prev_result, entry.result),
+  };
 
   switch (queueId) {
     case "new_failures":
@@ -1136,8 +1155,8 @@ function queueColumns(queueId) {
         when("Last pass", "last_pass_time"),
         commentCol,
         assigneeCol];
-    case "acknowledged":
-      return [testCol, ackCol, commentCol, assigneeCol];
+    case "muted":
+      return [testCol, stateCol, muteCol, commentCol, assigneeCol];
     case "fixed":
       // No "failing since" here: these tests are passing now, so the
       // summary reports no streak for them.
@@ -1194,8 +1213,8 @@ function reviewOptions() {
     staleBefore: state.summary ? state.summary.stale_before
       : (queue ? queue.stale_before : null),
     onChanged: () => refreshQueueCounts(),
-    // An acknowledgment moves a test between queues, not just a count.
-    onAcknowledged: () => refreshAll(),
+    // A mute moves a test between queues, not just a count.
+    onMuted: () => refreshAll(),
     onRetired: () => refreshSummary(),
   };
 }
@@ -1489,9 +1508,9 @@ function buildRow(row) {
     chip.title = "Known failure: " + row.known_failure_reason;
   }
   resultCell.appendChild(chip);
-  const ackTag = acknowledgedTag(row);
-  if (ackTag) {
-    resultCell.appendChild(ackTag);
+  const muteTag = mutedTag(row);
+  if (muteTag) {
+    resultCell.appendChild(muteTag);
   }
   tr.appendChild(resultCell);
 
