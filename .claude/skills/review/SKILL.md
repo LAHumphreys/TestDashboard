@@ -5,7 +5,19 @@ description: The review before a commit. Spawns a Sonnet fresh-eyes reviewer wit
 
 # /review <ledger slug>
 
-Runs after `/verify` is green, before the commit. Three passes, in order.
+Runs after `/verify` is green, before the commit. Three passes, in order,
+preceded on the trigger paths by the performance pass.
+
+## 0. The performance pass (trigger paths only; round 2)
+
+If the diff touches `testboard/storage.py`, `testboard/api.py`, the push
+path or anything on a page's first paint, or the main session asks for it,
+spawn `performance-engineer` with the brief's Performance impact answer,
+the base and head commits and the worktree path. It runs the cold,
+in-process, alternated A/B against the production-scale seed and reports
+against the Known slow table. A regression goes back to the implementer
+before anything else is reviewed. A diff off those paths whose brief says
+"none, and here is why" skips this pass: light changes are not held up.
 
 ## 1. Fresh eyes (Sonnet, never the implementer)
 

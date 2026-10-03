@@ -44,6 +44,7 @@ second was reviewing what a cheaper implementer had under-polished.
 | Main session | Fable | Specs, briefs, reviews, commits, drops, `CLAUDE.md`, `PROCESS.md`, `.claude/`, the `docs/` state files, git and PRs | Edits a file under `testboard/`, `static/`, `tests/`, `tools/`, `clients/`, `feeder/` |
 | `backend-engineer` | Opus | `testboard/`, `tools/`, `clients/`, `feeder/`, the two `run_*.py`, `tests/` except the frontend guards, the runbook, the feeder template, the registry row it claims | Writes frontend; weakens a guard; adds a host dependency; edits `MIGRATIONS[0]`; commits |
 | `ui-engineer` | Opus | `static/`, `tests/test_frontend_calls.py`; may edit `whatsnew.html` but never adds a release section | Writes backend; blocks the progressive load; puts a user string through `innerHTML`; commits |
+| `performance-engineer` (round 2) | Opus | The design pass and the measured A/B pass on the trigger paths; `tools/dev/perf/` and the Known slow baseline | Edits product code; runs on a light change off the trigger paths |
 | Fresh-eyes reviewer | Sonnet, spawned by `/review` | A diff against its acceptance list, then the mechanical sweep, then the publication gate's judgement pass | Edits anything |
 | Recon and sweeps | Sonnet (`Explore`, `general-purpose`) | Reading, measuring, drafting a docs section into a ledger | Edits repo code |
 
@@ -67,6 +68,15 @@ One item is one brief plus one ledger, one fresh agent, one commit. A new
 request is a fresh spawn; `SendMessage` continues only judgement that lives in
 an agent's context, such as a review finding going back to its implementer.
 Hand off at durable artefacts, never mid-build; there is no turn budget.
+
+### The performance pass, and light changes
+
+The performance pass runs only when a change touches `testboard/storage.py`,
+`testboard/api.py`, the push path, or anything on a page's first paint, or
+when the main session calls it on judgement. A change whose brief answers
+Performance impact with "none, and here is why" and touches none of those
+paths goes straight to fresh-eyes review: **light changes with obviously no
+performance impact are never held up by process.**
 
 ### Worktrees and databases
 
@@ -155,7 +165,7 @@ onboarding an agent needs after a reinstall lives in its definition and in
 | `/handover` | Rewrites `docs/SESSION_HANDOVER.md`; refuses to append |
 | `docs/UPGRADE_PLAN_STATUS.md` | The record: what was done, measured and decided, including design-review rounds |
 | `.claude/agent-memory/<agent>/` | What an agent learned since its definition was written; never state; gitignored |
-| Round 2 adds | `/perf-ab` (cold, in-process, alternated A/B of two trees), `/drop`, `tools/dev/` (the DOM-shim net, seeders, A/B runner, the gate's scanner) |
+| Round 2 adds | `performance-engineer` and its `/perf-ab` (cold, in-process, alternated A/B of two trees), `/drop`, `tools/dev/` (the DOM-shim net, seeders, A/B runner, the gate's scanner) |
 | Round 3 adds | `/overnight`: the unattended stage loop with a cron heartbeat armed before the first spawn |
 
 ## §8 How to spot the process not working
@@ -213,6 +223,15 @@ Dated, newest last, each with the incident behind it. Append only.
   "Responsiveness is a top priority", a Performance impact heading in the
   brief template, a section in each agent definition, and a line in
   `/review`'s sweep.
+
+- **2026-10-03, evening.** The owner proposed a dedicated performance
+  engineer: a design pass and a measured A/B pass in its own context,
+  owning the harness, so the implementers stay focused while staying
+  conscious of cost. Agreed, with three pushbacks accepted: the
+  implementers keep the design-time duty; the pass runs on a path trigger,
+  not by default, so light changes with obviously no performance impact
+  are never held up; it is a reviewer with an instrument, not a third
+  implementer. D14 in the design doc; built in round 2.
 
 ## Maintaining this document
 

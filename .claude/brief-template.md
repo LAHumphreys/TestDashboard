@@ -29,6 +29,10 @@ it is built: which endpoints or pages it touches, whether it adds a query,
 join, pass, request or render work, and how the cost is kept minimal. "none,
 and here is why" is an acceptable answer; a blank is not. The report must
 return the measured before/after for every endpoint or page named here.
+"none, and here is why" off the trigger paths (`storage.py`, `api.py`, the
+push path, first paint) means no performance pass: light changes are not
+held up. On the trigger paths the performance engineer reviews this
+heading before you start and measures the result before fresh-eyes review.
 
 ## Worktree
 - Path: `<worktree path>`

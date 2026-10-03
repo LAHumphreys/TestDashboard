@@ -48,6 +48,7 @@ state, rewritten rather than appended. Then, as needed:
 |---|---|
 | `testboard/`, `tools/`, `clients/`, `feeder/`, `run_server.py`, `run_feeder.py`, `tests/` except `test_frontend_calls.py`, `docs/MARIADB_MIGRATION.md`, `docs/FEEDER_TEMPLATE.md` | `backend-engineer` (Opus) |
 | `static/`, `tests/test_frontend_calls.py` | `ui-engineer` (Opus) |
+| `tools/dev/perf/` and the Known slow baseline | `performance-engineer` (Opus, round 2): reviews cost at design time and measures the A/B on the trigger paths; never edits product code |
 | `CLAUDE.md`, `PROCESS.md`, `.claude/`, the `docs/` state files (handover, log, drops, design), git, PRs, drops | main session |
 
 A change that spans both layers is two briefs against an agreed JSON contract.
@@ -93,6 +94,8 @@ is **flagged in the brief's Performance impact section and in the report**,
 and designed to minimise that cost where it cannot be avoided. A regression
 against the handover's "Known slow" table or a cache-guard test is a finding
 that blocks the commit until it is explained and accepted by the owner.
+The performance pass (`PROCESS.md` §3) runs only on the trigger paths; a
+light change with obviously no performance impact is never held up by it.
 
 ## Five rules that have each cost a day
 

@@ -278,6 +278,40 @@ Decided in the same breath: the sibling project is the owner's private repo
 and is never named in tracked text; its name is on the gate's term list and
 every published copy says "a sibling project".
 
+### 3.10 A performance engineer
+
+Added 2026-10-03 at the owner's suggestion, with the pushbacks agreed. The
+evidence: the one real regression in the WP-40 build was caught by an A/B
+agent working in its own context, not by the implementer and not by review
+by diff. An implementer measuring its own design has the blind spot a
+reviewer exists to cover; "never self-certifies" applies to performance too.
+
+`performance-engineer`, Opus, with memory, three jobs, no product code:
+
+- **Design pass**, before implementation: reads the brief or design doc and
+  answers in a few lines what the change will cost, where, and whether a
+  cheaper shape exists.
+- **Measured pass**, after implementation and before fresh-eyes review: the
+  cold, in-process, alternated A/B of the implementer's tree against the
+  base on the production-scale seed, reported against the Known slow table.
+  The implementer's own numbers are fast feedback; these are the ones that
+  count. A regression is a finding sent back to the implementer.
+- **Owns the instrument**: `tools/dev/perf/` (the A/B runner, the seeders,
+  the recipe) and the Known slow baseline in the handover. `/perf-ab` is its
+  command.
+
+The performance pass runs only when a change touches `testboard/storage.py`,
+`testboard/api.py`, the push path, or anything on a page's first paint, or
+when the main session calls it on judgement. A change whose brief answers
+Performance impact with "none, and here is why" and touches none of those
+paths goes straight to fresh-eyes review: **light changes with obviously no
+performance impact are never held up by process.**
+
+The implementers keep their design-time duty (§3.9's Performance impact
+heading); the performance engineer is the test, not the designer. It is a
+reviewer with an instrument, not a third implementer; D3 stands. Built in
+round 2 with `/perf-ab` and `tools/dev/`.
+
 ## §4 Decisions, as positions for the owner
 
 Each is written as the position I recommend; mark it `agree` or overwrite it.
@@ -333,6 +367,13 @@ Each is written as the position I recommend; mark it `agree` or overwrite it.
   `/drop` and `/handover`. the owner's request of 2026-10-03: the repo is public and
   the handover, log, drop notes and commit messages are where internal lessons
   would leak. Nothing checks today. [owner: ]
+
+- **D14. A dedicated `performance-engineer`** (§3.10): design pass on
+  trigger, measured A/B pass before fresh-eyes review, owner of the perf
+  harness and the Known slow baseline; never edits product code; never
+  runs on a light change whose brief says "none, and here is why" off the
+  trigger paths. The owner's proposal of 2026-10-03, with the pushbacks
+  agreed. [owner: agree, 2026-10-03]
 
 ## §5 Open questions — answered 2026-10-03
 
