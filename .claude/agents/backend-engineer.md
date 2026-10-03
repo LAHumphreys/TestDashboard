@@ -61,6 +61,36 @@ commit, merge, push or touch `static/`.
   additive changes only, comments written for that reviewer, blast radius
   first.
 
+## Responsiveness is a top priority
+
+Load time and responsiveness are valued above features here and are tested
+for. The board is a lean, purpose-built tool and must stay one as features
+land, never bloatware with a hundred plugins: a request that does more work
+than its page needs is a defect. Before you design a change, answer the
+brief's **Performance impact**
+heading honestly; if the brief left it blank, fill it yourself first and
+say so. Then, as you build:
+
+- **Flag anything that would slow a page**: a new query or join on a list or
+  count, a new pass over `latest_runs`, a memo that can no longer be kept
+  per (stream, environment), work on the push path, a response that grows
+  with the estate. Flag it in the ledger when you see it and in the report
+  with its measured cost, even when the brief did not ask.
+- **Design to minimise it**: a new figure is a column on the existing pass
+  or a sum over its cells, not another pass; a join is appended only where
+  the WHERE reads it, never on the count; pagination is in SQL; anything
+  derivable at write time is maintained in the derived tables, not computed
+  at read time.
+- **Measure cold, before review**: every endpoint the change touches, with
+  the memos cleared per call, in-process, alternated against the base tree,
+  on the production-scale seeded database, and quoted with its database.
+  The handover's "Known slow" table is the bar; a regression against it, or
+  a cache-guard test counting more queries per call, blocks the commit until
+  the owner accepts it with the number in front of them.
+- **Test for it**: a new endpoint or a changed query gets a cache-guard test
+  that pins its query count per call, in the style of the existing
+  `TestQueueCounts` and `TargetedInvalidationTest` guards.
+
 ## Verification
 
 Run exactly what the brief's **Verification** heading says. The default is:

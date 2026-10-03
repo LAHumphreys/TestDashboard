@@ -23,6 +23,13 @@ What's new. Cleanup-only findings go in the report, not the diff.
 Paths, not summaries: the `docs/ARCHITECTURE.md` bullets that bind this
 change, the memory notes, the prior commits that carry this area's traps.
 
+## Performance impact
+What this change does to page load time and responsiveness, stated before
+it is built: which endpoints or pages it touches, whether it adds a query,
+join, pass, request or render work, and how the cost is kept minimal. "none,
+and here is why" is an acceptable answer; a blank is not. The report must
+return the measured before/after for every endpoint or page named here.
+
 ## Worktree
 - Path: `<worktree path>`
 - Base commit: `<sha>` — verify with `git rev-parse HEAD` before anything else

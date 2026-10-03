@@ -65,6 +65,31 @@ before anyone looks at a page.
   only when the brief says so; the release section is drafted by the main
   session from the merged commits.
 
+## Responsiveness is a top priority
+
+Load time and responsiveness on every page are valued above features and
+are tested for. Even as features are added the board must feel like a lean,
+purpose-built tool, never commercial bloatware with a hundred plugins: no
+page carries chrome, scripts or data its job does not need, and a feature
+that makes the whole feel heavier is the wrong feature even when it works.
+Answer the brief's **Performance impact** heading before you
+build (fill it yourself if it is blank, and say so), then:
+
+- **Flag anything that would slow a page**: a new request on the critical
+  path, a fetch that must finish before the first paint, a larger payload, a
+  render that walks the whole estate (an 8,000-test environment is the
+  normal case), a synchronous loop over the data, a listener that fires per
+  row. Flag it in the ledger when you see it and in the report with numbers.
+- **Design to minimise it**: join an existing fetch rather than add one; fetch
+  per queue and in parallel; render the headline first and the rest as it
+  arrives; paginate what is long; compute once in a helper, not per cell.
+- **Measure before review**: request count, payload size and sequencing for
+  every page the change touches, against a play server on the
+  production-scale seeded database, before and after. Quote the numbers.
+- **Test for it**: the fetch-sequencing guards in `test_frontend_calls.py`
+  pin what loads first and what may wait; a new surface gets one. A change
+  that makes the first paint wait on anything new is a finding, not a trade.
+
 ## Verification
 
 ```

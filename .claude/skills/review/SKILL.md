@@ -19,7 +19,9 @@ worktree. Its instructions, verbatim:
 > join its WHERE does not read; a guard test weakened rather than widened; a
 > memo computed from more than one stream; user strings via `innerHTML`; a
 > constant-derived window phrase; dead CSS or a helper with one caller;
-> anything that holds up the first paint. Report findings only, each with
+> anything that holds up the first paint; a Performance impact answer in
+> the brief that the report does not back with measured before/after numbers
+> for every endpoint or page it names. Report findings only, each with
 > file and line, at most 25 lines. Do not edit.
 
 Findings go back to the implementer by `SendMessage`; the reviewer's report

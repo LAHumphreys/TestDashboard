@@ -16,6 +16,13 @@ Three goals, in priority order:
    build-against-mainline history, the comparison tool) must be a click away
    and complete. The board is a purpose-built tool, not the driver of their
    day. Every other goal serves this one.
+0b. **Responsiveness, and staying lean.** Page load time and responsiveness
+   throughout the app are a top priority, valued above features and tested
+   for. Even as features land the board stays a lean, purpose-built tool,
+   never commercial bloatware with a hundred plugins installed. A change
+   that would slow anything is flagged at design time (the brief's
+   Performance impact section), designed to minimise the cost, measured
+   cold before review, and reported with numbers. Regressions block.
 1. **Quality through specialists.** Each layer of the code has one implementer
    that reads only that layer's traps on spawn, writes the code and its tests,
    and verifies on both backends. No rule may trade output quality for tokens.
@@ -198,6 +205,14 @@ Dated, newest last, each with the incident behind it. Append only.
   overshot to "nothing after triage"; both were wrong. Now §1 goal 0, `CLAUDE.md` "Who the board is for", and
   the first line of the ui-engineer's bar; the word "tester" is gone from
   every process file.
+
+- **2026-10-03, later still.** The owner asked for a strong guide to both
+  agents that load times and responsiveness throughout the app are a top
+  priority, tested for, with anything that would hurt them flagged at design
+  time and designed to minimise the cost. Now §1 goal 0b, `CLAUDE.md`
+  "Responsiveness is a top priority", a Performance impact heading in the
+  brief template, a section in each agent definition, and a line in
+  `/review`'s sweep.
 
 ## Maintaining this document
 

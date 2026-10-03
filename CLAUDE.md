@@ -78,6 +78,22 @@ sacrificial database, reported in at most 25 lines. The rituals are skills:
 - Ops: `tools/drop_environment.py` (`--dry-run` first), `tools/add_site_note.py`, `tools/upgrade_mariadb_schema.py` (runbook §G).
 - **Never against the repo-root `testboard.db`** for anything that migrates or writes: copy it to a temp directory first. Opening it with current code migrates it.
 
+## Responsiveness is a top priority
+
+Page load time and responsiveness everywhere in the app are valued above
+features and are **tested for, not assumed**. Even as features are added the
+board must stay a lean, purpose-built tool, never commercial bloatware with a
+hundred plugins installed: every page does one job quickly, and a feature
+that would make the whole feel heavier is the wrong feature even when it
+works. Every change is designed with
+its cost in mind, measured cold before review, and its effect reported with
+numbers. A change that would slow a page, add a request to the critical path,
+add a query or a join or a pass to an endpoint, or add work to the push path
+is **flagged in the brief's Performance impact section and in the report**,
+and designed to minimise that cost where it cannot be avoided. A regression
+against the handover's "Known slow" table or a cache-guard test is a finding
+that blocks the commit until it is explained and accepted by the owner.
+
 ## Five rules that have each cost a day
 
 - **Measure, do not estimate.** Every performance or migration claim has a number behind it and says which database it was taken on. Measure cold, in-process and alternated; the repo-root `testboard.db` is generated dev data, roughly a quarter of production's size, and is never called "production".
