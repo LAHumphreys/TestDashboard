@@ -9,10 +9,10 @@ python tools/dev/perf/seed.py --out <scratch>/perf.db            # ~75 s, ~95 MB
 python tools/dev/perf/ab.py --base <base-sha> --head <head-sha> --db <scratch>/perf.db
 ```
 
-- `<scratch>` is a temp directory. Both scripts refuse a path inside a
-  checkout: the seed is scratch output, and the repo-root `testboard.db` is
-  dev data at about a quarter of production that current code migrates on
-  open.
+- `<scratch>` is a temp directory. `seed.py` refuses to write anywhere inside
+  a checkout: the seed is scratch output. `ab.py` refuses only the repo-root
+  `testboard.db` (dev data at about a quarter of production, which current
+  code migrates on open); any other `--db` is read and copied, never written.
 - Build the seed with the **base** tree (`--tree <base checkout>`, default:
   the checkout `seed.py` is in). Code refuses a database newer than itself;
   newer code migrates its own copy.

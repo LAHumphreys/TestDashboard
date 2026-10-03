@@ -77,6 +77,13 @@ FLOOR_MS = 1.0
 FLOOR_FRACTION = 0.05
 
 
+def ro_uri(path: str) -> str:
+    """A read-only SQLite URI for *path*, percent-quoted so a ``?`` or
+    ``#`` in it is part of the name rather than the query."""
+    return "file:{}?mode=ro".format(urllib.parse.quote(
+        os.path.abspath(path).replace("\\", "/"), safe="/:"))
+
+
 class Tree(NamedTuple):
     """One code tree loaded into this process."""
 
@@ -422,8 +429,7 @@ def derive_scope(path: str) -> Scope:
     largest build, and a clock one hour after the last run ended. Read
     from the copy, read-only; the same seed always gives the same scope.
     """
-    conn = sqlite3.connect("file:{}?mode=ro".format(
-        os.path.abspath(path).replace("\\", "/")), uri=True)
+    conn = sqlite3.connect(ro_uri(path), uri=True)
     try:
         row = conn.execute(
             "SELECT ep.product, l.environment, COUNT(*) FROM latest_runs l "

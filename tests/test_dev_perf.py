@@ -124,7 +124,7 @@ class RunnerTest(_SeededCase):
     def _run(self, head: str, pages: List[Tuple[str, str]]) -> object:
         scratch = tempfile.mkdtemp(dir=self.scratch)
         return ab.run(REPO_ROOT, head, self.db, scratch, ("A", "B"),
-                      pages=pages, calls=6, known=False)
+                      pages=pages, calls=8, known=False)
 
     def test_refuses_the_repo_root_database(self) -> None:
         with self.assertRaises(ValueError) as caught:
@@ -142,8 +142,10 @@ class RunnerTest(_SeededCase):
         self.assertTrue(rows["browse"].call.startswith("SLOWER"),
                         rows["browse"])
         self.assertGreater(rows["browse"].delta, 20.0)
-        self.assertFalse(rows["headline"].call.startswith("SLOWER"),
-                         rows["headline"])
+        # The plant does not leak into a row that never calls it. Not
+        # the verdict word: on a loaded machine an untouched row can be
+        # "SLOWER" by a millisecond; it cannot be by the plant's 25 ms.
+        self.assertLess(abs(rows["headline"].delta), 10.0, rows["headline"])
         # The caller's testboard is the one it had before the run.
         self.assertIs(sys.modules.get("testboard.storage"), before)
 

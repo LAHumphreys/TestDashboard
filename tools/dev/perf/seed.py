@@ -34,6 +34,7 @@ import os
 import random
 import sqlite3
 import sys
+import urllib.parse
 from typing import Dict, List, NamedTuple, Optional, Sequence, TextIO, Tuple
 
 #: Bump when the recipe changes, so a number can say which seed it is from.
@@ -59,6 +60,13 @@ ESTATE = [
 FULL_BUILD = "nightly/full"
 USERS = ["amy", "ben", "chen", "dana"]
 BATCH = 2000
+
+
+def ro_uri(path: str) -> str:
+    """A read-only SQLite URI for *path*, percent-quoted so a ``?`` or
+    ``#`` in it is part of the name rather than the query."""
+    return "file:{}?mode=ro".format(urllib.parse.quote(
+        os.path.abspath(path).replace("\\", "/"), safe="/:"))
 
 
 class TestSpec(NamedTuple):
@@ -332,8 +340,7 @@ def fingerprint(path: str) -> Tuple[Dict[str, int], str]:
     What the determinism test compares: two builds of the same recipe
     must agree on both.
     """
-    conn = sqlite3.connect("file:{}?mode=ro".format(
-        os.path.abspath(path).replace("\\", "/")), uri=True)
+    conn = sqlite3.connect(ro_uri(path), uri=True)
     try:
         counts = {}  # type: Dict[str, int]
         for (table,) in conn.execute(
