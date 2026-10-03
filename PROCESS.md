@@ -61,7 +61,7 @@ the main session and delegate only drafting.
 |---|---|
 | Question | Answered from the code; no agent |
 | Small change | `/brief`, spawn in a worktree, report, `/verify`, `/review`, commit, log entry |
-| Large change | Design doc in `docs/design/`, review rounds, sizing, then `/overnight` (round 3) or a run of the small path |
+| Large change | `/design-review`: discuss §0, the owning agents write round 0, the owner reviews, comments captured verbatim each round, sizing, then `/overnight` (round 3) or a run of the small path |
 | Drop | `/drop` (round 2), PR, green, squash, deploy, `/handover` with the deploy answers |
 
 One item is one brief plus one ledger, one fresh agent, one commit. A new
@@ -93,8 +93,10 @@ other and never commit.
 - Say what must be true when it is done, not how to do it; the brief carries
   intent and the agent reads the code.
 - A question and a change are different requests; ask them separately.
-- A design doc goes through `docs/design/` with a round number; comments on
-  it are captured verbatim into the file before anything is rewritten.
+- Anything larger than one brief starts with `/design-review <what you
+  want>`: a discussion until §0 is agreed, then the agents write round 0.
+  Comments on a round are captured verbatim into the file before anything
+  is rewritten.
 - "Quick" is not a size class. The one-line change goes through the same path;
   the path is cheap when the change is.
 
@@ -158,6 +160,7 @@ onboarding an agent needs after a reinstall lives in its definition and in
 
 | Instrument | What it is for |
 |---|---|
+| `/design-review` | Starts and runs a design arc: discussion to §0, round 0 by the owning agents, verbatim capture of the owner's comments each round, sizing at the close |
 | `.claude/brief-template.md` | Every hand-off; `/brief` fills it and shows it before spawning |
 | `.claude/work/TEMPLATE.md` | The ledger: restart point for a killed agent; deleted at commit |
 | `/verify` | The gate before review: the suite on SQLite, then the MariaDB leg with the brief's database; quiet output |
@@ -232,6 +235,13 @@ Dated, newest last, each with the incident behind it. Append only.
   not by default, so light changes with obviously no performance impact
   are never held up; it is a reviewer with an instrument, not a third
   implementer. D14 in the design doc; built in round 2.
+
+- **2026-10-03, night.** The owner asked where `/design-review` was: D12
+  accepted it and round 1 shipped without it. Added as the fifth prose
+  skill: a discussion to §0 first, round 0 written by the owning agents
+  (payloads and rows for backend, text wireframes for UI), the owner's
+  comments captured verbatim each round, the status log as the record, a
+  sizing pass at the close.
 
 ## Maintaining this document
 

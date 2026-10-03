@@ -419,7 +419,9 @@ Each is written as the position I recommend; mark it `agree` or overwrite it.
    commit, no code change, verify skipped.
 2. The two agent definitions and their seeded memory; `brief-template.md`;
    `work/TEMPLATE.md`.
-3. `/brief`, `/verify`, `/review`, `/handover`: prose skills, same day.
+3. `/design-review`, `/brief`, `/verify`, `/review`, `/handover`: prose skills,
+   same day. (`/design-review` was missed in the first build of round 1 and
+   added the same evening.)
 4. `/perf-ab` and `/drop`: the two with scripts; `/perf-ab` needs the
    seeded-database recipe written down.
 5. Two supervised packages through the full path (a candidate: the +8 ms

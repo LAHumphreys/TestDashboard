@@ -56,7 +56,8 @@ A change that spans both layers is two briefs against an agreed JSON contract.
 edit repo code. Every hand-off is a brief from `.claude/brief-template.md`
 with a ledger in `.claude/work/`, run in its own worktree with its own
 sacrificial database, reported in at most 25 lines. The rituals are skills:
-`/brief`, `/verify`, `/review`, `/handover`.
+`/design-review` to start anything larger than one brief, then `/brief`,
+`/verify`, `/review`, `/handover`.
 
 ## Hard constraints (apply to all code)
 
