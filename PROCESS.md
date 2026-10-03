@@ -275,6 +275,12 @@ Dated, newest last, each with the incident behind it. Append only.
   cap (one line under 160 characters, superseded notes deleted) is in every
   agent definition.
 
+- **2026-10-03, last.** `/verify` as first written piped the suite through
+  `tail`; a test printing to stdout at exit buried the summary and the
+  exit code was `tail`'s, so a MariaDB-variant run had to be repeated to
+  learn whether it passed. The skill now captures to a file, reads the
+  suite's own exit code and greps the summary.
+
 ## Maintaining this document
 
 A rule without a dated entry in §9 is a preference. A change to any agent

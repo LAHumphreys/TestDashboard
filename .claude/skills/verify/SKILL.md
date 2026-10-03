@@ -8,10 +8,15 @@ description: The gate before review and before any commit. Runs the suite on SQL
 Run in the main checkout (or the worktree under review, labelled as such):
 
 ```
-python -m unittest discover 2>&1 | tail -3
-TESTBOARD_TEST_DB_CNF=<absolute path to the main session's sacrificial cnf> python -m unittest discover 2>&1 | tail -3
+python -m unittest discover > <scratch>/sqlite.log 2>&1; echo "exit $?"
+TESTBOARD_TEST_DB_CNF=<absolute path to the main session's sacrificial cnf> python -m unittest discover > <scratch>/mariadb.log 2>&1; echo "exit $?"
+grep -E "^Ran |^OK|^FAILED" <scratch>/sqlite.log <scratch>/mariadb.log
 ```
 
+- Capture to a file and read the exit code of `unittest` itself. Never pipe
+  the run through `tail`: a test that prints to stdout at exit buries the
+  summary, and the pipeline's exit code is `tail`'s, not the suite's. That
+  happened on the process PR and cost a re-run.
 - Report the two `Ran N tests` lines and `OK`/`FAILED`, then only the failing
   test names with their first assertion line. Never paste the full output.
 - The expected SQLite count is in `docs/SESSION_HANDOVER.md` ("First ten
