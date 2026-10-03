@@ -12,13 +12,17 @@ lines, 2,640 tests (3,626 with the MariaDB variants active), schema at
 migration 11. **Production serves MariaDB** and is the only deployment since
 2026-10-01. SQLite and MariaDB are equal, permanently supported backends.
 
-**Who the board is for.** Its users are developers maintaining products, reviewing
-the nightly runs of their automated tests. The board exists so that keeping the
-tests in good shape costs them as little time as possible and they can get back
-to building features. When everything is green they should need no more than a
-glance; when something breaks they must be able to review it, comment on it and
-assign it out quickly. It is not a tool they live in all day, and no design
-decision may assume they do.
+**Who the board is for.** Its users are developers (and their managers)
+maintaining products, reviewing the nightly runs of their automated tests on
+mainline and on their release builds. The board exists so that keeping the
+tests in good shape costs them as little of their day as possible. When
+everything is green a glance is enough. When something breaks they triage it:
+review, comment, assign. When triage is not enough the depth is there:
+captured output, a test's run history with the output of each run, a build's
+history against mainline's, and the comparison tool for what a branch has
+gained or is missing. It is a tool with a purpose, reached for when needed; it
+is not the main driver of a developer's day, and no design decision may assume
+it is.
 
 **Start every session by reading `docs/SESSION_HANDOVER.md`**: one screen of
 state, rewritten rather than appended. Then, as needed:

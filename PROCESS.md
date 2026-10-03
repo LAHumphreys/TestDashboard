@@ -10,8 +10,12 @@ those changes, this file changes in the same commit**, with a dated line in
 Three goals, in priority order:
 
 0. **The users' time.** They are developers maintaining products, reviewing
-   nightly test runs. Green should cost them a glance; red should cost them
-   one quick review, comment or assignment. Every other goal serves this one.
+   nightly test runs on mainline and release builds. Green should cost a
+   glance; red should cost a quick triage (review, comment, assign); and when
+   a failure needs investigating, the depth (captured output, run history,
+   build-against-mainline history, the comparison tool) must be a click away
+   and complete. The board is a purpose-built tool, not the driver of their
+   day. Every other goal serves this one.
 1. **Quality through specialists.** Each layer of the code has one implementer
    that reads only that layer's traps on spawn, writes the code and its tests,
    and verifies on both backends. No rule may trade output quality for tokens.
@@ -187,9 +191,11 @@ Dated, newest last, each with the incident behind it. Append only.
 
 - **2026-10-03, later.** The owner corrected who the board is for: developers
   maintaining products, reviewing nightly test runs, not "testers". Green
-  costs a glance, red costs one quick review, comment or assignment; nobody
-  lives in it. The round-1 ui-engineer definition had said the opposite
-  ("read all day"). Now §1 goal 0, `CLAUDE.md` "Who the board is for", and
+  costs a glance, red a quick triage, and an investigation has the depth it
+  needs (output, run history, build versus mainline, the comparison tool);
+  the board is purpose-built, not the driver of their day. The round-1
+  ui-engineer definition had said "read all day", and the first correction
+  overshot to "nothing after triage"; both were wrong. Now §1 goal 0, `CLAUDE.md` "Who the board is for", and
   the first line of the ui-engineer's bar; the word "tester" is gone from
   every process file.
 
