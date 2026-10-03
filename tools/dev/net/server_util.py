@@ -6,6 +6,7 @@ gives a clean shutdown. Never touches the repo-root testboard.db.
 """
 import http.client
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -16,6 +17,20 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 PORT = 8931
 HOST = "127.0.0.1"
+
+
+def free_port() -> int:
+    """A port nothing is listening on: bind to 0 and read it back.
+
+    A fixed port would let a stray server already on it answer the
+    readiness probe and be tested in place of the copy.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((HOST, 0))
+        return int(probe.getsockname()[1])
+    finally:
+        probe.close()
 
 
 class NetServer(object):

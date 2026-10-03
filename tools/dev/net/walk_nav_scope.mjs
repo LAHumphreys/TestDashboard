@@ -15,11 +15,11 @@
  * re-asserted here so a future edit that quietly widens or narrows the
  * list is caught).
  *
- * Run: node tools/dev/net/walk_nav_scope.mjs   (server on 8931)
+ * Run: node tools/dev/net/walk_nav_scope.mjs   (server on $NET_PORT, default 8931)
  */
 import { installDom, Element } from "./domshim.mjs";
 
-const BASE = "http://127.0.0.1:8931";
+const BASE = "http://127.0.0.1:" + (process.env.NET_PORT || "8931");
 let failures = 0;
 function check(condition, label) {
   if (condition) {

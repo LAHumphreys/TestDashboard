@@ -3,7 +3,8 @@
 standing NUL-byte check and one extra "leftover kind" check the net
 found while orienting (see LeftoverKindCheck below).
 
-Pure stdlib, talks to the live scratch server on 8931 (see run_net.py). Each check
+Pure stdlib, talks to the live scratch server on NET_PORT (set by
+run_net.py; default 8931). Each check
 function returns a list of failure dicts: {"check": name, "detail": str}.
 Called from run_net.py; nothing here boots a server or seeds data.
 """
@@ -13,8 +14,13 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-PORT = 8931
-BASE = "http://127.0.0.1:%d" % PORT
+DEFAULT_PORT = "8931"
+
+
+def base_url() -> str:
+    """The net server's origin; read per call, since run_net.py sets
+    NET_PORT after this module is imported."""
+    return "http://127.0.0.1:%s" % os.environ.get("NET_PORT", DEFAULT_PORT)
 
 #: The checkout this file lives in (tools/dev/net/ -> root).
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -25,7 +31,7 @@ def _call(path: str, data: Any = None, method: Optional[str] = None
           ) -> Tuple[int, Any]:
     """(status, decoded JSON body); Any is the JSON boundary."""
     req = urllib.request.Request(
-        BASE + path,
+        base_url() + path,
         data=json.dumps(data).encode() if data is not None else None,
         headers={"Content-Type": "application/json"},
         method=method or ("POST" if data is not None else "GET"),

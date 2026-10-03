@@ -21,11 +21,11 @@
  * so per WP-24 being a declared pure refactor (no URL shape change) the
  * same script should pass unchanged after WP-24 lands too.
  *
- * Run: node tools/dev/net/walk_index_scope.mjs   (server on 8931)
+ * Run: node tools/dev/net/walk_index_scope.mjs   (server on $NET_PORT, default 8931)
  */
 import { installDom } from "./domshim.mjs";
 
-const BASE = "http://127.0.0.1:8931";
+const BASE = "http://127.0.0.1:" + (process.env.NET_PORT || "8931");
 // WP-28: NET_URL_PREFIX (set by run_net.py's --url-prefix) is the path
 // prefix this walk loads every page THROUGH, e.g. "testboard" ->
 // PAGE_BASE "http://127.0.0.1:8931/testboard/". Empty (the default) ->

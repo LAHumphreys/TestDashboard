@@ -103,12 +103,22 @@ class MessageModeTest(_TempDirCase):
             "Co-Authored-By: Claude <%s>\n" % ALLOWED_EMAIL)
         self.assertEqual((code, out), (0, ""))
 
-    def test_git_commentary_and_the_verbose_diff_are_not_scanned(self) -> None:
-        code, _ = self.gate_message(
-            "Clean subject\n# On branch zebracorn\n"
+    def test_hash_lines_are_scanned(self) -> None:
+        """git commit -m / -F keep '#' lines (whitespace cleanup)."""
+        code, out = self.gate_message(
+            "Clean subject\n\n# Reported by Zebracorn\n")
+        self.assertEqual(code, 1, out)
+        self.assertIn("COMMIT_EDITMSG:3: Zebracorn", out)
+        code, out = self.gate_message("Closes #12 for zebracorn\n")
+        self.assertEqual(code, 1, out)
+
+    def test_the_verbose_diff_below_the_scissors_is_not_scanned(self) -> None:
+        code, out = self.gate_message(
+            "Clean subject\n"
             "# ------------------------ >8 ------------------------\n"
-            "+ a diff line naming %s\n" % PLANTED_EMAIL)
-        self.assertEqual(code, 0)
+            "# Do not modify or remove the line above.\n"
+            "+ a diff line naming %s and zebracorn\n" % PLANTED_EMAIL)
+        self.assertEqual((code, out), (0, ""))
 
     def test_an_impossible_octet_is_not_an_address(self) -> None:
         code, _ = self.gate_message("see 300.1.2.3 and 1.2.3\n")

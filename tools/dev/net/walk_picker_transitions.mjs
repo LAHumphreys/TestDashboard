@@ -5,12 +5,12 @@
  * mainline choice on Compare-to is never ambiguous with absence
  * (SCOPED_URLS_PLAN.md §1 bug #6/#7 -- exactly what this walk targets).
  *
- * Run: node tools/dev/net/walk_picker_transitions.mjs   (server on 8931)
+ * Run: node tools/dev/net/walk_picker_transitions.mjs   (server on $NET_PORT, default 8931)
  */
 import { installDom } from "./domshim.mjs";
 import { readFileSync } from "node:fs";
 
-const BASE = "http://127.0.0.1:8931";
+const BASE = "http://127.0.0.1:" + (process.env.NET_PORT || "8931");
 // WP-28: see walk_index_scope.mjs's own comment on this same constant --
 // NET_URL_PREFIX (run_net.py's --url-prefix) is the prefix this walk
 // loads pages THROUGH; PAGE_BASE is what every relative href/fetch this

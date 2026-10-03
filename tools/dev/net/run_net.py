@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """The sanity net's one entry point.
 
-    python tools/dev/net/run_net.py [--base-db PATH] [--db existing.db] [--keep]
+    python tools/dev/net/run_net.py [--base-db PATH] [--db seeded.db] [--keep]
     python tools/dev/net/run_net.py --url-prefix testboard
 
 Copies the generated dev estate (default: the repo-root testboard.db) to
 a temp directory -- the original is never opened -- boots THIS
-checkout's server on port 8931 against the copy, seeds the
+checkout's server on a free port against the copy, seeds the
 demonstration estate, runs every API check (classes 3/4/5/6 plus two
 extra findings) and every DOM-shim walk (classes 1/2), tears the server
 down, and prints one PASS/FAIL summary line per check with one-line
@@ -81,6 +81,31 @@ def seed(db_path: Path) -> None:
         raise RuntimeError("seed script failed: %s" % addendum)
 
 
+def is_checkout(folder: str) -> bool:
+    """True for a testboard checkout root (or worktree root)."""
+    return (os.path.isfile(os.path.join(folder, "run_server.py"))
+            and os.path.isdir(os.path.join(folder, "testboard")))
+
+
+def check_db(path: str) -> None:
+    """Raise ValueError for a database the net must not serve from.
+
+    ``--db`` is opened by the net's server, and current code migrates
+    what it opens: the repo-root ``testboard.db`` of any checkout must
+    only ever be copied (``--base-db``), never served.
+    """
+    full = os.path.abspath(path)
+    if (os.path.basename(full) == "testboard.db"
+            and is_checkout(os.path.dirname(full))):
+        raise ValueError(
+            "refusing the repo-root testboard.db ({}): the net's server "
+            "would open and migrate it. Pass it as --base-db (copied, "
+            "never opened), or --db a seeded copy kept with --keep"
+            .format(full))
+    if not os.path.isfile(full):
+        raise ValueError("no database at {}".format(full))
+
+
 def find_node() -> Optional[str]:
     """The node executable, or None: node is optional dev tooling."""
     return shutil.which("node")
@@ -145,6 +170,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         os.environ.pop("NET_URL_PREFIX", None)
         print("URL prefix for this walk: none (bare paths)")
 
+    if args.db:
+        try:
+            check_db(args.db)
+        except ValueError as exc:
+            print("FATAL: %s" % exc)
+            return 2
+
     node = find_node()
     if node is None:
         print("SKIP: node is not on PATH, so the DOM-shim walks will not "
@@ -169,8 +201,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         shutil.copyfile(str(base_db), str(db_path))
 
     log_path = work_dir / "net_server.log"
-    server = server_util.NetServer(str(db_path), str(log_path))
-    print("Booting %s's server on :8931 against %s ..." % (REPO_ROOT, db_path))
+    port = server_util.free_port()
+    # The seeds, the API checks and the walks all read NET_PORT.
+    os.environ["NET_PORT"] = str(port)
+    server = server_util.NetServer(str(db_path), str(log_path), port=port)
+    print("Booting %s's server on :%d against %s ..."
+          % (REPO_ROOT, port, db_path))
     server.start()
     print("Server up. Log: %s" % log_path)
 

@@ -25,16 +25,21 @@ substitute for a browser.
 python tools/dev/net/run_net.py                      # copy testboard.db, seed, check
 python tools/dev/net/run_net.py --url-prefix testboard   # the same, pages under /testboard/
 python tools/dev/net/run_net.py --base-db PATH       # another generated estate
-python tools/dev/net/run_net.py --db seeded.db       # reuse a seeded copy, skip seeding
+python tools/dev/net/run_net.py --keep              # keep the seeded copy (path printed)
+python tools/dev/net/run_net.py --db <kept copy>    # reuse it, skip seeding
 ```
 
 Run it twice, with and without `--url-prefix`: the prefix run is the one
 that catches a relative link that resolves outside the prefix.
 
-The server listens on `127.0.0.1:8931`. The database is a **copy** in a
-temp directory; the source file is never opened (opening the repo-root
-`testboard.db` with current code would migrate it). The copy and the
-server log are removed on exit unless `--keep` is given. A run takes
+The server listens on a free port of `127.0.0.1`, picked per run and
+handed to the seeds, checks and walks as `NET_PORT`, so a stray server
+on a fixed port can never be tested in place of the copy. The database
+is a **copy** in a temp directory; the source file is never opened
+(opening the repo-root `testboard.db` with current code would migrate
+it). `--db` *is* opened by the server, so it refuses a `testboard.db`
+at a checkout root (`tests/test_dev_net.py`). The copy and the server
+log are removed on exit unless `--keep` is given. A run takes
 about a minute, most of it seeding.
 
 ## Seeding
@@ -64,4 +69,4 @@ Without it `run_net.py` prints a `SKIP` line, still runs every API
 check, and reports the walks as skipped rather than failed.
 
 Exit status: 0 when every check that ran passed, 1 on any failure, 2 when
-the base database is missing.
+the base database is missing or `--db` is refused.

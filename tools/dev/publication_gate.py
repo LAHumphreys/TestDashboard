@@ -207,19 +207,20 @@ def _read_text(path: str) -> str:
 
 
 def message_lines(text: str) -> List[Tuple[int, str]]:
-    """A commit message's lines that git will keep.
+    """A commit message's lines, up to git's ``--verbose`` scissors line.
 
-    Lines starting ``#`` are git's own commentary (branch name, file
-    list) and are stripped before the commit is made; everything from
-    the scissors line down is the ``--verbose`` diff, also stripped.
-    The diff's added lines are scanned by the ``pre-commit`` hook.
+    Only what git strips in EVERY cleanup mode is skipped: the scissors
+    line and the diff below it. Lines starting ``#`` are scanned:
+    ``git commit -m`` and ``-F`` use whitespace cleanup, which keeps
+    them, so ``# Reported by <name>`` would otherwise be published
+    unchecked. In editor mode they include git's own commentary (the
+    branch name), which is a false positive the author can reword, not
+    a hole. The diff's added lines are scanned by the ``pre-commit`` hook.
     """
     kept = []  # type: List[Tuple[int, str]]
     for number, line in enumerate(text.splitlines(), 1):
-        if line.startswith("#"):
-            if _SCISSORS in line:
-                break
-            continue
+        if line.startswith("#") and _SCISSORS in line:
+            break
         kept.append((number, line))
     return kept
 
