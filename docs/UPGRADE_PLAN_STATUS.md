@@ -4342,3 +4342,21 @@ publication gate (judgement pass now, a local scanner and hooks in round 2).
 Evidence the rules rest on is the 2026-10-01 build, listed in `PROCESS.md`
 §9. Nothing in shipped code changed; the suite was not run for this commit
 (docs and `.claude/` only), per `/verify`.
+
+## Process: built as one set, reviewed as a whole (2026-10-03, later)
+
+The staged rollout above was dropped the same day at the owner's direction;
+everything the review decided is in PR #16: `PROCESS.md`, the `CLAUDE.md`
+split, three agent definitions (a `performance-engineer` was added as D14,
+on a path trigger so light changes are never held up), eight skills, the
+publication gate's scanner and hooks, and `tools/dev/` with the promoted net
+and the performance harness. The two code pieces were the first briefs
+through the process; both had fresh-eyes reviews whose findings went back to
+the implementers. A fresh-eyes review of the process files against the
+fourteen decisions found the performance pass wired inconsistently; fixed to
+one order (`PROCESS.md` §3). Measured in the main checkout on the final tree:
+SQLite 2674 OK (skipped 1); with the MariaDB variants active 3660 OK
+(skipped 71). The harness's A/A baseline (perf-seed/1, SQLite): every Known
+slow row "same", half-band 10–14 ms on the 250–300 ms rows; these rows read
+2–4× the table's older dev-scale figures, so the table's database label
+changes when it is next updated from the harness.
