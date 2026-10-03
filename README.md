@@ -1552,7 +1552,7 @@ Match is exact and case-sensitive: `UNKNOWN` does not take `unknown` or
 The What's new page ships inside the build, so a deployment overwrites it. When
 something changes on the same morning that *isn't* testboard — the in-house
 reader, a rebuilt box, a renamed environment — it belongs on the same page
-under the same date, because a tester reading "what changed" does not care which
+under the same date, because a developer reading "what changed" does not care which
 repository it came from.
 
 ```
@@ -1577,14 +1577,14 @@ not testboard's data.
 
 A note is **published the moment it is written**, because the file is read per
 request. That is why `--edit` and `--remove` exist and address notes by the id
-`--list` prints: correcting a typo that every tester can already see must not
+`--list` prints: correcting a typo that every user can already see must not
 mean hand-editing JSON underneath a running server. A note dated where the
 build shipped no release notes gets its own section on the page, marked as
 coming from this site.
 
 A note whose date matches a release section appears inside it; every note is
 visibly attributed to the site rather than blended into testboard's own notes,
-because a tester who cannot tell "testboard changed" from "our environment
+because a developer who cannot tell "testboard changed" from "our environment
 changed" cannot tell who to ask about it.
 
 ### What the server is doing now — the Metrics page

@@ -9,6 +9,9 @@ those changes, this file changes in the same commit**, with a dated line in
 
 Three goals, in priority order:
 
+0. **The users' time.** They are developers maintaining products, reviewing
+   nightly test runs. Green should cost them a glance; red should cost them
+   one quick review, comment or assignment. Every other goal serves this one.
 1. **Quality through specialists.** Each layer of the code has one implementer
    that reads only that layer's traps on spawn, writes the code and its tests,
    and verifies on both backends. No rule may trade output quality for tokens.
@@ -80,8 +83,8 @@ Changes ship as a dated drop: batched, verified together, deployed as one
 group. Two documents, two readers, neither substitutes for the other.
 
 - **`static/whatsnew.html`** gets a dated section at the top (newest first),
-  written for a *tester*: what changed, where to find it, what it means for
-  them. Nothing user-visible ships without a line there, and nothing appears
+  written for a *developer who glances at the board*: what changed, where to
+  find it, what it means for them, in the fewest lines that say so. Nothing user-visible ships without a line there, and nothing appears
   there that is not in the build. Every section carries
   `data-drop-date="YYYY-MM-DD"` matching its heading; `DropDateTest` fails the
   build otherwise. `/drop` drafts it from the merged commits; the main session
@@ -154,7 +157,7 @@ onboarding an agent needs after a reinstall lives in its definition and in
 | A ledger outlived its commit | The item was never closed | Read it, close it or park it, delete it |
 | A guard test was edited to pass | A finding was weakened | Widen the scope instead, and say so in the commit |
 | Two agents edited one checkout | No worktree | Isolate, then reset each to its base |
-| A What's new line with nothing behind it | The note was written from the plan | Remove it; testers report its absence as a bug |
+| A What's new line with nothing behind it | The note was written from the plan | Remove it; users report its absence as a bug |
 
 ## §9 Decisions log
 
@@ -181,6 +184,14 @@ Dated, newest last, each with the incident behind it. Append only.
   definitions, the templates, four prose skills. Round 2: the gate's scanner
   and hooks, `tools/dev/`, `/perf-ab`, `/drop`, two supervised packages.
   Round 3: `/overnight`.
+
+- **2026-10-03, later.** The owner corrected who the board is for: developers
+  maintaining products, reviewing nightly test runs, not "testers". Green
+  costs a glance, red costs one quick review, comment or assignment; nobody
+  lives in it. The round-1 ui-engineer definition had said the opposite
+  ("read all day"). Now §1 goal 0, `CLAUDE.md` "Who the board is for", and
+  the first line of the ui-engineer's bar; the word "tester" is gone from
+  every process file.
 
 ## Maintaining this document
 

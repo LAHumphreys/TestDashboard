@@ -42,7 +42,7 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
    Then process round 2 (`PROCESS.md` §7): the publication-gate scanner and
    hooks, `tools/dev/`, `/perf-ab`, `/drop`, and two supervised packages.
 2. **Watch the first days of muting.** The log's WP-40 entries list six
-   recorded edges; the two a tester is likeliest to trip over: the Assigned
+   recorded edges; the two a user is likeliest to trip over: the Assigned
    and Muted tabs overlap (a mute assigns), and unassigning from mainline
    drops a build's mute of the same test. The "New failures" delta line
    does not add muted failures back. Change nothing until someone asks.
@@ -51,7 +51,7 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
    `master` too. A candidate for the next performance pass, with the
    "Known slow" table below.
 4. **Decide the Java client's fate** (PR #9), open since 2026-09-08.
-5. Then whatever the testers report.
+5. Then whatever the users report.
 
 ## Where the code is
 
@@ -69,7 +69,7 @@ keep it a mirror of `origin/master`, never commit to it.
 ## Needs a person, not a commit
 
 1. **Should there be a switch that turns the build delete off**, or anything
-   in front of it beyond a typed name? The testers' use will say.
+   in front of it beyond a typed name? The users' habits will say.
 2. **Build comments — the workshop the user offered:** mainline lists show a
    test's newest comment of any origin, unlabelled; deleting a build clears
    the tag on its comments; nothing carries from one build to the next of the

@@ -12,6 +12,14 @@ lines, 2,640 tests (3,626 with the MariaDB variants active), schema at
 migration 11. **Production serves MariaDB** and is the only deployment since
 2026-10-01. SQLite and MariaDB are equal, permanently supported backends.
 
+**Who the board is for.** Its users are developers maintaining products, reviewing
+the nightly runs of their automated tests. The board exists so that keeping the
+tests in good shape costs them as little time as possible and they can get back
+to building features. When everything is green they should need no more than a
+glance; when something breaks they must be able to review it, comment on it and
+assign it out quickly. It is not a tool they live in all day, and no design
+decision may assume they do.
+
 **Start every session by reading `docs/SESSION_HANDOVER.md`**: one screen of
 state, rewritten rather than appended. Then, as needed:
 
@@ -25,7 +33,7 @@ state, rewritten rather than appended. Then, as needed:
 | `docs/STREAMS_PLAN.md` | Products/streams decisions (§0) and cross-cutting rules (§6) |
 | `docs/FEEDER_TEMPLATE.md` | Frozen contract for a new product's feeder: additive changes only |
 | `docs/design/` | Design docs under review |
-| `static/whatsnew.html` | What the testers see. Every user-visible change has a line there; nothing is there that is not in the build |
+| `static/whatsnew.html` | What the users see. Every user-visible change has a line there; nothing is there that is not in the build |
 | `docs/BRIEF_*.md`, `docs/FEEDER_BRIEF.md` | Historical briefs. `FEEDER_BRIEF.md` is still the accurate reference for the one product on `run_feeder.py` |
 
 ## Who implements what — check the path before touching any file

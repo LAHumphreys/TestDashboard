@@ -5,8 +5,8 @@ uses this shape. Fill every heading; write "none" rather than omitting one.
 The brief carries intent; the agent reads the code.
 
 ## Goal
-One paragraph: what must be true when you are done, and why (the reason a
-tester or an operator would give).
+One paragraph: what must be true when you are done, and why: the reason a
+developer glancing at the board, or an operator deploying it, would give.
 
 ## Acceptance
 - [ ] concrete, checkable statements: behaviour, named tests, measured numbers

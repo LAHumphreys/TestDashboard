@@ -69,7 +69,7 @@ Two of those rows are the whole argument for D2 and D9.
 |---|---|---|---|---|
 | Main session | nowhere; it is the session | Fable | Specs, briefs, reviews, commits, drops, `CLAUDE.md`, `.claude/**`, the `docs/` state files, git | Edits a file under `testboard/`, `static/`, `tests/`, `tools/`, `clients/`, `feeder/` |
 | `backend-engineer` | `.claude/agents/` | Opus (D2) | `testboard/`, `tools/`, `clients/`, `feeder/`, `run_feeder.py`, `run_server.py`, `tests/` except `test_frontend_calls.py`, `docs/MARIADB_MIGRATION.md`, `docs/FEEDER_TEMPLATE.md`, the migration registry row it claims | Writes frontend; weakens a guard test; adds a host dependency; edits `MIGRATIONS[0]` |
-| `ui-engineer` | `.claude/agents/` | Opus (D2) | `static/**`, `tests/test_frontend_calls.py`, the tester-facing section of `static/whatsnew.html` | Writes backend; blocks the progressive load; puts a user string through `innerHTML` |
+| `ui-engineer` | `.claude/agents/` | Opus (D2) | `static/**`, `tests/test_frontend_calls.py`, the user-facing section of `static/whatsnew.html` | Writes backend; blocks the progressive load; puts a user string through `innerHTML` |
 | Fresh-eyes reviewer | not a file | Sonnet | A diff against its spec section, then the mechanical sweep | Edits anything |
 | Recon and sweeps | `Explore`, `general-purpose` | Sonnet | Reading; measuring; drafting a docs section into a ledger | Edits repo code |
 
@@ -350,7 +350,7 @@ Each is written as the position I recommend; mark it `agree` or overwrite it.
    `tools/dev/`, or stay machine-local with absolute paths in the briefs.
 4. **The handover carries a Registered builds table.** Original question: should the handover carry the registered-build table when `/overnight`
    exists, or should that be a `docs/design/<slug>.md` §0 strip as the sibling project does?
-5. **`/drop` drafts each release section and the main session owns it; ui-engineer never adds one.** Original question: It is tester-facing prose inside the UI
+5. **`/drop` drafts each release section and the main session owns it; ui-engineer never adds one.** Original question: It is user-facing prose inside the UI
    territory. I gave the section drafting to `/drop` (main session) and the file
    to ui-engineer; the alternative is that ui-engineer writes the section as
    part of each UI item and `/drop` only checks the date attribute.
