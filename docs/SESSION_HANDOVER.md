@@ -39,8 +39,8 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
 ## Next session's plan
 
 1. **Get the deploy answers above** into the log; rewrite this paragraph.
-   Then process round 2 (`PROCESS.md` §7): the publication-gate scanner and
-   hooks, `tools/dev/`, `/perf-ab`, `/drop`, and two supervised packages.
+   Then two packages through the full process (`PROCESS.md` §3) with the
+   owner watching, which is `/overnight`'s readiness gate.
 2. **Watch the first days of muting.** The log's WP-40 entries list six
    recorded edges; the two a user is likeliest to trip over: the Assigned
    and Muted tabs overlap (a mute assigns), and unassigning from mainline

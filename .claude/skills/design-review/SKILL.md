@@ -26,7 +26,9 @@ captured verbatim before anything else happens to them.
    text wireframes of every surface, the states (loading, empty, error), and
    what loads first. A doc that crosses the API contract is two sections
    written against the same §0, backend first or in parallel. On the trigger
-   paths, `performance-engineer` (round 2) adds its design pass as a §.
+   paths, `performance-engineer` adds its design pass as its own section:
+   cost, where it lands, the cheaper shape, verdict. A design doc on the
+   trigger paths is not round 0 without it.
 3. **The doc's shape:** §0 what we are building; decisions written as the
    recommended position each, with a verdict slot; numbered open questions;
    the 20-minute reading bar. The main session assembles the agents' sections
@@ -63,7 +65,9 @@ When no decision is open: a **sizing pass** turns the doc into a master plan
 (items in order, each one brief, with its layer, its trigger status and what
 it is gated on), the doc is marked frozen in its status line, and the build
 is registered as a line in `docs/SESSION_HANDOVER.md`. Small plans run the
-small path item by item; large ones run through `/overnight` (round 3).
+small path item by item; large ones run through `/overnight`. Every item
+in the plan carries its trigger status, so the performance pass is planned
+into the build rather than discovered during it.
 
 ## Publication gate
 

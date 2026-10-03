@@ -48,7 +48,7 @@ state, rewritten rather than appended. Then, as needed:
 |---|---|
 | `testboard/`, `tools/`, `clients/`, `feeder/`, `run_server.py`, `run_feeder.py`, `tests/` except `test_frontend_calls.py`, `docs/MARIADB_MIGRATION.md`, `docs/FEEDER_TEMPLATE.md` | `backend-engineer` (Opus) |
 | `static/`, `tests/test_frontend_calls.py` | `ui-engineer` (Opus) |
-| `tools/dev/perf/` and the Known slow baseline | `performance-engineer` (Opus, round 2): reviews cost at design time and measures the A/B on the trigger paths; never edits product code |
+| `tools/dev/perf/` and the Known slow baseline | `performance-engineer` (Opus): reviews cost at design time and measures the A/B on the trigger paths; never edits product code |
 | `CLAUDE.md`, `PROCESS.md`, `.claude/`, the `docs/` state files (handover, log, drops, design), git, PRs, drops | main session |
 
 A change that spans both layers is two briefs against an agreed JSON contract.
@@ -57,7 +57,8 @@ edit repo code. Every hand-off is a brief from `.claude/brief-template.md`
 with a ledger in `.claude/work/`, run in its own worktree with its own
 sacrificial database, reported in at most 25 lines. The rituals are skills:
 `/design-review` to start anything larger than one brief, then `/brief`,
-`/verify`, `/review`, `/handover`.
+`/verify`, `/perf-ab` on the trigger paths, `/review`, `/drop`, `/handover`,
+and `/overnight` for an unattended run of a frozen plan.
 
 ## Hard constraints (apply to all code)
 

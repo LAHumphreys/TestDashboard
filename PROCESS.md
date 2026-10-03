@@ -44,7 +44,7 @@ second was reviewing what a cheaper implementer had under-polished.
 | Main session | Fable | Specs, briefs, reviews, commits, drops, `CLAUDE.md`, `PROCESS.md`, `.claude/`, the `docs/` state files, git and PRs | Edits a file under `testboard/`, `static/`, `tests/`, `tools/`, `clients/`, `feeder/` |
 | `backend-engineer` | Opus | `testboard/`, `tools/`, `clients/`, `feeder/`, the two `run_*.py`, `tests/` except the frontend guards, the runbook, the feeder template, the registry row it claims | Writes frontend; weakens a guard; adds a host dependency; edits `MIGRATIONS[0]`; commits |
 | `ui-engineer` | Opus | `static/`, `tests/test_frontend_calls.py`; may edit `whatsnew.html` but never adds a release section | Writes backend; blocks the progressive load; puts a user string through `innerHTML`; commits |
-| `performance-engineer` (round 2) | Opus | The design pass and the measured A/B pass on the trigger paths; `tools/dev/perf/` and the Known slow baseline | Edits product code; runs on a light change off the trigger paths |
+| `performance-engineer` | Opus | The design pass and the measured A/B pass on the trigger paths; `tools/dev/perf/` and the Known slow baseline | Edits product code; runs on a light change off the trigger paths |
 | Fresh-eyes reviewer | Sonnet, spawned by `/review` | A diff against its acceptance list, then the mechanical sweep, then the publication gate's judgement pass | Edits anything |
 | Recon and sweeps | Sonnet (`Explore`, `general-purpose`) | Reading, measuring, drafting a docs section into a ledger | Edits repo code |
 
@@ -61,8 +61,8 @@ the main session and delegate only drafting.
 |---|---|
 | Question | Answered from the code; no agent |
 | Small change | `/brief`, spawn in a worktree, report, `/verify`, `/review`, commit, log entry |
-| Large change | `/design-review`: discuss §0, the owning agents write round 0, the owner reviews, comments captured verbatim each round, sizing, then `/overnight` (round 3) or a run of the small path |
-| Drop | `/drop` (round 2), PR, green, squash, deploy, `/handover` with the deploy answers |
+| Large change | `/design-review`: discuss §0, the owning agents write round 0, the owner reviews, comments captured verbatim each round, sizing, then `/overnight` or a run of the small path |
+| Drop | `/drop`, PR, green, squash, deploy, `/handover` with the deploy answers |
 
 One item is one brief plus one ledger, one fresh agent, one commit. A new
 request is a fresh spawn; `SendMessage` continues only judgement that lives in
@@ -143,10 +143,12 @@ one borrows is referred to as "a sibling project", never by name.
 
 Two layers:
 
-- **Mechanical** (round 2): a term list that is itself never committed
-  (`.claude/private/`, gitignored), scanned by a stdlib script in `tools/dev/`
-  that local `commit-msg` and `pre-commit` hooks run; a hit blocks the commit.
-- **Judgement** (now): `/review` and `/handover` end with a pass over the diff
+- **Mechanical:** a term list that is itself never committed
+  (`.claude/private/terms.txt`, gitignored), scanned by
+  `tools/dev/publication_gate.py` (stdlib), which the local `commit-msg` and
+  `pre-commit` hooks run (`python tools/dev/install_hooks.py` installs them
+  once per clone); a hit blocks the commit.
+- **Judgement:** `/review` and `/handover` end with a pass over the diff
   of tracked text and the commit message asking one question, "would this read
   as internal to an outsider", reporting hits and never editing.
 
@@ -168,8 +170,10 @@ onboarding an agent needs after a reinstall lives in its definition and in
 | `/handover` | Rewrites `docs/SESSION_HANDOVER.md`; refuses to append |
 | `docs/UPGRADE_PLAN_STATUS.md` | The record: what was done, measured and decided, including design-review rounds |
 | `.claude/agent-memory/<agent>/` | What an agent learned since its definition was written; never state; gitignored |
-| Round 2 adds | `performance-engineer` and its `/perf-ab` (cold, in-process, alternated A/B of two trees), `/drop`, `tools/dev/` (the DOM-shim net, seeders, A/B runner, the gate's scanner) |
-| Round 3 adds | `/overnight`: the unattended stage loop with a cron heartbeat armed before the first spawn |
+| `/perf-ab` | The measured performance pass, run by `performance-engineer` on the trigger paths: cold, in-process, alternated A/B against the production-scale seed |
+| `/drop` | The release ritual in order: operator note, What's new, log, handover, the PR whose body is the squash message, the after-deploy bookkeeping |
+| `/overnight` | The unattended stage loop over a frozen plan, cron heartbeat armed before the first spawn, parking not stopping; its own readiness gate |
+| `tools/dev/` | The publication gate's scanner and hook installer; `net/` the DOM-shim sanity net and seeders; `perf/` the A/B runner and seed recipe (the performance engineer's) |
 
 ## §8 How to spot the process not working
 
@@ -242,6 +246,16 @@ Dated, newest last, each with the incident behind it. Append only.
   (payloads and rows for backend, text wireframes for UI), the owner's
   comments captured verbatim each round, the status log as the record, a
   sizing pass at the close.
+
+- **2026-10-03, late.** The owner stopped the staged rollout: "we're missing
+  things by trying to artificially stage this." Everything the design
+  decided is now built as one set: `performance-engineer`, `/design-review`
+  with the performance pass baked in, `/perf-ab`, `/drop`, `/overnight`
+  (with its own readiness gate in place of a rollout stage), the gate's
+  scanner and hooks, and `tools/dev/`. The earlier log lines that say
+  "round 2" or "round 3" describe the plan as it stood then; they are not
+  rewritten. Reviewed as a whole against the fourteen decisions before the
+  owner's read.
 
 ## Maintaining this document
 

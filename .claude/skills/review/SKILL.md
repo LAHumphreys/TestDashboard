@@ -8,7 +8,7 @@ description: The review before a commit. Spawns a Sonnet fresh-eyes reviewer wit
 Runs after `/verify` is green, before the commit. Three passes, in order,
 preceded on the trigger paths by the performance pass.
 
-## 0. The performance pass (trigger paths only; round 2)
+## 0. The performance pass (trigger paths only)
 
 If the diff touches `testboard/storage.py`, `testboard/api.py`, the push
 path or anything on a page's first paint, or the main session asks for it,
@@ -55,6 +55,8 @@ commit message, one question: would any of this read as internal to an
 outsider? A person's name or handle; an employer, team, product or site name;
 a real host, address, port or internal URL; a ticket id; a lesson from
 internal use rather than a fact about this code; the sibling project named.
-Until round 2's scanner exists this pass is a Sonnet agent given the diff and
-the message and that paragraph, reporting hits only. A hit blocks the commit
-until the text is changed; the gate never rewrites history.
+Two layers: the mechanical scanner (`tools/dev/publication_gate.py` against
+the gitignored term list, run by the local hooks on every commit; run it by
+hand on the PR body) and a Sonnet agent given the diff and the message and
+that paragraph, reporting hits only. A hit blocks the commit until the text
+is changed; the gate never rewrites history.

@@ -17,7 +17,7 @@ rewritten. Appending to it produces a worse log; the log is
    (the branch table) · Needs a person, not a commit · Known slow, measured,
    not changed · Verification tooling · First ten minutes. Facts the operator
    has not reported are listed as unknowns to ask, never assumed.
-3. **Registered builds** (from round 3): a table of plan, spec, branch and
+3. **Registered builds:** a table of plan, spec, branch and
    status, under "Where the code is". State lives here, never in a skill.
 4. **Numbers come from the main checkout.** The expected suite count in
    "First ten minutes" is what `/verify` printed there, never a worktree's.

@@ -44,8 +44,8 @@ heading before you start and measures the result before fresh-eyes review.
 Exactly what to run and what evidence the report must cite. Default:
 `python -m unittest discover` on SQLite, then with `TESTBOARD_TEST_DB_CNF`
 set to the file above. UI: the walkthrough against a play server. Backend
-touching `storage.py` or `api.py`: the cold, in-process A/B (round 2's
-`/perf-ab`; until then, the method in `docs/SESSION_HANDOVER.md`).
+on the trigger paths: `/perf-ab` by `performance-engineer` before fresh-eyes
+review; your own cold numbers are fast feedback, theirs are the record.
 
 ## Cleanup contract
 Any live state you may create (a play server, database copies, files outside
