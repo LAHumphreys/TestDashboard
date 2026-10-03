@@ -23,9 +23,11 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
   Metrics page shows schema 11; whether anyone has muted a test yet.
   Carried from 2026-09-30, still unanswered: were the counters left on; what
   "Waited, mean" reads during a run.
-- **In flight: `process-round-1`** (docs and `.claude/` only): `PROCESS.md`,
-  the `CLAUDE.md` split, two agent definitions, the brief and ledger
-  templates, four skills. Read `PROCESS.md` before the next piece of code
+- **In flight: `process-round-1`** (PR #16): `PROCESS.md`, the `CLAUDE.md`
+  split, three agent definitions, the brief and ledger templates, eight
+  skills, the publication gate's scanner and hooks, and `tools/dev/`
+  (the promoted net, the performance harness). Run
+  `python tools/dev/install_hooks.py` once per clone after it merges. Read `PROCESS.md` before the next piece of code
   work; every change now goes through `/brief`. PR #12 is closed
   (redundant). The shipped branches (`drop-2026-10-01`,
   `wp-40-acknowledged-failures`, `drop-2026-09-30`,

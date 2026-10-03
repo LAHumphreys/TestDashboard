@@ -413,19 +413,20 @@ Each is written as the position I recommend; mark it `agree` or overwrite it.
 - Screenshot harnesses: there is no browser. The DOM-shim net is the
   equivalent, and the walkthrough is a text one against a play server.
 
-## §7 Rollout, if §4 stands
+## §7 Rollout: built as one set, not staged
 
-1. `PROCESS.md`, the `CLAUDE.md` split, `docs/ARCHITECTURE.md`: one docs
-   commit, no code change, verify skipped.
-2. The two agent definitions and their seeded memory; `brief-template.md`;
-   `work/TEMPLATE.md`.
-3. `/design-review`, `/brief`, `/verify`, `/review`, `/handover`: prose skills,
-   same day. (`/design-review` was missed in the first build of round 1 and
-   added the same evening.)
-4. `/perf-ab` and `/drop`: the two with scripts; `/perf-ab` needs the
-   seeded-database recipe written down.
-5. Two supervised packages through the full path (a candidate: the +8 ms
-   assignments count on the browse page, backend only; then a small UI item).
-6. `/overnight`, then the next real overnight build runs through it.
-
-Steps 1 to 3 are a morning. Nothing in them changes shipped code.
+The three-round rollout this section first described was dropped on
+2026-10-03 at the owner's direction: "we're missing things by trying to
+artificially stage this." Everything §3 and §4 decide is built together in
+one PR: `PROCESS.md`, the `CLAUDE.md` split with `docs/ARCHITECTURE.md`, the
+three agent definitions (`backend-engineer`, `ui-engineer`,
+`performance-engineer`), the brief and ledger templates, the eight skills
+(`/design-review`, `/brief`, `/verify`, `/perf-ab`, `/review`, `/drop`,
+`/handover`, `/overnight`), the publication gate's scanner and hooks, and
+`tools/dev/` with the promoted net and the performance harness. The one
+piece of staging that survives is inside `/overnight` as its own readiness
+gate: it refuses to run unattended until two packages have shipped through
+the supervised path, or the owner says go. The whole set is reviewed against
+§4's decisions and the owner's three principles (who the board is for;
+responsiveness and staying lean; the public repository) before the owner
+reads the PR.
