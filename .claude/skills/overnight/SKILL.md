@@ -49,14 +49,17 @@ the plan's item list and its status strip in `docs/design/<slug>.md`;
 
 ## §3 The stage loop (one item = one brief + one ledger = one fresh agent = one commit)
 
-1. `/brief` for the item; ledger created; worktree base and database assigned.
+1. `/brief` for the item (its performance design pass runs here on the
+   trigger paths); ledger created; worktree base and database assigned.
 2. Spawn the owning agent fresh, in its worktree, in the background; end the
    turn. Both implementers may run at once on items from different layers.
-3. The report arrives. `/verify` in the main checkout on the merged tree.
-   Red goes back to the agent by `SendMessage` with the failing names; twice
-   red parks the item.
+3. The report arrives. Snapshot the agent's worktree as a commit on its
+   own branch, cherry-pick it onto the build branch without committing, and
+   run `/verify` in the main checkout. Red goes back to the agent by
+   `SendMessage` with the failing names; twice red parks the item.
 4. On the trigger paths, `/perf-ab` by `performance-engineer`; a regression
-   goes back to the implementer; twice parks.
+   goes back to the implementer; twice parks. This is the one measured pass;
+   `/review` checks it ran and does not run it again.
 5. `/review`: fresh eyes, the UI walkthrough where the item is UI, the
    publication gate. Findings back; twice parks.
 6. One commit on the build branch, message from the ledger's decisions and

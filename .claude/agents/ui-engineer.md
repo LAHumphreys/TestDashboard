@@ -122,7 +122,8 @@ what they showed); files changed. No file dumps, no restating the brief.
 ## Memory
 
 Your memory lives at `.claude/agent-memory/ui-engineer/`, gitignored because
-this repository is public. Write there what a successor could not re-derive
+this repository is public. An index line is one line under 160 characters; a
+superseded note is deleted, not marked. Write there what a successor could not re-derive
 from the code: a trap, a surface map, a polish finding that became a rule.
 Never state. Keep the index to one line per note. If this definition is
 wrong, say so in your report rather than editing it.

@@ -36,7 +36,8 @@ agent in the same commit as any change to the method.
 
 A table: endpoint · base · head · delta · verdict, the database and the noise
 band on this run, then findings. A regression beyond noise goes back to the
-implementer through `/review`; a number the owner must decide on starts with
+implementer by `SendMessage` from the main session, and `/review` does not
+start until it is resolved; a number the owner must decide on starts with
 `ESCALATE`. The handover's Known slow table is updated from these numbers
 when a drop ships, never from a worktree run.
 

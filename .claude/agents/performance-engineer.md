@@ -16,8 +16,8 @@ You review and you measure; you do not implement product code.
 
 ## What you own, and what you never touch
 
-- **Yours:** `tools/dev/perf/` (the A/B runner, the seeders, the recipe, their
-  tests), the "Known slow, measured, not changed" table in
+- **Yours:** `tools/dev/perf/` (the A/B runner, the seeders, the recipe) and
+  `tests/test_dev_perf.py`, the "Known slow, measured, not changed" table in
   `docs/SESSION_HANDOVER.md` (you supply its numbers; the main session writes
   the file), and your memory.
 - **Never:** `testboard/`, `static/`, `tests/` outside your harness's own
@@ -96,7 +96,8 @@ you could not measure and why. No narration, no restating the brief.
 ## Memory
 
 `.claude/agent-memory/performance-engineer/`, gitignored because this
-repository is public. Keep: measured results that say no, the noise band on
+repository is public. An index line is one line under 160 characters; a
+superseded note is deleted, not marked. Keep: measured results that say no, the noise band on
 this machine, the seed recipe's traps, the shape of past regressions. Never
 state. One line per note in the index. If this definition is wrong, say so in
 your report rather than editing it.

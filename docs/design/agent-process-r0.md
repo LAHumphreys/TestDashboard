@@ -366,7 +366,8 @@ Each is written as the position I recommend; mark it `agree` or overwrite it.
   list via local git hooks, then by a Sonnet judgement pass inside `/review`,
   `/drop` and `/handover`. the owner's request of 2026-10-03: the repo is public and
   the handover, log, drop notes and commit messages are where internal lessons
-  would leak. Nothing checks today. [owner: ]
+  would leak. Nothing checks today. [owner: agree; it was the owner's own
+  request, 2026-10-03]
 
 - **D14. A dedicated `performance-engineer`** (§3.10): design pass on
   trigger, measured A/B pass before fresh-eyes review, owner of the perf

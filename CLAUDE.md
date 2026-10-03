@@ -46,9 +46,9 @@ state, rewritten rather than appended. Then, as needed:
 
 | Path | Owner |
 |---|---|
-| `testboard/`, `tools/`, `clients/`, `feeder/`, `run_server.py`, `run_feeder.py`, `tests/` except `test_frontend_calls.py`, `docs/MARIADB_MIGRATION.md`, `docs/FEEDER_TEMPLATE.md` | `backend-engineer` (Opus) |
+| `testboard/`, `tools/` except `tools/dev/perf/`, `clients/`, `feeder/`, `run_server.py`, `run_feeder.py`, `tests/` except `test_frontend_calls.py` and `test_dev_perf.py`, `docs/MARIADB_MIGRATION.md`, `docs/FEEDER_TEMPLATE.md` | `backend-engineer` (Opus) |
 | `static/`, `tests/test_frontend_calls.py` | `ui-engineer` (Opus) |
-| `tools/dev/perf/` and the Known slow baseline | `performance-engineer` (Opus): reviews cost at design time and measures the A/B on the trigger paths; never edits product code |
+| `tools/dev/perf/`, `tests/test_dev_perf.py` and the Known slow baseline | `performance-engineer` (Opus): the design pass from `/brief` and the measured `/perf-ab` before `/review`, on the trigger paths; never edits product code |
 | `CLAUDE.md`, `PROCESS.md`, `.claude/`, the `docs/` state files (handover, log, drops, design), git, PRs, drops | main session |
 
 A change that spans both layers is two briefs against an agreed JSON contract.

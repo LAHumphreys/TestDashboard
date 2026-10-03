@@ -18,8 +18,12 @@ both and the PR, in this order, and refuses to skip a step.
 - Every migration on the branch has its registry row in `docs/UPGRADE_PLAN.md`
   §1, its ledger step in the upgrade tool, and its table in the exporter's
   `ddl()`; `LedgerTest` is the proof.
-- The publication gate has run on every commit; it runs again on the drop
-  note, What's new and the PR body below.
+- The publication gate has run on every commit through the hooks. It runs
+  again here, both layers, on the three texts this skill writes:
+  `python tools/dev/publication_gate.py --text docs/drops/<date>.md
+  static/whatsnew.html <PR body file>`, then a Sonnet agent given the same
+  three texts and the question "would any of this read as internal to an
+  outsider", reporting hits only. A hit blocks the PR until the text changes.
 
 ## 1. The operator note: `docs/drops/<date>.md`
 

@@ -4,8 +4,8 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-10-03, process round 1** (a line-level update of
-the 2026-10-01 rewrite; the next full rewrite goes through `/handover`). The drop of 2026-10-01
+Last rewritten: **2026-10-03, the process PR** (a line-level update of the
+2026-10-01 rewrite; the next full rewrite goes through `/handover`). The drop of 2026-10-01
 (WP-39 empty builds pruned; WP-40 muted failures, migration 11) was
 squash-merged as PR #14 and **deployed to production the same day**. The
 user reported only "Deployed"; nothing else from the deploy is recorded yet.
@@ -68,6 +68,13 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
 A local `master` exists since 2026-10-03 (created by the PR #15 merge);
 keep it a mirror of `origin/master`, never commit to it.
 
+**Registered builds** (plans frozen out of `/design-review`, run by
+`/overnight` or the small path; state lives here, never in a skill):
+
+| Plan | Spec | Branch | Status |
+|---|---|---|---|
+| none registered | | | |
+
 ## Needs a person, not a commit
 
 1. **Should there be a switch that turns the build delete off**, or anything
@@ -107,24 +114,30 @@ within noise, after `dbb5523`.)
 
 There is still no browser here; every drop's operator note says so.
 
-- `.scratch/net/run_net.py` — the six-class sanity net (~18 s, port 8931).
-  Boots the pinned worktree `.scratch/net-wt` (`b816151`); re-point it to
-  verify a branch and restore the pin afterwards. **It fails 5 checks on
-  `master` and did before the drop**: its seed is dated August. Re-seed
-  it before trusting a pass.
-- `.scratch/net/drop-2026-09-30/` — the 2026-09-30 drop's drivers, seeded
-  databases and benchmark scripts, plus the WP-40 A/B scripts and raw
-  numbers (`wp40_ab.txt`, `wp40_ab.py`, `wp40_bench.py`, `wp40_dash.py`);
-  `README.txt` has the command lines. **To compare two code trees use the
-  in-process, alternated method** — HTTP timings here vary 2–3× between runs.
-- A local MariaDB 12.3 lives in `.scratch/mariadb-data` (port 3307,
-  option file `.scratch/mariadb-test.cnf`; `.scratch/mariadb-test-via.cnf`
-  names a second sacrificial database for `TESTBOARD_TEST_DB_VIA_UPGRADE=1`
-  runs or a second agent): start `mariadbd.exe` with
-  `--defaults-file=.scratch/mariadb-data/my.ini --port=3307`, then set
-  `TESTBOARD_TEST_DB_CNF` (an absolute path). It is not 10.3; CI's two 10.3
-  legs are the authority for production's stream. It may still be running
-  from the 2026-10-01 session.
+- `tools/dev/net/run_net.py` — the six-class sanity net, promoted from
+  `.scratch/net/` by the process PR; boots the repo it lives in on a copy of
+  the database, needs `node` on PATH for the DOM walks (optional; the API
+  checks run without it). **It fails 5 checks on this tree and did on
+  `master` before**: its seed is dated August and the checks are
+  clock-dependent. Re-dating the seed is its own brief.
+- `tools/dev/perf/` — the performance engineer's harness (`seed.py` builds
+  the production-scale seed in ~75 s; `ab.py` is the cold, in-process,
+  alternated A/B of two trees; `README.md` is the recipe). `/perf-ab` runs
+  it. Its A/A baseline on 2026-10-03 (perf-seed/1, SQLite): every Known slow
+  row "same", half-band 10–14 ms on the 250–300 ms rows. **Never compare
+  trees over HTTP here** — timings vary 2–3× between runs.
+- `.scratch/net/drop-2026-09-30/` — the 2026-09-30 drop's live drivers and
+  raw numbers; superseded for measuring by `tools/dev/perf/`.
+- A local MariaDB 12.3 lives in `.scratch/mariadb-data` (port 3307): start
+  `mariadbd.exe` with `--defaults-file=.scratch/mariadb-data/my.ini
+  --port=3307`. Four option files, each naming a sacrificial database the
+  suite drops and recreates; `/brief` assigns them and `/verify` keeps the
+  last (absolute paths in `TESTBOARD_TEST_DB_CNF`):
+  `.scratch/mariadb-test.cnf` (agent A), `.scratch/mariadb-test-via.cnf`
+  (agent B, also `TESTBOARD_TEST_DB_VIA_UPGRADE=1` runs),
+  `.scratch/mariadb-test-c.cnf` (agent C), `.scratch/mariadb-test-main.cnf`
+  (the main session's `/verify`). It is not 10.3; CI's two 10.3 legs are the
+  authority for production's stream.
 - A play server for trying the UI: `python run_server.py --db <COPY of
   testboard.db> --port 8947 --host 127.0.0.1 --workers 4`. Never the
   repo-root file itself.
@@ -137,7 +150,8 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 git fetch origin --prune
 git log --oneline -3 origin/master   # 49e596d on top = the 2026-10-01 drop; it is deployed
 gh pr list --state open              # expect #9 only (plus this admin PR until merged)
-python -m unittest discover          # expect 2640 OK (skipped 1), SQLite
+python -m unittest discover          # expect 2668 OK (skipped 1), SQLite, after the process PR
+python tools/dev/install_hooks.py    # once per clone: the publication gate's hooks
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,

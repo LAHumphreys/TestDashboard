@@ -1,4 +1,4 @@
-# <slug>   status: in-progress | blocked | done   owner: backend-engineer | ui-engineer
+# <slug>   status: in-progress | blocked | done   owner: backend-engineer | ui-engineer | performance-engineer
 
 ## Brief
 Path to the brief, or the brief pasted here if it is short.

@@ -1,7 +1,8 @@
 # Agent brief template
 
-Every hand-off from the main session to `backend-engineer` or `ui-engineer`
-uses this shape. Fill every heading; write "none" rather than omitting one.
+Every hand-off from the main session to `backend-engineer`, `ui-engineer` or
+`performance-engineer` uses this shape (a design pass or a measured pass is a
+brief too, with Acceptance being the questions it must answer). Fill every heading; write "none" rather than omitting one.
 The brief carries intent; the agent reads the code.
 
 ## Goal

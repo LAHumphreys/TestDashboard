@@ -11,11 +11,23 @@ description: Draft an agent brief from .claude/brief-template.md for a described
 2. **Owner by path.** `static/` or `tests/test_frontend_calls.py` →
    `ui-engineer`; anything else under `testboard/`, `tools/`, `clients/`,
    `feeder/`, `tests/`, the two `run_*.py`, the runbook or the feeder
-   template → `backend-engineer`. `CLAUDE.md`, `PROCESS.md`, `.claude/`, the
-   `docs/` state files are the main session's; they need no brief.
+   template → `backend-engineer`, except `tools/dev/perf/` and
+   `tests/test_dev_perf.py`, which are `performance-engineer`'s. `CLAUDE.md`,
+   `PROCESS.md`, `.claude/`, the `docs/` state files are the main session's;
+   they need no brief.
 3. **Fill every heading** of `.claude/brief-template.md`. Acceptance lines are
    checkable; context is paths; out-of-scope names the other layer, docs and
-   What's new. Verification names the exact commands.
+   What's new. Verification names the exact commands. **Performance impact**
+   is answered, never blank: "none, and here is why" or the cost and where it
+   lands.
+3b. **The performance design pass, on the trigger paths only.** If the brief
+   touches `testboard/storage.py`, `testboard/api.py`, the push path or a
+   page's first paint, spawn `performance-engineer` with the brief before it
+   is shown: its answer (cost, where it lands, cheaper shape, verdict, at
+   most 15 lines) is appended under Performance impact, and a cheaper shape
+   it proposes becomes the brief's design unless the main session says why
+   not. Off those paths, with "none, and here is why", nothing is spawned:
+   light changes are not held up.
 4. **Worktree and database.** Base commit is the branch head the change
    builds on (`git rev-parse <branch>`), written as a sha. Assign one of the
    sacrificial MariaDB option files listed in `docs/SESSION_HANDOVER.md`

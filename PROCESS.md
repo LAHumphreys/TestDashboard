@@ -42,9 +42,9 @@ second was reviewing what a cheaper implementer had under-polished.
 | Role | Model | Owns | Never |
 |---|---|---|---|
 | Main session | Fable | Specs, briefs, reviews, commits, drops, `CLAUDE.md`, `PROCESS.md`, `.claude/`, the `docs/` state files, git and PRs | Edits a file under `testboard/`, `static/`, `tests/`, `tools/`, `clients/`, `feeder/` |
-| `backend-engineer` | Opus | `testboard/`, `tools/`, `clients/`, `feeder/`, the two `run_*.py`, `tests/` except the frontend guards, the runbook, the feeder template, the registry row it claims | Writes frontend; weakens a guard; adds a host dependency; edits `MIGRATIONS[0]`; commits |
+| `backend-engineer` | Opus | `testboard/`, `tools/` except `tools/dev/perf/`, `clients/`, `feeder/`, the two `run_*.py`, `tests/` except the frontend guards and `test_dev_perf.py`, the runbook, the feeder template, the registry row it claims | Writes frontend; weakens a guard; adds a host dependency; edits `MIGRATIONS[0]`; commits |
 | `ui-engineer` | Opus | `static/`, `tests/test_frontend_calls.py`; may edit `whatsnew.html` but never adds a release section | Writes backend; blocks the progressive load; puts a user string through `innerHTML`; commits |
-| `performance-engineer` | Opus | The design pass and the measured A/B pass on the trigger paths; `tools/dev/perf/` and the Known slow baseline | Edits product code; runs on a light change off the trigger paths |
+| `performance-engineer` | Opus | The design pass (from `/brief`) and the measured A/B pass (`/perf-ab`, before `/review`) on the trigger paths; `tools/dev/perf/`, `tests/test_dev_perf.py` and the Known slow baseline | Edits product code; runs on a light change off the trigger paths |
 | Fresh-eyes reviewer | Sonnet, spawned by `/review` | A diff against its acceptance list, then the mechanical sweep, then the publication gate's judgement pass | Edits anything |
 | Recon and sweeps | Sonnet (`Explore`, `general-purpose`) | Reading, measuring, drafting a docs section into a ledger | Edits repo code |
 
@@ -60,7 +60,7 @@ the main session and delegate only drafting.
 | Kind | Path |
 |---|---|
 | Question | Answered from the code; no agent |
-| Small change | `/brief`, spawn in a worktree, report, `/verify`, `/review`, commit, log entry |
+| Small change | `/brief` (with the performance design pass on the trigger paths), spawn in a worktree, report, `/verify`, `/perf-ab` on the trigger paths, `/review`, commit, log entry |
 | Large change | `/design-review`: discuss §0, the owning agents write round 0, the owner reviews, comments captured verbatim each round, sizing, then `/overnight` or a run of the small path |
 | Drop | `/drop`, PR, green, squash, deploy, `/handover` with the deploy answers |
 
@@ -68,6 +68,10 @@ One item is one brief plus one ledger, one fresh agent, one commit. A new
 request is a fresh spawn; `SendMessage` continues only judgement that lives in
 an agent's context, such as a review finding going back to its implementer.
 Hand off at durable artefacts, never mid-build; there is no turn budget.
+
+Agent memory (`.claude/agent-memory/<agent>/`, gitignored): an index line
+is one line under 160 characters; a superseded note is deleted, not marked;
+a note that describes state is wrong by construction.
 
 ### The performance pass, and light changes
 
@@ -148,7 +152,7 @@ Two layers:
   `tools/dev/publication_gate.py` (stdlib), which the local `commit-msg` and
   `pre-commit` hooks run (`python tools/dev/install_hooks.py` installs them
   once per clone); a hit blocks the commit.
-- **Judgement:** `/review` and `/handover` end with a pass over the diff
+- **Judgement:** `/review`, `/drop` and `/handover` end with a pass over the diff
   of tracked text and the commit message asking one question, "would this read
   as internal to an outsider", reporting hits and never editing.
 
@@ -203,7 +207,7 @@ Dated, newest last, each with the incident behind it. Append only.
   tier saved (§2, Opus implementers); the context compacted mid-build with no
   ledger to recover from (§7, the ledger).
 - **2026-10-03.** Design review round 0 of this process accepted: thirteen
-  decisions, recorded in `docs/design/agent-process-r0.md` §4 with the
+  decisions (fourteen by the evening), recorded in `docs/design/agent-process-r0.md` §4 with the
   owner's verdicts. Two revisions during review: agent memory is gitignored
   rather than committed, and a publication gate screens every commit, both
   because the repository is public. The sibling project whose process is the
@@ -256,6 +260,20 @@ Dated, newest last, each with the incident behind it. Append only.
   "round 2" or "round 3" describe the plan as it stood then; they are not
   rewritten. Reviewed as a whole against the fourteen decisions before the
   owner's read.
+
+- **2026-10-03, night, after the whole-set review.** A fresh-eyes pass over
+  every process file against the fourteen decisions found the performance
+  pass wired inconsistently: not started by `/brief` or `/overnight`, run
+  twice by `/overnight` then `/review`, and `tools/dev/perf/` claimed by two
+  agents. Fixed to one order: `/brief` runs the design pass on the trigger
+  paths; implement; `/verify`; `/perf-ab`; `/review` checks it ran and never
+  runs it; commit. `tools/dev/perf/` and `tests/test_dev_perf.py` are the
+  performance engineer's alone. The gate's judgement pass is now named the
+  same way in `/review`, `/drop` and `/handover`; the templates name all
+  three agents; the handover lists four sacrificial databases and the
+  promoted tools and carries the registered-builds table; the memory-index
+  cap (one line under 160 characters, superseded notes deleted) is in every
+  agent definition.
 
 ## Maintaining this document
 

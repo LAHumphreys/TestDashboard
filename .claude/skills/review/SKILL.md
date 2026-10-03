@@ -8,16 +8,17 @@ description: The review before a commit. Spawns a Sonnet fresh-eyes reviewer wit
 Runs after `/verify` is green, before the commit. Three passes, in order,
 preceded on the trigger paths by the performance pass.
 
-## 0. The performance pass (trigger paths only)
+## 0. The performance pass has already run (trigger paths only)
 
-If the diff touches `testboard/storage.py`, `testboard/api.py`, the push
-path or anything on a page's first paint, or the main session asks for it,
-spawn `performance-engineer` with the brief's Performance impact answer,
-the base and head commits and the worktree path. It runs the cold,
-in-process, alternated A/B against the production-scale seed and reports
-against the Known slow table. A regression goes back to the implementer
-before anything else is reviewed. A diff off those paths whose brief says
-"none, and here is why" skips this pass: light changes are not held up.
+The order is fixed: implement, `/verify`, `/perf-ab` on the trigger paths,
+then `/review`. If the diff touches `testboard/storage.py`,
+`testboard/api.py`, the push path or anything on a page's first paint, or
+the main session asked for it, `/review` does not start until the
+`/perf-ab` report is in hand and every regression in it has gone back to the
+implementer and been resolved. `/review` never spawns the performance pass
+itself; if it is missing, stop and run `/perf-ab` first. A diff off those
+paths whose brief says "none, and here is why" has no such report and
+needs none: light changes are not held up.
 
 ## 1. Fresh eyes (Sonnet, never the implementer)
 

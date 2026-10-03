@@ -22,7 +22,10 @@ rewritten. Appending to it produces a worse log; the log is
 4. **Numbers come from the main checkout.** The expected suite count in
    "First ten minutes" is what `/verify` printed there, never a worktree's.
 5. **Date it** in the "Last rewritten" line with what prompted the rewrite.
-6. **Publication gate.** Before writing, read the draft once as an outsider
-   would: no names, hosts, ticket ids, or lessons from internal use; the
-   sibling project unnamed. Measurements and estate-scale numbers at the
-   level already in `CLAUDE.md` are fine.
+6. **Publication gate, both layers.** Before committing, run
+   `python tools/dev/publication_gate.py --text docs/SESSION_HANDOVER.md`,
+   then a Sonnet agent given the file and the question "would any of this
+   read as internal to an outsider", reporting hits only: no names, hosts,
+   ticket ids, or lessons from internal use; the sibling project unnamed.
+   Measurements and estate-scale numbers at the level already in `CLAUDE.md`
+   are fine. The handover is the likeliest carrier, so this is not skipped.
