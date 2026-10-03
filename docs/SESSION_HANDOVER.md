@@ -4,7 +4,8 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-10-01, after the deploy**. The drop of 2026-10-01
+Last rewritten: **2026-10-03, process round 1** (a line-level update of
+the 2026-10-01 rewrite; the next full rewrite goes through `/handover`). The drop of 2026-10-01
 (WP-39 empty builds pruned; WP-40 muted failures, migration 11) was
 squash-merged as PR #14 and **deployed to production the same day**. The
 user reported only "Deployed"; nothing else from the deploy is recorded yet.
@@ -22,7 +23,10 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
   Metrics page shows schema 11; whether anyone has muted a test yet.
   Carried from 2026-09-30, still unanswered: were the counters left on; what
   "Waited, mean" reads during a run.
-- **Nothing is in flight.** No feature branch exists. PR #12 is closed
+- **In flight: `process-round-1`** (docs and `.claude/` only): `PROCESS.md`,
+  the `CLAUDE.md` split, two agent definitions, the brief and ledger
+  templates, four skills. Read `PROCESS.md` before the next piece of code
+  work; every change now goes through `/brief`. PR #12 is closed
   (redundant). The shipped branches (`drop-2026-10-01`,
   `wp-40-acknowledged-failures`, `drop-2026-09-30`,
   `docs-handover-2026-09-29`) are deleted locally and on origin.
@@ -35,6 +39,8 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
 ## Next session's plan
 
 1. **Get the deploy answers above** into the log; rewrite this paragraph.
+   Then process round 2 (`PROCESS.md` §7): the publication-gate scanner and
+   hooks, `tools/dev/`, `/perf-ab`, `/drop`, and two supervised packages.
 2. **Watch the first days of muting.** The log's WP-40 entries list six
    recorded edges; the two a tester is likeliest to trip over: the Assigned
    and Muted tabs overlap (a mute assigns), and unassigning from mainline
@@ -52,13 +58,13 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
 | | |
 |---|---|
 | `origin/master` | `49e596d` — **deployed** |
-| `admin-2026-10-01-deployed` | this handover + the deploy record (docs only); merge when green and delete |
+| `process-round-1` | the process files (docs and `.claude/` only); PR open, review and squash |
 | `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, green, untouched since 2026-09-08 |
 | `wp-14-in-run-progress` | parked WIP; its migration renumbers to **12** before merging (registry §1) and needs a MariaDB ledger step |
 | `wp-32-timeline-follow`, `wp-31-own-results-always`, `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*`, `wp-17`…`wp-25` | merged; prune when convenient. Sibling worktrees (`TestDashboard-*-wt`) hold some of them — remove the worktree before the branch |
 
-There is **no local `master` branch** in this checkout; work from
-`origin/master`.
+A local `master` exists since 2026-10-03 (created by the PR #15 merge);
+keep it a mirror of `origin/master`, never commit to it.
 
 ## Needs a person, not a commit
 

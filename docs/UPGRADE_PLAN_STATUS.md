@@ -4317,3 +4317,28 @@ branches (`drop-2026-10-01`, `wp-40-acknowledged-failures`,
 `drop-2026-09-30`, `docs-handover-2026-09-29`) deleted locally and on
 origin; the handover rewritten; the build session's play server stopped.
 Open: PR #9 (the Java client), unchanged since 2026-09-08.
+
+## Process: design review round 0 accepted; round 1 built (2026-10-03)
+
+The repository now has a written process for agent-driven work, modelled on
+a sibling project's and adapted here. The review is
+`docs/design/agent-process-r0.md`; the owner's verdicts are recorded in its
+§4 (thirteen decisions, all agreed, two revised during review) and §5 (six
+questions answered). The rules live in `PROCESS.md`; `CLAUDE.md` shrank from
+210 lines to about 110 by moving the architecture decisions, verbatim, to
+`docs/ARCHITECTURE.md`.
+
+Decided, in short: the main session never implements, with no size
+exception; two Opus implementers own path territories (`backend-engineer`,
+`ui-engineer`), briefed from `.claude/brief-template.md` with a ledger in
+`.claude/work/`, each in its own worktree with its own sacrificial database;
+a Sonnet fresh-eyes review before every commit, with the main session's own
+walkthrough kept for UI; four prose skills now (`/brief`, `/verify`,
+`/review`, `/handover`), `/perf-ab` and `/drop` with scripts in round 2,
+`/overnight` in round 3. Revised during review because the repository is
+public: agent memory is gitignored, not committed, and every commit passes a
+publication gate (judgement pass now, a local scanner and hooks in round 2).
+
+Evidence the rules rest on is the 2026-10-01 build, listed in `PROCESS.md`
+§9. Nothing in shipped code changed; the suite was not run for this commit
+(docs and `.claude/` only), per `/verify`.
