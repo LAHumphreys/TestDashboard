@@ -150,7 +150,7 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 git fetch origin --prune
 git log --oneline -3 origin/master   # 49e596d on top = the 2026-10-01 drop; it is deployed
 gh pr list --state open              # expect #9 only (plus this admin PR until merged)
-python -m unittest discover          # expect 2668 OK (skipped 1), SQLite, after the process PR
+python -m unittest discover          # expect 2674 OK (skipped 1), SQLite, after the process PR
 python tools/dev/install_hooks.py    # once per clone: the publication gate's hooks
 ```
 
