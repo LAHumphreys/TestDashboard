@@ -173,7 +173,13 @@ class RunnerTest(_SeededCase):
             # Warm: the same call again WITHOUT clearing.
             conn = store._conn()
             seen = []  # type: List[str]
-            conn.set_trace_callback(seen.append)
+
+            def record(statement: str) -> None:
+                seen.append(statement)
+
+            # A plain function, not seen.append: 3.6's sqlite3 hashes the
+            # callback, and a list's bound method is unhashable there.
+            conn.set_trace_callback(record)
             try:
                 getattr(tree.modules["testboard.api"], "handle_api")(
                     store, ab.make_request(tree, url),
