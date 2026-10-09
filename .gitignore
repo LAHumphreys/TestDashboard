@@ -28,3 +28,14 @@ validate-server.err
 validate-server-before.log
 # Session scratch: database copies, DOM-shim harnesses, perf notes.
 .scratch/
+# Claude Code process files that must never be published (this repository is
+# public): agent memory, the publication gate's term list, in-flight work
+# ledgers, and the session's own worktrees, locks and local settings.
+.claude/agent-memory/
+.claude/private/
+.claude/work/*
+!.claude/work/TEMPLATE.md
+!.claude/work/README.md
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

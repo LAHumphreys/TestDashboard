@@ -4,7 +4,8 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-10-01, after the deploy**. The drop of 2026-10-01
+Last rewritten: **2026-10-03, the process PR** (a line-level update of the
+2026-10-01 rewrite; the next full rewrite goes through `/handover`). The drop of 2026-10-01
 (WP-39 empty builds pruned; WP-40 muted failures, migration 11) was
 squash-merged as PR #14 and **deployed to production the same day**. The
 user reported only "Deployed"; nothing else from the deploy is recorded yet.
@@ -22,7 +23,12 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
   Metrics page shows schema 11; whether anyone has muted a test yet.
   Carried from 2026-09-30, still unanswered: were the counters left on; what
   "Waited, mean" reads during a run.
-- **Nothing is in flight.** No feature branch exists. PR #12 is closed
+- **In flight: `process-round-1`** (PR #16): `PROCESS.md`, the `CLAUDE.md`
+  split, three agent definitions, the brief and ledger templates, eight
+  skills, the publication gate's scanner and hooks, and `tools/dev/`
+  (the promoted net, the performance harness). Run
+  `python tools/dev/install_hooks.py` once per clone after it merges. Read `PROCESS.md` before the next piece of code
+  work; every change now goes through `/brief`. PR #12 is closed
   (redundant). The shipped branches (`drop-2026-10-01`,
   `wp-40-acknowledged-failures`, `drop-2026-09-30`,
   `docs-handover-2026-09-29`) are deleted locally and on origin.
@@ -35,8 +41,9 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
 ## Next session's plan
 
 1. **Get the deploy answers above** into the log; rewrite this paragraph.
+   Then the first features through the process (`PROCESS.md` §3).
 2. **Watch the first days of muting.** The log's WP-40 entries list six
-   recorded edges; the two a tester is likeliest to trip over: the Assigned
+   recorded edges; the two a user is likeliest to trip over: the Assigned
    and Muted tabs overlap (a mute assigns), and unassigning from mainline
    drops a build's mute of the same test. The "New failures" delta line
    does not add muted failures back. Change nothing until someone asks.
@@ -45,25 +52,32 @@ user reported only "Deployed"; nothing else from the deploy is recorded yet.
    `master` too. A candidate for the next performance pass, with the
    "Known slow" table below.
 4. **Decide the Java client's fate** (PR #9), open since 2026-09-08.
-5. Then whatever the testers report.
+5. Then whatever the users report.
 
 ## Where the code is
 
 | | |
 |---|---|
 | `origin/master` | `49e596d` — **deployed** |
-| `admin-2026-10-01-deployed` | this handover + the deploy record (docs only); merge when green and delete |
+| `process-round-1` | the process files (docs and `.claude/` only); PR open, review and squash |
 | `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, green, untouched since 2026-09-08 |
 | `wp-14-in-run-progress` | parked WIP; its migration renumbers to **12** before merging (registry §1) and needs a MariaDB ledger step |
 | `wp-32-timeline-follow`, `wp-31-own-results-always`, `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*`, `wp-17`…`wp-25` | merged; prune when convenient. Sibling worktrees (`TestDashboard-*-wt`) hold some of them — remove the worktree before the branch |
 
-There is **no local `master` branch** in this checkout; work from
-`origin/master`.
+A local `master` exists since 2026-10-03 (created by the PR #15 merge);
+keep it a mirror of `origin/master`, never commit to it.
+
+**Registered builds** (plans frozen out of `/design-review`, run by
+`/overnight` or the small path; state lives here, never in a skill):
+
+| Plan | Spec | Branch | Status |
+|---|---|---|---|
+| none registered | | | |
 
 ## Needs a person, not a commit
 
 1. **Should there be a switch that turns the build delete off**, or anything
-   in front of it beyond a typed name? The testers' use will say.
+   in front of it beyond a typed name? The users' habits will say.
 2. **Build comments — the workshop the user offered:** mainline lists show a
    test's newest comment of any origin, unlabelled; deleting a build clears
    the tag on its comments; nothing carries from one build to the next of the
@@ -99,24 +113,30 @@ within noise, after `dbb5523`.)
 
 There is still no browser here; every drop's operator note says so.
 
-- `.scratch/net/run_net.py` — the six-class sanity net (~18 s, port 8931).
-  Boots the pinned worktree `.scratch/net-wt` (`b816151`); re-point it to
-  verify a branch and restore the pin afterwards. **It fails 5 checks on
-  `master` and did before the drop**: its seed is dated August. Re-seed
-  it before trusting a pass.
-- `.scratch/net/drop-2026-09-30/` — the 2026-09-30 drop's drivers, seeded
-  databases and benchmark scripts, plus the WP-40 A/B scripts and raw
-  numbers (`wp40_ab.txt`, `wp40_ab.py`, `wp40_bench.py`, `wp40_dash.py`);
-  `README.txt` has the command lines. **To compare two code trees use the
-  in-process, alternated method** — HTTP timings here vary 2–3× between runs.
-- A local MariaDB 12.3 lives in `.scratch/mariadb-data` (port 3307,
-  option file `.scratch/mariadb-test.cnf`; `.scratch/mariadb-test-via.cnf`
-  names a second sacrificial database for `TESTBOARD_TEST_DB_VIA_UPGRADE=1`
-  runs or a second agent): start `mariadbd.exe` with
-  `--defaults-file=.scratch/mariadb-data/my.ini --port=3307`, then set
-  `TESTBOARD_TEST_DB_CNF` (an absolute path). It is not 10.3; CI's two 10.3
-  legs are the authority for production's stream. It may still be running
-  from the 2026-10-01 session.
+- `tools/dev/net/run_net.py` — the six-class sanity net, promoted from
+  `.scratch/net/` by the process PR; boots the repo it lives in on a copy of
+  the database, needs `node` on PATH for the DOM walks (optional; the API
+  checks run without it). **It fails 5 checks on this tree and did on
+  `master` before**: its seed is dated August and the checks are
+  clock-dependent. Re-dating the seed is its own brief.
+- `tools/dev/perf/` — the performance engineer's harness (`seed.py` builds
+  the production-scale seed in ~75 s; `ab.py` is the cold, in-process,
+  alternated A/B of two trees; `README.md` is the recipe). `/perf-ab` runs
+  it. Its A/A baseline on 2026-10-03 (perf-seed/1, SQLite): every Known slow
+  row "same", half-band 10–14 ms on the 250–300 ms rows. **Never compare
+  trees over HTTP here** — timings vary 2–3× between runs.
+- `.scratch/net/drop-2026-09-30/` — the 2026-09-30 drop's live drivers and
+  raw numbers; superseded for measuring by `tools/dev/perf/`.
+- A local MariaDB 12.3 lives in `.scratch/mariadb-data` (port 3307): start
+  `mariadbd.exe` with `--defaults-file=.scratch/mariadb-data/my.ini
+  --port=3307`. Four option files, each naming a sacrificial database the
+  suite drops and recreates; `/brief` assigns them and `/verify` keeps the
+  last (absolute paths in `TESTBOARD_TEST_DB_CNF`):
+  `.scratch/mariadb-test.cnf` (agent A), `.scratch/mariadb-test-via.cnf`
+  (agent B, also `TESTBOARD_TEST_DB_VIA_UPGRADE=1` runs),
+  `.scratch/mariadb-test-c.cnf` (agent C), `.scratch/mariadb-test-main.cnf`
+  (the main session's `/verify`). It is not 10.3; CI's two 10.3 legs are the
+  authority for production's stream.
 - A play server for trying the UI: `python run_server.py --db <COPY of
   testboard.db> --port 8947 --host 127.0.0.1 --workers 4`. Never the
   repo-root file itself.
@@ -129,7 +149,8 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 git fetch origin --prune
 git log --oneline -3 origin/master   # 49e596d on top = the 2026-10-01 drop; it is deployed
 gh pr list --state open              # expect #9 only (plus this admin PR until merged)
-python -m unittest discover          # expect 2640 OK (skipped 1), SQLite
+python -m unittest discover          # expect 2674 OK (skipped 1), SQLite, after the process PR
+python tools/dev/install_hooks.py    # once per clone: the publication gate's hooks
 ```
 
 The repo-root `testboard.db` is generated dev data — only ever copied,

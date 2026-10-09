@@ -4317,3 +4317,46 @@ branches (`drop-2026-10-01`, `wp-40-acknowledged-failures`,
 `drop-2026-09-30`, `docs-handover-2026-09-29`) deleted locally and on
 origin; the handover rewritten; the build session's play server stopped.
 Open: PR #9 (the Java client), unchanged since 2026-09-08.
+
+## Process: design review round 0 accepted; round 1 built (2026-10-03)
+
+The repository now has a written process for agent-driven work, modelled on
+a sibling project's and adapted here. The review is
+`docs/design/agent-process-r0.md`; the owner's verdicts are recorded in its
+§4 (thirteen decisions, all agreed, two revised during review) and §5 (six
+questions answered). The rules live in `PROCESS.md`; `CLAUDE.md` shrank from
+210 lines to about 110 by moving the architecture decisions, verbatim, to
+`docs/ARCHITECTURE.md`.
+
+Decided, in short: the main session never implements, with no size
+exception; two Opus implementers own path territories (`backend-engineer`,
+`ui-engineer`), briefed from `.claude/brief-template.md` with a ledger in
+`.claude/work/`, each in its own worktree with its own sacrificial database;
+a Sonnet fresh-eyes review before every commit, with the main session's own
+walkthrough kept for UI; four prose skills now (`/brief`, `/verify`,
+`/review`, `/handover`), `/perf-ab` and `/drop` with scripts in round 2,
+`/overnight` in round 3. Revised during review because the repository is
+public: agent memory is gitignored, not committed, and every commit passes a
+publication gate (judgement pass now, a local scanner and hooks in round 2).
+
+Evidence the rules rest on is the 2026-10-01 build, listed in `PROCESS.md`
+§9. Nothing in shipped code changed; the suite was not run for this commit
+(docs and `.claude/` only), per `/verify`.
+
+## Process: built as one set, reviewed as a whole (2026-10-03, later)
+
+The staged rollout above was dropped the same day at the owner's direction;
+everything the review decided is in PR #16: `PROCESS.md`, the `CLAUDE.md`
+split, three agent definitions (a `performance-engineer` was added as D14,
+on a path trigger so light changes are never held up), eight skills, the
+publication gate's scanner and hooks, and `tools/dev/` with the promoted net
+and the performance harness. The two code pieces were the first briefs
+through the process; both had fresh-eyes reviews whose findings went back to
+the implementers. A fresh-eyes review of the process files against the
+fourteen decisions found the performance pass wired inconsistently; fixed to
+one order (`PROCESS.md` §3). Measured in the main checkout on the final tree:
+SQLite 2674 OK (skipped 1); with the MariaDB variants active 3660 OK
+(skipped 71). The harness's A/A baseline (perf-seed/1, SQLite): every Known
+slow row "same", half-band 10–14 ms on the 250–300 ms rows; these rows read
+2–4× the table's older dev-scale figures, so the table's database label
+changes when it is next updated from the harness.
