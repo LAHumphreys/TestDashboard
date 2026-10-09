@@ -9,6 +9,14 @@ history is still worth reading; that is what retirement is for.
 
     python3 tools/drop_environment.py --db testboard.db --environment UNKNOWN
     python3 tools/drop_environment.py --db testboard.db -e UNKNOWN --dry-run
+    python3 tools/drop_environment.py --db-config /etc/testboard/db.cnf \
+        --site-notes /var/lib/testboard/site_notes.json -e UNKNOWN --dry-run
+
+Works against either backend: pass --db for SQLite or --db-config plus
+--site-notes for MariaDB, the same flags run_server.py and
+drop_stream.py take. Exactly one of --db and --db-config is required;
+there is no default database, so a forgotten flag can never make some
+file in the working directory the silent target.
 
 **This cannot be undone.** So:
 
@@ -16,7 +24,10 @@ history is still worth reading; that is what retirement is for.
 - Without ``--yes`` the environment name has to be typed back at the
   prompt. An environment name is the one thing a mistake here turns on,
   and ``prod`` is three characters away from a name you meant to drop.
-- The only rollback is a copy of the database file. Take one.
+- The only rollback is a backup taken beforehand: a copy of the
+  database file (SQLite), or a dump of the database (MariaDB, which
+  this tool does not run DDL against either way -- it only deletes
+  rows through the same Storage a running server uses). Take one.
 
 Run it with the server STOPPED. The delete takes one transaction, and
 the derived tables it rewrites (``latest_runs``,
@@ -27,9 +38,12 @@ afterwards, so its entry goes too and the Build picker stops listing it
 (the ``streams`` line of the report counts those). A build that also
 ran elsewhere keeps its other environments' results.
 
-Space is not returned to the file system until a ``VACUUM``; pass
-``--vacuum`` to do that here, in a maintenance window (it rewrites the
-whole file and takes an exclusive lock).
+On SQLite, space is not returned to the file system until a
+``VACUUM``; pass ``--vacuum`` to do that here, in a maintenance window
+(it rewrites the whole file and takes an exclusive lock). On MariaDB
+``--vacuum`` does nothing and says so: InnoDB manages its own space,
+and ``OPTIMIZE TABLE`` is the server operator's decision, not this
+tool's.
 
 NOTE: like the other entry-point scripts, this file contains no
 f-strings and only type COMMENTS, so it still *parses* under Python 2 and
@@ -42,7 +56,7 @@ import sys
 import traceback
 
 try:
-    from typing import Dict, List, Optional  # noqa: F401 (used in comments)
+    from typing import Any, Dict, List, Optional  # noqa: F401 (comments)
 except ImportError:  # pragma: no cover - Python 2: main() exits before use
     pass
 
@@ -59,8 +73,15 @@ def build_parser():
         ),
     )
     parser.add_argument(
-        "--db", default="testboard.db", metavar="PATH",
-        help="SQLite database file (default: %(default)s)")
+        "--db", default=None, metavar="PATH",
+        help="SQLite database file (mutually exclusive with --db-config)")
+    parser.add_argument(
+        "--db-config", default=None, metavar="CNF",
+        help=("mysql option file naming a MariaDB server (mutually "
+              "exclusive with --db); requires --site-notes"))
+    parser.add_argument(
+        "--site-notes", default=None, metavar="PATH",
+        help="site notes file, required alongside --db-config")
     parser.add_argument(
         "--environment", "-e", required=True, metavar="NAME",
         help="the environment to delete (exact match, case sensitive)")
@@ -72,8 +93,9 @@ def build_parser():
         help="skip the confirmation prompt (for use from a script)")
     parser.add_argument(
         "--vacuum", action="store_true",
-        help=("rebuild the file afterwards to return freed space to the "
-              "disk (exclusive lock, rewrites the whole database)"))
+        help=("SQLite only: rebuild the file afterwards to return freed "
+              "space to the disk (exclusive lock, rewrites the whole "
+              "database). Does nothing on MariaDB"))
     parser.add_argument(
         "--verbose", action="store_true",
         help="print the full traceback on failure")
@@ -119,6 +141,62 @@ def _confirm(environment):
     return typed.strip() == environment
 
 
+def _open_storage(args):
+    # type: (argparse.Namespace) -> Any
+    """Open the storage backend named by --db or --db-config.
+
+    drop_stream.py's shape: the same refusals in the same order, None
+    after writing one to stderr. Prints the "Database:" line, which on
+    MariaDB is the option file and ``Settings.describe()`` -- never the
+    password. A MariaDB open failure is described the way run_server.py
+    describes it: the backend's own refusals (schema version, strict
+    mode) verbatim, a genuine connect failure with the host-matching /
+    auth-plugin advice.
+    """
+    import testboard.storage
+    if args.db and args.db_config:
+        sys.stderr.write("--db and --db-config are mutually exclusive.\n")
+        return None
+    if args.db:
+        if not os.path.isfile(args.db):
+            sys.stderr.write(
+                "Database not found: {0}\n".format(os.path.abspath(args.db)))
+            return None
+        print("Database: {0} ({1})".format(
+            os.path.abspath(args.db), _describe(os.path.getsize(args.db))))
+        return testboard.storage.Storage(args.db)
+    if args.db_config:
+        if not args.site_notes:
+            sys.stderr.write(
+                "--db-config requires --site-notes (the same pair "
+                "run_server.py needs for a MariaDB deployment).\n")
+            return None
+        import testboard.dbconfig
+        import testboard.mariadb
+        try:
+            settings = testboard.dbconfig.read_option_file(args.db_config)
+        except testboard.dbconfig.DbConfigError as exc:
+            sys.stderr.write("Cannot read --db-config:\n  {0}\n".format(exc))
+            return None
+        print("Database: MariaDB, {0} (from {1})".format(
+            settings.describe(), args.db_config))
+        try:
+            return testboard.storage.Storage.mariadb(settings)
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                message = str(exc)
+            else:
+                message = testboard.mariadb.describe_connect_error(
+                    settings, exc)
+            sys.stderr.write(
+                "Cannot open the database:\n  {0}\n".format(message))
+            if args.verbose:
+                traceback.print_exc()
+            return None
+    sys.stderr.write("One of --db or --db-config is required.\n")
+    return None
+
+
 def main(argv=None):
     # type: (Optional[List[str]]) -> int
     """Delete an environment; returns the exit code (0 = done, 2 = error)."""
@@ -144,27 +222,26 @@ def main(argv=None):
     if not args.environment.strip():
         sys.stderr.write("--environment must not be empty.\n")
         return 2
-    if not os.path.isfile(args.db):
-        sys.stderr.write(
-            "Database not found: {0}\n".format(os.path.abspath(args.db)))
-        return 2
 
     # Imported only after the version check: Python-3-only syntax.
     sys.path.insert(
         0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    import testboard.storage
-
-    before = os.path.getsize(args.db)
-    print("Database: {0} ({1})".format(
-        os.path.abspath(args.db), _describe(before)))
 
     try:
-        storage = testboard.storage.Storage(args.db)
+        storage = _open_storage(args)
     except Exception as exc:
         sys.stderr.write("Cannot open the database: {0}\n".format(exc))
         if args.verbose:
             traceback.print_exc()
         return 2
+    if storage is None:
+        return 2
+    # SQLite only: the file's size before and after is how the operator
+    # sees what the delete (and --vacuum) did. A MariaDB server has no
+    # file this tool can stat, so nothing is printed rather than a
+    # number about something else.
+    sqlite_file = None if args.db_config else args.db  # type: Optional[str]
+    before = os.path.getsize(sqlite_file) if sqlite_file else 0
 
     try:
         counts = storage.count_environment_rows(args.environment)
@@ -203,16 +280,25 @@ def main(argv=None):
                   "changed in between -- is the server or feeder "
                   "running?".format(total, removed))
 
-        if args.vacuum:
-            print("Rebuilding the database (VACUUM)...")
-            storage.vacuum()
-        after = os.path.getsize(args.db)
-        print("\nDatabase is now {0} (was {1}).".format(
-            _describe(after), _describe(before)))
-        if not args.vacuum and removed:
-            print("Freed pages stay in the file for reuse; pass --vacuum "
-                  "to return them to the disk.")
-        print("Restart the server so it is not serving a cached summary "
+        if sqlite_file:
+            if args.vacuum:
+                print("Rebuilding the database (VACUUM)...")
+                storage.vacuum()
+            after = os.path.getsize(sqlite_file)
+            print("\nDatabase is now {0} (was {1}).".format(
+                _describe(after), _describe(before)))
+            if not args.vacuum and removed:
+                print("Freed pages stay in the file for reuse; pass "
+                      "--vacuum to return them to the disk.")
+        elif args.vacuum:
+            # Not storage.vacuum(): on MariaDB that is a logged no-op,
+            # and calling it would put "vacuum" in the output of a run
+            # that compacted nothing.
+            print("\n--vacuum does nothing on MariaDB: nothing was "
+                  "compacted. InnoDB manages its own space; OPTIMIZE "
+                  "TABLE is the server operator's decision, not this "
+                  "tool's.")
+        print("\nRestart the server so it is not serving a cached summary "
               "of an environment that no longer exists.")
     except Exception as exc:
         sys.stderr.write("Delete failed: {0}\n".format(exc))
