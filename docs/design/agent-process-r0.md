@@ -424,10 +424,10 @@ three agent definitions (`backend-engineer`, `ui-engineer`,
 `performance-engineer`), the brief and ledger templates, the eight skills
 (`/design-review`, `/brief`, `/verify`, `/perf-ab`, `/review`, `/drop`,
 `/handover`, `/overnight`), the publication gate's scanner and hooks, and
-`tools/dev/` with the promoted net and the performance harness. The one
-piece of staging that survives is inside `/overnight` as its own readiness
-gate: it refuses to run unattended until two packages have shipped through
-the supervised path, or the owner says go. The whole set is reviewed against
+`tools/dev/` with the promoted net and the performance harness. No
+staging survives: `/overnight`'s only conditions are a frozen, sized plan
+and the owner's go at kickoff (its two-supervised-packages gate was removed
+on 2026-10-09 at the owner's direction). The whole set is reviewed against
 §4's decisions and the owner's three principles (who the board is for;
 responsiveness and staying lean; the public repository) before the owner
 reads the PR.

@@ -176,7 +176,7 @@ onboarding an agent needs after a reinstall lives in its definition and in
 | `.claude/agent-memory/<agent>/` | What an agent learned since its definition was written; never state; gitignored |
 | `/perf-ab` | The measured performance pass, run by `performance-engineer` on the trigger paths: cold, in-process, alternated A/B against the production-scale seed |
 | `/drop` | The release ritual in order: operator note, What's new, log, handover, the PR whose body is the squash message, the after-deploy bookkeeping |
-| `/overnight` | The unattended stage loop over a frozen plan, cron heartbeat armed before the first spawn, parking not stopping; its own readiness gate |
+| `/overnight` | The unattended stage loop over a frozen plan, cron heartbeat armed before the first spawn, parking not stopping; the owner's go at kickoff is the only gate |
 | `tools/dev/` | The publication gate's scanner and hook installer; `net/` the DOM-shim sanity net and seeders; `perf/` the A/B runner and seed recipe (the performance engineer's) |
 
 ## §8 How to spot the process not working
@@ -280,6 +280,10 @@ Dated, newest last, each with the incident behind it. Append only.
   exit code was `tail`'s, so a MariaDB-variant run had to be repeated to
   learn whether it passed. The skill now captures to a file, reads the
   suite's own exit code and greps the summary.
+
+- **2026-10-09.** The owner removed `/overnight`'s readiness gate (two
+  supervised packages first). A frozen, sized plan and the owner's go at
+  kickoff are its only conditions. Merged with PR #16.
 
 ## Maintaining this document
 

@@ -1,6 +1,6 @@
 ---
 name: overnight
-description: The unattended build. Runs a frozen master plan from /design-review item by item through the full small path - brief, ledger, fresh agent in a worktree, verify, the performance pass on the trigger paths, fresh-eyes review, one commit, a log line - with a cron heartbeat armed before the first spawn, parking instead of stopping, and exactly one question at the kickoff gate. Orients from files alone so it survives compaction and killed agents. Its own readiness gate: two packages shipped through the supervised path first, or the owner's explicit go.
+description: The unattended build. Runs a frozen master plan from /design-review item by item through the full small path - brief, ledger, fresh agent in a worktree, verify, the performance pass on the trigger paths, fresh-eyes review, one commit, a log line - with a cron heartbeat armed before the first spawn, parking instead of stopping, and exactly one question at the kickoff gate. Orients from files alone so it survives compaction and killed agents. The owner's go at the kickoff gate is the only gate.
 ---
 
 # /overnight <plan slug>
@@ -10,14 +10,11 @@ same stage loop the supervised path uses. Nothing here is new behaviour;
 what is new is that nobody is watching, so every piece of state lives in a
 file and every step is idempotent.
 
-## Readiness gate (its own, not a rollout stage)
+## Precondition
 
-Refuse to start unless one of these holds: `docs/SESSION_HANDOVER.md` records
-at least two packages shipped through the full supervised path
-(`/brief` → agent → `/verify` → `/review` → commit → drop), or the owner says
-"go unattended" in this session for this plan. Say which applies in the
-kickoff summary. A plan with no sizing pass (no ordered items with layers and
-trigger status) is not a plan; send it back to `/design-review`.
+A plan with no sizing pass (no ordered items with layers and trigger status)
+is not a plan; send it back to `/design-review`. The owner's go at the
+kickoff gate below is the only other condition.
 
 ## §1 Orient, from files only
 
