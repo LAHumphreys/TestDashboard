@@ -4360,3 +4360,51 @@ SQLite 2674 OK (skipped 1); with the MariaDB variants active 3660 OK
 slow row "same", half-band 10–14 ms on the 250–300 ms rows; these rows read
 2–4× the table's older dev-scale figures, so the table's database label
 changes when it is next updated from the harness.
+
+## 2026-10-12 — the drop of 2026-10-12: WP-41 and WP-42 (ready to deploy)
+
+Two packages, the first two features through the process end to end
+(`/brief`, worktree, `/verify`, fresh-eyes `/review`, publication gate,
+`/drop`). **No migration; schema stays at 11; nothing under `testboard/`
+changed.**
+
+**WP-41** (`022ce41`, PR #18, merged to master 2026-10-12):
+`tools/drop_environment.py` takes `--db-config CNF` plus `--site-notes
+PATH` for MariaDB, or `--db PATH` for SQLite, exactly one required; `--db`
+lost its default of `testboard.db`, so a forgotten flag refuses instead of
+targeting whatever file sits in the working directory. Three refusal tests
+always on; a MariaDB CLI test (dry run, delete, streams settled, no
+SQLite-only line, no password) when `TESTBOARD_TEST_DB_CNF` is set. Same
+gap, not fixed: `prune_runs.py`, `diagnose_db.py` and `add_site_note.py`
+still default `--db`; `drop_stream.py` has no MariaDB CLI test.
+
+**WP-42** (`6501104`, branch `wp-42-copy-output`): a "Copy output" button
+in all four run-output viewers (Review panel, Timeline run rows, the test
+page's "Run output" section and history rows), one helper
+`copyOutputButton(getText)` in `static/api.js` beside `fillOutput`. It
+copies the full `run.output` the viewer fetched, never the `<pre>`'s text
+(three viewers truncate to the last 20 KB). Built disabled, enabled once
+the fetch resolves and the run has output; the label is the feedback
+("Copied" / "Copy failed", two seconds). `navigator.clipboard` with a
+hidden-textarea `execCommand` fallback. One CSS rule new
+(`.review-btn:disabled`); the dead `fillOutput` import in `app.js`
+removed. Guards: `CopyOutputTest` (seven) and
+`PlantedCopyOutputRegressionTest` (three, running the real token counter
+over planted sources). The brief was corrected mid-flight: production is
+served over HTTPS behind a reverse proxy, so the clipboard API is the
+path and the fallback is insurance for a play server only.
+
+Decided: the fresh-eyes review's two findings (a planted test that could
+not fail; the dead import) went back to the implementer and were fixed
+before the commit. Performance: off the trigger paths, "none" accepted
+(no request, query or render pass; nothing on first paint); no `/perf-ab`.
+Not fixed, noted: the test page's standalone "Run output" section builds
+its button only after a successful fetch, so a failed fetch leaves the
+previous run's button in place with that run's output still shown.
+
+Measured in the main checkout on the rebased drop branch: SQLite
+2687 OK (skipped 1); with the MariaDB variants active 3674 OK (skipped 71) on the local
+MariaDB 12.3 sacrificial database. CI's two 10.3 legs are the authority.
+No browser has rendered the UI; the DOM-shim walk covered the four viewers
+with a 55,534-character output reaching the clipboard whole while the
+`<pre>` showed 20,000.
