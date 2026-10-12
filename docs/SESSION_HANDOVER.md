@@ -27,8 +27,8 @@ supersedes the one in PR #17 (2026-10-09), which never merged.
   `--site-notes` for MariaDB; `--db` lost its default) and WP-42 (a "Copy
   output" button in all four run-output viewers, copying the full output
   the viewer fetched). **No migration; schema stays at 11.** Operator note
-  `docs/drops/2026-10-12.md`; the PR is open from that branch, its body the
-  squash message. Rollback is a checkout and a restart.
+  `docs/drops/2026-10-12.md`; **PR #19** is open from that branch, its body
+  the squash message. Rollback is a checkout and a restart.
 - **Not reported back from the 2026-10-01 deploy — ask, do not assume:**
   what the upgrade tool's dry run said (`SERVER: may keep running`
   expected); whether the start-up output named the orphaned build
@@ -87,7 +87,7 @@ supersedes the one in PR #17 (2026-10-09), which never merged.
 | | |
 |---|---|
 | `origin/master` | `022ce41` — WP-41 (PR #18) on top of the process PR and the deployed `49e596d`; the server's Python is still `49e596d`'s |
-| `wp-42-copy-output` | **the drop of 2026-10-12**, PR open; WP-42 plus the drop's docs. Squash-merge, delete |
+| `wp-42-copy-output` | **the drop of 2026-10-12**, PR #19 open; WP-42 plus the drop's docs. Squash-merge, delete |
 | `admin-2026-10-09-handover` | PR #17, a handover rewrite superseded by this one; **close without merging** |
 | `wp-41-drop-env-mariadb` | merged as PR #18; the remote branch can go |
 | `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, green, untouched since 2026-09-08 |
@@ -195,7 +195,7 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 ```bash
 git fetch origin --prune
 git log --oneline -4 origin/master   # 022ce41 on top = WP-41; 49e596d below is what production runs until the drop lands
-gh pr list --state open              # expect #9, #17 (close it) and the drop of 2026-10-12
+gh pr list --state open              # expect #9, #17 (close it) and #19, the drop of 2026-10-12
 python -m unittest discover          # expect 2687 OK (skipped 1), SQLite, on the drop branch; 3674 OK (skipped 71) with MariaDB
 python tools/dev/install_hooks.py    # once per clone: the publication gate's hooks
 ```
