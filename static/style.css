@@ -1110,6 +1110,10 @@ button.bar-row:focus-visible {
 
 .review-btn:hover { background: #eef4fc; }
 
+/* Copy output, while there is nothing to copy yet (loading, a failed
+   fetch, a run that captured no output). After :hover so it wins. */
+.review-btn:disabled { opacity: 0.5; cursor: default; background: #fff; }
+
 .review-btn[aria-expanded="true"] {
   background: var(--accent-link);
   border-color: var(--accent-link);

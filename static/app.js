@@ -40,7 +40,6 @@ import {
   el,
   assigneeSelect,
   fetchJson,
-  fillOutput,
   formatDuration,
   formatTime,
   getUsername,
