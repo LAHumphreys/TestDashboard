@@ -424,6 +424,74 @@ export function fillOutput(pre, text) {
   return null;
 }
 
+const COPY_OUTPUT_LABEL = "Copy output";
+
+/**
+ * A "Copy output" button for a run-output viewer: the one place the
+ * board touches the clipboard.
+ *
+ * It copies the ENTIRE output. `getText` returns the full `run.output`
+ * the viewer fetched — never a `<pre>`'s text, which fillOutput() may
+ * have cut to the last MAX_INLINE_OUTPUT characters, and pasting the
+ * whole thing into an analyser is the reason the button exists.
+ *
+ * Built disabled; the viewer sets `disabled = !output` once its fetch
+ * resolves, so the button is dead while loading, after a failed fetch
+ * and when the run captured nothing. Feedback is the label itself
+ * ("Copied" / "Copy failed" for two seconds): no toast, nothing new
+ * elsewhere on the page.
+ *
+ * `navigator.clipboard` exists only in a secure context (production is
+ * HTTPS; localhost counts). A play server reached over plain HTTP by
+ * another address falls back to a hidden textarea and execCommand.
+ */
+export function copyOutputButton(getText) {
+  const button = el("button", "review-btn", COPY_OUTPUT_LABEL);
+  button.type = "button";
+  button.disabled = true;
+  let resetTimer = null;
+  const flash = (label) => {
+    button.textContent = label;
+    window.clearTimeout(resetTimer);
+    resetTimer = window.setTimeout(() => {
+      button.textContent = COPY_OUTPUT_LABEL;
+    }, 2000);
+  };
+  button.addEventListener("click", async () => {
+    const text = getText();
+    if (!text) {
+      return;
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.left = "-9999px";
+        document.body.appendChild(area);
+        area.select();
+        let copied = false;
+        try {
+          copied = document.execCommand("copy");
+        } finally {
+          document.body.removeChild(area);
+          button.focus();
+        }
+        if (!copied) {
+          throw new Error("copy refused");
+        }
+      }
+      flash("Copied");
+    } catch (err) {
+      flash("Copy failed");
+    }
+  });
+  return button;
+}
+
 /* ---------------- DOM helpers ---------------- */
 
 /** Create an element with optional class and (textContent-only) text. */

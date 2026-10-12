@@ -27,6 +27,7 @@ import {
   muteDurationSelect,
   assigneeSelect,
   clearNode,
+  copyOutputButton,
   el,
   fetchJson,
   fillOutput,
@@ -165,9 +166,12 @@ async function buildReviewPanel(entry, container, opts) {
   inTimeline.textContent = "View in timeline →";
   inTimeline.title = "This run in its night's running order — what ran "
     + "before it is listed above it";
+  let output = null;
+  const copy = copyOutputButton(() => output);
   head.appendChild(el("span", "review-title", "Latest run output"));
   head.appendChild(inTimeline);
   head.appendChild(full);
+  head.appendChild(copy);
   panel.appendChild(head);
 
   // Actions FIRST. The output block is tall, so anything below it is
@@ -181,6 +185,8 @@ async function buildReviewPanel(entry, container, opts) {
   try {
     const run = await fetchJson("api/runs/" + entry.run_id);
     const truncated = fillOutput(pre, run.output);
+    output = run.output;
+    copy.disabled = !output;
     if (truncated) {
       pre.parentNode.insertBefore(
         el("p", "review-note",

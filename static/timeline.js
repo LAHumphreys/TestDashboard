@@ -33,6 +33,7 @@
 import {
   clearError,
   clearNode,
+  copyOutputButton,
   el,
   fetchJson,
   fillOutput,
@@ -904,6 +905,14 @@ function renderDetail(detail, data) {
     outputRow.hidden = true;
     const outputCell = el("td", "");
     outputCell.setAttribute("colspan", "5");
+    /* The full text, for the Copy button: `pre` may hold only the
+     * tail. The button sits in this row, not the run row, so the run
+     * row's click-to-toggle never sees it. */
+    let output = null;
+    const copy = copyOutputButton(() => output);
+    const outputHead = el("div", "review-head");
+    outputHead.appendChild(copy);
+    outputCell.appendChild(outputHead);
     const pre = el("pre", "tl-output");
     outputCell.appendChild(pre);
     outputRow.appendChild(outputCell);
@@ -919,6 +928,8 @@ function renderDetail(detail, data) {
           try {
             const full = await fetchJson(runApiPath(run.run_id));
             const truncated = fillOutput(pre, full.output);
+            output = full.output;
+            copy.disabled = !output;
             if (truncated) {
               outputCell.appendChild(el("p", "muted cap-note",
                 truncated + " Open the test page for all of it."));

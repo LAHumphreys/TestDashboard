@@ -5697,5 +5697,223 @@ class MutedBesideFailingTest(unittest.TestCase):
         self.assertNotIn('buildStat("Muted"', card)
 
 
+def _call_arguments(source: str, callee: str) -> List[str]:
+    """The argument text of every ``callee(...)`` call, paren-matched.
+
+    A ``function callee(`` declaration is not a call and is skipped.
+    """
+    found = []  # type: List[str]
+    for match in re.finditer(r"\b" + re.escape(callee) + r"\s*\(", source):
+        if source[max(0, match.start() - 9):match.start()] == "function ":
+            continue
+        depth = 0
+        for index in range(match.end() - 1, len(source)):
+            if source[index] == "(":
+                depth += 1
+            elif source[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    found.append(source[match.end():index].strip())
+                    break
+    return found
+
+
+#: A copy getter may only hand over the API's string: ``run.output`` /
+#: ``full.output`` directly, or a local ``output`` the viewer assigned
+#: from one (checked separately). Anything else -- ``pre.textContent``,
+#: ``innerText``, a slice -- is the truncated tail, not the output.
+_FULL_OUTPUT_GETTER_RE = re.compile(r"^\(\)\s*=>\s*(?:\w+\.)?output$")
+
+#: What only copyOutputButton() may say: a second copy path, or a
+#: second button wearing its label.
+_COPY_TOKENS = ("clipboard", "execCommand", '"Copy output"')
+
+
+def _copy_tokens_outside_helper(name: str, source: str,
+                                helper: str) -> List[str]:
+    """The copy tokens *source* uses outside copyOutputButton().
+
+    ``helper`` is the helper's comment-stripped body; it is only
+    subtracted for api.js, where the label is also a module constant.
+    """
+    code = _strip_comments(source)
+    offenders = []  # type: List[str]
+    for token in _COPY_TOKENS:
+        outside = code.count(token)
+        if name == "api.js":
+            outside -= helper.count(token)
+            if token == '"Copy output"':
+                outside -= code.count(
+                    'const COPY_OUTPUT_LABEL = "Copy output"')
+        if outside > 0:
+            offenders.append(token)
+    return offenders
+
+
+class CopyOutputTest(unittest.TestCase):
+    """One Copy button, on every output viewer, copying the WHOLE output.
+
+    fillOutput() puts at most the last MAX_INLINE_OUTPUT characters in
+    the ``<pre>``, so selecting it by hand never gives a long output in
+    full -- which is the one thing the button is for. The button is
+    therefore handed the string the viewer fetched from the API, and a
+    getter that read the ``<pre>`` would look like it works on every
+    short output while silently copying a tail on exactly the long ones.
+    """
+
+    #: Viewer -> how many Copy buttons it builds, and inside which
+    #: functions. Four viewers in three files; no other page shows output.
+    _VIEWERS = {
+        "review.js": ["async function buildReviewPanel("],
+        "timeline.js": ["function renderDetail("],
+        "test.js": ["async function showRunOutput(",
+                    "function appendHistoryRow("],
+    }
+
+    def test_the_helper_is_defined_in_exactly_one_file(self) -> None:
+        self.assertIn("export function copyOutputButton(getText)",
+                      read("api.js"))
+        offenders = sorted(
+            name for name, source in scripts().items()
+            if name != "api.js" and "function copyOutputButton" in source)
+        self.assertEqual(offenders, [])
+
+    def test_only_the_helper_touches_the_clipboard(self) -> None:
+        """No second copy path, and nothing else building a copy button."""
+        helper = _strip_comments(_function_body(
+            read("api.js"), "export function copyOutputButton("))
+        self.assertIn("navigator.clipboard.writeText(text)", helper)
+        self.assertIn('document.execCommand("copy")', helper)
+        offenders = {
+            name: _copy_tokens_outside_helper(name, source, helper)
+            for name, source in scripts().items()
+        }
+        self.assertEqual(
+            {name: found for name, found in offenders.items() if found}, {},
+            "copy tokens used outside copyOutputButton()")
+
+    def test_every_output_viewer_has_the_button(self) -> None:
+        for name, functions in sorted(self._VIEWERS.items()):
+            source = read(name)
+            self.assertIn("copyOutputButton", _imported_names(source), name)
+            code = _strip_comments(source)
+            self.assertEqual(
+                len(_call_arguments(code, "copyOutputButton")),
+                len(functions), name)
+            for signature in functions:
+                body = _function_body(code, signature)
+                self.assertTrue(body, signature)
+                self.assertIn("copyOutputButton(", body, signature)
+
+    def test_every_file_rendering_output_offers_the_copy(self) -> None:
+        """A fifth viewer cannot arrive without the button."""
+        callers = sorted(
+            name for name, source in scripts().items()
+            if name != "api.js"
+            and re.search(r"\bfillOutput\s*\(", _strip_comments(source)))
+        self.assertEqual(callers, ["review.js", "test.js", "timeline.js"])
+        # No dead imports either: whoever imports fillOutput calls it.
+        importers = sorted(
+            name for name, source in scripts().items()
+            if "fillOutput" in _imported_names(source))
+        self.assertEqual(importers, callers)
+        for name in callers:
+            self.assertIn("copyOutputButton", _imported_names(read(name)),
+                          name)
+
+    def test_no_copy_path_reads_an_output_pre(self) -> None:
+        for name, functions in sorted(self._VIEWERS.items()):
+            code = _strip_comments(read(name))
+            for signature in functions:
+                body = _function_body(code, signature)
+                for getter in _call_arguments(body, "copyOutputButton"):
+                    self.assertRegex(getter, _FULL_OUTPUT_GETTER_RE,
+                                     name + " " + signature)
+                    if getter.endswith("> output"):
+                        # A local: it must be assigned from the API's
+                        # response, and from nothing else.
+                        assigned = re.findall(
+                            r"(?<!let )\boutput = ([^;]+);", body)
+                        self.assertTrue(assigned, signature)
+                        for value in assigned:
+                            self.assertRegex(value, r"^\w+\.output$",
+                                             signature)
+        helper = _strip_comments(_function_body(
+            read("api.js"), "export function copyOutputButton("))
+        self.assertIn("const text = getText();", helper)
+        self.assertNotIn("innerText", helper)
+        # The helper only ever WRITES textContent (its own label).
+        self.assertEqual(
+            re.findall(r"textContent(?!\s*=[^=])", helper), [])
+
+    def test_disabled_until_the_full_text_is_in_hand(self) -> None:
+        helper = _strip_comments(_function_body(
+            read("api.js"), "export function copyOutputButton("))
+        self.assertIn('el("button", "review-btn"', helper)
+        self.assertIn('button.type = "button"', helper)
+        self.assertIn("button.disabled = true;", helper)
+        for name, functions in sorted(self._VIEWERS.items()):
+            code = _strip_comments(read(name))
+            for signature in functions:
+                body = _function_body(code, signature)
+                self.assertRegex(
+                    body, r"copy\.disabled = !(?:\w+\.)?output;", signature)
+        self.assertIn(".review-btn:disabled", read("style.css"))
+
+    def test_the_timeline_button_is_not_in_the_clickable_run_row(self) -> None:
+        """The run row toggles its output on click; the button is elsewhere.
+
+        It lives in the output row, which has no click handler, so a
+        click on Copy can never collapse the output it is copying.
+        """
+        body = _strip_comments(_function_body(
+            read("timeline.js"), "function renderDetail("))
+        self.assertIn("outputHead.appendChild(copy);", body)
+        self.assertIn("outputCell.appendChild(outputHead);", body)
+        self.assertNotIn("tr.appendChild(copy", body)
+        self.assertNotIn("outputRow.addEventListener", body)
+
+
+class PlantedCopyOutputRegressionTest(unittest.TestCase):
+    """Prove the copy detectors can fail."""
+
+    def test_a_getter_reading_the_pre_would_be_caught(self) -> None:
+        for planted in ("() => pre.textContent", "() => pre.innerText",
+                        "() => output.slice(-20000)"):
+            self.assertNotRegex(planted, _FULL_OUTPUT_GETTER_RE)
+        self.assertRegex("() => run.output", _FULL_OUTPUT_GETTER_RE)
+
+    def test_a_second_clipboard_call_would_be_caught(self) -> None:
+        """The real guard's counting, over planted sources."""
+        helper = _strip_comments(_function_body(
+            read("api.js"), "export function copyOutputButton("))
+        planted = (
+            "btn.addEventListener('click', () => {\n"
+            "  navigator.clipboard.writeText(pre.textContent);\n"
+            "});\n")
+        self.assertEqual(
+            _copy_tokens_outside_helper("timeline.js", planted, helper),
+            ["clipboard"])
+        # In api.js itself, but outside the helper.
+        self.assertEqual(
+            _copy_tokens_outside_helper(
+                "api.js", read("api.js") + "\n" + planted, helper),
+            ["clipboard"])
+        self.assertEqual(
+            _copy_tokens_outside_helper(
+                "test.js", 'const b = el("button", "x", "Copy output");',
+                helper),
+            ['"Copy output"'])
+        # And the shipped api.js, helper included, is clean.
+        self.assertEqual(
+            _copy_tokens_outside_helper("api.js", read("api.js"), helper), [])
+
+    def test_call_arguments_are_paren_matched(self) -> None:
+        planted = ("function copyOutputButton(getText) {}\n"
+                   "const a = copyOutputButton(() => f(run).output);\n")
+        self.assertEqual(_call_arguments(planted, "copyOutputButton"),
+                         ["() => f(run).output"])
+
+
 if __name__ == "__main__":
     unittest.main()
