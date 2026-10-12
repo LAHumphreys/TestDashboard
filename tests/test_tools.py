@@ -27,6 +27,7 @@ from testboard.model import (
     utcnow,
 )
 from testboard.storage import Storage
+from tests import backends
 from tools import (
     demo_bootstrap,
     drop_environment,
@@ -739,3 +740,126 @@ class TestDropEnvironmentCLI(unittest.TestCase):
                 ["--db", self.db, "-e", "  ", "--yes"])
         self.assertEqual(rc, 2)
         self.assertIn("must not be empty", err.getvalue())
+
+    def test_db_and_db_config_together_exits_2(self) -> None:
+        """drop_stream.py's flag semantics: two backends is a refusal."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = drop_environment.main([
+                "--db", self.db, "--db-config", "x.cnf",
+                "--site-notes", "notes.json", "-e", "UNKNOWN", "--yes"])
+        self.assertEqual(rc, 2)
+        self.assertIn("mutually exclusive", err.getvalue())
+        self.assertEqual(self.environments(), ["UNKNOWN", "linux-sim"])
+
+    def test_neither_db_nor_db_config_exits_2(self) -> None:
+        """No default database: --db used to default to testboard.db,
+        which made whatever file sat in the working directory the
+        silent target of an irreversible delete."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = drop_environment.main(["-e", "UNKNOWN", "--yes"])
+        self.assertEqual(rc, 2)
+        self.assertIn("One of --db or --db-config is required",
+                      err.getvalue())
+
+    def test_db_config_without_site_notes_exits_2(self) -> None:
+        """The same pair run_server.py requires, refused before the
+        option file is even read."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = drop_environment.main(
+                ["--db-config", os.path.join(self.tmp, "no.cnf"),
+                 "-e", "UNKNOWN", "--yes"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--db-config requires --site-notes", err.getvalue())
+
+
+if backends.MARIADB_AVAILABLE:
+
+    class TestDropEnvironmentCLIMariaDB(unittest.TestCase):
+        """The drop-environment CLI end to end against MariaDB.
+
+        ``EnvironmentDeleteTest``'s MariaDB variant already covers the
+        storage methods; what went unnoticed until WP-41 was the CLI,
+        which accepted nothing but ``--db`` because nothing ever ran it
+        against MariaDB. Defined only when ``TESTBOARD_TEST_DB_CNF`` is
+        set, like ``tests/test_mariadb_backend.py``, so the SQLite-only
+        run gains no skip.
+        """
+
+        def setUp(self) -> None:
+            """Two environments; a build that only ever ran on UNKNOWN."""
+            self.tmp = tempfile.mkdtemp(prefix="testboard-drop-maria-")
+            self.addCleanup(shutil.rmtree, self.tmp, True)
+            self.site_notes = os.path.join(self.tmp, "site_notes.json")
+            store = backends.mariadb_storage()
+            try:
+                records = [
+                    RunRecord(
+                        environment=environment, script="suite.py",
+                        test_name="test_a", result=Result.PASS,
+                        start_time=NOW,
+                        end_time=NOW + datetime.timedelta(seconds=1),
+                        output="out", source_link="",
+                        known_failure_reason=None, build=None)
+                    for environment in ("linux-sim", "UNKNOWN")
+                ]
+                records.append(RunRecord(
+                    environment="UNKNOWN", script="suite.py",
+                    test_name="test_b", result=Result.PASS,
+                    start_time=NOW,
+                    end_time=NOW + datetime.timedelta(seconds=1),
+                    output="out", source_link="",
+                    known_failure_reason=None, build="dodgy"))
+                store.upsert_runs(records)
+            finally:
+                store.close()
+
+        def run_cli(self, extra: List[str]) -> Tuple[int, str]:
+            """main() with --db-config/--site-notes; (exit code, stdout)."""
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = drop_environment.main(
+                    ["--db-config", backends.MARIADB_CNF,
+                     "--site-notes", self.site_notes, "-e", "UNKNOWN"]
+                    + extra)
+            return rc, out.getvalue()
+
+        def environments(self) -> List[str]:
+            store = Storage.mariadb(backends.settings())
+            try:
+                return sorted(store.environments())
+            finally:
+                store.close()
+
+        def assert_mariadb_output(self, out: str) -> None:
+            """No SQLite-only lines, and never the password."""
+            self.assertIn("Database: MariaDB, " + backends.settings()
+                          .describe(), out)
+            self.assertNotIn("Database is now", out)
+            self.assertNotIn("Freed pages", out)
+            password = backends.settings().password
+            if password:
+                self.assertNotIn(password, out)
+
+        def test_dry_run_then_delete(self) -> None:
+            rc, out = self.run_cli(["--dry-run"])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("Dry run", out)
+            self.assertRegex(out, r"streams\s+1\b")
+            self.assert_mariadb_output(out)
+            self.assertEqual(self.environments(), ["UNKNOWN", "linux-sim"])
+
+            rc, out = self.run_cli(["--yes", "--vacuum"])
+            self.assertEqual(rc, 0, out)
+            self.assert_mariadb_output(out)
+            self.assertIn("--vacuum does nothing on MariaDB", out)
+            # The backend's own no-op line would read as a vacuum done.
+            self.assertNotIn("vacuum: no-op", out)
+            self.assertNotIn("Note: counted", out)
+            self.assertEqual(self.environments(), ["linux-sim"])
+            store = Storage.mariadb(backends.settings())
+            self.addCleanup(store.close)
+            self.assertEqual(store.list_streams(""), [])
+            self.assertEqual(store.prune_empty_streams(), [])
