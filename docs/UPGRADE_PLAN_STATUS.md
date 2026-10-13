@@ -4408,3 +4408,38 @@ MariaDB 12.3 sacrificial database. CI's two 10.3 legs are the authority.
 No browser has rendered the UI; the DOM-shim walk covered the four viewers
 with a 55,534-character output reaching the clipboard whole while the
 `<pre>` showed 20,000.
+
+## Design review: the dashboard's charts split assigned from unassigned, round 0 (2026-10-13)
+
+The owner asked for one UI tweak: the three charts on the home dashboard
+should show, in a different colour of the stack, which failing tests are
+assigned to someone and which are nobody's yet. Recon showed the payload
+carries no assigned count for any of the three and that the per-day trend
+can only be split by "assigned now", so the change is a backend brief and
+a UI brief against a JSON contract, on the performance trigger paths: the
+smallest shape of an arc. §0 was agreed in chat (all three charts; segments
+ordered unassigned red, assigned, muted grey) and round 0 was written by
+the owning agents: `docs/design/charts-assigned-split-r0.md` on branch
+`design-charts-assigned-split`, with a Claude Doc as the viewer.
+
+Measured in round 0 (statement timings, in-process, 48 alternated calls,
+median, on a scratch copy of the production-scale SQLite seed, 7 nights):
+the one new statement for both bar charts, driven from the assignments
+table, 0.25 ms at 65 assignments and 0.38 ms at 1,000; the trend's split,
+which must read `runs`, 5.0 ms at 65 and 18.4 ms at 1,000 with the join
+forced to start from the assignments, 29 ms as a plain join when SQLite
+scanned the window. The rejected alternative, an assignments column on the
+per-environment pass, measured +3 ms on the largest environment. MariaDB
+not timed. Production estimates are labelled as such in the doc.
+
+Decided so far (the performance design pass, pending the owner): the trend's
+split is served as its own `parts=assigned_trend`, fetched by the page in
+parallel with the headline, never in the headline (an estimated 5 to 10 ms
+on the cold first paint, growing with the window and the release streams);
+the MariaDB join order is checked by hand on a production-scale copy during
+`/perf-ab`, not by a CI EXPLAIN guard, because the CI leg's few-row tables
+make such a guard flaky one way and meaningless the other. Open for the
+owner: thirteen decisions with verdict slots and six questions; the main
+session recommends deferring the derivation of the assigned-open tile and
+the queue counts from the new statement to its own package. Nothing is
+built; no migration.
