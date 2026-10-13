@@ -4443,3 +4443,34 @@ owner: thirteen decisions with verdict slots and six questions; the main
 session recommends deferring the derivation of the assigned-open tile and
 the queue counts from the new statement to its own package. Nothing is
 built; no migration.
+
+## Design review: charts split assigned from unassigned, round 0 reviewed and frozen (2026-10-13)
+
+The owner was taken through all thirteen decisions and six open questions
+in chat the same day, each offered as the recommended position with its
+alternatives; every verdict is the position as written, with decision 10
+(deriving the assigned-open tile and the queue counts from the new
+statement) deferred to its own package as recommended. The verdicts are
+captured verbatim in the doc's §7 and the doc is frozen; §8 is the master
+plan. A fresh-eyes pass read the frozen doc for coherence and the
+publication gate before this commit.
+
+Decided, in short: a new mid-blue token for "assigned"; the trend stacks
+unassigned, assigned, muted and unexpected pass with an "as they stand
+now" caption and a seven-column table; the bars split in the same order
+under a legend per card, end label and sort unchanged; one wording helper;
+the bar renderer gains a segments list with today's DOM pinned for callers
+that pass none. Backend: one assignments-driven statement (FAIL only) for
+both bar charts, memoized on the mute epoch; the trend's split as its own
+`parts=assigned_trend`, fetched in parallel with the headline, with
+`FAIL_ASSIGNED` and `FAIL_MUTED` disjoint; the MariaDB join order checked
+by hand during `/perf-ab`, a `STRAIGHT_JOIN` hook only if needed; no
+cutoff on the trend statement's growth, timed at 90 days and 1,000
+assignments on a widened seed.
+
+The build is **WP-43**, branch `wp-43-charts-assigned-split`, registered
+in the handover: item 0 the widened seed (performance-engineer, parallel),
+item 1 the backend brief (trigger paths, `/perf-ab` as 1p with the by-hand
+EXPLAIN), item 2 the UI brief on top of item 1's commit (first paint; the
+fetch-sequencing guard is its gate), item 3 the drop. Small path, item by
+item.

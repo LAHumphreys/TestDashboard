@@ -104,7 +104,7 @@ from 2026-10-01; harmless, remove when it unlocks.
 
 | Plan | Spec | Branch | Status |
 |---|---|---|---|
-| none registered | | | |
+| WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8 (frozen 2026-10-13) | `wp-43-charts-assigned-split` (not yet created; off `master` once the drop of 2026-10-12 lands) | registered, nothing built; small path, item 0 (seed) and item 1 (backend) first |
 
 ## Needs a person, not a commit
 
