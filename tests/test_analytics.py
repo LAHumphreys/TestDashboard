@@ -24,7 +24,7 @@ from testboard.analytics import (
     summarize_rollup,
 )
 from testboard.model import Result, StoredRun, format_iso
-from testboard.storage import RollupCount, ScriptHourBucket
+from testboard.storage import AssignedCell, RollupCount, ScriptHourBucket
 
 # A fixed, deterministic "now": Sunday 2026-07-26 12:00:00 UTC.
 NOW = datetime.datetime(2026, 7, 26, 12, 0, 0)
@@ -974,6 +974,40 @@ class SummarizeRollupTest(unittest.TestCase):
                  retired=True),
         ]).by_environment
         self.assertEqual([r.environment for r in rollups], ["linux-sim"])
+
+    def test_assigned_sums_the_unmuted_cells_per_environment(self) -> None:
+        """WP-43: ``assigned`` is the environment's FAIL tests with an
+        assignee and no live mute, a subset of ``failed``; the muted
+        ones are already outside ``failed`` and stay outside this."""
+        counts = [
+            cell(Result.FAIL, Result.PASS, count=5),
+            cell(Result.FAIL, Result.FAIL, count=3),
+            cell(Result.FAIL, Result.FAIL, count=2, environment="win-sim"),
+            cell(Result.PASS, Result.PASS, count=10, environment="mac-sim"),
+        ]
+        muted = [cell(Result.FAIL, Result.FAIL, count=1)]
+        assigned = [
+            AssignedCell("linux-sim", "a.py", False, 2),
+            AssignedCell("linux-sim", "b.py", False, 1),
+            AssignedCell("linux-sim", "b.py", True, 1),
+            AssignedCell("win-sim", "a.py", False, 2),
+            # An environment the rollup does not hold adds nothing.
+            AssignedCell("gone-sim", "a.py", False, 4),
+        ]
+        rollups = {
+            r.environment: r for r in summarize_rollup(
+                counts, muted=muted, assigned=assigned).by_environment}
+        self.assertEqual(
+            {name: (r.failed, r.assigned, r.muted)
+             for name, r in rollups.items()},
+            {"linux-sim": (7, 3, 1), "win-sim": (2, 2, 0),
+             "mac-sim": (0, 0, 0)})
+        for rollup in rollups.values():
+            self.assertLessEqual(rollup.assigned, rollup.failed)
+
+    def test_assigned_defaults_to_zero(self) -> None:
+        for rollup in summarize_rollup(self.counts()).by_environment:
+            self.assertEqual(rollup.assigned, 0)
 
     def test_empty_estate(self) -> None:
         summary = summarize_rollup([])

@@ -638,6 +638,41 @@ export function failingWithMuted(count, muted) {
   return count.toLocaleString() + (suffix ? " (" + suffix + ")" : "");
 }
 
+/** A failing figure split three ways (WP-43): of the unmuted `failing`,
+ * the `assigned` ones someone has and the rest nobody has yet, with the
+ * `muted` failures beside them. Returns the three counts, `words` for a
+ * screen reader ("8 unassigned, 6 assigned, 4 muted", zero parts left
+ * out, "none failing" when all three are zero) and the tooltip's `rows`,
+ * one per part in the bars' order, a zero part included: "0 unassigned"
+ * is the good news. The one place the words are spelled, so the two bar
+ * charts cannot drift apart. */
+export function failingSplit(failing, assigned, muted) {
+  const parts = {
+    assigned: assigned || 0,
+    muted: muted || 0,
+  };
+  parts.unassigned = Math.max(0, (failing || 0) - parts.assigned);
+  const order = [
+    { key: "unassigned", swatchClass: "swatch-fail" },
+    { key: "assigned", swatchClass: "swatch-assigned" },
+    { key: "muted", swatchClass: "swatch-muted" },
+  ];
+  const said = order
+    .filter((part) => parts[part.key] > 0)
+    .map((part) => parts[part.key].toLocaleString() + " " + part.key);
+  return {
+    unassigned: parts.unassigned,
+    assigned: parts.assigned,
+    muted: parts.muted,
+    words: said.length ? said.join(", ") : "none failing",
+    rows: order.map((part) => ({
+      swatchClass: part.swatchClass,
+      label: part.key,
+      value: parts[part.key].toLocaleString(),
+    })),
+  };
+}
+
 /** The ONE list of mute durations, in hours (the wire unit; the server
  * accepts any whole number 1..168, the UI offers these). Every control
  * that sets a duration -- the selection bar, the review panel, the test

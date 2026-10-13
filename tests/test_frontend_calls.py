@@ -33,10 +33,14 @@ Python 3.6 compatible; standard library only.
 """
 
 import io
+import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 STATIC_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
@@ -5685,16 +5689,545 @@ class MutedBesideFailingTest(unittest.TestCase):
         self.assertIn("status.muted_still_failing", status)
 
     def test_the_charts_draw_a_grey_extension(self) -> None:
+        """Widened at WP-43 from "the spelling `extra: entry.muted || 0`
+        appears twice" to "both bar callers draw a muted segment": both
+        now go through failingBar(), which draws the muted failures as
+        the last segment of the split or, for a payload without the
+        split, as the WP-40 grey extension; barRows draws either grey."""
         app = _strip_comments(read("app.js"))
-        self.assertIn("extra: entry.muted || 0", app)
-        self.assertEqual(app.count("extra: entry.muted || 0"), 2)
-        self.assertIn("item.extra", _strip_comments(read("charts.js")))
+        bars = _function_body(app, "function renderBars()")
+        self.assertEqual(bars.count("failingBar("), 2)
+        bar = _function_body(app, "function failingBar(")
+        self.assertIn("extra: entry.muted || 0", bar)
+        self.assertIn('{ value: split.muted, className: "bar-muted" }', bar)
+        charts = _strip_comments(read("charts.js"))
+        self.assertIn("item.extra", charts)
+        self.assertIn('className: "bar-muted"', charts)
 
     def test_the_watch_failing_stat_carries_the_suffix(self) -> None:
         card = _strip_comments(_function_body(
             read("watch.js"), "function buildOkCard("))
         self.assertIn('buildStat("Failing", card.failing, card.muted)', card)
         self.assertNotIn('buildStat("Muted"', card)
+
+
+class AssignedSplitTest(unittest.TestCase):
+    """WP-43 (docs/design/charts-assigned-split-r0.md §3): the three
+    charts split the red three ways, unassigned, assigned, muted, so a
+    glance says how much of it is nobody's yet. The order, the words and
+    the fallback die silently: a swapped pair still draws, and an older
+    server's payload drawn as all-red still looks like a chart."""
+
+    _ORDER = ("FAIL_UNASSIGNED", "FAIL_ASSIGNED", "FAIL_MUTED",
+              "UNEXPECTED_PASS")
+
+    def _app(self) -> str:
+        return _strip_comments(read("app.js"))
+
+    def test_both_bar_callers_draw_through_one_split(self) -> None:
+        bars = _function_body(self._app(), "function renderBars()")
+        self.assertEqual(bars.count("failingBar("), 2, bars)
+        self.assertEqual(bars.count("failingLegend("), 2)
+
+    def test_the_bars_split_unassigned_assigned_muted(self) -> None:
+        bar = _function_body(self._app(), "function failingBar(")
+        order = [bar.index(token) for token in (
+            '{ value: split.unassigned, className: "fill-fail" }',
+            '{ value: split.assigned, className: "bar-assigned" }',
+            '{ value: split.muted, className: "bar-muted" }')]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("failingSplit(failing, entry.assigned, entry.muted)",
+                      bar)
+        self.assertIn("tooltipRows: split.rows.concat(moreRows)", bar)
+        self.assertIn("split.words", bar)
+        # An older payload: the WP-40 bar, never all red.
+        self.assertIn('typeof entry.assigned !== "number"', bar)
+        self.assertLess(bar.index('typeof entry.assigned !== "number"'),
+                        bar.index("failingSplit("))
+
+    def test_the_trend_series_bottom_first(self) -> None:
+        app = self._app()
+        series = app[app.index("const TREND_SPLIT_SERIES = ["):]
+        series = series[:series.index("];")]
+        keys = re.findall(r'key: "(\w+)"', series)
+        self.assertEqual(tuple(keys), self._ORDER)
+        self.assertIn("const FAILING_SPLIT_LEGEND = "
+                      "TREND_SPLIT_SERIES.slice(0, 3)", app)
+
+    def test_the_unassigned_part_is_derived_and_floored(self) -> None:
+        body = _function_body(self._app(), "function splitNights(")
+        self.assertRegex(
+            body, r"FAIL_UNASSIGNED: Math\.max\(\s*0, night\.FAIL - "
+                  r"part\.FAIL_ASSIGNED - part\.FAIL_MUTED\)")
+        # Merged by date, and a night the part does not carry means the
+        # whole card draws today's two series.
+        self.assertIn("byDate.get(night.date)", body)
+        self.assertIn("return null", body)
+
+    def test_the_home_trend_counts_days(self) -> None:
+        body = _function_body(self._app(), "function renderTrend()")
+        self.assertIn('{ unit: "day" }', body)
+        self.assertIn("isSplit ? TREND_SPLIT_SERIES : TREND_SERIES", body)
+
+    def test_the_caption_ships_under_the_plot(self) -> None:
+        html = read("index.html")
+        caption = ("Assigned and muted are as they stand now: a day's "
+                   "columns recolour as tests are taken.")
+        self.assertEqual(html.count(caption), 1)
+        at = html.index(caption)
+        self.assertLess(html.index('id="trend-chart"'), at)
+        self.assertLess(at, html.index("Data table", at))
+        tag = html[html.rindex("<p", 0, at):at]
+        self.assertIn('id="trend-split-caption"', tag)
+        # The no-split state is the markup's default: nothing about a
+        # split shows under an empty or two-series plot.
+        self.assertIn(" hidden>", tag)
+
+    def test_the_table_twin_has_the_three_parts_after_failed(self) -> None:
+        html = read("index.html")
+        table = html[html.index('id="trend-table"'):]
+        table = table[:table.index("</thead>")]
+        self.assertEqual(
+            re.findall(r"<th[^>]*>([^<]+)</th>", table),
+            ["Day", "Failed", "Unassigned", "Assigned", "Muted",
+             "Unexpected pass", "Runs"])
+        self.assertEqual(table.count("trend-split-col"), 3)
+        self.assertEqual(table.count('trend-split-col" hidden>'), 3)
+        body = _function_body(self._app(), "function renderTrend()")
+        self.assertRegex(
+            body, r"\[night\.FAIL, night\.FAIL_UNASSIGNED, "
+                  r"night\.FAIL_ASSIGNED,\s*night\.FAIL_MUTED, "
+                  r"night\.UNEXPECTED_PASS, night\.total\]")
+
+    def test_the_words_have_one_helper(self) -> None:
+        api = _strip_comments(read("api.js"))
+        helper = _function_body(api, "export function failingSplit(")
+        self.assertIn('"none failing"', helper)
+        for key in ("unassigned", "assigned", "muted"):
+            self.assertIn('key: "' + key + '"', helper)
+        app = self._app()
+        self.assertEqual(app.count("failingSplit("), 1)
+        self.assertEqual(
+            _unassigned_literals(app), [],
+            "app.js spells the unassigned words itself; failingSplit() "
+            "in api.js is their one home")
+
+    def test_the_unassigned_detector_can_fail(self) -> None:
+        planted = 'value: split.unassigned + " unassigned",'
+        self.assertEqual(_unassigned_literals(planted), ['" unassigned"'])
+
+    def test_every_new_class_has_a_rule_and_a_user(self) -> None:
+        css = read("style.css")
+        code = "".join(_strip_comments(text) for text in scripts().values())
+        self.assertIn("--c-assigned: #3b6cc0;", css)
+        for name in ("swatch-assigned", "swatch-muted", "seg-assigned",
+                     "seg-muted", "bar-assigned"):
+            self.assertRegex(css, r"\." + name + r"\b", name)
+            self.assertIn('"' + name + '"', code, name)
+        for rule in (".tt-key.swatch-assigned", ".tt-key.swatch-muted",
+                     ".legend-swatch.swatch-assigned",
+                     ".legend-swatch.swatch-muted"):
+            self.assertIn(rule, css)
+
+    def test_barrows_draws_segments_on_one_path(self) -> None:
+        body = _strip_comments(_function_body(
+            read("charts.js"), "export function barRows("))
+        self.assertIn("item.segments ||", body)
+        self.assertIn('className: "bar-muted"', body)
+        loop = body[body.index("for (const item of items)"):]
+        self.assertIn("segmentsOf(item)", loop.split("\n")[1])
+        self.assertIn("index === 0 || segment.value > 0", body)
+        treemap = _function_body(
+            read("charts.js"), "export function treemapBoxes(")
+        self.assertNotIn("segments", treemap)
+
+
+def _unassigned_literals(source: str) -> List[str]:
+    """String literals in *source* that spell the word "unassigned",
+    bar the wire parameter and the browse chip's element id."""
+    return [
+        literal for literal in re.findall(r'"[^"\n]*"', source)
+        if re.search(r"\bunassigned\b", literal)
+        and literal not in ('"unassigned"', '"unassigned-toggle"')
+    ]
+
+
+class AssignedTrendFetchTest(unittest.TestCase):
+    """WP-43 §1, decisions 8 and 13: the trend's split is its own part,
+    sent in the SAME parallel batch as the headline and never chained
+    after it; only the trend card waits for it. A chained or awaited
+    split would still work, just later, which is why it is pinned."""
+
+    def _app(self) -> str:
+        return _strip_comments(read("app.js"))
+
+    def test_the_part_carries_the_headlines_scope(self) -> None:
+        app = self._app()
+        url = _function_body(app, "function assignedTrendUrl()")
+        self.assertIn('parts: "assigned_trend"', url)
+        self.assertIn("apiScope()", url)
+        self.assertIn("apiScope()", _function_body(app, "function summaryUrl()"))
+
+    def test_it_is_fetched_in_the_batch_and_after_a_take(self) -> None:
+        app = self._app()
+        self.assertEqual(app.count("fetchJson(assignedTrendUrl())"), 1)
+        self.assertEqual(len(_call_arguments(app, "fetchAssignedTrend")), 2)
+        refresh = _function_body(app, "async function refreshAll(")
+        # The page-wide dim waits for the headline, the queue and the
+        # browse page only; the trend card's own dim waits for the split.
+        self.assertIn(
+            "await Promise.all([headlinePart, queuePart, browsePart])",
+            refresh)
+        self.assertIn(
+            "Promise.all([headlinePart, trendSplitPart]).then(", refresh)
+        self.assertIn('trendCard.classList.add("is-loading")', refresh)
+        self.assertIn('trendCard.classList.remove("is-loading")', refresh)
+        headline = refresh[refresh.index("const headlinePart = "):
+                           refresh.index("const trendSplitPart = ")]
+        self.assertNotIn("trendSplit", headline.replace(
+            "trendInputLanded()", ""))
+        self.assertNotIn("fetchAssignedTrend", headline)
+        coalescer = _function_body(app, "async function fetchSummary(")
+        self.assertIn("fetchAssignedTrend(),", coalescer)
+        self.assertIn("state.trendSplit = results[2]", coalescer)
+
+    def test_the_first_paint_does_not_wait_for_it(self) -> None:
+        app = self._app()
+        headline = _function_body(app, "function renderHeadline()")
+        self.assertIn("renderBars()", headline)
+        self.assertNotIn("renderTrend()", headline)
+        self.assertNotIn("renderCharts()", headline)
+        refresh = _function_body(app, "async function refreshAll(")
+        self.assertIn("if (trendInputs === 2)", refresh)
+
+    def test_it_never_rejects_and_never_hangs(self) -> None:
+        body = _function_body(self._app(), "function fetchAssignedTrend()")
+        self.assertIn("window.setTimeout(", body)
+        self.assertIn("() => resolve(null), ASSIGNED_TREND_TIMEOUT_MS", body)
+        self.assertIn("resolve(null); });", body)
+
+
+NODE = shutil.which("node")
+REPO_DIR = os.path.dirname(STATIC_DIR)
+
+#: The shim walk: the real ES modules over tools/dev/net/domshim.mjs with
+#: fetch answered from a fixture file. argv: repo root, fixture path.
+_SHIM_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, "http://127.0.0.1/index.html");
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+const shape = (container) => container.children
+  .filter((row) => row.className === "bar-row")
+  .map((row) => {
+    const track = row.children.find((c) => c.className.startsWith("bar-track"));
+    return { track: track.className,
+      fills: track.children.map((f) => [f.className, f.style.width]) };
+  });
+const out = {};
+if (fixture.bars) {
+  const { barRows } = await import(pathToFileURL(root + "/static/charts.js").href);
+  for (const [name, call] of Object.entries(fixture.bars)) {
+    const box = document.createElement("div");
+    barRows(box, call.items, call.options);
+    out[name] = shape(box);
+  }
+} else {
+  const asked = [];
+  globalThis.fetch = (url) => {
+    const u = new URL(String(url), "http://127.0.0.1/");
+    asked.push(u.searchParams.get("parts") || u.pathname);
+    const part = u.searchParams.get("parts");
+    let status = 200;
+    let body = [];
+    if (part === "headline") {
+      body = fixture.headline;
+    } else if (part === "assigned_trend") {
+      if (fixture.part === "hang") {
+        return new Promise(() => {});
+      }
+      status = fixture.part === null ? 400 : 200;
+      body = fixture.part === null ? { error: "parts: unknown" } : fixture.part;
+    } else if (part === "queue") {
+      body = { generated_at: fixture.headline.generated_at,
+        stale_before: fixture.headline.stale_before,
+        queue: { tests: [], total: 0 } };
+    } else if (u.pathname.endsWith("api/dashboard")) {
+      body = { tests: [], total: 0 };
+    }
+    return Promise.resolve({ ok: status < 400, status,
+      text: async () => JSON.stringify(body) });
+  };
+  await import(pathToFileURL(root + "/static/app.js").href);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const legend = (node) => {
+    const row = node.children.find((c) => c.className === "chart-legend");
+    return row ? row.children.map((item) => item.textContent) : null;
+  };
+  const classes = (node, found) => {
+    for (const child of node.children || []) {
+      found.push(...String(child.className || "").split(/\s+/));
+      classes(child, found);
+    }
+    return found;
+  };
+  const firstRow = byId["trend-table-body"].children[0];
+  Object.assign(out, {
+    asked,
+    tilesPainted: byId["stat-tiles"].children.length > 0,
+    dimmed: Object.keys(byId).filter(
+      (id) => byId[id].classList.contains("is-loading")).sort(),
+    trendLegend: legend(byId["trend-chart"]),
+    envLegend: legend(byId["env-chart"]),
+    scriptsLegend: legend(byId["scripts-chart"]),
+    envAssigned: classes(byId["env-chart"], []).includes("bar-assigned"),
+    envRows: shape(byId["env-chart"]),
+    envAria: byId["env-chart"].children
+      .filter((c) => c.className === "bar-row")
+      .map((c) => c.attributes["aria-label"] || null),
+    captionHidden: byId["trend-split-caption"].hidden,
+    tableRow: firstRow ? firstRow.children.map((td) => td.textContent) : null,
+  });
+}
+console.log(JSON.stringify(out));
+process.exit(0);
+"""
+
+
+def _shim(fixture: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the shim driver over *fixture*; its JSON answer, typed at the
+    boundary by the caller's assertions."""
+    with tempfile.TemporaryDirectory() as scratch:
+        driver = os.path.join(scratch, "driver.mjs")
+        data = os.path.join(scratch, "fixture.json")
+        with io.open(driver, "w", encoding="utf-8") as handle:
+            handle.write(_SHIM_DRIVER)
+        with io.open(data, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(fixture))
+        done = subprocess.run(
+            [str(NODE), driver, REPO_DIR, data], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+    if done.returncode != 0:
+        raise AssertionError("shim driver failed: " + done.stderr[-2000:])
+    answer = json.loads(done.stdout.strip().split("\n")[-1])  # type: Dict[str, Any]
+    return answer
+
+
+#: The class lists and widths ``barRows`` drew at the base commit
+#: (the pre-WP-43 charts.js) for a caller passing neither ``segments`` nor
+#: ``extra``, and for the WP-40 ``extra`` caller; captured over the shim
+#: from that commit's charts.js. One path draws both now, and it must
+#: draw exactly these.
+_BASE_BARS = {
+    "plain": {
+        "items": [{"label": "a", "value": 5}, {"label": "b", "value": 0},
+                  {"label": "c", "value": 1}],
+        "options": {},
+        "drawn": [
+            {"track": "bar-track", "fills": [["bar-fill fill-fail", "100%"]]},
+            {"track": "bar-track", "fills": [["bar-fill fill-fail", "0%"]]},
+            {"track": "bar-track", "fills": [["bar-fill fill-fail", "20%"]]},
+        ],
+    },
+    "extra": {
+        "items": [{"label": "a", "value": 7, "extra": 3},
+                  {"label": "b", "value": 0, "extra": 2},
+                  {"label": "c", "value": 4, "extra": 0},
+                  {"label": "d", "value": 1}],
+        "options": {},
+        "drawn": [
+            {"track": "bar-track bar-track-split",
+             "fills": [["bar-fill fill-fail bar-fill-open", "70%"],
+                       ["bar-fill bar-muted", "30%"]]},
+            {"track": "bar-track bar-track-split",
+             "fills": [["bar-fill fill-fail bar-fill-open", "0%"],
+                       ["bar-fill bar-muted", "20%"]]},
+            {"track": "bar-track", "fills": [["bar-fill fill-fail", "40%"]]},
+            {"track": "bar-track", "fills": [["bar-fill fill-fail", "10%"]]},
+        ],
+    },
+    "fillClass": {
+        "items": [{"label": "a", "value": 6}],
+        "options": {"fillClass": "fill-time"},
+        "drawn": [
+            {"track": "bar-track", "fills": [["bar-fill fill-time", "100%"]]},
+        ],
+    },
+}  # type: Dict[str, Dict[str, Any]]
+
+
+def _index_ids() -> List[str]:
+    return re.findall(r'id="([^"]+)"', read("index.html"))
+
+
+def _headline(assigned: bool) -> Dict[str, Any]:
+    """A small headline payload in the server's shape; ``assigned=False``
+    is a server from before WP-43."""
+    nights = [
+        {"date": "2026-10-0" + str(day), "PASS": 50, "FAIL": 9,
+         "FAILED_AS_EXPECTED": 1, "UNEXPECTED_PASS": 2, "total": 62}
+        for day in (1, 2, 3)
+    ]
+    environments = [
+        {"environment": "env-a", "total_tests": 80, "failed": 14,
+         "new_failures": 3, "unexpected_passes": 1, "not_run": 0,
+         "muted": 4, "assigned": 6},
+        {"environment": "env-b", "total_tests": 40, "failed": 0,
+         "new_failures": 0, "unexpected_passes": 0, "not_run": 0,
+         "muted": 2, "assigned": 0},
+    ]
+    scripts_rows = [{"environment": "env-a", "script": "s1.py",
+                     "failing": 5, "muted": 1, "assigned": 2}]
+    if not assigned:
+        for entry in environments + scripts_rows:
+            del entry["assigned"]
+    return {
+        "generated_at": "2026-10-03T12:00:00", "environment": None,
+        "product": None, "stream": 1, "covered_passes": 0, "products": [],
+        "environments": ["env-a", "env-b"], "scripts": ["s1.py"],
+        "assignees": [], "assignment_streams": [], "recent_hours": 36,
+        "stale_before": "2026-10-02T00:00:00",
+        "latest_run_time": "2026-10-03T04:00:00",
+        "environment_updated": {"env-a": "2026-10-03T04:00:00",
+                                "env-b": "2026-10-03T04:00:00"},
+        "queue_cap": 500,
+        "status": {
+            "total_tests": 120, "ran_recently": 120, "not_run": 0,
+            "retired": 0,
+            "results": {"PASS": 98, "FAIL": 14, "FAILED_AS_EXPECTED": 6,
+                        "UNEXPECTED_PASS": 2},
+            "recent_results": {"PASS": 98, "FAIL": 14,
+                               "FAILED_AS_EXPECTED": 6,
+                               "UNEXPECTED_PASS": 2},
+            "new_failures": 3, "still_failing": 11, "fixed": 0,
+            "assigned_open": 6, "muted": 6, "muted_new_failures": 0,
+            "muted_still_failing": 6, "muted_total": 6},
+        "trend": {"days": 3, "from": "2026-10-01", "to": "2026-10-03",
+                  "nights": nights},
+        "by_environment": environments,
+        "top_failing_scripts": scripts_rows,
+        "queue_totals": {"new_failures": 3, "still_failing": 11,
+                         "muted": 6, "fixed": 0, "unexpected_passes": 2,
+                         "not_run": 0, "assigned": 6, "mine": 0},
+    }
+
+
+def _part() -> Dict[str, Any]:
+    return {"trend": {"days": 3, "from": "2026-10-01", "to": "2026-10-03",
+                      "nights": [
+                          {"date": "2026-10-0" + str(day),
+                           "FAIL_ASSIGNED": 3, "FAIL_MUTED": 2}
+                          for day in (1, 2, 3)]}}
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class AssignedSplitDomTest(unittest.TestCase):
+    """WP-43 over the DOM shim (``tools/dev/net/domshim.mjs``): the real
+    modules, run in node where it is installed, with fetch answered from
+    a fixture. No browser; it proves DOM shape and wiring, not colour."""
+
+    def test_barrows_draws_the_base_dom_for_legacy_callers(self) -> None:
+        answer = _shim({"ids": [], "bars": {
+            name: {"items": case["items"], "options": case["options"]}
+            for name, case in _BASE_BARS.items()}})
+        for name, case in _BASE_BARS.items():
+            self.assertEqual(answer[name], case["drawn"], name)
+
+    def test_segments_skip_later_zeros_and_open_all_but_the_last(
+            self) -> None:
+        answer = _shim({"ids": [], "bars": {"split": {"options": {}, "items": [
+            {"label": "a", "value": 10, "segments": [
+                {"value": 4, "className": "fill-fail"},
+                {"value": 6, "className": "bar-assigned"},
+                {"value": 0, "className": "bar-muted"}]},
+            {"label": "b", "value": 0, "segments": [
+                {"value": 0, "className": "fill-fail"},
+                {"value": 0, "className": "bar-assigned"},
+                {"value": 5, "className": "bar-muted"}]},
+            {"label": "c", "value": 2, "segments": [
+                {"value": 0, "className": "fill-fail"},
+                {"value": 2, "className": "bar-assigned"},
+                {"value": 0, "className": "bar-muted"}]},
+        ]}}})
+        self.assertEqual(answer["split"], [
+            {"track": "bar-track bar-track-split",
+             "fills": [["bar-fill fill-fail bar-fill-open", "40%"],
+                       ["bar-fill bar-assigned", "60%"]]},
+            {"track": "bar-track bar-track-split",
+             "fills": [["bar-fill fill-fail bar-fill-open", "0%"],
+                       ["bar-fill bar-muted", "50%"]]},
+            {"track": "bar-track bar-track-split",
+             "fills": [["bar-fill fill-fail bar-fill-open", "0%"],
+                       ["bar-fill bar-assigned", "20%"]]},
+        ])
+
+    def test_an_older_server_draws_todays_charts(self) -> None:
+        """No ``assigned`` and a 400 for the part: two series, the
+        four-column table, no blue, no bar legend, the WP-40 bars."""
+        answer = _shim({"ids": _index_ids(),
+                        "headline": _headline(False), "part": None})
+        self.assertEqual(answer["trendLegend"], ["Failed", "Unexpected pass"])
+        self.assertEqual(answer["tableRow"], ["Oct 1", "9", "2", "62"])
+        self.assertTrue(answer["captionHidden"])
+        self.assertFalse(answer["envAssigned"])
+        self.assertIsNone(answer["envLegend"])
+        self.assertIsNone(answer["scriptsLegend"])
+        self.assertEqual(answer["envAria"], [None, None])
+        self.assertEqual(
+            [fill[0] for fill in answer["envRows"][0]["fills"]],
+            ["bar-fill fill-fail bar-fill-open", "bar-fill bar-muted"])
+
+    def test_the_split_draws_in_all_three_charts(self) -> None:
+        answer = _shim({"ids": _index_ids(),
+                        "headline": _headline(True), "part": _part()})
+        self.assertEqual(answer["trendLegend"], [
+            "Unassigned", "Assigned", "Muted", "Unexpected pass"])
+        self.assertEqual(answer["tableRow"],
+                         ["Oct 1", "9", "4", "3", "2", "2", "62"])
+        self.assertFalse(answer["captionHidden"])
+        self.assertEqual(answer["envLegend"], ["Unassigned", "Assigned", "Muted"])
+        self.assertEqual(answer["scriptsLegend"],
+                         ["Unassigned", "Assigned", "Muted"])
+        self.assertEqual(answer["envAria"], [
+            "env-a: 14 failing, 8 unassigned, 6 assigned, 4 muted",
+            "env-b: 0 failing, 2 muted"])
+        self.assertEqual(
+            [fill[0] for fill in answer["envRows"][0]["fills"]],
+            ["bar-fill fill-fail bar-fill-open",
+             "bar-fill bar-assigned bar-fill-open", "bar-fill bar-muted"])
+
+    def test_a_failed_part_costs_the_trend_its_split_only(self) -> None:
+        answer = _shim({"ids": _index_ids(),
+                        "headline": _headline(True), "part": None})
+        self.assertEqual(answer["trendLegend"], ["Failed", "Unexpected pass"])
+        self.assertEqual(answer["envLegend"], ["Unassigned", "Assigned", "Muted"])
+
+    def test_a_hung_part_holds_up_nothing_but_the_trend(self) -> None:
+        """The fetch-sequencing gate, behaviourally: the part is asked
+        for beside the headline, before either answers, and while it
+        hangs the tiles and both bar charts paint and the trend waits."""
+        answer = _shim({"ids": _index_ids(),
+                        "headline": _headline(True), "part": "hang"})
+        asked = answer["asked"]
+        self.assertIn("assigned_trend", asked)
+        self.assertLess(asked.index("headline"), asked.index("queue"))
+        self.assertLess(asked.index("assigned_trend"), asked.index("queue"))
+        self.assertTrue(answer["tilesPainted"])
+        self.assertEqual(answer["envLegend"], ["Unassigned", "Assigned", "Muted"])
+        self.assertIsNone(answer["trendLegend"])
+        # Only the trend card is still dimmed; every section has lifted.
+        self.assertEqual(answer["dimmed"], ["trend-card"])
+
+    def test_both_inputs_in_lift_every_dim(self) -> None:
+        answer = _shim({"ids": _index_ids(),
+                        "headline": _headline(True), "part": _part()})
+        self.assertEqual(answer["dimmed"], [])
 
 
 def _call_arguments(source: str, callee: str) -> List[str]:

@@ -76,6 +76,25 @@ export function hideTooltip() {
   }
 }
 
+/* ---------------- legend ---------------- */
+
+/**
+ * The legend row every chart here draws above its plot: one swatch and
+ * label per entry, `entries` being [{label, swatchClass}] in reading
+ * order. One builder, so the trend's legend and the bar cards' (WP-43)
+ * cannot drift apart.
+ */
+function chartLegend(entries) {
+  const legend = el("div", "chart-legend");
+  for (const entry of entries) {
+    const item = el("span", "legend-item");
+    item.appendChild(el("span", "legend-swatch " + entry.swatchClass));
+    item.appendChild(el("span", "legend-label", entry.label));
+    legend.appendChild(item);
+  }
+  return legend;
+}
+
 /* ---------------- SVG helpers ---------------- */
 
 function svgEl(tag, attrs) {
@@ -161,14 +180,7 @@ export function stackedColumnChart(container, nights, series, options) {
   const unit = opts.unit || "night";
   clearNode(container);
 
-  const legend = el("div", "chart-legend");
-  for (const s of series) {
-    const item = el("span", "legend-item");
-    item.appendChild(el("span", "legend-swatch " + s.swatchClass));
-    item.appendChild(el("span", "legend-label", s.label));
-    legend.appendChild(item);
-  }
-  container.appendChild(legend);
+  container.appendChild(chartLegend(series));
 
   const width = 560;
   const height = 190;
@@ -330,24 +342,46 @@ export function stackedColumnChart(container, nights, series, options) {
  * the max value; every bar carries its value as a direct end label, so the
  * tooltip only adds context. Rows with onClick become real buttons.
  *
- * `item.extra` (optional, a count) is a SECOND segment appended to the
- * end of the bar in the muted grey (WP-40: the muted failures beside
- * the unmuted ones). The scale takes the longest value + extra, so the
- * grey part is drawn to the same scale as the bar it extends; the end
- * label stays the item's own `value`. Callers that never pass `extra`
- * draw exactly what they always drew.
+ * `item.segments` (optional, [{value, className}], left to right) splits
+ * the bar into parts (WP-43: unassigned, assigned, muted). The scale is
+ * the longest segment sum; the end label and the aria number stay the
+ * item's own `value`. Every non-zero segment gets the 1.5% floor, a zero
+ * segment after the first is not drawn, and every drawn segment but the
+ * last gives up its rounded end to the one after it.
+ *
+ * `item.extra` (optional, a count) is the WP-40 shape of the same thing:
+ * a grey muted segment after the bar. It is normalised into `segments`
+ * on the loop's first line, so one path draws both. An item with neither
+ * key draws exactly what it always drew: one fill, 0% included.
+ *
+ * `item.ariaLabel` (optional) names the row for a screen reader, and
+ * `options.legend` ([{label, swatchClass}], optional) draws the trend's
+ * legend markup above the rows.
  */
 export function barRows(container, items, options) {
   clearNode(container);
   const opts = options || {};
-  const max = Math.max(
-    1, ...items.map((item) => item.value + (item.extra || 0)));
+  const fillClass = opts.fillClass || "fill-fail";
+  const segmentsOf = (item) => item.segments || [
+    { value: item.value, className: fillClass },
+  ].concat(item.extra > 0
+    ? [{ value: item.extra, className: "bar-muted" }] : []);
+  const max = Math.max(1, ...items.map((item) => segmentsOf(item)
+    .reduce((sum, segment) => sum + segment.value, 0)));
+  if (opts.legend) {
+    container.appendChild(chartLegend(opts.legend));
+  }
 
   for (const item of items) {
+    const drawn = segmentsOf(item)
+      .filter((segment, index) => index === 0 || segment.value > 0);
     const row = el(item.onClick ? "button" : "div", "bar-row");
     if (item.onClick) {
       row.type = "button";
       row.addEventListener("click", item.onClick);
+    }
+    if (item.ariaLabel) {
+      row.setAttribute("aria-label", item.ariaLabel);
     }
 
     const labelBox = el("div", "bar-labels");
@@ -358,19 +392,19 @@ export function barRows(container, items, options) {
     row.appendChild(labelBox);
 
     const track = el("div", "bar-track");
-    const fill = el("div", "bar-fill " + (opts.fillClass || "fill-fail"));
-    const pct = (item.value / max) * 100;
-    fill.style.width = (item.value > 0 ? Math.max(pct, 1.5) : 0) + "%";
-    track.appendChild(fill);
-    if (item.extra > 0) {
-      // The failing fill gives up its rounded end to the grey segment,
-      // which takes it over.
+    drawn.forEach((segment, index) => {
+      const fill = el("div", "bar-fill " + segment.className);
+      const pct = (segment.value / max) * 100;
+      fill.style.width = (segment.value > 0 ? Math.max(pct, 1.5) : 0) + "%";
+      if (index < drawn.length - 1) {
+        fill.classList.add("bar-fill-open");
+      }
+      track.appendChild(fill);
+    });
+    if (drawn.length > 1) {
+      // A flex row only when the bar is split, so every other bar chart
+      // is untouched.
       track.classList.add("bar-track-split");
-      fill.classList.add("bar-fill-open");
-      const extraFill = el("div", "bar-fill bar-muted");
-      extraFill.style.width =
-        Math.max((item.extra / max) * 100, 1.5) + "%";
-      track.appendChild(extraFill);
     }
     row.appendChild(track);
 

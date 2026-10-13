@@ -253,6 +253,32 @@ EXCLUDED_TESTS = {
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssignee.test_the_query_count_is_bounded_not_per_row":
         "counts queries via sqlite3's set_trace_callback.",
+    "AssignedCellsTest.test_one_statement_cold_none_warm":
+        "counts statements with sqlite3's set_trace_callback (WP-43); "
+        "the values are compared on MariaDB by the rest of "
+        "AssignedCellsTest.",
+    "AssignedCellsTest.test_no_live_mute_no_mute_join":
+        "reads statements with sqlite3's set_trace_callback (WP-43).",
+    "AssignedTrendTest.test_one_statement_cold_none_warm":
+        "counts statements with sqlite3's set_trace_callback (WP-43); "
+        "the values are compared on MariaDB by the rest of "
+        "AssignedTrendTest.",
+    "AssignedTrendTest.test_no_live_mute_no_mute_join":
+        "reads statements with sqlite3's set_trace_callback (WP-43).",
+    "AssignedTrendTest.test_the_plan_starts_from_the_assignments":
+        "asserts EXPLAIN QUERY PLAN output — SQLite's planner. "
+        "MariaDB's plan for the CROSS JOIN is taken by hand on a "
+        "production-scale copy (WP-43 decision 12): CI's few-row "
+        "tables make an EXPLAIN assertion there the wrong gate.",
+    "SummaryAssignedSplitTest"
+    ".test_the_headline_pays_one_statement_more_cold_none_warm":
+        "counts statements with sqlite3's set_trace_callback (WP-43).",
+    "SummaryAssignedSplitTest"
+    ".test_the_full_payload_costs_what_it_did_at_base":
+        "counts statements with sqlite3's set_trace_callback (WP-43).",
+    "SummaryAssignedSplitTest"
+    ".test_the_part_is_one_read_of_runs_cold_none_warm":
+        "counts statements with sqlite3's set_trace_callback (WP-43).",
     "TestBulkSetAssignee.test_empty_input_issues_no_writes":
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssigneeForTriples."

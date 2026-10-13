@@ -130,19 +130,23 @@
     <!-- ============ Charts ============ -->
     <section id="charts-section" aria-label="Charts">
       <div class="chart-grid">
-        <div class="card">
+        <div class="card" id="trend-card">
           <!-- Per DAY, not per night: a suite can run more than once in
                a day, and this chart counts runs in a calendar day. Open a
                suite's page for its individual executions. -->
           <h3>Failing runs per day</h3>
           <div id="trend-chart"></div>
+          <p id="trend-split-caption" class="chart-caption" hidden>Assigned and muted are as they stand now: a day's columns recolour as tests are taken.</p>
           <details>
             <summary>Data table</summary>
-            <table class="data-table small">
+            <table class="data-table small" id="trend-table">
               <thead>
                 <tr>
                   <th>Day</th>
                   <th class="num">Failed</th>
+                  <th class="num trend-split-col" hidden>Unassigned</th>
+                  <th class="num trend-split-col" hidden>Assigned</th>
+                  <th class="num trend-split-col" hidden>Muted</th>
                   <th class="num">Unexpected pass</th>
                   <th class="num">Runs</th>
                 </tr>

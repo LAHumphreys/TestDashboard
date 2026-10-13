@@ -2,6 +2,8 @@
 
     python tools/dev/perf/seed.py --out <scratch>/perf.db
     python tools/dev/perf/seed.py --out <scratch>/perf.db --tree <checkout>
+    python tools/dev/perf/seed.py --out <scratch>/h90.db --history-nights 90
+    python tools/dev/perf/seed.py --onto <scratch>/copy.db --assignments 1000
 
 The shape is the largest product's, as production has it: about 12,000
 tests over five environments (the largest 8,000), run SEQUENTIALLY and
@@ -11,6 +13,17 @@ beside mainline. Around it: three smaller builds of the same product and
 a second, small product, so a product scope and an unscoped request
 differ. Comments, no assignments (the runner adds those itself, as a
 measured state). See README.md for what it is NOT: a year of history.
+
+``--history-nights N`` builds the variant ``perf-seed/1-hN``: the same
+seed with N - 7 older nights of MAINLINE for the largest environment
+written before it, so a request that reads a window of ``runs`` can be
+timed over N days. The history has its own random stream: the last seven
+nights are perf-seed/1's runs exactly.
+
+``--assignments N`` (with ``--onto`` an existing seed) writes the
+assignments fixture: N current assignments in the largest environment, 10
+of them live mutes. ``ab.py --assign N`` applies the same fixture to its
+own copies instead, through each tree's own Storage.
 
 Deterministic: one seeded ``random.Random``, fixed dates, no wall clock
 in anything the runner reads. Two builds of the same arguments with the
@@ -35,10 +48,18 @@ import random
 import sqlite3
 import sys
 import urllib.parse
-from typing import Dict, List, NamedTuple, Optional, Sequence, TextIO, Tuple
+from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence,
+                    Set, TextIO, Tuple)
 
 #: Bump when the recipe changes, so a number can say which seed it is from.
 RECIPE = "perf-seed/1"
+
+#: Nights in one block of the history: each block redraws the largest
+#: environment's behaviours, so 90 nights carry the week's flips and mix.
+HISTORY_BLOCK = 7
+
+#: The assignments fixture's live mutes, whatever its size.
+FIXTURE_MUTES = 10
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
@@ -101,6 +122,19 @@ def refuse_inside_checkout(path: str) -> None:
         folder = parent
 
 
+def kind_for(roll: float) -> str:
+    """A test's behaviour from one uniform draw: the recipe's mix."""
+    if roll < 0.010:
+        return "broken"
+    if roll < 0.013:
+        return "fixed"
+    if roll < 0.020:
+        return "flaky"
+    if roll < 0.025:
+        return "expected"
+    return "stable"
+
+
 def draw_estate(rng: random.Random, scale: float, nights: int
                 ) -> List[TestSpec]:
     """Every test of the estate, with its behaviour, in run order."""
@@ -115,17 +149,7 @@ def draw_estate(rng: random.Random, scale: float, nights: int
             script = "suite/{}/{}/test_{:04d}.py".format(
                 product.lower(), area, script_no)
             for case in range(min(rng.randint(8, 40), count - made)):
-                roll = rng.random()
-                if roll < 0.010:
-                    kind = "broken"
-                elif roll < 0.013:
-                    kind = "fixed"
-                elif roll < 0.020:
-                    kind = "flaky"
-                elif roll < 0.025:
-                    kind = "expected"
-                else:
-                    kind = "stable"
+                kind = kind_for(rng.random())
                 tests.append(TestSpec(
                     product=product, environment=environment, script=script,
                     test_name="test_{}_{:03d}".format(area, case),
@@ -200,19 +224,71 @@ def records_for(
     return records, clock
 
 
+def recipe_name(nights: int, history_nights: int) -> str:
+    """The name a number quotes: perf-seed/1, or the -hN variant."""
+    if history_nights > nights:
+        return "{}-h{}".format(RECIPE, history_nights)
+    return RECIPE
+
+
+def write_history(
+    model: object, store: object, specs: Sequence[TestSpec], seed: int,
+    nights: int, history_nights: int, say: Callable[[str], None],
+) -> None:
+    """The variant's older mainline nights of one environment, oldest
+    first, before the seed's own *nights*.
+
+    Its own ``random.Random`` (derived from *seed*), so the seed's
+    stream, and with it every run of the last *nights*, is untouched.
+    Every :data:`HISTORY_BLOCK` nights the behaviours are redrawn with
+    the recipe's mix, broken and fixed tests turning inside the block,
+    so each week of history looks like the seed's week. Mainline only:
+    see README.md for why the builds are not extended.
+    """
+    rng = random.Random(seed * 7919 + history_nights)
+    extra = history_nights - nights
+    block = []  # type: List[TestSpec]
+    for night in range(extra):
+        if night % HISTORY_BLOCK == 0:
+            block = [spec._replace(
+                kind=kind_for(rng.random()),
+                turn_night=rng.randint(1, HISTORY_BLOCK - 1))
+                for spec in specs]
+        day = NEWEST_NIGHT - datetime.timedelta(
+            days=history_nights - 1 - night)
+        results = {}  # type: Dict[Tuple[str, str, str], str]
+        for spec in block:
+            results[(spec.environment, spec.script, spec.test_name)] = (
+                mainline_result(rng, spec, night % HISTORY_BLOCK))
+        records, _ended = records_for(
+            model, rng, block, day + datetime.timedelta(minutes=30),
+            night, None, results)
+        for at in range(0, len(records), BATCH):
+            getattr(store, "upsert_runs")(records[at:at + BATCH])
+        say("  {:40s} {:7d} runs".format(
+            "{} history {}".format(day.date(), specs[0].environment),
+            len(records)))
+
+
 def build(out: str, tree: Optional[str] = None, scale: float = 1.0,
           nights: int = 7, seed: int = 20261003,
-          log: Optional[TextIO] = None) -> Dict[str, int]:
+          log: Optional[TextIO] = None,
+          history_nights: int = 0) -> Dict[str, int]:
     """Write the seed to *out* (which must not exist) and return counts.
 
     *tree* is the checkout whose ``testboard`` writes it; ``None`` uses
     whichever ``testboard`` is importable already (the tests do that).
+    *history_nights* above *nights* builds the ``-hN`` variant: the
+    largest environment's mainline goes back that many nights.
     """
     refuse_inside_checkout(out)
     if os.path.exists(out):
         raise ValueError("{} exists; remove it first".format(out))
     if nights < 2:
         raise ValueError("nights must be at least 2")
+    if history_nights and history_nights <= nights:
+        raise ValueError("history nights ({}) must exceed nights ({})".format(
+            history_nights, nights))
     if tree is not None:
         sys.path.insert(0, os.path.abspath(tree))
     from testboard import model
@@ -228,7 +304,8 @@ def build(out: str, tree: Optional[str] = None, scale: float = 1.0,
     for spec in tests:
         by_env.setdefault(spec.environment, []).append(spec)
     store = Storage(out)
-    declared_at = NEWEST_NIGHT - datetime.timedelta(days=nights + 1)
+    declared_at = NEWEST_NIGHT - datetime.timedelta(
+        days=max(nights, history_nights) + 1)
     for product, environment, _count in ESTATE:
         store.set_environment_product(environment, product, "amy", declared_at)
     for user in USERS:
@@ -239,6 +316,9 @@ def build(out: str, tree: Optional[str] = None, scale: float = 1.0,
             store.upsert_runs(records[at:at + BATCH])  # type: ignore
         say("  {:40s} {:7d} runs".format(label, len(records)))
 
+    if history_nights:
+        write_history(model, store, by_env[ESTATE[0][1]], seed, nights,
+                      history_nights, say)
     mainline = {}  # type: Dict[int, Dict[Tuple[str, str, str], str]]
     full_nights = min(5, nights)
     for night in range(nights):
@@ -334,6 +414,131 @@ def build(out: str, tree: Optional[str] = None, scale: float = 1.0,
     return counts
 
 
+def seed_clock(path: str) -> datetime.datetime:
+    """The clock a seed is read at: two hours past the hour of its last
+    run's end (``ab.derive_scope`` derives the same)."""
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        last = conn.execute("SELECT MAX(end_time) FROM runs").fetchone()[0]
+    finally:
+        conn.close()
+    if last is None:
+        raise ValueError("no runs in {}".format(path))
+    ended = datetime.datetime.strptime(last[:19], "%Y-%m-%dT%H:%M:%S")
+    return (ended.replace(minute=0, second=0)
+            + datetime.timedelta(hours=2))
+
+
+def fixture_triples(path: str, environment: str, count: int
+                    ) -> Tuple[List[Tuple[str, str, str]],
+                               List[Tuple[str, str, str]]]:
+    """The assignments fixture's *count* triples and its mutes, in order.
+
+    Order: the environment's current mainline failures by (script,
+    test_name), so the first 65 are exactly the Known slow row's
+    ``assign_65``; then tests that failed on mainline before, most
+    recent failure first (on the -hN variant there are thousands); then
+    the rest. Mutes: :data:`FIXTURE_MUTES` of the selection, spread
+    evenly over its current failures (over the selection when it has
+    fewer). Read-only on *path*.
+    """
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        failing = [(str(row[0]), str(row[1]), str(row[2]))
+                   for row in conn.execute(
+            "SELECT environment, script, test_name FROM latest_runs "
+            "WHERE stream_id = 1 AND environment = ? AND result = 'FAIL' "
+            "ORDER BY script, test_name", (environment,)).fetchall()]
+        failed_before = [(str(row[0]), str(row[1]), str(row[2]))
+                         for row in conn.execute(
+            "SELECT environment, script, test_name, MAX(start_time) AS last "
+            "FROM runs WHERE stream_id = 1 AND environment = ? "
+            "AND result = 'FAIL' GROUP BY environment, script, test_name "
+            "ORDER BY last DESC, script, test_name",
+            (environment,)).fetchall()]
+        rest = [(str(row[0]), str(row[1]), str(row[2]))
+                for row in conn.execute(
+            "SELECT environment, script, test_name FROM latest_runs "
+            "WHERE stream_id = 1 AND environment = ? "
+            "ORDER BY script, test_name", (environment,)).fetchall()]
+    finally:
+        conn.close()
+    chosen = []  # type: List[Tuple[str, str, str]]
+    seen = set()  # type: Set[Tuple[str, str, str]]
+    for triple in failing + failed_before + rest:
+        if len(chosen) >= count:
+            break
+        if triple not in seen:
+            seen.add(triple)
+            chosen.append(triple)
+    if len(chosen) < count:
+        raise ValueError("{} has {} tests, fewer than {} assignments".format(
+            environment, len(chosen), count))
+    failing_set = set(failing)
+    now_failing = [t for t in chosen if t in failing_set]
+    pool = now_failing if len(now_failing) >= FIXTURE_MUTES else chosen
+    mutes = []  # type: List[Tuple[str, str, str]]
+    if count >= FIXTURE_MUTES:
+        step = float(len(pool)) / FIXTURE_MUTES
+        mutes = [pool[int(index * step)] for index in range(FIXTURE_MUTES)]
+    return chosen, mutes
+
+
+def apply_fixture(store: object, path: str, environment: str, count: int,
+                  now: datetime.datetime) -> Tuple[int, int]:
+    """Write the assignments fixture through *store* (any tree's
+    ``Storage`` on *path*): *count* tests of *environment* assigned to
+    amy, :data:`FIXTURE_MUTES` of them muted on mainline for a week from
+    *now*. Returns (assigned, muted); muted is 0 on a tree without
+    mutes. Idempotent over ``ab.assign_65``'s 65: same triples, same
+    assignee, so the result is *count* current assignments either way.
+    """
+    chosen, mutes = fixture_triples(path, environment, count)
+    assign = getattr(store, "bulk_set_assignee_for_triples")
+    assign("amy", "amy", now,
+           [(triple[0], triple[1], triple[2], None) for triple in chosen])
+    mute = getattr(store, "mute_tests", None)
+    if mute is None or not mutes:
+        return len(chosen), 0
+    mute([(triple[0], triple[1], triple[2], 1) for triple in mutes],
+         "perf fixture", 168, "amy", "amy", now)
+    return len(chosen), len(mutes)
+
+
+def apply_onto(path: str, count: int, tree: Optional[str] = None
+               ) -> Tuple[int, int]:
+    """``--onto``: write the fixture into an existing seed (a copy, never
+    inside a checkout), through *tree*'s Storage, at the seed's clock."""
+    refuse_inside_checkout(path)
+    if not os.path.isfile(path):
+        raise ValueError("no seed at {}".format(path))
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM current_assignments "
+            "WHERE assignee IS NOT NULL").fetchone()[0]
+    finally:
+        conn.close()
+    if existing:
+        raise ValueError("{} already has {} assignments; apply the fixture "
+                         "to a fresh copy of the seed".format(path, existing))
+    if tree is not None:
+        sys.path.insert(0, os.path.abspath(tree))
+    from testboard.storage import Storage
+    now = seed_clock(path)
+    store = Storage(path)
+    try:
+        done = apply_fixture(store, path, ESTATE[0][1], count, now)
+    finally:
+        store.close()
+    checkpoint = sqlite3.connect(path)
+    try:
+        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        checkpoint.close()
+    return done
+
+
 def fingerprint(path: str) -> Tuple[Dict[str, int], str]:
     """Row counts of every table, and a digest of runs and latest_runs.
 
@@ -365,8 +570,12 @@ def fingerprint(path: str) -> Tuple[Dict[str, int], str]:
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point; see the module docstring."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--out", required=True,
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--out",
                         help="database to create (outside any checkout)")
+    target.add_argument("--onto",
+                        help="an existing seed (a copy) to write the "
+                             "--assignments fixture into; builds nothing")
     parser.add_argument("--tree", default=REPO_ROOT,
                         help="checkout whose testboard writes the seed "
                              "(default: this one); use the A/B's base")
@@ -376,15 +585,36 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="mainline nights (the full build runs the "
                              "last five of them)")
     parser.add_argument("--seed", type=int, default=20261003)
+    parser.add_argument("--history-nights", type=int, default=0,
+                        help="build the perf-seed/1-hN variant: the "
+                             "largest environment's mainline goes back N "
+                             "nights (90 for a 90-day window)")
+    parser.add_argument("--assignments", type=int, default=0,
+                        help="with --onto: the fixture's size (65 is "
+                             "the reference estate's figure, 1000 the "
+                             "stress); 10 of them muted")
     args = parser.parse_args(argv)
     try:
+        if args.onto:
+            if args.assignments < 1:
+                raise ValueError("--onto needs --assignments N")
+            assigned, muted = apply_onto(args.onto, args.assignments,
+                                         args.tree)
+            print("fixture: {} assigned, {} muted -> {}".format(
+                assigned, muted, args.onto))
+            return 0
+        if args.assignments:
+            raise ValueError("--assignments goes with --onto a copy of a "
+                             "built seed (or ab.py --assign)")
         counts = build(args.out, args.tree, args.scale, args.nights,
-                       args.seed, log=sys.stdout)
+                       args.seed, log=sys.stdout,
+                       history_nights=args.history_nights)
     except ValueError as exc:
         print("seed.py: {}".format(exc), file=sys.stderr)
         return 2
     print("{} scale={} nights={} -> {}".format(
-        RECIPE, args.scale, args.nights, args.out))
+        recipe_name(args.nights, args.history_nights), args.scale,
+        args.nights, args.out))
     for table in sorted(counts):
         print("  {:28s} {:9d}".format(table, counts[table]))
     return 0

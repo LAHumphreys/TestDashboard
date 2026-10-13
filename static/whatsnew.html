@@ -44,6 +44,36 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-10-13">
+      <div class="section-head">
+        <h2 class="eyebrow">13 October 2026</h2>
+        <span class="muted">New: the home page&rsquo;s charts show which failures are assigned and which are nobody&rsquo;s yet</span>
+      </div>
+
+      <h3>What's new</h3>
+      <ul>
+        <li><strong>The charts show who has what.</strong> On the home
+          page, <strong>Failing tests by environment</strong> and
+          <strong>Most failures by script</strong> now split each bar
+          three ways: failing and <em>unassigned</em> in the red you know,
+          failing and <em>assigned</em> to someone in blue, and
+          <em>muted</em> in grey, with a legend on each card. The red is
+          what still needs an owner; no red means nothing is unowned. The
+          number at the end of the bar is still the failing total, and
+          clicking a row still scopes the page as before. Hover a bar for
+          the three counts.</li>
+        <li><strong>The same split on Failing runs per day.</strong> Each
+          day&rsquo;s Failed column is now stacked unassigned, assigned
+          and muted, with unexpected passes on top as before, and the data
+          table under the chart gains the three columns. The split is as
+          things stand <em>now</em>: when someone takes a test, every red
+          run it had in the window turns blue, and unassigning turns it
+          back. The chart says so in a line under the plot. The split
+          arrives a moment after the rest of the page; if it cannot be
+          fetched, the chart draws the two series it always drew.</li>
+      </ul>
+    </section>
+
     <section class="release" data-drop-date="2026-10-12">
       <div class="section-head">
         <h2 class="eyebrow">12 October 2026</h2>

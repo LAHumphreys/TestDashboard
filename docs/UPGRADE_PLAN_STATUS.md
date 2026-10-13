@@ -4408,3 +4408,257 @@ MariaDB 12.3 sacrificial database. CI's two 10.3 legs are the authority.
 No browser has rendered the UI; the DOM-shim walk covered the four viewers
 with a 55,534-character output reaching the clipboard whole while the
 `<pre>` showed 20,000.
+
+## Design review: the dashboard's charts split assigned from unassigned, round 0 (2026-10-13)
+
+The owner asked for one UI tweak: the three charts on the home dashboard
+should show, in a different colour of the stack, which failing tests are
+assigned to someone and which are nobody's yet. Recon showed the payload
+carries no assigned count for any of the three and that the per-day trend
+can only be split by "assigned now", so the change is a backend brief and
+a UI brief against a JSON contract, on the performance trigger paths: the
+smallest shape of an arc. §0 was agreed in chat (all three charts; segments
+ordered unassigned red, assigned, muted grey) and round 0 was written by
+the owning agents: `docs/design/charts-assigned-split-r0.md` on branch
+`design-charts-assigned-split`, with a Claude Doc as the viewer.
+
+Measured in round 0 (statement timings, in-process, 48 alternated calls,
+median, on a scratch copy of the production-scale SQLite seed, 7 nights):
+the one new statement for both bar charts, driven from the assignments
+table, 0.25 ms at 65 assignments and 0.38 ms at 1,000; the trend's split,
+which must read `runs`, 5.0 ms at 65 and 18.4 ms at 1,000 with the join
+forced to start from the assignments, 29 ms as a plain join when SQLite
+scanned the window. The rejected alternative, an assignments column on the
+per-environment pass, measured +3 ms on the largest environment. MariaDB
+not timed. Production estimates are labelled as such in the doc.
+
+Decided so far (the performance design pass, pending the owner): the trend's
+split is served as its own `parts=assigned_trend`, fetched by the page in
+parallel with the headline, never in the headline (an estimated 5 to 10 ms
+on the cold first paint, growing with the window and the release streams);
+the MariaDB join order is checked by hand on a production-scale copy during
+`/perf-ab`, not by a CI EXPLAIN guard, because the CI leg's few-row tables
+make such a guard flaky one way and meaningless the other. Open for the
+owner: thirteen decisions with verdict slots and six questions; the main
+session recommends deferring the derivation of the assigned-open tile and
+the queue counts from the new statement to its own package. Nothing is
+built; no migration.
+
+## Design review: charts split assigned from unassigned, round 0 reviewed and frozen (2026-10-13)
+
+The owner was taken through all thirteen decisions and six open questions
+in chat the same day, each offered as the recommended position with its
+alternatives; every verdict is the position as written, with decision 10
+(deriving the assigned-open tile and the queue counts from the new
+statement) deferred to its own package as recommended. The verdicts are
+captured verbatim in the doc's §7 and the doc is frozen; §8 is the master
+plan. A fresh-eyes pass read the frozen doc for coherence and the
+publication gate before this commit.
+
+Decided, in short: a new mid-blue token for "assigned"; the trend stacks
+unassigned, assigned, muted and unexpected pass with an "as they stand
+now" caption and a seven-column table; the bars split in the same order
+under a legend per card, end label and sort unchanged; one wording helper;
+the bar renderer gains a segments list with today's DOM pinned for callers
+that pass none. Backend: one assignments-driven statement (FAIL only) for
+both bar charts, memoized on the mute epoch; the trend's split as its own
+`parts=assigned_trend`, fetched in parallel with the headline, with
+`FAIL_ASSIGNED` and `FAIL_MUTED` disjoint; the MariaDB join order checked
+by hand during `/perf-ab`, a `STRAIGHT_JOIN` hook only if needed; no
+cutoff on the trend statement's growth, timed at 90 days and 1,000
+assignments on a widened seed.
+
+The build is **WP-43**, branch `wp-43-charts-assigned-split`, registered
+in the handover: item 0 the widened seed (performance-engineer, parallel),
+item 1 the backend brief (trigger paths, `/perf-ab` as 1p with the by-hand
+EXPLAIN), item 2 the UI brief on top of item 1's commit (first paint; the
+fetch-sequencing guard is its gate), item 3 the drop. Small path, item by
+item.
+
+## WP-43 item 1: the backend of the assigned/unassigned split (2026-10-13, overnight run)
+
+**WP-43 item 1** (commit named in the strip, branch `wp-43-charts-assigned-split`): the
+figures behind the charts' split. `by_environment[i].assigned` and
+`top_failing_scripts[i].assigned` ride `parts=headline`, served by one new
+statement, `Storage.assigned_cells`, driven from `current_assignments`
+into `latest_runs` (FAIL only, retired excluded, the mutes join only while
+the stream has a live mute), memoized per environment on the mute epoch
+as the muted cells are. The trend's split, `FAIL_ASSIGNED` and
+`FAIL_MUTED` per night, is served by a new `parts=assigned_trend` only,
+from `Storage.daily_assigned_failures`, a `CROSS JOIN` driving from the
+assignments table into `runs` (a plain join planned a window scan: 29 ms
+against 5 ms on the production-scale seed), memoized in the summary memo
+and never in the trend cache, which assignment writes do not drop. No
+migration; schema 11.
+
+**Decided during the build, by the main session, under decisions 8 and
+13:** the full, unsliced `/api/summary` payload does not carry the two
+keys. The measured pass found the Open Actions page fetches that payload
+on its first paint, where the trend statement cost +18.9 ms [+14.4,
++20.7] and +13.6 ms [+6.3, +17.7] on two cold alternated runs with 65
+assignments. The design doc's §7 records the decision; the owner may
+reverse it at the cost of that number. Decision 10 stays deferred: the
+statement selects FAIL only and does not group by assignee.
+
+**Measured** (performance-engineer; perf-seed/1, production-scale SQLite,
+cold, in-process, alternated; `git archive` of `27632fb` against
+`5ff4159`; the machine ran about twice as fast during the second run, so
+only paired deltas compare; widest half-band 26 ms on run 1, 8.4 ms on
+run 2): every Known slow row "same" (watch 297/296 ms, compare 266/264,
+Open Actions rows 48/48, home headline 43/43 with cold statements 35 to
+36, browse 12/12 and 13/13 with 65 assignments). The new part: 0.1 ms
+with no assignments, about 11 ms with 65 at 14 days, two cold statements
+(the mute-epoch read, then the trend statement), none warm. The by-hand
+MariaDB EXPLAIN on the local server (12.3, indicative) starts from
+`current_assignments` by the assignee index and reaches `runs` by the
+identity index: item 1h, the `STRAIGHT_JOIN` hook, is not needed.
+Statement timings on this machine read two to three times the design's
+figures, the unchanged reference statement included. The 90-day,
+1,000-assignment half of the pass runs on the widened seed of item 0.
+
+**Review:** fresh eyes delivered every acceptance line; three findings
+(a long docstring line, the mute-implies-assigned rule unnamed in two
+docstrings, measurements quoted by seed name in product docstrings)
+fixed before the commit. **Verify** in the main checkout on the
+cherry-picked diff: SQLite 2720 OK (skipped 1); MariaDB (local 12.3, main
+sacrificial database) 3738 OK (skipped 79).
+
+## WP-43 item 0: a 90-night performance seed and an assignments fixture (2026-10-13, overnight run)
+
+**WP-43 item 0** (commit named in the strip): `seed.py --history-nights 90` builds
+`perf-seed/1-h90`: the largest environment gets 90 nights of mainline
+history (720,000 runs, 7,496 FAIL), every other environment keeps its
+seven, and the last seven nights are perf-seed/1's row for row because the
+history draws from its own random stream; behaviours are redrawn every
+seven nights with the recipe's mix. Mainline only for the older nights: a
+nightly full build over 90 nights would be about 5.8M runs a year on one
+environment, above the reference estate, so mainline alone is its density.
+The assignments fixture comes two ways, `ab.py --assign N` through each
+tree's own Storage and `seed.py --onto COPY --assignments N` for a by-hand
+MariaDB load; current failures first, so the first 65 are the existing
+`assign_65` set; ten mutes of 168 h on the current failures.
+
+**Measured** (SQLite, this machine): the variant builds in 8m20s, 393 MB,
+830,240 runs. An A/A on the variant with `--assign 1000` (24 calls):
+every row "same", widest half-band 17.7 ms; watch 293 ms, compare 254,
+Open Actions rows 154 (97 on perf-seed/1: its streaks read the runs
+history), headline 90, browse 21/27, full summary 202 at 14 days and 210
+at 90, headline with the fixture 95. The Known slow bar stays
+perf-seed/1's; the README says to name the seed beside every number.
+perf-seed/1 was never byte-identical between builds (the mainline stream
+row's last-seen time is the migration's wall clock); the fingerprint and
+every other table match before and after.
+
+**Review:** five findings (a README line mangled by a text substitution,
+a spliced docstring, a redraw test that a static week would pass, no pin
+on the default recipe, figures stated as production's) fixed before the
+commit: the redraw test now proves two history blocks break different
+tests, the default recipe's tiny-scale fingerprint is pinned to a constant
+computed on the base commit, and the README says "the reference estate".
+Off the trigger paths, no measured pass. **Verify** in the main checkout
+on the cherry-picked diff: SQLite 2729 OK (skipped 1); MariaDB (local 12.3, main
+sacrificial database) 3747 OK (skipped 79); the implementer's one unexplained
+error on an earlier MariaDB run did not recur in three later runs.
+
+## WP-43 item 2: the dashboard's charts split assigned from unassigned (2026-10-13, overnight run)
+
+**WP-43 item 2** (the commit carrying this entry): the UI half. The two bar
+charts split unassigned red, assigned blue (`--c-assigned: #3b6cc0`,
+validated against every chart colour for normal and colour-blind vision)
+and muted grey under a legend per card; end label, sort and click target
+unchanged; `barRows` gains a `segments` list with today's `extra`
+normalised into it and the base DOM pinned for callers that pass
+neither. The trend stacks unassigned, assigned, muted and unexpected pass
+under an "as they stand now" caption and a seven-column table; its split
+comes from `parts=assigned_trend`, requested in the same parallel batch as
+the headline with the headline's scope, merged by date, rendered when the
+second of the two inputs lands, never awaited before the tiles and bars
+paint, never rejecting (a failure, a 400 or the 10 s timeout gives the
+two-series card). One wording helper, `failingSplit` in `api.js`, builds
+the parts, their words and the tooltip rows; the home trend call passes
+the day unit, so the aria no longer says "per night".
+
+**Requests:** three parallel data requests became four; headline 78 ms
+and 14.4 KB, the part 3 ms and 1 KB against a copy of the dev database.
+**Review:** fresh eyes delivered every acceptance line; the main session's
+walkthrough on a play server read the headline, the part, the page and
+the served JS, and moved an assignment through the API to see the
+environment's count and the trend's runs change together. Four findings
+fixed before the commit: the page-wide dim waited on the part where only
+the trend card may; the caption was visible on first load under an empty
+plot; a one-caller wrapper; a raw commit hash in a test comment.
+**Guards:** the WP-40 spelling guard widened to "both bar callers draw a
+muted segment"; `AssignedSplitTest`, `AssignedTrendFetchTest` and the
+DOM-shim `AssignedSplitDomTest`, which runs the real modules under node in
+a subprocess and skips where node is absent (one more skipped class on a
+leg without node). No browser has rendered the UI. **Verify** in the main
+checkout on the cherry-picked diff: SQLite 2751 OK (skipped 1); MariaDB (local
+12.3, main sacrificial database) 3769 OK (skipped 79).
+
+## WP-43 item 1p, second half: the trend part at 90 days and 1,000 assignments (2026-10-13, overnight run)
+
+**Measured** by performance-engineer on `perf-seed/1-h90` (item 0's
+90-night variant, SQLite, cold, in-process, alternated, 32 calls per
+side; `--base 27632fb` against `--head 386fff5`; the seed rebuilt from
+the base in 6m41s with a fingerprint identical to the README's copy;
+widest half-band 5.5 ms at 65 assignments and 12.3 ms at 1,000). Every
+Known slow row "same" on this seed (watch 305/306 ms, compare 251/254,
+Open Actions rows 121/129 under the 5 % floor, home headline 73/74 with
+35 to 36 statements, browse 13.5/13.2 and 24.3/23.9); the headline at 65
+and 1,000 assignments and at 14 and 90 days inside its band; the full
+payload at both inside its band with one more statement and the trend
+statement never run in it (0 calls), so the §7 decision holds and the
+Known slow table does not change.
+
+**The trend part, head against itself:** 22.8 ms [±1.7] at 14 days and
+65 assignments; 100.6 ms [±6.6] at 90 days and 65; 317 ms [±21] at 14
+days and 1,000; 1,553 ms [±74] at 90 days and 1,000. The MariaDB
+statement alone (local 12.3, 1,000 assignments loaded with `seed.py
+--onto` and the migration tool): about 80 ms at 14 days once warm, 2.2 to
+3.0 s at 90 days, every call. Cause: `runs` reaches the triple's runs by
+the identity index, which carries neither result nor stream, so every run
+of every assigned test in the window is fetched then filtered (96,767
+rows read for 3,537 FAIL). The MariaDB plan still starts from
+`current_assignments`; item 1h confirmed unnecessary. A covering index on
+`runs (environment, script, test_name, result, start_time, stream_id)`
+measured 1,536 → 26 ms on SQLite and about 2,400 → 11 ms on MariaDB on
+scratch copies, at +85 MB on 830k runs, an unmeasured push-path write and
+schema migration 12.
+
+**ESCALATED to the owner, recorded in the design doc's §7**; no item was
+parked because none depends on it. The options are accept as built,
+the covering index as its own package, or a cap that reverses decision
+13. Raw outputs in the session's scratch directory: `r1_ab65.txt`,
+`r2_ab1000.txt`, `r3_hh65.txt`, `r4_hh1000.txt` (not tracked).
+
+## 2026-10-13 — the drop of 2026-10-13: WP-43 (PR open, not yet deployed)
+
+**What ships:** WP-43, the three home-dashboard charts split assigned from
+unassigned failing tests, built unattended from the frozen design review
+`docs/design/charts-assigned-split-r0.md` as three items on branch
+`wp-43-charts-assigned-split` (item 1 the backend `db835c4`, item 0 the
+90-night seed `386fff5`, item 2 the UI `99e09de`), plus the measured pass
+in two halves. **No migration; schema 11; no new flag; the server's Python
+changed, so the restart is required.** Operator note
+`docs/drops/2026-10-13.md`; What's new section dated the same; the PR's
+body is the squash message.
+
+**Measured** (all in the entries above): the Known slow table unchanged on
+every row on both seeds; the home headline one bounded statement more
+(about 0.3 ms); the full payload never runs the trend statement; the new
+part 23 ms at 14 days and 101 ms at 90 with 65 assignments, 317 ms and
+1,553 ms at 1,000, memoized. **Decided:** the full unsliced payload does
+not carry the trend keys (the main session, under decisions 8 and 13,
+reversible); the dialect hook is not needed. **Escalated to the owner,
+open:** the part's cost at 90 days with many assignments: accept, a
+covering index on `runs` as its own package, or a cap.
+
+**The run itself:** kickoff after `/verify` green on a clean tree
+(2687/3674); a heartbeat cron hourly; items 0 and 1 in parallel in their
+own worktrees, item 2 on item 1's commit; each verified on both legs in
+the main checkout, measured where on the trigger paths, read by fresh eyes;
+findings sent back twice per item at most (one performance finding and
+three review findings on item 1, five on item 0, four on item 2), all
+fixed before the commits; no item parked. Suite in the main checkout on
+the final branch: SQLite 2751 OK (skipped 1); MariaDB (local 12.3) 3769 OK (skipped 79).
+No browser has rendered the UI.

@@ -1407,6 +1407,30 @@ class DailyResultCount(NamedTuple):
     count: int
 
 
+class DailyAssignedFailures(NamedTuple):
+    """WP-43: of one UTC day's FAIL runs, how many belong to a test that
+    has an assignee NOW and no live mute now (``assigned``), and how many
+    to a test under a live mute now (``muted``). Disjoint; their sum
+    never exceeds the day's FAIL count. See
+    :meth:`Storage.daily_assigned_failures`."""
+
+    day: datetime.date
+    assigned: int
+    muted: int
+
+
+class AssignedCell(NamedTuple):
+    """WP-43: one cell of :meth:`Storage.assigned_cells`: the tests of
+    one (environment, script) on a stream whose latest result is FAIL,
+    un-retired, with a current assignee, split by whether a live mute
+    covers them (``muted``)."""
+
+    environment: str
+    script: str
+    muted: bool
+    count: int
+
+
 class LatestComment(NamedTuple):
     """The newest comment on a test, for list views that show one."""
 
@@ -8321,6 +8345,232 @@ class Storage:
                 recent=bool(row[3]), retired=False, count=int(row[4]))
             for row in rows
         ]
+
+    def assigned_cells(
+        self,
+        now: Optional[datetime.datetime],
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+    ) -> List[AssignedCell]:
+        """WP-43: the tests on *stream_id* whose latest result is FAIL,
+        un-retired, with a current assignee, grouped by (environment,
+        script) and split by whether a live mute covers them. The
+        headline's two bar charts read it: an environment's
+        ``assigned`` is the sum of its UNMUTED cells, a script's the
+        same per (environment, script), so both stay subsets of
+        ``failed``/``failing`` (which exclude the muted ones).
+
+        One statement for the whole stream, driven from
+        ``current_assignments`` and reaching ``latest_runs`` by its
+        primary key: bounded by the number of assignments (or the
+        stream's FAIL rows, whichever the planner starts from), never
+        by the estate. The mute join is made only while the stream has
+        a live mute at all (:meth:`mute_epoch`); otherwise every cell
+        is unmuted and the statement does not read ``test_mutes``.
+
+        A muted test is counted only when it is also assigned (the
+        statement is driven from ``current_assignments``): exact by the
+        write-path rule "a live mute implies an assignee", kept by
+        :meth:`mute_tests` (it assigns) and :meth:`_drop_mutes_on_unassign`.
+
+        Memoized exactly as :meth:`muted_cells`: per environment,
+        tagged ``(stream, environment)`` and keyed on the mute epoch,
+        an entry for every environment of the stream (empty ones too).
+        It reads no recency cutoff, so every scope and every window
+        shares the entries. An assignment, a mute or an unmute drops
+        every memo; a push into one environment drops that
+        environment's entry; an expiry moves the epoch, which is in
+        the key. The scope is filtered here, in Python.
+        """
+        at = now or model.utcnow()
+        epoch = self.mute_epoch(stream_id, at)
+        names = self._stream_environment_names(stream_id)
+        per_environment = {}  # type: Dict[str, List[AssignedCell]]
+        for name in names:
+            cached = self._cached_summary(
+                ("assigned_cells", stream_id, name, epoch))
+            if cached is None:
+                break
+            per_environment[name] = cached
+        else:
+            cells = []  # type: List[AssignedCell]
+            for name in names:
+                cells.extend(per_environment[name])
+            return self._filter_assigned_cells(
+                cells, environment, environments)
+        grouped = {}  # type: Dict[str, List[AssignedCell]]
+        for cell in self._read_assigned_cells(at, stream_id, epoch):
+            grouped.setdefault(cell.environment, []).append(cell)
+        for name in sorted(set(names) | set(grouped)):
+            key = ("assigned_cells", stream_id, name, epoch)
+            entry = grouped.get(name, [])
+            self._store_summary(key, entry, stream_id, name)
+        cells = []
+        for name in sorted(grouped):
+            cells.extend(grouped[name])
+        return self._filter_assigned_cells(cells, environment, environments)
+
+    @staticmethod
+    def _filter_assigned_cells(
+        cells: Sequence[AssignedCell], environment: Optional[str],
+        environments: Optional[Sequence[str]],
+    ) -> List[AssignedCell]:
+        """The scope filter of :meth:`_filter_cells`, for these cells."""
+        allowed = None if environments is None else set(environments)
+        return [
+            cell for cell in cells
+            if (environment is None or cell.environment == environment)
+            and (allowed is None or cell.environment in allowed)
+        ]
+
+    def _read_assigned_cells(
+        self, now: datetime.datetime, stream_id: int, epoch: Optional[str],
+    ) -> List[AssignedCell]:
+        """The one grouped read behind :meth:`assigned_cells`, for the
+        whole stream. FAIL only, no grouping by assignee: deriving the
+        assigned-open and queue figures from these cells was deferred
+        (WP-43 decision 10), and they are the only readers that would
+        need either."""
+        params = []  # type: List[Any]
+        if epoch is None:
+            muted = "0 AS muted"
+            join = ""
+            group = "GROUP BY lr.environment, lr.script"
+        else:
+            muted = ("CASE WHEN " + _MUTE_LIVE
+                     + " THEN 1 ELSE 0 END AS muted")
+            join = " " + _MUTE_JOIN
+            group = "GROUP BY lr.environment, lr.script, muted"
+            params.append(model.format_iso(now))
+        params.extend([stream_id, Result.FAIL.value])
+        rows = self._conn().execute(
+            "SELECT lr.environment, lr.script, " + muted + ", COUNT(*) "
+            "FROM current_assignments AS ca "
+            "JOIN latest_runs AS lr "
+            "  ON lr.stream_id = ? AND lr.environment = ca.environment "
+            " AND lr.script = ca.script AND lr.test_name = ca.test_name "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name"
+            + join
+            + " WHERE ca.assignee IS NOT NULL AND lr.result = ? AND "
+            + self._NOT_RETIRED + " " + group,
+            params,
+        ).fetchall()
+        return [
+            AssignedCell(
+                environment=row[0], script=row[1], muted=bool(row[2]),
+                count=int(row[3]))
+            for row in rows
+        ]
+
+    def daily_assigned_failures(
+        self,
+        since: datetime.datetime,
+        now: Optional[datetime.datetime],
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+    ) -> List[DailyAssignedFailures]:
+        """WP-43: the trend's split. Of each UTC day's FAIL runs on
+        *stream_id* since *since*, those whose test has an assignee NOW
+        and no live mute now (``assigned``), and those under a live mute
+        now (``muted``): disjoint, and a subset of the day's FAIL in
+        :meth:`daily_result_counts`. No retirement filter, because that
+        FAIL has none. A past day is split by who owns each test
+        TODAY: an assignment recolours every red run its test had in
+        the window, an unassignment or an expiry recolours them back.
+
+        It must read ``runs`` (``activity_hours`` carries no test
+        identity), so it is driven from ``current_assignments``: the
+        ``CROSS JOIN`` is load-bearing. As a plain ``JOIN`` SQLite
+        plans it from ``idx_runs_start_time_result``, a scan of the
+        whole window of runs (29 ms on the production-scale seed);
+        ``CROSS JOIN``
+        forces the assignments first and reaches runs by its UNIQUE
+        (triple, start_time) index, bounded by assignments × window ×
+        streams; ``AssignedTrendTest`` pins the plan on SQLite. MariaDB
+        reads ``CROSS JOIN ... ON`` as an inner join it may reorder: its
+        plan is checked by hand on a production-scale copy (WP-43
+        decision 12), not by a test.
+
+        ``muted`` counts a muted test only when it is also assigned
+        (driven from ``current_assignments``): exact by the write-path
+        rule "a live mute implies an assignee", kept by
+        :meth:`mute_tests` (it assigns) and :meth:`_drop_mutes_on_unassign`.
+
+        Memoized in the SUMMARY memo, never ``_trend_cache``: the trend
+        cache is not dropped by assignment or mute writes and this is
+        a function of both. Keyed on the mute epoch (an expiry moves
+        it), tagged with the stream and, when scoped to one
+        environment, that environment, so pushes, assignments, mutes
+        and the TTL all drop it. The mute join is made only while the
+        stream has a live mute.
+        """
+        at = now or model.utcnow()
+        epoch = self.mute_epoch(stream_id, at)
+        since_iso = model.format_iso(since)
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = ("assigned_trend", stream_id, since_iso, environment,
+               envs_key, epoch)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return list(cached)
+        params = []  # type: List[Any]
+        if epoch is None:
+            muted = "0 AS muted"
+            join = ""
+            group = " GROUP BY day ORDER BY day"
+        else:
+            muted = ("CASE WHEN " + _MUTE_LIVE
+                     + " THEN 1 ELSE 0 END AS muted")
+            join = (
+                " LEFT JOIN test_mutes AS tm "
+                "  ON tm.stream_id = ? AND tm.environment = ca.environment "
+                " AND tm.script = ca.script "
+                " AND tm.test_name = ca.test_name")
+            group = " GROUP BY day, muted ORDER BY day, muted"
+            params.append(model.format_iso(at))
+        params.append(since_iso)
+        if epoch is not None:
+            params.append(stream_id)
+        sql = (
+            "SELECT SUBSTR(r.start_time, 1, 10) AS day, " + muted
+            + ", COUNT(*) FROM current_assignments AS ca "
+            "CROSS JOIN runs AS r "
+            "  ON r.environment = ca.environment "
+            " AND r.script = ca.script AND r.test_name = ca.test_name "
+            " AND r.start_time >= ?"
+            + join
+            + " WHERE ca.assignee IS NOT NULL AND r.stream_id = ? "
+            "AND r.result = ?"
+        )
+        params.extend([stream_id, Result.FAIL.value])
+        if environment is not None:
+            sql += " AND ca.environment = ?"
+            params.append(environment)
+        envs_clause, envs_params = self._environments_clause(
+            environments, column="ca.environment")
+        if envs_clause is not None:
+            sql += " AND " + envs_clause
+            params.extend(envs_params)
+        sql += group
+        by_day = {}  # type: Dict[str, List[int]]
+        for row in self._conn().execute(sql, params).fetchall():
+            bucket = by_day.setdefault(str(row[0]), [0, 0])
+            bucket[1 if row[1] else 0] += int(row[2])
+        result = [
+            DailyAssignedFailures(
+                day=datetime.datetime.strptime(day, "%Y-%m-%d").date(),
+                assigned=bucket[0], muted=bucket[1])
+            for day, bucket in sorted(by_day.items())
+        ]
+        frozen = tuple(result)
+        self._store_summary(key, frozen, stream_id, environment)
+        return result
 
     def _subtract_muted(
         self,

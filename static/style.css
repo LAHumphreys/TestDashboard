@@ -5,6 +5,7 @@
   --c-fail: #c62828;
   --c-fae: #f9a825;
   --c-up: #7b1fa2;
+  --c-assigned: #3b6cc0;  /* WP-43: failing, and someone has it; no result colour */
   --ink: #1f1f1c;
   --muted: #6b6b66;
   --border: #e3e3df;
@@ -405,6 +406,10 @@ main.wide { max-width: 1340px; }
   transition: opacity 0.15s ease;
 }
 
+/* WP-43: the trend card's own dim inside a dimmed section is one dim,
+   not two. */
+.is-loading .is-loading { opacity: 1; }
+
 /* ---------- Toolbar (the one filter row) ---------- */
 
 .toolbar {
@@ -570,11 +575,15 @@ button.tile:focus-visible {
 .swatch-up, .legend-swatch.swatch-up { background: var(--c-up); }
 .swatch-pass, .legend-swatch.swatch-pass { background: var(--c-pass); }
 .swatch-fae, .legend-swatch.swatch-fae { background: var(--c-fae); }
+.swatch-assigned, .legend-swatch.swatch-assigned { background: var(--c-assigned); }
+.swatch-muted, .legend-swatch.swatch-muted { background: var(--muted); opacity: 0.55; }
 
 .seg-fail { fill: var(--c-fail); }
 .seg-up { fill: var(--c-up); }
 .seg-pass { fill: var(--c-pass); }
 .seg-fae { fill: var(--c-fae); }
+.seg-assigned { fill: var(--c-assigned); }
+.seg-muted { fill: var(--muted); opacity: 0.55; }
 
 .trend-band.is-hover .seg { filter: brightness(1.18); }
 
@@ -671,6 +680,10 @@ button.bar-row:focus-visible {
 
 .bar-muted { background: var(--muted); opacity: 0.55; }
 
+/* WP-43: the failing tests someone has, between the unassigned red and
+   the muted grey. */
+.bar-assigned { background: var(--c-assigned); }
+
 .bar-value {
   font-size: 12px;
   font-weight: 600;
@@ -715,6 +728,8 @@ button.bar-row:focus-visible {
 .tt-key.swatch-up { background: var(--c-up); }
 .tt-key.swatch-pass { background: var(--c-pass); }
 .tt-key.swatch-fae { background: var(--c-fae); }
+.tt-key.swatch-assigned { background: var(--c-assigned); }
+.tt-key.swatch-muted { background: var(--muted); opacity: 0.55; }
 
 .tt-value {
   font-weight: 650;
