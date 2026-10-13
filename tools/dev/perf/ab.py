@@ -3,6 +3,7 @@
     python tools/dev/perf/ab.py --base SHA --head SHA --db <scratch>/perf.db
     python tools/dev/perf/ab.py --base SHA --head-tree <worktree> --db ...
         [--pages NAME=URL ...] [--calls 24] [--methods m1,m2] [--json OUT]
+        [--assign 65|1000]
 
 Both trees' ``testboard`` packages are loaded into ONE process, each
 against its own copy of ``--db``. For every request the two are called
@@ -18,6 +19,11 @@ delta, the delta's 95% band (the noise), the statements per cold call
 on each side, and a verdict. ``--methods`` adds statements per call for
 named ``Storage`` methods. README.md says what each column means.
 
+``--assign N`` measures the ``--pages`` rows after seed.py's assignments
+fixture (N assigned, 10 of them muted) is written through each tree's
+own Storage. The Known slow rows are measured first, in their own
+states, whatever N is.
+
 A SHA is materialised with ``git archive`` into a scratch directory (no
 worktree is registered); ``--base-tree``/``--head-tree`` take a checkout
 as it stands, uncommitted edits included. Nothing is written to ``--db``
@@ -26,6 +32,7 @@ or inside a checkout; the scratch directory is removed unless --keep.
 
 import argparse
 import datetime
+import importlib.util
 import io
 import json
 import math
@@ -491,6 +498,16 @@ def assign_65(tree: Tree, store: object, copy: str, scope: Scope) -> int:
     return len(triples)
 
 
+def load_seed() -> types.ModuleType:
+    """seed.py beside this file, by path (tools/dev is not a package):
+    the assignments fixture lives there, shared with ``seed.py --onto``."""
+    spec = importlib.util.spec_from_file_location(
+        "dev_perf_seed_for_ab", os.path.join(HERE, "seed.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore
+    return module
+
+
 def copy_db(source: str, target: str) -> None:
     """Copy a database and any WAL/SHM beside it."""
     for suffix in ("", "-wal", "-shm"):
@@ -511,13 +528,15 @@ class Result(NamedTuple):
     calls: int
     rows: List[Row]
     methods: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]
+    fixture: Tuple[int, int]
 
 
 def run(base_tree: str, head_tree: str, db: str, scratch: str,
         labels: Tuple[str, str], pages: Sequence[Tuple[str, str]] = (),
         calls: int = 24, methods: Sequence[str] = (),
         known: bool = True,
-        log: Optional[Callable[[str], None]] = None) -> Result:
+        log: Optional[Callable[[str], None]] = None,
+        assign: int = 0) -> Result:
     """Measure every row on both trees; see the module docstring."""
     check_db(db)
     trees = (load_tree(labels[0], base_tree), load_tree(labels[1], head_tree))
@@ -540,10 +559,12 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                     "older tree".format(labels[side], exc))
         pair = (stores[0], stores[1])
         tracers = (_Tracer(), _Tracer())
+        page_state = "fixture" if assign else "plain"
         wanted = [(name, url, state) for name, url, state in KNOWN_SLOW
-                  if known] + [(name, url, "plain") for name, url in pages]
+                  if known] + [(name, url, page_state) for name, url in pages]
         rows = []  # type: List[Row]
-        for state in ("plain", "assign65"):
+        fixture = (0, 0)
+        for state in ("plain", "assign65", "fixture"):
             todo = [w for w in wanted if w[2] == state]
             if not todo:
                 continue
@@ -551,6 +572,18 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                 for side in (0, 1):
                     activator.use(trees[side])
                     assign_65(trees[side], stores[side], copies[side], scope)
+            if state == "fixture":
+                seed = load_seed()
+                done = []  # type: List[Tuple[int, int]]
+                for side in (0, 1):
+                    activator.use(trees[side])
+                    done.append(seed.apply_fixture(
+                        stores[side], copies[side], scope.environment,
+                        assign, scope.now))
+                if done[0] != done[1]:
+                    raise ValueError("the fixture differs between the "
+                                     "trees: {} / {}".format(*done))
+                fixture = done[0]
             for name, url, _state in todo:
                 row = alternate(trees, pair, activator, name,
                                 fill(url, scope), scope.now, calls,
@@ -571,7 +604,8 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
             getattr(store, "close")()
         activator.restore()
     return Result(labels=labels, db=os.path.abspath(db), scope=scope,
-                  calls=calls, rows=rows, methods=per_method)
+                  calls=calls, rows=rows, methods=per_method,
+                  fixture=fixture)
 
 
 def report(result: Result) -> List[str]:
@@ -584,6 +618,12 @@ def report(result: Result) -> List[str]:
         "{} calls per side; scope {} / {} / build {} at {}".format(
             result.calls, result.scope.product, result.scope.environment,
             result.scope.build, result.scope.now.isoformat()))
+    if result.fixture[0]:
+        lines.append(
+            "--pages rows measured with the assignments fixture: {} assigned "
+            "in {}, {} of them muted".format(
+                result.fixture[0], result.scope.environment,
+                result.fixture[1]))
     lines.append("{:36s} {:>9s} {:>9s} {:>8s} {:>18s} {:>9s}  {}".format(
         "request", "A ms", "B ms", "B-A ms", "95% band of B-A", "stmts A/B",
         "verdict"))
@@ -653,6 +693,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "statements per call for")
     parser.add_argument("--no-known", action="store_true",
                         help="skip the Known slow rows (--pages only)")
+    parser.add_argument("--assign", type=int, default=0,
+                        help="measure the --pages rows after the "
+                             "assignments fixture (65 = the reference "
+                             "estate's figure, 1000 = stress; 10 muted "
+                             "either way)")
     parser.add_argument("--json", help="also write raw samples here")
     parser.add_argument("--keep", action="store_true",
                         help="keep the scratch directory")
@@ -661,6 +706,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         check_db(args.db)
         pages = _parse_pages(args.pages)
+        if args.assign and not pages:
+            raise ValueError("--assign applies to the --pages rows; name "
+                             "at least one")
         trees = []  # type: List[Tuple[str, str]]
         for index, (sha, tree) in enumerate(((args.base, args.base_tree),
                                              (args.head, args.head_tree))):
@@ -674,7 +722,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                      (trees[0][0], trees[1][0]), pages, args.calls,
                      [m for m in args.methods.split(",") if m],
                      known=not args.no_known,
-                     log=lambda text: print(text, file=sys.stderr))
+                     log=lambda text: print(text, file=sys.stderr),
+                     assign=args.assign)
     except ValueError as exc:
         print("ab.py: {}".format(exc), file=sys.stderr)
         return 2
@@ -689,6 +738,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         with open(args.json, "w") as handle:
             json.dump({
                 "labels": list(result.labels), "db": result.db,
+                "fixture": list(result.fixture),
                 "rows": [row._asdict() for row in result.rows],
             }, handle, indent=1)
     return 0

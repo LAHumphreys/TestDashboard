@@ -613,9 +613,9 @@ any interruption is the first line not `done` or `parked`.
 
 | Item | Status | Commit | Note |
 |---|---|---|---|
-| 0 seed | in flight (spawned 2026-10-13) | | ledger `.claude/work/wp43-0-seed.md` |
-| 1 backend | done | see §9 after item 0 | one finding from 1p (the full payload) and three from fresh eyes, fixed before the commit |
+| 0 seed | done | the commit after `db835c4` | five fresh-eyes findings fixed before the commit; variant at the path the harness README names |
+| 1 backend | done | `db835c4` | one finding from 1p (the full payload) and three from fresh eyes, fixed before the commit |
 | 1p measured pass | first half done (perf-seed/1, 65 assignments); second half (90 days, 1,000 assignments on the widened seed) pending item 0 | | Known slow table holds; MariaDB plan starts from `current_assignments` |
 | 1h dialect hook | not needed | | 1p's EXPLAIN starts from `current_assignments` (local MariaDB 12.3, indicative) |
-| 2 UI | not started | | |
+| 2 UI | in flight (spawned 2026-10-13 on `db835c4`) | | ledger `.claude/work/wp43-2-ui.md` |
 | 3 drop | not started | | |

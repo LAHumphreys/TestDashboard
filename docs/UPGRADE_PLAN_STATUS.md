@@ -4522,3 +4522,40 @@ docstrings, measurements quoted by seed name in product docstrings)
 fixed before the commit. **Verify** in the main checkout on the
 cherry-picked diff: SQLite 2720 OK (skipped 1); MariaDB (local 12.3, main
 sacrificial database) 3738 OK (skipped 79).
+
+## WP-43 item 0: a 90-night performance seed and an assignments fixture (2026-10-13, overnight run)
+
+**WP-43 item 0** (commit named in the strip): `seed.py --history-nights 90` builds
+`perf-seed/1-h90`: the largest environment gets 90 nights of mainline
+history (720,000 runs, 7,496 FAIL), every other environment keeps its
+seven, and the last seven nights are perf-seed/1's row for row because the
+history draws from its own random stream; behaviours are redrawn every
+seven nights with the recipe's mix. Mainline only for the older nights: a
+nightly full build over 90 nights would be about 5.8M runs a year on one
+environment, above the reference estate, so mainline alone is its density.
+The assignments fixture comes two ways, `ab.py --assign N` through each
+tree's own Storage and `seed.py --onto COPY --assignments N` for a by-hand
+MariaDB load; current failures first, so the first 65 are the existing
+`assign_65` set; ten mutes of 168 h on the current failures.
+
+**Measured** (SQLite, this machine): the variant builds in 8m20s, 393 MB,
+830,240 runs. An A/A on the variant with `--assign 1000` (24 calls):
+every row "same", widest half-band 17.7 ms; watch 293 ms, compare 254,
+Open Actions rows 154 (97 on perf-seed/1: its streaks read the runs
+history), headline 90, browse 21/27, full summary 202 at 14 days and 210
+at 90, headline with the fixture 95. The Known slow bar stays
+perf-seed/1's; the README says to name the seed beside every number.
+perf-seed/1 was never byte-identical between builds (the mainline stream
+row's last-seen time is the migration's wall clock); the fingerprint and
+every other table match before and after.
+
+**Review:** five findings (a README line mangled by a text substitution,
+a spliced docstring, a redraw test that a static week would pass, no pin
+on the default recipe, figures stated as production's) fixed before the
+commit: the redraw test now proves two history blocks break different
+tests, the default recipe's tiny-scale fingerprint is pinned to a constant
+computed on the base commit, and the README says "the reference estate".
+Off the trigger paths, no measured pass. **Verify** in the main checkout
+on the cherry-picked diff: SQLite 2729 OK (skipped 1); MariaDB (local 12.3, main
+sacrificial database) 3747 OK (skipped 79); the implementer's one unexplained
+error on an earlier MariaDB run did not recur in three later runs.
