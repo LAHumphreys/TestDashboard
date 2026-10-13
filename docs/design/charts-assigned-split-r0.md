@@ -580,3 +580,17 @@ in rather than discovered.
 Item 2 may be briefed as soon as item 1's commit exists, before 1p
 finishes; a 1p finding goes back to item 1 and item 2 rebases. The build
 runs the small path item by item, not `/overnight`.
+
+## §9 Build status strip (WP-43, `wp-43-charts-assigned-split`)
+
+One line per item of §8, kept current by the run; the restart point after
+any interruption is the first line not `done` or `parked`.
+
+| Item | Status | Commit | Note |
+|---|---|---|---|
+| 0 seed | not started | | |
+| 1 backend | not started | | |
+| 1p measured pass | not started | | |
+| 1h dialect hook | not started | | exists only if 1p's EXPLAIN starts from `runs` |
+| 2 UI | not started | | |
+| 3 drop | not started | | |
