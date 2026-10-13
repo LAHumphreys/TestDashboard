@@ -4474,3 +4474,51 @@ item 1 the backend brief (trigger paths, `/perf-ab` as 1p with the by-hand
 EXPLAIN), item 2 the UI brief on top of item 1's commit (first paint; the
 fetch-sequencing guard is its gate), item 3 the drop. Small path, item by
 item.
+
+## WP-43 item 1: the backend of the assigned/unassigned split (2026-10-13, overnight run)
+
+**WP-43 item 1** (commit named in the strip, branch `wp-43-charts-assigned-split`): the
+figures behind the charts' split. `by_environment[i].assigned` and
+`top_failing_scripts[i].assigned` ride `parts=headline`, served by one new
+statement, `Storage.assigned_cells`, driven from `current_assignments`
+into `latest_runs` (FAIL only, retired excluded, the mutes join only while
+the stream has a live mute), memoized per environment on the mute epoch
+as the muted cells are. The trend's split, `FAIL_ASSIGNED` and
+`FAIL_MUTED` per night, is served by a new `parts=assigned_trend` only,
+from `Storage.daily_assigned_failures`, a `CROSS JOIN` driving from the
+assignments table into `runs` (a plain join planned a window scan: 29 ms
+against 5 ms on the production-scale seed), memoized in the summary memo
+and never in the trend cache, which assignment writes do not drop. No
+migration; schema 11.
+
+**Decided during the build, by the main session, under decisions 8 and
+13:** the full, unsliced `/api/summary` payload does not carry the two
+keys. The measured pass found the Open Actions page fetches that payload
+on its first paint, where the trend statement cost +18.9 ms [+14.4,
++20.7] and +13.6 ms [+6.3, +17.7] on two cold alternated runs with 65
+assignments. The design doc's §7 records the decision; the owner may
+reverse it at the cost of that number. Decision 10 stays deferred: the
+statement selects FAIL only and does not group by assignee.
+
+**Measured** (performance-engineer; perf-seed/1, production-scale SQLite,
+cold, in-process, alternated; `git archive` of `27632fb` against
+`5ff4159`; the machine ran about twice as fast during the second run, so
+only paired deltas compare; widest half-band 26 ms on run 1, 8.4 ms on
+run 2): every Known slow row "same" (watch 297/296 ms, compare 266/264,
+Open Actions rows 48/48, home headline 43/43 with cold statements 35 to
+36, browse 12/12 and 13/13 with 65 assignments). The new part: 0.1 ms
+with no assignments, about 11 ms with 65 at 14 days, two cold statements
+(the mute-epoch read, then the trend statement), none warm. The by-hand
+MariaDB EXPLAIN on the local server (12.3, indicative) starts from
+`current_assignments` by the assignee index and reaches `runs` by the
+identity index: item 1h, the `STRAIGHT_JOIN` hook, is not needed.
+Statement timings on this machine read two to three times the design's
+figures, the unchanged reference statement included. The 90-day,
+1,000-assignment half of the pass runs on the widened seed of item 0.
+
+**Review:** fresh eyes delivered every acceptance line; three findings
+(a long docstring line, the mute-implies-assigned rule unnamed in two
+docstrings, measurements quoted by seed name in product docstrings)
+fixed before the commit. **Verify** in the main checkout on the
+cherry-picked diff: SQLite 2720 OK (skipped 1); MariaDB (local 12.3, main
+sacrificial database) 3738 OK (skipped 79).

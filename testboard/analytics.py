@@ -60,7 +60,7 @@ from typing import (
 )
 
 from testboard.model import Result, StoredRun, duration_seconds, format_iso
-from testboard.storage import RollupCount, ScriptHourBucket
+from testboard.storage import AssignedCell, RollupCount, ScriptHourBucket
 
 __all__ = [
     "DAY_NAMES",
@@ -492,6 +492,10 @@ class EnvironmentRollup(NamedTuple):
     #: WP-40 — see SummaryStatus.muted (failing-and-muted only);
     #: ``failed``/``new_failures`` exclude these.
     muted: int
+    #: WP-43: of ``failed``, the tests with a current assignee. The
+    #: unassigned ones are ``failed - assigned``; ``muted`` is beside
+    #: both, never inside either.
+    assigned: int
 
 
 class ProductRollup(NamedTuple):
@@ -939,6 +943,7 @@ class EstateSummary(NamedTuple):
 def summarize_rollup(
     counts: Sequence[RollupCount], assigned_open: int = 0,
     muted: Sequence[RollupCount] = (),
+    assigned: Sequence[AssignedCell] = (),
 ) -> EstateSummary:
     """Derive the estate headline from grouped counts.
 
@@ -975,6 +980,14 @@ def summarize_rollup(
     nothing. A test still counts
     in ``total_tests`` and ``ran_recently``: it exists and it ran; it
     is its failure that has been muted.
+
+    *assigned* (WP-43) is :meth:`Storage.assigned_cells` for the same
+    stream and scope: the FAIL, un-retired tests with a current
+    assignee, per (environment, script), split by live mute. Each
+    environment's ``assigned`` is the sum of its UNMUTED cells, so it
+    is a subset of ``failed`` (which excludes the muted ones) and
+    ``failed - assigned`` is the unassigned figure. A cell for an
+    environment with no rollup row adds nothing.
     """
     results = {result: 0 for result in Result}
     recent_results = {result: 0 for result in Result}
@@ -989,7 +1002,7 @@ def summarize_rollup(
     muted_total = 0
 
     # Per environment: [total, failed, new_failures, unexpected, not_run,
-    # muted]
+    # muted, assigned]
     env_totals = collections.OrderedDict()  # type: Dict[str, List[int]]
 
     for cell in counts:
@@ -1017,7 +1030,7 @@ def summarize_rollup(
             fixed += cell.count
 
         if cell.environment not in env_totals:
-            env_totals[cell.environment] = [0, 0, 0, 0, 0, 0]
+            env_totals[cell.environment] = [0, 0, 0, 0, 0, 0, 0]
         bucket = env_totals[cell.environment]
         bucket[0] += cell.count
         if is_fail:
@@ -1050,6 +1063,11 @@ def summarize_rollup(
                 bucket[2] -= cell.count
             bucket[5] += cell.count
 
+    for assigned_cell in assigned:
+        if assigned_cell.muted or assigned_cell.environment not in env_totals:
+            continue
+        env_totals[assigned_cell.environment][6] += assigned_cell.count
+
     status = SummaryStatus(
         total_tests=total,
         ran_recently=ran_recently,
@@ -1075,6 +1093,7 @@ def summarize_rollup(
             unexpected_passes=bucket[3],
             not_run=bucket[4],
             muted=bucket[5],
+            assigned=bucket[6],
         )
         for environment, bucket in sorted(env_totals.items())
     ]

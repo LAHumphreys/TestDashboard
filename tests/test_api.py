@@ -109,6 +109,20 @@ def test_path(
     )
 
 
+#: WP-43: the two keys only ``parts=assigned_trend`` carries. Neither
+#: the headline nor the full payload has them: the full payload is the
+#: Open Actions page's first-paint request, and the split reads runs.
+ASSIGNED_SPLIT_KEYS = ("FAIL_ASSIGNED", "FAIL_MUTED")
+
+
+def assert_no_trend_split(case: unittest.TestCase,
+                          payload: Dict[str, Any]) -> None:
+    """No night of *payload*'s trend carries the WP-43 split keys."""
+    for night in payload["trend"]["nights"]:
+        for key in ASSIGNED_SPLIT_KEYS:
+            case.assertNotIn(key, night, night["date"])
+
+
 class ApiCase(unittest.TestCase):
     """Base case: a real Storage on :memory: plus request helpers."""
 
@@ -2639,7 +2653,7 @@ class TestSummary(ApiCase):
         self.assertEqual(
             data["top_failing_scripts"],
             [{"environment": "env2", "script": "smoke.py", "failing": 1,
-              "muted": 0}],
+              "muted": 0, "assigned": 0}],
         )
         # The environments list stays unfiltered (it feeds the picker).
         self.assertEqual(data["environments"], ["env2", "linux-sim"])
@@ -2660,7 +2674,7 @@ class TestSummary(ApiCase):
         self.assertEqual(
             data["top_failing_scripts"][0],
             {"environment": "linux-sim", "script": "suite/alpha.py",
-             "failing": 2, "muted": 0},
+             "failing": 2, "muted": 0, "assigned": 0},
         )
 
     def test_assigned_queue_after_assignment(self) -> None:
@@ -4770,6 +4784,10 @@ class SummaryPartsTest(ApiCase):
         }
         self.assertEqual(headline, expected)
         self.assertNotIn("queues", headline)
+        # WIDENED for WP-43, not weakened: neither carries the trend
+        # split, which is parts=assigned_trend's alone.
+        assert_no_trend_split(self, full)
+        assert_no_trend_split(self, headline)
 
     def test_queue_totals_agree_with_the_queues_themselves(self) -> None:
         self.seed()
@@ -6981,6 +6999,8 @@ class MuteApiTest(ApiCase):
         self.assertEqual(full["status"]["muted"], 2)
         self.assertEqual(
             head, {k: v for k, v in full.items() if k != "queues"})
+        # WIDENED for WP-43: the trend split is in neither.
+        assert_no_trend_split(self, full)
         self.assertEqual(
             full["queue_totals"],
             {k: q["total"] for k, q in full["queues"].items()})
@@ -7157,3 +7177,265 @@ class MuteApiTest(ApiCase):
                 "GET", "/api/mutes",
                 query={"expiring_within_hours": [bad]}, expect=400)
             self.assertIn("expiring_within_hours", error["error"])
+
+
+class SummaryAssignedSplitTest(ApiCase):
+    """WP-43: the charts' split of failing into unassigned, assigned and
+    muted. ``assigned`` on every ``by_environment`` and
+    ``top_failing_scripts`` entry of the headline; ``FAIL_ASSIGNED`` and
+    ``FAIL_MUTED`` per night from ``parts=assigned_trend`` (and inside
+    the full payload's nights, never the headline's)."""
+
+    seed = TestSummary.seed
+
+    #: Cold SELECTs of ``parts=headline`` on this fixture at the base
+    #: commit (a8013f1), measured in the WP-43 build: Q1 adds one.
+    BASE_COLD_HEADLINE_SELECTS = 19
+    #: The same for the full (unparted) payload, measured the same way:
+    #: 29 at a8013f1. WP-43 adds Q1 (its ``by_environment`` and
+    #: ``top_failing_scripts`` carry ``assigned``, as the headline's
+    #: do) and NOT the trend split: the full payload is the Open
+    #: Actions page's first-paint request.
+    BASE_COLD_FULL_SELECTS = 29
+
+    def _assign(self, name: str, who: str = "alice",
+                environment: str = "linux-sim",
+                script: str = "suite/alpha.py") -> None:
+        self.call(
+            "PUT", test_path(environment, script, name, "/assignee"),
+            body={"username": who, "assigned_by": "bob"})
+
+    def _selects(self, query: Dict[str, List[str]]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", "/api/summary", query=query)
+        finally:
+            conn.set_trace_callback(None)
+        return [s for s in seen if s.strip().upper().startswith("SELECT")]
+
+    def _cold_selects(self, query: Dict[str, List[str]]) -> List[str]:
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        return self._selects(query)
+
+    def test_assigned_is_on_every_entry(self) -> None:
+        self.seed()
+        self._assign("test_still_fail")
+        for query in ({"parts": ["headline"]}, {}):
+            data = self.call("GET", "/api/summary", query=query)
+            for entry in data["by_environment"]:
+                self.assertIsInstance(entry["assigned"], int)
+                self.assertLessEqual(0, entry["assigned"])
+                self.assertLessEqual(entry["assigned"], entry["failed"])
+            for entry in data["top_failing_scripts"]:
+                self.assertIsInstance(entry["assigned"], int)
+                self.assertLessEqual(0, entry["assigned"])
+                self.assertLessEqual(entry["assigned"], entry["failing"])
+            envs = {e["environment"]: e for e in data["by_environment"]}
+            self.assertEqual(
+                (envs["linux-sim"]["failed"], envs["linux-sim"]["assigned"]),
+                (2, 1))
+            self.assertEqual(envs["env2"]["assigned"], 0)
+            scripts = {(e["environment"], e["script"]): e
+                       for e in data["top_failing_scripts"]}
+            self.assertEqual(
+                scripts[("linux-sim", "suite/alpha.py")]["assigned"], 1)
+            self.assertEqual(scripts[("env2", "smoke.py")]["assigned"], 0)
+
+    def test_a_muted_test_is_not_assigned(self) -> None:
+        self.seed()
+        self.storage.mute_tests(
+            [("linux-sim", "suite/alpha.py", "test_still_fail",
+              MAINLINE_STREAM_ID)], "flaky", 24, "alice", "bob", NOW)
+        data = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        envs = {e["environment"]: e for e in data["by_environment"]}
+        self.assertEqual(
+            (envs["linux-sim"]["failed"], envs["linux-sim"]["assigned"],
+             envs["linux-sim"]["muted"]), (1, 0, 1))
+        split = self.call(
+            "GET", "/api/summary", query={"parts": ["assigned_trend"]})
+        by_date = {n["date"]: n for n in split["trend"]["nights"]}
+        self.assertEqual(
+            (by_date["2026-07-26"]["FAIL_ASSIGNED"],
+             by_date["2026-07-26"]["FAIL_MUTED"]), (0, 1))
+
+    def test_the_headline_does_not_carry_the_trend_split(self) -> None:
+        self.seed()
+        self._assign("test_still_fail")
+        head = self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]})
+        assert_no_trend_split(self, head)
+        # Nor the full payload: the Open Actions page's first paint.
+        assert_no_trend_split(self, self.call("GET", "/api/summary"))
+
+    def test_the_parts_shape(self) -> None:
+        self.seed()
+        self._assign("test_still_fail")
+        data = self.call(
+            "GET", "/api/summary",
+            query={"parts": ["assigned_trend"], "days": ["7"]})
+        self.assertEqual(
+            sorted(data),
+            ["environment", "generated_at", "product", "stream", "trend"])
+        trend = data["trend"]
+        self.assertEqual(
+            (trend["days"], trend["from"], trend["to"]),
+            (7, "2026-07-20", "2026-07-26"))
+        self.assertEqual(
+            [night["date"] for night in trend["nights"]],
+            ["2026-07-{:02d}".format(day) for day in range(20, 27)])
+        for night in trend["nights"]:
+            self.assertEqual(
+                sorted(night), ["FAIL_ASSIGNED", "FAIL_MUTED", "date"])
+        self.assertEqual(
+            [(n["FAIL_ASSIGNED"], n["FAIL_MUTED"]) for n in trend["nights"]],
+            [(0, 0)] * 4 + [(1, 0)] * 3)
+        full = self.call("GET", "/api/summary", query={"days": ["7"]})
+        self.assertEqual(
+            [night["date"] for night in trend["nights"]],
+            [night["date"] for night in full["trend"]["nights"]])
+        for split, night in zip(trend["nights"], full["trend"]["nights"]):
+            self.assertLessEqual(
+                split["FAIL_ASSIGNED"] + split["FAIL_MUTED"], night["FAIL"])
+
+    def test_an_assignment_recolours_the_next_read(self) -> None:
+        self.seed()
+        query = {"parts": ["assigned_trend"]}
+        before = self.call("GET", "/api/summary", query=query)
+        self.assertEqual(
+            sum(n["FAIL_ASSIGNED"] for n in before["trend"]["nights"]), 0)
+        self._assign("test_still_fail")
+        after = self.call("GET", "/api/summary", query=query)
+        self.assertEqual(
+            sum(n["FAIL_ASSIGNED"] for n in after["trend"]["nights"]), 3)
+
+    def test_the_parts_scope(self) -> None:
+        self.seed()
+        self._assign("test_still_fail")
+        self._assign("test_first", environment="env2", script="smoke.py")
+
+        def assigned(query: Dict[str, List[str]]) -> int:
+            query = dict(query, parts=["assigned_trend"])
+            return sum(
+                n["FAIL_ASSIGNED"] for n in self.call(
+                    "GET", "/api/summary", query=query)["trend"]["nights"])
+
+        self.assertEqual(assigned({}), 4)
+        self.assertEqual(assigned({"environment": ["env2"]}), 1)
+        self.assertEqual(assigned({"days": ["1"]}), 2)
+        self.call(
+            "PUT", "/api/environments/env2/product",
+            body={"product": "Beacon", "username": "amy"})
+        self.assertEqual(assigned({"product": ["Beacon"]}), 1)
+        self.assertEqual(assigned({"product": ["Nobody"]}), 0)
+
+    def test_stream_scoping(self) -> None:
+        self.seed()
+        self._assign("test_still_fail")
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T05:00:03.000000"),
+            record(test_name="test_new_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T05:00:03.000000"),
+        ])
+        stream_id = self.call(
+            "GET", "/api/streams", query={"product": [""]}
+        )["streams"][0]["id"]
+        query = {"stream": [str(stream_id)]}
+        split = self.call(
+            "GET", "/api/summary", query=dict(query, parts=["assigned_trend"]))
+        self.assertEqual(split["stream"], stream_id)
+        self.assertEqual(
+            [(n["date"], n["FAIL_ASSIGNED"]) for n in split["trend"]["nights"]
+             if n["FAIL_ASSIGNED"]], [("2026-07-26", 1)])
+        head = self.call(
+            "GET", "/api/summary", query=dict(query, parts=["headline"]))
+        self.assertEqual(
+            [(e["environment"], e["failed"], e["assigned"])
+             for e in head["by_environment"]], [("linux-sim", 2, 1)])
+        self.assertEqual(
+            [(e["script"], e["failing"], e["assigned"])
+             for e in head["top_failing_scripts"]],
+            [("suite/alpha.py", 2, 1)])
+
+    def test_the_parts_errors(self) -> None:
+        self.seed()
+        self.call("GET", "/api/summary", query={"parts": ["bogus"]},
+                  expect=400)
+        for days in ("0", "91", "x"):
+            self.call(
+                "GET", "/api/summary",
+                query={"parts": ["assigned_trend"], "days": [days]},
+                expect=400)
+        self.call(
+            "GET", "/api/summary",
+            query={"parts": ["assigned_trend"], "stream": ["x"]},
+            expect=400)
+        self.call(
+            "GET", "/api/summary",
+            query={"parts": ["assigned_trend"], "stream": ["999"]},
+            expect=404)
+
+    # -- the cost (sqlite3's trace callback: excluded on MariaDB) -----
+
+    def test_the_headline_pays_one_statement_more_cold_none_warm(
+            self) -> None:
+        """Q1 is the headline's one new statement, cold; warm it is a
+        memo hit; and the trend split, which reads runs, is never on the
+        headline at all (WP-43 decision 8)."""
+        self.seed()
+        self._assign("test_still_fail")
+        query = {"parts": ["headline"]}
+        cold = self._cold_selects(query)
+        warm = self._selects(query)
+        self.storage.assigned_cells = (  # type: ignore
+            lambda *args, **kwargs: [])
+        try:
+            cold_without = self._cold_selects(query)
+            warm_without = self._selects(query)
+        finally:
+            del self.storage.assigned_cells
+        self.assertEqual(len(cold), len(cold_without) + 1, cold)
+        self.assertEqual(len(cold), self.BASE_COLD_HEADLINE_SELECTS + 1)
+        self.assertEqual(len(warm), len(warm_without), warm)
+        for statement in cold + warm:
+            self.assertNotIn("CROSS JOIN", statement.upper())
+            self.assertNotIn(" RUNS AS R", statement.upper())
+
+    def test_the_full_payload_costs_what_it_did_at_base(self) -> None:
+        """The measured pass found the split's read of runs on the Open
+        Actions page's first paint (+14-19 ms cold, perf-seed/1): the
+        full payload must not run it, and costs its base count."""
+        self.seed()
+        self._assign("test_still_fail")
+        cold = self._cold_selects({})
+        # The queue rows join runs by id, one page each; the split's
+        # CROSS JOIN from current_assignments must not be here.
+        for statement in cold:
+            self.assertNotIn("CROSS JOIN", statement.upper())
+        self.storage.assigned_cells = (  # type: ignore
+            lambda *args, **kwargs: [])
+        try:
+            cold_without = self._cold_selects({})
+        finally:
+            del self.storage.assigned_cells
+        self.assertEqual(len(cold), len(cold_without) + 1, cold)
+        self.assertEqual(len(cold), self.BASE_COLD_FULL_SELECTS + 1, cold)
+
+    def test_the_part_is_one_read_of_runs_cold_none_warm(self) -> None:
+        self.seed()
+        self._assign("test_still_fail")
+        query = {"parts": ["assigned_trend"]}
+        cold = self._cold_selects(query)
+        reads = [s for s in cold if "CROSS JOIN" in s.upper()]
+        self.assertEqual(len(reads), 1, cold)
+        # Two cold: the epoch's one indexed MIN and the split itself;
+        # nothing else of the headline.
+        self.assertEqual(len(cold), 2, cold)
+        self.assertIn("MIN(EXPIRES_AT)", " ".join(cold[0].split()).upper())
+        self.assertEqual(self._selects(query), [])

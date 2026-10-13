@@ -56,9 +56,11 @@ runs from:
   runs, those whose test has an assignee now and no live mute now, and those
   under a live mute now. Disjoint, so the trend's three segments carry the
   bars' definitions (the UI's pushback, accepted; §B's D-B3 says the same).
-- The trend's two keys are served by `parts=assigned_trend`, not by the
-  headline (§B D-B2), because they are the one figure that must read `runs`.
-  The full, unsliced payload still carries them inside `trend.nights`.
+- The trend's two keys are served by `parts=assigned_trend` only (§B D-B2),
+  because they are the one figure that must read `runs`. Neither the
+  headline nor the full, unsliced payload carries them: the measured pass
+  found the Open Actions page fetches the full payload on its first paint
+  (§7, decided during the build).
 - **The UI sends that part in the same parallel batch as the headline**, the
   home page's three requests becoming four, and paints the trend card when
   both have landed; nothing else on the page waits (§P's condition on D-B2).
@@ -216,8 +218,9 @@ environment, 10 muted. Statement timings: the build's gate is still the endpoint
   per-environment pass or the scripts query. Verdict: agreed (§7).
 - **D-B2. The trend split is `parts=assigned_trend`**, `{"trend": {"days",
   "from", "to", "nights": [{"date", "FAIL_ASSIGNED", "FAIL_MUTED"}]}}`, same
-  scope parameters; the full payload carries the keys in `trend.nights` as the
-  contract says. First paint pays nothing; in the headline, about 5–10 ms
+  scope parameters; the full payload does NOT carry the keys (amended at
+  item 1p, §7: the Open Actions page fetches it on first paint). First
+  paint pays nothing; in the headline, about 5–10 ms
   cold (estimate). Verdict: agreed, fetched in parallel (§7).
 - **D-B3. Add `FAIL_MUTED`**: free (the `tm` join is needed anyway to keep muted
   runs out of `FAIL_ASSIGNED`), and the trend gets the bars' segments. Verdict: agreed (§7).
@@ -561,6 +564,28 @@ consequences the doc already names become instructions to the build:
 No pushback on the owner's behalf was needed: nothing agreed conflicts
 with a constraint.
 
+### Decided during the build, by the main session (2026-10-13, item 1p)
+
+**The full, unsliced `/api/summary` payload does not carry `FAIL_ASSIGNED`
+and `FAIL_MUTED`; `parts=assigned_trend` is their only carrier.** §1 and
+§2 D-B2 said the full payload would carry them too. The measured pass found
+that the Open Actions page fetches the unsliced payload on its first paint,
+so the trend statement landed on a first paint after all: +18.9 ms
+[+14.4, +20.7] and +13.6 ms [+6.3, +17.7] on two cold, alternated runs of
+the production-scale SQLite seed with 65 assignments, growing with
+assignments × window × streams. Decisions 8 and 13 both rest on the split
+being off every first paint, so the cheaper shape (the pre-WP-43 payload
+shape for every unsliced caller; the part as the only carrier, which has no
+other consumer) was taken as the design without parking the run. **The
+owner may reverse it**: putting the keys back is one branch in the handler
+and one test, and would cost the Open Actions page the number above.
+
+Also from the measured pass: the MariaDB plan for the trend statement
+starts from `current_assignments` on the local server (12.3, indicative
+only), so item 1h does not exist; `parts=assigned_trend` costs two cold
+statements (the mute-epoch read plus the trend statement), not one, and
+its guard pins two.
+
 ## §8 Master plan (sizing pass; the doc is frozen from here)
 
 One package, **WP-43**, one branch `wp-43-charts-assigned-split`, three
@@ -589,8 +614,8 @@ any interruption is the first line not `done` or `parked`.
 | Item | Status | Commit | Note |
 |---|---|---|---|
 | 0 seed | in flight (spawned 2026-10-13) | | ledger `.claude/work/wp43-0-seed.md` |
-| 1 backend | in flight (spawned 2026-10-13) | | ledger `.claude/work/wp43-1-backend.md` |
-| 1p measured pass | not started | | |
-| 1h dialect hook | not started | | exists only if 1p's EXPLAIN starts from `runs` |
+| 1 backend | done | see §9 after item 0 | one finding from 1p (the full payload) and three from fresh eyes, fixed before the commit |
+| 1p measured pass | first half done (perf-seed/1, 65 assignments); second half (90 days, 1,000 assignments on the widened seed) pending item 0 | | Known slow table holds; MariaDB plan starts from `current_assignments` |
+| 1h dialect hook | not needed | | 1p's EXPLAIN starts from `current_assignments` (local MariaDB 12.3, indicative) |
 | 2 UI | not started | | |
 | 3 drop | not started | | |

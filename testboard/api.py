@@ -1339,7 +1339,45 @@ def _summary_queue_totals(
 
 
 #: Valid values of /api/summary's ``parts`` parameter.
-_SUMMARY_PARTS = ("headline", "queue")
+_SUMMARY_PARTS = ("headline", "queue", "assigned_trend")
+
+
+def _assigned_trend_nights(
+    storage: Storage,
+    current: datetime.datetime,
+    days: int,
+    environment: Optional[str],
+    environments: Optional[Sequence[str]],
+    stream_id: int,
+) -> Dict[str, Dict[str, int]]:
+    """WP-43: the trend's split, ``{date: {"FAIL_ASSIGNED", "FAIL_MUTED"}}``
+    for every day of the same window the trend covers, zero-filled.
+
+    Of each day's ``FAIL`` runs, those whose test has an assignee now
+    and no live mute now, and those under a live mute now: disjoint,
+    and never more than the day's ``FAIL``. The one figure on the home
+    page that must read ``runs``, which is why it is served ONLY by its
+    own part (``parts=assigned_trend``) and by no first-paint request:
+    not the headline, not the full payload (WP-43 decision 8).
+    Memoized by :meth:`Storage.daily_assigned_failures`.
+    """
+    first_day = current.date() - datetime.timedelta(days=days - 1)
+    since = datetime.datetime.combine(first_day, datetime.time())
+    split = {
+        entry.day: entry for entry in storage.daily_assigned_failures(
+            since, current, environment, environments=environments,
+            stream_id=stream_id,
+        )
+    }
+    nights = {}  # type: Dict[str, Dict[str, int]]
+    for offset in range(days):
+        day = first_day + datetime.timedelta(days=offset)
+        entry = split.get(day)
+        nights[day.isoformat()] = {
+            "FAIL_ASSIGNED": 0 if entry is None else entry.assigned,
+            "FAIL_MUTED": 0 if entry is None else entry.muted,
+        }
+    return nights
 
 
 def _products_summary(
@@ -1512,7 +1550,18 @@ def _handle_summary(
       (status, trend, rollups, filters, ``queue_totals`` for the tab
       badges);
     - ``parts=queue&queue=<kind>`` — one queue's rows. ``kind`` is a
-      :data:`testboard.storage.QUEUE_KINDS` entry or ``mine``.
+      :data:`testboard.storage.QUEUE_KINDS` entry or ``mine``;
+    - ``parts=assigned_trend`` (WP-43) — ``{"trend": {"days", "from",
+      "to", "nights": [{"date", "FAIL_ASSIGNED", "FAIL_MUTED"}]}}`` for
+      the same ``days``/``environment``/``product``/``stream``: the
+      trend's split by who owns each failing test now. The page sends
+      it in the same parallel batch as the headline. It is the ONLY
+      carrier of the two keys: neither the headline nor the full
+      payload has them, because the full payload is the Open Actions
+      page's first-paint request (it draws no trend) and the split is
+      the one figure here that reads ``runs`` (measured +14-19 ms cold
+      there on the production-scale seed, growing with assignments x
+      window x streams).
 
     Nothing here is proportional to the size of the estate. The headline
     counts come from a GROUP BY (a few dozen rows however many tests
@@ -1540,6 +1589,32 @@ def _handle_summary(
     # endpoint, scoped — absent, the default (mainline) means every
     # deployed caller from before this drop sees no change at all.
     stream_id = _resolve_stream_id(storage, request)
+
+    if part == "assigned_trend":
+        # WP-43: nothing else the headline computes (no pass view, no
+        # catalogues): this part is the one memoized read of runs.
+        current = now()
+        split = _assigned_trend_nights(
+            storage, current, days, environment, environments, stream_id)
+        return _json_response(200, {
+            "generated_at": model.format_iso(current),
+            "environment": environment,
+            "product": product,
+            "stream": stream_id,
+            "trend": {
+                "days": days,
+                "from": min(split),
+                "to": current.date().isoformat(),
+                "nights": [
+                    {
+                        "date": date,
+                        "FAIL_ASSIGNED": split[date]["FAIL_ASSIGNED"],
+                        "FAIL_MUTED": split[date]["FAIL_MUTED"],
+                    }
+                    for date in sorted(split)
+                ],
+            },
+        })
 
     # WP-23 fix: the CATALOG fields below (environments/scripts/
     # environment_updated) must be scoped the same way product=
@@ -1631,13 +1706,28 @@ def _handle_summary(
         current, recent_cutoff, environment, environments=environments,
         stream_id=stream_id,
     )
+    # WP-43: the FAIL tests with an assignee, per (environment,
+    # script), split by live mute: one statement for the stream, driven
+    # from current_assignments, memoized per environment on the mute
+    # epoch. Both bar charts' ``assigned`` are sums over these cells.
+    assigned_cells = storage.assigned_cells(
+        current, environment, environments=environments,
+        stream_id=stream_id,
+    )
     estate = analytics.summarize_rollup(
         estate_rollup,
         storage.assigned_open_count(
             environment, environments=environments, stream_id=stream_id,
         ),
         muted=muted_cells,
+        assigned=assigned_cells,
     )
+    assigned_by_script = {}  # type: Dict[Tuple[str, str], int]
+    for assigned_cell in assigned_cells:
+        if not assigned_cell.muted:
+            script_key = (assigned_cell.environment, assigned_cell.script)
+            assigned_by_script[script_key] = (
+                assigned_by_script.get(script_key, 0) + assigned_cell.count)
     # WP-23 perf pass: _products_summary always needs the estate-wide
     # MAINLINE rollup, regardless of this request's own scope. When the
     # request itself IS that exact scope (no environment=, no product=,
@@ -1806,6 +1896,8 @@ def _handle_summary(
                     "unexpected_passes": rollup.unexpected_passes,
                     "not_run": rollup.not_run,
                     "muted": rollup.muted,
+                    # WP-43: of "failed", those with an assignee now.
+                    "assigned": rollup.assigned,
                 }
                 for rollup in estate.by_environment
             ],
@@ -1818,6 +1910,11 @@ def _handle_summary(
                     # as a grey extension of the first.
                     "failing": entry.failing,
                     "muted": entry.muted,
+                    # WP-43: of "failing", those with an assignee now;
+                    # merged from the assigned cells, so the scripts'
+                    # own statement and memo are unchanged.
+                    "assigned": assigned_by_script.get(
+                        (entry.environment, entry.script), 0),
                 }
                 for entry in storage.top_failing_scripts(
                     environment, _SUMMARY_TOP_SCRIPTS,
@@ -1839,6 +1936,10 @@ def _handle_summary(
     # Full payload: the pre-split shape (plus queue_totals above), for
     # callers that want one round trip — and for the contract tests,
     # which pin it so the split cannot drift from the whole.
+    # WP-43: NOT the trend's split. The Open Actions page fetches this
+    # payload on its first paint and draws no trend; the split's read of
+    # runs measured +14-19 ms cold there on the production-scale seed.
+    # parts=assigned_trend only.
     streaks = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
     queues = {
         kind: _summary_queue_json(

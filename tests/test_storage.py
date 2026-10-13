@@ -7283,6 +7283,7 @@ class TargetedInvalidationTest(StorageTestBase):
     """
 
     CUTOFF = BASE - datetime.timedelta(hours=1)
+    NOW = BASE + datetime.timedelta(hours=12)
 
     def setUp(self) -> None:
         super().setUp()
@@ -7316,6 +7317,14 @@ class TargetedInvalidationTest(StorageTestBase):
                 stream_id=stream_id),
             "trend": self.store.daily_result_counts(
                 BASE - datetime.timedelta(days=1), stream_id=stream_id),
+            # WIDENED for WP-43: the bars' assigned cells (per
+            # environment) and the trend's split (whole stream) are
+            # memoized components too, held to the same rules.
+            "assigned_cells": self.store.assigned_cells(
+                self.NOW, stream_id=stream_id),
+            "assigned_trend": self.store.daily_assigned_failures(
+                BASE - datetime.timedelta(days=1), self.NOW,
+                stream_id=stream_id),
             "streaks": self.store.failure_streak_bounds_many(
                 [("linux-sim", "suite.py", "test_a",
                   BASE + datetime.timedelta(
@@ -7510,6 +7519,33 @@ class TargetedInvalidationTest(StorageTestBase):
         self.store._invalidate_summary_cache()
         self.store._invalidate_trend_cache()
         self.assertEqual(after["rollup"], self._warm(self.mainline)["rollup"])
+
+    def test_a_push_into_one_environment_leaves_the_others_assigned_cells(
+            self) -> None:
+        """WP-43: the assigned cells are stored per environment, tagged
+        with it, so a push into linux-sim drops linux-sim's entry and
+        leaves win-sim's, and what is served afterwards is what a cold
+        computation gives."""
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_w", result=Result.FAIL)])
+        self.store.set_assignee(
+            "win-sim", "suite.py", "test_w", "alice", "amy", CREATED)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_new", "alice", "amy", CREATED)
+        self._warm(self.mainline)
+        win = ("assigned_cells", self.mainline, "win-sim", None)
+        linux = ("assigned_cells", self.mainline, "linux-sim", None)
+        self.assertIsNotNone(self.store._cached_summary(win))
+        self.assertIsNotNone(self.store._cached_summary(linux))
+        self._push(None)     # linux-sim
+        self.assertIsNotNone(self.store._cached_summary(win))
+        self.assertIsNone(self.store._cached_summary(linux))
+        served = self._warm(self.mainline)["assigned_cells"]
+        self.assertIn(
+            ("linux-sim", "suite.py", False, 1),
+            [(c.environment, c.script, c.muted, c.count) for c in served])
+        self.store._invalidate_summary_cache()
+        self.assertEqual(served, self._warm(self.mainline)["assigned_cells"])
 
     def test_the_memo_report_counts_a_narrowed_clear(self) -> None:
         self.store.reset_memo_counts()
@@ -9167,3 +9203,388 @@ class MuteTest(StorageTestBase):
         self.assertEqual(
             self._count("mute_history", "environment = ?",
                         [self.ENV]), 1)
+
+
+class AssignedCellsTest(StorageTestBase):
+    """WP-43: :meth:`Storage.assigned_cells`, the one statement behind
+    both bar charts' ``assigned`` figure. Each rule of the design's
+    B.1 (docs/design/charts-assigned-split-r0.md §2) is one test; the
+    figure is checked against the Watch page's unassigned count, its
+    bounds, and its memo."""
+
+    NOW = BASE + datetime.timedelta(days=1)
+    CUTOFF = BASE - datetime.timedelta(hours=1)
+    ENV = "linux-sim"
+    SCRIPT = "suite.py"
+
+    def setUp(self) -> None:
+        super().setUp()
+        fail = Result.FAIL
+        self.store.upsert_runs([
+            make_record(test_name="a_fail", result=fail),
+            make_record(test_name="a_muted", result=fail),
+            make_record(test_name="a_unassigned", result=fail),
+            make_record(test_name="a_retired", result=fail),
+            make_record(test_name="a_pass", result=Result.PASS),
+            make_record(test_name="a_up", result=Result.UNEXPECTED_PASS),
+            make_record(test_name="a_cleared", result=fail),
+            make_record(script="other.py", test_name="o_fail", result=fail),
+            make_record(environment="win-sim", test_name="w_fail",
+                        result=fail),
+            make_record(environment="win-sim", test_name="w_unassigned",
+                        result=fail),
+            # A build: assignments are the triple's, so a_fail is
+            # assigned there too; a_unassigned passes there.
+            make_record(test_name="a_fail", result=fail, build="b1",
+                        start=BASE + datetime.timedelta(hours=2)),
+            make_record(test_name="a_unassigned", result=Result.PASS,
+                        build="b1",
+                        start=BASE + datetime.timedelta(hours=2)),
+        ])
+        for env, script, name in (
+                (self.ENV, self.SCRIPT, "a_fail"),
+                (self.ENV, self.SCRIPT, "a_retired"),
+                (self.ENV, self.SCRIPT, "a_pass"),
+                (self.ENV, self.SCRIPT, "a_up"),
+                (self.ENV, self.SCRIPT, "a_cleared"),
+                (self.ENV, "other.py", "o_fail"),
+                ("win-sim", self.SCRIPT, "w_fail")):
+            self.store.set_assignee(
+                env, script, name, "alice", "bob", CREATED)
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "a_cleared", None, "bob", CREATED)
+        self.store.set_retired(
+            self.ENV, self.SCRIPT, "a_retired", True, "bob", "gone",
+            CREATED)
+        self.store.mute_tests(
+            [(self.ENV, self.SCRIPT, "a_muted", storage.MAINLINE_STREAM_ID)],
+            "flaky rig", 72, "carol", "bob", self.NOW)
+        self.build = self.store.list_streams("")[0].stream_id
+
+    def _cells(self, **kwargs: Any) -> List[Tuple[str, str, bool, int]]:
+        return sorted(
+            (c.environment, c.script, c.muted, c.count)
+            for c in self.store.assigned_cells(self.NOW, **kwargs))
+
+    def _statements(self, call: Callable[[], Any]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            call()
+        finally:
+            conn.set_trace_callback(None)
+        return [s for s in seen if s.strip().upper().startswith("SELECT")]
+
+    def _summary(self, stream_id: int = storage.MAINLINE_STREAM_ID,
+                 ) -> analytics.EstateSummary:
+        return analytics.summarize_rollup(
+            self.store.summary_rollup(self.CUTOFF, stream_id=stream_id),
+            muted=self.store.muted_cells(
+                self.NOW, self.CUTOFF, stream_id=stream_id),
+            assigned=self.store.assigned_cells(
+                self.NOW, stream_id=stream_id))
+
+    # -- the rules ----------------------------------------------------
+
+    def test_fail_assigned_unretired_split_by_live_mute(self) -> None:
+        """a_fail counts; a_muted counts as muted (a mute assigns);
+        a_unassigned, the retired, the passing, the unexpected pass and
+        the cleared assignment do not."""
+        self.assertEqual(self._cells(), [
+            (self.ENV, "other.py", False, 1),
+            (self.ENV, self.SCRIPT, False, 1),
+            (self.ENV, self.SCRIPT, True, 1),
+            ("win-sim", self.SCRIPT, False, 1),
+        ])
+
+    def test_an_expired_mute_counts_as_assigned(self) -> None:
+        later = self.NOW + datetime.timedelta(hours=73)
+        cells = sorted(
+            (c.environment, c.script, c.muted, c.count)
+            for c in self.store.assigned_cells(later))
+        self.assertIn((self.ENV, self.SCRIPT, False, 2), cells)
+        self.assertNotIn(True, [cell[2] for cell in cells])
+
+    def test_a_build_reads_its_own_results_and_the_triples_assignee(
+            self) -> None:
+        self.assertEqual(
+            self._cells(stream_id=self.build),
+            [(self.ENV, self.SCRIPT, False, 1)])
+
+    def test_the_scope_is_a_filter_of_the_stream(self) -> None:
+        self.assertEqual(
+            self._cells(environment="win-sim"),
+            [("win-sim", self.SCRIPT, False, 1)])
+        self.assertEqual(
+            [cell[0] for cell in self._cells(environments=[self.ENV])],
+            [self.ENV] * 3)
+        self.assertEqual(self._cells(environments=[]), [])
+        self.assertEqual(self._cells(environment="nowhere"), [])
+
+    def test_failed_minus_assigned_is_watchs_unassigned_figure(
+            self) -> None:
+        """Watch counts FAIL, un-retired, unassigned, muted or not; it
+        equals ``failed - assigned`` by the invariant "a live mute
+        implies an assignee". Checked on mainline and on the build."""
+        for stream_id in (storage.MAINLINE_STREAM_ID, self.build):
+            watch = self.store.unassigned_failing_by_environment(stream_id)
+            for rollup in self._summary(stream_id).by_environment:
+                self.assertEqual(
+                    rollup.failed - rollup.assigned,
+                    watch.get(rollup.environment, 0),
+                    (stream_id, rollup))
+        linux = {r.environment: r for r in self._summary().by_environment}
+        self.assertEqual(
+            (linux[self.ENV].failed, linux[self.ENV].assigned,
+             linux[self.ENV].muted), (4, 2, 1))
+
+    def test_the_bounds(self) -> None:
+        for stream_id in (storage.MAINLINE_STREAM_ID, self.build):
+            for rollup in self._summary(stream_id).by_environment:
+                self.assertGreaterEqual(rollup.assigned, 0)
+                self.assertLessEqual(rollup.assigned, rollup.failed)
+            by_script = {}  # type: Dict[Tuple[str, str], int]
+            for cell in self.store.assigned_cells(
+                    self.NOW, stream_id=stream_id):
+                if not cell.muted:
+                    key = (cell.environment, cell.script)
+                    by_script[key] = by_script.get(key, 0) + cell.count
+            scripts = self.store.top_failing_scripts(
+                stream_id=stream_id, now=self.NOW)
+            for entry in scripts:
+                assigned = by_script.get(
+                    (entry.environment, entry.script), 0)
+                self.assertLessEqual(assigned, entry.failing, entry)
+            self.assertLessEqual(
+                set(by_script),
+                set((e.environment, e.script) for e in scripts))
+
+    # -- the cost -----------------------------------------------------
+
+    def test_one_statement_cold_none_warm(self) -> None:
+        """The headline pays one statement for both bar charts: the
+        epoch and the environment names are already in hand there."""
+        self.store.mute_epoch(storage.MAINLINE_STREAM_ID, self.NOW)
+        self.store._stream_environment_names(storage.MAINLINE_STREAM_ID)
+        cold = self._statements(lambda: self._cells())
+        self.assertEqual(len(cold), 1, cold)
+        self.assertIn(
+            "FROM CURRENT_ASSIGNMENTS AS CA JOIN LATEST_RUNS",
+            " ".join(cold[0].split()).upper())
+        self.assertEqual(self._statements(lambda: self._cells()), [])
+        self.assertEqual(
+            self._statements(lambda: self._cells(environment="win-sim")),
+            [])
+
+    def test_no_live_mute_no_mute_join(self) -> None:
+        self.store.unmute_tests(
+            [(self.ENV, self.SCRIPT, "a_muted",
+              storage.MAINLINE_STREAM_ID)], "bob", self.NOW)
+        cold = self._statements(lambda: self._cells())
+        own = [s for s in cold if "current_assignments" in s.lower()]
+        self.assertEqual(len(own), 1, cold)
+        self.assertNotIn("test_mutes", own[0].lower())
+        self.store.mute_tests(
+            [(self.ENV, self.SCRIPT, "a_muted", storage.MAINLINE_STREAM_ID)],
+            "again", 24, "carol", "bob", self.NOW)
+        own = [s for s in self._statements(lambda: self._cells())
+               if "current_assignments" in s.lower()]
+        self.assertEqual(len(own), 1)
+        self.assertIn("test_mutes", own[0].lower())
+
+    def test_an_assignment_is_seen_by_the_next_call(self) -> None:
+        self.assertEqual(self._cells(environment="win-sim"),
+                         [("win-sim", self.SCRIPT, False, 1)])
+        self.store.set_assignee(
+            "win-sim", self.SCRIPT, "w_unassigned", "dave", "bob", CREATED)
+        self.assertEqual(self._cells(environment="win-sim"),
+                         [("win-sim", self.SCRIPT, False, 2)])
+
+    def test_a_push_drops_only_its_environments_cells(self) -> None:
+        """Paired: the entry left served is still right afterwards."""
+        self._cells()
+        epoch = self.store.mute_epoch(storage.MAINLINE_STREAM_ID, self.NOW)
+        keys = [("assigned_cells", storage.MAINLINE_STREAM_ID, env, epoch)
+                for env in (self.ENV, "win-sim")]
+        for key in keys:
+            self.assertIsNotNone(self.store._cached_summary(key), key)
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="w_unassigned",
+            result=Result.PASS, start=BASE + datetime.timedelta(hours=3))])
+        self.assertIsNotNone(self.store._cached_summary(keys[0]))
+        self.assertIsNone(self.store._cached_summary(keys[1]))
+        served = self._cells()
+        self.store._invalidate_summary_cache()
+        self.assertEqual(served, self._cells())
+
+
+class AssignedTrendTest(StorageTestBase):
+    """WP-43: :meth:`Storage.daily_assigned_failures`, the trend's
+    split. A day's FAIL runs are split by who owns each test NOW: an
+    assignment recolours the past, an expiry recolours it back without
+    a write, and the split never exceeds the day's FAIL."""
+
+    D0 = BASE
+    D1 = BASE + datetime.timedelta(days=1)
+    D2 = BASE + datetime.timedelta(days=2)
+    NOW = D2 + datetime.timedelta(hours=10)
+    SINCE = datetime.datetime(2026, 7, 1)
+    ENV = "linux-sim"
+    SCRIPT = "suite.py"
+
+    def setUp(self) -> None:
+        super().setUp()
+        fail = Result.FAIL
+        records = []  # type: List[RunRecord]
+        for day, result in ((self.D0, fail), (self.D1, fail),
+                            (self.D2, Result.PASS)):
+            records.append(make_record(
+                test_name="t_assigned", result=result, start=day))
+        for day in (self.D0, self.D1, self.D2):
+            records.append(make_record(
+                test_name="t_muted", result=fail, start=day))
+            records.append(make_record(
+                test_name="t_nobody", result=fail, start=day))
+        records.extend([
+            make_record(test_name="t_retired", result=fail, start=self.D1),
+            make_record(test_name="t_up", result=Result.UNEXPECTED_PASS,
+                        start=self.D2),
+            make_record(environment="win-sim", test_name="w_assigned",
+                        result=fail, start=self.D2),
+            make_record(test_name="t_assigned", result=fail, build="b1",
+                        start=self.D2 + datetime.timedelta(hours=1)),
+        ])
+        self.store.upsert_runs(records)
+        for env, name in ((self.ENV, "t_assigned"), (self.ENV, "t_retired"),
+                          (self.ENV, "t_up"), ("win-sim", "w_assigned")):
+            self.store.set_assignee(
+                env, self.SCRIPT, name, "alice", "bob", CREATED)
+        self.store.set_retired(
+            self.ENV, self.SCRIPT, "t_retired", True, "bob", "gone",
+            CREATED)
+        self.store.mute_tests(
+            [(self.ENV, self.SCRIPT, "t_muted", storage.MAINLINE_STREAM_ID)],
+            "flaky", 2, "carol", "bob", self.NOW)
+        self.build = self.store.list_streams("")[0].stream_id
+
+    def _split(self, now: Optional[datetime.datetime] = None,
+               **kwargs: Any) -> List[Tuple[str, int, int]]:
+        return [
+            (entry.day.isoformat(), entry.assigned, entry.muted)
+            for entry in self.store.daily_assigned_failures(
+                self.SINCE, now or self.NOW, **kwargs)]
+
+    def _statements(self, call: Callable[[], Any]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            call()
+        finally:
+            conn.set_trace_callback(None)
+        return [s for s in seen if s.strip().upper().startswith("SELECT")]
+
+    def test_the_split(self) -> None:
+        """t_assigned on D0 and D1; t_retired on D1 (no retirement
+        filter: the day's FAIL has none); w_assigned on D2; t_muted
+        every day; t_up and the build's run never."""
+        self.assertEqual(self._split(), [
+            ("2026-07-01", 1, 1),
+            ("2026-07-02", 2, 1),
+            ("2026-07-03", 1, 1),
+        ])
+
+    def test_disjoint_and_within_the_days_fail(self) -> None:
+        for kwargs in ({}, {"environment": self.ENV},
+                       {"stream_id": self.build}):
+            fail = {
+                entry.day.isoformat(): entry.count
+                for entry in self.store.daily_result_counts(
+                    self.SINCE, **kwargs)
+                if entry.result is Result.FAIL}
+            for day, assigned, muted in self._split(**kwargs):
+                self.assertGreaterEqual(min(assigned, muted), 0)
+                self.assertLessEqual(
+                    assigned + muted, fail.get(day, 0), (kwargs, day))
+
+    def test_an_assignment_recolours_the_next_call(self) -> None:
+        self._split()
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "t_nobody", "dave", "bob", CREATED)
+        self.assertEqual(self._split(), [
+            ("2026-07-01", 2, 1),
+            ("2026-07-02", 3, 1),
+            ("2026-07-03", 2, 1),
+        ])
+
+    def test_an_expiry_recolours_without_a_write(self) -> None:
+        """The mute was for 2 hours; past it the muted runs are the
+        owner's assigned ones (a mute assigns)."""
+        self._split()
+        later = self.NOW + datetime.timedelta(hours=3)
+        self.assertEqual(self._split(later), [
+            ("2026-07-01", 2, 0),
+            ("2026-07-02", 3, 0),
+            ("2026-07-03", 2, 0),
+        ])
+
+    def test_the_scope(self) -> None:
+        self.assertEqual(self._split(environment="win-sim"),
+                         [("2026-07-03", 1, 0)])
+        self.assertEqual(
+            [day[1] for day in self._split(environments=[self.ENV])],
+            [1, 2, 0])
+        self.assertEqual(self._split(environments=[]), [])
+        self.assertEqual(self._split(stream_id=self.build),
+                         [("2026-07-03", 1, 0)])
+
+    def test_one_statement_cold_none_warm(self) -> None:
+        self.store.mute_epoch(storage.MAINLINE_STREAM_ID, self.NOW)
+        cold = self._statements(lambda: self._split())
+        self.assertEqual(len(cold), 1, cold)
+        self.assertEqual(self._statements(lambda: self._split()), [])
+
+    def test_no_live_mute_no_mute_join(self) -> None:
+        later = self.NOW + datetime.timedelta(hours=3)
+        own = [s for s in self._statements(lambda: self._split(later))
+               if "CROSS JOIN" in s.upper()]
+        self.assertEqual(len(own), 1)
+        self.assertNotIn("test_mutes", own[0].lower())
+        own = [s for s in self._statements(lambda: self._split())
+               if "CROSS JOIN" in s.upper()]
+        self.assertEqual(len(own), 1)
+        self.assertIn("test_mutes", own[0].lower())
+
+    def test_a_push_drops_it(self) -> None:
+        self._split()
+        self.store.upsert_runs([make_record(
+            test_name="t_assigned", result=Result.FAIL,
+            start=self.D2 + datetime.timedelta(hours=5))])
+        self.assertEqual(self._split()[-1], ("2026-07-03", 2, 1))
+
+    def test_the_plan_starts_from_the_assignments(self) -> None:
+        """The CROSS JOIN is load-bearing: as a plain JOIN SQLite drove
+        it from idx_runs_start_time_result, a scan of the window of
+        runs. SQLite's planner, SQLite's words: excluded from the
+        MariaDB variants by name (WP-43 decision 12)."""
+        for now in (self.NOW, self.NOW + datetime.timedelta(hours=3)):
+            self.store._invalidate_summary_cache()
+            statement = [
+                s for s in self._statements(lambda: self._split(now))
+                if "CROSS JOIN" in s.upper()][0]
+            plan = [
+                str(row[-1]).upper() for row in self.store._conn().execute(
+                    "EXPLAIN QUERY PLAN " + statement).fetchall()]
+            steps = [line for line in plan
+                     if line.startswith(("SCAN", "SEARCH"))]
+            self.assertTrue(steps[0].startswith("SCAN"), plan)
+            self.assertTrue(
+                " CA" in steps[0] or "CURRENT_ASSIGNMENTS" in steps[0], plan)
+            for line in plan:
+                self.assertNotIn("IDX_RUNS_START_TIME_RESULT", line, plan)
+            runs = [line for line in steps
+                    if " R " in line + " " or " AS R " in line + " "]
+            self.assertTrue(runs, plan)
+            for line in runs:
+                self.assertTrue(line.startswith("SEARCH"), plan)
