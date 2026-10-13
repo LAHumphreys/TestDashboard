@@ -586,6 +586,51 @@ only), so item 1h does not exist; `parts=assigned_trend` costs two cold
 statements (the mute-epoch read plus the trend statement), not one, and
 its guard pins two.
 
+### For the owner, from the measured pass's second half (2026-10-13, item 1p): decision 13 has its number
+
+**The trend part's growth is real and larger than estimated.** On the
+90-night seed (`perf-seed/1-h90`, SQLite, cold, in-process, alternated,
+32 calls per side), `parts=assigned_trend` costs, head against itself:
+
+| Window | 65 assignments | 1,000 assignments |
+|---|---|---|
+| 14 days | 22.8 ms [±1.7] | 317 ms [±21] |
+| 90 days | 100.6 ms [±6.6] | 1,553 ms [±74] |
+
+On the local MariaDB (12.3, indicative) the statement alone takes about
+80 ms at 14 days once warm and 2.2 to 3.0 s at 90 days with 1,000
+assignments. The cause is the `runs` table's indexes: the unique
+(environment, script, test_name, start_time) index reaches the triple's
+runs but carries neither result nor stream, so every run of every
+assigned test in the window is fetched and then filtered (96,767 rows read
+for 3,537 FAIL at 90 days × 1,000). The plan on both engines still starts
+from the assignments table; item 1h is confirmed unnecessary.
+
+**What stands:** the headline and the full payload are unchanged within
+noise at both fixture sizes and both windows, so decisions 8 and 13's
+premise, off every first paint, holds, and the Known slow table does not
+move. At the reference estate's 65 assignments the part costs 23 ms at
+the default 14 days and 101 ms at 90 days, and it is memoized until the
+next push or Take.
+
+**The owner's choice, not taken by the run:**
+
+1. **Accept as built** (decision 13 as written): the number only matters
+   if assignments grow by an order of magnitude or someone opens a 90-day
+   window often; the card paints late, nothing else waits.
+2. **A covering index** on `runs (environment, script, test_name, result,
+   start_time, stream_id)`: measured on scratch copies, 1,536 → 26 ms at
+   90 days on SQLite and about 2,400 → 11 ms on MariaDB. Costs: +85 MB on
+   830k runs (an unmeasured estimate of +450 MB at the reference estate's
+   yearly volume), one more index write per run on every push (not
+   measured), and schema migration 12 through the upgrade-tool ledger,
+   which `docs/UPGRADE_PLAN.md` §0.2 locks. A package of its own.
+3. **A cap**: the part refuses or truncates above a window or an
+   assignment count. Reverses decision 13.
+
+Raw runs: the performance engineer's four output files are named in the
+log entry.
+
 ## §8 Master plan (sizing pass; the doc is frozen from here)
 
 One package, **WP-43**, one branch `wp-43-charts-assigned-split`, three
@@ -613,9 +658,9 @@ any interruption is the first line not `done` or `parked`.
 
 | Item | Status | Commit | Note |
 |---|---|---|---|
-| 0 seed | done | the commit after `db835c4` | five fresh-eyes findings fixed before the commit; variant at the path the harness README names |
+| 0 seed | done | `386fff5` | five fresh-eyes findings fixed before the commit; variant at the path the harness README names |
 | 1 backend | done | `db835c4` | one finding from 1p (the full payload) and three from fresh eyes, fixed before the commit |
-| 1p measured pass | first half done (perf-seed/1, 65 assignments); second half (90 days, 1,000 assignments on the widened seed) pending item 0 | | Known slow table holds; MariaDB plan starts from `current_assignments` |
+| 1p measured pass | done, with an escalation for the owner (§7: the part at 90 days and 1,000 assignments) | | Known slow table holds on both seeds; headline and full payload unchanged; MariaDB plan starts from `current_assignments` |
 | 1h dialect hook | not needed | | 1p's EXPLAIN starts from `current_assignments` (local MariaDB 12.3, indicative) |
-| 2 UI | in flight (spawned 2026-10-13 on `db835c4`) | | ledger `.claude/work/wp43-2-ui.md` |
+| 2 UI | done | the commit carrying this line | four review findings fixed before the commit; no browser has rendered it |
 | 3 drop | not started | | |

@@ -18,11 +18,13 @@
  * are ever in memory.
  *
  * Data, per refresh, all in parallel: /api/summary?parts=headline (the
- * tiles, charts, filters and every queue's COUNT — the fast part), one
- * /api/summary?parts=queue for the active triage tab's rows, and one
- * page of /api/dashboard. Each section paints as its data lands, so the
- * page is readable as soon as the headline answers; the other queue
- * tabs fetch their rows when first opened. While refreshing, previous
+ * tiles, charts, filters and every queue's COUNT — the fast part),
+ * /api/summary?parts=assigned_trend (the trend's assigned/muted split,
+ * WP-43: only the trend card waits for it), one /api/summary?parts=queue
+ * for the active triage tab's rows, and one page of /api/dashboard. Each
+ * section paints as its data lands, so the page is readable as soon as
+ * the headline answers; the other queue tabs fetch their rows when first
+ * opened. While refreshing, previous
  * renders are held at reduced opacity (no skeletons, no layout jumps).
  * All data reaches the DOM via textContent only.
  */
@@ -34,6 +36,7 @@ import {
   mutedTag,
   muteDetail,
   failingWithMuted,
+  failingSplit,
   mutedSuffix,
   clearError,
   clearNode,
@@ -120,6 +123,10 @@ const state = {
   // than relying on whatever this browser's switcher last stored.
   streamProduct: "",
   summary: null,          // last headline payload (no queue rows)
+  // WP-43: the last parts=assigned_trend payload, or null when it could
+  // not be had (failed, timed out, an older server's 400): the trend then
+  // draws today's two series from the headline alone.
+  trendSplit: null,
   // Queue rows by kind, fetched per tab on demand. Absent = not landed
   // yet for the current filters; renderQueueTable shows a loading line.
   queues: {},
@@ -230,6 +237,32 @@ function summaryUrl() {
     apiScope());
 }
 
+/** URL for the trend's assigned/muted split (WP-43): the headline's own
+ * scope and window, so its nights line up with the headline's by date. */
+function assignedTrendUrl() {
+  return apiUrl("api/summary", { parts: "assigned_trend" }, apiScope());
+}
+
+/* How long the trend card waits for its split before drawing today's two
+ * series without it. The part is one memoized statement; a server that
+ * takes this long for it is in trouble, and the card must not hang. */
+const ASSIGNED_TREND_TIMEOUT_MS = 10000;
+
+/**
+ * The trend's split, or null when it cannot be had. Never rejects: a
+ * failure, a timeout or an older server's 400 all mean "draw the trend
+ * without it", never an error banner and never a blocked card.
+ */
+function fetchAssignedTrend() {
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(
+      () => resolve(null), ASSIGNED_TREND_TIMEOUT_MS);
+    fetchJson(assignedTrendUrl()).then(
+      (payload) => { window.clearTimeout(timer); resolve(payload); },
+      () => { window.clearTimeout(timer); resolve(null); });
+  });
+}
+
 /** URL for one triage queue's rows. */
 function queueUrl(kind) {
   return apiUrl(
@@ -257,9 +290,12 @@ function browseUrl(offset) {
 /**
  * Reload everything, painting each section as its data lands.
  *
- * Three requests go out together — the headline, the active queue's
- * rows, the first browse page — and each renders its own section on
- * arrival rather than waiting for the slowest. The tiles, charts and
+ * Four requests go out together — the headline, the trend's split, the
+ * active queue's rows, the first browse page — and each renders its own
+ * section on arrival rather than waiting for the slowest. The trend card
+ * is the one that needs two: it paints when the headline AND its split
+ * have both landed, whichever is second; the tiles, the bars and the tab
+ * badges paint on the headline alone (WP-43). The tiles, charts and
  * tab counts are a fraction of the old monolithic payload, so the page
  * is readable at once even when a queue takes its time. A section that
  * fails shows the error without blanking the ones that succeeded.
@@ -273,6 +309,21 @@ async function refreshAll() {
   clearError();
   setLoading(true);
   state.queues = {};  // the filters may have changed; refetch per tab
+  // The trend card's two inputs for THIS generation; it renders on the
+  // second to land, so it never pairs a new headline with an old split.
+  // It is the one card that waits for the split, so it carries its own
+  // dim, lifted when both have settled; the page-wide one below waits
+  // for the headline, the queue and the browse page only, as it always
+  // did (WP-43).
+  const trendCard = document.getElementById("trend-card");
+  trendCard.classList.add("is-loading");
+  let trendInputs = 0;
+  const trendInputLanded = () => {
+    trendInputs += 1;
+    if (trendInputs === 2) {
+      renderTrend();
+    }
+  };
 
   const headlinePart = (async () => {
     try {
@@ -284,12 +335,26 @@ async function refreshAll() {
       renderHeadline();
       // First meaningful paint: the page is usable from here.
       document.getElementById("loading-state").hidden = true;
+      trendInputLanded();
     } catch (err) {
       if (seq === state.requestSeq) {
         showError(err.message);
       }
     }
   })();
+  const trendSplitPart = (async () => {
+    const split = await fetchAssignedTrend();
+    if (seq !== state.requestSeq) {
+      return;
+    }
+    state.trendSplit = split;
+    trendInputLanded();
+  })();
+  Promise.all([headlinePart, trendSplitPart]).then(() => {
+    if (seq === state.requestSeq) {
+      trendCard.classList.remove("is-loading");
+    }
+  });
   const queuePart = loadQueue(state.activeQueue, seq);
   const browsePart = (async () => {
     try {
@@ -388,8 +453,9 @@ async function loadBrowse(append) {
  * still reflect the final action. A burst of any size costs two
  * requests rather than one per action.
  *
- * A refresh is now the headline plus the ACTIVE queue's rows, fetched
- * together. The other queues' caches are dropped, not refetched: five
+ * A refresh is now the headline, the trend's split (WP-43: so red turns
+ * blue in all three charts after a "Take") and the ACTIVE queue's rows,
+ * fetched together. The other queues' caches are dropped, not refetched: five
  * row payloads nobody is looking at, refetched on every "Take", is the
  * expense the parts split exists to avoid. Their tabs refetch on the
  * next click; their badge counts come fresh with the headline either
@@ -412,10 +478,12 @@ async function fetchSummary() {
     summaryInFlight = Promise.all([
       fetchJson(summaryUrl()),
       fetchJson(queueUrl(kind)),
+      fetchAssignedTrend(),
     ]);
     try {
       const results = await summaryInFlight;
       state.summary = results[0];
+      state.trendSplit = results[2];
       state.queues = {};
       tagStream(results[1].queue.tests);
       state.queues[kind] = results[1].queue;
@@ -431,7 +499,8 @@ async function refreshSummary() {
     await fetchSummary();
     renderStatus();
     renderEnvUpdated();
-    renderCharts();
+    renderTrend();
+    renderBars();
     renderQueues();
   } catch (err) {
     showError(err.message);
@@ -452,7 +521,8 @@ function renderHeadline() {
   renderToolbar();
   renderStatus();
   renderEnvUpdated();
-  renderCharts();
+  // The bars only: the trend card waits for its split (refreshAll).
+  renderBars();
   renderQueues();
   populateScriptOptions();
   updateProductColumn();
@@ -754,6 +824,7 @@ function renderStatus() {
 
 /* ================= charts ================= */
 
+/* Today's trend, and the one an older server (or a failed split) gets. */
 const TREND_SERIES = [
   { key: "FAIL", label: "Failed", segClass: "seg-fail",
     swatchClass: "swatch-fail" },
@@ -761,67 +832,156 @@ const TREND_SERIES = [
     segClass: "seg-up", swatchClass: "swatch-up" },
 ];
 
-function renderCharts() {
-  const summary = state.summary;
+/* WP-43: the Failed column split by whose the test is NOW, bottom first:
+ * nobody's (the red, where the eye starts), someone's, muted; then
+ * unexpected pass on top. The first three are also the bars' legend. */
+const TREND_SPLIT_SERIES = [
+  { key: "FAIL_UNASSIGNED", label: "Unassigned", segClass: "seg-fail",
+    swatchClass: "swatch-fail" },
+  { key: "FAIL_ASSIGNED", label: "Assigned", segClass: "seg-assigned",
+    swatchClass: "swatch-assigned" },
+  { key: "FAIL_MUTED", label: "Muted", segClass: "seg-muted",
+    swatchClass: "swatch-muted" },
+  { key: "UNEXPECTED_PASS", label: "Unexpected pass",
+    segClass: "seg-up", swatchClass: "swatch-up" },
+];
+const FAILING_SPLIT_LEGEND = TREND_SPLIT_SERIES.slice(0, 3);
 
-  // 1. Nightly trend (stacked columns) + its table twin.
+/**
+ * The headline's nights with the split merged in by date, the unassigned
+ * part derived here, or null when the trend must draw today's two
+ * series: no split, or a night it does not carry. One series list per
+ * chart, so one missing night means the whole card goes without, never
+ * a night of everything-red claiming nobody owns it.
+ */
+function splitNights(nights, split) {
+  if (!split || !split.trend || !Array.isArray(split.trend.nights)) {
+    return null;
+  }
+  const byDate = new Map(split.trend.nights.map((n) => [n.date, n]));
+  const merged = [];
+  for (const night of nights) {
+    const part = byDate.get(night.date);
+    if (!part || typeof part.FAIL_ASSIGNED !== "number"
+        || typeof part.FAIL_MUTED !== "number") {
+      return null;
+    }
+    merged.push(Object.assign({}, night, {
+      FAIL_UNASSIGNED: Math.max(
+        0, night.FAIL - part.FAIL_ASSIGNED - part.FAIL_MUTED),
+      FAIL_ASSIGNED: part.FAIL_ASSIGNED,
+      FAIL_MUTED: part.FAIL_MUTED,
+    }));
+  }
+  return merged;
+}
+
+/** 1. Failing runs per day (stacked columns) + its table twin. */
+function renderTrend() {
+  const headlineNights = state.summary.trend.nights;
+  const merged = splitNights(headlineNights, state.trendSplit);
+  const isSplit = merged !== null;
+  const nights = isSplit ? merged : headlineNights;
   stackedColumnChart(
-    document.getElementById("trend-chart"),
-    summary.trend.nights, TREND_SERIES);
+    document.getElementById("trend-chart"), nights,
+    isSplit ? TREND_SPLIT_SERIES : TREND_SERIES, { unit: "day" });
+  document.getElementById("trend-split-caption").hidden = !isSplit;
+  for (const th of document.querySelectorAll(
+    "#trend-table th.trend-split-col")) {
+    th.hidden = !isSplit;
+  }
   const twin = document.getElementById("trend-table-body");
   clearNode(twin);
-  for (const night of summary.trend.nights) {
+  for (const night of nights) {
     const tr = document.createElement("tr");
     tr.appendChild(el("td", "", formatNight(night.date)));
-    tr.appendChild(el("td", "num", night.FAIL.toLocaleString()));
-    tr.appendChild(el("td", "num",
-      night.UNEXPECTED_PASS.toLocaleString()));
-    tr.appendChild(el("td", "num", night.total.toLocaleString()));
+    const counts = isSplit
+      ? [night.FAIL, night.FAIL_UNASSIGNED, night.FAIL_ASSIGNED,
+        night.FAIL_MUTED, night.UNEXPECTED_PASS, night.total]
+      : [night.FAIL, night.UNEXPECTED_PASS, night.total];
+    for (const count of counts) {
+      tr.appendChild(el("td", "num", count.toLocaleString()));
+    }
     twin.appendChild(tr);
   }
+}
+
+/**
+ * One failing bar. An entry carrying `assigned` (WP-43) is drawn three
+ * ways, left to right: nobody's (red), someone's, muted (grey), with the
+ * tooltip rows and the row's screen-reader name from failingSplit(). An
+ * entry without it (an older server) is exactly the WP-40 bar: the
+ * failing count with its muted failures as a grey extension, never all
+ * red. The end label is the unmuted failing count either way.
+ */
+function failingBar(item, entry, failing, failingLabel, moreRows) {
+  if (typeof entry.assigned !== "number") {
+    return Object.assign(item, {
+      value: failing,
+      extra: entry.muted || 0,
+      tooltipRows: [{ swatchClass: "swatch-fail", label: failingLabel,
+        value: failingWithMuted(failing, entry.muted) }].concat(moreRows),
+    });
+  }
+  const split = failingSplit(failing, entry.assigned, entry.muted);
+  const name = item.sublabel
+    ? item.label + " in " + item.sublabel : item.label;
+  return Object.assign(item, {
+    value: failing,
+    segments: [
+      { value: split.unassigned, className: "fill-fail" },
+      { value: split.assigned, className: "bar-assigned" },
+      { value: split.muted, className: "bar-muted" },
+    ],
+    tooltipRows: split.rows.concat(moreRows),
+    ariaLabel: name + ": " + failing.toLocaleString() + " "
+      + failingLabel + ", " + split.words,
+  });
+}
+
+/** The bar cards' legend, drawn whenever the payload carries the split
+ * (zeros included, so a card's height never changes on a "Take"). */
+function failingLegend(entries) {
+  return entries.every((entry) => typeof entry.assigned === "number")
+    ? { legend: FAILING_SPLIT_LEGEND } : {};
+}
+
+/** 2 and 3: the two bar charts, from the headline alone. */
+function renderBars() {
+  const summary = state.summary;
 
   // 2. Failing tests by environment (click to scope). The bar is the
-  // UNMUTED failing count with the muted failures as a grey extension
-  // of it (WP-40), sorted by the unmuted number; an environment whose
-  // failures are all muted still shows, grey only.
+  // UNMUTED failing count, split by assignment, with the muted failures
+  // after it in grey (WP-40, WP-43), sorted by the unmuted number; an
+  // environment whose failures are all muted still shows, grey only.
   const envItems = summary.by_environment
     .filter((entry) => entry.failed > 0 || (entry.muted || 0) > 0)
     .sort((a, b) => (b.failed - a.failed)
       || ((b.muted || 0) - (a.muted || 0)))
-    .map((entry) => ({
-      label: entry.environment,
-      value: entry.failed,
-      extra: entry.muted || 0,
-      tooltipRows: [
-        { swatchClass: "swatch-fail", label: "failing",
-          value: failingWithMuted(entry.failed, entry.muted) },
+    .map((entry) => failingBar(
+      { label: entry.environment,
+        onClick: () => setEnvironment(entry.environment) },
+      entry, entry.failed, "failing", [
         { swatchClass: "", label: "new failures",
           value: entry.new_failures.toLocaleString() },
         { swatchClass: "", label: "tests",
           value: entry.total_tests.toLocaleString() },
-      ],
-      onClick: () => setEnvironment(entry.environment),
-    }));
-  barRows(document.getElementById("env-chart"), envItems, {});
+      ]));
+  barRows(document.getElementById("env-chart"), envItems,
+    failingLegend(summary.by_environment));
   document.getElementById("env-chart-empty").hidden =
     envItems.length !== 0;
 
   // 3. Most-failing scripts (click to open in the test list).
   // Cap at 7 rows so the card stays in balance with its neighbours.
-  const scriptItems = summary.top_failing_scripts.slice(0, 7).map((entry) => ({
-    label: entry.script,
-    sublabel: entry.environment,
-    // The server ranks by the UNMUTED count; the muted failures of the
-    // script ride as a grey extension of the bar (WP-40).
-    value: entry.failing,
-    extra: entry.muted || 0,
-    tooltipRows: [
-      { swatchClass: "swatch-fail", label: "failing tests",
-        value: failingWithMuted(entry.failing, entry.muted) },
-    ],
-    onClick: () => openScriptInBrowse(entry),
-  }));
-  barRows(document.getElementById("scripts-chart"), scriptItems, {});
+  // The server ranks by the UNMUTED count.
+  const scripts = summary.top_failing_scripts.slice(0, 7);
+  const scriptItems = scripts.map((entry) => failingBar(
+    { label: entry.script, sublabel: entry.environment,
+      onClick: () => openScriptInBrowse(entry) },
+    entry, entry.failing, "failing tests", []));
+  barRows(document.getElementById("scripts-chart"), scriptItems,
+    failingLegend(scripts));
   document.getElementById("scripts-chart-empty").hidden =
     scriptItems.length !== 0;
 }

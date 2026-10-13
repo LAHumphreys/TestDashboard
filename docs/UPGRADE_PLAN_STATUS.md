@@ -4559,3 +4559,74 @@ Off the trigger paths, no measured pass. **Verify** in the main checkout
 on the cherry-picked diff: SQLite 2729 OK (skipped 1); MariaDB (local 12.3, main
 sacrificial database) 3747 OK (skipped 79); the implementer's one unexplained
 error on an earlier MariaDB run did not recur in three later runs.
+
+## WP-43 item 2: the dashboard's charts split assigned from unassigned (2026-10-13, overnight run)
+
+**WP-43 item 2** (the commit carrying this entry): the UI half. The two bar
+charts split unassigned red, assigned blue (`--c-assigned: #3b6cc0`,
+validated against every chart colour for normal and colour-blind vision)
+and muted grey under a legend per card; end label, sort and click target
+unchanged; `barRows` gains a `segments` list with today's `extra`
+normalised into it and the base DOM pinned for callers that pass
+neither. The trend stacks unassigned, assigned, muted and unexpected pass
+under an "as they stand now" caption and a seven-column table; its split
+comes from `parts=assigned_trend`, requested in the same parallel batch as
+the headline with the headline's scope, merged by date, rendered when the
+second of the two inputs lands, never awaited before the tiles and bars
+paint, never rejecting (a failure, a 400 or the 10 s timeout gives the
+two-series card). One wording helper, `failingSplit` in `api.js`, builds
+the parts, their words and the tooltip rows; the home trend call passes
+the day unit, so the aria no longer says "per night".
+
+**Requests:** three parallel data requests became four; headline 78 ms
+and 14.4 KB, the part 3 ms and 1 KB against a copy of the dev database.
+**Review:** fresh eyes delivered every acceptance line; the main session's
+walkthrough on a play server read the headline, the part, the page and
+the served JS, and moved an assignment through the API to see the
+environment's count and the trend's runs change together. Four findings
+fixed before the commit: the page-wide dim waited on the part where only
+the trend card may; the caption was visible on first load under an empty
+plot; a one-caller wrapper; a raw commit hash in a test comment.
+**Guards:** the WP-40 spelling guard widened to "both bar callers draw a
+muted segment"; `AssignedSplitTest`, `AssignedTrendFetchTest` and the
+DOM-shim `AssignedSplitDomTest`, which runs the real modules under node in
+a subprocess and skips where node is absent (one more skipped class on a
+leg without node). No browser has rendered the UI. **Verify** in the main
+checkout on the cherry-picked diff: SQLite 2751 OK (skipped 1); MariaDB (local
+12.3, main sacrificial database) 3769 OK (skipped 79).
+
+## WP-43 item 1p, second half: the trend part at 90 days and 1,000 assignments (2026-10-13, overnight run)
+
+**Measured** by performance-engineer on `perf-seed/1-h90` (item 0's
+90-night variant, SQLite, cold, in-process, alternated, 32 calls per
+side; `--base 27632fb` against `--head 386fff5`; the seed rebuilt from
+the base in 6m41s with a fingerprint identical to the README's copy;
+widest half-band 5.5 ms at 65 assignments and 12.3 ms at 1,000). Every
+Known slow row "same" on this seed (watch 305/306 ms, compare 251/254,
+Open Actions rows 121/129 under the 5 % floor, home headline 73/74 with
+35 to 36 statements, browse 13.5/13.2 and 24.3/23.9); the headline at 65
+and 1,000 assignments and at 14 and 90 days inside its band; the full
+payload at both inside its band with one more statement and the trend
+statement never run in it (0 calls), so the §7 decision holds and the
+Known slow table does not change.
+
+**The trend part, head against itself:** 22.8 ms [±1.7] at 14 days and
+65 assignments; 100.6 ms [±6.6] at 90 days and 65; 317 ms [±21] at 14
+days and 1,000; 1,553 ms [±74] at 90 days and 1,000. The MariaDB
+statement alone (local 12.3, 1,000 assignments loaded with `seed.py
+--onto` and the migration tool): about 80 ms at 14 days once warm, 2.2 to
+3.0 s at 90 days, every call. Cause: `runs` reaches the triple's runs by
+the identity index, which carries neither result nor stream, so every run
+of every assigned test in the window is fetched then filtered (96,767
+rows read for 3,537 FAIL). The MariaDB plan still starts from
+`current_assignments`; item 1h confirmed unnecessary. A covering index on
+`runs (environment, script, test_name, result, start_time, stream_id)`
+measured 1,536 → 26 ms on SQLite and about 2,400 → 11 ms on MariaDB on
+scratch copies, at +85 MB on 830k runs, an unmeasured push-path write and
+schema migration 12.
+
+**ESCALATED to the owner, recorded in the design doc's §7**; no item was
+parked because none depends on it. The options are accept as built,
+the covering index as its own package, or a cap that reverses decision
+13. Raw outputs in the session's scratch directory: `r1_ab65.txt`,
+`r2_ab1000.txt`, `r3_hh65.txt`, `r4_hh1000.txt` (not tracked).
