@@ -25,8 +25,8 @@ design decision taken on the owner's behalf and recorded.
   on top of `e839953`: WP-43, the three home-dashboard charts split assigned
   from unassigned failing tests. **No migration; schema stays at 11; no new
   flag; the server's Python changed, so the restart is required.** Operator
-  note `docs/drops/2026-10-13.md`; the PR is open from that branch, its body
-  the squash message. Rollback is a checkout and a restart.
+  note `docs/drops/2026-10-13.md`; **PR #20** is open from that branch, its
+  body the squash message. Rollback is a checkout and a restart.
 - **One decision waits for the owner, nothing in the build depends on it:**
   the trend chart's split is its own summary part, off every first paint
   and memoized, costing about 23 ms at the default 14 days and 101 ms at
@@ -92,7 +92,7 @@ design decision taken on the owner's behalf and recorded.
 | | |
 |---|---|
 | `origin/master` | `e839953` — the drop of 2026-10-12 (PR #19) on top of WP-41 and the process PR; deployment not reported |
-| `wp-43-charts-assigned-split` | **the drop of 2026-10-13**, PR open; the design arc's two commits, the status strip, items 1, 0 and 2 of WP-43, the drop's docs. Squash-merge, delete |
+| `wp-43-charts-assigned-split` | **the drop of 2026-10-13**, PR #20 open; the design arc's two commits, the status strip, items 1, 0 and 2 of WP-43, the drop's docs. Squash-merge, delete |
 | `design-charts-assigned-split` | the arc's frozen doc, two commits, already the base of the branch above; **delete after the merge** |
 | `admin-2026-10-09-handover` | PR #17, a handover rewrite superseded twice; **close without merging** |
 | `wp43-backend-wt`, `wp43-seed-wt`, `wp43-ui-wt` | the agents' snapshot branches, each with a worktree under `.claude/worktrees/`; remove the worktrees, then the branches, after the merge |
@@ -110,7 +110,7 @@ predate WP-43; remove when they unlock.
 
 | Plan | Spec | Branch | Status |
 |---|---|---|---|
-| WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8, status strip §9 (frozen 2026-10-13) | `wp-43-charts-assigned-split` | **built, every item done; drop PR open**; one owner decision recorded in §7 |
+| WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8, status strip §9 (frozen 2026-10-13) | `wp-43-charts-assigned-split` | **built, every item done; drop PR #20 open**; one owner decision recorded in §7 |
 
 ## Needs a person, not a commit
 
@@ -223,7 +223,7 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 ```bash
 git fetch origin --prune
 git log --oneline -4 origin/master   # e839953 on top = the drop of 2026-10-12; 49e596d below is what production last reported running
-gh pr list --state open              # expect #9, #17 (close it) and the drop of 2026-10-13
+gh pr list --state open              # expect #9, #17 (close it) and #20, the drop of 2026-10-13
 python -m unittest discover          # expect 2751 OK (skipped 1), SQLite, on the drop branch; 3769 OK (skipped 79) with MariaDB (node on PATH; one more skipped class without it)
 python tools/dev/install_hooks.py    # once per clone: the publication gate's hooks
 ```
