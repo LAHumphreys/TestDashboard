@@ -588,8 +588,8 @@ any interruption is the first line not `done` or `parked`.
 
 | Item | Status | Commit | Note |
 |---|---|---|---|
-| 0 seed | not started | | |
-| 1 backend | not started | | |
+| 0 seed | in flight (spawned 2026-10-13) | | ledger `.claude/work/wp43-0-seed.md` |
+| 1 backend | in flight (spawned 2026-10-13) | | ledger `.claude/work/wp43-1-backend.md` |
 | 1p measured pass | not started | | |
 | 1h dialect hook | not started | | exists only if 1p's EXPLAIN starts from `runs` |
 | 2 UI | not started | | |
