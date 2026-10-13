@@ -4630,3 +4630,35 @@ parked because none depends on it. The options are accept as built,
 the covering index as its own package, or a cap that reverses decision
 13. Raw outputs in the session's scratch directory: `r1_ab65.txt`,
 `r2_ab1000.txt`, `r3_hh65.txt`, `r4_hh1000.txt` (not tracked).
+
+## 2026-10-13 — the drop of 2026-10-13: WP-43 (PR open, not yet deployed)
+
+**What ships:** WP-43, the three home-dashboard charts split assigned from
+unassigned failing tests, built unattended from the frozen design review
+`docs/design/charts-assigned-split-r0.md` as three items on branch
+`wp-43-charts-assigned-split` (item 1 the backend `db835c4`, item 0 the
+90-night seed `386fff5`, item 2 the UI `99e09de`), plus the measured pass
+in two halves. **No migration; schema 11; no new flag; the server's Python
+changed, so the restart is required.** Operator note
+`docs/drops/2026-10-13.md`; What's new section dated the same; the PR's
+body is the squash message.
+
+**Measured** (all in the entries above): the Known slow table unchanged on
+every row on both seeds; the home headline one bounded statement more
+(about 0.3 ms); the full payload never runs the trend statement; the new
+part 23 ms at 14 days and 101 ms at 90 with 65 assignments, 317 ms and
+1,553 ms at 1,000, memoized. **Decided:** the full unsliced payload does
+not carry the trend keys (the main session, under decisions 8 and 13,
+reversible); the dialect hook is not needed. **Escalated to the owner,
+open:** the part's cost at 90 days with many assignments: accept, a
+covering index on `runs` as its own package, or a cap.
+
+**The run itself:** kickoff after `/verify` green on a clean tree
+(2687/3674); a heartbeat cron hourly; items 0 and 1 in parallel in their
+own worktrees, item 2 on item 1's commit; each verified on both legs in
+the main checkout, measured where on the trigger paths, read by fresh eyes;
+findings sent back twice per item at most (one performance finding and
+three review findings on item 1, five on item 0, four on item 2), all
+fixed before the commits; no item parked. Suite in the main checkout on
+the final branch: SQLite 2751 OK (skipped 1); MariaDB (local 12.3) 3769 OK (skipped 79).
+No browser has rendered the UI.

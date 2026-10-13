@@ -663,4 +663,4 @@ any interruption is the first line not `done` or `parked`.
 | 1p measured pass | done, with an escalation for the owner (§7: the part at 90 days and 1,000 assignments) | | Known slow table holds on both seeds; headline and full payload unchanged; MariaDB plan starts from `current_assignments` |
 | 1h dialect hook | not needed | | 1p's EXPLAIN starts from `current_assignments` (local MariaDB 12.3, indicative) |
 | 2 UI | done | the commit carrying this line | four review findings fixed before the commit; no browser has rendered it |
-| 3 drop | not started | | |
+| 3 drop | PR open (the drop of 2026-10-13); stops here for the owner | | operator note `docs/drops/2026-10-13.md`; What's new dated the same |
