@@ -141,309 +141,302 @@ the line says whose position stands; "decision N" points at §4.
   applies to build streams only: §P found it wrong for mainline on a migrated
   database, which is production's case (decision 18).
 
-## §2 Backend (§B, round 1, backend-engineer, base `652b0bb`)
+## §2 Backend (§B, round 2, backend-engineer, base `028eb33`)
 
-Against §0, §1, §4's verdicts and §8. **Migration 12, create-only.** Nothing
-on the push path; no existing table altered. §P's numbers are marked §P; the
-rest were measured for this round (B.5). Minimise the cost, accept some.
+Against §0, §1, §4, §8 and §9; the design as frozen. **Migration 12,
+create-only**; nothing on the push path. Numbers marked §P or §3b are the
+performance pass's, the rest this round's (B.5). Some cost is accepted.
 
-### B.1 Definitions (round 1)
+### B.1 Definitions (round 2)
 
 - **A failure is `FAIL` only** (decision 1): an `UNEXPECTED_PASS` or
   `FAILED_AS_EXPECTED` among the last N runs keeps the test flaking.
-- **State on a stream**, judged on the triple's runs there, newest first, up
-  to the latest; `streak` and `runs` are §1's, capped at N:
+- **State on a stream**, from its runs there, newest first; `streak`,
+  `runs` are §1's, capped at N; **New**: a New failure tonight (§9):
 
-  | Latest | Previous | N | State | streak | runs | Reads `runs` |
-  |---|---|---|---|---|---|---|
-  | not FAIL | any | any | `passing` | 0 | null | no |
-  | FAIL | none | any | `failing` (verdict 8) | 1 | 1 | no |
-  | FAIL | not FAIL | any | `flaking` | 1 | null | no |
-  | FAIL | FAIL | 2 | `failing` | 2 | 2 | no |
-  | FAIL | FAIL | 3..10 | `flaking` if one of the newest N is not FAIL, else `failing` | leading FAILs | rows read | ≤ N rows |
-  | no row there | | | `null`, absent there (§8) | | | no |
+  | Latest | Prev | N | State | streak | runs | New | Reads `runs` |
+  |---|---|---|---|---|---|---|---|
+  | not FAIL | any | any | `passing` | 0 | null | no | no |
+  | FAIL | none | any | `failing` (verdict 8) | 1 | 1 | yes, as today | no |
+  | FAIL | not FAIL | any | `flaking` | 1 | null | no | no |
+  | FAIL | FAIL | 2 | `failing` | 2 | 2 | run 3 exists, not FAIL | summary paths, ≤ 3 |
+  | FAIL | FAIL | 3..10 | `flaking` if one of the newest N is not FAIL, else `failing` | leading FAILs | rows read | failing, and run N+1 exists, not FAIL | ≤ N+1 |
+  | no row | | | `null`, absent there (§8) | | | | no |
 
-- **Counted once**: muted, else flaking, else assigned, else unassigned. A
-  live mute wins everywhere, Open Actions included. Retired: in no count.
-- **Dormant assignment (round 1, §8).** A marked test that is flaking, or
-  passing with an assignee, and not live-muted, is on nobody's open figures
-  on that stream: Open Actions, `status.assigned_open`,
-  `queue_totals.assigned` and `.mine`, the assigned and My actions queues,
-  WP-43's `assigned`. Over its cadence it is back. The assignment row is
-  untouched; the mark never assigns. An `UNEXPECTED_PASS` is a stale
-  annotation, not a failure the mark tolerates: it stays (B.8 1).
-- **Newly fixed (round 1, decision 3).** A marked, unmuted, unretired test at
-  not-FAIL after a FAIL is fixed only if that FAIL was over its cadence: the
-  N runs ending at it (2 to N+1 of the newest N+1) all FAIL, or all it had,
-  fewer than N. Otherwise it was tolerated: not in `status.fixed`,
-  `queue_totals.fixed`, the Fixed queue or Home's `new_failures − fixed`.
+- **Went over on this run (round 2)**: over now and not over at the
+  previous run, which is exactly "run N+1 exists and is not FAIL". With
+  N+1 runs or fewer, all FAIL, it was over already (verdict 8). The next
+  night it is Still failing. A cadence change brings no run: never New.
+- **Counted once**: muted, else flaking, else assigned, else unassigned
+  (the charts' split); a live mute wins everywhere. Retired: in no count.
+- **F and X (round 2, §9).** **F**: the stream's marked tests that are
+  `flaking` under no live mute, exactly the rows that read FLAKING (§3).
+  **X**: F's members with no assignee, not retired, the only tests Open
+  Actions leaves out. Nothing is dormant: an assigned flaking test is
+  listed, reading FLAKING; a marked `UNEXPECTED_PASS` stays (§9). The
+  open-assignment figures and queues are **as today**
+  (`status.assigned_open`, `queue_totals.assigned`, `.mine`, the assigned
+  and My actions queues).
+- **Newly fixed** (decision 3): a marked, unmuted, unretired test passing
+  after a FAIL is fixed only if runs 2 to N+1 of its newest N+1 all FAIL,
+  or all it had; else tolerated, in no Fixed figure, queue or delta.
 
-### B.2 Data model and payloads (round 1)
+### B.2 Data model and payloads (round 2)
 
 ```sql
-CREATE TABLE test_flaky_marks (environment TEXT NOT NULL, script TEXT NOT NULL,
-    test_name TEXT NOT NULL, cadence INTEGER NOT NULL,   -- 2..10, refused otherwise
-    reason TEXT NOT NULL,                                -- a cadence change never replaces it
+CREATE TABLE test_flaky_marks (environment TEXT NOT NULL,
+    script TEXT NOT NULL, test_name TEXT NOT NULL,
+    cadence INTEGER NOT NULL, reason TEXT NOT NULL,       -- cadence 2..10
     marked_by TEXT NOT NULL REFERENCES users(username), marked_at TEXT NOT NULL,
-    PRIMARY KEY (environment, script, test_name));       -- no stream: one mark per triple
+    PRIMARY KEY (environment, script, test_name));        -- no stream
 CREATE TABLE flaky_mark_history (id INTEGER PRIMARY KEY AUTOINCREMENT,
     environment TEXT NOT NULL, script TEXT NOT NULL, test_name TEXT NOT NULL,
-    action TEXT NOT NULL, cadence INTEGER, reason TEXT,  -- 'mark' | 'cadence' | 'unmark'
+    action TEXT NOT NULL, cadence INTEGER, reason TEXT,  -- mark|cadence|unmark
     actor TEXT NOT NULL REFERENCES users(username), acted_at TEXT NOT NULL);
-CREATE INDEX idx_flaky_mark_history_triple ON flaky_mark_history (environment, script, test_name, id);
+CREATE INDEX idx_flaky_mark_history_triple
+    ON flaky_mark_history (environment, script, test_name, id);
 ```
 
-**Migration 12**, claimed in `UPGRADE_PLAN.md` §1 in the build's commit (WP-15
-to 13); MariaDB ledger step 11→12, `alters=()`, both tables in `ddl()` and
-`_ENVIRONMENT_TABLES`; the server may stay up. **Rollback**: SQLite, the copy
-taken first; MariaDB, drop both tables, `schema_version` back to 11.
+**Migration 12** (claimed in `UPGRADE_PLAN.md` §1 in the build's commit;
+WP-15 to 13): ledger step 11→12, `alters=()`, both tables in `ddl()` and
+`_ENVIRONMENT_TABLES`. **Rollback**: SQLite's copy; MariaDB, drop, back to 11.
 
 ```text
-rows (browse, queues, Open Actions), test detail, on the row's stream; comparison rows: none (decision 9)
-  "flaky": null | {"cadence": 3, "marked_by", "marked_at", "reason", "state": "failing", "streak": 2, "runs": 2}
-/api/summary status: "flaking", "flaking_new_failures", "flaking_still_failing", "flaky_total";
-  "flaking" on by_environment[], top_failing_scripts[], products[], Watch's e:/p: cards
-parts=assigned_trend nights[]: {"date", "FAIL_ASSIGNED", "FAIL_MUTED", "FAIL_FLAKING"}
-GET /api/summary?parts=names[&product=][&stream=]                      (round 1, the build's first item)
-  -> {"generated_at", "product", "stream", "stale_before", "environments", "assignees",
-      "products": [{"product": "Atlas"}], "assignment_streams"}
-GET /api/dashboard?open=1[&result=FAIL|UNEXPECTED_PASS]   rows, total and bulk leave out B.3(b)'s set
-GET /api/flaky?stream=&environment=&product=&limit=100&offset=0 -> {"generated_at", "stream", "total",
-  "retired", "marks": [{<triple>, "cadence", "marked_by", "marked_at", "reason", "retired", "result",
-  "state", "muted", "assignee", "failed_runs": 7, "runs": 20}]}            order: D-B11
-POST /api/flaky/bulk {"username", "reason"?, "cadence", "tests": [{<triple>, "stream_id"?}]}
-  -> {"marked", "changed", "unchanged", "unknown"}       # unknown: no latest_runs row anywhere
-POST /api/flaky/unmark {"username", "reason"?, "tests"} -> {"unmarked"}
-test detail also: "flaky_history": [{"id", "action", "cadence", "reason", "actor", "acted_at"}]
+rows (browse, queues, Open Actions), test detail; comparison rows: none
+  "flaky": null | {cadence, marked_by, marked_at, reason, state, streak, runs}
+  a New failures row with prev_result FAIL and state "failing" is a
+  promotion (§3: FLAKING -> FAIL (flaky)); queue rows carry both today
+/api/summary: §1's counts, unchanged (status.flaking, …, FAIL_FLAKING)
+GET /api/summary?parts=names -> round 1's fields plus flaky_marks
+GET /api/dashboard?...&result=FLAKING: B.3(c); ?open=1 leaves out X: B.3(b)
+GET /api/flaky?stream=&environment=&product=&limit=100&offset=0 -> {
+  generated_at, stream, total, retired, marks: [{<triple>, cadence,
+  marked_by, marked_at, reason, retired, result, state, muted, assignee,
+  recent_failures, recent_runs}]}                        order: D-B11
+POST /api/flaky/bulk {username, reason?, cadence, tests} -> {marked,
+  changed, unchanged, unknown};  POST /api/flaky/unmark -> {unmarked}
+test detail: "flaky_history": [{id, action, cadence, reason, actor,
+  acted_at}], in the detail (§3b)
 ```
 
-A flaking row's own chip and edge (decision 8) need only `flaky.state` and
-the row's `mute`: `result` stays `FAIL`; no Result filter value (§8).
+**The Flaky tab (round 2).** `assignee` is the current assignee, as
+anywhere; nothing reads "dormant". The window figures are renamed
+`recent_failures`, `recent_runs` (§3 U12.2): `runs` is only a row's.
 
-### B.3 Where the cadence is evaluated (round 1)
+### B.3 Where the cadence is evaluated (round 2)
 
-**(a) At read time, bounded (decision 17; WP-8's streak bounds and a
-`fail_streak` column were rejected there).** Python applies B.1 to these
-statements, qmark-canonical, each with its driving side pinned:
+**(a) At read time, bounded (decision 17).** Python applies B.1 to these,
+qmark-canonical, each with its driving side pinned and a plan guard:
 
 ```sql
--- Q1, one per stream: §P's cheaper shape, plus the dormant member
-SELECT 'f', lr.<triple>, fm.cadence, fm.marked_at, lr.prev_result, lr.start_time,
-       tm.expires_at, tr.retired_at, ca.assignee
-FROM latest_runs AS lr CROSS JOIN test_flaky_marks AS fm ON <triple>     -- FAIL range first
-LEFT JOIN test_mutes AS tm ON tm.stream_id = lr.stream_id AND <triple>
-LEFT JOIN test_retirements AS tr ON <triple> LEFT JOIN current_assignments AS ca ON <triple>
+-- Q1, per stream, the marked FAIL rows (round 1's dormant member gone)
+SELECT lr.<triple>, fm.cadence, lr.prev_result, lr.start_time,
+  tm.expires_at, tr.retired_at, ca.assignee FROM latest_runs AS lr
+CROSS JOIN test_flaky_marks AS fm ON <triple> LEFT JOIN test_mutes AS tm ON
+  tm.stream_id = lr.stream_id AND <triple> LEFT JOIN test_retirements AS tr
+  ON <triple> LEFT JOIN current_assignments AS ca ON <triple>
 WHERE lr.stream_id = ? AND lr.result = 'FAIL'
-UNION ALL SELECT 'd', …   -- dormant: current_assignments CROSS JOIN marks CROSS JOIN latest_runs
-                         -- (stream's key), tm, tr; assignee set, result not FAIL or UP
--- Qc, summary paths only: §P's count in SQL, decision 3's candidates in the same pass
-SELECT CASE WHEN <fixed> THEN 'x' ELSE 'c' END, fm.environment, CASE WHEN <fixed> THEN fm.script END,
-       CASE WHEN <fixed> THEN fm.test_name END, COUNT(*), MAX(fm.cadence), MAX(lr.start_time)
-FROM test_flaky_marks AS fm CROSS JOIN latest_runs AS lr ON lr.stream_id = ? AND <triple>
-LEFT JOIN test_retirements AS tr ON <triple>
-WHERE tr.retired_at IS NULL GROUP BY 1, 2, 3, 4    -- <fixed>: prev_result = FAIL, result <> FAIL
--- Q2 (round 0's shape): newest N runs per test, ≤ its latest start, one UNION ALL per 100 tests
+-- Qc (summary paths, round 1's shape): flaky_total, decision 3's candidates
+-- Q2: newest N+1 runs per test, <= latest start, UNION ALL per 100 tests;
+--   the floor on build streams only (decision 18)
 ```
 
-- **Plans, SQLite, measured**: Q1 `SEARCH lr USING INDEX
-  idx_latest_runs_result`, then the marks' key; its `d` member `SCAN ca`;
-  Qc `SCAN fm` and a temp B-tree; Q2 a range on the runs UNIQUE index.
-  **Every statement on the marks has a plan guard** (§P: an inner join
-  scanned the partition). MariaDB does not pin on `CROSS JOIN` (B.8 4).
-- **Q2's floor** (`start_time >= streams.first_seen`) on **build streams
-  only** (decision 18): migration 9 stamped mainline's `first_seen` with its
-  own clock, hiding older runs on a migrated database (§P).
-- Q2 also serves decision 3 at LIMIT N+1 for Qc's `x` rows and the tab at
-  LIMIT 20, its page only (decision 4; never `recent_results`, §P: 52 ms).
-  Mute liveness is judged in Python from `tm.expires_at` at `now`.
+- **One Q2 for every list**, at LIMIT N+1: marked FAIL/FAIL rows of
+  cadence 3 to 10; on summary paths also cadence 2 (promotion) and Qc's
+  candidates. Plans (SQLite): Q1 the `idx_latest_runs_result` range, then
+  the marks' key; Q2 a runs UNIQUE range. Mute liveness: Python, `now`.
 
-**(b) Open Actions without the set-aside tests (round 1, decision 23).**
-- **One definition.** `open=1` ("needs action") leaves out X: the stream's
-  marked, unretired, not live-muted tests that are flaking, or passing (not
-  UP) with an assignee. It lives in `_dashboard_filters`, so the rows, the
-  `total` and `POST /api/assignments/bulk` agree (WP-26). The page sends
-  `open=1` in all three modes, plus `result=FAIL` or `UNEXPECTED_PASS` for
-  the narrow two (the UI's contract). Browse sends no `open`: unchanged.
-- **X comes from Q1's memo** (B.4), bound as parameters: paging and the count
-  stay exact SQL, and the count gains no join (its WHERE reads `lr`, `ca`):
+**(b) Open Actions: X only (round 2, §9).** `open=1` leaves out X in
+`_dashboard_filters`: rows, `total` and bulk assign agree (WP-26). The
+page sends `open=1` in its three modes; its Failing mode sends
+`result=FAIL&result=FLAKING` (today's FAIL, (c)).
+- **SQLite: the keys form only** (§3b). One statement returns the matched
+  keys in sort order (no `runs` or mute join); Python drops X; `total` is
+  what is left; the page comes by key, `(lr.<triple>) IN (VALUES (?, ?,
+  ?), …)`, ≤ 250. It replaces rows and count; bounded by the open items.
+- **MariaDB: bound, gated**, rows and count: `AND NOT (lr.result = ? AND
+  ca.assignee IS NULL AND (lr.<triple>) IN ((?, ?, ?), …))`. **The gate
+  changes** from `(result = FAIL OR assigned)`, prefilter and groups to
+  `result = FAIL AND ca.assignee IS NULL` and a row-value list (§3b (d)):
+  true of every member of X, and naming `ca` keeps it after `ca`'s probe.
+  The count already joins `ca`: no join is added.
 
-  ```sql
-  AND NOT ((lr.result = ? OR ca.assignee IS NOT NULL)      -- every member of X is one
-           AND lr.test_name IN (?, …)                       -- prefilter
-           AND ((lr.environment = ? AND lr.script = ? AND lr.test_name IN (?, …)) OR …))
-  ```
+**(c) The browse Result filter gains Flaking (round 2, §9).** The wire
+follows the chip (§3): `result=FLAKING` matches F; `result=FAIL` every
+other FAIL row, a muted flaking one included; both together are today's
+FAIL. `result` stays repeatable; sorting stays on the wire value. The API
+maps FLAKING to raw `FAIL` plus a mode: FAIL alone *excludes F*, FLAKING
+alone *keeps only F among FAIL rows*, both or neither has none. Non-FAIL
+rows are never touched, so every other filter composes by AND.
+- **The term binds F on both engines**, scoped in Python to the request's
+  environments and script: exclude `AND NOT (lr.result = ? AND
+  (lr.<triple>) IN (<F>))`, keep `AND (lr.result <> ? OR (lr.<triple>) IN
+  (<F>))`; `<F>` is `VALUES (?, ?, ?), …` on SQLite, `((?, ?, ?), …)` on
+  MariaDB. Rows and count alike; the count's WHERE reads `lr` only: **no
+  join**. Paging, sort and `total` stay exact SQL.
+- **Not the keys form** (B.9), except **above the ceiling** (SQLite
+  before 3.32, over 300 of F in scope: an outage), where it answers exact.
+- **No marks**: FLAKING maps to nothing, so alone it is an empty result
+  list, answered today without a statement; FAIL is today's SQL.
+  Watch's `result=FAIL&unassigned=1` link and the scripts chart's click
+  now list what their figures count (both leave flaking out, §1).
 
-  The gate names `ca`, so the term runs after `ca`'s probe and the open
-  composite, not on every row of the partition. Ungated, the count took
-  +2.9 ms at 50 marks and +13.5 ms at 1,000; gated, +0.02 and +0.09 (B.5).
-- **Ceiling.** Parameters: 1 + names + 2 × groups + |X|. The MariaDB driver
-  interpolates; SQLite before 3.32 allows 999, about 300 excluded tests in
-  scope. Above the backend's cap the read takes the matched keys in order
-  (every `DASHBOARD_SORTS` key is on `lr` or `ca`), drops X and slices in
-  Python, then fetches the page by key: exact, bounded by the open items.
-- **The figures agree.** `status.assigned_open`, `queue_totals.assigned`
-  and `mine` lose X's assigned flaking members in scope (B.4; they count
-  FAIL and UP only, so never held the passing ones); the assigned and My
-  actions queues drop them. The owner strip is names, no figure: a person
-  with only dormant assignments keeps a chip and the list says 0 open, which
-  is true. Dormancy is judged on the stream the figure reads (B.8 2).
+**(d) The promotion, counted (round 2, §9).** P: the promoted tests in
+scope, unmuted, unretired. `new_failures` loses the flaking cells with
+prev not FAIL and gains |P|; `still_failing` loses the other flaking
+cells and |P|; Home's delta follows. When P is not empty the New failures
+queue's rows widen to `prev not FAIL OR fm.cadence IS NOT NULL` (decision
+19's join), over-fetch by the marked FAIL/FAIL rows in scope and keep P;
+Still failing drops F and P, over-fetching. Nothing bound; engine order.
 
-### B.4 Memos, caches and the no-marks bit (round 1)
+### B.4 Memos, caches and the no-marks bit (round 2)
 
-- **No marks: no statement and no join, on any read.** The "any mark" bit
-  rides a statement each request already runs: on summary paths, the mute
-  epoch's memo entry, `mute_epoch()`'s return value unchanged (§P: five
-  callers test it); on `/api/dashboard`, the environment-products statement,
-  moved before the rows (`… UNION ALL SELECT NULL, MIN(environment) FROM
-  test_flaky_marks`: one row, the min-optimisation on both engines); on a
-  queue part whose kind reads no epoch today (fixed, unexpected passes, not
-  run, assigned, mine), the same `MIN` as a scalar column on its count, run
-  before its rows. Bit clear: no Q1, Qc, predicate or join; `"flaky": null`.
-- **`flaky_states`**: Q1 (and Qc on summary paths) and Q2 per stream, stored
-  per environment, key `("flaky_states", stream, environment)`, so tagged,
-  no epoch; Q2's answers in `_streak_cache` (stream, triple, latest start,
-  N). §P: about seven entries per stream join the 128-entry memo. A push
-  drops its pair; a mark act or assignment drops everything, as
-  `mute_tests`. **The push path gains nothing.** The names part: no memo.
-- **Counts exact without SQL for the cadence**, as `_subtract_muted`: the
-  flaking cells leave new, still, assigned and mine, the tolerated fixes
-  leave fixed; capped queues and `top_failing_scripts` over-fetch by the
-  count in scope and drop (§P: exact, +0.056 ms at F = 56).
+- **No marks: no statement and no join, on any read.** The bit rides
+  statements already run (round 1): the mute epoch's entry (its return
+  value unchanged); `/api/dashboard`'s environment-products statement,
+  moved first (`UNION ALL SELECT NULL, MIN(environment) FROM
+  test_flaky_marks`); a `MIN` on a queue kind's count; and `flaky_marks`,
+  a `UNION ALL` row on the names part's products statement (§3b).
+- **One entry per (stream, environment)**, `flaky_states`: Q1's rows and
+  the states from Q2, **filled by whichever page reads first**. **Rows
+  paths never run Qc**, its own entry, summary paths only; a summary path
+  reads what a rows-path fill lacks (cadence 2, fix candidates) in its one
+  Q2. Dropped by a push to its pair and by a mark, mute, assignment or
+  retirement act (Q1 reads `ca`, `tm`, `tr`).
+- **Q2's answers survive every act** (§3b (c)): their own dict,
+  `_cadence_runs_cache`, key (stream, triple, latest start, N), which no
+  act's full clear touches; deletes drop it, a push its stream's (hygiene,
+  never staleness). The name keeps it in the harness's cold sweep.
+- **Unfiltered browse never runs Q1**: state from the row's own result,
+  `prev_result` and cadence; Q2 only for the page's marked FAIL/FAIL rows
+  of cadence 3 to 10, unless memoized.
+- **Counts exact without SQL** (B.3(d), as `_subtract_muted`); capped
+  queues over-fetch and drop. **The push path gains nothing.**
 
-### B.5 Cost, measured (round 1)
+### B.5 Cost, measured (round 2)
 
-Copies of perf-seed/1 and -h90, the 65-assignment fixture through the base
-tree's `Storage`, the tables by hand, round 0's marks (largest environment,
-current failures first, cadences 3,3,2,5,3,4,10,3). SQLite, in-process, memos
-cleared before every call, alternated. Base `652b0bb`'s handler; head the same
-with the proposed SQL substituted at execute time, the fold, X and rows by
-hand. Median ms; B−A the median paired difference [95 % band]; statements per
-cold call. **MariaDB not timed.**
+Copies of perf-seed/1 and -h90, 65 assignments, ten mutes, round 1's
+marks and cadences. SQLite, in-process, memos cleared before every call,
+alternated: 32 calls (perf-seed/1), 24 (-h90), 16 (the forms). Base
+`028eb33`; head its handler with the proposed SQL substituted. Median
+paired B−A [95 % band], ms; statements per cold call base/head; warm =
+memo filled, as after a Home glance. A fast machine (browse count 2.5 ms,
+Known slow 22): compare deltas. **MariaDB not timed.** perf-seed/1 (-h90):
+50 marks, F 11, X 7 (6), P 8 (7); 1,000, F 56 (57), X 22 (21), P 9 (7).
 
-| Open Actions' rows, Known slow URL | 0 marks | 50 marks | 1,000 marks |
+| Open Actions' rows, perf-seed/1 ; -h90 | 0 | 50 | 1,000 |
 |---|---|---|---|
-| perf-seed/1, 48 calls | 20.5, +0.05 [−0.25, +0.40]; 295/295 | 21.0, +3.44 [+2.89, +3.77]; 295/297 | 20.4, +5.74 [+5.44, +6.67]; 295/291 |
-| -h90, 24 calls | 34.4, −0.25 [−1.04, +0.49]; 295/295 | 35.3, +2.17 [+1.75, +2.76]; 295/297 | 35.8, +0.01 [−1.20, +0.84]; 295/291 |
-| `total` | 177 | 166 | 121 (-h90: 120) |
+| cold | +0.16 [−0.15, +0.28] 295/295 ; +0.39 [−0.39, +0.76] | +1.23 [+0.71, +1.77] 295/297 ; +1.25 [+0.85, +1.67] | +1.43 [+1.09, +1.86] 295/294 ; −0.10 [−0.89, +0.50] |
+| warm | | −1.69 [−1.97, −0.71] ; −1.75 [−2.88, −1.13] | −1.40 [−1.84, −0.74] ; −3.49 [−3.75, −2.95] |
+| `total` (base 177) | 177 | 170 ; 171 | 155 ; 156 |
 
-- At 0 marks the head carries the fold and `"flaky": null` (+1.5 KB per 100
-  rows); a 32-call perf-seed/1 run read +0.69, +3.85, +7.35. **Where it
-  goes** (perf-seed/1, 50 / 1,000): Q1+Q2+fold 2.1 / 3.4 ms (-h90 2.5 / 4.4,
-  with Qc's count: an upper bound); the rows walk further for their 100,
-  +0.6 / +2.7 (inherent); the gated predicate +0.02 / +0.09; the join +0.14.
-  On -h90 the rows replacing 57 excluded failures carry cheaper streaks.
-- **Fixture**: 50 marks: 29–30 assigned, 13 flaking, X 11 (4–5 assigned);
-  1,000: all 65 assignments marked, 62–63 flaking, X 56–57 (34–36
-  assigned).
-- **Against the bar.** No marks: same, nothing added (met). With marks the
-  row reads SLOWER by the runner's rule: +16 % at 50 and +28 % at 1,000 on
-  perf-seed/1 (Known slow 97 ms; base here 20.5), +6 % at 50 on -h90, same
-  at 1,000. The page still waits less (below; B.9).
+Round 1's +3.4 and +5.7 (perf-seed/1) become +1.2 and +1.4; warm beats
+base because the keys form replaces the count and the walk.
 
-| Open Actions' catalogue request | full payload | `parts=names` | B−A |
+| Browse `limit=250`, perf-seed/1 ; -h90 | 0 | 50 | 1,000 |
 |---|---|---|---|
-| unscoped, perf-seed/1, 32 calls | 38.7 ms, 161,512 B, 47 stmts | 3.0 ms, 374 B, 14 | −36.2 [−39.3, −34.9] |
-| `product=Atlas`, perf-seed/1, 32 | 38.0, 154,356 B, 46 | 3.1, 346 B, 15 | −35.0 [−35.8, −34.3] |
-| unscoped, -h90, 24 | 38.8, 161,571 B, 47 | 3.1, 374 B, 14 | −35.2 [−38.1, −34.1] |
+| no filter (base 4.9 ms) | +0.06 3/3 ; +0.05 3/3 | +0.24 [+0.19, +0.28] 3/4 ; +0.26 3/3 | +0.44 [+0.40, +0.46] 3/4 ; +0.30 3/3 |
+| its count alone (same SQL) | +0.03 ; +0.01 | +0.01 ; +0.01 | +0.01 ; +0.01 |
+| Failing cold (base 1.8 ms) | +0.04 3/3 ; +0.04 | +3.27 3/5 ; +3.48 | +3.60 3/5 ; +3.83 |
+| Failing warm | | +0.31 ; +0.32 | +0.22 ; +0.21 |
+| Flaking cold | −1.72 3/1 ; −1.73 | +0.73 3/5 ; +0.75 | +2.12 3/5 ; +2.34 |
+| Flaking warm | | −1.44 ; −1.45 | −0.86 ; −0.85 |
+| count alone, Failing / Flaking term | | +0.09 / +0.00 | +0.26 / +0.04 |
 
-The five fields equal the full payload's on every row (asserted). The page
-waits for the slower of its two parallel requests: today the full payload
-(38.7 ms here), after it the rows (20.5, up to 26.6 at 1,000 marks): 12 to
-18 ms less, with or without marks.
+Filtered bands within ±0.2 ms; FAIL 171 splits 160 + 11 and 115 + 56,
+asserted against the keys form. **No filter meets the bar**: no marks,
+same; with marks the join and a page-local Q2 (+1 statement, no memo),
++0.2 to +0.5 ms, under round 1's whole-stream Q1 and Q2. **Failing and
+Flaking**, off every first paint: +2 to +4 ms cold against the Known slow
+count, nearly all the memo's fill; +0.3 or faster warm. With Passing:
+bound +4.1 to +5.7 cold, +0.5 to +1.1 warm; keys +12.1 to +12.6 warm.
 
-**Carried.** Headline (§P, SQLite): +2.2–2.7 ms at 50 marks, +3.3–3.7 at
-1,000. Decision 3 adds (statements, mine): Qc over the count alone +0.0 at
-50, +0.5 (perf-seed/1) and +1.5 ms (-h90) at 1,000; Q2 at N+1 0.41 ms for 27
-candidates (23 tolerated), 0.11 for 8. Composed, about +4.2 and +5.3 ms at
-1,000; §P measures the handler. Tab (§P, page of 100): 5.7, 11.4 ms. Trend
-(round 0, -h90): 4.6 ms at 14 days, 50 marks; 366 at 90 days, 1,000 (21).
+| Headline, perf-seed/1 ; -h90 | 0 | 50 | 1,000 |
+|---|---|---|---|
+| round 2 read vs base | +0.05 [−0.55, +0.37] 37/37 ; −0.03 | +3.69 [+3.15, +4.07] 37/40 ; +4.12 [+3.31, +4.68] | +7.55 [+7.22, +7.78] 37/40 ; +7.24 [+6.69, +7.86] |
+| the promotion's share | | +0.17 [−0.34, +0.43] ; +0.03 [−0.50, +0.64] | +0.65 [+0.18, +1.21] ; +0.44 [−0.28, +1.06] |
 
-### B.6 Decisions, as settled (round 1)
+The share: round 2's one Q2 against round 1's (state at LIMIT N, fixes
+at N+1), same handler. §3b's +6.3 to +6.9 at 1,000 becomes +7.2 to +7.6.
+Queue over-fetch not timed (§3a: +0.056 ms at F 56).
 
-- As decided: **D-B1** trend "that night" (2, corner with WP-43's, 21),
-  **D-B2** last-20 by Q2 (4), **D-B4 to D-B8** lifecycle (11), comment tag
-  (10), deactivated user (12), comparison and Watch's builds (9), the tab.
-- **D-B3 (round 1)** The unsliced `/api/summary` keeps the counts (its
-  queues agree with the headline's) and after D-B10 is on **no page's first
-  paint**. Left: `feeder/status.py` (`--status`, connection test), the curl
-  hint `tools/diagnose_db.py` prints, drop notes' smoke checks, contract
-  tests, Open Actions' fallback on an older server. Home, a build's tab and
-  the other pages read `parts=` slices or `/api/products` already.
-- **D-B9 (round 1)** Open Actions: B.3(b). **D-B10 (round 1)** `parts=names`
-  is a part, not an endpoint: the handler's own scope resolution (`product=`,
-  a scoped stream's product, per-product `stale_before`) makes the five
-  values the full payload's by construction; an older server's 400 is the
-  UI's cue to fall back. `products`: names only.
-- **D-B11 (round 1, decision 16 confirmed)**: failing, flaking, passing,
-  newest mark first, then the triple, no measure needed. The first two groups
-  come from the memo (bounded by the stream's marked failures); passing is
-  one SQL page (marks `CROSS JOIN` latest_runs, `ORDER BY fm.marked_at DESC,
-  <triple> LIMIT ? OFFSET ?`, offset less the first two); retired follow,
-  flagged. `total` counts every row and `retired` those; the badge
-  (`status.flaky_total`) counts the unretired.
+**The whole page, corrected.** Round 1's "Open Actions waits 12 to 18 ms
+less" holds **on SQLite** (§3b: 27 and 20 less). **On MariaDB** (§3b's
+numbers, 12.3) the page is −11.7 ms with no marks, level at about 50
+(+2.6) and slower beyond (+11.0 at 1,000); the rows alone +9.2 and +19.1
+cold, about +11 cold and +4 warm at 1,000 with (a) to (d) (estimate).
 
-### B.7 Tests the build writes (round 1)
+### B.6 Decisions, as settled (round 2)
 
-- `test_storage.py`: `FlakyMarkWriteTest`; `FlakyCadenceTest` (B.1 with
-  `streak`, `runs`, the floor on builds only); `FlakyAgreesWithAnalyticsTest`;
-  **`OpenActionsSetAsideTest`** (each mode; `total` equals the rows paged;
-  bulk acts on the same set; dormancy ends over the cadence; mute wins; UP
-  stays; a planted cap of 1 answers as the bound form);
-  **`DormantFiguresTest`** (every B.3(b) figure agrees); **`FixedRuleTest`**
-  (both ways, cadence 2, fewer than N runs); **`FlakyTabOrderTest`**.
-  `test_api.py`: shapes, 400s, paging, **`NamesPartTest`**.
-- **`NoMarksAddsNothingTest`, widened**: empty table, the cold counts of the
-  headline, full payload, each queue kind, browse, Open Actions, Watch and
-  `assigned_trend` equal base, and only the three bit carriers name the
-  marks. The count-join guard's scope widened: no `COUNT(*)` joins them.
-- Cache guards, with marks: Open Actions cold = base + 1 + ⌈Q2 tests / 100⌉,
-  headline base + 2 + ⌈…⌉, `parts=names` pinned, warm = base; plan guards
-  on Q1, Qc, Q2, the gated predicate, the trend; `TargetedInvalidationTest`,
-  `test_migrations.py`, `LedgerTest` (11→12); MariaDB variants (decision 22).
+- As decided: **D-B1** trend "that night", **D-B2** last-20 by Q2, **D-B3**
+  the unsliced summary keeps the counts, **D-B4 to D-B8** lifecycle, tag,
+  deactivated user, comparison and Watch's builds, the tab, **D-B10**
+  `parts=names`, **D-B11** the tab's order (failing, flaking, passing,
+  newest mark first, retired last). **Round 2: D-B9** X only (B.3(b)),
+  **D-B12** `result=FLAKING` (B.3(c)), **D-B13** the promotion (B.3(d)).
 
-### B.8 Open questions (round 1)
+### B.7 Tests the build writes (round 2)
 
-1. **A marked test at `UNEXPECTED_PASS`** stays on Open Actions as a stale
-   annotation (B.1). Confirm, or set it aside as passing.
-2. **An assignment made from a build** is dormant by the list's stream
-   (mainline on Open Actions), not its origin build's: that would cost one
-   more Q1 per such build.
-3. **The test page's mark history**: one key-range statement on every test
-   page, marked or not, or fetched when its disclosure opens (§UI).
-4. **For §P**: MariaDB 10.3 plans of Q1, Qc, the gated predicate and the
-   fold; whether `CROSS JOIN` needs `STRAIGHT_JOIN` there.
+- `test_storage.py`: `FlakyMarkWriteTest`; `FlakyCadenceTest` (B.1, the
+  floor on builds only); `FlakyAgreesWithAnalyticsTest`;
+  **`OpenActionsSetAsideTest`** (only X leaves; assigned flaking and UP
+  listed; mute wins; `total` = rows paged; bulk on the same set; Failing
+  mode with FAIL+FLAKING = today); **`OpenAssignmentFiguresUnchangedTest`**,
+  replacing `DormantFiguresTest` (`status.assigned_open`,
+  `queue_totals.assigned`, `.mine`, the assigned and My actions queues
+  byte-identical with and without marks, bar the rows' `flaky`);
+  **`BrowseFlakingFilterTest`** (FAIL and FLAKING partition today's FAIL,
+  rows and `total`; muted flaking under FAIL; paging across a boundary,
+  every sort; with Passing; a planted ceiling answers alike; bulk
+  agrees); **`PromotionTest`** (New that night, Still after; cadence 2;
+  N+1 runs or fewer; no New from a cadence change; the queue row's
+  `prev_result` and `flaky`; Home's delta); `FixedRuleTest`;
+  `FlakyTabOrderTest`. `test_api.py`: shapes, 400s, `NamesPartTest`.
+- **`NoMarksAddsNothingTest`, widened**: empty table, the cold statements
+  of the headline, full payload, queues, browse (none, FAIL, FAIL+FLAKING),
+  Open Actions, Watch, `assigned_trend` equal base; FLAKING alone runs
+  none; no `COUNT(*)` joins the marks (the count-join guard widened).
+- Cache guards, cold, same rows: Open Actions and filtered browse base + 1
+  + ⌈Q2/100⌉; headline base + 2 + ⌈Q2/100⌉; unfiltered browse base +
+  ⌈page's Q2/100⌉; warm = base; `parts=names` pinned.
+  **`TargetedInvalidationTest`**: acts leave `_cadence_runs_cache` filled;
+  a push drops its stream's, a delete all. Plan guards on Q1, Qc, Q2, both
+  terms; `test_migrations.py`; `LedgerTest` (11→12); MariaDB variants with
+  ≥ 101 marks (decision 22).
 
-### B.9 Pushback (round 1)
+### B.8 Open questions (round 2)
 
-- **Decision 19, refined, not reopened**: the rows' join is added only when
-  the bit says a mark exists, so no marks costs nothing on any read.
-- **Decision 23 costs Open Actions' own row** +3.4 to +5.7 ms on perf-seed/1
-  with marks, SLOWER by the runner's rule; the page waits 12 to 18 ms less
-  only because of D-B10. The owner's acceptance of the row's number is asked.
+1. **For §P, MariaDB 10.3**: plans and timings of both row-value terms,
+   Q1 and Q2 at LIMIT N+1; `STRAIGHT_JOIN` needed? (12.3: no, §3b).
 
-## §3 UI (§UI, round 1, ui-engineer, base `652b0bb`)
+### B.9 Pushback (round 2)
 
-Against §0, §1 as reconciled, §4 and §8. Flaking is a state of its own: a
-flaking row reads FLAKING, chip and edge in the flaking colour, no pill
-(decision 8). Flaking tests leave Open Actions (decision 23), which drops
-its marker and fetches less (decision 20). No marks: today's page. No
-browser has rendered any of this. Key: `█` unassigned (red), `▓` assigned
-(blue), `░` muted (grey), `▒` flaking, `·` empty.
+- **§3b's "keys form only on SQLite" holds for Open Actions, not browse**,
+  measured (B.5): with Passing also chosen browse matches the whole
+  partition, +12.1 to +12.6 ms warm by keys against +0.5 to +1.1 bound;
+  alone the two are within 0.3 ms. Keys stays as the above-ceiling form.
+- **Open Actions' Failing mode must send FAIL+FLAKING** (§3): FAIL alone
+  would drop an assigned flaking test from that mode, which §9 rules out.
 
-### U1 The colour for "flaking" (round 1)
+## §3 UI (§UI, round 2, ui-engineer, base `028eb33`)
 
-Charts keep **`--c-flaking: #a66993`** (decision 7). It cannot carry text:
-white on it is 4.15:1, and a chip's 12 px semibold text needs 4.5:1. Chips
-and row edges take **`--c-flaking-strong: #8f638b`**, a step darker in the
-same hue (OKLCH L .56 C .08 h 330 against L .60 C .096 h 339; ΔE×100 4.6,
-one colour to the eye): **white on it 4.85:1** (red's chip 5.62, green's
-5.13); the 3 px edge clears 3:1. By U1's method (OKLab ΔE×100, Machado
-CVD) against the chips it sits beside: normal, UNEXPECTED_PASS 16.4, red
-16.6, green 21.8, amber 30.3 (floor 15); CVD minimum 11.2 (green, deutan;
-target 8). The script reproduces round 0's `#a66993` figures (15.9, 8.7).
-The amber chip's own ink is the precedent for a second shade.
+Against §0, §1, §4, §8 and §9; the design freezes here. A flaking row
+reads FLAKING, chip and edge in the strong mauve, no pill (decision 8).
+Open Actions follows §9's rule and nothing more. Browse's Result filter
+gains FLAKING. No marks: today's page. No browser has rendered any of
+this. `▒` is the flaking chart segment.
 
-### U2 Wording: one set of helpers in `api.js`, from the data (round 1)
+### U1 The colour for "flaking"
+
+Two steps of one mauve (agreed, §9). Charts keep **`--c-flaking:
+#a66993`** (decision 7); white on it is 4.15:1, too low for chip text.
+Chips, row edges and the pressed FLAKING toggle take
+**`--c-flaking-strong: #8f638b`** (ΔE×100 4.6 from the chart token, one
+colour to the eye): white on it 4.85:1, the 3 px edge clears 3:1. Against
+its neighbours (OKLab ΔE×100): UNEXPECTED_PASS 16.4, red 16.6, green 21.8,
+amber 30.3 (floor 15); CVD minimum 11.2 (target 8).
+
+### U2 Wording: one set of helpers in `api.js`, from the data (round 2)
 
 ```
 displayResult(result, flakyState, muted)    "FLAKING" | result unchanged
@@ -455,48 +448,52 @@ failingSplit(failing, assigned, muted, flaking)  .words, zeros left out
 setAsideWords(muted, flaking)   "3 muted · 4 flaking" | "4 flaking" | ""
 failedOfRuns(6, 20)             "6 of its last 20 runs"
 cadenceWords(3) "3 in a row"; cadenceSentence(3); flakyCadenceSelect(…)
+newFailuresSub(flakyTotal)  "were passing or flaking before" if any mark
+previousShown(entry)  "FLAKING" on a promotion row, else prev_result
+failToggleTitle()     "Failing, flaking tests left out"
+BROWSE_RESULTS        PASS FAIL FLAKING FAILED_AS_EXPECTED UNEXPECTED_PASS
 ```
 
-`displayResult` is the one place FLAKING is made (`state` is `flaking`,
-no live mute); `resultClass` maps it to `result-flaking`. It never
-touches `entry.result`, so filters, sorts and the wire stay FAIL. The
-set-aside pair replaces `mutedSuffix` and `failingWithMuted`, printing
-today's bytes when nothing is flaking. Titles
-read `streak` and `runs` (§1); the two `runs` rows are over the cadence:
+`displayResult` is the one place FLAKING is made (`state` flaking, no live
+mute) and `resultClass` maps it to `result-flaking`; it never touches
+`entry.result`, so sorts and the wire stay FAIL. The set-aside pair
+replaces `mutedSuffix` and `failingWithMuted`, printing today's bytes when
+nothing is flaking. Every row over its cadence, the promotion night
+included (U6), takes one form of title:
 
 ```
 flaking    Flaking: failed its last 2 runs; counts as failing at 3 in a row
            ("failed its last run" when streak is 1)
-runs = N   Failing: its last 3 runs all failed (marked flaky, 3 in a row)
-runs < N   Failing: every run here has failed (2 of 2); marked flaky, 3 in a row
-           ("its only run here failed" for one run)
+runs = N   Failing: its last 3 runs all failed; marked flaky, 3 in a row
+runs < N   Failing: every run here has failed (2 of 2);
+           marked flaky, 3 in a row ("its only run here failed" for one)
 passing    Marked flaky: counts as failing once its last 3 runs have failed
 live mute  Marked flaky; the mute comes first until it runs out
 ```
 
 ### U3 The selection bar
 
-Unchanged (decision 13; round 0's wireframe stands): `Flaky [at…▾] Mark
-as flaky · Unmark` after Mute, about 400 px wider (estimate), sharing the
-note box as the reason; the owner is the person marking (decision 12).
-**Set cadence** replaces Mark when every ticked row is marked.
+Unchanged (decision 13): `Flaky [at…▾] Mark as flaky · Unmark` after
+Mute, about 400 px wider (estimate), the note box as the reason, the
+person marking as owner (decision 12). **Set cadence** replaces Mark when
+every ticked row is marked.
 
-### U4 The Review panel (round 1)
-
-No pill: the row shows the chip; the panel gives its sentence in text.
+### U4 The Review panel
 
 ```
 Flaky  [why is this test flaky? (required)    ] [at…▾] [Mark as flaky]
 Flaky  Flaking: failed its last run; counts as failing at 3 in a row
-       dev1 · 12 days ago · race in teardown  [3 in a row▾] Set cadence Unmark
+       dev1 · 12 days ago · race in teardown  [3 in a row▾] Set cadence
+       Unmark
 ```
 
-### U5 The test page (round 1)
+### U5 The test page
 
-The mark rides the detail (`flaky`, `flaky_history`). The header's latest
-chip is the test's state here, so it goes through `displayResult`; the
-run history keeps each run's FAIL (a run is what happened; flaking is a
-judgement on the test now). The compare strip stays raw (decision 9).
+The mark and its history ride the detail (`flaky`, `flaky_history`; no
+fetch when the history opens, §3b). The header's chip goes through
+`displayResult`; run history and the compare strip stay raw (a run is
+what happened; flaking is a judgement on the test now; decision 9). With
+`state` null the banner reads "Marked flaky, 3 in a row; no run here yet".
 
 ```
 login_retry                  [FLAKING] 2026-11-10 02:14 · 41.2 s
@@ -507,174 +504,204 @@ FLAKINESS   unmarked: [Mark as flaky]   marked: Marked flaky, 3 in a row
 Flaky mark history ▸   Action | By | When (UTC) | Cadence | Reason
 ```
 
-With `state` null (no run on this stream; rows never carry it) the banner
-reads "Marked flaky, 3 in a row; no run here yet", so it can be unmarked.
-
-### U6 Home tiles and "All clear" (round 1)
+### U6 Home tiles, "All clear", the promotion night (round 2)
 
 ```
-New failures 12                               Still failing 31
-were passing before · +3 muted · +4 flaking   failed before too · +2 flaking
+New failures 12                        Still failing 31
+were passing or flaking before         failed before too · +2 flaking
+· +3 muted · +4 flaking
 
 ✓ All clear. No new failures, nothing still failing, no stale annotations.
   Set aside: 3 muted · 4 flaking
 ```
 
-**"All clear" names what is set aside** (§8) from `setAsideWords`: muted
-is `muted_new_failures + muted_still_failing`, flaking `status.flaking`.
-"Set aside: 3 muted", "Set aside: 4 flaking", or both as drawn; both zero
-or an older server, no line. Each part is a link button to its tab, as
-"retired" is. The counts come with the headline that gates the banner.
+**Going over the cadence is a New failure** (§9). That night the test is
+in `status.new_failures`, so "▲ N more failing than before" moves with no
+UI change; the next night it is Still failing. Its change cell reads
+`FLAKING → FAIL (flaky)`: `previousShown` gives FLAKING for a New
+failures row with `prev_result` FAIL and `flaky.state` failing. Its title
+is U2's `runs = N` line: the queue says when, the title says why.
+Decision 3 is now symmetric: a real failure counts "▲" when it starts and
+"▼" when fixed (`FAIL → PASS (flaky)`); a tolerated one moves neither.
+**The subline**: "were passing before" is untrue of a promotion, so
+where `status.flaky_total > 0` it reads "were passing or flaking before";
+otherwise today's bytes. No new field.
 
-**Fixed and the delta (decision 3)**: no UI change. A pass after a
-tolerated failure is not in `status.fixed`: neither the tile nor "▼ N
-fewer failing than before" moves. A pass after a spell over the cadence
-is a real fix, "worth verifying" stands, and the row reads FAIL (ghost)
-→ PASS (flaky). One asymmetry remains (question 1).
+**Tiles stay buttons that open their queues**: "+4 flaking" cannot hold a
+link inside a `<button>`, so it stays text, as "+3 muted" does.
 
-### U7 The three home charts (round 1)
+**"All clear" names what is set aside** (§8): muted
+`muted_new_failures + muted_still_failing`, flaking `status.flaking`;
+both zero, no line. "3 muted" opens the Muted tab; **"4 flaking" opens
+browse on FLAKING alone** (stale cleared, scrolled to, as "retired"
+does): the tests flaking now, where the Flaky tab lists every mark.
 
-Round 0's design and wireframe stand: a fourth segment `▒` after the grey,
-in the chart token, its key, tooltip row, column and caption words only
-where `status.flaky_total > 0` (decision 5). New: `FAIL_FLAKING` is each
-night as it stood then, under today's marks (decision 2), and the caption
-says "flaking that night, by today's marks".
+### U7 The three home charts
 
-### U8 The Flaky tab, beside Muted (round 1)
+Round 0's design stands: a fourth segment `▒` after the grey, in the chart
+token, with key, tooltip row, column and caption words only where
+`status.flaky_total > 0` (decision 5). `FAIL_FLAKING` is each night as it
+stood then, under today's marks (decision 2), captioned "flaking that
+night, by today's marks"; so the promotion night is red, as in New
+failures.
+
+### U8 The Flaky tab, beside Muted (round 2)
 
 ```
 New failures 3 · Still failing 11 · Muted 2 · Flaky 7 · Fixed 4 · …
 Failing first, then flaking, then passing; newest mark first.
-☐ Test             State    Mark                 Cadence     Failed
-☐ dad_timeout      FAIL     races the DAD timer  2 in a row  9 of its
-  lab-alpha·ipv6            dev2 · 3 days ago                last 20 runs
-☐ login_retry      FLAKING  race in teardown     3 in a row  6 of its
-  lab-alpha·auth            dev1 · 41 days ago               last 20 runs
-☐ cache_warm       PASS     slow mirror          5 in a row  0 of its
-  lab-alpha·cache           dev2 · 90 days ago               last 20 runs
+1 flaking now · List them in All tests
+☐ Test         State    Mark                    Cadence  Failed   Assignee
+☐ dad_timeout  FAIL     races the DAD · dev2    2 in a…  9 of 20  [Take]
+☐ login_retry  FLAKING  race in teardown · dev1 3 in a…  6 of 20  dev1
+☐ cache_warm   PASS     slow mirror · dev2      5 in a…  0 of 20  [Take]
 ```
 
-- **Data**: `GET /api/flaky` (§1) on the first click only, never in
+- **Data**: `GET /api/flaky` on the first click only, never in
   `refreshAll` or `fetchSummary`; 100 a page, "Show more" appends, in the
-  server's order (decision 16). No column sorts (`SortingTest`'s rule).
-- **Badge**: `status.flaky_total`, "…" until the headline, never hot; the
-  tab exists only above zero. A `state: null` mark is absent (§1).
-- **Cells**: `failedOfRuns(failed_runs, runs)`: "0 of its last 20 runs"
-  shows a stale mark. Chip and edge from `displayResult(result, state,
-  muted)`, a muted pill when `muted`, no "flaky" tag (every row is
-  marked). "retired" under a retired test. Assignee with Take follows; a
-  flaking or passing row's assignee reads "dormant", titled "On nobody's
-  Open Actions until it fails past its cadence".
-- **States**: "Loading…"; empty (an unmark raced it) "No test is marked
-  flaky here."; errors as other tabs. An act refetches page one and the
-  counts, as Mute does.
+  server's order (decision 16); no column sorts.
+- **Badge**: `status.flaky_total`, "…" until the headline; the tab exists
+  only above zero. A `state: null` mark is absent.
+- **Cells**: environment·script under the test and the mark's age under
+  its owner (cut from the drawing); `cadenceWords`; `failedOfRuns` ("0 of
+  its last 20 runs" shows a stale mark); chip and edge by `displayResult`;
+  a muted pill; "retired". **The assignee cell is every queue's**, name or
+  Take, no qualifier: an assignment means the same in any state (§9).
+- **Link line** (new): "N flaking now · List them in All tests" from
+  `status.flaking`, above zero only; it does what "All clear"'s does.
+- **States**: "Loading…"; empty "No test is marked flaky here."; errors as
+  other tabs. An act refetches page one and the counts, as Mute does.
 
-### U9 Rows everywhere else (round 1)
-
-```
-state                    chip      row edge   tag
-under cadence, no mute   FLAKING   mauve      none
-over its cadence         FAIL      red        flaky   (grey pill)
-marked and passing       PASS      green      flaky
-live mute, any state     result    result     muted flaky
-lab-alpha  auth/login  login_retry  FLAKING        2026-11-10 02:14
-lab-alpha  ipv6/dad    dad_timeout  FAIL (flaky)   2026-11-10 02:15
-lab-alpha  cache/warm  cache_warm   PASS (flaky)   2026-11-10 02:16
-```
-
-Each row builder gives one `displayResult` value to both `resultClass`
-(the edge) and `resultChip`: a class and a word, no element, and chip and
-edge cannot disagree. FLAKING's title is `flakySentence`. Covered: browse,
-the script page's tests (`/api/dashboard` rows), every Home queue, a
-build's own tab, Not run's "Last result"; New failures and Still failing
-hold no flaking test (§1). Raw results stay in run history, the execution
-breakdown, the compare strip, the comparison page and Watch's build cards:
-**no comparison pill** (decision 9). Watch's environment and product cards
-read `Failing 12 (+3 muted, +4 flaking)`. Browse's FAIL toggle still
-matches FLAKING rows (FAIL on the wire; a flaking value was not taken).
-
-**Open Actions.** No flaking test in any mode, assigned or not; a dormant
-assignment comes back when the test goes over its cadence. So there is
-no flaking marker. A marked row there is over its cadence: FAIL (flaky).
-One quiet footer line, only where the scope has a mark:
+### U9 Rows everywhere else (round 2)
 
 ```
-☐ dad_timeout  atlas  FAIL (flaky)  dev2  races the DAD…  2026-11-10 02:15
-42 tests · Flaking tests are not listed until they fail past their cadence.
+state                    chip              row edge   tag
+under cadence, no mute   FLAKING           mauve      none
+over its cadence         FAIL              red        flaky (grey pill)
+marked and passing       PASS              green      flaky
+marked, unexpected pass  UNEXPECTED_PASS   its own    flaky
+live mute, any state     result            result     muted flaky
+```
+
+Each row builder gives one `displayResult` value to `resultClass` (the
+edge) and `resultChip`, so they cannot disagree. Covered: browse, the
+script page, every Home queue, a build's own tab, Not run's "Last result".
+Still failing holds no flaking test; New failures holds the promotion
+only (U6). Raw results stay in run history, the execution breakdown, the
+compare strip, the comparison page and Watch's build cards (decision 9).
+Watch's cards read `Failing 12 (+3 muted, +4 flaking)`.
+
+**Open Actions (round 2).** One change from today: an unassigned flaking
+test is not listed, in any mode or owner filter; all else is as today. An
+assigned test is listed whatever its state, reading FLAKING while
+flaking; a marked test at an unexpected pass stays, tagged "flaky"; an
+unassigned one over its cadence is FAIL (flaky). Home's **My actions**
+follows the same rule. The page's Failing mode sends `result=FAIL` and
+`result=FLAKING` together (§2 B.3(b)): FAIL alone now leaves flaking
+rows out, an assigned one included. The footer line shows only if
+`flaky_marks`:
+
+```
+☐ login_retry  atlas  FLAKING                  dev1  2026-11-10 02:14
+☐ dad_timeout  atlas  FAIL (flaky)             —     2026-11-10 02:15
+☐ cache_warm   atlas  UNEXPECTED_PASS (flaky)  dev2  2026-11-10 02:16
+42 open actions
+Unassigned tests that are flaking are left out until they fail past their
+cadence.
 ```
 
 **The names-only request.** `refresh()` swaps `summaryUrl()` for one
-product-scoped request returning `environments`, `assignees`, `products`
-(`[{product}]`, `/api/products`' shape), `assignment_streams` and
-`stale_before` under today's names, so the reading code is unchanged;
-plus `flaky_marks` (U12). Nothing else on the page reads the summary (the
-switcher reads names and a length; expiring, users and environments fetch
-their own). The "fetched once" gate moves from `state.assignees.length`
-to a loaded flag: with no assignees it refetches on every refresh today.
+product-scoped request returning `environments`, `assignees`, `products`,
+`assignment_streams`, `stale_before` and `flaky_marks` under today's
+names. The "fetched once" gate moves from `state.assignees.length` to a
+loaded flag (with no assignees it refetches on every refresh today).
 
-### U10 Performance impact (round 1)
+**The browse Result filter (round 2).** Browse only.
+
+```
+Script [all ▾]  [PASS] [FAIL] [FLAKING] [FAILED_AS_EXPECTED]
+[UNEXPECTED_PASS]  [Not run recently] [Include retired] [Unassigned only]
+[Search test name…]                                  4 matching tests
+```
+
+- **The value follows the chip.** FLAKING matches rows reading FLAKING
+  (FAIL on the wire, flaking, no live mute); FAIL matches every other FAIL
+  row, muted ones included. The two partition the failing tests; both
+  pressed is today's FAIL. Sorting stays on the wire value.
+- **Order and look**: after FAIL, the two halves side by side; the wire
+  word as label, like its neighbours; pressed in the strong token. While
+  shown, FAIL's title is "Failing, flaking tests left out".
+- **Hidden**: until the headline lands with `status.flaky_total > 0`, or
+  while pressed, so a pressed filter is never invisible.
+- **The URL**: `result=FLAKING`, repeatable beside today's values, read at
+  load by today's loop (over `BROWSE_RESULTS`); on a build it opens "Its
+  own results" as any `result=` does. Toggles do not write the address
+  bar today and this one does not start to.
+- **Count line and empty state**: today's ("4 matching tests").
+- **Links in**: "All clear" and the Flaky tab set FLAKING alone. Watch's
+  `result=FAIL&unassigned=1` is unchanged and now lands on exactly its
+  figure, which leaves flaking out (§1). The scripts chart's click sets
+  FAIL, plus FLAKING when that bar has a flaking segment.
+
+### U10 Performance impact (round 2)
 
 | Page | First-paint data requests | Payload |
 |---|---|---|
 | Home (and a build's tab) | 4 → 4; Flaky +1 on click only | integers |
-| Browse, script page | 1 → 1 | +13 B a row, 3.2 KB per 250 |
+| Browse, script page | 1 → 1; FLAKING is a value on it | +13 B a row |
 | Watch | unchanged | `flaking` per env/product card |
 | Test page | unchanged, detail first | the mark and history |
-| Open Actions | 2 → 2, + expiring (not awaited) | summary → 5 lists |
+| Open Actions | 2 → 2, + expiring (not awaited) | summary → names |
 
-Home's four: headline, active queue, `assigned_trend`, browse. Open
-Actions sheds the queues it never read (about 19 of 36 ms, §P), so the
-flaking counts reach no first paint. Render: a class and a word per
-flaking row, a pill per marked row, no per-row listener; no marks, today's
-DOM. The build measures requests, payload and sequencing per page.
+Home's four: headline, active queue, `assigned_trend`, browse. The toggle
+appears with the headline, already in flight; nothing waits on it. Open
+Actions excludes a smaller set than §3b measured, an upper bound; the
+browse filter's cost on rows and count (a Known slow row) is §2's and
+§P's. Render: a class and a word per flaking row, a pill per marked row,
+one hidden button, no per-row listener; no marks, today's DOM.
 
-### U11 Guards (`tests/test_frontend_calls.py`) (round 1)
+### U11 Guards (`tests/test_frontend_calls.py`) (round 2)
 
 - **Widen `ResultEmphasisTest`, every assertion kept**: each row builder
-  passes one `displayResult(` value to `resultClass(` and `resultChip(`
-  (planted: a builder on `resultClass(row.result)`); `ghostChip` never
-  takes it, so FLAKING is never outlined; `.chip.result-flaking` and
-  `tr.result-flaking` use the strong token. Also widened:
+  passes one `displayResult(` value to `resultClass(` and `resultChip(`;
+  `ghostChip` takes a raw result or `previousShown(`, never
+  `displayResult(` (both planted); `.result-flaking` chips, rows and
+  pressed toggles use the strong token, and the pressed-toggle ink rule's
+  `:not()` list names it, or that rule wins on specificity. Also widened:
   `MutedBesideFailingTest`, `AssignedSplitTest`, `SortingTest`.
-- **New**: `FlakyWordingTest` (planted; "FLAKING", "in a row", "Set
-  aside" only in `api.js`), `FlakyMarkControlsTest`, `FlakyTabTest` (click
-  only; first paint stays four), `AllClearSetAsideTest`,
-  `OpenActionsCatalogueTest` (`actions.js` never names `api/summary`).
-- **DOM shim**: U9's four states; no new fields, or `flaky_total: 0`,
-  draw the WP-43 DOM; Still failing never draws FLAKING.
+- **New**: `FlakyWordingTest` (planted; the flaking words only in
+  `api.js`), `FlakyMarkControlsTest`, `FlakyTabTest` (click only),
+  `AllClearSetAsideTest`, `OpenActionsCatalogueTest` (`actions.js` never
+  names `api/summary`; its Failing mode sends FAIL and FLAKING),
+  `FlakingFilterTest` (after FAIL; hidden until
+  `flaky_total > 0` or pressed; read at load; on the existing request),
+  `PromotionTransitionTest` (prev FAIL, state failing: `FLAKING → FAIL`).
+- **DOM shim**: U9's five states; an assigned flaking row on Open Actions
+  reads FLAKING; no new fields, or `flaky_total: 0`, draw the WP-43 DOM.
 
-### U12 Pushback on §0 and §1 (round 1)
+### U12 Pushback and asks
 
-Round 0's eight points are settled (1 to 4 and 8 by §1, 5 by D-B8, 6 by
-decision 9, 7 by decision 3). Nothing is pushed back. Two asks of §1:
+Nothing is pushed back; `flaky_marks` is granted (§3b). Round 1's ask is
+granted too: a tab entry's window is `recent_failures` of `recent_runs`
+(§2 B.2), so `runs` is only a row's. §2 B.3(c) splits FLAKING from FAIL
+exactly as U9's chip does (a muted flaking row is FAIL).
 
-1. **`flaky_marks`**, a boolean on the names-only response for U9's line
-   (the "any mark" bit beside the mute epoch, scoped by product). If §B
-   prices it above zero, the line goes and What's new carries the rule.
-2. **`runs` means two things**: N-capped on a row's `flaky`, the window on
-   a tab entry. Buildable as is; a distinct tab name would be clearer.
+### Open questions
 
-### Open questions (round 1)
+None. Round 1's question 1 is closed by §9 (U6); question 2 by §9's rule
+(U9: My actions keeps its flaking tests).
 
-Round 0's are answered (§8). Still open:
+### What's new (draft, for the drop) (round 2)
 
-1. **A promotion is not counted.** A test going over its cadence lands in
-   Still failing (its previous run failed), so "▲ more failing" never
-   counts it, while its fix counts "▼ fewer". Count promotions in the
-   delta (one integer), or accept?
-2. **Home's "My actions"**: does decision 23 apply (no flaking test,
-   assignments dormant)? The UI assumes so; it is one person's list.
-
-### What's new (draft, for the drop) (round 1)
-
-- **Mark a test as flaky** from the selection bar or beside Flakiness on
-  its page, with a reason and how many failures in a row count as failing
-  (2 to 10). It stays until removed, on mainline and every build.
-- **Flaking is its own state.** Under its cadence a failing test reads
-  FLAKING in its own colour, beside the figures ("+4 flaking"), and still
-  counts against the pass rate. Past the cadence it is red again.
-- **Flaking tests stay off Open Actions** until they fail past their
-  cadence, and "All clear" names what is set aside.
+- **Mark a test as flaky** from the selection bar or its page, with a
+  reason and how many failures in a row count as failing (2 to 10), on
+  mainline and every build, until removed.
+- **Flaking is its own state**: FLAKING in its own colour, beside the
+  figures ("+4 flaking"), still against the pass rate. The night it fails
+  past its cadence it is a new failure, red again.
+- **Open Actions leaves out unassigned flaking tests**; an assigned one
+  stays, reading FLAKING. "All clear" names what is set aside.
+- **All tests gains a FLAKING filter**; FAIL now leaves flaking tests out.
 - **A Flaky tab beside Muted** lists every mark: owner, cadence, age and
   how often the test has actually failed.
 
