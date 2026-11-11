@@ -221,10 +221,19 @@ spread evenly over the selection's current failures.
 
 N flaky marks on the largest environment (`atlas-lab-alpha`), written
 through the tree's own `Storage.mark_flaky` (one call per cadence, by amy,
-at the seed's clock, reason `perf fixture: accepted as flaky`), never by a
-raw INSERT: each mark leaves its history row and its comment, as a person's
-would. Deterministic: the same seed gives the same marks, cadences and rows
-(`fixture_digest()`).
+reason `perf fixture: accepted as flaky`), never by a raw INSERT: each mark
+leaves its history row and its comment, as a person's would. Deterministic:
+the same seed gives the same marks, cadences and rows (`fixture_digest()`).
+
+- **When.** The marks, their history rows and their comments are dated an
+  hour before the hour of the environment's first latest run on any stream
+  (`marks_clock()`: 2026-09-27T23:00 on both seeds), so every stream's
+  latest run follows every mark, as a night's runs follow a mark set in
+  the day. The product promotes a test only on a run that started at or
+  after its cadence was last set; marks dated at the seed's clock, after
+  every run, leave the product's P at 0 whatever the census says, and the
+  promoted paths unmeasured. The companions are written at the seed's
+  clock.
 
 - **Which tests.** The design-time order (`docs/design/flaky-mark-r0.md`
   §2 B.5's script): failing on mainline now first, then by mainline
@@ -335,7 +344,9 @@ through either route. The marks fixture (on a seed at scale 0.3 over seven
 nights, which holds every state): `mark_state` is §2 B.1's table row by row;
 every cadence 2 to 10; the census at 0, 40 and 120 pinned; every state
 marked; one marked test muted, one assigned, two retired; written through
-`mark_flaky` (its history and comments); same seed, same digest; composed
+`mark_flaky` (its history and comments); every mark dated before the
+latest runs, and the product's P on mainline equal to the census's (on a
+tree that promotes); same seed, same digest; composed
 with the reference assignments fixture it adds no assignment or mute; the
 runner applies it and a tree without marks refuses N > 0 but runs N = 0.
 A retired real fix leaves the candidate and fix counts; a tree writing the

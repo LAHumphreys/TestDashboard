@@ -753,6 +753,32 @@ def _first(items: Sequence[Triple]) -> Optional[Triple]:
     return items[0] if items else None
 
 
+def marks_clock(path: str, environment: str) -> datetime.datetime:
+    """When the marks fixture dates its marks: one hour before the hour
+    of the first start among *environment*'s latest runs, on any stream.
+
+    A mark is set in the day and the night's runs follow it. The product
+    promotes a test only on a run that started at or after its cadence
+    was last set (a mark or a cadence change never makes a test New), so
+    marks dated at the seed's clock, after every run, would leave no
+    test promoted and the promoted paths unmeasured. Dated here, every
+    stream's latest run follows every mark, and the product's P is the
+    census's. Read-only on *path*.
+    """
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        first = conn.execute(
+            "SELECT MIN(start_time) FROM latest_runs WHERE environment = ?",
+            (environment,)).fetchone()[0]
+    finally:
+        conn.close()
+    if first is None:
+        raise ValueError("no runs of {} in {}".format(environment, path))
+    started = datetime.datetime.strptime(first[:19], "%Y-%m-%dT%H:%M:%S")
+    return (started.replace(minute=0, second=0)
+            - datetime.timedelta(hours=1))
+
+
 def has_marks_table(path: str) -> bool:
     """True when the database at *path* has migration 12's marks."""
     conn = sqlite3.connect(ro_uri(path), uri=True)
@@ -770,7 +796,10 @@ def apply_marks(store: object, path: str, environment: str, count: int,
     *path*): the companions first, at every N including 0, so 0, 50 and
     1,000 differ only in the marks; then the first *count* of
     ``plan_marks`` through ``Storage.mark_flaky``, one call per cadence,
-    marked by amy at *now*, never by a raw INSERT.
+    marked by amy, never by a raw INSERT. The companions are written at
+    *now*; the marks (their history rows and comments with them) are
+    dated by :func:`marks_clock`, before the latest runs they are read
+    against.
 
     A companion already in its state (an assignment or a mute the
     assignments fixture wrote) is left as it is, so the fixture composes
@@ -824,9 +853,10 @@ def apply_marks(store: object, path: str, environment: str, count: int,
     for triple, cadence in plan.marks[:count]:
         by_cadence.setdefault(cadence, []).append(triple + (None,))
     written = 0
+    dated = marks_clock(path, environment) if by_cadence else now
     for cadence in sorted(by_cadence):
         result = mark(by_cadence[cadence], cadence, MARK_REASON, MARK_USER,
-                      now)  # type: ignore
+                      dated)  # type: ignore
         written += int(getattr(result, "marked"))
     return MarksDone(
         marks=written,

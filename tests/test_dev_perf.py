@@ -616,6 +616,54 @@ class MarksFixtureTest(unittest.TestCase):
             copy, "SELECT COUNT(*) FROM comments WHERE text = '{}'".format(
                 seed.MARK_REASON)), 40)
 
+    def test_the_marks_precede_the_runs_they_are_read_against(self) -> None:
+        """A test is promoted only on a run that started at or after its
+        cadence was set: marks dated after the runs leave P at 0 in the
+        product whatever the census says. Every mark, its history and its
+        comment come before every latest run of the environment, and the
+        product's own P on mainline is the census's."""
+        copy = self._copy("dated.db")
+        seed.apply_onto_marks(copy, 0, None, 40)
+        environment = seed.ESTATE[0][1]
+        dated = seed.marks_clock(copy, environment)
+        conn = sqlite3.connect(copy)
+        try:
+            first = conn.execute(
+                "SELECT MIN(start_time) FROM latest_runs "
+                "WHERE environment = ?", (environment,)).fetchone()[0]
+            latest_act = conn.execute(
+                "SELECT MAX(marked_at) FROM test_flaky_marks").fetchone()[0]
+            latest_history = conn.execute(
+                "SELECT MAX(acted_at) FROM flaky_mark_history").fetchone()[0]
+            latest_comment = conn.execute(
+                "SELECT MAX(created_at) FROM comments WHERE text = ?",
+                (seed.MARK_REASON,)).fetchone()[0]
+        finally:
+            conn.close()
+        for stamp in (latest_act, latest_history, latest_comment):
+            self.assertLess(stamp, first)
+            self.assertEqual(stamp[:19], dated.strftime("%Y-%m-%dT%H:%M:%S"))
+        census = seed.mark_census(copy, seed.seed_clock(copy))[0]
+        self.assertEqual(census.stream, "mainline")
+        self.assertGreater(census.promoted, 0)
+        sys.path.insert(0, REPO_ROOT)
+        try:
+            from testboard import storage as product
+        finally:
+            sys.path.remove(REPO_ROOT)
+        store = product.Storage(copy)
+        try:
+            view_of = getattr(store, "flaky_view", None)
+            if view_of is None:
+                return  # a tree before WP-44 item 6 has no promotion
+            view = view_of(1, seed.seed_clock(copy), environment=environment,
+                           marks=True, failing=True)
+        finally:
+            store.close()
+        promoted = [c for c in getattr(view, "counted")
+                    if getattr(c, "role") == "promoted"]
+        self.assertEqual(len(promoted), census.promoted)
+
     def test_same_seed_same_marks_same_digest(self) -> None:
         first, second = self._copy("first.db"), self._copy("second.db")
         seed.apply_onto_marks(first, 0, None, 120)
