@@ -102,6 +102,7 @@ __all__ = [
     "flaky_state",
     "flaky_went_over",
     "flaky_fix_counts",
+    "flaking_that_night",
     "AnalyticsSummary",
     "select_window",
     "compute_analytics",
@@ -351,6 +352,33 @@ def flaky_fix_counts(
     """
     before = list(results_newest_first[1:cadence + 1])
     return all(result is Result.FAIL for result in before)
+
+
+def flaking_that_night(
+    cadence: int, results_oldest_first: Sequence[Result], first: int = 0,
+) -> List[bool]:
+    """Was each run from index *first* on a tolerated failure as it stood
+    that night (decision 2, WP-44 item 8): a FAIL whose state, judged by
+    :func:`flaky_state` on the runs up to and including it, was
+    ``flaking``. The per-day chart's ``FAIL_FLAKING``: a spell over the
+    cadence stays a failure there, as it was in the bars.
+
+    *results_oldest_first* is one test's runs on one stream, oldest
+    first, with at least ``cadence - 1`` runs before index *first* where
+    the stream has them (fewer means the stream has no more: a stream
+    with fewer runs than the cadence, all FAIL, is over it). One flag per
+    run from *first* on.
+    """
+    flags = []  # type: List[bool]
+    for index in range(first, len(results_oldest_first)):
+        if results_oldest_first[index] is not Result.FAIL:
+            flags.append(False)
+            continue
+        start = max(0, index - cadence + 1)
+        window = list(reversed(results_oldest_first[start:index + 1]))
+        state = flaky_state(cadence, window)
+        flags.append(state is not None and state.state == FLAKY_FLAKING)
+    return flags
 
 
 def _compute_day_of_week(window: List[StoredRun]) -> List[DayStats]:

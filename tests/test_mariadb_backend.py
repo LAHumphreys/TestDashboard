@@ -320,6 +320,27 @@ EXCLUDED_TESTS = {
     "FlakyBoardApiTest.test_the_full_payload_and_watch_pay_once":
         "counts statements with sqlite3's set_trace_callback (WP-44 "
         "item 6).",
+    "FlakyPlanTest.test_the_trend_reaches_runs_from_each_mark":
+        "the per-day chart's marks-to-runs read (WP-44 item 8) has the "
+        "shape of WP-43's assignments-to-runs read: on CI's few-row runs "
+        "table MariaDB reasonably scans runs (1,621 rows here) where a "
+        "production table reads each mark's range, so its plan is taken "
+        "by hand on a production-scale copy in the measured pass, as "
+        "AssignedTrendTest's is (WP-43 decision 12). The SQLite plan is "
+        "pinned by the same test, which runs there.",
+    "FlakyBoardApiTest.test_the_filtered_reads_cost":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 8). The rows and totals those reads return are compared on "
+        "MariaDB by OpenActionsSetAsideTest and BrowseFlakingFilterTest, "
+        "with 101 marked tests (decision 22), and their plans by "
+        "FlakyPlanTest.",
+    "FlakyBoardApiTest.test_no_count_joins_the_marks_with_marks":
+        "reads statements with sqlite3's set_trace_callback (WP-44 item "
+        "8); the statement text is the same on both engines.",
+    "FlakyBoardApiTest.test_the_trend_part_and_the_tab_cost":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 8). The values are FlakyTrendTest's and FlakyTabOrderTest's, "
+        "which run here.",
     "TestBulkSetAssignee.test_empty_input_issues_no_writes":
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssigneeForTriples."

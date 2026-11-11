@@ -193,6 +193,11 @@ class MariaDBBackend(object):
     limited_union_member = _LIMITED_UNION_MEMBER
     row_value_list = _ROW_VALUE_LIST
 
+    #: WP-44 item 8: Open Actions' unassigned flaking tests are bound as
+    #: a gated row-value term on the rows and their count here; the keys
+    #: form brought nothing on this engine (design §3b).
+    set_aside_by_keys = False
+
     #: No ceiling: the driver interpolates the values client-side, so a
     #: bound list is never refused for its length (design §3b).
     max_bound_parameters = None  # type: Optional[int]

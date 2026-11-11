@@ -5011,3 +5011,38 @@ found no defect; two points were fixed before the commit (a flaking Open
 Actions row assigned from a build had only its colour to say so; one
 docstring). 2934 and 4039 green in the main checkout with item 6 beneath
 it. No browser has rendered it.
+
+## WP-44 item 8 and 8p: the lists follow the mark; two costs found by the measured pass and removed; the trend's cost for the owner (2026-11-11)
+
+Item 8 is committed: Open Actions leaves out the unassigned flaking tests
+(rows, total and bulk assign on one set); `result=FLAKING` and the
+narrowed `result=FAIL`; `GET /api/flaky`; `FAIL_FLAKING` on every night
+of `parts=assigned_trend`. With no marks every read is the base's,
+statement for statement, on both seeds and on MariaDB.
+
+8p ran twice. The first pass found two costs. A cold Open Actions or
+filtered browse read ran the stream's whole environment list (6 to 10
+ms): replaced by the environments that hold a mark, carried on a
+statement the read already ran. And `parts=assigned_trend` turned out to
+be in Home's first batch, where the design had it off every first paint:
+with marks it cost Home +12.5 ms (11%) at 50 marks and +118 ms (86%) at
+1,000 on SQLite; item 9 moves the request after the headline. The second
+pass confirmed both on the final tree: every list and filter row is
+inside the design's bar (Open Actions' rows -8% on SQLite and in band on
+MariaDB; browse with Failing +1.3 ms and +6.1; with Passing 64 to 84% of
+base against a bar of 78 to 94%). The package as a whole against the tree
+before it, as pages, cold: Home the same at 0 and 50 marks on SQLite,
++11 ms on MariaDB at 50, +14 to +20 ms (20 to 26%) at 1,000; Open Actions
+25 to 48% faster on SQLite and 10% faster to level on MariaDB; All tests
+the same to +3.7 ms; Watch the same to +11%.
+
+**For the owner.** The trend part with many marks is worse than the
+design's worst recorded figure: on the 90-night seed, 90 days at 1,000
+marks, +909 to +1,047 ms against 366. It is off first paint, so it delays
+the chart's split and not the page. Priced and not taken: a covering runs
+index (968 ms to 399; a migration, 23% more database, about 12% on a
+push). One MariaDB reading (Home as a page with no marks, +9.6 ms in one
+order, -10.3 in the other, equal statements) is unexplained and reads as
+an artefact of the page mode on a busy machine. MariaDB 10.3 has not run
+the plans. 3021 OK (skipped 1) and 4175 OK (skipped 90) green in the main checkout with
+item 9 beside it.

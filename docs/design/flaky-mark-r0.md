@@ -1342,7 +1342,7 @@ any interruption is the first line not `done` or `parked`.
 | 6p measured pass | done | | Home headline: SQLite +6.2 ms (22% of base) at 50 marks and +11.4 (41%) at 1,000; local MariaDB 12.3 +17.0 (18%) and +35.8 (38%); the bar was 18% / 34% and 16% / 34%. No marks: no change, Known slow rows the same. Priced and not taken: a covering runs index, dropping decision 3, dropping the cadence-2 read. The marks fixture was dating its marks after the runs (no promoted tests); fixed in its own commit. Carried into item 8: the assigned queue's own runs read, browse's per-row Python |
 | 6h dialect hook | only if a plan guard fails on CI's 10.3 legs | | |
 | 7 state on Home and rows, UI | done | the commit carrying this line | two fresh-eyes points fixed before the commit; "All clear" names the muted failures even on a board with no marks (the one region that changes there); "N flaking" is text until item 9 links it; no browser has rendered it |
-| 8 lists and filters, backend | not started | | |
-| 8p measured pass | not started | | |
+| 8 lists and filters, backend | done | the commit carrying this line | a cold filtered read first ran the stream's environment list (6 to 10 ms): replaced after the measured pass by the environments that hold a mark; the trend's plan guard runs on SQLite only, its MariaDB plan read by hand |
+| 8p measured pass | done | | two passes. Found `parts=assigned_trend` on Home's first paint (+11% at 50 marks, +86% at 1,000 on SQLite): item 9 sends it after the headline, and Home is then the base's. Every list and filter row inside the bar on the final tree. **For the owner:** the trend part at 90 days with 1,000 marks is +909 to +1,047 ms against the design's 366; a covering runs index is priced, not taken |
 | 9 lists and filters, UI | not started | | |
 | 10 the drop | not started | | |

@@ -668,23 +668,54 @@ def _parse_int_param(
     return value
 
 
-def _parse_results_param(request: Request) -> Optional[List[Result]]:
-    """Parse repeated ``result=`` params into Result members, 400 on unknown."""
+#: WP-44 item 8 (design §1 "The browse Result filter", decision 24): the
+#: Result filter's one value that is not a :class:`Result`. It matches
+#: the rows that read FLAKING; the wire result of those rows stays FAIL.
+_FLAKING_FILTER = "FLAKING"
+
+
+def _parse_results_param(
+    request: Request,
+) -> Tuple[Optional[List[Result]], Optional[bool]]:
+    """Parse repeated ``result=`` params, FLAKING included (WP-44 item 8):
+    the results to bind, and the FLAKING mode storage applies to the FAIL
+    rows among them.
+
+    FLAKING maps to the raw ``FAIL`` plus a mode. FAIL alone (no FLAKING)
+    leaves the flaking rows out (False): every other FAIL row, a muted
+    flaking one included. FLAKING alone keeps only them among the FAIL
+    rows (True). Both, or neither, is today's FAIL (None). The parameter
+    stays repeatable and every other value is a :class:`Result`, 400 on
+    anything else, naming FLAKING among the values expected."""
     raw_results = request.query.get("result")
     if raw_results is None:
-        return None
+        return None, None
     results = []  # type: List[Result]
     for raw in raw_results:
+        if raw == _FLAKING_FILTER:
+            if Result.FAIL not in results:
+                results.append(Result.FAIL)
+            continue
         try:
-            results.append(Result[raw])
+            result = Result[raw]
         except KeyError:
             raise _HttpError(
                 400,
                 "result: unknown value '{}' (expected one of {})".format(
-                    raw, ", ".join(r.name for r in Result)
+                    raw, ", ".join(
+                        [r.name for r in Result] + [_FLAKING_FILTER])
                 ),
             )
-    return results
+        if result not in results:
+            results.append(result)
+    asked_fail = Result.FAIL.name in raw_results
+    asked_flaking = _FLAKING_FILTER in raw_results
+    flaking = None  # type: Optional[bool]
+    if asked_flaking and not asked_fail:
+        flaking = True
+    elif asked_fail and not asked_flaking:
+        flaking = False
+    return results, flaking
 
 
 #: How long one environment must be quiet before its next block of runs
@@ -955,7 +986,7 @@ def _parse_dashboard_filters(
     environment = _query_single(request.query, "environment")
     script = _query_single(request.query, "script")
     q = _query_single(request.query, "q")
-    results = _parse_results_param(request)
+    results, flaking = _parse_results_param(request)
     product = _query_single(request.query, "product")
     environments = _resolve_product_environments(storage, product)
     stream_id, floor = _resolve_stream(storage, request)
@@ -1034,6 +1065,9 @@ def _parse_dashboard_filters(
         "open_items": open_items,
         "muted": muted,
         "now": now(),
+        # WP-44 item 8: the FLAKING mode of the Result filter, applied
+        # by storage to the FAIL rows (see _parse_results_param).
+        "flaking": flaking,
     }  # type: Dict[str, Any]
     return _DashboardFilters(
         filters=filters, product=product, with_comment=with_comment,
@@ -1086,7 +1120,10 @@ def _handle_dashboard(
     # item 6: read FIRST, because the "any mark" bit rides it as one
     # UNION ALL row, and the rows join the marks only when one exists.
     env_to_product, marked = storage.environment_products_and_marks()
-    rows = storage.dashboard(
+    # WP-44 item 8: the page and its total in one call, because where a
+    # read leaves flaking tests out by the keys form (Open Actions on
+    # SQLite), one statement answers both.
+    rows, total = storage.dashboard_page(
         sort=sort, descending=(order == "desc"), limit=limit,
         offset=offset, with_latest_comment=with_comment,
         with_flaky=marked, floor=parsed.floor, **filters
@@ -1148,7 +1185,7 @@ def _handle_dashboard(
         200,
         {
             "tests": payload,
-            "total": storage.dashboard_count(**filters),
+            "total": total,
             "limit": limit,
             "offset": offset,
             "with_streak": with_streak,
@@ -1442,9 +1479,11 @@ def _assigned_trend_nights(
     environment: Optional[str],
     environments: Optional[Sequence[str]],
     stream_id: int,
+    floor: Optional[datetime.datetime] = None,
 ) -> Dict[str, Dict[str, int]]:
-    """WP-43: the trend's split, ``{date: {"FAIL_ASSIGNED", "FAIL_MUTED"}}``
-    for every day of the same window the trend covers, zero-filled.
+    """WP-43: the trend's split, ``{date: {"FAIL_ASSIGNED", "FAIL_MUTED",
+    "FAIL_FLAKING"}}`` for every day of the same window the trend
+    covers, zero-filled.
 
     Of each day's ``FAIL`` runs, those whose test has an assignee now
     and no live mute now, and those under a live mute now: disjoint,
@@ -1453,6 +1492,14 @@ def _assigned_trend_nights(
     own part (``parts=assigned_trend``) and by no first-paint request:
     not the headline, not the full payload (WP-43 decision 8).
     Memoized by :meth:`Storage.daily_assigned_failures`.
+
+    WP-44 item 8 (decision 2): ``FAIL_FLAKING``, the day's tolerated
+    failures of marked tests as each night stood then under today's
+    marks, no live mute now (:meth:`Storage.daily_flaking_failures`),
+    counted once: an assigned test's flaking runs leave
+    ``FAIL_ASSIGNED``, so the three stay disjoint. With no mark it reads
+    nothing and is 0. *floor* is a build's first run, bounding the runs
+    read before the window.
     """
     first_day = current.date() - datetime.timedelta(days=days - 1)
     since = datetime.datetime.combine(first_day, datetime.time())
@@ -1462,13 +1509,23 @@ def _assigned_trend_nights(
             stream_id=stream_id,
         )
     }
+    flaking = {
+        entry.day: entry for entry in storage.daily_flaking_failures(
+            since, current, environment, environments=environments,
+            stream_id=stream_id, floor=floor,
+        )
+    }
     nights = {}  # type: Dict[str, Dict[str, int]]
     for offset in range(days):
         day = first_day + datetime.timedelta(days=offset)
         entry = split.get(day)
+        tolerated = flaking.get(day)
         nights[day.isoformat()] = {
-            "FAIL_ASSIGNED": 0 if entry is None else entry.assigned,
+            "FAIL_ASSIGNED": (
+                (0 if entry is None else entry.assigned)
+                - (0 if tolerated is None else tolerated.assigned)),
             "FAIL_MUTED": 0 if entry is None else entry.muted,
+            "FAIL_FLAKING": 0 if tolerated is None else tolerated.flaking,
         }
     return nights
 
@@ -1727,7 +1784,8 @@ def _handle_summary(
     - ``parts=queue&queue=<kind>`` — one queue's rows. ``kind`` is a
       :data:`testboard.storage.QUEUE_KINDS` entry or ``mine``;
     - ``parts=assigned_trend`` (WP-43) — ``{"trend": {"days", "from",
-      "to", "nights": [{"date", "FAIL_ASSIGNED", "FAIL_MUTED"}]}}`` for
+      "to", "nights": [{"date", "FAIL_ASSIGNED", "FAIL_MUTED",
+      "FAIL_FLAKING"}]}}`` (``FAIL_FLAKING``: WP-44 item 8) for
       the same ``days``/``environment``/``product``/``stream``: the
       trend's split by who owns each failing test now. The page sends
       it in the same parallel batch as the headline. It is the ONLY
@@ -1779,7 +1837,8 @@ def _handle_summary(
         # catalogues): this part is the one memoized read of runs.
         current = now()
         split = _assigned_trend_nights(
-            storage, current, days, environment, environments, stream_id)
+            storage, current, days, environment, environments, stream_id,
+            floor)
         return _json_response(200, {
             "generated_at": model.format_iso(current),
             "environment": environment,
@@ -1794,6 +1853,8 @@ def _handle_summary(
                         "date": date,
                         "FAIL_ASSIGNED": split[date]["FAIL_ASSIGNED"],
                         "FAIL_MUTED": split[date]["FAIL_MUTED"],
+                        # WP-44 item 8: disjoint from both above.
+                        "FAIL_FLAKING": split[date]["FAIL_FLAKING"],
                     }
                     for date in sorted(split)
                 ],
@@ -3065,6 +3126,81 @@ def _handle_flaky_unmark(
     return _json_response(200, {"unmarked": unmarked})
 
 
+#: The Flaky tab's page (design §1 "The Flaky tab"): 100 marks, and no
+#: more in one request, so the page's runs read is one statement.
+_FLAKY_TAB_PAGE = 100
+
+
+def _handle_flaky_list(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """GET /api/flaky?stream=&environment=&product=&limit=100&offset=0 —
+    the Flaky tab (WP-44 item 8, design §1, §2 B.2), fetched on the
+    tab's first click and by no first paint.
+
+    Every mark in scope whose test has a run on the stream (absent
+    otherwise), paged by the server in the order of decision 16:
+    failing first, then flaking, then passing, newest mark first,
+    retired last. ``total`` counts the marks listed that are not retired
+    (the tab's badge is ``status.flaky_total``, the same set); a retired
+    test's mark is listed, flagged, and counted apart in ``retired``.
+    Each entry carries the mark, the test's latest ``result`` and
+    ``state`` on the stream, ``muted`` (a live mute on it now),
+    ``retired``, the current ``assignee`` and ``recent_failures`` of
+    ``recent_runs``: its last 20 runs on the stream.
+
+    ``stream`` is an id (absent: mainline; 400 not an integer, 404 no
+    such stream); ``product`` narrows to its environments (an unknown
+    one is an empty list, as everywhere); ``environment`` is exact.
+    ``limit`` 1..100 (default 100) and ``offset`` are 400 outside their
+    range. ``offset`` pages over ``total + retired`` entries: the retired
+    marks sit at the end of the same list, so a client pages until it
+    has ``total + retired``.
+    """
+    environment = _query_single(request.query, "environment")
+    product = _query_single(request.query, "product")
+    environments = _resolve_product_environments(storage, product)
+    stream_id, floor = _resolve_stream(storage, request)
+    limit = _parse_int_param(
+        request, "limit", _FLAKY_TAB_PAGE, 1, _FLAKY_TAB_PAGE)
+    offset = _parse_int_param(request, "offset", 0, 0, _MAX_OFFSET)
+    current = now()
+    page = storage.flaky_tab(
+        stream_id, current, environment=environment,
+        environments=environments, limit=limit, offset=offset, floor=floor)
+    marks = []  # type: List[Dict[str, Any]]
+    for entry in page.entries:
+        mark = entry.mark
+        marks.append({
+            "environment": mark.environment,
+            "script": mark.script,
+            "test_name": mark.test_name,
+            "cadence": mark.cadence,
+            "marked_by": mark.marked_by,
+            "marked_at": model.format_iso(mark.marked_at),
+            "reason": mark.reason,
+            "retired": entry.retired,
+            "result": entry.result.value,
+            "state": entry.state.state,
+            "muted": entry.muted,
+            "assignee": entry.assignee,
+            "recent_failures": entry.recent_failures,
+            "recent_runs": entry.recent_runs,
+        })
+    return _json_response(
+        200,
+        {
+            "generated_at": model.format_iso(current),
+            "stream": stream_id,
+            "total": page.total,
+            "retired": page.retired,
+            "marks": marks,
+        },
+    )
+
+
 def _handle_bulk_assignments_list(
     storage: Storage,
     obj: Dict[str, Any],
@@ -3168,9 +3304,10 @@ def _handle_bulk_assignments(
 
     assignee, assigned_by, comment_text = _parse_bulk_assignment_body(
         storage, obj)
-    filters = _parse_dashboard_filters(storage, request, now).filters
+    parsed = _parse_dashboard_filters(storage, request, now)
     updated = storage.bulk_set_assignee(
-        assignee, assigned_by, now(), comment_text=comment_text, **filters
+        assignee, assigned_by, now(), comment_text=comment_text,
+        floor=parsed.floor, **parsed.filters
     )
     return _json_response(200, {"updated": updated})
 
@@ -5038,6 +5175,10 @@ def _route(
     if rest == ["flaky", "unmark"]:
         _check_method(request.method, ("POST",))
         return _handle_flaky_unmark(storage, request, now)
+
+    if rest == ["flaky"]:
+        _check_method(request.method, ("GET",))
+        return _handle_flaky_list(storage, request, now)
 
     if rest == ["mutes", "unmute"]:
         _check_method(request.method, ("POST",))
