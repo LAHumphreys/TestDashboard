@@ -4943,3 +4943,21 @@ accessible label, one source for two shared titles). Recorded and left as
 they were before the package: the Mute group has the same mid-flight hole,
 and the test page's refresh after an act swallows its own error. No browser
 has rendered it.
+
+## WP-44 item 4: the marks fixture and the page mode in the performance harness (2026-11-11)
+
+Item 4 is committed, tooling only. `ab.py --marks N` (0, 50, 1,000) and
+`seed.py --onto COPY --marks N` apply a deterministic marks fixture,
+written through the product's own `Storage.mark_flaky`, that composes with
+`--assign`. With 65 assignments it reproduces the design-time fixture's
+sets exactly on mainline (perf-seed/1: F 11, X 7, P 8 at 50 marks and F 56,
+X 22, P 9 at 1,000; the 90-night seed: 11, 6, 7 and 57, 21, 7), so the
+build's figures read against the ones the owner accepted. It differs where
+the design asked: the "Newly fixed" candidates are counted (27 of the 1,000
+on perf-seed/1), every cadence is used, and one marked test is also muted,
+one assigned and two retired at every N. `mark_census()`, the harness's own
+reading of the rule, and the fixture digest are compared across the two
+sides before anything is timed. `--page-mode` times a page's first-paint
+requests on long-lived workers, cold, alternated. Fresh eyes found nothing
+unfair between the sides; seven hardening points were fixed before the
+commit. An A/A at 50 and 1,000 marks on both seeds read every row "same".

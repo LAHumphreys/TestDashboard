@@ -380,6 +380,541 @@ class FixtureTest(_SeededCase):
         self.assertEqual(self._state(self.db), (0, 0))
 
 
+#: Appended to a COPY of storage.py: a tree from before migration 12, as
+#: far as the harness can tell (it asks for ``Storage.mark_flaky``).
+_NO_MARKS = '''
+
+del Storage.mark_flaky
+'''
+
+#: Appended to a COPY of storage.py: the same marks and cadences, a
+#: different reason, so the census agrees and the rows do not.
+_OTHER_REASON = '''
+
+_planted_mark_flaky = Storage.mark_flaky
+
+
+def _other_reason(self, tests, cadence, reason, marked_by, when):
+    return _planted_mark_flaky(self, tests, cadence, "another reason",
+                               marked_by, when)
+
+
+Storage.mark_flaky = _other_reason
+'''
+
+#: Appended to a COPY of storage.py: every Browse page raises.
+_RAISE = '''
+
+def _planted_raising_dashboard(self, *args, **kwargs):
+    raise RuntimeError("planted: browse is broken")
+
+
+Storage.dashboard = _planted_raising_dashboard
+'''
+
+
+#: Appended to a COPY of api.py: Browse raises OUTSIDE the handler's own
+#: catch, as a broken tree or harness would.
+_ESCAPE = '''
+
+_planted_handle_api = handle_api
+
+
+def handle_api(storage, request, *args, **kwargs):
+    if request.path == "/api/dashboard":
+        raise RuntimeError("planted: escaped the handler")
+    return _planted_handle_api(storage, request, *args, **kwargs)
+'''
+
+
+def _planted_copy(scratch: str, name: str, plant: str) -> str:
+    """A copy of the package with *plant* appended to its storage.py."""
+    tree = os.path.join(scratch, name)
+    shutil.copytree(os.path.join(REPO_ROOT, "testboard"),
+                    os.path.join(tree, "testboard"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    with open(os.path.join(tree, "testboard", "storage.py"), "a",
+              encoding="utf-8") as handle:
+        handle.write(plant)
+    return tree
+
+
+class MarkStateTest(unittest.TestCase):
+    """``seed.mark_state`` is §2 B.1's table, row by row: the census the
+    README quotes and a measured pass reads the build against."""
+
+    F, P, U = "FAIL", "PASS", "UNEXPECTED_PASS"
+
+    def _state(self, results: List[str], cadence: int) -> Tuple[object, ...]:
+        state = seed.mark_state(results, cadence)
+        return (state.state, state.streak, state.runs, state.promoted,
+                state.candidate, state.real_fix)
+
+    def test_the_table(self) -> None:
+        F, P, U = self.F, self.P, self.U
+        cases = [
+            # latest not FAIL: passing; after a FAIL a candidate, a real
+            # fix when runs 2..N+1 (or all it had) all failed
+            ([P, P, F], 3, ("passing", 0, None, False, False, False)),
+            ([P, F, P, F], 3, ("passing", 0, None, False, True, False)),
+            ([P, F, F, F, P], 3, ("passing", 0, None, False, True, True)),
+            ([P, F, F], 3, ("passing", 0, None, False, True, True)),
+            # a FAIL with none before: failing, as today
+            ([F], 5, ("failing", 1, 1, False, False, False)),
+            # a FAIL after anything else (an unexpected pass included)
+            ([F, U, F], 2, ("flaking", 1, None, False, False, False)),
+            # cadence 2, two FAILs running: failing; promoted when run 3
+            # exists and is not a FAIL
+            ([F, F, P], 2, ("failing", 2, 2, True, False, False)),
+            ([F, F, F], 2, ("failing", 2, 2, False, False, False)),
+            ([F, F], 2, ("failing", 2, 2, False, False, False)),
+            # cadence 3..10: flaking until the newest N all failed
+            ([F, F, P, F], 3, ("flaking", 2, None, False, False, False)),
+            ([F, F, F, P], 3, ("failing", 3, 3, True, False, False)),
+            ([F, F, F, F], 3, ("failing", 3, 3, False, False, False)),
+            # fewer than N runs, every one a FAIL: over already (verdict 8)
+            ([F, F, F], 5, ("failing", 3, 3, False, False, False)),
+        ]
+        for results, cadence, expected in cases:
+            self.assertEqual(self._state(results, cadence), expected,
+                             (results, cadence))
+
+    def test_every_cadence_from_two_to_ten(self) -> None:
+        cadences = [seed.mark_cadence(i) for i in range(80)]
+        self.assertEqual(sorted(set(cadences)), list(range(2, 11)))
+        # The design-time cycle, bar its 10-slot.
+        for index in range(80):
+            if index % 8 != 6:
+                self.assertEqual(cadences[index], seed.MARK_CYCLE[index % 8])
+        self.assertEqual(cadences[6], 10)
+
+
+class MarksFixtureTest(unittest.TestCase):
+    """The marks fixture on a seed big enough to hold every state: N
+    marks through the product's own ``mark_flaky``, its companions at
+    every N, the counts pinned, the same twice, composing with the
+    assignments fixture, refused by a tree without marks."""
+
+    #: Seven nights so a cadence-3 test can be promoted; 0.3 so the core
+    #: of 50 holds every state of the rule.
+    SEED = {"scale": 0.3, "nights": 7}
+
+    #: mark_census at N on SEED, mainline then the two builds the
+    #: largest environment runs on: (marks, flaky_total, retired,
+    #: passing, candidates, real_fixes, flaking, F, X, failing,
+    #: failing with fewer than N runs, P, muted, assigned). Recompute
+    #: (and say so in the commit) when the recipe or the rule changes.
+    PINNED = {
+        0: [],
+        40: [("mainline", (40, 38, 2, 19, 12, 4, 11, 10, 9, 10, 0, 3, 1, 2)),
+             ("nightly/full",
+              (40, 38, 2, 19, 12, 4, 10, 10, 9, 11, 1, 3, 0, 2)),
+             ("feature/checkout-rewrite",
+              (25, 24, 1, 11, 7, 4, 7, 7, 6, 7, 3, 0, 0, 2))],
+        120: [("mainline",
+               (120, 118, 2, 99, 21, 4, 11, 10, 9, 10, 0, 3, 1, 2)),
+              ("nightly/full",
+               (120, 118, 2, 99, 22, 4, 10, 10, 9, 11, 1, 3, 0, 2)),
+              ("feature/checkout-rewrite",
+               (62, 61, 1, 47, 10, 4, 8, 8, 7, 7, 3, 0, 0, 2))],
+    }  # type: Dict[int, List[Tuple[str, Tuple[int, ...]]]]
+
+    scratch = ""
+    db = ""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.scratch = tempfile.mkdtemp(prefix="testboard-dev-perf-marks-")
+        cls.db = os.path.join(cls.scratch, "seed.db")
+        seed.build(cls.db, None, **cls.SEED)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.scratch, ignore_errors=True)
+
+    def _copy(self, name: str) -> str:
+        copy = os.path.join(self.scratch, name)
+        ab.copy_db(self.db, copy)
+        return copy
+
+    def _census(self, path: str) -> List[Tuple[str, Tuple[int, ...]]]:
+        return [(c.stream, (c.marks, c.flaky_total, c.retired, c.passing,
+                            c.candidates, c.real_fixes, c.flaking, c.f, c.x,
+                            c.failing, c.failing_short, c.promoted, c.muted,
+                            c.assigned))
+                for c in seed.mark_census(path, seed.seed_clock(path))]
+
+    def _count(self, path: str, sql: str) -> int:
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute(sql).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_the_counts_per_n_are_pinned(self) -> None:
+        for count in sorted(self.PINNED):
+            copy = self._copy("pinned-{}.db".format(count))
+            _assigned, done = seed.apply_onto_marks(copy, 0, None, count)
+            self.assertEqual(tuple(done), (count, 1, 1, 2), count)
+            self.assertEqual(self._census(copy), self.PINNED[count], count)
+            self.assertEqual(self._count(
+                copy, "SELECT COUNT(*) FROM test_flaky_marks"), count)
+
+    def test_every_state_and_cadence_is_marked(self) -> None:
+        copy = self._copy("states.db")
+        seed.apply_onto_marks(copy, 0, None, 40)
+        census = dict((c.stream, c) for c in seed.mark_census(
+            copy, seed.seed_clock(copy)))
+        main = census["mainline"]
+        self.assertEqual(main.cadences, list(range(2, 11)))
+        for field in ("passing", "candidates", "real_fixes", "flaking", "f",
+                      "x", "failing", "promoted", "retired"):
+            self.assertGreater(getattr(main, field), 0, field)
+        # Failing with fewer than N runs: on a build.
+        self.assertGreater(census["feature/checkout-rewrite"].failing_short, 0)
+        # flaky_total is every mark in scope, the candidates included.
+        self.assertEqual(main.flaky_total, main.marks - main.retired)
+
+    def test_one_marked_test_is_muted_and_one_assigned(self) -> None:
+        copy = self._copy("companions.db")
+        seed.apply_onto_marks(copy, 0, None, 40)
+        plan = seed.plan_marks(copy, seed.ESTATE[0][1])
+        marked = set(t for t, _c in plan.marks[:40])
+        self.assertIn(plan.muted, marked)
+        self.assertIn(plan.assigned, marked)
+        self.assertNotEqual(plan.muted, plan.assigned)
+        conn = sqlite3.connect(copy)
+        try:
+            muted = conn.execute(
+                "SELECT environment, script, test_name FROM test_mutes "
+                "WHERE stream_id = 1").fetchall()
+            assigned = conn.execute(
+                "SELECT environment, script, test_name FROM "
+                "current_assignments WHERE assignee IS NOT NULL").fetchall()
+            retired = conn.execute(
+                "SELECT environment, script, test_name FROM "
+                "test_retirements").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([tuple(r) for r in muted], [plan.muted])
+        # A mute is owned: the muted test is assigned too.
+        self.assertEqual(sorted(tuple(r) for r in assigned),
+                         sorted([plan.muted, plan.assigned]))
+        self.assertEqual(sorted(tuple(r) for r in retired),
+                         sorted(plan.retired))
+        self.assertTrue(set(plan.retired) <= marked)
+
+    def test_written_through_the_storage_call(self) -> None:
+        copy = self._copy("history.db")
+        seed.apply_onto_marks(copy, 0, None, 40)
+        # mark_flaky's own trail: one history row and one comment per
+        # mark, which a raw INSERT would not leave.
+        self.assertEqual(self._count(
+            copy, "SELECT COUNT(*) FROM flaky_mark_history "
+                  "WHERE action = 'mark'"), 40)
+        self.assertEqual(self._count(
+            copy, "SELECT COUNT(*) FROM comments WHERE text = '{}'".format(
+                seed.MARK_REASON)), 40)
+
+    def test_same_seed_same_marks_same_digest(self) -> None:
+        first, second = self._copy("first.db"), self._copy("second.db")
+        seed.apply_onto_marks(first, 0, None, 120)
+        seed.apply_onto_marks(second, 0, None, 120)
+        self.assertEqual(seed.fixture_digest(first),
+                         seed.fixture_digest(second))
+        self.assertEqual(self._census(first), self._census(second))
+        self.assertNotEqual(seed.fixture_digest(first),
+                            seed.fixture_digest(self.db))
+        # The plan does not depend on N: the fixture at 40 is the first
+        # 40 of the fixture at 120.
+        plan = seed.plan_marks(first, seed.ESTATE[0][1])
+        self.assertEqual(len(plan.marks), len(set(t for t, _ in plan.marks)))
+        with self.assertRaises(ValueError):
+            seed.apply_onto_marks(first, 0, None, 120)
+
+    def test_it_composes_with_the_assignments_fixture(self) -> None:
+        copy = self._copy("composed.db")
+        (assigned, muted), done = seed.apply_onto_marks(
+            copy, seed.REFERENCE_ASSIGNMENTS, None, 40)
+        self.assertEqual((assigned, muted),
+                         (seed.REFERENCE_ASSIGNMENTS, seed.FIXTURE_MUTES))
+        self.assertEqual(done.marks if done else None, 40)
+        # The companions coincide with the reference fixture's own: the
+        # marks add no assignment and no mute to --assign 65.
+        self.assertEqual(self._count(
+            copy, "SELECT COUNT(*) FROM current_assignments "
+                  "WHERE assignee IS NOT NULL"), seed.REFERENCE_ASSIGNMENTS)
+        self.assertEqual(self._count(
+            copy, "SELECT COUNT(*) FROM test_mutes"), seed.FIXTURE_MUTES)
+
+    def test_the_runner_applies_it_and_reports_the_census(self) -> None:
+        scratch = tempfile.mkdtemp(dir=self.scratch)
+        result = ab.run(REPO_ROOT, REPO_ROOT, self.db, scratch, ("A", "B"),
+                        pages=[("browse", "/api/dashboard?limit=50&offset=0")],
+                        calls=2, known=False, assign=40, marks=40)
+        self.assertEqual(getattr(result, "fixture"), (40, 10))
+        self.assertEqual(getattr(result, "marks"), (40, 1, 1, 2))
+        text = "\n".join(ab.report(result))
+        self.assertIn("40 marked", text)
+        self.assertIn("mainline", text)
+        self.assertEqual(self._count(
+            self.db, "SELECT COUNT(*) FROM test_flaky_marks"), 0)
+
+    def test_newly_fixed_counts_only_unmuted_unretired(self) -> None:
+        """§2 B.1: "Newly fixed" concerns a marked, unmuted, unretired
+        test; a retired candidate leaves both counts."""
+        copy = self._copy("retired-candidate.db")
+        seed.apply_onto_marks(copy, 0, None, 40)
+        now = seed.seed_clock(copy)
+        before = seed.mark_census(copy, now)[0]
+        plan = seed.plan_marks(copy, seed.ESTATE[0][1])
+        conn = sqlite3.connect(copy)
+        try:
+            fix = None
+            for triple, cadence in plan.marks[:40]:
+                state = seed.mark_state(
+                    seed._newest(conn, 1, triple, cadence + 1), cadence)
+                if state.real_fix:
+                    fix = triple
+                    break
+            self.assertIsNotNone(fix)
+            # Setting up the state the census reads, in a test copy.
+            conn.execute(
+                "INSERT INTO test_retirements VALUES (?, ?, ?, ?, ?)",
+                tuple(fix or ()) + ("2026-09-28T22:00:00", "amy"))
+            conn.commit()
+        finally:
+            conn.close()
+        after = seed.mark_census(copy, now)[0]
+        self.assertEqual(after.stream, "mainline")
+        self.assertEqual(after.candidates, before.candidates - 1)
+        self.assertEqual(after.real_fixes, before.real_fixes - 1)
+        self.assertEqual(after.passing, before.passing)
+
+    def test_the_sides_must_write_the_same_rows(self) -> None:
+        """The census holds the set of cadences, not each test's; the
+        digest holds every row. A tree writing the same marks with a
+        different reason agrees on the census and is refused."""
+        tree = _planted_copy(self.scratch, "other-reason", _OTHER_REASON)
+        with self.assertRaises(ValueError) as caught:
+            ab.run(REPO_ROOT, tree, self.db,
+                   tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                   pages=[("browse", "/api/dashboard?limit=50&offset=0")],
+                   calls=2, known=False, marks=40)
+        self.assertIn("rows differ", str(caught.exception))
+
+    def test_run_refuses_a_fixture_with_nothing_to_measure(self) -> None:
+        for kwargs in ({"marks": 40}, {"marks": 0}, {"assign": 40}):
+            with self.assertRaises(ValueError) as caught:
+                ab.run(REPO_ROOT, REPO_ROOT, self.db,
+                       tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                       calls=2, known=True, **kwargs)
+            self.assertIn("--pages", str(caught.exception))
+
+    def test_a_tree_without_marks_refuses_unless_n_is_zero(self) -> None:
+        tree = os.path.join(self.scratch, "no-marks")
+        shutil.copytree(os.path.join(REPO_ROOT, "testboard"),
+                        os.path.join(tree, "testboard"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        with open(os.path.join(tree, "testboard", "storage.py"), "a",
+                  encoding="utf-8") as handle:
+            handle.write(_NO_MARKS)
+        page = [("browse", "/api/dashboard?limit=50&offset=0")]
+        with self.assertRaises(ValueError) as caught:
+            ab.run(tree, REPO_ROOT, self.db,
+                   tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                   pages=page, calls=2, known=False, marks=40)
+        self.assertIn("migration 12", str(caught.exception))
+        result = ab.run(tree, REPO_ROOT, self.db,
+                        tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                        pages=page, calls=2, known=False, marks=0)
+        self.assertEqual(getattr(result, "marks"), (0, 1, 1, 2))
+
+
+class PageModeTest(_SeededCase):
+    """The page mode: a page's first-paint requests on long-lived
+    workers, cold, with what the page waits for; a planted slow request
+    shows up as the page's, and as what it waits for."""
+
+    def _planted_tree(self) -> str:
+        tree = os.path.join(self.scratch, "planted-page")
+        shutil.copytree(os.path.join(REPO_ROOT, "testboard"),
+                        os.path.join(tree, "testboard"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        with open(os.path.join(tree, "testboard", "storage.py"), "a",
+                  encoding="utf-8") as handle:
+            handle.write(_PLANT)
+        return tree
+
+    def test_the_shape(self) -> None:
+        result = ab.run(REPO_ROOT, REPO_ROOT, self.db,
+                        tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                        calls=4, known=False,
+                        page_modes=["open-actions", "home"])
+        pages = dict((page.name, page)
+                     for page in getattr(result, "page_rows"))
+        self.assertEqual(sorted(pages), ["home", "open-actions"])
+        for name, page in pages.items():
+            self.assertEqual(page.requests,
+                             [label for label, _ in ab.FIRST_PAINT[name]])
+            self.assertEqual((page.status_a, page.status_b), (200, 200))
+            self.assertEqual(page.workers, 2)
+            self.assertEqual(len(page.a_ms), 4)
+            for side_ms, legs in ((page.a_ms, page.legs_a),
+                                  (page.b_ms, page.legs_b)):
+                self.assertEqual(len(legs), len(page.requests))
+                # The page waits for its last answer, no longer.
+                for load, page_ms in enumerate(side_ms):
+                    self.assertAlmostEqual(
+                        page_ms, max(leg[load] for leg in legs), places=6)
+            self.assertGreater(page.statements_a, 0)
+            self.assertIn(ab.waits_for(page, 1)[0], page.requests)
+        text = "\n".join(ab.report(result))
+        self.assertIn("page home (2 workers)", text)
+        self.assertIn("waits for", text)
+
+    def test_a_planted_slow_request_is_what_the_page_waits_for(self) -> None:
+        before = sys.modules.get("testboard.storage")
+        result = ab.run(REPO_ROOT, self._planted_tree(), self.db,
+                        tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                        calls=8, known=False, page_modes=["home"])
+        page = getattr(result, "page_rows")[0]
+        verdict = ab.judge_page(page)
+        self.assertTrue(verdict.call.startswith("SLOWER"), verdict)
+        self.assertGreater(verdict.delta, 15.0)
+        self.assertEqual(ab.waits_for(page, 1)[0], "browse")
+        self.assertIs(sys.modules.get("testboard.storage"), before)
+
+    def test_a_failing_handler_is_a_status_not_a_timing(self) -> None:
+        """A handler that raises is a 500 from ``handle_api`` (it catches,
+        as the server does): the page is reported by that status with no
+        timing, as a row is. An exception that escapes the handler fails
+        the run instead (``PoolTest``)."""
+        before = sys.modules.get("testboard.storage")
+        tree = _planted_copy(self.scratch, "raising-page", _RAISE)
+        result = ab.run(REPO_ROOT, tree, self.db,
+                        tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                        calls=2, known=False, page_modes=["home"])
+        page = getattr(result, "page_rows")[0]
+        self.assertEqual((page.status_a, page.status_b), (200, 500))
+        self.assertEqual(ab.judge_page(page).call, "status 200/500")
+        line = [text for text in ab.report(result)
+                if text.startswith("page home")][0]
+        self.assertIn("status 200/500", line)
+        self.assertIs(sys.modules.get("testboard.storage"), before)
+
+    def test_a_raising_request_fails_the_run_with_its_text(self) -> None:
+        """An exception that escapes the handler, raised in a worker,
+        ends the run naming the request and carrying its text."""
+        before = sys.modules.get("testboard.storage")
+        tree = _planted_copy(self.scratch, "escaping-page", "")
+        with open(os.path.join(tree, "testboard", "api.py"), "a",
+                  encoding="utf-8") as handle:
+            handle.write(_ESCAPE)
+        with self.assertRaises(ValueError) as caught:
+            ab.run(REPO_ROOT, tree, self.db,
+                   tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                   calls=2, known=False, page_modes=["home"])
+        text = str(caught.exception)
+        self.assertIn("browse of home on B", text)
+        self.assertIn("planted: escaped the handler", text)
+        self.assertIs(sys.modules.get("testboard.storage"), before)
+
+
+class PoolTest(unittest.TestCase):
+    """The page mode's pool: one setup job per worker, and an exception
+    in a worker fails the load with its text, never a status 0."""
+
+    def test_every_worker_runs_the_setup_once(self) -> None:
+        pool = ab.Pool(3)
+        seen = []  # type: List[int]
+
+        def record() -> None:
+            seen.append(ab.threading.get_ident())
+
+        try:
+            pool.on_every_worker(record)
+        finally:
+            pool.stop()
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(len(set(seen)), 3)
+
+    def test_an_exception_fails_the_load_with_its_text(self) -> None:
+        pool = ab.Pool(2)
+
+        def fine() -> int:
+            return 200
+
+        def broken() -> int:
+            raise RuntimeError("the text of the failure")
+
+        try:
+            with self.assertRaises(ValueError) as caught:
+                pool.load([fine, broken], ["fine", "the broken one"])
+            # The pool is still usable after a failed load.
+            self.assertEqual(pool.load([fine, fine])[2], [200, 200])
+        finally:
+            pool.stop()
+        self.assertIn("the broken one", str(caught.exception))
+        self.assertIn("the text of the failure", str(caught.exception))
+
+    def test_a_raising_setup_does_not_leave_workers_waiting(self) -> None:
+        pool = ab.Pool(3)
+        calls = []  # type: List[int]
+
+        def setup() -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("setup failed")
+
+        try:
+            with self.assertRaises(ValueError) as caught:
+                pool.on_every_worker(setup)
+        finally:
+            pool.stop()
+        self.assertIn("setup failed", str(caught.exception))
+
+
+class NamedMemoTest(unittest.TestCase):
+    """The cold sweep clears ``_cadence_runs_cache`` by name, whatever
+    its type, and does not fail on a tree that has none."""
+
+    class _Memo(object):
+        """Not a dict: the generic sweep would not see it."""
+
+        def __init__(self) -> None:
+            self.entries = {"k": 1}
+
+        def clear(self) -> None:
+            self.entries = {}
+
+    class _Store(object):
+        def __init__(self) -> None:
+            self.invalidated = 0
+
+        def _invalidate_summary_cache(self) -> None:
+            self.invalidated += 1
+
+    def test_cleared_by_name_when_present(self) -> None:
+        store = self._Store()
+        memo = self._Memo()
+        setattr(store, "_cadence_runs_cache", memo)
+        ab.clear_memos(store)
+        self.assertEqual(memo.entries, {})
+        self.assertEqual(store.invalidated, 1)
+
+    def test_absent_is_fine(self) -> None:
+        store = self._Store()
+        ab.clear_memos(store)
+        self.assertEqual(store.invalidated, 1)
+
+    def test_a_named_memo_that_cannot_be_cleared_is_refused(self) -> None:
+        store = self._Store()
+        setattr(store, "_cadence_runs_cache", object())
+        with self.assertRaises(ValueError):
+            ab.clear_memos(store)
+
+
 class AnnotationsTest(unittest.TestCase):
     """The harness is not a package, so the compat sweep parses it but
     cannot import it; evaluate its annotations here."""

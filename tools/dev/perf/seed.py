@@ -4,6 +4,8 @@
     python tools/dev/perf/seed.py --out <scratch>/perf.db --tree <checkout>
     python tools/dev/perf/seed.py --out <scratch>/h90.db --history-nights 90
     python tools/dev/perf/seed.py --onto <scratch>/copy.db --assignments 1000
+    python tools/dev/perf/seed.py --onto <scratch>/copy.db --assignments 65 \
+        --marks 50 --tree <checkout at migration 12 or later>
 
 The shape is the largest product's, as production has it: about 12,000
 tests over five environments (the largest 8,000), run SEQUENTIALLY and
@@ -24,6 +26,13 @@ nights are perf-seed/1's runs exactly.
 assignments fixture: N current assignments in the largest environment, 10
 of them live mutes. ``ab.py --assign N`` applies the same fixture to its
 own copies instead, through each tree's own Storage.
+
+``--marks N`` (with ``--onto``, alone or after ``--assignments``) writes
+the marks fixture: N flaky marks in the largest environment through the
+tree's own ``Storage.mark_flaky``, cadences 2 to 10, with its companions
+(one marked test muted, one assigned, two retired). ``ab.py --marks N``
+applies it to its own copies. README.md says what it holds at 0, 50 and
+1,000 on both seeds.
 
 Deterministic: one seeded ``random.Random``, fixed dates, no wall clock
 in anything the runner reads. Two builds of the same arguments with the
@@ -60,6 +69,29 @@ HISTORY_BLOCK = 7
 
 #: The assignments fixture's live mutes, whatever its size.
 FIXTURE_MUTES = 10
+
+#: The marks fixture's cadences, by a candidate's place in the design-time
+#: order (docs/design/flaky-mark-r0.md §2 B.5): that fixture's cycle of
+#: eight, except that its 10-slot takes 10, 6, 7, 8 and 9 in turn, so
+#: every cadence from 2 to 10 is marked and the shares of 2, 3, 4 and 5
+#: are the design's.
+MARK_CYCLE = [3, 3, 2, 5, 3, 4, 10, 3]
+MARK_ROTATION = [10, 6, 7, 8, 9]
+
+#: The prefix of the marked order the companions are chosen from, so they
+#: are marked at every N from it up: the design's smaller size.
+MARK_CORE = 50
+
+#: Marked tests the fixture retires (failing ones, from the core).
+MARK_RETIRED = 2
+
+#: The assignments fixture at the reference estate's figure (``ab.py
+#: --assign 65``, the Known slow row's ``assign_65``): the design-time
+#: marks were measured on top of it.
+REFERENCE_ASSIGNMENTS = 65
+
+MARK_REASON = "perf fixture: accepted as flaky"
+MARK_USER = "amy"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
@@ -505,30 +537,494 @@ def apply_fixture(store: object, path: str, environment: str, count: int,
     return len(chosen), len(mutes)
 
 
-def apply_onto(path: str, count: int, tree: Optional[str] = None
-               ) -> Tuple[int, int]:
-    """``--onto``: write the fixture into an existing seed (a copy, never
-    inside a checkout), through *tree*'s Storage, at the seed's clock."""
+# ----------------------------------------------------------------------
+# The marks fixture (WP-44 item 4)
+# ----------------------------------------------------------------------
+
+Triple = Tuple[str, str, str]
+
+
+class MarkState(NamedTuple):
+    """A marked test on one stream, by the rule of the design's §2 B.1."""
+
+    state: str            # passing | flaking | failing
+    streak: int           # FAILs ending at the latest run, capped at N
+    runs: Optional[int]   # runs the stream has, capped at N, when failing
+    promoted: bool        # over its cadence on this run, not the one before
+    candidate: bool       # passing after a FAIL (decision 3's candidates)
+    real_fix: bool        # a candidate that had been over its cadence
+
+
+class MarksPlan(NamedTuple):
+    """Which tests the marks fixture marks, at which cadence, and its
+    companions. Independent of N: ``marks[:N]`` is the fixture at N."""
+
+    marks: List[Tuple[Triple, int]]
+    fillers: List[Triple]
+    muted: Optional[Triple]
+    assigned: Optional[Triple]
+    retired: List[Triple]
+
+
+class MarksDone(NamedTuple):
+    """What ``apply_marks`` left in the copy: marks written, and the
+    companions present (written now, or there already)."""
+
+    marks: int
+    muted: int
+    assigned: int
+    retired: int
+
+
+class MarkCount(NamedTuple):
+    """The marks fixture's census on one stream (``mark_census``)."""
+
+    stream: str
+    marks: int             # marked tests with a row on the stream
+    retired: int
+    flaky_total: int       # every mark in scope: marks - retired
+    passing: int
+    candidates: int        # of passing: after a FAIL; unmuted, unretired
+    real_fixes: int        # of candidates: had been over the cadence
+    flaking: int
+    failing: int
+    failing_short: int     # of failing: every run a FAIL, fewer than N
+    promoted: int          # P: promoted, unmuted, unretired
+    f: int                 # F: flaking, under no live mute
+    x: int                 # X: F with no assignee, unretired
+    muted: int             # marked and under a live mute here
+    assigned: int          # marked and assigned
+    cadences: List[int]    # the distinct cadences in scope
+
+
+def mark_cadence(index: int) -> int:
+    """The cadence of the candidate at *index* of the design-time order."""
+    slot = index % len(MARK_CYCLE)
+    if MARK_CYCLE[slot] == 10:
+        return MARK_ROTATION[(index // len(MARK_CYCLE)) % len(MARK_ROTATION)]
+    return MARK_CYCLE[slot]
+
+
+def mark_state(newest_first: Sequence[str], cadence: int) -> MarkState:
+    """§2 B.1 on a stream's newest runs of one test (results, newest
+    first, at least N+1 of them where the stream has them).
+
+    A failure is ``FAIL`` and nothing else. Latest not a FAIL: passing,
+    a candidate when the run before failed, a real fix when runs 2 to N+1
+    (or all it had) failed. Latest a FAIL with none before: failing, as
+    today. A FAIL after anything else: flaking. Two FAILs running:
+    failing when its newest N (or all it has, fewer) are FAILs, promoted
+    when run N+1 exists and is not; flaking otherwise.
+    """
+    results = list(newest_first)
+    if not results:
+        raise ValueError("a marked test with no run on the stream has no "
+                         "state there")
+    if results[0] != "FAIL":
+        candidate = len(results) > 1 and results[1] == "FAIL"
+        window = results[1:cadence + 1]
+        real = candidate and all(r == "FAIL" for r in window)
+        return MarkState("passing", 0, None, False, candidate, real)
+    if len(results) == 1:
+        return MarkState("failing", 1, 1, False, False, False)
+    if results[1] != "FAIL":
+        return MarkState("flaking", 1, None, False, False, False)
+    head = results[:cadence]
+    if all(r == "FAIL" for r in head):
+        promoted = len(results) > cadence and results[cadence] != "FAIL"
+        return MarkState("failing", len(head), len(head), promoted,
+                         False, False)
+    streak = 0
+    for result in head:
+        if result != "FAIL":
+            break
+        streak += 1
+    return MarkState("flaking", streak, None, False, False, False)
+
+
+def _newest(conn: sqlite3.Connection, stream_id: int, triple: Triple,
+            limit: int) -> List[str]:
+    return [str(row[0]) for row in conn.execute(
+        "SELECT result FROM runs WHERE environment = ? AND script = ? "
+        "AND test_name = ? AND stream_id = ? "
+        "ORDER BY start_time DESC, id DESC LIMIT ?",
+        (triple[0], triple[1], triple[2], stream_id, limit)).fetchall()]
+
+
+def marks_order(path: str, environment: str) -> List[Triple]:
+    """Every mainline test of *environment* in the design-time order
+    (§2 B.5's script): failing now first, then by mainline failures over
+    the whole history, most first, then by (script, test). Read-only."""
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        return [(str(row[0]), str(row[1]), str(row[2])) for row in
+                conn.execute(
+            "SELECT lr.environment, lr.script, lr.test_name "
+            "FROM latest_runs AS lr WHERE lr.stream_id = 1 "
+            "AND lr.environment = ? "
+            "ORDER BY (lr.result = 'FAIL') DESC, "
+            "(SELECT COUNT(*) FROM runs AS r "
+            " WHERE r.environment = lr.environment AND r.script = lr.script"
+            " AND r.test_name = lr.test_name AND r.stream_id = 1 "
+            " AND r.result = 'FAIL') DESC, lr.script, lr.test_name",
+            (environment,)).fetchall()]
+    finally:
+        conn.close()
+
+
+def plan_marks(path: str, environment: str) -> MarksPlan:
+    """The marks fixture for *environment*, at every N at once.
+
+    The order is the design-time fixture's (``marks_order``), each test
+    keeping that order's cadence (``mark_cadence``), with up to three
+    **fillers** moved to the front so every state of the rule is marked
+    from N = 3: the first test passing after a pass, the first passing
+    after a tolerated failure and the first real fix. On both seeds the
+    fillers lie inside the design's first 1,000, so the 1,000 marks are
+    the design's set exactly; at :data:`MARK_CORE` they replace its last
+    plainly failing tests (failing, not promoted), which follow it.
+
+    Companions, from the first :data:`MARK_CORE` marks on mainline: the
+    first flaking test the reference assignments fixture mutes (else the
+    first flaking one) is muted; the next flaking one it assigns (else
+    the next flaking one) is assigned; the first :data:`MARK_RETIRED`
+    plainly failing tests are retired. So F, X and P with ``--assign 65``
+    are the design's. Read-only.
+    """
+    order = marks_order(path, environment)
+    cadence = dict((triple, mark_cadence(index))
+                   for index, triple in enumerate(order))
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        def state_of(triple: Triple) -> MarkState:
+            return mark_state(_newest(conn, 1, triple, cadence[triple] + 1),
+                              cadence[triple])
+
+        states = {}  # type: Dict[Triple, MarkState]
+        for triple in order[:MARK_CORE]:
+            states[triple] = state_of(triple)
+        wanted = ["pass", "tolerated", "fix"]
+        found = {}  # type: Dict[str, Triple]
+        for triple in order:
+            if len(found) == len(wanted):
+                break
+            state = states.get(triple) or state_of(triple)
+            if state.state != "passing":
+                continue
+            kind = ("fix" if state.real_fix else
+                    "tolerated" if state.candidate else "pass")
+            if kind not in found:
+                found[kind] = triple
+    finally:
+        conn.close()
+    fillers = [found[kind] for kind in wanted if kind in found]
+    core = order[:MARK_CORE]
+    # The fillers take the places of the core's last plainly failing
+    # tests (failing, not promoted), which follow the core instead: F, X
+    # and P at MARK_CORE are the design's, and 1,000 is its set.
+    plain = [t for t in core
+             if states[t].state == "failing" and not states[t].promoted]
+    room = len([t for t in fillers if t not in states])
+    displaced = plain[max(0, len(plain) - room):] if room else []
+    moved = set(fillers) | set(displaced)
+    marked = (fillers + [t for t in core if t not in moved] + displaced
+              + [t for t in order[MARK_CORE:] if t not in moved])
+    in_core = marked[:MARK_CORE]
+    flaking = [t for t in in_core
+               if t in states and states[t].state == "flaking"]
+    # The companions coincide with the reference assignments fixture's
+    # (65 assigned, 10 muted) where they can, so --assign 65 composed
+    # with the marks adds no assignment or mute the design did not have.
+    reference, reference_mutes = fixture_triples(
+        path, environment, min(REFERENCE_ASSIGNMENTS, len(order)))
+    muted = _first([t for t in flaking if t in set(reference_mutes)]
+                   + flaking)
+    assigned = _first([t for t in flaking
+                       if t in set(reference) and t != muted]
+                      + [t for t in flaking if t != muted])
+    retired = [t for t in in_core if t in states and t not in displaced
+               and t in set(plain)][:MARK_RETIRED]
+    return MarksPlan(
+        marks=[(triple, cadence[triple]) for triple in marked],
+        fillers=fillers, muted=muted, assigned=assigned, retired=retired)
+
+
+def _first(items: Sequence[Triple]) -> Optional[Triple]:
+    return items[0] if items else None
+
+
+def has_marks_table(path: str) -> bool:
+    """True when the database at *path* has migration 12's marks."""
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'test_flaky_marks'").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def apply_marks(store: object, path: str, environment: str, count: int,
+                now: datetime.datetime) -> MarksDone:
+    """Write the marks fixture through *store* (any tree's ``Storage`` on
+    *path*): the companions first, at every N including 0, so 0, 50 and
+    1,000 differ only in the marks; then the first *count* of
+    ``plan_marks`` through ``Storage.mark_flaky``, one call per cadence,
+    marked by amy at *now*, never by a raw INSERT.
+
+    A companion already in its state (an assignment or a mute the
+    assignments fixture wrote) is left as it is, so the fixture composes
+    with ``apply_fixture``. Raises ValueError for N > 0 on a tree without
+    marks (before migration 12).
+    """
+    if count < 0:
+        raise ValueError("--marks N needs N >= 0")
+    mark = getattr(store, "mark_flaky", None)
+    if count and mark is None:
+        raise ValueError(
+            "this tree has no flaky marks (Storage.mark_flaky, migration "
+            "12): --marks {} needs both trees at WP-44 item 3 or later; "
+            "--marks 0 measures the companions alone".format(count))
+    plan = plan_marks(path, environment)
+    if count > len(plan.marks):
+        raise ValueError("{} has {} tests, fewer than {} marks".format(
+            environment, len(plan.marks), count))
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        def present(sql: str, triple: Triple) -> bool:
+            return conn.execute(sql, triple).fetchone() is not None
+
+        assigned_sql = (
+            "SELECT 1 FROM current_assignments WHERE environment = ? "
+            "AND script = ? AND test_name = ? AND assignee IS NOT NULL")
+        need_assign = (plan.assigned is not None
+                       and not present(assigned_sql, plan.assigned))
+        need_mute = (plan.muted is not None and not present(
+            "SELECT 1 FROM test_mutes WHERE stream_id = 1 AND "
+            "environment = ? AND script = ? AND test_name = ?",
+            plan.muted))
+        need_retire = [t for t in plan.retired if not present(
+            "SELECT 1 FROM test_retirements WHERE environment = ? "
+            "AND script = ? AND test_name = ?", t)]
+    finally:
+        conn.close()
+    if need_assign and plan.assigned is not None:
+        getattr(store, "bulk_set_assignee_for_triples")(
+            MARK_USER, MARK_USER, now,
+            [plan.assigned + (None,)])
+    if need_mute and plan.muted is not None:
+        getattr(store, "mute_tests")(
+            [plan.muted + (1,)], "perf fixture: muted and marked", 168,
+            MARK_USER, MARK_USER, now)
+    for triple in need_retire:
+        getattr(store, "set_retired")(
+            triple[0], triple[1], triple[2], True, MARK_USER,
+            "perf fixture: retired and marked", now)
+    by_cadence = {}  # type: Dict[int, List[Tuple[str, str, str, Optional[int]]]]
+    for triple, cadence in plan.marks[:count]:
+        by_cadence.setdefault(cadence, []).append(triple + (None,))
+    written = 0
+    for cadence in sorted(by_cadence):
+        result = mark(by_cadence[cadence], cadence, MARK_REASON, MARK_USER,
+                      now)  # type: ignore
+        written += int(getattr(result, "marked"))
+    return MarksDone(
+        marks=written,
+        muted=1 if plan.muted is not None else 0,
+        assigned=1 if plan.assigned is not None else 0,
+        retired=len(plan.retired))
+
+
+def _is_live(expires_at: Optional[str], now: datetime.datetime) -> bool:
+    if expires_at is None:
+        return False
+    return datetime.datetime.strptime(
+        expires_at[:19], "%Y-%m-%dT%H:%M:%S") > now
+
+
+def mark_census(path: str, now: datetime.datetime) -> List[MarkCount]:
+    """What the marks in *path* are, per stream, by ``mark_state``: the
+    figures the README quotes and the tests pin. Independent of the
+    product's own evaluation (it reads the tables), so a measured pass
+    can hold the build's counts against it. Empty without marks."""
+    if not has_marks_table(path):
+        return []
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT lr.stream_id, s.name, fm.environment, fm.script, "
+            "fm.test_name, fm.cadence, "
+            "(SELECT MAX(tm.expires_at) FROM test_mutes AS tm "
+            " WHERE tm.stream_id = lr.stream_id "
+            " AND tm.environment = fm.environment "
+            " AND tm.script = fm.script AND tm.test_name = fm.test_name), "
+            "ca.assignee, tr.retired_at "
+            "FROM test_flaky_marks AS fm "
+            "JOIN latest_runs AS lr ON lr.environment = fm.environment "
+            " AND lr.script = fm.script AND lr.test_name = fm.test_name "
+            "JOIN streams AS s ON s.id = lr.stream_id "
+            "LEFT JOIN current_assignments AS ca "
+            " ON ca.environment = fm.environment AND ca.script = fm.script "
+            " AND ca.test_name = fm.test_name "
+            "LEFT JOIN test_retirements AS tr "
+            " ON tr.environment = fm.environment AND tr.script = fm.script "
+            " AND tr.test_name = fm.test_name "
+            "ORDER BY lr.stream_id, fm.environment, fm.script, fm.test_name"
+        ).fetchall()
+        per = {}  # type: Dict[int, Dict[str, int]]
+        names = {}  # type: Dict[int, str]
+        cadences = {}  # type: Dict[int, Set[int]]
+        for row in rows:
+            stream_id, cadence = int(row[0]), int(row[5])
+            names[stream_id] = str(row[1]) or "mainline"
+            counts = per.setdefault(stream_id, {})
+            cadences.setdefault(stream_id, set()).add(cadence)
+            triple = (str(row[2]), str(row[3]), str(row[4]))
+            state = mark_state(_newest(conn, stream_id, triple, cadence + 1),
+                               cadence)
+            muted = _is_live(row[6], now)
+            assigned = row[7] is not None
+            retired = row[8] is not None
+
+            def bump(key: str, when: bool = True) -> None:
+                if when:
+                    counts[key] = counts.get(key, 0) + 1
+
+            bump("marks")
+            bump("retired", retired)
+            bump(state.state)
+            # "Newly fixed" concerns a marked, unmuted, unretired test
+            # (§2 B.1), as P does.
+            counted = not muted and not retired
+            bump("candidates", state.candidate and counted)
+            bump("real_fixes", state.real_fix and counted)
+            bump("failing_short", state.state == "failing"
+                 and state.runs is not None and state.runs < cadence)
+            bump("promoted", state.promoted and not muted and not retired)
+            flaking_unmuted = state.state == "flaking" and not muted
+            bump("f", flaking_unmuted)
+            bump("x", flaking_unmuted and not assigned and not retired)
+            bump("muted", muted)
+            bump("assigned", assigned)
+    finally:
+        conn.close()
+    out = []  # type: List[MarkCount]
+    for stream_id in sorted(per):
+        counts = per[stream_id]
+        out.append(MarkCount(
+            stream=names[stream_id], marks=counts.get("marks", 0),
+            retired=counts.get("retired", 0),
+            flaky_total=counts.get("marks", 0) - counts.get("retired", 0),
+            passing=counts.get("passing", 0),
+            candidates=counts.get("candidates", 0),
+            real_fixes=counts.get("real_fixes", 0),
+            flaking=counts.get("flaking", 0),
+            failing=counts.get("failing", 0),
+            failing_short=counts.get("failing_short", 0),
+            promoted=counts.get("promoted", 0), f=counts.get("f", 0),
+            x=counts.get("x", 0), muted=counts.get("muted", 0),
+            assigned=counts.get("assigned", 0),
+            cadences=sorted(cadences[stream_id])))
+    return out
+
+
+def census_lines(census: Sequence[MarkCount]) -> List[str]:
+    """The census as the lines ab.py and ``seed.py --onto`` print."""
+    lines = []  # type: List[str]
+    for count in census:
+        lines.append(
+            "  {:26s} marks {:4d} (total {:4d}, {} retired) | passing {:4d}"
+            " (candidates {}, real fixes {}) | flaking {:3d} (F {}, X {}) |"
+            " failing {:3d} ({} with fewer than N runs) | P {} | muted {}, "
+            "assigned {} | cadences {}".format(
+                count.stream, count.marks, count.flaky_total, count.retired,
+                count.passing, count.candidates, count.real_fixes,
+                count.flaking, count.f, count.x, count.failing,
+                count.failing_short, count.promoted, count.muted,
+                count.assigned, "-".join(str(c) for c in count.cadences)
+                if len(count.cadences) < 3 else "{}..{} ({})".format(
+                    count.cadences[0], count.cadences[-1],
+                    len(count.cadences))))
+    return lines
+
+
+def fixture_digest(path: str) -> str:
+    """A digest of every row the fixtures write (marks and their history,
+    assignments, mutes, retirements, comments): the determinism test's
+    "same seed, same marks, same digest"."""
+    conn = sqlite3.connect(ro_uri(path), uri=True)
+    try:
+        tables = set(str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"))
+        digest = hashlib.sha256()
+        for table, order in (
+                ("test_flaky_marks", "environment, script, test_name"),
+                ("flaky_mark_history", "id"),
+                ("current_assignments", "environment, script, test_name"),
+                ("test_mutes", "stream_id, environment, script, test_name"),
+                ("test_retirements", "environment, script, test_name"),
+                ("comments", "id")):
+            if table not in tables:
+                continue
+            digest.update(table.encode("utf-8"))
+            for row in conn.execute(
+                    "SELECT * FROM {} ORDER BY {}".format(table, order)):
+                digest.update(repr(tuple(row)).encode("utf-8"))
+        return digest.hexdigest()
+    finally:
+        conn.close()
+
+
+def apply_onto(path: str, count: int, tree: Optional[str] = None,
+               marks: Optional[int] = None) -> Tuple[int, int]:
+    """``--onto``: write the fixtures into an existing seed (a copy, never
+    inside a checkout), through *tree*'s Storage, at the seed's clock:
+    the assignments fixture when *count*, then the marks fixture when
+    *marks* is not None. Returns (assigned, muted) of the assignments
+    fixture; ``apply_onto_marks`` is the same with the marks' result."""
+    return apply_onto_marks(path, count, tree, marks)[0]
+
+
+def apply_onto_marks(path: str, count: int, tree: Optional[str] = None,
+                     marks: Optional[int] = None
+                     ) -> Tuple[Tuple[int, int], Optional[MarksDone]]:
+    """``apply_onto``, returning the marks fixture's result as well."""
     refuse_inside_checkout(path)
     if not os.path.isfile(path):
         raise ValueError("no seed at {}".format(path))
+    if not count and marks is None:
+        raise ValueError("--onto needs --assignments N or --marks N")
     conn = sqlite3.connect(ro_uri(path), uri=True)
     try:
         existing = conn.execute(
             "SELECT COUNT(*) FROM current_assignments "
             "WHERE assignee IS NOT NULL").fetchone()[0]
+        marked = 0
+        if marks is not None and conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'test_flaky_marks'").fetchone()[0]:
+            marked = conn.execute(
+                "SELECT COUNT(*) FROM test_flaky_marks").fetchone()[0]
     finally:
         conn.close()
-    if existing:
+    if count and existing:
         raise ValueError("{} already has {} assignments; apply the fixture "
                          "to a fresh copy of the seed".format(path, existing))
+    if marked:
+        raise ValueError("{} already has {} flaky marks; apply the fixture "
+                         "to a fresh copy of the seed".format(path, marked))
     if tree is not None:
         sys.path.insert(0, os.path.abspath(tree))
     from testboard.storage import Storage
     now = seed_clock(path)
     store = Storage(path)
+    done = (0, 0)
+    marks_done = None  # type: Optional[MarksDone]
     try:
-        done = apply_fixture(store, path, ESTATE[0][1], count, now)
+        if count:
+            done = apply_fixture(store, path, ESTATE[0][1], count, now)
+        if marks is not None:
+            marks_done = apply_marks(store, path, ESTATE[0][1], marks, now)
     finally:
         store.close()
     checkpoint = sqlite3.connect(path)
@@ -536,7 +1032,7 @@ def apply_onto(path: str, count: int, tree: Optional[str] = None
         checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         checkpoint.close()
-    return done
+    return done, marks_done
 
 
 def fingerprint(path: str) -> Tuple[Dict[str, int], str]:
@@ -593,19 +1089,34 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="with --onto: the fixture's size (65 is "
                              "the reference estate's figure, 1000 the "
                              "stress); 10 of them muted")
+    parser.add_argument("--marks", type=int, default=None,
+                        help="with --onto: the marks fixture's size (0, "
+                             "50 or 1000), after --assignments when both "
+                             "are given; the tree must have migration 12")
     args = parser.parse_args(argv)
     try:
         if args.onto:
-            if args.assignments < 1:
-                raise ValueError("--onto needs --assignments N")
-            assigned, muted = apply_onto(args.onto, args.assignments,
-                                         args.tree)
-            print("fixture: {} assigned, {} muted -> {}".format(
-                assigned, muted, args.onto))
+            if args.assignments < 0 or (args.marks is not None
+                                        and args.marks < 0):
+                raise ValueError("--assignments and --marks take N >= 0")
+            (assigned, muted), marked = apply_onto_marks(
+                args.onto, args.assignments, args.tree, args.marks)
+            if args.assignments:
+                print("fixture: {} assigned, {} muted -> {}".format(
+                    assigned, muted, args.onto))
+            if marked is not None:
+                print("marks fixture: {} marked; companions {} muted, {} "
+                      "assigned, {} retired -> {}".format(
+                          marked.marks, marked.muted, marked.assigned,
+                          marked.retired, args.onto))
+                for line in census_lines(
+                        mark_census(args.onto, seed_clock(args.onto))):
+                    print(line)
             return 0
-        if args.assignments:
-            raise ValueError("--assignments goes with --onto a copy of a "
-                             "built seed (or ab.py --assign)")
+        if args.assignments or args.marks is not None:
+            raise ValueError("--assignments and --marks go with --onto a "
+                             "copy of a built seed (or ab.py --assign, "
+                             "--marks)")
         counts = build(args.out, args.tree, args.scale, args.nights,
                        args.seed, log=sys.stdout,
                        history_nights=args.history_nights)

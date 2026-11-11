@@ -3,7 +3,8 @@
     python tools/dev/perf/ab.py --base SHA --head SHA --db <scratch>/perf.db
     python tools/dev/perf/ab.py --base SHA --head-tree <worktree> --db ...
         [--pages NAME=URL ...] [--calls 24] [--methods m1,m2] [--json OUT]
-        [--assign 65|1000]
+        [--assign 65|1000] [--marks 0|50|1000]
+        [--page-mode open-actions home] [--workers 2]
 
 Both trees' ``testboard`` packages are loaded into ONE process, each
 against its own copy of ``--db``. For every request the two are called
@@ -24,6 +25,17 @@ fixture (N assigned, 10 of them muted) is written through each tree's
 own Storage. The Known slow rows are measured first, in their own
 states, whatever N is.
 
+``--marks N`` does the same with seed.py's marks fixture (after the
+assignments fixture when both are given): N flaky marks written through
+each tree's own ``Storage.mark_flaky``, with their companions, and the
+fixture's census printed. N > 0 needs both trees at migration 12.
+
+``--page-mode PAGE ...`` times a page's first paint: its requests
+(``FIRST_PAINT``) sent together to ``--workers`` long-lived threads in
+this process, memos cleared once per load, A and B alternated; it
+reports the page's time (its last answer) and what it waited for. Its
+pages are measured in the same state as the ``--pages`` rows.
+
 A SHA is materialised with ``git archive`` into a scratch directory (no
 worktree is registered); ``--base-tree``/``--head-tree`` take a checkout
 as it stands, uncommitted edits included. Nothing is written to ``--db``
@@ -37,6 +49,7 @@ import io
 import json
 import math
 import os
+import queue
 import shutil
 import sqlite3
 import statistics
@@ -44,7 +57,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
+import traceback
 import types
 import urllib.parse
 from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence,
@@ -78,6 +93,36 @@ KNOWN_SLOW = [
      "/api/dashboard?sort=environment&order=asc&limit=250&offset=0",
      "assign65"),
 ]  # type: List[Tuple[str, str, str]]
+
+#: Each page's first-paint requests, in the order the page sends them
+#: (static/actions.js, static/app.js at their defaults: no product, as
+#: amy, mainline). ``--page-mode`` sends them together to a pool of
+#: long-lived workers and times what the page waits for.
+FIRST_PAINT = {
+    "open-actions": [
+        ("names", "/api/summary?parts=names"),
+        ("rows", "/api/dashboard?open=1&with_comment=1&with_streak=1"
+                 "&sort=environment&order=asc&limit=100&offset=0"),
+    ],
+    "home": [
+        ("headline", "/api/summary?parts=headline&assignee=amy"),
+        ("assigned_trend", "/api/summary?parts=assigned_trend"),
+        ("queue", "/api/summary?parts=queue&queue=new_failures"
+                  "&assignee=amy"),
+        ("browse", "/api/dashboard?sort=environment&order=asc&limit=250"
+                   "&offset=0"),
+    ],
+}  # type: Dict[str, List[Tuple[str, str]]]
+
+#: Warm-up page loads per side before the measured ones. Each worker's
+#: connection to each copy is opened before these, explicitly, on every
+#: worker (run(), Pool.on_every_worker): a fast page can leave a worker
+#: idle through every warm-up, and its first connection must not open
+#: inside a measured load.
+PAGE_WARMUPS = 3
+
+#: How long a worker waits at the pool's barrier, and stop() for a worker.
+BARRIER_SECONDS = 60.0
 
 #: Below this a significant delta is immaterial: the verdict stays "same".
 FLOOR_MS = 1.0
@@ -117,6 +162,24 @@ class Row(NamedTuple):
     status_b: int
     a_ms: List[float]
     b_ms: List[float]
+    statements_a: int
+    statements_b: int
+
+
+class PageRow(NamedTuple):
+    """One page's first paint: per load, the page's time (its last
+    request's finish) and each request's finish, ms from the page's
+    start; statements of its requests run in order, cold once."""
+
+    name: str
+    requests: List[str]
+    workers: int
+    status_a: int
+    status_b: int
+    a_ms: List[float]
+    b_ms: List[float]
+    legs_a: List[List[float]]
+    legs_b: List[List[float]]
     statements_a: int
     statements_b: int
 
@@ -252,14 +315,22 @@ def materialise(sha: str, into: str) -> str:
 # Measuring
 # ----------------------------------------------------------------------
 
+#: Memos cleared BY NAME when a tree has them, whatever their type, since
+#: the sweep below only sees plain dicts. ``_cadence_runs_cache`` (WP-44
+#: item 6, the design's §2 B.4) survives every act's full clear on
+#: purpose, so neither invalidator drops it; a cold call must.
+NAMED_MEMOS = ("_cadence_runs_cache",)
+
+
 def clear_memos(store: object) -> None:
     """Drop every storage memo, so the next call is cold.
 
-    The two invalidators are what a push calls; the sweep after them
-    clears any memo dict a later tree adds under the ``_*_cache`` /
-    ``_*_memo`` convention, so a new memo can never turn a cold number
-    warm unnoticed. Refuses a tree that has neither invalidator: its
-    numbers would be warm and look cold.
+    The two invalidators are what a push calls; then each of
+    :data:`NAMED_MEMOS` the tree has; then a sweep that clears any memo
+    dict a later tree adds under the ``_*_cache`` / ``_*_memo``
+    convention, so a new memo can never turn a cold number warm
+    unnoticed. Refuses a tree that has neither invalidator, or a named
+    memo with no ``clear()``: its numbers would be warm and look cold.
     """
     found = False
     for name in ("_invalidate_summary_cache", "_invalidate_trend_cache"):
@@ -270,6 +341,15 @@ def clear_memos(store: object) -> None:
     if not found:
         raise ValueError("this tree's Storage has no memo invalidator; "
                          "update clear_memos() before trusting a number")
+    for name in NAMED_MEMOS:
+        memo = getattr(store, name, None)
+        if memo is None:
+            continue
+        clear = getattr(memo, "clear", None)
+        if clear is None:
+            raise ValueError("{} has no clear(); update clear_memos() "
+                             "before trusting a number".format(name))
+        clear()
     for name, value in list(vars(store).items()):
         if name.endswith("_cache") and isinstance(value, dict):
             value.clear()
@@ -425,6 +505,202 @@ def judge(row: Row) -> Verdict:
     return Verdict(median_a, median_b, delta, low, high, call)
 
 
+def judge_page(page: PageRow) -> Verdict:
+    """A page's verdict, by the same rule as a row's."""
+    return judge(Row(name=page.name, url="", status_a=page.status_a,
+                     status_b=page.status_b, a_ms=page.a_ms, b_ms=page.b_ms,
+                     statements_a=page.statements_a,
+                     statements_b=page.statements_b))
+
+
+def waits_for(page: PageRow, side: int) -> Tuple[str, float, int]:
+    """What the page waits for on *side*: the request with the latest
+    median finish, that median, and in how many loads it finished last."""
+    legs = page.legs_a if side == 0 else page.legs_b
+    medians = [statistics.median(leg) for leg in legs]
+    slowest = max(range(len(legs)), key=lambda i: (medians[i], -i))
+    last = 0
+    for load in range(len(legs[0])):
+        finishes = [leg[load] for leg in legs]
+        if finishes.index(max(finishes)) == slowest:
+            last += 1
+    return page.requests[slowest], medians[slowest], last
+
+
+# ----------------------------------------------------------------------
+# The page mode: a page's first paint on long-lived workers
+# ----------------------------------------------------------------------
+
+class Pool(object):
+    """A fixed pool of long-lived worker threads, as the server has.
+
+    Each worker keeps its own connection per ``Storage`` for the whole
+    run (``Storage`` holds one per thread), so its SQLite page cache is
+    a worker's, never a fresh connection's. A page load puts every
+    request on one queue at once, in the page's order, and the workers
+    take them as they free up; the load ends when the last one answers.
+    """
+
+    def __init__(self, size: int) -> None:
+        if size < 1:
+            raise ValueError("--workers needs at least one worker")
+        self.size = size
+        self._jobs = queue.Queue()  # type: queue.Queue
+        self._done = queue.Queue()  # type: queue.Queue
+        self._threads = [threading.Thread(target=self._work, daemon=True)
+                         for _ in range(size)]
+        for thread in self._threads:
+            thread.start()
+
+    def _work(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            index, call = job
+            error = ""
+            status = 0
+            try:
+                status = call()
+            except Exception:  # noqa: BLE001 - carried back to load()
+                error = traceback.format_exc().strip()
+            self._done.put((index, time.perf_counter(), status, error))
+
+    def load(self, calls: Sequence[Callable[[], int]],
+             names: Optional[Sequence[str]] = None
+             ) -> Tuple[float, List[float], List[int]]:
+        """Send *calls* together; (page ms, each finish ms, statuses).
+
+        A call that raises fails the load: every answer is collected
+        first, then ValueError names the request (*names*, else its
+        index) and carries the exception's text. A page with a hole in
+        it is never reported as a timing.
+        """
+        started = time.perf_counter()
+        for index, call in enumerate(calls):
+            self._jobs.put((index, call))
+        finished = [0.0] * len(calls)
+        statuses = [0] * len(calls)
+        errors = []  # type: List[Tuple[int, str]]
+        for _ in calls:
+            index, at, status, error = self._done.get()
+            finished[index] = (at - started) * 1000.0
+            statuses[index] = status
+            if error:
+                errors.append((index, error))
+        if errors:
+            # The cause first: a barrier broken by it says less.
+            errors.sort(key=lambda item: (
+                "BrokenBarrierError" in item[1], item[0]))
+            raise ValueError("\n".join(
+                "the page's request {} raised in a worker:\n{}".format(
+                    names[index] if names else index, error)
+                for index, error in errors))
+        return max(finished), finished, statuses
+
+    def on_every_worker(self, call: Callable[[], None]) -> None:
+        """Run *call* once on each worker thread (opening or closing its
+        connections): a barrier holds each worker until all have one, so
+        no worker takes two. The barrier times out
+        (:data:`BARRIER_SECONDS`), so a call that raises fails the load
+        instead of leaving the others waiting."""
+        barrier = threading.Barrier(self.size, timeout=BARRIER_SECONDS)
+
+        def held() -> int:
+            try:
+                call()
+            except Exception:
+                barrier.abort()
+                raise
+            barrier.wait()
+            return 200
+
+        self.load([held] * self.size,
+                  ["worker setup"] * self.size)
+
+    def stop(self) -> None:
+        """End the workers (a worker stuck in a call is left, a daemon)."""
+        for _ in self._threads:
+            self._jobs.put(None)
+        for thread in self._threads:
+            thread.join(BARRIER_SECONDS)
+
+
+def _page_calls(tree: Tree, store: object, urls: Sequence[str],
+                now: datetime.datetime) -> List[Callable[[], int]]:
+    handle = getattr(tree.modules["testboard.api"], "handle_api")
+
+    def one(url: str) -> Callable[[], int]:
+        request = make_request(tree, url)
+
+        def call() -> int:
+            return int(handle(store, request, now=lambda: now).status)
+        return call
+
+    return [one(url) for url in urls]
+
+
+def page_statements(tree: Tree, store: object, urls: Sequence[str],
+                    now: datetime.datetime) -> int:
+    """Statements one cold load of the page executes: memos cleared once,
+    its requests in the page's order on this thread (in the pool the
+    order, and so which request fills a shared memo, is a race)."""
+    conn = getattr(store, "_conn")()
+    tracer = _Tracer()
+    clear_memos(store)
+    conn.set_trace_callback(tracer)
+    try:
+        for call in _page_calls(tree, store, urls, now):
+            call()
+    finally:
+        conn.set_trace_callback(None)
+    return tracer.total
+
+
+def measure_page(trees: Tuple[Tree, Tree], stores: Tuple[object, object],
+                 activator: Activator, pool: Pool, name: str,
+                 now: datetime.datetime, calls: int) -> PageRow:
+    """One page, cold, alternated: memos cleared once before each load
+    (a page's requests may share a memo, as they do in the server)."""
+    requests = FIRST_PAINT[name]
+    urls = [url for _label, url in requests]
+    pages = ([], [])  # type: Tuple[List[float], List[float]]
+    legs = ([[] for _ in urls], [[] for _ in urls]
+            )  # type: Tuple[List[List[float]], List[List[float]]]
+    statuses = [200, 200]
+
+    def load(side: int, keep: bool) -> None:
+        activator.use(trees[side])
+        clear_memos(stores[side])
+        page_ms, finished, answered = pool.load(
+            _page_calls(trees[side], stores[side], urls, now),
+            ["{} of {} on {}".format(label, name, trees[side].label)
+             for label, _url in requests])
+        bad = [status for status in answered if status != 200]
+        if bad:
+            statuses[side] = bad[0]
+        if keep:
+            pages[side].append(page_ms)
+            for index, at in enumerate(finished):
+                legs[side][index].append(at)
+
+    for _ in range(PAGE_WARMUPS):
+        load(0, False)
+        load(1, False)
+    for index in range(calls):
+        for side in ((0, 1) if index % 2 == 0 else (1, 0)):
+            load(side, True)
+    counted = [0, 0]
+    for side in (0, 1):
+        activator.use(trees[side])
+        counted[side] = page_statements(trees[side], stores[side], urls, now)
+    return PageRow(name=name, requests=[label for label, _url in requests],
+                   workers=pool.size, status_a=statuses[0],
+                   status_b=statuses[1], a_ms=pages[0], b_ms=pages[1],
+                   legs_a=legs[0], legs_b=legs[1],
+                   statements_a=counted[0], statements_b=counted[1])
+
+
 # ----------------------------------------------------------------------
 # The seed
 # ----------------------------------------------------------------------
@@ -529,6 +805,36 @@ class Result(NamedTuple):
     rows: List[Row]
     methods: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]
     fixture: Tuple[int, int]
+    marks: Optional[Tuple[int, int, int, int]]
+    census: List[str]
+    page_rows: List[PageRow]
+
+
+def _apply_marks(seed: types.ModuleType, trees: Tuple[Tree, Tree],
+                 stores: Sequence[object], copies: Tuple[str, str],
+                 activator: Activator, scope: Scope, marks: int
+                 ) -> Tuple[Tuple[int, int, int, int], List[str]]:
+    """The marks fixture on both copies, each through its own tree; the
+    two must agree in what was written, in the census, and row for row
+    in every table the fixtures write (``seed.fixture_digest``: each
+    test's own cadence, history, comments, companions)."""
+    done = []  # type: List[Tuple[int, int, int, int]]
+    for side in (0, 1):
+        activator.use(trees[side])
+        done.append(tuple(seed.apply_marks(  # type: ignore
+            stores[side], copies[side], scope.environment, marks,
+            scope.now)))
+    census = [seed.mark_census(copy, scope.now) for copy in copies]
+    digests = [seed.fixture_digest(copy) for copy in copies]
+    if done[0] != done[1] or census[0] != census[1]:
+        raise ValueError("the marks fixture differs between the trees: "
+                         "{} / {}".format(done[0], done[1]))
+    if digests[0] != digests[1]:
+        raise ValueError("the marks fixture's rows differ between the "
+                         "trees (fixture_digest {} / {}): the two sides "
+                         "would not measure the same estate".format(
+                             digests[0][:12], digests[1][:12]))
+    return done[0], seed.census_lines(census[1])
 
 
 def run(base_tree: str, head_tree: str, db: str, scratch: str,
@@ -536,9 +842,19 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
         calls: int = 24, methods: Sequence[str] = (),
         known: bool = True,
         log: Optional[Callable[[str], None]] = None,
-        assign: int = 0) -> Result:
+        assign: int = 0, marks: Optional[int] = None,
+        page_modes: Sequence[str] = (), workers: int = 2) -> Result:
     """Measure every row on both trees; see the module docstring."""
     check_db(db)
+    for name in page_modes:
+        if name not in FIRST_PAINT:
+            raise ValueError("no page mode {}; there are {}".format(
+                name, ", ".join(sorted(FIRST_PAINT))))
+    if marks is not None and marks < 0:
+        raise ValueError("--marks N needs N >= 0")
+    if (assign or marks is not None) and not (pages or page_modes):
+        raise ValueError("--assign and --marks apply to the --pages rows "
+                         "and --page-mode pages; name at least one")
     trees = (load_tree(labels[0], base_tree), load_tree(labels[1], head_tree))
     copies = (os.path.join(scratch, "a.db"), os.path.join(scratch, "b.db"))
     for copy in copies:
@@ -546,11 +862,18 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
     scope = derive_scope(copies[0])
     activator = Activator()
     stores = []  # type: List[object]
+    pool = None  # type: Optional[Pool]
     try:
         for side in (0, 1):
             activator.use(trees[side])
             storage_type = getattr(trees[side].modules["testboard.storage"],
                                    "Storage")
+            if marks and getattr(storage_type, "mark_flaky", None) is None:
+                raise ValueError(
+                    "{} has no flaky marks (Storage.mark_flaky, migration "
+                    "12): --marks {} needs both trees at WP-44 item 3 or "
+                    "later; --marks 0 runs on any tree".format(
+                        labels[side], marks))
             try:
                 stores.append(storage_type(copies[side]))
             except Exception as exc:
@@ -559,14 +882,18 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                     "older tree".format(labels[side], exc))
         pair = (stores[0], stores[1])
         tracers = (_Tracer(), _Tracer())
-        page_state = "fixture" if assign else "plain"
+        page_state = "fixture" if assign or marks is not None else "plain"
         wanted = [(name, url, state) for name, url, state in KNOWN_SLOW
                   if known] + [(name, url, page_state) for name, url in pages]
         rows = []  # type: List[Row]
+        page_rows = []  # type: List[PageRow]
         fixture = (0, 0)
+        marked = None  # type: Optional[Tuple[int, int, int, int]]
+        census = []  # type: List[str]
         for state in ("plain", "assign65", "fixture"):
             todo = [w for w in wanted if w[2] == state]
-            if not todo:
+            paged = list(page_modes) if state == page_state else []
+            if not todo and not paged:
                 continue
             if state == "assign65":
                 for side in (0, 1):
@@ -574,16 +901,20 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                     assign_65(trees[side], stores[side], copies[side], scope)
             if state == "fixture":
                 seed = load_seed()
-                done = []  # type: List[Tuple[int, int]]
-                for side in (0, 1):
-                    activator.use(trees[side])
-                    done.append(seed.apply_fixture(
-                        stores[side], copies[side], scope.environment,
-                        assign, scope.now))
-                if done[0] != done[1]:
-                    raise ValueError("the fixture differs between the "
-                                     "trees: {} / {}".format(*done))
-                fixture = done[0]
+                if assign:
+                    done = []  # type: List[Tuple[int, int]]
+                    for side in (0, 1):
+                        activator.use(trees[side])
+                        done.append(seed.apply_fixture(
+                            stores[side], copies[side], scope.environment,
+                            assign, scope.now))
+                    if done[0] != done[1]:
+                        raise ValueError("the fixture differs between the "
+                                         "trees: {} / {}".format(*done))
+                    fixture = done[0]
+                if marks is not None:
+                    marked, census = _apply_marks(
+                        seed, trees, stores, copies, activator, scope, marks)
             for name, url, _state in todo:
                 row = alternate(trees, pair, activator, name,
                                 fill(url, scope), scope.now, calls,
@@ -591,6 +922,24 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                 rows.append(row)
                 if log is not None:
                     log("  measured {}".format(name))
+            if paged and pool is None:
+                pool = Pool(workers)
+                # Every worker opens its connection to both copies now,
+                # each on its own thread, before any warm-up.
+                ready = list(stores)
+
+                def open_all() -> None:
+                    for store in ready:
+                        getattr(store, "_conn")()
+
+                pool.on_every_worker(open_all)
+            for name in paged:
+                if pool is not None:
+                    page_rows.append(measure_page(
+                        trees, pair, activator, pool, name, scope.now,
+                        calls))
+                if log is not None:
+                    log("  measured page {}".format(name))
         per_method = {}  # type: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]
         for name in methods:
             per_method[name] = (
@@ -599,13 +948,29 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                 (tracers[1].calls.get(name, 0),
                  tracers[1].statements.get(name, 0)))
     finally:
+        if pool is not None:
+            opened = list(stores)
+
+            def close_all() -> None:
+                for store in opened:
+                    getattr(store, "close")()
+
+            try:
+                pool.on_every_worker(close_all)
+            except ValueError as exc:
+                # Never mask the error that ended the run; say this one.
+                if log is not None:
+                    log("  closing the workers' connections failed: "
+                        "{}".format(exc))
+            pool.stop()
         for side, store in enumerate(stores):
             activator.use(trees[side])
             getattr(store, "close")()
         activator.restore()
     return Result(labels=labels, db=os.path.abspath(db), scope=scope,
                   calls=calls, rows=rows, methods=per_method,
-                  fixture=fixture)
+                  fixture=fixture, marks=marked, census=census,
+                  page_rows=page_rows)
 
 
 def report(result: Result) -> List[str]:
@@ -624,6 +989,14 @@ def report(result: Result) -> List[str]:
             "in {}, {} of them muted".format(
                 result.fixture[0], result.scope.environment,
                 result.fixture[1]))
+    if result.marks is not None:
+        lines.append(
+            "--pages rows measured with the marks fixture: {} marked in {}; "
+            "companions {} muted, {} assigned, {} retired. Census (the "
+            "harness's own reading of the rule):".format(
+                result.marks[0], result.scope.environment, result.marks[1],
+                result.marks[2], result.marks[3]))
+        lines.extend(result.census)
     lines.append("{:36s} {:>9s} {:>9s} {:>8s} {:>18s} {:>9s}  {}".format(
         "request", "A ms", "B ms", "B-A ms", "95% band of B-A", "stmts A/B",
         "verdict"))
@@ -642,6 +1015,30 @@ def report(result: Result) -> List[str]:
                 "[{:+.1f}, {:+.1f}]".format(verdict.low, verdict.high),
                 "{}/{}".format(row.statements_a, row.statements_b),
                 verdict.call))
+    for page in result.page_rows:
+        verdict = judge_page(page)
+        label = "page {} ({} workers)".format(page.name, page.workers)
+        if verdict.call.startswith("status"):
+            lines.append("{:36s} {:>9s} {:>9s} {:>8s} {:>18s} {:>9s}  {}"
+                         .format(label, "-", "-", "-", "-", "-",
+                                 verdict.call))
+            continue
+        widest = max(widest, (verdict.high - verdict.low) / 2.0)
+        lines.append(
+            "{:36s} {:9.1f} {:9.1f} {:+8.1f} {:>18s} {:>9s}  {}".format(
+                label, verdict.median_a, verdict.median_b, verdict.delta,
+                "[{:+.1f}, {:+.1f}]".format(verdict.low, verdict.high),
+                "{}/{}".format(page.statements_a, page.statements_b),
+                verdict.call))
+        for side, tag in ((0, "A"), (1, "B")):
+            legs = page.legs_a if side == 0 else page.legs_b
+            slowest, at, last = waits_for(page, side)
+            lines.append("    {} waits for {} ({:.1f} ms, last in {} of {} "
+                         "loads); finishes: {}".format(
+                             tag, slowest, at, last, len(legs[0]),
+                             ", ".join("{} {:.1f}".format(
+                                 name, statistics.median(leg))
+                                 for name, leg in zip(page.requests, legs))))
     lines.append("noise: widest half-band on this run {:.1f} ms; a verdict "
                  "needs the band clear of zero and |B-A| over max(1 ms, 5% "
                  "of A)".format(widest))
@@ -698,6 +1095,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "assignments fixture (65 = the reference "
                              "estate's figure, 1000 = stress; 10 muted "
                              "either way)")
+    parser.add_argument("--marks", type=int, default=None,
+                        help="measure the --pages rows and --page-mode "
+                             "pages after the marks fixture (0, 50 or "
+                             "1000 marks; after --assign when both are "
+                             "given); N > 0 needs both trees at migration "
+                             "12")
+    parser.add_argument("--page-mode", nargs="*", default=[],
+                        metavar="PAGE",
+                        help="also time a page's first paint on long-lived "
+                             "workers: {}".format(
+                                 ", ".join(sorted(FIRST_PAINT))))
+    parser.add_argument("--workers", type=int, default=2,
+                        help="the page mode's worker threads (default 2)")
     parser.add_argument("--json", help="also write raw samples here")
     parser.add_argument("--keep", action="store_true",
                         help="keep the scratch directory")
@@ -706,9 +1116,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         check_db(args.db)
         pages = _parse_pages(args.pages)
-        if args.assign and not pages:
-            raise ValueError("--assign applies to the --pages rows; name "
-                             "at least one")
+        if (args.assign or args.marks is not None) and not (
+                pages or args.page_mode):
+            raise ValueError("--assign and --marks apply to the --pages "
+                             "rows and --page-mode pages; name at least "
+                             "one")
         trees = []  # type: List[Tuple[str, str]]
         for index, (sha, tree) in enumerate(((args.base, args.base_tree),
                                              (args.head, args.head_tree))):
@@ -723,7 +1135,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                      [m for m in args.methods.split(",") if m],
                      known=not args.no_known,
                      log=lambda text: print(text, file=sys.stderr),
-                     assign=args.assign)
+                     assign=args.assign, marks=args.marks,
+                     page_modes=args.page_mode, workers=args.workers)
     except ValueError as exc:
         print("ab.py: {}".format(exc), file=sys.stderr)
         return 2
@@ -739,7 +1152,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             json.dump({
                 "labels": list(result.labels), "db": result.db,
                 "fixture": list(result.fixture),
+                "marks": (list(result.marks) if result.marks is not None
+                          else None),
+                "census": result.census,
                 "rows": [row._asdict() for row in result.rows],
+                "pages": [page._asdict() for page in result.page_rows],
             }, handle, indent=1)
     return 0
 

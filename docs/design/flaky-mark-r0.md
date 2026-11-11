@@ -1336,7 +1336,7 @@ any interruption is the first line not `done` or `parked`.
 | 2p measured pass | done | | the page 38 ms less on perf-seed/1 and 78 ms less on the 90-night seed (SQLite), 9.5 to 36.7 ms less on a local MariaDB 12.3; Known slow rows the same. For the owner: Open Actions no longer warms Home's headline memo, so Home opened straight after it pays its own cold headline |
 | 3 the mark, backend | done | the commit carrying this line | fresh eyes found no defect; a blank reason on a cadence change and a helper with no caller fixed before the commit; the three carriers of the "any mark" bit left to item 6 |
 | 3p measured pass | done | | Known slow rows the same with the tables empty; the detail of a marked test +0.07 to +0.27 ms on SQLite, +0.41 to +0.84 on a local MariaDB 12.3; the push path runs the same statements. Carried into item 6: unmark and cadence change send a statement per test on MariaDB. Recorded, outside the package: every bulk endpoint resolves each entry's stream with two statements |
-| 4 marks fixture | in flight | | |
+| 4 marks fixture | done | the commit carrying this line | with 65 assignments it reproduces the design-time fixture's F, X and P at 50 and 1,000 marks on both seeds; seven fresh-eyes hardening points fixed before the commit; the page mode is in the harness |
 | 5 controls, UI | done | the commit carrying this line | four fresh-eyes findings fixed before the commit; the bar's Set cadence is reachable only once rows carry the mark (item 6); no browser has rendered it |
 | 6 state and counts, backend | in flight | | |
 | 6p measured pass | not started | | |
