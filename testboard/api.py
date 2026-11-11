@@ -53,8 +53,11 @@ from testboard.storage import (
     MUTE_MAX_HOURS,
     COMPARE_CATEGORIES,
     DASHBOARD_SORTS,
+    FLAKY_CADENCE_MAX,
+    FLAKY_CADENCE_MIN,
     MAINLINE_STREAM_ID,
     QUEUE_KINDS,
+    FlakyMark,
     Mute,
     Comment,
     CompareCounts,
@@ -2069,6 +2072,12 @@ def _handle_test_detail(
         max_days=_ANALYTICS_MAX_DAYS,
         max_runs=_ANALYTICS_MAX_RUNS,
     )
+    assignee = storage.current_assignee(environment, script, test_name)
+    mute = storage.mute_for(stream_id, environment, script, test_name)
+    # WP-40's mute history read, which since WP-44 also carries the
+    # flaky mark and its history: one statement either way, in the
+    # same place in the sequence.
+    acts = storage.test_acts(environment, script, test_name)
     return _json_response(
         200,
         {
@@ -2076,9 +2085,7 @@ def _handle_test_detail(
             "script": script,
             "test_name": test_name,
             "source_link": latest.source_link,
-            "assignee": storage.current_assignee(
-                environment, script, test_name
-            ),
+            "assignee": assignee,
             "latest": _run_json(latest),
             "analytics": analytics.analytics_to_dict(
                 summary, max_runs=_ANALYTICS_MAX_RUNS
@@ -2089,11 +2096,7 @@ def _handle_test_detail(
             # WP-40: THIS stream's current mute (live or
             # expired, `live` says which) and every act on the test,
             # across streams, newest first.
-            "mute": _mute_json(
-                storage.mute_for(
-                    stream_id, environment, script, test_name),
-                now_dt,
-            ),
+            "mute": _mute_json(mute, now_dt),
             "mute_history": [
                 {
                     "id": act.id,
@@ -2106,11 +2109,75 @@ def _handle_test_detail(
                     "actor": act.actor,
                     "acted_at": model.format_iso(act.acted_at),
                 }
-                for act in storage.mute_history(
-                    environment, script, test_name)
+                for act in acts.mute_history
+            ],
+            # WP-44: the test's flaky mark (one per test, every stream)
+            # with its state on THIS stream, and every act on it, newest
+            # first, so opening the history fetches nothing.
+            "flaky": _flaky_detail_json(
+                storage, acts.flaky_mark, stream, latest, runs),
+            "flaky_history": [
+                {
+                    "id": act.id,
+                    "action": act.action,
+                    "cadence": act.cadence,
+                    "reason": act.reason,
+                    "actor": act.actor,
+                    "acted_at": model.format_iso(act.acted_at),
+                }
+                for act in acts.flaky_history
             ],
         },
     )
+
+
+def _flaky_detail_json(
+    storage: Storage,
+    mark: Optional[FlakyMark],
+    stream: Optional[Stream],
+    latest: StoredRun,
+    runs: Sequence[StoredRun],
+) -> Optional[Dict[str, Any]]:
+    """The test detail's ``flaky``: the mark and its state on the
+    detail's stream (WP-44), or None for a test with no mark.
+
+    The state needs the stream's newest N results. The detail already
+    holds its analytics window (*runs*: this stream's runs of the test
+    over 90 days, at most 200, newest first), and whenever that window
+    has N runs, or a non-FAIL among those it has, the state is decided
+    from it with no statement at all. Only a test that ran fewer than N
+    times in the window (none, if its latest run is older), every one a
+    FAIL, reads further back: one :meth:`Storage.cadence_runs` (Q2) of
+    at most N rows from *latest*, bounded below on a build by the
+    build's first run. *stream* is None on mainline, as the detail
+    holds it.
+    """
+    if mark is None:
+        return None
+    cadence = mark.cadence
+    results = [run.result for run in runs]
+    if (len(results) < cadence
+            and all(result is Result.FAIL for result in results)):
+        stream_id = (MAINLINE_STREAM_ID if stream is None
+                     else stream.stream_id)
+        floor = (None if stream is None or stream.kind == "mainline"
+                 else stream.first_seen)
+        results = storage.cadence_runs(
+            stream_id,
+            [(mark.environment, mark.script, mark.test_name,
+              latest.start_time, cadence)],
+            floor,
+        )[(mark.environment, mark.script, mark.test_name)]
+    state = analytics.flaky_state(cadence, results)
+    return {
+        "cadence": cadence,
+        "marked_by": mark.marked_by,
+        "marked_at": model.format_iso(mark.marked_at),
+        "reason": mark.reason,
+        "state": None if state is None else state.state,
+        "streak": None if state is None else state.streak,
+        "runs": None if state is None else state.runs,
+    }
 
 
 def _handle_test_streams(
@@ -2709,6 +2776,135 @@ def _handle_mutes_list(
             "mutes": entries,
         },
     )
+
+
+def _parse_flaky_cadence(obj: Dict[str, Any]) -> int:
+    """``cadence``: a whole number 2..10 (WP-44). Absent, null, a
+    string, a bool, a float or out of range are all the same 400."""
+    cadence = obj.get("cadence")
+    if (not isinstance(cadence, int) or isinstance(cadence, bool)
+            or cadence < FLAKY_CADENCE_MIN or cadence > FLAKY_CADENCE_MAX):
+        raise _HttpError(
+            400,
+            "cadence: must be a whole number from {} to {}".format(
+                FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX),
+        )
+    return cadence
+
+
+#: Fields a flaky act refuses rather than ignores: a mark's owner is the
+#: person making it and nobody else can be named (decision 12), so a
+#: client that thinks it is naming one is told, not silently overruled.
+_FLAKY_OWNER_FIELDS = ("marked_by", "assignee")
+
+
+def _refuse_a_named_owner(obj: Dict[str, Any]) -> None:
+    for field in _FLAKY_OWNER_FIELDS:
+        if field in obj:
+            raise _HttpError(
+                400,
+                "{}: a flaky mark belongs to the user making it "
+                "(username) and cannot name anyone else".format(field),
+            )
+
+
+def _storage_value_error(exc: ValueError) -> _HttpError:
+    """A storage refusal of a flaky act as the API's 400, naming the
+    field the way every other 400 here does."""
+    message = str(exc)
+    if message.startswith("reason is required"):
+        message = "reason: is required" + message[
+            len("reason is required"):]
+    return _HttpError(400, message)
+
+
+def _handle_flaky_bulk(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/flaky/bulk — mark a selection of tests as flaky, or
+    change the cadence of their marks (WP-44).
+
+    Body: ``{"username", "reason"?, "cadence", "tests": [{environment,
+    script, test_name, stream_id?}, ...]}``. ``cadence`` is 2..10. A
+    mark is per test and covers every stream; an entry's ``stream_id``
+    is the stream the selection was made on and tags the reason's
+    comment (decision 10). The owner is ``username``, a known and active
+    user, and nobody else can be named (decision 12): ``marked_by`` or
+    ``assignee`` in the body is a 400. ``reason`` is required for a test
+    not yet marked and optional for a cadence change, which keeps the
+    mark's owner; a blank one (empty or whitespace) is no reason. If any
+    test the request names is not yet marked and there is no reason, the
+    whole request is a 400 naming the field and nothing is written. A
+    test with no result on any stream is counted ``unknown`` and
+    skipped.
+
+    Response: ``{"marked": n, "changed": n, "unchanged": n,
+    "unknown": n}``.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    _refuse_a_named_owner(obj)
+    cadence = _parse_flaky_cadence(obj)
+    # The note box is sent as it stands: absent, null, empty and
+    # whitespace-only all mean "no reason", which a cadence change may
+    # have. Whether a reason was REQUIRED (a test not yet marked) is
+    # storage's to decide, for the whole request before anything is
+    # written.
+    reason = None  # type: Optional[str]
+    raw_reason = obj.get("reason")
+    if raw_reason is not None and not (
+            isinstance(raw_reason, str) and not raw_reason.strip()):
+        reason = _validate_comment_text(obj, field="reason")
+    if "tests" not in obj:
+        raise _HttpError(400, "tests: required field is missing")
+    entries = _parse_test_entries(storage, obj["tests"])
+    if not entries:
+        raise _HttpError(400, "tests: must name at least one test")
+    try:
+        result = storage.mark_flaky(
+            entries, cadence, reason, username, now())
+    except ValueError as exc:
+        raise _storage_value_error(exc)
+    return _json_response(
+        200,
+        {
+            "marked": result.marked,
+            "changed": result.changed,
+            "unchanged": result.unchanged,
+            "unknown": result.unknown,
+        },
+    )
+
+
+def _handle_flaky_unmark(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/flaky/unmark — remove the flaky mark of each listed
+    test that has one (WP-44). Anyone known and active may; each removal
+    is recorded in the mark's history.
+
+    Body: ``{"username", "tests": [...]}``, the bulk endpoint's list.
+    Response: ``{"unmarked": n}``.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    if "tests" not in obj:
+        raise _HttpError(400, "tests: required field is missing")
+    entries = _parse_test_entries(storage, obj["tests"])
+    if not entries:
+        raise _HttpError(400, "tests: must name at least one test")
+    try:
+        unmarked = storage.unmark_flaky(
+            [(environment, script, test_name)
+             for environment, script, test_name, _stream in entries],
+            username, now())
+    except ValueError as exc:
+        raise _storage_value_error(exc)
+    return _json_response(200, {"unmarked": unmarked})
 
 
 def _handle_bulk_assignments_list(
@@ -4656,6 +4852,14 @@ def _route(
     if rest == ["mutes", "bulk"]:
         _check_method(request.method, ("POST",))
         return _handle_mutes_bulk(storage, request, now)
+
+    if rest == ["flaky", "bulk"]:
+        _check_method(request.method, ("POST",))
+        return _handle_flaky_bulk(storage, request, now)
+
+    if rest == ["flaky", "unmark"]:
+        _check_method(request.method, ("POST",))
+        return _handle_flaky_unmark(storage, request, now)
 
     if rest == ["mutes", "unmute"]:
         _check_method(request.method, ("POST",))

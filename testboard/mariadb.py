@@ -70,6 +70,12 @@ _LIKE_TEST_NAME = (
     "lr.test_name COLLATE utf8mb4_general_ci LIKE ? ESCAPE '\\\\'"
 )
 
+#: A ``UNION ALL`` member with its own ORDER BY and LIMIT (WP-44's
+#: ``Storage.cadence_runs``), parenthesised: the same rows as SQLite's
+#: subquery spelling, 1.5 to 2 ms cheaper per statement on MariaDB
+#: (measured on 12.3, design doc section 3c). The index is unused here.
+_LIMITED_UNION_MEMBER = "({0})"
+
 
 def _driver() -> Any:
     """Import the vendored driver, or say where it should have been."""
@@ -180,6 +186,7 @@ class MariaDBBackend(object):
 
     like_test_name = _LIKE_TEST_NAME
     limit_all_offset = _LIMIT_ALL_OFFSET
+    limited_union_member = _LIMITED_UNION_MEMBER
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings

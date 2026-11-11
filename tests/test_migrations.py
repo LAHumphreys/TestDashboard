@@ -423,6 +423,80 @@ class DataSurvivesTest(TempDirTest):
             conn.close()
 
 
+class Migration12Test(TempDirTest):
+    """WP-44: migration 12 creates the flaky mark's two tables and their
+    one index and touches nothing else, so a version-11 database (with
+    mutes in it, the shape production is in) steps to 12 with every
+    existing object and row unchanged. MariaDB's half is step 11 to 12
+    of the upgrade-tool ledger (``LedgerTest`` and the upgrade tests)."""
+
+    ADDED = {
+        ("table", "test_flaky_marks"),
+        ("table", "flaky_mark_history"),
+        ("index", "idx_flaky_mark_history_triple"),
+        ("index", "sqlite_autoindex_test_flaky_marks_1"),
+    }
+
+    def _columns(self, path: str, table: str) -> List[Tuple[str, str, int]]:
+        conn = sqlite3.connect(path)
+        try:
+            return [(row[1], row[2], row[3]) for row in conn.execute(
+                "PRAGMA table_info({0})".format(table))]
+        finally:
+            conn.close()
+
+    def test_eleven_to_twelve_creates_only(self) -> None:
+        path = self.path("v11.db")
+        build_at(path, 11)
+        conn = sqlite3.connect(path)
+        conn.execute("INSERT INTO users (username, created_at) "
+                     "VALUES ('someone', '2026-10-01T00:00:00.000000')")
+        conn.execute(
+            "INSERT INTO test_mutes (stream_id, environment, script, "
+            "test_name, reason, muted_at, expires_at, muted_by) VALUES "
+            "(1, 'prod', 's.py', 't', 'infra', "
+            "'2026-10-01T00:00:00.000000', '2026-10-02T00:00:00.000000', "
+            "'someone')")
+        conn.commit()
+        conn.close()
+        before = schema_of(path)
+
+        storage = Storage(path)
+        self.addCleanup(storage.close)
+        self.assertEqual(version_of(path), 12)
+        after = schema_of(path)
+        added = {(kind, name) for kind, name, _sql in after} - {
+            (kind, name) for kind, name, _sql in before}
+        self.assertEqual(added, self.ADDED)
+        self.assertEqual(
+            [row for row in after if (row[0], row[1]) not in self.ADDED],
+            before)
+        self.assertEqual(
+            self._columns(path, "test_flaky_marks"),
+            [("environment", "TEXT", 1), ("script", "TEXT", 1),
+             ("test_name", "TEXT", 1), ("cadence", "INTEGER", 1),
+             ("reason", "TEXT", 1), ("marked_by", "TEXT", 1),
+             ("marked_at", "TEXT", 1)])
+        self.assertEqual(
+            self._columns(path, "flaky_mark_history"),
+            [("id", "INTEGER", 0), ("environment", "TEXT", 1),
+             ("script", "TEXT", 1), ("test_name", "TEXT", 1),
+             ("action", "TEXT", 1), ("cadence", "INTEGER", 0),
+             ("reason", "TEXT", 0), ("actor", "TEXT", 1),
+             ("acted_at", "TEXT", 1)])
+        conn = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT reason FROM test_mutes").fetchall(),
+                [("infra",)])
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM test_flaky_marks").fetchone()[0],
+                0)
+        finally:
+            conn.close()
+
+
 class PlantedRegressionTest(unittest.TestCase):
     """Prove each detector can fail, rather than that it passes today.
 

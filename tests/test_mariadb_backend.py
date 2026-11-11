@@ -61,6 +61,12 @@ EXCLUDED_CLASSES = {
         "The delete itself runs against MariaDB in "
         "DeleteStreamEnvironmentTest's generated variant; which index "
         "MariaDB chooses for it has no automated pin here.",
+    "NoMarksAddsNothingTest":
+        "counts and reads statements with sqlite3's set_trace_callback "
+        "(WP-44): the instrument is SQLite's. The values the reads "
+        "return with the flaky tables present and empty are every "
+        "other generated class's, which run here on a schema carrying "
+        "them.",
     "TestEnvironmentListingCost":
         "counts sqlite page reads to pin a query-shape regression; "
         "the instrument is engine-specific even though the shape "
@@ -283,6 +289,15 @@ EXCLUDED_TESTS = {
         "counts statements with sqlite3's set_trace_callback (WP-44). "
         "That the part runs no headline, trend or queue read is "
         "test_no_headline_trend_or_queue_read_runs, which runs here.",
+    "FlakyCadenceTest.test_q2_costs_one_statement_per_hundred_tests":
+        "counts statements with sqlite3's set_trace_callback (WP-44). "
+        "That both a full statement and a second one execute on MariaDB "
+        "is test_q2_over_more_than_one_statement, which runs here "
+        "(decision 22).",
+    "FlakyCadenceTest.test_the_marks_reads_are_driven_by_their_keys":
+        "reads statements with sqlite3's set_trace_callback and asserts "
+        "SQLite's EXPLAIN QUERY PLAN (WP-44). Q2's plan guard, "
+        "test_q2_is_a_runs_unique_range_on_both_backends, runs here.",
     "TestBulkSetAssignee.test_empty_input_issues_no_writes":
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssigneeForTriples."

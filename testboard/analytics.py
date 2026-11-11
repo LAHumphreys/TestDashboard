@@ -60,7 +60,13 @@ from typing import (
 )
 
 from testboard.model import Result, StoredRun, duration_seconds, format_iso
-from testboard.storage import AssignedCell, RollupCount, ScriptHourBucket
+from testboard.storage import (
+    FLAKY_CADENCE_MAX,
+    FLAKY_CADENCE_MIN,
+    AssignedCell,
+    RollupCount,
+    ScriptHourBucket,
+)
 
 __all__ = [
     "DAY_NAMES",
@@ -70,6 +76,10 @@ __all__ = [
     "Flakiness",
     "DEFAULT_FLAKY_THRESHOLD",
     "stability_of",
+    "FLAKY_CADENCE_MIN",
+    "FLAKY_CADENCE_MAX",
+    "FlakyState",
+    "flaky_state",
     "AnalyticsSummary",
     "select_window",
     "compute_analytics",
@@ -239,6 +249,72 @@ def stability_of(
     return Flakiness(
         transitions=transitions, score=score, classification=classification
     )
+
+
+#: The three states a marked test can be in on a stream.
+FLAKY_PASSING = "passing"
+FLAKY_FLAKING = "flaking"
+FLAKY_FAILING = "failing"
+
+
+class FlakyState(NamedTuple):
+    """A marked test's state on one stream (WP-44, design §2 B.1).
+
+    ``streak`` is the consecutive FAILs ending at the latest run, capped
+    at the cadence. ``runs`` is how many runs the stream has of the
+    test, capped at the cadence, and is given only when ``state`` is
+    ``failing`` (the one place the page reads it: "every run here has
+    failed, 2 of 2"); ``None`` otherwise.
+    """
+
+    state: str
+    streak: int
+    runs: Optional[int]
+
+
+def flaky_state(
+    cadence: int, results_newest_first: Sequence[Result],
+) -> Optional[FlakyState]:
+    """The state of a test marked flaky at *cadence*, from its results
+    on one stream, newest first. ``None`` when it has none there (a mark
+    on a test that never ran on a stream is absent from it).
+
+    The rule (design §2 B.1, decision 1 and verdict 8), one definition:
+
+    - A failure is ``FAIL`` and nothing else: an ``UNEXPECTED_PASS`` or a
+      ``FAILED_AS_EXPECTED`` breaks a run of failures exactly as a
+      ``PASS`` does, so one among the newest N keeps the test flaking.
+    - Latest not FAIL: ``passing``, streak 0.
+    - The newest N all FAIL: ``failing`` (over its cadence).
+    - Fewer than N runs, every one a FAIL: ``failing`` too; a stream
+      (a build, usually) with fewer runs than the cadence needs is over
+      it when every run it has failed.
+    - Otherwise: ``flaking``, a tolerated failure.
+
+    *results_newest_first* must hold the stream's newest
+    ``min(cadence, all it has)`` results at least; more are ignored.
+    The latest two alone (``[result, prev_result]``, or ``[result]``
+    when there is no previous run) suffice for every row of the table
+    except FAIL after FAIL at a cadence of 3 or more.
+    """
+    if cadence < FLAKY_CADENCE_MIN or cadence > FLAKY_CADENCE_MAX:
+        raise ValueError(
+            "cadence must be {0} to {1}, got {2!r}".format(
+                FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX, cadence))
+    window = list(results_newest_first[:cadence])
+    if not window:
+        return None
+    streak = 0
+    for result in window:
+        if result is not Result.FAIL:
+            break
+        streak += 1
+    if streak == 0:
+        return FlakyState(state=FLAKY_PASSING, streak=0, runs=None)
+    if streak == len(window):
+        # The newest N all failed, or fewer than N exist and all failed.
+        return FlakyState(state=FLAKY_FAILING, streak=streak, runs=streak)
+    return FlakyState(state=FLAKY_FLAKING, streak=streak, runs=None)
 
 
 def _compute_day_of_week(window: List[StoredRun]) -> List[DayStats]:

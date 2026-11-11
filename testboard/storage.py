@@ -913,12 +913,69 @@ MIGRATIONS = [
             "ON mute_history (environment, script, test_name, id)",
         ],
     ),
+    (
+        12,
+        [
+            # WP-44: the flaky mark. A named user accepts a test as
+            # flaky with a cadence N (2..10): the test counts as failing
+            # only once its N most recent runs on a stream have all
+            # failed. Keyed by the TRIPLE, like an assignment: one mark
+            # covers the test in its environment on mainline and on
+            # every build, and each stream judges the cadence on its
+            # own runs at read time (nothing is stored per stream and
+            # nothing is added to the push path). It never expires.
+            #
+            # `test_flaky_marks` is the current mark; `flaky_mark_history`
+            # one row per act (mark / cadence / unmark).
+            #
+            # Creates only; touches no existing table — so on MariaDB
+            # (tools/upgrade_mariadb_schema.py's ledger, step 11->12,
+            # alters=()) the server may keep running through it.
+            # Takes 12 from WP-15's parked reservation, which moves to
+            # 13 — the seventh time (UPGRADE_PLAN.md §1).
+            """
+            CREATE TABLE test_flaky_marks (
+                environment TEXT NOT NULL,
+                script TEXT NOT NULL,
+                test_name TEXT NOT NULL,
+                cadence INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                marked_by TEXT NOT NULL REFERENCES users(username),
+                marked_at TEXT NOT NULL,
+                PRIMARY KEY (environment, script, test_name)
+            )
+            """,
+            """
+            CREATE TABLE flaky_mark_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                environment TEXT NOT NULL,
+                script TEXT NOT NULL,
+                test_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                cadence INTEGER,
+                reason TEXT,
+                actor TEXT NOT NULL REFERENCES users(username),
+                acted_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX idx_flaky_mark_history_triple "
+            "ON flaky_mark_history (environment, script, test_name, id)",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: WP-40: the longest a mute can run, in HOURS (seven days), on any
 #: stream. Refused
 #: above this by the API AND by storage (:meth:`Storage.mute_tests`).
 MUTE_MAX_HOURS = 168
+
+#: WP-44: the cadence a flaky mark may carry, inclusive. A mark of N
+#: means "count the test as failing only once its N most recent runs on
+#: a stream have all failed". Refused outside this by the API and by
+#: storage (:meth:`Storage.mark_flaky`); :func:`analytics.flaky_state`
+#: applies it.
+FLAKY_CADENCE_MIN = 2
+FLAKY_CADENCE_MAX = 10
 
 #: Prefix marking a migration step that runs Python instead of SQL.
 #:
@@ -1397,6 +1454,63 @@ class ExpiringMute(NamedTuple):
     stream_name: str
     result: Result
     assignee: Optional[str]
+
+
+class FlakyMark(NamedTuple):
+    """WP-44: a test's current flaky mark. One per TRIPLE: it covers the
+    test on mainline and on every build, and each stream judges the
+    cadence on its own runs (``analytics.flaky_state``)."""
+
+    environment: str
+    script: str
+    test_name: str
+    #: N, 2..10: failing only once the N most recent runs all FAILed.
+    cadence: int
+    reason: str
+    #: Who accepted the flakiness. A record, not an assignment.
+    marked_by: str
+    marked_at: datetime.datetime
+
+
+class FlakyMarkAct(NamedTuple):
+    """One row of ``flaky_mark_history``: who did what, when."""
+
+    id: int
+    environment: str
+    script: str
+    test_name: str
+    #: ``mark``, ``cadence`` or ``unmark``.
+    action: str
+    #: The cadence the act set; for ``unmark``, the one it removed.
+    cadence: Optional[int]
+    reason: Optional[str]
+    actor: str
+    acted_at: datetime.datetime
+
+
+class FlakyMarkResult(NamedTuple):
+    """What :meth:`Storage.mark_flaky` did with a selection."""
+
+    #: Tests marked afresh.
+    marked: int
+    #: Tests already marked at another cadence, moved to this one.
+    changed: int
+    #: Tests already marked at this cadence: nothing written.
+    unchanged: int
+    #: Requested tests with no ``latest_runs`` row on any stream —
+    #: skipped, never a hard failure (a stale page).
+    unknown: int
+
+
+class TestActs(NamedTuple):
+    """What the test page shows of a test's human acts beyond its
+    comments and assignee, read in ONE statement
+    (:meth:`Storage.test_acts`): every mute act on any stream, the
+    current flaky mark and every act on it, each list newest first."""
+
+    mute_history: List[MuteAct]
+    flaky_mark: Optional[FlakyMark]
+    flaky_history: List[FlakyMarkAct]
 
 
 class DailyResultCount(NamedTuple):
@@ -1881,6 +1995,10 @@ _ENVIRONMENT_TABLES = (
     "test_retirements",
     "test_mutes",
     "mute_history",
+    # WP-44: a dropped environment takes its marks and their history
+    # with it (decision 11); retiring a test or deleting a build does not.
+    "test_flaky_marks",
+    "flaky_mark_history",
     "environment_expectations",
     "environment_products",
     "activity_hours",
@@ -2225,6 +2343,13 @@ class _SqliteBackend(object):
     #: "No limit, but an offset" — SQLite spells no-limit as -1, which
     #: MariaDB rejects outright.
     limit_all_offset = " LIMIT -1 OFFSET ?"
+
+    #: One member of a ``UNION ALL`` that carries its own ``ORDER BY``
+    #: and ``LIMIT`` (WP-44's :meth:`Storage.cadence_runs`), formatted
+    #: with the member's SQL and its index. SQLite allows them only
+    #: inside a subquery and rejects a parenthesised member; MariaDB
+    #: takes the member in parentheses, which it reads cheaper.
+    limited_union_member = "SELECT * FROM ({0}) AS q{1}"
 
     def __init__(self, path: str, cache_mb: Optional[int],
                  mmap_mb: Optional[int], max_connections: int) -> None:
@@ -8679,6 +8804,369 @@ class Storage:
                 result=Result(row[11]), assignee=row[12])
             for row in self._conn().execute(sql, params).fetchall()
         ]
+
+    # ------------------------------------------------------------------
+    # Flaky marks (migration 12, WP-44)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _require_active_user(
+        conn: sqlite3.Connection, username: str,
+    ) -> None:
+        """Inside the caller's transaction: refuse a flaky act by anyone
+        but a known, active user (decision 12). Unlike a comment or an
+        assignment, a mark never creates its actor: the person marking
+        is the mark's owner, so the name must already be a person here.
+        ``ValueError`` names the ``username`` field for the API's 400."""
+        row = conn.execute(
+            "SELECT deactivated_at FROM users WHERE username = ?",
+            (username,)).fetchone()
+        if row is None:
+            raise ValueError(
+                "username: {0} is not a known user; only a known, "
+                "active user can mark a test as flaky or change or "
+                "remove a mark".format(username))
+        if row[0] is not None:
+            raise ValueError(
+                "username: {0} has been deactivated and cannot mark a "
+                "test as flaky or change or remove a mark".format(username))
+
+    def mark_flaky(
+        self,
+        tests: Sequence[Tuple[str, str, str, Optional[int]]],
+        cadence: int,
+        reason: Optional[str],
+        marked_by: str,
+        when: datetime.datetime,
+    ) -> FlakyMarkResult:
+        """Mark EXACTLY the given tests as flaky at *cadence*, or move an
+        existing mark to it — one transaction.
+
+        *tests* is ``(environment, script, test_name, stream_id)``. The
+        mark is the TRIPLE's (it covers every stream); *stream_id* is
+        only the stream the person was looking at, and tags the reason's
+        comment (decision 10). A triple named twice is acted on once,
+        tagged with its first entry's stream. A test with no
+        ``latest_runs`` row on any stream is ``unknown`` and skipped.
+
+        *cadence* is 2..10 (``ValueError`` otherwise; the API refuses
+        first). A test with no mark is MARKED: *reason* is required
+        (``ValueError`` naming how many lacked one, nothing written) and
+        *marked_by* owns it. A test marked at another cadence is
+        CHANGED: the cadence moves, the owner does not, and *reason*,
+        when given, replaces the old one. A test already marked at this
+        cadence is UNCHANGED: nothing is written for it.
+
+        *marked_by* must be a known, active user and is the only owner
+        a mark can have (decision 12). Each act is a
+        ``flaky_mark_history`` row (``mark`` or ``cadence``), and a given
+        *reason* is posted as a comment on each test acted on, tagged
+        with its stream (``None`` for mainline, the assignment
+        convention). Drops every memo, like the mute and assignment
+        acts; nothing on the push path changes.
+        """
+        if (not isinstance(cadence, int) or isinstance(cadence, bool)
+                or cadence < FLAKY_CADENCE_MIN
+                or cadence > FLAKY_CADENCE_MAX):
+            raise ValueError(
+                "cadence: must be a whole number from {0} to {1}, got "
+                "{2!r}".format(FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX,
+                               cadence))
+        origins = {}  # type: Dict[Tuple[str, str, str], Optional[int]]
+        order = []  # type: List[Tuple[str, str, str]]
+        for env, scr, test, sid in tests:
+            triple = (env, scr, test)
+            if triple not in origins:
+                origins[triple] = (
+                    None if sid is None or int(sid) == MAINLINE_STREAM_ID
+                    else int(sid))
+                order.append(triple)
+        if not order:
+            return FlakyMarkResult(marked=0, changed=0, unchanged=0,
+                                   unknown=0)
+        has_reason = bool(reason and reason.strip())
+        when_iso = model.format_iso(when)
+
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_active_user(conn, marked_by)
+            # Found triple -> its current cadence (None: not marked).
+            current = {}  # type: Dict[Tuple[str, str, str], Optional[int]]
+            for start in range(0, len(order), _RECENT_CHUNK):
+                chunk = order[start:start + _RECENT_CHUNK]
+                clause = " OR ".join(
+                    "(lr.environment = ? AND lr.script = ? "
+                    "AND lr.test_name = ?)" for _ in chunk)
+                params = []  # type: List[Any]
+                for triple in chunk:
+                    params.extend(triple)
+                # Driven from latest_runs (the LEFT JOIN pins it), each
+                # triple an idx_latest_runs_triple range, the mark by its
+                # primary key.
+                rows = conn.execute(
+                    "SELECT DISTINCT lr.environment, lr.script, "
+                    "lr.test_name, fm.cadence FROM latest_runs AS lr "
+                    "LEFT JOIN test_flaky_marks AS fm "
+                    "  ON fm.environment = lr.environment "
+                    " AND fm.script = lr.script "
+                    " AND fm.test_name = lr.test_name "
+                    "WHERE " + clause,
+                    tuple(params)).fetchall()
+                for row in rows:
+                    current[(row[0], row[1], row[2])] = (
+                        None if row[3] is None else int(row[3]))
+            fresh = [t for t in order if t in current and current[t] is None]
+            changed = [t for t in order
+                       if t in current and current[t] is not None
+                       and current[t] != cadence]
+            unchanged = len([t for t in order if current.get(t) == cadence])
+            if fresh and not has_reason:
+                raise ValueError(
+                    "reason is required: {0} of these tests {1} not yet "
+                    "marked as flaky".format(
+                        len(fresh), "is" if len(fresh) == 1 else "are"))
+            if fresh:
+                conn.executemany(
+                    "INSERT INTO test_flaky_marks (environment, script, "
+                    "test_name, cadence, reason, marked_by, marked_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(env, scr, test, cadence, reason, marked_by, when_iso)
+                     for (env, scr, test) in fresh])
+            if changed and has_reason:
+                conn.executemany(
+                    "UPDATE test_flaky_marks SET cadence = ?, reason = ? "
+                    "WHERE environment = ? AND script = ? "
+                    "AND test_name = ?",
+                    [(cadence, reason, env, scr, test)
+                     for (env, scr, test) in changed])
+            elif changed:
+                conn.executemany(
+                    "UPDATE test_flaky_marks SET cadence = ? "
+                    "WHERE environment = ? AND script = ? "
+                    "AND test_name = ?",
+                    [(cadence, env, scr, test)
+                     for (env, scr, test) in changed])
+            acted = fresh + changed
+            if acted:
+                logged_reason = reason if has_reason else None
+                conn.executemany(
+                    "INSERT INTO flaky_mark_history (environment, "
+                    "script, test_name, action, cadence, reason, actor, "
+                    "acted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(env, scr, test, "mark", cadence, logged_reason,
+                      marked_by, when_iso) for (env, scr, test) in fresh]
+                    + [(env, scr, test, "cadence", cadence, logged_reason,
+                        marked_by, when_iso)
+                       for (env, scr, test) in changed])
+            if acted and has_reason:
+                conn.executemany(
+                    "INSERT INTO comments (environment, script, "
+                    "test_name, author, created_at, text, stream_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(env, scr, test, marked_by, when_iso, reason,
+                      origins[(env, scr, test)])
+                     for (env, scr, test) in acted])
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if fresh or changed:
+            self._invalidate_summary_cache()
+        return FlakyMarkResult(
+            marked=len(fresh), changed=len(changed), unchanged=unchanged,
+            unknown=len(order) - len(current))
+
+    def unmark_flaky(
+        self,
+        tests: Sequence[Tuple[str, str, str]],
+        unmarked_by: str,
+        when: datetime.datetime,
+    ) -> int:
+        """Remove the flaky mark of each given test that has one; return
+        how many went. Anyone known and active may (decision 12's
+        "anyone, recorded"): each removal is an ``unmark`` row of
+        ``flaky_mark_history`` carrying the cadence it removed. Drops
+        every memo when anything went."""
+        order = []  # type: List[Tuple[str, str, str]]
+        seen = set()  # type: Set[Tuple[str, str, str]]
+        for env, scr, test in tests:
+            triple = (env, scr, test)
+            if triple not in seen:
+                seen.add(triple)
+                order.append(triple)
+        if not order:
+            return 0
+        when_iso = model.format_iso(when)
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_active_user(conn, unmarked_by)
+            existing = []  # type: List[Tuple[str, str, str, int]]
+            for start in range(0, len(order), _RECENT_CHUNK):
+                chunk = order[start:start + _RECENT_CHUNK]
+                clause = " OR ".join(
+                    "(environment = ? AND script = ? AND test_name = ?)"
+                    for _ in chunk)
+                params = []  # type: List[Any]
+                for triple in chunk:
+                    params.extend(triple)
+                existing.extend(
+                    (row[0], row[1], row[2], int(row[3]))
+                    for row in conn.execute(
+                        "SELECT environment, script, test_name, cadence "
+                        "FROM test_flaky_marks WHERE " + clause,
+                        tuple(params)).fetchall())
+            if existing:
+                conn.executemany(
+                    "DELETE FROM test_flaky_marks WHERE environment = ? "
+                    "AND script = ? AND test_name = ?",
+                    [(env, scr, test) for (env, scr, test, _c) in existing])
+                conn.executemany(
+                    "INSERT INTO flaky_mark_history (environment, "
+                    "script, test_name, action, cadence, reason, actor, "
+                    "acted_at) VALUES (?, ?, ?, 'unmark', ?, NULL, ?, ?)",
+                    [(env, scr, test, cad, unmarked_by, when_iso)
+                     for (env, scr, test, cad) in existing])
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if existing:
+            self._invalidate_summary_cache()
+        return len(existing)
+
+    def test_acts(
+        self, environment: str, script: str, test_name: str,
+    ) -> TestActs:
+        """The test page's mute history, flaky mark and flaky history, in
+        the ONE statement the page already ran for its mute history
+        (WP-40): the mark is a primary-key read and its history an
+        ``idx_flaky_mark_history_triple`` range, carried as two
+        ``UNION ALL`` members, so a test with no mark costs no statement
+        more than it did before the mark existed (and nothing is
+        consulted to know there is none). Every list newest first."""
+        triple = (environment, script, test_name)
+        rows = self._conn().execute(
+            "SELECT 0 AS kind, id, stream_id, action, reason, expires_at, "
+            "NULL AS cadence, actor, acted_at FROM mute_history "
+            "WHERE environment = ? AND script = ? AND test_name = ? "
+            "UNION ALL SELECT 1, id, NULL, action, reason, NULL, cadence, "
+            "actor, acted_at FROM flaky_mark_history "
+            "WHERE environment = ? AND script = ? AND test_name = ? "
+            "UNION ALL SELECT 2, NULL, NULL, NULL, reason, NULL, cadence, "
+            "marked_by, marked_at FROM test_flaky_marks "
+            "WHERE environment = ? AND script = ? AND test_name = ?",
+            triple + triple + triple).fetchall()
+        mutes = []  # type: List[MuteAct]
+        acts = []  # type: List[FlakyMarkAct]
+        mark = None  # type: Optional[FlakyMark]
+        for row in rows:
+            kind = int(row[0])
+            if kind == 0:
+                mutes.append(MuteAct(
+                    id=int(row[1]), stream_id=int(row[2]),
+                    environment=environment, script=script,
+                    test_name=test_name, action=row[3], reason=row[4],
+                    expires_at=(None if row[5] is None
+                                else model.parse_iso(row[5])),
+                    actor=row[7], acted_at=model.parse_iso(row[8])))
+            elif kind == 1:
+                acts.append(FlakyMarkAct(
+                    id=int(row[1]), environment=environment, script=script,
+                    test_name=test_name, action=row[3],
+                    cadence=None if row[6] is None else int(row[6]),
+                    reason=row[4], actor=row[7],
+                    acted_at=model.parse_iso(row[8])))
+            else:
+                mark = FlakyMark(
+                    environment=environment, script=script,
+                    test_name=test_name, cadence=int(row[6]),
+                    reason=row[4], marked_by=row[7],
+                    marked_at=model.parse_iso(row[8]))
+        mutes.sort(key=lambda act: act.id, reverse=True)
+        acts.sort(key=lambda act: act.id, reverse=True)
+        return TestActs(mute_history=mutes, flaky_mark=mark,
+                        flaky_history=acts)
+
+    def cadence_runs(
+        self,
+        stream_id: int,
+        tests: Sequence[Tuple[str, str, str, datetime.datetime, int]],
+        floor: Optional[datetime.datetime] = None,
+    ) -> Dict[Tuple[str, str, str], List[Result]]:
+        """Q2 (WP-44, design §2 B.3(a)): the newest results of many tests
+        on ONE stream, newest first, for :func:`analytics.flaky_state`.
+
+        *tests* is ``(environment, script, test_name, latest_start,
+        limit)``: at most *limit* runs of the triple on *stream_id*, none
+        later than *latest_start* (the start ``latest_runs`` holds, so a
+        run pushed since the caller read it cannot move the window). A
+        triple named twice is read once, as first named. *floor*, the
+        stream's first run (``streams.first_seen``), is for BUILD streams
+        only: it stops a build's read of a test it ran fewer than *limit*
+        times from walking back through mainline's year of the same
+        triple; mainline passes None (its ``first_seen`` predates its
+        migrated history, design §3a).
+
+        One statement per :data:`_RECENT_CHUNK` (100) tests: each test a
+        member of a ``UNION ALL``, each member a range of the runs
+        UNIQUE (triple, start_time) index read backwards from
+        *latest_start*, so the cost is bounded by the tests times their
+        limits (and on a build by the floor), never by the estate. The
+        members are spelled by the backend (``limited_union_member``):
+        SQLite allows ``ORDER BY``/``LIMIT`` in a member only inside a
+        subquery; MariaDB reads a parenthesised member 1.5 to 2 ms
+        cheaper for the same rows (design §3c). A tests list of one is
+        a plain statement on both. Every requested triple is in the
+        answer, empty when it has no run there.
+        """
+        order = []  # type: List[Tuple[str, str, str, str, int]]
+        out = {}  # type: Dict[Tuple[str, str, str], List[Result]]
+        for env, scr, test, latest, limit in tests:
+            triple = (env, scr, test)
+            if triple in out:
+                continue
+            if not isinstance(limit, int) or limit < 1:
+                raise ValueError(
+                    "limit must be a positive whole number, got "
+                    "{0!r}".format(limit))
+            out[triple] = []
+            order.append((env, scr, test, model.format_iso(latest), limit))
+        if not order:
+            return out
+        member = (
+            "SELECT environment, script, test_name, start_time, result "
+            "FROM runs WHERE environment = ? AND script = ? "
+            "AND test_name = ? AND stream_id = ? AND start_time <= ?"
+            + ("" if floor is None else " AND start_time >= ?")
+            + " ORDER BY start_time DESC LIMIT ?")
+        floor_iso = None if floor is None else model.format_iso(floor)
+        spelling = self._backend.limited_union_member
+        conn = self._conn()
+        found = {}  # type: Dict[Tuple[str, str, str], List[Tuple[str, str]]]
+        for start in range(0, len(order), _RECENT_CHUNK):
+            chunk = order[start:start + _RECENT_CHUNK]
+            params = []  # type: List[Any]
+            for env, scr, test, latest_iso, limit in chunk:
+                params.extend([env, scr, test, stream_id, latest_iso])
+                if floor_iso is not None:
+                    params.append(floor_iso)
+                params.append(limit)
+            if len(chunk) == 1:
+                sql = member
+            else:
+                sql = " UNION ALL ".join(
+                    spelling.format(member, index)
+                    for index in range(len(chunk)))
+            for row in conn.execute(sql, tuple(params)).fetchall():
+                found.setdefault((row[0], row[1], row[2]), []).append(
+                    (str(row[3]), str(row[4])))
+        for triple, runs in found.items():
+            # A UNION ALL promises no order across or within members.
+            runs.sort(reverse=True)
+            out[triple] = [Result(result) for _start, result in runs]
+        return out
 
     def set_assignee(
         self,

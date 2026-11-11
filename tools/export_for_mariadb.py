@@ -54,6 +54,8 @@ TABLE_ORDER = (
     "test_retirements",
     "test_mutes",
     "mute_history",
+    "test_flaky_marks",
+    "flaky_mark_history",
     "environment_expectations",
     "environment_products",
     "activity_hours",
@@ -262,6 +264,30 @@ CREATE TABLE mute_history (
   PRIMARY KEY (id)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
+CREATE TABLE test_flaky_marks (
+  environment {env} NOT NULL,
+  script      {script} NOT NULL,
+  test_name   {name} NOT NULL,
+  cadence     INT NOT NULL,
+  reason      TEXT NOT NULL,
+  marked_by   {user} NOT NULL,
+  marked_at   {stamp} NOT NULL,
+  PRIMARY KEY (environment, script, test_name)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE flaky_mark_history (
+  id          BIGINT NOT NULL AUTO_INCREMENT,
+  environment {env} NOT NULL,
+  script      {script} NOT NULL,
+  test_name   {name} NOT NULL,
+  action      VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  cadence     INT NULL,
+  reason      TEXT NULL,
+  actor       {user} NOT NULL,
+  acted_at    {stamp} NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
 CREATE TABLE environment_expectations (
   environment    {env} NOT NULL,
   expected_tests INT NOT NULL,
@@ -332,6 +358,8 @@ CREATE INDEX idx_test_mutes_expiry
   ON test_mutes (expires_at);
 CREATE INDEX idx_mute_history_triple
   ON mute_history (environment, script, test_name, id);
+CREATE INDEX idx_flaky_mark_history_triple
+  ON flaky_mark_history (environment, script, test_name, id);
 """
 
 

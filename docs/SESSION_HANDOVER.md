@@ -97,7 +97,7 @@ design decision taken on the owner's behalf and recorded.
 | `admin-2026-10-09-handover` | PR #17, a handover rewrite superseded twice; **close without merging** |
 | `wp43-backend-wt`, `wp43-seed-wt`, `wp43-ui-wt` | the agents' snapshot branches, each with a worktree under `.claude/worktrees/`; remove the worktrees, then the branches, after the merge |
 | `wp-30-java-feeder` | Java micro client + CI, PR #9 **open**, green, untouched since 2026-09-08 |
-| `wp-14-in-run-progress` | parked WIP; its migration renumbers to **12** before merging (registry §1) and needs a MariaDB ledger step |
+| `wp-14-in-run-progress` | parked WIP; its migration renumbers to **13** before merging (registry §1) and needs a MariaDB ledger step |
 | `wp-32-timeline-follow`, `wp-31-own-results-always`, `tooling-2026-08-10`, `streams-upgrade`, `wp-2x-*`, `docs-tidy-*`, `wp-17`…`wp-25`, `drop-2026-07-30`, `main` | merged or dead; prune when convenient. Sibling worktrees (`TestDashboard-*-wt`) hold some of them — remove the worktree before the branch |
 
 A local `master` exists since 2026-10-03; keep it a mirror of

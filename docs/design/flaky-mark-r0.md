@@ -1334,11 +1334,11 @@ any interruption is the first line not `done` or `parked`.
 | 1 names-only request, backend | done | the commit carrying this line | `products` carries names only (the design's shape; the counted list is the headline's pass); fresh eyes found nothing to send back; 2p is its measured pass |
 | 2 names-only request, UI | done | the commit carrying this line | one fresh-eyes finding fixed before the commit (a load-more hid a catalogue that had failed to load); no browser has rendered it |
 | 2p measured pass | done | | the page 38 ms less on perf-seed/1 and 78 ms less on the 90-night seed (SQLite), 9.5 to 36.7 ms less on a local MariaDB 12.3; Known slow rows the same. For the owner: Open Actions no longer warms Home's headline memo, so Home opened straight after it pays its own cold headline |
-| 3 the mark, backend | in flight | | |
-| 3p measured pass | not started | | |
-| 4 marks fixture | not started | | |
-| 5 controls, UI | not started | | |
-| 6 state and counts, backend | not started | | |
+| 3 the mark, backend | done | the commit carrying this line | fresh eyes found no defect; a blank reason on a cadence change and a helper with no caller fixed before the commit; the three carriers of the "any mark" bit left to item 6 |
+| 3p measured pass | done | | Known slow rows the same with the tables empty; the detail of a marked test +0.07 to +0.27 ms on SQLite, +0.41 to +0.84 on a local MariaDB 12.3; the push path runs the same statements. Carried into item 6: unmark and cadence change send a statement per test on MariaDB. Recorded, outside the package: every bulk endpoint resolves each entry's stream with two statements |
+| 4 marks fixture | in flight | | |
+| 5 controls, UI | in flight | | |
+| 6 state and counts, backend | in flight | | |
 | 6p measured pass | not started | | |
 | 6h dialect hook | only if a plan guard fails on CI's 10.3 legs | | |
 | 7 state on Home and rows, UI | not started | | |

@@ -4900,3 +4900,29 @@ rows request. The six Known slow rows are the same. Recorded for the owner:
 Open Actions no longer warms Home's headline memo as a side effect, so Home
 opened straight after it pays its own cold headline (84.6 ms against 3.6 on
 that one journey, perf-seed/1, SQLite; Home on its own is unchanged).
+
+## WP-44 items 3 and 3p: the flaky mark, backend, measured (2026-11-11)
+
+Item 3 is committed: migration 12 (create-only: `test_flaky_marks`,
+`flaky_mark_history`; the registry row moves the parked WP-15 to 13), the
+ledger step, `POST /api/flaky/bulk` and `/unmark` with history and the
+reason as a tagged comment, the cadence rule as one pure function
+(`analytics.flaky_state`), the bounded runs read (`Storage.cadence_runs`)
+and `flaky` with `flaky_history` on the test detail. The detail's mark and
+history ride its existing mute-history statement, so it runs the same number
+of statements marked or not. The three carriers of the "any mark" bit are
+left to item 6, where their first consumer is. Fresh eyes found no defect;
+a blank reason on a cadence change (it was refused) and a helper with no
+caller were fixed before the commit.
+
+The measured pass (3p; cold, in-process, alternated, base `152820e`): the
+six Known slow rows the same on both seeds with the tables empty; the
+detail of an unmarked test the same on SQLite (0.81 to 0.79 ms on
+perf-seed/1) and +0.21 ms on a local MariaDB 12.3; the detail of a marked
+test +0.07 to +0.27 ms on SQLite and +0.41 to +0.84 on MariaDB; an import
+of 1,000 runs runs the same 7,169 statements; the upgrade step creates two
+tables and an index in 0.55 s. Two findings off every first paint: the
+unmark and the cadence change send a statement per test on MariaDB (carried
+into item 6), and every bulk endpoint, the existing ones included, resolves
+each entry's stream with two statements, +110 ms per 100 entries on MariaDB
+(predates the package; a candidate of its own).

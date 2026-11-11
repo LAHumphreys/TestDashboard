@@ -651,8 +651,13 @@ class TestDetail(ApiCase):
                 "stream_identity",
                 "mute",
                 "mute_history",
+                # WP-44: the flaky mark and its history.
+                "flaky",
+                "flaky_history",
             },
         )
+        self.assertIsNone(data["flaky"])
+        self.assertEqual(data["flaky_history"], [])
         self.assertEqual(data["environment"], self.ENV)
         self.assertEqual(data["script"], self.SCRIPT)
         self.assertEqual(data["test_name"], self.NAME)
@@ -7647,3 +7652,426 @@ class NamesPartTest(ApiCase):
                 flat = " ".join(statement.split()).upper()
                 self.assertNotIn(" RUNS ", flat + " ")
                 self.assertNotIn("PREV_RESULT", flat)
+
+
+class FlakyApiTest(ApiCase):
+    """WP-44: the flaky mark over HTTP — ``POST /api/flaky/bulk``,
+    ``POST /api/flaky/unmark``, their shapes and 400s, and the test
+    detail's ``flaky`` and ``flaky_history``.
+
+    TestSummary's estate: test_still_fail ran PASS on the 23rd, then
+    FAIL on the 24th, 25th and 26th; test_new_fail PASS then FAIL;
+    test_fixed FAIL then PASS. A build ran test_still_fail once, a
+    FAIL, on the 26th.
+    """
+
+    seed = TestSummary.seed
+
+    STILL = ("linux-sim", "suite/alpha.py", "test_still_fail")
+    NEW = ("linux-sim", "suite/alpha.py", "test_new_fail")
+    FIXED = ("linux-sim", "suite/alpha.py", "test_fixed")
+    FLAKY_KEYS = {"cadence", "marked_by", "marked_at", "reason", "state",
+                  "streak", "runs"}
+    HISTORY_KEYS = {"id", "action", "cadence", "reason", "actor",
+                    "acted_at"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.seed()
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T05:00:03.000000"),
+        ])
+        self.build = self.storage.list_streams("")[0].stream_id
+        created = datetime.datetime(2026, 7, 1)
+        for name in ("alice", "bob", "carol"):
+            self.storage.ensure_user(name, created)
+        self.storage.set_user_active("carol", False, "bob", created)
+
+    @staticmethod
+    def entry(key: Any, **extra: Any) -> Dict[str, Any]:
+        item = {
+            "environment": key[0], "script": key[1], "test_name": key[2],
+        }  # type: Dict[str, Any]
+        item.update(extra)
+        return item
+
+    def mark(self, keys: List[Any], expect: int = 200,
+             **overrides: Any) -> Dict[str, Any]:
+        body = {
+            "username": "alice", "reason": "race in teardown",
+            "cadence": 3, "tests": [self.entry(k) for k in keys],
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return self.call("POST", "/api/flaky/bulk", body=body,
+                         expect=expect)
+
+    def unmark(self, keys: List[Any], expect: int = 200,
+               **overrides: Any) -> Dict[str, Any]:
+        body = {
+            "username": "bob", "tests": [self.entry(k) for k in keys],
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return self.call("POST", "/api/flaky/unmark", body=body,
+                         expect=expect)
+
+    def detail(self, key: Any, stream: Optional[int] = None
+               ) -> Dict[str, Any]:
+        query = {} if stream is None else {"stream": [str(stream)]}
+        return self.call("GET", test_path(*key), query=query)
+
+    # -- the shapes ---------------------------------------------------
+
+    def test_the_acts_answer_in_their_shapes(self) -> None:
+        self.assertEqual(
+            self.mark([self.STILL, self.NEW,
+                       ("linux-sim", "suite/alpha.py", "nope")]),
+            {"marked": 2, "changed": 0, "unchanged": 0, "unknown": 1})
+        self.assertEqual(
+            self.mark([self.STILL, self.NEW], cadence=5, reason=None,
+                      username="bob"),
+            {"marked": 0, "changed": 2, "unchanged": 0, "unknown": 0})
+        again = {"username": "bob", "cadence": 5,
+                 "tests": [self.entry(self.STILL)]}
+        self.assertEqual(
+            self.call("POST", "/api/flaky/bulk", body=again),
+            {"marked": 0, "changed": 0, "unchanged": 1, "unknown": 0})
+        self.assertEqual(self.unmark([self.STILL, self.FIXED]),
+                         {"unmarked": 1})
+
+    def test_the_detail_carries_the_mark_its_state_and_history(
+        self,
+    ) -> None:
+        data = self.detail(self.STILL)
+        self.assertIsNone(data["flaky"])
+        self.assertEqual(data["flaky_history"], [])
+        self.mark([self.STILL], cadence=4, username="alice")
+        self.mark([self.STILL], cadence=3, reason=None, username="bob")
+        data = self.detail(self.STILL)
+        self.assertEqual(set(data["flaky"]), self.FLAKY_KEYS)
+        # F F F (P): at 3 every one of the newest three failed.
+        self.assertEqual(
+            data["flaky"],
+            {"cadence": 3, "marked_by": "alice",
+             "marked_at": format_iso(NOW), "reason": "race in teardown",
+             "state": "failing", "streak": 3, "runs": 3})
+        history = data["flaky_history"]
+        for act in history:
+            self.assertEqual(set(act), self.HISTORY_KEYS)
+        self.assertEqual(
+            [(a["action"], a["cadence"], a["reason"], a["actor"])
+             for a in history],
+            [("cadence", 3, None, "bob"),
+             ("mark", 4, "race in teardown", "alice")])
+        self.assertGreater(history[0]["id"], history[1]["id"])
+        # The reason is a comment, posted from nowhere in particular.
+        comments = self.call("GET", test_path(*self.STILL, "/comments"))
+        self.assertEqual(
+            [(c["author"], c["text"]) for c in comments["comments"]],
+            [("alice", "race in teardown")])
+
+    def test_the_state_is_the_streams_own(self) -> None:
+        self.mark([self.STILL], cadence=4)
+        self.mark([self.NEW, self.FIXED], cadence=2)
+        # Mainline F F F P at 4: flaking, three in a row.
+        self.assertEqual(
+            {k: self.detail(self.STILL)["flaky"][k]
+             for k in ("state", "streak", "runs")},
+            {"state": "flaking", "streak": 3, "runs": None})
+        # The build ran it once, a FAIL: fewer runs than the cadence,
+        # every one failed, so over it there (verdict 8).
+        on_build = self.detail(self.STILL, stream=self.build)["flaky"]
+        self.assertEqual(
+            (on_build["state"], on_build["streak"], on_build["runs"]),
+            ("failing", 1, 1))
+        self.assertEqual(on_build["cadence"], 4)
+        new = self.detail(self.NEW)["flaky"]
+        self.assertEqual((new["state"], new["streak"], new["runs"]),
+                         ("flaking", 1, None))
+        fixed = self.detail(self.FIXED)["flaky"]
+        self.assertEqual((fixed["state"], fixed["streak"], fixed["runs"]),
+                         ("passing", 0, None))
+
+    def test_a_mark_made_from_a_build_tags_its_comment(self) -> None:
+        self.mark([self.STILL], tests=[
+            self.entry(self.STILL, stream_id=self.build)])
+        comments = self.call("GET", test_path(*self.STILL, "/comments"))
+        self.assertEqual(
+            [c["stream_id"] for c in comments["comments"]], [self.build])
+
+    # -- the 400s -----------------------------------------------------
+
+    def test_bulk_refuses_a_bad_body(self) -> None:
+        cases = [
+            ({"username": None}, "username"),
+            ({"username": ""}, "username"),
+            ({"cadence": None}, "cadence"),
+            ({"cadence": 1}, "cadence"),
+            ({"cadence": 11}, "cadence"),
+            ({"cadence": "3"}, "cadence"),
+            ({"cadence": True}, "cadence"),
+            ({"cadence": 2.5}, "cadence"),
+            ({"reason": ""}, "reason"),
+            ({"reason": 7}, "reason"),
+            ({"reason": "x" * 10001}, "reason"),
+            ({"tests": []}, "tests"),
+            ({"tests": "all"}, "tests"),
+            ({"tests": [{"environment": "linux-sim"}]}, "tests[0]"),
+            ({"marked_by": "bob"}, "marked_by"),
+            ({"assignee": "bob"}, "assignee"),
+            ({"username": "nobody"}, "username"),
+            ({"username": "carol"}, "username"),
+        ]
+        for overrides, field in cases:
+            body = {
+                "username": "alice", "reason": "why", "cadence": 3,
+                "tests": [self.entry(self.STILL)],
+            }  # type: Dict[str, Any]
+            body.update(overrides)
+            if body["username"] is None:
+                del body["username"]
+            if body["cadence"] is None:
+                del body["cadence"]
+            error = self.call("POST", "/api/flaky/bulk", body=body,
+                              expect=400)["error"]
+            self.assertTrue(error.startswith(field), (overrides, error))
+        missing = {"username": "alice", "cadence": 3, "reason": "why"}
+        self.assertTrue(self.call(
+            "POST", "/api/flaky/bulk", body=missing,
+            expect=400)["error"].startswith("tests"))
+        self.call("POST", "/api/flaky/bulk", body=b"{not json",
+                  expect=400)
+        # Nothing was written by any of them.
+        self.assertIsNone(self.detail(self.STILL)["flaky"])
+
+    def test_a_fresh_mark_without_a_reason_is_a_400_naming_it(self) -> None:
+        self.mark([self.STILL])
+        error = self.mark([self.STILL, self.NEW], cadence=5, reason=None,
+                          expect=400)["error"]
+        self.assertTrue(error.startswith("reason: is required"), error)
+        self.assertIn("1 of these tests is not yet marked", error)
+        self.assertEqual(self.detail(self.STILL)["flaky"]["cadence"], 3)
+        self.assertIsNone(self.detail(self.NEW)["flaky"])
+
+    def _comment_count(self, key: Any) -> int:
+        return len(self.call(
+            "GET", test_path(*key, "/comments"))["comments"])
+
+    def test_a_pure_cadence_change_takes_any_blank_reason(self) -> None:
+        """The UI sends the note box as it stands: absent, null, empty
+        and whitespace-only are all "no reason", which a cadence change
+        may have. No comment, and the history records a null reason."""
+        self.mark([self.STILL, self.NEW], cadence=3)
+        comments = self._comment_count(self.STILL)
+        blanks = [{"reason": None}, {"reason": ""}, {"reason": "   "},
+                  {"reason": "\n\t"}, {}]
+        for cadence, blank in zip(range(4, 9), blanks):
+            body = {
+                "username": "bob", "cadence": cadence,
+                "tests": [self.entry(self.STILL), self.entry(self.NEW)],
+            }  # type: Dict[str, Any]
+            body.update(blank)
+            self.assertEqual(
+                self.call("POST", "/api/flaky/bulk", body=body),
+                {"marked": 0, "changed": 2, "unchanged": 0, "unknown": 0},
+                blank)
+            data = self.detail(self.STILL)
+            self.assertEqual(data["flaky"]["cadence"], cadence)
+            self.assertEqual(data["flaky"]["reason"], "race in teardown")
+            self.assertEqual(data["flaky"]["marked_by"], "alice")
+            latest = data["flaky_history"][0]
+            self.assertEqual(
+                (latest["action"], latest["cadence"], latest["reason"],
+                 latest["actor"]), ("cadence", cadence, None, "bob"), blank)
+        self.assertEqual(self._comment_count(self.STILL), comments)
+        # A real reason on a cadence change is posted and recorded.
+        self.mark([self.STILL], cadence=2, reason="worse", username="bob")
+        data = self.detail(self.STILL)
+        self.assertEqual(data["flaky_history"][0]["reason"], "worse")
+        self.assertEqual(data["flaky"]["reason"], "worse")
+        self.assertEqual(self._comment_count(self.STILL), comments + 1)
+
+    def test_a_mixed_request_with_a_blank_reason_writes_nothing(
+        self,
+    ) -> None:
+        """One test marked, one not, and a blank reason: a 400 naming
+        the reason for the whole request, all or nothing. The marked
+        test's cadence does not move either."""
+        self.mark([self.STILL], cadence=3)
+        history = len(self.detail(self.STILL)["flaky_history"])
+        comments = self._comment_count(self.STILL)
+        for blank in ({"reason": None}, {"reason": ""}, {"reason": "  "},
+                      {}):
+            body = {
+                "username": "bob", "cadence": 6,
+                "tests": [self.entry(self.STILL), self.entry(self.NEW)],
+            }  # type: Dict[str, Any]
+            body.update(blank)
+            error = self.call("POST", "/api/flaky/bulk", body=body,
+                              expect=400)["error"]
+            self.assertTrue(error.startswith("reason: is required"), error)
+            self.assertIn("1 of these tests is not yet marked", error)
+        still = self.detail(self.STILL)
+        self.assertEqual(still["flaky"]["cadence"], 3)
+        self.assertEqual(len(still["flaky_history"]), history)
+        self.assertEqual(self._comment_count(self.STILL), comments)
+        self.assertIsNone(self.detail(self.NEW)["flaky"])
+
+    def test_an_unknown_stream_is_a_404(self) -> None:
+        self.mark([self.STILL], expect=404,
+                  tests=[self.entry(self.STILL, stream_id=999)])
+
+    def test_unmark_refuses_a_bad_body(self) -> None:
+        self.mark([self.STILL])
+        for overrides, field in (({"username": ""}, "username"),
+                                 ({"username": "nobody"}, "username"),
+                                 ({"username": "carol"}, "username"),
+                                 ({"tests": []}, "tests"),
+                                 ({"tests": None}, "tests")):
+            error = self.unmark([self.STILL], expect=400,
+                                **overrides)["error"]
+            self.assertTrue(error.startswith(field), (overrides, error))
+        self.call("POST", "/api/flaky/unmark",
+                  body={"username": "bob"}, expect=400)
+        self.assertEqual(self.detail(self.STILL)["flaky"]["cadence"], 3)
+
+    def test_only_post_is_allowed(self) -> None:
+        self.assert_405("GET", "/api/flaky/bulk", "POST")
+        self.assert_405("GET", "/api/flaky/unmark", "POST")
+
+
+class NoMarksAddsNothingTest(ApiCase):
+    """WP-44, first form: with the flaky tables present and EMPTY, the
+    cold statements of every read the mark will later touch are the
+    base's, and none of them reads the mark's tables, bar the test
+    detail's one read of its acts.
+
+    The counts were measured on this fixture at the base commit
+    (152820e, item 1), cold, by the same trace, and the base's
+    statement lists compared with these byte for byte: identical for
+    every read except the detail, whose mute-history statement became
+    :meth:`Storage.test_acts`, the same read with the mark and its
+    history as two ``UNION ALL`` members (nothing else changed and
+    nothing was added). Later items widen this (design §2 B.7).
+    """
+
+    #: Cold SELECTs per read at the base commit, on this fixture.
+    BASE_COLD_SELECTS = {
+        "headline": 22, "full": 29, "browse": 3, "open_actions": 13,
+        "watch": 12, "detail": 5, "detail_build": 9,
+        "queue_new_failures": 9, "queue_still_failing": 9,
+        "queue_muted": 9, "queue_fixed": 8, "queue_unexpected_passes": 8,
+        "queue_not_run": 8, "queue_assigned": 8,
+    }
+    DETAIL = "/api/tests/linux-sim/suite%2Falpha.py/test_still_fail"
+
+    def setUp(self) -> None:
+        super().setUp()
+        TestSummary.seed(self)  # type: ignore
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T06:00:00.000000"),
+        ])
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_new_fail", "/assignee"),
+                  body={"username": "alice", "assigned_by": "bob"})
+        self.call("POST", "/api/mutes/bulk", body={
+            "username": "bob", "reason": "infra", "hours": 24,
+            "assignee": "carol",
+            "tests": [{"environment": "linux-sim",
+                       "script": "suite/alpha.py",
+                       "test_name": "test_still_fail"}]})
+        self.build = self.storage.list_streams("")[0].stream_id
+
+    def _reads(self) -> List[Any]:
+        reads = [
+            ("headline", "/api/summary", {"parts": ["headline"]}),
+            ("full", "/api/summary", {}),
+            ("browse", "/api/dashboard", {"limit": ["250"]}),
+            ("open_actions", "/api/dashboard",
+             {"open": ["1"], "with_comment": ["1"], "with_streak": ["1"],
+              "limit": ["100"]}),
+            ("watch", "/api/watch", {"c": ["e:linux-sim", "p:Atlas"]}),
+            ("detail", self.DETAIL, {}),
+            ("detail_build", self.DETAIL, {"stream": [str(self.build)]}),
+        ]  # type: List[Any]
+        for kind in QUEUE_KINDS:
+            reads.append(("queue_" + kind, "/api/summary",
+                          {"parts": ["queue"], "queue": [kind]}))
+        return reads
+
+    def _cold_selects(self, path: str, query: Dict[str, List[str]]
+                      ) -> List[str]:
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", path, query=query)
+        finally:
+            conn.set_trace_callback(None)
+        return [" ".join(s.split()) for s in seen
+                if s.strip().upper().startswith("SELECT")]
+
+    def test_every_read_costs_what_it_did_and_reads_no_mark(self) -> None:
+        self.assertEqual(sorted(name for name, _p, _q in self._reads()),
+                         sorted(self.BASE_COLD_SELECTS))
+        for name, path, query in self._reads():
+            cold = self._cold_selects(path, query)
+            self.assertEqual(len(cold), self.BASE_COLD_SELECTS[name],
+                             (name, cold))
+            touching = [s for s in cold if "flaky" in s.lower()]
+            if not name.startswith("detail"):
+                self.assertEqual(touching, [], name)
+                continue
+            # The detail: its one acts read, the mute history first and
+            # the mark's two tables only as UNION ALL members of it.
+            self.assertEqual(len(touching), 1, (name, touching))
+            members = touching[0].split(" UNION ALL ")
+            self.assertEqual(len(members), 3, touching)
+            self.assertIn("FROM mute_history WHERE", members[0])
+            self.assertNotIn("flaky", members[0].lower())
+            self.assertIn("FROM flaky_mark_history WHERE", members[1])
+            self.assertIn("FROM test_flaky_marks WHERE", members[2])
+            self.assertEqual(cold[-1], touching[0], name)
+
+    def test_no_statement_joins_or_counts_the_marks(self) -> None:
+        for name, path, query in self._reads():
+            for statement in self._cold_selects(path, query):
+                upper = statement.upper()
+                self.assertNotIn("JOIN TEST_FLAKY_MARKS", upper, name)
+                self.assertNotIn("JOIN FLAKY_MARK_HISTORY", upper, name)
+                if "COUNT(" in upper:
+                    self.assertNotIn("FLAKY", upper, name)
+
+    def test_the_detail_of_a_marked_test_costs_the_same(self) -> None:
+        """The detail's cache guard: a mark adds no statement, whatever
+        its state, while the 90-day window holds N runs or a non-FAIL
+        among them; only a window shorter than N, every run a FAIL,
+        reads one Q2 (here the build's single FAIL at cadence 3)."""
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+        base = self.BASE_COLD_SELECTS["detail"]
+        for cadence, state in ((3, "failing"), (4, "flaking")):
+            self.call("POST", "/api/flaky/bulk", body={
+                "username": "dev1", "reason": "why", "cadence": cadence,
+                "tests": [{"environment": "linux-sim",
+                           "script": "suite/alpha.py",
+                           "test_name": "test_still_fail"}]})
+            self.assertEqual(
+                self.call("GET", self.DETAIL)["flaky"]["state"], state)
+            self.assertEqual(len(self._cold_selects(self.DETAIL, {})),
+                             base)
+        build = {"stream": [str(self.build)]}
+        cold = self._cold_selects(self.DETAIL, build)
+        self.assertEqual(len(cold),
+                         self.BASE_COLD_SELECTS["detail_build"] + 1, cold)
+        self.assertIn("FROM runs", cold[-1])
+        self.assertIn("ORDER BY start_time DESC LIMIT 4", cold[-1])
+        self.assertEqual(
+            self.call("GET", self.DETAIL, query=build)["flaky"]["state"],
+            "failing")

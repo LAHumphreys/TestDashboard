@@ -336,6 +336,54 @@ def step_10_to_11(sizes: exporter.Sizes) -> List[str]:
     ]
 
 
+def step_11_to_12(sizes: exporter.Sizes) -> List[str]:
+    """test_flaky_marks + flaky_mark_history - migration 12 (WP-44).
+
+    Mirrors storage.py's entry 12: two new tables and one index, no
+    backfill, nothing existing touched, so the server may keep serving
+    through it. Column-for-column identical to ``exporter.ddl()`` (the
+    oracle ``verify`` diffs against), kept literal for the same reason
+    as step_7_to_8. The mark is keyed by the triple alone (no stream:
+    one mark covers every stream); ``reason`` is TEXT; ``action``
+    shares ``result``'s ascii_bin, as mute_history's does.
+    """
+    env = "VARCHAR({0})".format(sizes.environment)
+    script = "VARCHAR({0})".format(sizes.script)
+    name = "VARCHAR({0})".format(sizes.test_name)
+    stamp = "VARCHAR(26) CHARACTER SET ascii COLLATE ascii_bin"
+    return [
+        "CREATE TABLE test_flaky_marks (\n"
+        "  environment {env} NOT NULL,\n"
+        "  script      {script} NOT NULL,\n"
+        "  test_name   {name} NOT NULL,\n"
+        "  cadence     INT NOT NULL,\n"
+        "  reason      TEXT NOT NULL,\n"
+        "  marked_by   VARCHAR(100) NOT NULL,\n"
+        "  marked_at   {stamp} NOT NULL,\n"
+        "  PRIMARY KEY (environment, script, test_name)\n"
+        ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC".format(
+            env=env, script=script, name=name, stamp=stamp),
+
+        "CREATE TABLE flaky_mark_history (\n"
+        "  id          BIGINT NOT NULL AUTO_INCREMENT,\n"
+        "  environment {env} NOT NULL,\n"
+        "  script      {script} NOT NULL,\n"
+        "  test_name   {name} NOT NULL,\n"
+        "  action      VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin "
+        "NOT NULL,\n"
+        "  cadence     INT NULL,\n"
+        "  reason      TEXT NULL,\n"
+        "  actor       VARCHAR(100) NOT NULL,\n"
+        "  acted_at    {stamp} NOT NULL,\n"
+        "  PRIMARY KEY (id)\n"
+        ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC".format(
+            env=env, script=script, name=name, stamp=stamp),
+
+        "CREATE INDEX idx_flaky_mark_history_triple "
+        "ON flaky_mark_history (environment, script, test_name, id)",
+    ]
+
+
 #: Every MariaDB migration since the cutover, in order. One entry per
 #: ``storage.MIGRATIONS`` entry above CUTOVER_VERSION — a gap fails
 #: ``LedgerTest`` and stops the tool at start-up (see ledger_gaps).
@@ -378,6 +426,16 @@ LEDGER = (
                       "test_mutes", None),
                 Probe("mute_history table",
                       "mute_history", None)),
+        alters=(),
+    ),
+    Step(
+        from_version=11, package="WP-44",
+        summary="test_flaky_marks and flaky_mark_history tables",
+        statements=lambda sizes, now_iso: step_11_to_12(sizes),
+        probes=(Probe("test_flaky_marks table",
+                      "test_flaky_marks", None),
+                Probe("flaky_mark_history table",
+                      "flaky_mark_history", None)),
         alters=(),
     ),
 )  # type: Tuple[Step, ...]

@@ -80,10 +80,11 @@ class SeedTest(_SeededCase):
     PINNED = ({
         "activity_hours": 63, "assignments": 0, "comments": 2,
         "current_assignments": 0, "environment_expectations": 0,
-        "environment_products": 7, "latest_runs": 974, "mute_history": 0,
+        "environment_products": 7, "flaky_mark_history": 0,
+        "latest_runs": 974, "mute_history": 0,
         "run_outputs": 2790, "runs": 2790, "schema_version": 1,
-        "script_hours": 182, "streams": 5, "test_mutes": 0,
-        "test_retirements": 0, "users": 4},
+        "script_hours": 182, "streams": 5, "test_flaky_marks": 0,
+        "test_mutes": 0, "test_retirements": 0, "users": 4},
         "0ae17dd0184f6878230e574fd129f5556fc9e979191875778d46530740bd252e")
 
     def test_the_default_recipe_is_pinned(self) -> None:
