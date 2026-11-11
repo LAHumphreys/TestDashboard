@@ -18,6 +18,15 @@ Semantics (repeated in the README):
 - **Failure** means :attr:`~testboard.model.Result.FAIL` only.
   ``FAILED_AS_EXPECTED`` counts as non-failure; ``UNEXPECTED_PASS`` is
   non-failure but tracked separately in the day-of-week profile.
+- **A flaky mark** (WP-44) is a team's standing acceptance that a test
+  fails now and then: with a cadence N it counts as failing only once
+  its N most recent runs on a stream have all failed
+  (:func:`flaky_state`). Under the cadence its failure is *flaking*: a
+  failure still (the pass rate counts it) but set aside from every
+  failing figure here and reported beside them, as a mute is. The
+  computed signal below (:func:`stability_of`, "flips about 1 run in
+  3") is a measurement, not the mark: the word "flaky" on the board
+  means the mark.
 - **Window**: runs with ``start_time >= now - max_days`` days, then the
   newest ``max_runs`` of those. Defaults: ``max_days=90``, ``max_runs=200``.
 - **Failure streak**: consecutive runs, newest backwards, with result FAIL.
@@ -63,7 +72,15 @@ from testboard.model import Result, StoredRun, duration_seconds, format_iso
 from testboard.storage import (
     FLAKY_CADENCE_MAX,
     FLAKY_CADENCE_MIN,
+    FLAKY_FAILING,
+    FLAKY_FLAKING,
+    FLAKY_PASSING,
+    FLAKY_ROLE_FLAKING,
+    FLAKY_ROLE_PROMOTED,
+    FLAKY_ROLE_TOLERATED,
     AssignedCell,
+    FlakyCount,
+    FlakyState,
     RollupCount,
     ScriptHourBucket,
 )
@@ -78,8 +95,13 @@ __all__ = [
     "stability_of",
     "FLAKY_CADENCE_MIN",
     "FLAKY_CADENCE_MAX",
+    "FLAKY_PASSING",
+    "FLAKY_FLAKING",
+    "FLAKY_FAILING",
     "FlakyState",
     "flaky_state",
+    "flaky_went_over",
+    "flaky_fix_counts",
     "AnalyticsSummary",
     "select_window",
     "compute_analytics",
@@ -251,27 +273,6 @@ def stability_of(
     )
 
 
-#: The three states a marked test can be in on a stream.
-FLAKY_PASSING = "passing"
-FLAKY_FLAKING = "flaking"
-FLAKY_FAILING = "failing"
-
-
-class FlakyState(NamedTuple):
-    """A marked test's state on one stream (WP-44, design §2 B.1).
-
-    ``streak`` is the consecutive FAILs ending at the latest run, capped
-    at the cadence. ``runs`` is how many runs the stream has of the
-    test, capped at the cadence, and is given only when ``state`` is
-    ``failing`` (the one place the page reads it: "every run here has
-    failed, 2 of 2"); ``None`` otherwise.
-    """
-
-    state: str
-    streak: int
-    runs: Optional[int]
-
-
 def flaky_state(
     cadence: int, results_newest_first: Sequence[Result],
 ) -> Optional[FlakyState]:
@@ -315,6 +316,41 @@ def flaky_state(
         # The newest N all failed, or fewer than N exist and all failed.
         return FlakyState(state=FLAKY_FAILING, streak=streak, runs=streak)
     return FlakyState(state=FLAKY_FLAKING, streak=streak, runs=None)
+
+
+def flaky_went_over(
+    cadence: int, results_newest_first: Sequence[Result],
+) -> bool:
+    """Did a test marked at *cadence* go over it on its latest run
+    (decision 25, design §2 B.1)? Over now and not over at the run
+    before, which is exactly: the newest N are all FAIL, and run N+1
+    exists and is not a FAIL. With N+1 runs or fewer, every one a FAIL,
+    it was over already (verdict 8): Still failing, not New. A cadence
+    change brings no run, so it can never make a test go over.
+
+    *results_newest_first* must hold the newest N+1 results, or all
+    the stream has when it has fewer.
+    """
+    state = flaky_state(cadence, results_newest_first)
+    return (state is not None and state.state == FLAKY_FAILING
+            and len(results_newest_first) > cadence
+            and results_newest_first[cadence] is not Result.FAIL)
+
+
+def flaky_fix_counts(
+    cadence: int, results_newest_first: Sequence[Result],
+) -> bool:
+    """Is a marked test's pass after a FAIL a real fix (decision 3,
+    design §2 B.1)? Only if it had been over its cadence: runs 2 to N+1
+    of its newest N+1 all FAIL, or all it had. A pass after a tolerated
+    failure is in no Fixed figure, queue or delta.
+
+    *results_newest_first* is the newest N+1 results (the latest one
+    not a FAIL, the one before a FAIL). With nothing read, the pass
+    counts, as it did before the mark existed.
+    """
+    before = list(results_newest_first[1:cadence + 1])
+    return all(result is Result.FAIL for result in before)
 
 
 def _compute_day_of_week(window: List[StoredRun]) -> List[DayStats]:
@@ -522,8 +558,15 @@ class SummaryStatus(NamedTuple):
     state of the estate); ``recent_results`` counts only tests whose
     latest run started within the recency window — the "last night"
     view. ``new_failures``/``still_failing``/``fixed`` come from the
-    latest-vs-previous result pair; ``assigned_open`` counts tests with
-    an assignee whose latest result is FAIL or UNEXPECTED_PASS.
+    latest-vs-previous result pair, with the muted and the flaking
+    failures set aside (WP-40, WP-44): counted once, muted, else
+    flaking, else assigned, else unassigned. A marked test that went
+    over its cadence on its latest run is a New failure, not Still
+    failing (decision 25), and a marked test's pass after a tolerated
+    failure is not ``fixed`` (decision 3). ``assigned_open`` counts
+    tests with an assignee whose latest result is FAIL or
+    UNEXPECTED_PASS, flaking or not: the open-assignment figures do not
+    move for a mark.
     """
 
     total_tests: int
@@ -554,6 +597,20 @@ class SummaryStatus(NamedTuple):
     #: it expires or is unmuted). ``muted_total - muted`` are the muted
     #: tests no longer failing; nothing is subtracted for them.
     muted_total: int
+    #: WP-44: failing tests that are flaking (marked, under their
+    #: cadence, no live mute), EXCLUDED from ``new_failures``/
+    #: ``still_failing`` and reported here beside them, never a silent
+    #: subtraction; still a failure, so ``results[FAIL]`` keeps them.
+    #: The sum of the next two.
+    flaking: int
+    #: The flaking failures whose previous result was not a FAIL (they
+    #: would otherwise be ``new_failures``), and the ones whose previous
+    #: result was (``still_failing``): the "+N flaking" of each tile.
+    flaking_new_failures: int
+    flaking_still_failing: int
+    #: WP-44: every un-retired mark in scope whose test has run on the
+    #: stream, whatever its state: the Flaky tab's badge.
+    flaky_total: int
 
 
 class EnvironmentRollup(NamedTuple):
@@ -572,6 +629,9 @@ class EnvironmentRollup(NamedTuple):
     #: unassigned ones are ``failed - assigned``; ``muted`` is beside
     #: both, never inside either.
     assigned: int
+    #: WP-44: the flaking failures, beside ``failed`` and ``muted`` and
+    #: inside neither (nor inside ``assigned``).
+    flaking: int
 
 
 class ProductRollup(NamedTuple):
@@ -593,11 +653,17 @@ class ProductRollup(NamedTuple):
     #: WP-40 — see SummaryStatus.muted (failing-and-muted only);
     #: ``failing``/``new_failures`` exclude these.
     muted: int
+    #: WP-44 — see SummaryStatus.flaking; ``failing``/``new_failures``
+    #: exclude these. Nothing draws it on Home; it is here because the
+    #: product's failing figure has them taken off, and the board never
+    #: subtracts silently.
+    flaking: int
 
 
 def summarize_by_product(
     counts: Sequence[RollupCount], env_to_product: Dict[str, str],
     muted: Sequence[RollupCount] = (),
+    flaky: Sequence[FlakyCount] = (),
 ) -> List[ProductRollup]:
     """Aggregate rollup cells into one row per DECLARED product.
 
@@ -623,6 +689,14 @@ def summarize_by_product(
     ``new_failures`` and reported as ``muted``, the one rule every
     failing count in the system follows (docs, WP-40 spec); a muted
     test that is passing is subtracted from nothing.
+
+    *flaky* (WP-44) is :attr:`Storage.flaky_view`'s ``counted`` for the
+    same stream, unscoped: the flaking tests leave ``failing`` (and
+    ``new_failures`` when their previous result was not a FAIL) and are
+    reported as ``flaking``; a test that went over its cadence on its
+    latest run is a new failure (decision 25); a pass after a tolerated
+    failure leaves ``fixed`` (decision 3). Counted once: muted, else
+    flaking, the view having left the muted ones out.
     """
     buckets = {}  # type: Dict[str, List[int]]
     for cell in counts:
@@ -631,7 +705,7 @@ def summarize_by_product(
         product = env_to_product.get(cell.environment)
         if product is None:
             continue
-        bucket = buckets.setdefault(product, [0, 0, 0, 0, 0])
+        bucket = buckets.setdefault(product, [0, 0, 0, 0, 0, 0])
         is_fail = cell.result is Result.FAIL
         was_fail = cell.prev_result is Result.FAIL
         if is_fail:
@@ -653,11 +727,25 @@ def summarize_by_product(
         if cell.prev_result is not Result.FAIL:
             bucket[1] -= cell.count
         bucket[4] += cell.count
+    for entry in flaky:
+        product = env_to_product.get(entry.environment)
+        if product is None or product not in buckets:
+            continue
+        bucket = buckets[product]
+        if entry.role == FLAKY_ROLE_FLAKING:
+            bucket[0] -= 1
+            if not entry.prev_fail:
+                bucket[1] -= 1
+            bucket[5] += 1
+        elif entry.role == FLAKY_ROLE_PROMOTED:
+            bucket[1] += 1
+        elif entry.role == FLAKY_ROLE_TOLERATED:
+            bucket[2] -= 1
     return [
         ProductRollup(
             product=product, failing=bucket[0], new_failures=bucket[1],
             fixed=bucket[2], unexpected_passes=bucket[3],
-            muted=bucket[4],
+            muted=bucket[4], flaking=bucket[5],
         )
         for product, bucket in sorted(buckets.items())
     ]
@@ -1020,6 +1108,8 @@ def summarize_rollup(
     counts: Sequence[RollupCount], assigned_open: int = 0,
     muted: Sequence[RollupCount] = (),
     assigned: Sequence[AssignedCell] = (),
+    flaky: Sequence[FlakyCount] = (),
+    flaky_total: int = 0,
 ) -> EstateSummary:
     """Derive the estate headline from grouped counts.
 
@@ -1064,6 +1154,22 @@ def summarize_rollup(
     is a subset of ``failed`` (which excludes the muted ones) and
     ``failed - assigned`` is the unassigned figure. A cell for an
     environment with no rollup row adds nothing.
+
+    *flaky* (WP-44) is :meth:`Storage.flaky_view`'s ``counted`` for the
+    same stream and scope: un-muted, un-retired marked tests, each in
+    one role. A ``flaking`` test leaves ``new_failures`` or
+    ``still_failing`` by its previous result (reported as
+    ``flaking_new_failures``/``flaking_still_failing``, ``flaking``
+    their sum), and leaves its environment's ``failed``,
+    ``new_failures`` and ``assigned``, reported as its ``flaking``; it
+    is still a failure, so ``results[FAIL]`` and ``recent_results``
+    keep it. A ``promoted`` test went over its cadence on its latest
+    run: a New failure that night, so it moves from ``still_failing``
+    to ``new_failures`` (decision 25). A ``tolerated`` one passed after
+    a tolerated failure and leaves ``fixed`` (decision 3). Counted once:
+    muted, else flaking, else assigned, else unassigned. *flaky_total*
+    (every un-retired mark in scope with a run on the stream) is passed
+    straight through.
     """
     results = {result: 0 for result in Result}
     recent_results = {result: 0 for result in Result}
@@ -1078,7 +1184,7 @@ def summarize_rollup(
     muted_total = 0
 
     # Per environment: [total, failed, new_failures, unexpected, not_run,
-    # muted, assigned]
+    # muted, assigned, flaking]
     env_totals = collections.OrderedDict()  # type: Dict[str, List[int]]
 
     for cell in counts:
@@ -1106,7 +1212,7 @@ def summarize_rollup(
             fixed += cell.count
 
         if cell.environment not in env_totals:
-            env_totals[cell.environment] = [0, 0, 0, 0, 0, 0, 0]
+            env_totals[cell.environment] = [0, 0, 0, 0, 0, 0, 0, 0]
         bucket = env_totals[cell.environment]
         bucket[0] += cell.count
         if is_fail:
@@ -1144,6 +1250,35 @@ def summarize_rollup(
             continue
         env_totals[assigned_cell.environment][6] += assigned_cell.count
 
+    # WP-44: the flaky roles, each one test, each a subset of the cells
+    # above (same stream and scope, retired and muted left out by the
+    # view). bucket[7] is the environment's flaking figure.
+    flaking_new = 0
+    flaking_still = 0
+    for entry in flaky:
+        bucket = env_totals.get(entry.environment)
+        if entry.role == FLAKY_ROLE_FLAKING:
+            if entry.prev_fail:
+                flaking_still += 1
+                still_failing -= 1
+            else:
+                flaking_new += 1
+                new_failures -= 1
+            if bucket is not None:
+                bucket[1] -= 1
+                if not entry.prev_fail:
+                    bucket[2] -= 1
+                if entry.assigned:
+                    bucket[6] -= 1
+                bucket[7] += 1
+        elif entry.role == FLAKY_ROLE_PROMOTED:
+            new_failures += 1
+            still_failing -= 1
+            if bucket is not None:
+                bucket[2] += 1
+        elif entry.role == FLAKY_ROLE_TOLERATED:
+            fixed -= 1
+
     status = SummaryStatus(
         total_tests=total,
         ran_recently=ran_recently,
@@ -1159,6 +1294,10 @@ def summarize_rollup(
         muted_new_failures=muted_new,
         muted_still_failing=muted_still,
         muted_total=muted_total,
+        flaking=flaking_new + flaking_still,
+        flaking_new_failures=flaking_new,
+        flaking_still_failing=flaking_still,
+        flaky_total=flaky_total,
     )
     by_environment = [
         EnvironmentRollup(
@@ -1170,6 +1309,7 @@ def summarize_rollup(
             not_run=bucket[4],
             muted=bucket[5],
             assigned=bucket[6],
+            flaking=bucket[7],
         )
         for environment, bucket in sorted(env_totals.items())
     ]

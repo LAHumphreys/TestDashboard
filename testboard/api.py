@@ -55,6 +55,7 @@ from testboard.storage import (
     DASHBOARD_SORTS,
     FLAKY_CADENCE_MAX,
     FLAKY_CADENCE_MIN,
+    FLAKY_ROLE_FLAKING,
     MAINLINE_STREAM_ID,
     QUEUE_KINDS,
     FlakyMark,
@@ -64,6 +65,8 @@ from testboard.storage import (
     CompareRow,
     DerivedTablesDisagree,
     FailureStreak,
+    FlakyCount,
+    FlakyRow,
     RollupCount,
     Storage,
     Stream,
@@ -403,9 +406,48 @@ def _mute_json(
     }
 
 
+def _flaky_row_json(
+    flaky: Optional[FlakyRow],
+    shared: Optional[Dict[Tuple[Any, ...], Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """A listed row's ``flaky`` (WP-44 item 6, design §1 "State on a
+    row"): None for an unmarked test, else the mark and its state on
+    the row's stream. ``streak`` and ``runs`` are capped at the cadence;
+    ``runs`` is given only when the state is ``failing``. The wire
+    ``result`` stays ``FAIL``; what reads FLAKING (state ``flaking``,
+    no live mute) is the page's to say, from this and ``mute``.
+
+    *shared* is the caller's per-response dict of the objects already
+    built: a bulk act gives many rows the same mark fields and a page
+    repeats a few states, so equal values are one object, built once,
+    serialized wherever it appears. Nothing mutates them."""
+    if flaky is None:
+        return None
+    state = flaky.state
+    key = (flaky.mark.cadence, flaky.mark.marked_by, flaky.mark.marked_at,
+           flaky.mark.reason, state)
+    if shared is not None:
+        found = shared.get(key)
+        if found is not None:
+            return found
+    built = {
+        "cadence": flaky.mark.cadence,
+        "marked_by": flaky.mark.marked_by,
+        "marked_at": model.format_iso(flaky.mark.marked_at),
+        "reason": flaky.mark.reason,
+        "state": None if state is None else state.state,
+        "streak": None if state is None else state.streak,
+        "runs": None if state is None else state.runs,
+    }
+    if shared is not None:
+        shared[key] = built
+    return built
+
+
 def _summary_row_json(
     row: TestSummaryRow, product: str = "",
     now_value: Optional[datetime.datetime] = None,
+    flaky_shared: Optional[Dict[Tuple[Any, ...], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Serialize one dashboard row to its JSON shape.
 
@@ -443,6 +485,9 @@ def _summary_row_json(
         "retired_by": row.retired_by,
         "mute": _mute_json(
             row.mute, now_value or model.utcnow()),
+        # WP-44 item 6: the mark and its state on this stream, or null.
+        "flaky": (None if row.flaky is None
+                  else _flaky_row_json(row.flaky, flaky_shared)),
     }  # type: Dict[str, Any]
     if row.latest_comment is not None:
         payload["latest_comment"] = {
@@ -814,20 +859,34 @@ def _resolve_stream_id(
     product/environment NAME, so there is no "empty result" reading —
     a stream either exists or the request is wrong).
     """
+    return _resolve_stream(storage, request, param)[0]
+
+
+def _resolve_stream(
+    storage: Storage, request: Request, param: str = "stream"
+) -> Tuple[int, Optional[datetime.datetime]]:
+    """:func:`_resolve_stream_id`, and the stream's FLOOR for the
+    marked tests' runs read (WP-44 item 6): a build's first run, or
+    None on mainline (its ``first_seen`` predates its migrated history,
+    design §3a). From the stream row the validation already reads, so
+    it costs nothing; absent, the stream is mainline."""
     raw = _query_single(request.query, param)
     if raw is None:
-        return MAINLINE_STREAM_ID
+        return MAINLINE_STREAM_ID, None
     try:
         stream_id = int(raw)
     except ValueError:
         raise _HttpError(
             400, "{}: must be an integer, got '{}'".format(param, raw)
         )
-    if storage.get_stream(stream_id) is None:
+    stream = storage.get_stream(stream_id)
+    if stream is None:
         raise _HttpError(
             404, "unknown stream: {}".format(stream_id)
         )
-    return stream_id
+    floor = (None if stream.kind == "mainline"
+             or stream_id == MAINLINE_STREAM_ID else stream.first_seen)
+    return stream_id, floor
 
 
 def _validate_optional_stream_id(
@@ -872,6 +931,9 @@ class _DashboardFilters(NamedTuple):
     product: Optional[str]
     with_comment: bool
     with_streak: bool
+    #: WP-44 item 6: a build stream's first run, bounding its marked
+    #: tests' runs read; None on mainline. Not a filter.
+    floor: Optional[datetime.datetime]
 
 
 def _parse_dashboard_filters(
@@ -896,7 +958,7 @@ def _parse_dashboard_filters(
     results = _parse_results_param(request)
     product = _query_single(request.query, "product")
     environments = _resolve_product_environments(storage, product)
-    stream_id = _resolve_stream_id(storage, request)
+    stream_id, floor = _resolve_stream(storage, request)
 
     stale_before = None  # type: Optional[datetime.datetime]
     if _query_single(request.query, "stale") in ("1", "true"):
@@ -975,7 +1037,7 @@ def _parse_dashboard_filters(
     }  # type: Dict[str, Any]
     return _DashboardFilters(
         filters=filters, product=product, with_comment=with_comment,
-        with_streak=with_streak,
+        with_streak=with_streak, floor=floor,
     )
 
 
@@ -1019,16 +1081,21 @@ def _handle_dashboard(
     )
     offset = _parse_int_param(request, "offset", 0, 0, _MAX_OFFSET)
 
+    # One tiny lookup, not a join per row: the same map every OTHER
+    # product-aware endpoint reads from environment_products. WP-44
+    # item 6: read FIRST, because the "any mark" bit rides it as one
+    # UNION ALL row, and the rows join the marks only when one exists.
+    env_to_product, marked = storage.environment_products_and_marks()
     rows = storage.dashboard(
         sort=sort, descending=(order == "desc"), limit=limit,
-        offset=offset, with_latest_comment=with_comment, **filters
+        offset=offset, with_latest_comment=with_comment,
+        with_flaky=marked, floor=parsed.floor, **filters
     )
-    # One tiny lookup, not a join per row: the same map every OTHER
-    # product-aware endpoint reads from environment_products.
-    env_to_product = storage.environment_products_map()
+    flaky_shared = {}  # type: Dict[Tuple[Any, ...], Dict[str, Any]]
     payload = [
         _summary_row_json(
-            row, env_to_product.get(row.environment, ""), filters["now"])
+            row, env_to_product.get(row.environment, ""), filters["now"],
+            flaky_shared)
         for row in rows
     ]
     if with_streak:
@@ -1163,6 +1230,7 @@ def _status_row_json(
     streak: Optional[FailureStreak],
     product: str = "",
     now_value: Optional[datetime.datetime] = None,
+    flaky_shared: Optional[Dict[Tuple[Any, ...], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Serialize one queue entry (a status row plus optional streak info).
 
@@ -1208,6 +1276,11 @@ def _status_row_json(
         ),
         "mute": _mute_json(
             row.mute, now_value or model.utcnow()),
+        # WP-44 item 6: the mark and its state on this stream, or null.
+        # A New failures row with prev_result FAIL and state "failing"
+        # is a test that went over its cadence tonight (decision 25).
+        "flaky": (None if row.flaky is None
+                  else _flaky_row_json(row.flaky, flaky_shared)),
     }
 
 
@@ -1223,8 +1296,18 @@ def _summary_queue_json(
     stream_id: int = MAINLINE_STREAM_ID,
     queue_counts: Optional[Dict[str, int]] = None,
     now_value: Optional[datetime.datetime] = None,
+    marks: Optional[bool] = None,
+    floor: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
     """Serialize one triage queue: exact total plus capped, enriched entries.
+
+    WP-44 item 6: *marks* is the "any mark" bit when the caller has it
+    (the full payload, from the mute epoch its headline read). Without
+    it — the single-queue ``parts=queue`` path — the count is read FIRST
+    and carries the bit (:meth:`Storage.status_queue_count_and_marks`),
+    so the rows know whether to join the marks at no statement of the
+    bit's own. *floor* is a build stream's first run, bounding the
+    marked tests' runs read (None on mainline).
 
     *kind* is any storage queue kind, or ``"mine"`` — the assignee's
     open items, which resolves to the ``assigned`` predicate filtered to
@@ -1271,11 +1354,22 @@ def _summary_queue_json(
         queue_assignee = assignee
     with_streaks = kind in _STREAK_QUEUES or kind == "mine"
 
+    total = None  # type: Optional[int]
+    if queue_counts is not None:
+        total = queue_counts[kind]
+    else:
+        total, counted_marks = storage.status_queue_count_and_marks(
+            storage_kind, environment, assignee=queue_assignee,
+            stale_before=recent_cutoff, environments=environments,
+            stream_id=stream_id, now=now_value, floor=floor,
+        )
+        if marks is None:
+            marks = counted_marks
     rows = storage.status_queue(
         storage_kind, environment, limit=_SUMMARY_QUEUE_CAP,
         assignee=queue_assignee, stale_before=recent_cutoff,
         with_latest_comment=True, environments=environments,
-        stream_id=stream_id, now=now_value,
+        stream_id=stream_id, now=now_value, marks=marks, floor=floor,
     )
     if with_streaks:
         needed = [
@@ -1288,6 +1382,7 @@ def _summary_queue_json(
             streaks.update(
                 storage.failure_streak_bounds_many(needed, stream_id)
             )
+    flaky_shared = {}  # type: Dict[Tuple[Any, ...], Dict[str, Any]]
     entries = [
         _status_row_json(
             row,
@@ -1297,20 +1392,13 @@ def _summary_queue_json(
             ),
             products.get(row.environment, ""),
             now_value,
+            flaky_shared,
         )
         for row in rows
     ]
     if kind == "still_failing":
         # Oldest neglected regression first — the point of the queue.
         entries.sort(key=lambda entry: entry["failing_since"] or "")
-    total = (
-        queue_counts[kind] if queue_counts is not None
-        else storage.status_queue_count(
-            storage_kind, environment, assignee=queue_assignee,
-            stale_before=recent_cutoff, environments=environments,
-            stream_id=stream_id, now=now_value,
-        )
-    )
     return {
         "total": total,
         "tests": entries,
@@ -1325,6 +1413,7 @@ def _summary_queue_totals(
     environments: Optional[Sequence[str]] = None,
     stream_id: int = MAINLINE_STREAM_ID,
     now_value: Optional[datetime.datetime] = None,
+    floor: Optional[datetime.datetime] = None,
 ) -> Dict[str, int]:
     """Exact size of every queue, without fetching a single row.
 
@@ -1338,6 +1427,7 @@ def _summary_queue_totals(
     return storage.queue_counts(
         environment, assignee, stale_before=recent_cutoff,
         environments=environments, stream_id=stream_id, now=now_value,
+        floor=floor,
     )
 
 
@@ -1388,6 +1478,8 @@ def _products_summary(
     recent_cutoff: datetime.datetime,
     rollup_rows: Optional[List[RollupCount]] = None,
     muted: Sequence[RollupCount] = (),
+    flaky: Optional[Sequence[FlakyCount]] = None,
+    now_value: Optional[datetime.datetime] = None,
 ) -> List[Dict[str, Any]]:
     """The ``products[]`` breakdown of ``/api/summary`` (WP-20 §2.2).
 
@@ -1419,6 +1511,13 @@ def _products_summary(
     SAME estate-wide mainline scope — the caller fetches it once; every
     product's ``failing``/``new_failures`` exclude its FAIL cells and
     ``muted`` reports them beside them.
+
+    *flaky* (WP-44 item 6) is :meth:`Storage.flaky_view`'s ``counted``
+    for the same estate-wide mainline scope, when the caller has it (an
+    unscoped request); None reads mainline's here, at *now_value*, and
+    only when a product is declared. Each product's ``flaking`` is its
+    flaking tests, taken off ``failing``/``new_failures``; a promoted
+    test is a new failure and a tolerated pass leaves ``fixed``.
     """
     products = storage.distinct_products()
     if not products:
@@ -1427,16 +1526,20 @@ def _products_summary(
         rollup_rows if rollup_rows is not None
         else storage.summary_rollup(recent_cutoff)
     )
+    if flaky is None:
+        view = storage.flaky_view(
+            MAINLINE_STREAM_ID, now_value, marks=True)
+        flaky = [] if view is None else view.counted
     by_product = {
         row.product: row
         for row in analytics.summarize_by_product(
             rows, storage.environment_products_map(),
-            muted=muted,
+            muted=muted, flaky=flaky,
         )
     }
     zero = analytics.ProductRollup(
         product="", failing=0, new_failures=0, fixed=0,
-        unexpected_passes=0, muted=0,
+        unexpected_passes=0, muted=0, flaking=0,
     )
     return [
         {
@@ -1447,6 +1550,10 @@ def _products_summary(
             "unexpected_passes": by_product.get(
                 product, zero).unexpected_passes,
             "muted": by_product.get(product, zero).muted,
+            # WP-44: drawn nowhere on Home; here because "failing" has
+            # these taken off it, and the board never subtracts
+            # silently.
+            "flaking": by_product.get(product, zero).flaking,
         }
         for product in products
     ]
@@ -1493,21 +1600,27 @@ def _summary_names(
     No headline status, trend, queue, ``queue_totals`` or
     per-environment "last reported" work; ``stale_before`` is the pass
     view, memoized.
+
+    ``flaky_marks`` (WP-44 item 6): is there a flaky mark anywhere, so
+    the page knows whether to say what it leaves out. It rides the
+    products statement as one ``UNION ALL`` row
+    (:meth:`Storage.distinct_products_and_marks`): no statement of its
+    own.
     """
     recent_cutoff = _recent_cutoff(storage, current, environments, stream_id)
+    products, marked = storage.distinct_products_and_marks()
     return {
         "generated_at": model.format_iso(current),
         "environment": environment,
         "product": product,
         "stream": stream_id,
-        "products": [
-            {"product": name} for name in storage.distinct_products()
-        ],
+        "products": [{"product": name} for name in products],
         "environments": storage.environments(
             environments=catalog_environments),
         "assignees": storage.assignees(),
         "assignment_streams": _assignment_streams_json(storage),
         "stale_before": model.format_iso(recent_cutoff),
+        "flaky_marks": marked,
     }
 
 
@@ -1659,7 +1772,7 @@ def _handle_summary(
     # WP-23: a long-running branch's "own results" tab is this same
     # endpoint, scoped — absent, the default (mainline) means every
     # deployed caller from before this drop sees no change at all.
-    stream_id = _resolve_stream_id(storage, request)
+    stream_id, floor = _resolve_stream(storage, request)
 
     if part == "assigned_trend":
         # WP-43: nothing else the headline computes (no pass view, no
@@ -1764,7 +1877,7 @@ def _handle_summary(
                     storage, kind, environment, assignee, recent_cutoff,
                     {}, environments=environments,
                     env_to_product=env_to_product, stream_id=stream_id,
-                    now_value=current,
+                    now_value=current, floor=floor,
                 ),
             },
         )
@@ -1792,6 +1905,17 @@ def _handle_summary(
         current, environment, environments=environments,
         stream_id=stream_id,
     )
+    # WP-44 item 6: the marked tests that move a count, in this scope.
+    # Nothing at all with no mark (the bit rides the mute epoch's
+    # statement, read above); with marks, Q1, Qc and one Q2 at LIMIT
+    # N+1, memoized per (stream, environment), and every count below a
+    # sum over the one list, as the mutes are.
+    flaky = storage.flaky_view(
+        stream_id, current, environment, environments,
+        marks=True, floor=floor,
+    )
+    flaky_counted = (
+        [] if flaky is None else flaky.counted)  # type: List[FlakyCount]
     estate = analytics.summarize_rollup(
         estate_rollup,
         storage.assigned_open_count(
@@ -1799,6 +1923,8 @@ def _handle_summary(
         ),
         muted=muted_cells,
         assigned=assigned_cells,
+        flaky=flaky_counted,
+        flaky_total=0 if flaky is None else flaky.marks,
     )
     assigned_by_script = {}  # type: Dict[Tuple[str, str], int]
     for assigned_cell in assigned_cells:
@@ -1806,6 +1932,18 @@ def _handle_summary(
             script_key = (assigned_cell.environment, assigned_cell.script)
             assigned_by_script[script_key] = (
                 assigned_by_script.get(script_key, 0) + assigned_cell.count)
+    # WP-44: a flaking test leaves its script's failing figure, and its
+    # assigned one when it has an owner (counted once).
+    flaking_by_script = {}  # type: Dict[Tuple[str, str], int]
+    for entry in flaky_counted:
+        if entry.role != FLAKY_ROLE_FLAKING:
+            continue
+        script_key = (entry.environment, entry.script)
+        flaking_by_script[script_key] = (
+            flaking_by_script.get(script_key, 0) + 1)
+        if entry.assigned:
+            assigned_by_script[script_key] = (
+                assigned_by_script.get(script_key, 0) - 1)
     # WP-23 perf pass: _products_summary always needs the estate-wide
     # MAINLINE rollup, regardless of this request's own scope. When the
     # request itself IS that exact scope (no environment=, no product=,
@@ -1867,6 +2005,7 @@ def _handle_summary(
     queue_totals = _summary_queue_totals(
         storage, environment, assignee, recent_cutoff,
         environments=environments, stream_id=stream_id, now_value=current,
+        floor=floor,
     )
     payload = {
             "generated_at": model.format_iso(current),
@@ -1892,7 +2031,8 @@ def _handle_summary(
             # product-shaped at all.
             "products": _products_summary(
                 storage, recent_cutoff, products_rollup,
-                products_muted),
+                products_muted,
+                None if products_scoped else flaky_counted, current),
             "environments": storage.environments(
                 environments=catalog_environments),
             "scripts": storage.scripts(
@@ -1951,6 +2091,16 @@ def _handle_summary(
                 "muted_new_failures": status.muted_new_failures,
                 "muted_still_failing": status.muted_still_failing,
                 "muted_total": status.muted_total,
+                # WP-44: new_failures/still_failing above EXCLUDE the
+                # flaking failures (marked, under their cadence, no live
+                # mute); shown beside them, one figure per tile, never
+                # subtracted silently, and still in ``results``.
+                # ``flaky_total`` is every mark in scope whose test has
+                # run on the stream, retired excluded: the tab's badge.
+                "flaking": status.flaking,
+                "flaking_new_failures": status.flaking_new_failures,
+                "flaking_still_failing": status.flaking_still_failing,
+                "flaky_total": status.flaky_total,
             },
             "trend": {
                 "days": days,
@@ -1969,6 +2119,9 @@ def _handle_summary(
                     "muted": rollup.muted,
                     # WP-43: of "failed", those with an assignee now.
                     "assigned": rollup.assigned,
+                    # WP-44: beside "failed", "muted" and "assigned",
+                    # inside none of them.
+                    "flaking": rollup.flaking,
                 }
                 for rollup in estate.by_environment
             ],
@@ -1986,11 +2139,14 @@ def _handle_summary(
                     # own statement and memo are unchanged.
                     "assigned": assigned_by_script.get(
                         (entry.environment, entry.script), 0),
+                    # WP-44: its flaking tests, taken off "failing" (and
+                    # off "assigned" for those with an owner).
+                    "flaking": entry.flaking,
                 }
                 for entry in storage.top_failing_scripts(
                     environment, _SUMMARY_TOP_SCRIPTS,
                     environments=environments, stream_id=stream_id,
-                    now=current,
+                    now=current, flaking=flaking_by_script,
                 )
             ],
             # Every queue's exact size, row payloads not included. The
@@ -2012,12 +2168,14 @@ def _handle_summary(
     # runs measured +14-19 ms cold there on the production-scale seed.
     # parts=assigned_trend only.
     streaks = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
+    # WP-44 item 6: the bit the headline read with the mute epoch.
+    marked = flaky is not None
     queues = {
         kind: _summary_queue_json(
             storage, kind, environment, None, recent_cutoff, streaks,
             environments=environments, env_to_product=env_to_product,
             stream_id=stream_id, queue_counts=queue_totals,
-            now_value=current,
+            now_value=current, marks=marked, floor=floor,
         )
         for kind in QUEUE_KINDS
     }
@@ -2025,7 +2183,7 @@ def _handle_summary(
         storage, "mine", environment, assignee, recent_cutoff, streaks,
         environments=environments, env_to_product=env_to_product,
         stream_id=stream_id, queue_counts=queue_totals,
-        now_value=current,
+        now_value=current, marks=marked, floor=floor,
     )
     payload["queues"] = queues
     return _json_response(200, payload)
@@ -4484,23 +4642,37 @@ def _handle_watch(
     # mute input; they are unchanged.
     watch_muted = storage.muted_cells(
         now_value, estate_cutoff)
+    # WP-44 item 6: mainline's marked tests that move a count, unscoped,
+    # shared by every e:/p: card like the mutes above (the bit rides the
+    # mute epoch muted_cells has just read; with no mark, nothing). A
+    # flaking test leaves a card's failing, new and unassigned figures
+    # and is its "flaking"; s: cards are unchanged (decision 9).
+    watch_flaky_view = storage.flaky_view(
+        MAINLINE_STREAM_ID, now_value, marks=True)
+    watch_flaky = (
+        [] if watch_flaky_view is None else watch_flaky_view.counted
+    )  # type: List[FlakyCount]
+    for entry in watch_flaky:
+        if entry.role == FLAKY_ROLE_FLAKING and not entry.assigned:
+            unassigned_by_env[entry.environment] = (
+                unassigned_by_env.get(entry.environment, 0) - 1)
     by_environment = {
         row.product: row
         for row in analytics.summarize_by_product(
             rollup_counts, {e: e for e in known_environments},
-            muted=watch_muted,
+            muted=watch_muted, flaky=watch_flaky,
         )
     }
     by_product = {
         row.product: row
         for row in analytics.summarize_by_product(
             rollup_counts, env_to_product,
-            muted=watch_muted,
+            muted=watch_muted, flaky=watch_flaky,
         )
     }
     zero = analytics.ProductRollup(
         product="", failing=0, new_failures=0, fixed=0,
-        unexpected_passes=0, muted=0,
+        unexpected_passes=0, muted=0, flaking=0,
     )
 
     def card_cutoff(card_environments: Sequence[str]) -> datetime.datetime:
@@ -4536,6 +4708,9 @@ def _handle_watch(
                 "fixed": verdict.fixed,
                 "unexpected_passes": verdict.unexpected_passes,
                 "muted": verdict.muted,
+                # WP-44: taken off "failing", "new_failures" and
+                # "unassigned_failing", reported here.
+                "flaking": verdict.flaking,
                 "stale_before": model.format_iso(card_cutoff([name])),
                 "last_reported": (
                     None if env_last_reported is None
@@ -4571,6 +4746,9 @@ def _handle_watch(
                 "fixed": verdict.fixed,
                 "unexpected_passes": verdict.unexpected_passes,
                 "muted": verdict.muted,
+                # WP-44: taken off "failing", "new_failures" and
+                # "unassigned_failing", reported here.
+                "flaking": verdict.flaking,
                 "stale_before": model.format_iso(
                     card_cutoff(product_envs)),
                 # No single "last reported" for a multi-environment

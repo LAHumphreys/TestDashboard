@@ -4961,3 +4961,37 @@ sides before anything is timed. `--page-mode` times a page's first-paint
 requests on long-lived workers, cold, alternated. Fresh eyes found nothing
 unfair between the sides; seven hardening points were fixed before the
 commit. An A/A at 50 and 1,000 marks on both seeds read every row "same".
+
+## WP-44 item 6 and 6p: the board acts on the mark; its cost accepted over the bar, for the owner to confirm (2026-11-11)
+
+Item 6 is committed: `flaky` on every browse, queue and Open Actions row;
+the flaking figures on the headline, the charts' data, the products and
+Watch's cards; the promotion of a test that fails past its cadence into
+every new-failures figure and queue; "Newly fixed" by decision 3; the
+memo of marks and states per stream and the runs cache a push drops. A
+test is promoted only on a run that started at or after its cadence was
+last set. With no marks every read is the base's, statement for
+statement. Fresh eyes found ten NamedTuple field defaults (3.6.1, above
+the 3.6.0 floor): removed, and the 3.6 gate now detects them.
+
+6p, cold, alternated, with the fixture corrected to date its marks before
+the runs (its own commit): the Home headline is +6.2 ms on 28.6 (22%) at
+50 marks and +11.4 on 27.6 (41%) at 1,000 on SQLite; +17.0 on 93.0 (18%)
+and +35.8 on 95.0 (38%) on a local MariaDB 12.3. The accepted bar was 18%
+and 34% on SQLite, 16% and 34% on MariaDB. Unfiltered browse is +0.4 and
++1.1 ms; the New failures queue's bound term costs nothing warm; no marks,
+no change, the Known slow rows included. Q2 is about half of the
+headline's cost.
+
+**Over the bar, and committed.** The main session accepted the figures
+under the owner's instruction to finish the build overnight and decide
+pragmatically; the owner confirms or overturns it. The cost exists only
+where marks exist and only cold; at 50 marks it is 2 to 4 points over;
+MariaDB is at the bar within its band. The cheaper shapes, priced at 1,000
+marks, each cost more than they save: a covering runs index (4.6 ms of
+the SQLite headline, for a migration, about 19% more database and 12% on
+a push); dropping decision 3 (3.0 ms SQLite, 8.8 MariaDB); dropping the
+cadence-2 read (0.5, 1.7). Carried into item 8: the assigned queue's own
+runs read (+3.8 ms warm), browse's per-row Python at 1,000 marks, Open
+Actions' own runs read. MariaDB 10.3 has not run the plan guards. 2911
+and 4016 green in the main checkout.

@@ -76,6 +76,10 @@ _LIKE_TEST_NAME = (
 #: (measured on 12.3, design doc section 3c). The index is unused here.
 _LIMITED_UNION_MEMBER = "({0})"
 
+#: The right-hand side of a row-value ``IN`` over a bound list (WP-44
+#: item 6): the tuples themselves, where SQLite needs a VALUES clause.
+_ROW_VALUE_LIST = "{0}"
+
 
 def _driver() -> Any:
     """Import the vendored driver, or say where it should have been."""
@@ -187,6 +191,11 @@ class MariaDBBackend(object):
     like_test_name = _LIKE_TEST_NAME
     limit_all_offset = _LIMIT_ALL_OFFSET
     limited_union_member = _LIMITED_UNION_MEMBER
+    row_value_list = _ROW_VALUE_LIST
+
+    #: No ceiling: the driver interpolates the values client-side, so a
+    #: bound list is never refused for its length (design §3b).
+    max_bound_parameters = None  # type: Optional[int]
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings

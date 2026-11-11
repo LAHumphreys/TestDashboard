@@ -67,6 +67,13 @@ EXCLUDED_CLASSES = {
         "return with the flaky tables present and empty are every "
         "other generated class's, which run here on a schema carrying "
         "them.",
+    "FlakyStatementsTest":
+        "counts and reads statements with sqlite3's set_trace_callback "
+        "(WP-44 item 6): the instrument is SQLite's. The values those "
+        "reads return are compared on MariaDB by "
+        "FlakyAgreesWithAnalyticsTest, PromotionTest and FixedRuleTest, "
+        "with 101 marked tests in one environment (decision 22), and "
+        "their plans by FlakyPlanTest.",
     "TestEnvironmentListingCost":
         "counts sqlite page reads to pin a query-shape regression; "
         "the instrument is engine-specific even though the shape "
@@ -298,6 +305,21 @@ EXCLUDED_TESTS = {
         "reads statements with sqlite3's set_trace_callback and asserts "
         "SQLite's EXPLAIN QUERY PLAN (WP-44). Q2's plan guard, "
         "test_q2_is_a_runs_unique_range_on_both_backends, runs here.",
+    "FlakyBoardApiTest"
+    ".test_the_headline_pays_q1_qc_and_one_q2_cold_and_nothing_warm":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 6). The values the read returns are compared on MariaDB by "
+        "the rest of FlakyBoardApiTest.",
+    "FlakyBoardApiTest"
+    ".test_browse_pays_one_q2_for_its_page_and_its_count_nothing":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 6).",
+    "FlakyBoardApiTest.test_the_queue_part_costs":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 6).",
+    "FlakyBoardApiTest.test_the_full_payload_and_watch_pay_once":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 6).",
     "TestBulkSetAssignee.test_empty_input_issues_no_writes":
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssigneeForTriples."

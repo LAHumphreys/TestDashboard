@@ -1338,8 +1338,8 @@ any interruption is the first line not `done` or `parked`.
 | 3p measured pass | done | | Known slow rows the same with the tables empty; the detail of a marked test +0.07 to +0.27 ms on SQLite, +0.41 to +0.84 on a local MariaDB 12.3; the push path runs the same statements. Carried into item 6: unmark and cadence change send a statement per test on MariaDB. Recorded, outside the package: every bulk endpoint resolves each entry's stream with two statements |
 | 4 marks fixture | done | the commit carrying this line | with 65 assignments it reproduces the design-time fixture's F, X and P at 50 and 1,000 marks on both seeds; seven fresh-eyes hardening points fixed before the commit; the page mode is in the harness |
 | 5 controls, UI | done | the commit carrying this line | four fresh-eyes findings fixed before the commit; the bar's Set cadence is reachable only once rows carry the mark (item 6); no browser has rendered it |
-| 6 state and counts, backend | in flight | | |
-| 6p measured pass | not started | | |
+| 6 state and counts, backend | done | the commit carrying this line | **over the cost bar and committed on the main session's call, for the owner to confirm** (see 6p); fresh eyes found NamedTuple field defaults above the 3.6.0 floor, removed and now detected by the gate; a test is promoted only on a run that started after its cadence was set |
+| 6p measured pass | done | | Home headline: SQLite +6.2 ms (22% of base) at 50 marks and +11.4 (41%) at 1,000; local MariaDB 12.3 +17.0 (18%) and +35.8 (38%); the bar was 18% / 34% and 16% / 34%. No marks: no change, Known slow rows the same. Priced and not taken: a covering runs index, dropping decision 3, dropping the cadence-2 read. The marks fixture was dating its marks after the runs (no promoted tests); fixed in its own commit. Carried into item 8: the assigned queue's own runs read, browse's per-row Python |
 | 6h dialect hook | only if a plan guard fails on CI's 10.3 legs | | |
 | 7 state on Home and rows, UI | not started | | |
 | 8 lists and filters, backend | not started | | |
