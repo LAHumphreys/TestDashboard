@@ -4878,3 +4878,25 @@ against 181 to 256 ms for the full payload on the same calls. The measured
 pass of record is 2p, after the UI item. Fresh eyes found nothing to send
 back. Main checkout: 2758 OK (skipped 1) on SQLite, 3783 OK (skipped 80)
 with the MariaDB variants.
+
+## WP-44 items 2 and 2p: Open Actions on the names part, measured (2026-11-11)
+
+Item 2 is committed: the Open Actions page fetches
+`/api/summary?parts=names` in place of the full summary. Its "fetched once"
+gate is a loaded flag (the old gate refetched the whole summary on every
+refresh of an estate with no assignee), a catalogue that fails to load no
+longer stops the rows drawing, and a load-more retries a catalogue that is
+still missing; the last came from the fresh-eyes review and was fixed before
+the commit.
+
+The measured pass of items 1 and 2 (2p; cold, in-process, alternated, base
+`3e7a10c`): the names part reads 6 to 8 ms against 73 to 155 for the full
+payload on SQLite (perf-seed/1 and the 90-night seed) and 40 to 44 against
+164 to 209 on a local MariaDB 12.3, in 14, 15 or 17 statements against 46 to
+55. The page as it loads, two workers: 81.3 to 42.9 ms on perf-seed/1 and
+248.9 to 171.9 on the 90-night seed, SQLite; on MariaDB four runs read −9.5
+to −36.7 ms with two bands clear of zero, the page there being bound by the
+rows request. The six Known slow rows are the same. Recorded for the owner:
+Open Actions no longer warms Home's headline memo as a side effect, so Home
+opened straight after it pays its own cold headline (84.6 ms against 3.6 on
+that one journey, perf-seed/1, SQLite; Home on its own is unchanged).

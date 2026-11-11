@@ -1332,8 +1332,8 @@ any interruption is the first line not `done` or `parked`.
 | Item | Status | Commit | Note |
 |---|---|---|---|
 | 1 names-only request, backend | done | the commit carrying this line | `products` carries names only (the design's shape; the counted list is the headline's pass); fresh eyes found nothing to send back; 2p is its measured pass |
-| 2 names-only request, UI | in flight | | |
-| 2p measured pass | not started | | |
+| 2 names-only request, UI | done | the commit carrying this line | one fresh-eyes finding fixed before the commit (a load-more hid a catalogue that had failed to load); no browser has rendered it |
+| 2p measured pass | done | | the page 38 ms less on perf-seed/1 and 78 ms less on the 90-night seed (SQLite), 9.5 to 36.7 ms less on a local MariaDB 12.3; Known slow rows the same. For the owner: Open Actions no longer warms Home's headline memo, so Home opened straight after it pays its own cold headline |
 | 3 the mark, backend | in flight | | |
 | 3p measured pass | not started | | |
 | 4 marks fixture | not started | | |

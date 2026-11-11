@@ -3483,22 +3483,137 @@ class OpenActionsSummaryScopeTest(unittest.TestCase):
     """
 
     def test_summary_is_fetched_through_the_scoped_helper(self) -> None:
-        """WP-24: the appendProduct(qs) helper is gone -- summaryUrl()
+        """WP-24: the appendProduct(qs) helper is gone -- the helper
         now calls apiUrl() with a product scope from
         selectedProductScope() (getSelectedProduct() || null, so it is
         OMITTED rather than sent empty when nothing is selected -- the
         same behaviour appendProduct()'s `if (product)` guard gave).
         Same assertion intent (the summary fetch carries the product
-        scope), now checking the apiUrl() call site."""
+        scope), now checking the apiUrl() call site.
+
+        WP-44: the page's one summary request is the names part, and its
+        helper is ``namesUrl()`` (was ``summaryUrl()``); widened to that
+        helper and to the relative spelling of a bare fetch, every scope
+        assertion kept."""
         src = read("actions.js")
-        self.assertIn("function summaryUrl()", src)
-        self.assertIn("fetchJson(summaryUrl())", src)
-        self.assertNotIn('fetchJson("/api/summary")', src,
-                         "a bare unscoped summary fetch is the bug "
-                         "coming back")
-        body = _function_body(src, "function summaryUrl()")
+        self.assertIn("function namesUrl()", src)
+        self.assertIn("fetchJson(namesUrl())", src)
+        for bare in ('fetchJson("/api/summary")', 'fetchJson("api/summary")'):
+            self.assertNotIn(bare, src,
+                             "a bare unscoped summary fetch is the bug "
+                             "coming back")
+        body = _function_body(src, "function namesUrl()")
         self.assertIn("apiUrl(", body)
         self.assertIn("selectedProductScope()", body)
+
+
+def _unsliced_summary_requests(source: str) -> List[int]:
+    """Line numbers where comment-stripped *source* names ``api/summary``
+    in a statement that does not ask for the names part.
+
+    Each ``api/summary`` is read to the end of its statement (the next
+    ``;``), which must carry ``parts: "names"`` (the apiUrl() params
+    spelling) or ``parts=names`` (a hand-built query string)."""
+    code = _strip_comments(source)
+    hits = []  # type: List[int]
+    for match in re.finditer(r"api/summary", code):
+        end = code.find(";", match.end())
+        statement = code[match.start():end if end != -1 else len(code)]
+        if not re.search(r'parts:\s*"names"|parts=names\b', statement):
+            hits.append(code.count("\n", 0, match.start()) + 1)
+    return hits
+
+
+class OpenActionsCatalogueTest(unittest.TestCase):
+    """WP-44: Open Actions takes its catalogue from the names part.
+
+    The page reads five fields of the summary (environments, assignees,
+    products, assignment streams, stale_before) and used to wait for the
+    whole unsliced payload, every headline number and queue of the
+    board, on its first paint. ``GET /api/summary?parts=names`` returns
+    those five and nothing else. Reverting to the full summary still
+    WORKS, it is only slow again, so it is pinned here the way
+    ``SummaryPartsFetchTest`` pins the home page's split.
+
+    First half (WP-44 item 2): the names request. The second half, the
+    Failing mode sending FAIL and FLAKING, is item 9's and joins this
+    class below the seam marked at its end.
+    """
+
+    def test_every_summary_request_asks_for_the_names_part(self) -> None:
+        src = read("actions.js")
+        self.assertIn("api/summary", _strip_comments(src),
+                      "nothing to check: the page names no summary request")
+        self.assertEqual(
+            _unsliced_summary_requests(src), [],
+            "actions.js requests /api/summary without parts=names: the "
+            "Open Actions first paint waits on the whole board again")
+        self.assertIn('parts: "names"',
+                      _function_body(src, "function namesUrl()"))
+
+    def test_the_detector_catches_a_full_summary_request(self) -> None:
+        """Planted: the shipped helper with its part dropped, a bare
+        fetch, another part, and a hand-built query string."""
+        src = read("actions.js")
+        self.assertIn('{ parts: "names" }', src)
+        dropped = src.replace('{ parts: "names" }', "{}")
+        self.assertNotEqual(_unsliced_summary_requests(dropped), [])
+        for planted in (
+            'const s = await fetchJson("api/summary");\n',
+            'const u = apiUrl("api/summary", { parts: "headline" }, {});\n',
+            'fetchJson("api/summary?product=" + p);\n',
+            'fetchJson("api/summary?parts=namesake");\n',
+        ):
+            with self.subTest(planted=planted):
+                self.assertEqual(
+                    _unsliced_summary_requests(src + planted),
+                    [len(_strip_comments(src + planted).split("\n")) - 1])
+        self.assertEqual(_unsliced_summary_requests(
+            'fetchJson("api/summary?parts=names&product=" + p);\n'), [])
+
+    def test_the_catalogue_gate_is_a_loaded_flag(self) -> None:
+        """With nobody assigned, ``state.assignees.length`` stayed 0 and
+        every refresh refetched the catalogue. The flag is set where the
+        answer is applied, after the stale-answer check, and nowhere
+        else, so a failed or superseded request leaves it unset."""
+        code = _strip_comments(read("actions.js"))
+        body = _function_body(code, "async function refresh(")
+        self.assertNotIn("assignees.length", body)
+        self.assertIn("catalogueLoaded: false,", code)
+        # The flag alone: an append asks again while it is unset, or its
+        # clearError() hides the failure behind empty filters.
+        self.assertRegex(body, r"state\.catalogueLoaded\s*\?")
+        self.assertNotIn("catalogueLoaded || append", body)
+        self.assertEqual(code.count("state.catalogueLoaded = true"), 1)
+        self.assertNotIn("catalogueLoaded = false", code)
+        self.assertLess(body.index("seq !== state.seq"),
+                        body.index("state.catalogueLoaded = true"))
+
+    def test_first_paint_is_still_names_and_rows_then_expiring(self) -> None:
+        """Two awaited requests started together, names first, then the
+        expiring mutes, which nothing awaits (WP-40); nothing added."""
+        body = _function_body(
+            _strip_comments(read("actions.js")), "async function refresh(")
+        order = [body.index(token) for token in (
+            "Promise.all([", "fetchJson(namesUrl())",
+            "fetchJson(listUrl(offset))", "loadExpiring();",
+            "await requests")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(body.count("fetchJson("), 2)
+        self.assertEqual(body.count("await "), 1)
+        self.assertNotIn("await loadExpiring", body)
+
+    def test_a_failed_catalogue_still_draws_the_rows(self) -> None:
+        """The names request's own failure is caught beside it, so the
+        rows still draw; its message is shown after them."""
+        body = _function_body(
+            _strip_comments(read("actions.js")), "async function refresh(")
+        self.assertIn("fetchJson(namesUrl()).catch(", body)
+        self.assertLess(body.index("renderRows(page.tests, append)"),
+                        body.index("showError(namesError.message)"))
+
+    # ---- second half (WP-44 item 9): the Failing mode sends FAIL and
+    # FLAKING. Its tests join this class here. ----
 
 
 class OpenActionsOriginFilterTest(unittest.TestCase):
@@ -3565,8 +3680,10 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
         self.assertIn("row.assignment_stream_id === null", body)
 
     def test_summary_and_page_streams_are_both_read(self) -> None:
+        """WP-44: the summary's answer is the names part now, held as
+        ``names`` (was ``summary``); the same field is read from it."""
         code = _strip_comments(read("actions.js"))
-        self.assertIn("summary.assignment_streams", code)
+        self.assertIn("names.assignment_streams", code)
         self.assertIn("page.streams", code)
 
     def test_a_build_originated_row_links_to_the_streams_own_test_page(
@@ -5999,14 +6116,17 @@ process.exit(0);
 """
 
 
-def _shim(fixture: Dict[str, Any]) -> Dict[str, Any]:
-    """Run the shim driver over *fixture*; its JSON answer, typed at the
-    boundary by the caller's assertions."""
+def _shim(
+    fixture: Dict[str, Any], source: str = _SHIM_DRIVER
+) -> Dict[str, Any]:
+    """Run the shim driver *source* (the home page's by default) over
+    *fixture*; its JSON answer, typed at the boundary by the caller's
+    assertions."""
     with tempfile.TemporaryDirectory() as scratch:
         driver = os.path.join(scratch, "driver.mjs")
         data = os.path.join(scratch, "fixture.json")
         with io.open(driver, "w", encoding="utf-8") as handle:
-            handle.write(_SHIM_DRIVER)
+            handle.write(source)
         with io.open(data, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(fixture))
         done = subprocess.run(
@@ -6446,6 +6566,196 @@ class PlantedCopyOutputRegressionTest(unittest.TestCase):
                    "const a = copyOutputButton(() => f(run).output);\n")
         self.assertEqual(_call_arguments(planted, "copyOutputButton"),
                          ["() => f(run).output"])
+
+
+#: The Open Actions walk: the real actions.js over the shim, fetch
+#: answered from the fixture and every request recorded. It loads the
+#: page, presses load-more, changes the environment filter, then presses
+#: Reload, and reports what was asked for at each stage. argv: repo root,
+#: fixture path.
+_ACTIONS_SHIM_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom, Element } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, "http://127.0.0.1/actions.html");
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+// The markup marks the switcher host-managed, nests "Extend all" in a
+// header the duration select is inserted into, and init() swaps its
+// username slot for a picker; the shim parses no HTML and has no
+// replaceWith, so all three are supplied here as the page would find
+// them.
+byId["product-switcher"].setAttribute("data-host-managed", "");
+new Element("div").appendChild(byId["extend-all-btn"]);
+Element.prototype.replaceWith = function (node) {
+  if (node.id) byId[node.id] = node;
+};
+let namesFailures = fixture.namesFailures;
+const asked = [];
+globalThis.fetch = (url) => {
+  const u = new URL(String(url), "http://127.0.0.1/");
+  const part = u.searchParams.get("parts");
+  const path = u.pathname.replace(/^\//, "");
+  asked.push(part ? path + "?parts=" + part : path);
+  let status = 200;
+  let body = {};
+  if (path === "api/summary") {
+    if (namesFailures > 0) {
+      namesFailures -= 1;
+      status = 500;
+      body = { error: "names unavailable" };
+    } else {
+      body = fixture.names;
+    }
+  } else if (path === "api/dashboard") {
+    body = { tests: [fixture.row], total: 1, streams: {} };
+  } else if (path === "api/mutes") {
+    body = { mutes: [] };
+  } else if (path === "api/users") {
+    body = { users: [] };
+  }
+  return Promise.resolve({ ok: status < 400, status,
+    text: async () => JSON.stringify(body) });
+};
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+const banner = () => (byId["error-banner"].hidden
+  ? null : byId["error-banner"].textContent);
+await import(pathToFileURL(root + "/static/actions.js").href);
+await settle();
+const out = {
+  first: asked.slice(),
+  firstBanner: banner(),
+  firstRows: byId["actions-body"].children.length,
+  envOptions: byId["filter-environment"].children.map((o) => o.value),
+};
+await byId["show-more"].click();
+await settle();
+Object.assign(out, {
+  more: asked.slice(out.first.length),
+  moreBanner: banner(),
+  moreRows: byId["actions-body"].children.length,
+  moreEnvOptions: byId["filter-environment"].children.map((o) => o.value),
+});
+const beforeLater = asked.length;
+byId["filter-environment"].value = fixture.names.environments[0];
+await byId["filter-environment"].dispatch("change");
+await settle();
+await byId["reload-btn"].click();
+await settle();
+Object.assign(out, {
+  later: asked.slice(beforeLater),
+  laterBanner: banner(),
+  laterRows: byId["actions-body"].children.length,
+  laterEnvOptions: byId["filter-environment"].children.map((o) => o.value),
+});
+console.log(JSON.stringify(out));
+process.exit(0);
+"""
+
+
+def _actions_ids() -> List[str]:
+    return re.findall(r'id="([^"]+)"', read("actions.html"))
+
+
+def _names_part(assignees: List[str]) -> Dict[str, Any]:
+    """A ``parts=names`` answer in the server's shape (WP-44 item 1)."""
+    return {
+        "generated_at": "2026-11-11T12:00:00", "environment": None,
+        "product": None, "stream": 1, "products": [],
+        "environments": ["env-a", "env-b"], "assignees": assignees,
+        "assignment_streams": [], "stale_before": "2026-11-10T00:00:00",
+    }
+
+
+#: One Open Actions row in ``/api/dashboard``'s shape (with_comment,
+#: with_streak), as the play server returned it.
+_ACTIONS_ROW = {
+    "environment": "env-a", "product": "", "script": "s1.py",
+    "test_name": "test_one", "run_id": 7, "result": "FAIL",
+    "start_time": "2026-11-11T02:07:13", "end_time": "2026-11-11T02:07:17",
+    "duration_seconds": 3.4, "known_failure_reason": None,
+    "source_link": None, "assignee": None, "assignment_stream_id": None,
+    "retired_at": None, "retired_by": None, "mute": None,
+    "latest_comment": None, "failing_since": "2026-11-09T02:07:37",
+    "last_pass_time": "2026-11-08T02:07:04",
+    "stability": {"classification": "no-data", "transitions": 0,
+                  "score": 0.0, "runs": 0, "recent_results": []},
+}  # type: Dict[str, Any]
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class OpenActionsCatalogueDomTest(unittest.TestCase):
+    """WP-44 over the DOM shim: the real actions.js, its requests
+    recorded through a load, a filter change and a Reload. No browser;
+    it proves which requests are made and what is drawn, not how."""
+
+    def _walk(self, assignees: List[str], failures: int) -> Dict[str, Any]:
+        return _shim({"ids": _actions_ids(), "names": _names_part(assignees),
+                      "row": _ACTIONS_ROW, "namesFailures": failures},
+                     _ACTIONS_SHIM_DRIVER)
+
+    def test_first_paint_asks_for_names_then_rows_then_expiring(self) -> None:
+        answer = self._walk(["alice"], 0)
+        self.assertEqual(
+            [entry for entry in answer["first"] if entry != "api/users"],
+            ["api/summary?parts=names", "api/dashboard", "api/mutes"])
+        self.assertEqual(answer["envOptions"], ["", "env-a", "env-b"])
+        self.assertEqual(answer["firstRows"], 1)
+        self.assertIsNone(answer["firstBanner"])
+
+    def test_nobody_assigned_still_fetches_the_catalogue_once(self) -> None:
+        """The old gate, ``state.assignees.length``, refetched it on the
+        filter change and on Reload when nobody was assigned."""
+        answer = self._walk([], 0)
+        self.assertEqual(answer["first"].count("api/summary?parts=names"), 1)
+        self.assertNotIn("api/summary?parts=names", answer["later"])
+        self.assertEqual(answer["later"].count("api/dashboard"), 2)
+        self.assertEqual(answer["laterEnvOptions"], ["", "env-a", "env-b"])
+
+    def test_load_more_with_the_catalogue_loaded_is_one_request(self) -> None:
+        for assignees in (["alice"], []):
+            with self.subTest(assignees=assignees):
+                answer = self._walk(assignees, 0)
+                self.assertEqual(answer["more"], ["api/dashboard"])
+                self.assertEqual(answer["moreRows"], 2)
+
+    def test_a_failed_catalogue_shows_its_message_draws_rows_and_retries(
+            self) -> None:
+        """The first refresh after the failure asks again, a load-more
+        included, and lands it; nothing after that asks."""
+        answer = self._walk(["alice"], 1)
+        self.assertEqual(answer["firstBanner"], "names unavailable")
+        self.assertEqual(answer["firstRows"], 1)
+        self.assertEqual(answer["envOptions"], [],
+                         "nothing to fill the filter from yet")
+        self.assertEqual(answer["more"],
+                         ["api/summary?parts=names", "api/dashboard"])
+        self.assertIsNone(answer["moreBanner"])
+        self.assertEqual(answer["moreRows"], 2)
+        self.assertEqual(answer["moreEnvOptions"], ["", "env-a", "env-b"])
+        self.assertNotIn("api/summary?parts=names", answer["later"])
+        self.assertIsNone(answer["laterBanner"])
+
+    def test_load_more_never_hides_a_catalogue_that_is_still_missing(
+            self) -> None:
+        """Found by review: load-more's clearError() wiped the message
+        and, the gate skipping the catalogue on an append, left a page
+        that looked healthy with no filters. Failing twice, the message
+        is still up after load-more, the rows appended."""
+        answer = self._walk(["alice"], 2)
+        self.assertEqual(answer["more"],
+                         ["api/summary?parts=names", "api/dashboard"])
+        self.assertEqual(answer["moreBanner"], "names unavailable")
+        self.assertEqual(answer["moreRows"], 2)
+        self.assertEqual(answer["moreEnvOptions"], [])
+        self.assertEqual(answer["later"].count("api/summary?parts=names"), 1)
+        self.assertEqual(answer["later"][0], "api/summary?parts=names")
+        self.assertIsNone(answer["laterBanner"])
+        self.assertEqual(answer["laterEnvOptions"], ["", "env-a", "env-b"])
 
 
 if __name__ == "__main__":
