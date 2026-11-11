@@ -1135,3 +1135,34 @@ unchanged.
   unassigned flaking tests are left out; the browse Result filter gains
   Flaking; a test going over its cadence reads as a New failure.
   (`ui-engineer`)
+
+## §10 Round 2 review (2026-11-11, in chat, captured verbatim)
+
+Round 2's sections (§2, §3) left no open question; the round 2 performance
+pass (§3c) escalated one item, put to the owner as a question with a
+recommended position. Captured before anything is rewritten.
+
+| Question as put | Answer | Class |
+|---|---|---|
+| The design makes Home's headline slower on MariaDB when a product has marks. Today the headline takes about 45 ms cold. With marks it gains about 6 ms at 50 marks and about 13 ms at 1,000 marks; with no marks it is unchanged; measured on a local MariaDB 12.3, not production's 10.3. Accept that cost? (Offered and not taken: drop the "Newly fixed" rule, saving an estimated 4 to 5 ms at 1,000 marks and nothing at 50) | "Accept the cost (Recommended)": keep the design as it is; if the build measures worse than this on MariaDB, it comes back to the owner before it ships | D |
+
+**Settled by the main session in round 2, not put to the owner,** because
+each follows from a decision already given and only fixes how the two
+layers meet:
+
+- The Flaking filter is a new value of the request's existing `result`
+  parameter and follows the chip, so a muted flaking row counts under FAIL
+  (verdict 7, "Mute wins"). §2 first proposed a separate parameter that left
+  `result=FAIL` meaning what it does today; the one-parameter form was taken
+  so a filtered view is one linkable value. Its cost: once a mark exists,
+  `result=FAIL` alone leaves flaking rows out for every caller of the
+  request, so Open Actions' Failing mode sends both values.
+- The Flaky tab entry's window fields are `recent_failures` and
+  `recent_runs`.
+- The performance pass's round 2 conditions are taken as written (§3c): the
+  New failures queue binds the promoted tests; the cached runs answers are
+  dropped by a push to their stream and carry a time limit and a size cap;
+  the runs statement's members are parenthesised on MariaDB.
+
+**What this changes in the doc as written:** nothing in §2, §3 or §3c. §0,
+§1, §4 and §6 are brought into line with rounds 1 and 2 at the freeze.

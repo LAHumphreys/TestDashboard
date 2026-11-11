@@ -4791,3 +4791,42 @@ filter and the "Failing" exclusion on the browse rows and count; the
 narrowed Open Actions rule; the read that tells the night a test goes over
 its cadence; the performance pass's conditions folded into the backend
 section. Nothing is built.
+
+## Design review: mark a test as flaky, round 2 measured and reviewed (2026-11-11)
+
+Round 2 disposed of the owner's review of round 1: Open Actions narrowed to
+the owner's rule, a Flaking value on the browse page's Result filter, and a
+marked test counted as a New failure on the night it goes over its cadence.
+Both sections were rewritten by the owning agents, the performance engineer
+checked the numbers, and the one escalated item was put to the owner in
+chat; the answer is verbatim in the doc's §10.
+
+Measured (copies of perf-seed/1 and its 90-night variant with the backend
+section's fixture; cold, in-process, alternated; SQLite 24 to 32 calls,
+noise about 0.3 ms; MariaDB on a local 12.3, not production's 10.3, 40
+calls, noise 0.5 to 2.5 ms). Open Actions' rows, leaving out only unassigned
+flaking tests: SQLite +1.0 to +1.2 ms at 50 marks and +1.2 to +1.4 ms at
+1,000; MariaDB +8.8 ms cold and +2.7 ms warm at 50, +10.0 ms cold and
+nothing warm at 1,000, on a base of 83 to 85 ms. With the names-only
+request the page as a whole is faster than today on MariaDB at every mark
+count: 14.5 ms less with no marks, 5.4 less at 50, 1.0 less at 1,000. The
+browse page with no filter chosen, on Home's first paint: unchanged with no
+marks, +0.2 to +0.4 ms on SQLite and +0.5 to +0.7 ms on MariaDB with marks,
+its count statement the same SQL. With Failing or Flaking chosen: +0.6 to
++3.2 ms cold on SQLite, +4 to +8 ms cold on MariaDB, within 0.4 ms warm.
+Home's headline: SQLite +3.4 ms at 50 marks and +6.5 ms at 1,000; MariaDB
++7.2 and +15.2 ms on a base of 44 to 46 ms, of which the promotion's read
+is 0.6 and 1.4 ms.
+
+Decided: the owner accepts the headline's cost on MariaDB, about 6 ms at 50
+marks and 13 ms at 1,000 once the runs statement's members are parenthesised
+(an estimate from the measured figures), with the "Newly fixed" rule kept;
+a worse figure in the build returns to the owner before it ships. The
+backend section binds the flaking set on the browse page and keeps the keys
+form for Open Actions, and the performance pass confirmed the split. Carried
+into the build as conditions: the New failures queue binds the promoted
+tests; cached runs answers are dropped by a push to their stream and carry
+a time limit and a size cap; every MariaDB plan is rechecked on 10.3.
+
+No decision is open. Next: the contract reconciled, the sizing pass and the
+freeze. Nothing is built.
