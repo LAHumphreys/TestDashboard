@@ -4859,3 +4859,22 @@ names-only request is in. A worse figure returns to the owner.
 Before the commit the main session read the doc whole and a fresh-eyes
 reviewer read it for coherence and for the publication gate. The build is
 registered in the handover and waits for the owner's go. Nothing is built.
+
+## WP-44, the build starts; item 1, the names-only summary part (2026-11-11)
+
+The owner gave the go for the build with every item in one drop. The run is
+unattended, on branch `wp-44-flaky-mark`, from a suite green on both
+backends at the frozen design; the status strip is the design doc's §12.
+
+Item 1, `GET /api/summary?parts=names`, is committed: the catalogue the Open
+Actions page reads from the summary, as its own part. `products` carries the
+names only, because the full payload's per-product counts are the headline's
+own pass and the page reads the name and the length; the other four fields
+are held equal to the full payload's in eight scopes. A guard refuses
+sixteen headline, trend and queue reads on the part on both backends, and
+the cold statement count is pinned. The implementer's fast feedback, a copy
+of perf-seed/1 on SQLite, cold: 15.9 to 19.7 ms and 14 or 15 statements
+against 181 to 256 ms for the full payload on the same calls. The measured
+pass of record is 2p, after the UI item. Fresh eyes found nothing to send
+back. Main checkout: 2758 OK (skipped 1) on SQLite, 3783 OK (skipped 80)
+with the MariaDB variants.

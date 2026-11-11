@@ -1339,7 +1339,7 @@ def _summary_queue_totals(
 
 
 #: Valid values of /api/summary's ``parts`` parameter.
-_SUMMARY_PARTS = ("headline", "queue", "assigned_trend")
+_SUMMARY_PARTS = ("headline", "queue", "assigned_trend", "names")
 
 
 def _assigned_trend_nights(
@@ -1447,6 +1447,65 @@ def _products_summary(
         }
         for product in products
     ]
+
+
+def _assignment_streams_json(storage: Storage) -> List[Dict[str, Any]]:
+    """``assignment_streams`` of ``/api/summary`` (WP-21): every
+    non-mainline stream currently annotating an assignment, resolved to
+    its identity and ordered by id (dict iteration order is not a
+    promised sort). Shared by the full payload and ``parts=names``.
+    """
+    assignment_stream_ids = storage.assignment_stream_ids()
+    assignment_streams_by_id = storage.stream_identities(
+        assignment_stream_ids)
+    return [
+        _stream_json(assignment_streams_by_id[sid])
+        for sid in assignment_stream_ids
+        if sid in assignment_streams_by_id
+    ]
+
+
+def _summary_names(
+    storage: Storage,
+    current: datetime.datetime,
+    environment: Optional[str],
+    product: Optional[str],
+    environments: Optional[Sequence[str]],
+    catalog_environments: Optional[Sequence[str]],
+    stream_id: int,
+) -> Dict[str, Any]:
+    """``parts=names`` (WP-44): the catalogue the Open Actions page
+    takes from the summary, and nothing else.
+
+    ``environments``, ``assignees``, ``assignment_streams`` and
+    ``stale_before`` are computed by the same call, with the same
+    arguments, as the full payload's key of the same name for the same
+    query string, so the two cannot drift
+    (``tests/test_api.py::NamesPartTest``). ``products`` is the same
+    list of products in the same order, each entry carrying ``product``
+    only: the shape ``/api/products`` already serves and the switcher
+    reads. The full payload's per-product counts are a pass over
+    mainline's ``latest_runs`` per environment (the headline's own
+    cost, about 80 ms cold on perf-seed/1) that this page never reads.
+    No headline status, trend, queue, ``queue_totals`` or
+    per-environment "last reported" work; ``stale_before`` is the pass
+    view, memoized.
+    """
+    recent_cutoff = _recent_cutoff(storage, current, environments, stream_id)
+    return {
+        "generated_at": model.format_iso(current),
+        "environment": environment,
+        "product": product,
+        "stream": stream_id,
+        "products": [
+            {"product": name} for name in storage.distinct_products()
+        ],
+        "environments": storage.environments(
+            environments=catalog_environments),
+        "assignees": storage.assignees(),
+        "assignment_streams": _assignment_streams_json(storage),
+        "stale_before": model.format_iso(recent_cutoff),
+    }
 
 
 def _handle_metrics(
@@ -1562,6 +1621,15 @@ def _handle_summary(
       the one figure here that reads ``runs`` (measured +14-19 ms cold
       there on the production-scale seed, growing with assignments x
       window x streams).
+    - ``parts=names`` (WP-44) — ``environments``, ``assignees``,
+      ``assignment_streams`` and ``stale_before``, each equal to the
+      full payload's key for the same query string, and ``products``
+      as names only (``[{"product"}]``, the full payload's list without
+      its counts), plus the ``generated_at``/``environment``/
+      ``product``/``stream`` envelope: the catalogue the Open Actions
+      page reads, without the headline, trend and queue work of the
+      full payload it used to fetch on its first paint. See
+      :func:`_summary_names`.
 
     Nothing here is proportional to the size of the estate. The headline
     counts come from a GROUP BY (a few dozen rows however many tests
@@ -1637,6 +1705,13 @@ def _handle_summary(
             catalog_environments = storage.environments_for_product(
                 scoped_stream.product
             )
+    if part == "names":
+        # WP-44: the Open Actions page's catalogue. Branches before the
+        # queues' environment-product lookup, which it does not need.
+        return _json_response(200, _summary_names(
+            storage, now(), environment, product, environments,
+            catalog_environments, stream_id,
+        ))
     # One lookup, threaded through every queue below rather than
     # re-fetched per queue (see _summary_queue_json's docstring).
     env_to_product = storage.environment_products_map()
@@ -1779,14 +1854,7 @@ def _handle_summary(
     # filter reads this the same way it already reads `assignees`
     # below: the available VALUES to filter by, and (empty list) the
     # "zero visible change" signal that no assignment carries a stream.
-    assignment_stream_ids = storage.assignment_stream_ids()
-    assignment_streams_by_id = storage.stream_identities(
-        assignment_stream_ids)
-    assignment_streams = [
-        _stream_json(assignment_streams_by_id[sid])
-        for sid in assignment_stream_ids
-        if sid in assignment_streams_by_id
-    ]
+    assignment_streams = _assignment_streams_json(storage)
     # WP-23 perf pass: every queue's exact total, ONE grouped query
     # (Storage.queue_counts) — reused below for both the headline
     # tab-badge field and, in the full-payload branch, every queue's own

@@ -279,6 +279,10 @@ EXCLUDED_TESTS = {
     "SummaryAssignedSplitTest"
     ".test_the_part_is_one_read_of_runs_cold_none_warm":
         "counts statements with sqlite3's set_trace_callback (WP-43).",
+    "NamesPartTest.test_the_cold_count_is_pinned_and_warm_runs_no_more":
+        "counts statements with sqlite3's set_trace_callback (WP-44). "
+        "That the part runs no headline, trend or queue read is "
+        "test_no_headline_trend_or_queue_read_runs, which runs here.",
     "TestBulkSetAssignee.test_empty_input_issues_no_writes":
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssigneeForTriples."

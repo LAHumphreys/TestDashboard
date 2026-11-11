@@ -1331,10 +1331,10 @@ any interruption is the first line not `done` or `parked`.
 
 | Item | Status | Commit | Note |
 |---|---|---|---|
-| 1 names-only request, backend | in flight | | |
-| 2 names-only request, UI | not started | | |
+| 1 names-only request, backend | done | the commit carrying this line | `products` carries names only (the design's shape; the counted list is the headline's pass); fresh eyes found nothing to send back; 2p is its measured pass |
+| 2 names-only request, UI | in flight | | |
 | 2p measured pass | not started | | |
-| 3 the mark, backend | not started | | |
+| 3 the mark, backend | in flight | | |
 | 3p measured pass | not started | | |
 | 4 marks fixture | not started | | |
 | 5 controls, UI | not started | | |

@@ -7439,3 +7439,211 @@ class SummaryAssignedSplitTest(ApiCase):
         self.assertEqual(len(cold), 2, cold)
         self.assertIn("MIN(EXPIRES_AT)", " ".join(cold[0].split()).upper())
         self.assertEqual(self._selects(query), [])
+
+
+class NamesPartTest(ApiCase):
+    """WP-44: ``parts=names``, the catalogue the Open Actions page reads
+    from the summary on its first paint, without the headline, trend
+    and queue work of the full payload it used to fetch for it.
+
+    Every name is compared against the full payload for the same query
+    string, in every scope the page can ask for, rather than against
+    hand-written values: the contract is "the part cannot drift from
+    the whole". ``products`` is the whole's list by name only; its
+    per-product counts are the headline's per-environment pass.
+    """
+
+    seed = TestSummary.seed
+
+    #: The five names, and the envelope every summary part carries.
+    NAMES = ("assignees", "assignment_streams", "environments", "products",
+             "stale_before")
+    ENVELOPE = ("environment", "generated_at", "product", "stream")
+
+    #: Cold SELECTs of ``parts=names`` on this fixture, unscoped and
+    #: with ``product=``: the pass view behind ``stale_before`` (the
+    #: stream's environments, one count per environment, the declared
+    #: counts, the activity buckets: 3 + 2 here) and one statement per
+    #: catalogue (products, environments, assignees, assignment streams
+    #: and, since one exists here, their identities: 5). ``product=``
+    #: resolves its environments: one more. perf-seed/1 measures 14 and
+    #: 15 (WP-44 item 1): seven environments, no assignments.
+    COLD_SELECTS = 10
+    COLD_SELECTS_PRODUCT = 11
+
+    #: The Storage reads of the headline, trend and queues: none may
+    #: run for this part (``products`` included: its counts are the
+    #: per-environment pass).
+    HEADLINE_READS = (
+        "summary_rollup", "muted_cells", "assigned_cells", "mute_epoch",
+        "assigned_open_count", "queue_counts", "status_queue",
+        "status_queue_count", "daily_result_counts",
+        "daily_assigned_failures", "top_failing_scripts",
+        "latest_run_time", "latest_run_time_by_environment", "scripts",
+        "environment_products_map", "dashboard",
+    )
+
+    def _estate(self) -> int:
+        """TestSummary's estate in two products, a build of Atlas, and
+        one assignment from the build and one from mainline, so every
+        name is non-trivial. Returns the build's stream id."""
+        self.seed()
+        for environment, product in (("linux-sim", "Atlas"),
+                                     ("env2", "Beacon")):
+            self.call(
+                "PUT", "/api/environments/{}/product".format(environment),
+                body={"product": product, "username": "amy"})
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T05:00:03.000000"),
+        ])
+        build_id = self.call(
+            "GET", "/api/streams", query={"product": ["Atlas"]}
+        )["streams"][0]["id"]
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_still_fail",
+                      "/assignee"),
+            body={"username": "alice", "assigned_by": "bob",
+                  "stream_id": build_id})
+        self.call(
+            "PUT", test_path("env2", "smoke.py", "test_first", "/assignee"),
+            body={"username": "bob", "assigned_by": "bob"})
+        return build_id
+
+    def _scopes(self, build_id: int) -> List[Dict[str, List[str]]]:
+        """No product, a product, mainline and a build, and the other
+        scope parameters the summary honours."""
+        build = str(build_id)
+        return [
+            {},
+            {"product": ["Atlas"]},
+            {"product": ["Beacon"]},
+            {"product": ["Nobody"]},
+            {"stream": [build]},
+            {"stream": [build], "product": ["Atlas"]},
+            {"environment": ["env2"]},
+            {"assignee": ["alice"], "days": ["7"]},
+        ]
+
+    def _names(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
+        return self.call(
+            "GET", "/api/summary", query=dict(query, parts=["names"]))
+
+    def test_the_shape(self) -> None:
+        build_id = self._estate()
+        for query in self._scopes(build_id):
+            data = self._names(query)
+            self.assertEqual(
+                sorted(data), sorted(self.NAMES + self.ENVELOPE), query)
+            # Item 6 adds it; until then it is not here.
+            self.assertNotIn("flaky_marks", data)
+            for entry in data["products"]:
+                self.assertEqual(sorted(entry), ["product"])
+
+    def test_each_name_equals_the_full_payload_in_every_scope(self) -> None:
+        build_id = self._estate()
+        for query in self._scopes(build_id):
+            names = self._names(query)
+            full = self.call("GET", "/api/summary", query=query)
+            for key in self.NAMES + self.ENVELOPE:
+                if key == "products":
+                    self.assertEqual(
+                        names[key],
+                        [{"product": entry["product"]}
+                         for entry in full[key]], query)
+                else:
+                    self.assertEqual(names[key], full[key], (key, query))
+        # The fixture makes every name say something.
+        names = self._names({"product": ["Atlas"]})
+        self.assertEqual(
+            names["products"], [{"product": "Atlas"}, {"product": "Beacon"}])
+        self.assertEqual(names["environments"], ["linux-sim"])
+        self.assertEqual(names["assignees"], ["alice", "bob"])
+        self.assertEqual(
+            [stream["id"] for stream in names["assignment_streams"]],
+            [build_id])
+        build = self._names({"stream": [str(build_id)]})
+        self.assertEqual(build["stream"], build_id)
+        self.assertEqual(build["environments"], ["linux-sim"])
+
+    def test_with_no_product_declared_products_is_empty(self) -> None:
+        self.seed()
+        names = self._names({})
+        self.assertEqual(names["products"], [])
+        self.assertEqual(
+            names["products"], self.call("GET", "/api/summary")["products"])
+        self.assertEqual(names["environments"], ["env2", "linux-sim"])
+
+    def test_an_unknown_part_is_a_400_listing_every_part(self) -> None:
+        self.seed()
+        error = self.call(
+            "GET", "/api/summary", query={"parts": ["everything"]},
+            expect=400)["error"]
+        for part in ("headline", "queue", "assigned_trend", "names"):
+            self.assertIn(part, error)
+
+    def test_the_scope_errors_are_the_full_payloads(self) -> None:
+        self.seed()
+        for query, status in (({"stream": ["x"]}, 400),
+                              ({"stream": ["999"]}, 404),
+                              ({"days": ["0"]}, 400)):
+            self.call("GET", "/api/summary", query=query, expect=status)
+            self.call("GET", "/api/summary",
+                      query=dict(query, parts=["names"]), expect=status)
+
+    def test_no_headline_trend_or_queue_read_runs(self) -> None:
+        """By Storage method, so it holds on both backends."""
+        build_id = self._estate()
+        called = []  # type: List[str]
+
+        def refuse(name: str) -> Any:
+            def refused(*args: Any, **kwargs: Any) -> Any:
+                called.append(name)
+                raise AssertionError(name)
+            return refused
+
+        for name in self.HEADLINE_READS:
+            setattr(self.storage, name, refuse(name))
+        try:
+            for query in self._scopes(build_id):
+                self.storage._invalidate_summary_cache()
+                self.storage._invalidate_trend_cache()
+                self._names(query)
+        finally:
+            for name in self.HEADLINE_READS:
+                delattr(self.storage, name)
+        self.assertEqual(called, [])
+
+    # -- the cost (sqlite3's trace callback: excluded on MariaDB) -----
+
+    def _selects(self, query: Dict[str, List[str]]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self._names(query)
+        finally:
+            conn.set_trace_callback(None)
+        return [s for s in seen if s.strip().upper().startswith("SELECT")]
+
+    def _cold_selects(self, query: Dict[str, List[str]]) -> List[str]:
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        return self._selects(query)
+
+    def test_the_cold_count_is_pinned_and_warm_runs_no_more(self) -> None:
+        self._estate()
+        for query, pinned in (({}, self.COLD_SELECTS),
+                              ({"product": ["Atlas"]},
+                               self.COLD_SELECTS_PRODUCT)):
+            cold = self._cold_selects(query)
+            self.assertEqual(len(cold), pinned, cold)
+            warm = self._selects(query)
+            self.assertLessEqual(len(warm), len(cold), warm)
+            for statement in cold:
+                # Neither runs nor the rollup's GROUP BY over latest_runs.
+                flat = " ".join(statement.split()).upper()
+                self.assertNotIn(" RUNS ", flat + " ")
+                self.assertNotIn("PREV_RESULT", flat)
