@@ -6,6 +6,12 @@
   --c-fae: #f9a825;
   --c-up: #7b1fa2;
   --c-assigned: #3b6cc0;  /* WP-43: failing, and someone has it; no result colour */
+  /* WP-44: a marked test failing under its cadence. Two steps of one
+     mauve: the chart segment, and a darker step for chips, row edges
+     and pressed toggles, where white text needs 4.5:1 (4.85 here; the
+     chart step gives 4.15). */
+  --c-flaking: #a66993;
+  --c-flaking-strong: #8f638b;
   --ink: #1f1f1c;
   --muted: #6b6b66;
   --border: #e3e3df;
@@ -184,6 +190,9 @@ textarea {
 .chip.result-unexpected-pass,
 .toggle.result-unexpected-pass[aria-pressed="true"] { background: var(--c-up); color: #fff; border-color: transparent; }
 
+/* FLAKING is a displayed result, never a wire one (api.js's displayResult). */
+.chip.result-flaking { background: var(--c-flaking-strong); color: #fff; border-color: transparent; }
+
 /* ---------- Filters ---------- */
 
 .filter-row {
@@ -289,6 +298,7 @@ tr.result-pass { box-shadow: inset 3px 0 0 var(--c-pass); }
 tr.result-fail { box-shadow: inset 3px 0 0 var(--c-fail); }
 tr.result-failed-as-expected { box-shadow: inset 3px 0 0 var(--c-fae); }
 tr.result-unexpected-pass { box-shadow: inset 3px 0 0 var(--c-up); }
+tr.result-flaking { box-shadow: inset 3px 0 0 var(--c-flaking-strong); }
 
 /* ---------- Detail page ---------- */
 
@@ -977,13 +987,40 @@ button.bar-row:focus-visible {
   border-left-color: #b8860b;
 }
 
-.mute-reason-input {
+/* A flaky mark (WP-44): the same annotation, edged in the flaking
+ * colour. The sentence takes a line of its own so the controls wrap
+ * under it rather than beside a long title. */
+.known-failure.is-flaky {
+  flex-wrap: wrap;
+  border-color: var(--grid);
+  border-left-color: var(--c-flaking-strong);
+}
+
+.flaky-sentence {
+  flex: 1 0 100%;
+  font-size: 13px;
+}
+
+/* The Flakiness card's mark: the mark in words, or the button that
+ * opens the form to make one, which wraps inside the card. */
+.flaky-mark {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.mute-reason-input,
+.flaky-reason-input {
   flex: 1 1 220px;
   min-width: 160px;
 }
 
 .review-duration-select,
-.selection-duration-select {
+.selection-duration-select,
+.review-cadence-select,
+.selection-cadence-select {
   font: inherit;
   padding: 4px 6px;
 }
@@ -993,8 +1030,10 @@ button.bar-row:focus-visible {
   margin-right: 8px;
 }
 
-/* A small pill beside a result chip: this failure is muted. */
-.mute-tag {
+/* A small pill beside a result chip: this failure is muted, or this
+ * test carries a flaky mark it is not FLAKING under right now. */
+.mute-tag,
+.flaky-tag {
   display: inline-block;
   margin-left: 6px;
   padding: 1px 7px;
@@ -2456,6 +2495,8 @@ body.has-selection-bar { padding-bottom: 60px; }
 .selection-comment-btn:disabled,
 .selection-mute-btn:disabled,
 .selection-unmute-btn:disabled,
+.selection-flaky-btn:disabled,
+.selection-unmark-btn:disabled,
 .selection-unassign-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;

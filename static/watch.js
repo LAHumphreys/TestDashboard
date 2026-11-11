@@ -15,6 +15,7 @@
 "use strict";
 
 import {
+  ageText,
   clearError,
   clearNode,
   el,
@@ -24,7 +25,7 @@ import {
   mutedSuffix,
   showError,
 } from "./api.js";
-import { CATEGORY_LABELS, CATEGORY_ORDER, ageText } from "./compare.js";
+import { CATEGORY_LABELS, CATEGORY_ORDER } from "./compare.js";
 import { pageUrl } from "./urls.js";
 
 /** localStorage key holding this browser's default Watchlist query. */

@@ -32,6 +32,7 @@ begins with a second one.
 Python 3.6 compatible; standard library only.
 """
 
+import datetime
 import io
 import json
 import os
@@ -6756,6 +6757,872 @@ class OpenActionsCatalogueDomTest(unittest.TestCase):
         self.assertEqual(answer["later"][0], "api/summary?parts=names")
         self.assertIsNone(answer["laterBanner"])
         self.assertEqual(answer["laterEnvOptions"], ["", "env-a", "env-b"])
+
+
+#: The words a flaky mark is spoken in (WP-44, docs/design/flaky-mark-r0.md
+#: §3 U2), matched case-insensitively inside string literals: FLAKING and
+#: the sentences that say where a marked test stands, and "flips", the
+#: computed signal's word since decision 6 gave "flaky" to the mark.
+_FLAKY_WORDS = ("flaking", "marked flaky", "flips")
+
+#: Any one-line JavaScript string literal, in either quote, or a template.
+_STRING_LITERAL_RE = re.compile(
+    r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|`(?:[^`\\]|\\.)*`')
+
+
+def _flaky_wording_offenders(source: str) -> List[str]:
+    """The string literals in *source*'s code that spell a flaky word,
+    or start the way cadenceWords() ends (" in a row", someone rebuilding
+    "3 in a row" by hand)."""
+    found = []  # type: List[str]
+    for literal in _STRING_LITERAL_RE.findall(_strip_comments(source)):
+        text = literal[1:-1].lower()
+        if (any(word in text for word in _FLAKY_WORDS)
+                or re.match(r"\s*in a row", text)):
+            found.append(literal[1:-1])
+    return found
+
+
+#: The helpers this item's surfaces call (U2's list as built; the rest
+#: of U2 arrives with the items that call it).
+_FLAKY_HELPERS = (
+    "displayResult", "flakyTag", "flakySentence", "flakyDetail",
+    "flakyMarkWords", "cadenceWords", "cadenceSentence",
+    "flakyCadenceSelect", "stabilityWord",
+)
+
+
+class FlakyWordingTest(unittest.TestCase):
+    """WP-44: every word about a flaky mark is made in api.js and nowhere
+    else, so the selection bar, the Review panel, the test page and the
+    lists to come cannot drift apart. FLAKING is a displayed result made
+    by one helper; the wire, sorting and filters keep FAIL."""
+
+    def test_the_flaky_words_are_spelled_only_in_api_js(self) -> None:
+        offenders = {
+            name: _flaky_wording_offenders(source)
+            for name, source in scripts().items() if name != "api.js"
+        }
+        self.assertEqual(
+            {name: found for name, found in offenders.items() if found}, {},
+            "flaky wording outside api.js; call its helpers instead")
+        # And api.js does spell them, or the scan proves nothing.
+        api = _flaky_wording_offenders(read("api.js"))
+        for needle in ("FLAKING", "Flaking: ", "Marked flaky, ",
+                       " in a row", "flips about 1 run in ", "flips often"):
+            self.assertTrue(any(needle in text for text in api), needle)
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: each way a page could make the words itself."""
+        for planted in (
+                'resultCell.appendChild(el("span", "chip", "FLAKING"));',
+                'if (entry.flaky && entry.flaky.state === "flaking") {}',
+                "const words = cadence + ' in a row';",
+                'line.textContent = "Marked flaky, " + n;',
+                'return "flaky — flips about 1 run in " + period;'):
+            self.assertTrue(_flaky_wording_offenders(planted), planted)
+        self.assertEqual(_flaky_wording_offenders(
+            '// FLAKING is made in api.js\nconst a = "Mark as flaky";'), [])
+
+    def test_displayResult_is_the_one_place_FLAKING_is_made(self) -> None:
+        api = _strip_comments(read("api.js"))
+        body = _function_body(
+            api, "export function displayResult(result, flakyState, muted)")
+        self.assertIn('"FLAKING"', body)
+        self.assertIn('flakyState === "flaking"', body)
+        self.assertIn("!muted", body)
+        # It returns a label; it never rewrites the entry it read.
+        self.assertIsNone(re.search(r"\.result\s*=[^=]", body))
+        allowed = sum(
+            _function_body(api, signature).count('"FLAKING"')
+            for signature in ("export function displayResult(",
+                              "export function resultClass(",
+                              "export function flakyTag("))
+        self.assertEqual(api.count('"FLAKING"'), allowed)
+        self.assertIn('case "FLAKING": return "result-flaking";',
+                      _function_body(api, "export function resultClass("))
+
+    def test_every_flaky_helper_has_a_caller(self) -> None:
+        """No dead helpers: each one this item writes is called."""
+        code = {name: _strip_comments(source)
+                for name, source in scripts().items()}
+        api_exports = _exported_names(read("api.js"))
+        for helper in _FLAKY_HELPERS:
+            self.assertIn(helper, api_exports, helper)
+            calls = sum(
+                len(_call_arguments(source, helper))
+                for source in code.values())
+            self.assertGreater(calls, 0, helper + " has no caller")
+
+    def test_the_computed_signal_says_flips(self) -> None:
+        """Decision 6: "flaky" on screen means the mark."""
+        api = _strip_comments(read("api.js"))
+        sentence = _function_body(api, "export function stabilitySentence(")
+        self.assertIn('"flips about 1 run in "', sentence)
+        self.assertNotIn("flaky —", sentence)
+        self.assertIn('"flips often"',
+                      _function_body(api, "export function stabilityWord("))
+        card = _function_body(
+            _strip_comments(read("test.js")), "function renderFlakiness(")
+        self.assertIn("stabilityWord(flakiness.classification)", card)
+        self.assertNotIn('"big", flakiness.classification', card)
+
+    def test_the_two_tokens_and_the_flaking_class(self) -> None:
+        css = read_text("style.css")
+        root = css[css.index(":root {"):css.index("}", css.index(":root {"))]
+        self.assertIn("--c-flaking: #a66993;", root)
+        self.assertIn("--c-flaking-strong: #8f638b;", root)
+        rules = [line for line in css.split("\n")
+                 if "result-flaking" in line and "{" in line]
+        self.assertEqual(sorted(rule.split("{")[0].strip() for rule in rules),
+                         [".chip.result-flaking", "tr.result-flaking"])
+        for rule in rules:
+            # Chips and row edges take the strong step, never the chart's.
+            self.assertIn("var(--c-flaking-strong)", rule)
+            self.assertNotIn("var(--c-flaking)", rule)
+        self.assertIn("color: #fff", [r for r in rules if ".chip" in r][0])
+
+
+#: Spellings that would name an owner for a mark (decision 12): the
+#: person marking owns it, so a flaky act never reads the bar's
+#: "Assign to" box nor sends an assignee.
+_FLAKY_OWNER_TOKENS = ("userSelectEl", "userPickerSelect", "assignee",
+                       "marked_by")
+
+
+def _owner_tokens(body: str) -> List[str]:
+    return [token for token in _FLAKY_OWNER_TOKENS if token in body]
+
+
+class FlakyMarkControlsTest(unittest.TestCase):
+    """WP-44 item 5: mark, change the cadence and unmark from the
+    selection bar, the Review panel and the test page, each built like
+    its mute sibling and refreshed the way a mute refreshes."""
+
+    def test_the_two_urls_clear_every_scope_level(self) -> None:
+        urls = _strip_comments(read("urls.js"))
+        for signature, endpoint in (
+                ("export function bulkFlakyUrl(", '"api/flaky/bulk"'),
+                ("export function unmarkFlakyUrl(", '"api/flaky/unmark"')):
+            body = _function_body(urls, signature)
+            self.assertIn(endpoint, body)
+            for level in ("product", "stream", "baseline", "environment"):
+                self.assertIn(level + ": null", body, signature + level)
+
+    def test_the_bar_group_follows_mute(self) -> None:
+        bar = _function_body(
+            _strip_comments(read("selection.js")), "function ensureBar(")
+        order = [bar.index(needle) for needle in (
+            "barEl.appendChild(unmuteBtnEl)",
+            'flakyCadenceEl = flakyCadenceSelect("selection-cadence-select")',
+            "barEl.appendChild(flakyBtnEl)",
+            "barEl.appendChild(unmarkBtnEl)",
+            '"Clear selection"')]
+        self.assertEqual(order, sorted(order))
+
+    def test_the_bar_asks_for_the_reason_before_the_server_does(
+            self) -> None:
+        code = _strip_comments(read("selection.js"))
+        gate = _function_body(code, "function updateFlakyButtonState(")
+        for needle in ("selected.size === 0", "!flakyCadenceEl.value",
+                       "noteInputEl.value.trim()", "allSelectedMarked()",
+                       '"Set cadence"', '"Mark as flaky"'):
+            self.assertIn(needle, gate)
+        self.assertIn("updateFlakyButtonState()", _function_body(
+            code, "function updateCommentButtonState("))
+        self.assertIn(
+            'flakyCadenceEl.addEventListener("change", updateFlakyButtonState)',
+            code)
+        self.assertIn("marked: Boolean(entry.flaky)",
+                      _function_body(code, "function rowCell("))
+
+    def test_the_bar_acts_post_the_mark_and_name_no_owner(self) -> None:
+        code = _strip_comments(read("selection.js"))
+        mark = _function_body(code, "async function doMarkFlaky(")
+        unmark = _function_body(code, "async function doUnmarkFlaky(")
+        gate = _function_body(code, "function updateFlakyButtonState(")
+        for needle in ("postJson(bulkFlakyUrl(), body)", "cadence: cadence",
+                       "tests: testsPayload()", "body.reason = reason",
+                       'noteInputEl.value = ""', 'flakyCadenceEl.value = ""',
+                       "clearSelection()", "notifyChanged()"):
+            self.assertIn(needle, mark)
+        self.assertIn(
+            "postJson(unmarkFlakyUrl(), { username: me, tests: testsPayload() })",
+            unmark)
+        for body in (mark, unmark, gate):
+            self.assertEqual(_owner_tokens(body), [])
+
+    def test_an_owner_read_would_be_caught(self) -> None:
+        planted = ("async function doMarkFlaky() {\n"
+                   "  const owner = userSelectEl.value;\n"
+                   "  await postJson(bulkFlakyUrl(), { assignee: owner });\n"
+                   "}\n")
+        self.assertEqual(_owner_tokens(planted), ["userSelectEl", "assignee"])
+
+    def test_the_review_panel_offers_both_forms(self) -> None:
+        code = _strip_comments(read("review.js"))
+        group = _function_body(code, "function buildFlakyGroup(")
+        for needle in ("entry.flaky || null", "flakySentence(flaky, muteLive)",
+                       "flakyDetail(flaky)",
+                       'flakyCadenceSelect("review-cadence-select", flaky.cadence)',
+                       'flakyCadenceSelect("review-cadence-select")',
+                       '"Set cadence"', '"Unmark"', '"Mark as flaky"',
+                       "bulkFlakyUrl()", "unmarkFlakyUrl()",
+                       'afterStandingChange(opts, "flaky")'):
+            self.assertIn(needle, group)
+        self.assertEqual(_owner_tokens(group), [])
+        self.assertIn("buildFlakyGroup(entry, opts)",
+                      _function_body(code, "function buildReviewActions("))
+        # A mark refreshes exactly as a mute does.
+        self.assertIn('afterStandingChange(opts, "muted")',
+                      _function_body(code, "function buildMuteGroup("))
+
+    def test_the_test_page_draws_the_mark_from_the_detail(self) -> None:
+        """The mark and its history ride the detail: nothing fetches."""
+        code = _strip_comments(read("test.js"))
+        self.assertIn("detail.flaky || null",
+                      _function_body(code, "function renderFlaky("))
+        self.assertIn("detail.flaky_history",
+                      _function_body(code, "function renderFlaky("))
+        for signature in ("function renderFlaky(", "function renderFlakyBanner(",
+                          "function renderFlakyCard(", "function openFlakyForm(",
+                          "function renderFlakyHistory("):
+            body = _function_body(code, signature)
+            self.assertTrue(body, signature)
+            self.assertNotIn("fetchJson(", body, signature)
+            self.assertEqual(_owner_tokens(body), [], signature)
+        refresh = _function_body(code, "async function refreshActs(")
+        for needle in ("fetchJson(detailUrl())", "renderLatest(detail.latest, detail)",
+                       "renderMute(detail)", "renderFlaky(detail)"):
+            self.assertIn(needle, refresh)
+        self.assertIn("await refreshActs()",
+                      _function_body(code, "async function postAct("))
+        html = read("test.html")
+        self.assertLess(html.index('id="mute-banner"'),
+                        html.index('id="flaky-banner"'))
+        self.assertLess(html.index('id="flakiness"'),
+                        html.index('id="flaky-mark"'))
+        history = html[html.index('id="flaky-history-section"'):]
+        history = history[:history.index("</section>")]
+        self.assertEqual(re.findall(r"<th>([^<]+)</th>", history),
+                         ["Action", "By", "When (UTC)", "Cadence", "Reason"])
+
+    def test_the_header_reads_the_mark_and_history_stays_raw(self) -> None:
+        """Decision 9: a run is what happened, so run history and the
+        compare strip show the wire result; the header shows what the
+        test reads as now."""
+        code = _strip_comments(read("test.js"))
+        latest = _function_body(code, "function renderLatest(")
+        self.assertRegex(latest, r"resultChip\(\s*displayResult\(latest\.result")
+        self.assertNotIn("resultChip(latest.result)", latest)
+        self.assertIn("flakyTag(", latest)
+        self.assertIn("resultChip(run.result)",
+                      _function_body(code, "function appendHistoryRow("))
+        for signature in ("function appendHistoryRow(",
+                          "async function loadCompareStrip("):
+            self.assertNotIn("displayResult(", _function_body(code, signature))
+
+    def test_one_mark_controls_share_their_words_from_api_js(self) -> None:
+        """Review: the panel's and the page's titles were two copies,
+        and only the page's reason box had an accessible label."""
+        api = _strip_comments(read("api.js"))
+        for name in ("FLAKY_CADENCE_TITLE", "FLAKY_UNMARK_TITLE",
+                     "FLAKY_REASON_PLACEHOLDER", "FLAKY_REASON_LABEL"):
+            self.assertIn("export const " + name + " = ", api)
+        for name in ("review.js", "test.js"):
+            code = _strip_comments(read(name))
+            for needle in ("change.title = FLAKY_CADENCE_TITLE",
+                           "unmark.title = FLAKY_UNMARK_TITLE",
+                           "reason.placeholder = FLAKY_REASON_PLACEHOLDER",
+                           'reason.setAttribute("aria-label", '
+                           "FLAKY_REASON_LABEL)",
+                           "cadenceChanged(cadence, flaky)"):
+                self.assertIn(needle, code, name)
+            for words in ("The mark keeps its owner", "Remove the flaky mark",
+                          "Why is this test flaky"):
+                self.assertNotIn(words, code, name)
+
+    def test_no_user_string_reaches_innerHTML(self) -> None:
+        for name in ("selection.js", "review.js", "test.js", "api.js"):
+            self.assertNotIn("innerHTML", _strip_comments(read(name)), name)
+
+
+def _iso_days_ago(days: float) -> str:
+    moment = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=days))
+    return moment.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _flaky(state: Any, streak: Any = None, runs: Any = None) -> Dict[str, Any]:
+    """A test detail's or a row's ``flaky`` in the server's shape,
+    marked 12 days ago."""
+    return {"cadence": 3, "marked_by": "dev1",
+            "marked_at": _iso_days_ago(12.1), "reason": "race in teardown",
+            "state": state, "streak": streak, "runs": runs}
+
+
+_LIVE_MUTE = {
+    "live": True, "muted_by": "dev2", "reason": "infra outage",
+    "expires_at": _iso_days_ago(-2), "extensions": 0,
+}  # type: Dict[str, Any]
+
+
+def _test_detail(result: str, flaky: Any = "absent",
+                 mute: Any = None) -> Dict[str, Any]:
+    """``GET /api/tests/...`` in the server's shape; ``flaky="absent"``
+    is a server from before WP-44."""
+    detail = {
+        "environment": "env-a", "script": "s1.py", "test_name": "t1",
+        "source_link": None, "assignee": None,
+        "latest": {"run_id": 7, "result": result,
+                   "start_time": "2026-11-10T02:14:00",
+                   "duration_seconds": 41.2, "known_failure_reason": None},
+        "analytics": {
+            "window": {"max_days": 90, "max_runs": 200, "run_count": 12,
+                       "from": "2026-10-01T02:00:00",
+                       "to": "2026-11-10T02:14:00"},
+            "failing_since": None, "last_pass_before_failure": None,
+            "flakiness": {"classification": "flaky", "score": 0.4,
+                          "transitions": 5},
+            "duration_seconds": None, "day_of_week": [], "by_day": [],
+        },
+        "stream": None, "stream_identity": None, "mute": mute,
+        "mute_history": [],
+    }  # type: Dict[str, Any]
+    if flaky != "absent":
+        detail["flaky"] = flaky
+        detail["flaky_history"] = [] if flaky is None else [
+            {"id": 1, "action": "mark", "cadence": 3,
+             "reason": "race in teardown", "actor": "dev1",
+             "acted_at": "2026-11-01T02:00:00"}]
+    return detail
+
+
+#: The flaky walks: the real test.js, selection.js or review.js over the
+#: shim, fetch answered from the fixture and every request recorded, one
+#: act performed. argv: repo root, fixture path.
+_FLAKY_SHIM_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom, Element } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, fixture.url);
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+window.localStorage.setItem("testboard.username", "dev1");
+Element.prototype.focus = function () {};
+const asked = [];
+let acted = false;
+globalThis.fetch = (url, opts) => {
+  const u = new URL(String(url), "http://127.0.0.1/");
+  const path = decodeURIComponent(u.pathname.replace(/^\//, ""));
+  const method = (opts && opts.method) || "GET";
+  asked.push({ path, method,
+    body: opts && opts.body ? JSON.parse(opts.body) : null });
+  let body = {};
+  if (method === "POST") {
+    acted = true;
+    body = path.endsWith("unmark") ? { unmarked: 1 }
+      : { marked: 1, changed: 0, unchanged: 0, unknown: 0 };
+  } else if (path === "api/users") {
+    body = { users: [] };
+  } else if (path.startsWith("api/runs/")) {
+    body = { output: "boom" };
+  } else if (path.endsWith("/history")) {
+    body = { runs: [] };
+  } else if (path.endsWith("/comments")) {
+    body = { comments: [], streams: {} };
+  } else if (path.endsWith("/streams")) {
+    body = { results: [], product: null };
+  } else if (path.startsWith("api/tests/")) {
+    body = acted && fixture.after ? fixture.after : fixture.detail;
+  }
+  const answer = (status) => ({ ok: status < 400, status,
+    text: async () => JSON.stringify(
+      status < 400 ? body : { error: "server says no" }) });
+  if (method === "POST" && fixture.hold) {
+    // Held until the walk calls release(), answering postStatus then.
+    return new Promise((resolve) => {
+      release = () => resolve(answer(fixture.postStatus || 200));
+    });
+  }
+  return Promise.resolve(answer(200));
+};
+let release = null;
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+const button = (node, text) => node.find(
+  (c) => c.tagName === "BUTTON" && c.textContent === text)[0] || null;
+const errorShown = () => (byId["error-banner"].hidden
+  ? null : byId["error-banner"].textContent);
+const posts = () => asked.filter((a) => a.method === "POST")
+  .map((a) => [a.path, a.body]);
+const words = (node) => node.children
+  .filter((c) => c.tagName !== "SELECT").map((c) => c.textContent);
+const out = {};
+if (fixture.surface === "test") {
+  const page = () => {
+    const latest = byId["latest-run"];
+    const chip = latest.children.find(
+      (c) => String(c.className).startsWith("chip"));
+    const tag = latest.children.find((c) => c.className === "flaky-tag");
+    return {
+      chip: chip ? [chip.className, chip.textContent] : null,
+      tag: tag ? [tag.textContent, tag.title] : null,
+      banner: byId["flaky-banner"].hidden ? null : words(byId["flaky-banner"]),
+      card: words(byId["flaky-mark"]),
+      signal: byId["flakiness"].children[0].textContent,
+      historyHidden: byId["flaky-history-section"].hidden,
+      history: byId["flaky-history-body"].children.map((tr) => words(tr)),
+    };
+  };
+  await import(pathToFileURL(root + "/static/test.js").href);
+  await settle();
+  out.first = page();
+  out.firstAsked = asked.map((a) => a.method + " " + a.path);
+  const before = asked.length;
+  if (fixture.act === "mark") {
+    const box = byId["flaky-mark"];
+    await button(box, "Mark as flaky").click();
+    out.form = box.children.map((c) => c.tagName);
+    await button(box, "Mark as flaky").click();
+    out.emptyError = errorShown();
+    out.emptyPosts = posts().length;
+    box.children.find((c) => c.tagName === "INPUT").value = "race in teardown";
+    box.children.find((c) => c.tagName === "SELECT").value = "3";
+    await button(box, "Mark as flaky").click();
+  } else if (fixture.act === "cadence") {
+    const banner = byId["flaky-banner"];
+    const select = banner.children.find((c) => c.tagName === "SELECT");
+    const set = button(banner, "Set cadence");
+    out.selectValue = select.value;
+    out.setDisabledAtFirst = set.disabled;
+    select.value = "5";
+    await select.dispatch("change");
+    out.setDisabledAfter = set.disabled;
+    await set.click();
+  } else if (fixture.act === "unmark") {
+    await button(byId["flaky-banner"], "Unmark").click();
+  } else if (fixture.act === "cadence-fail") {
+    // Choose 5, send, and while it is out go back to the mark's own 3;
+    // the request then fails.
+    const banner = byId["flaky-banner"];
+    const select = banner.children.find((c) => c.tagName === "SELECT");
+    const set = button(banner, "Set cadence");
+    const unmark = button(banner, "Unmark");
+    select.value = "5";
+    await select.dispatch("change");
+    set.click();
+    await settle();
+    select.value = "3";
+    await select.dispatch("change");
+    out.inFlight = [set.disabled, unmark.disabled];
+    set.click();
+    unmark.click();
+    await settle();
+    out.postsInFlight = posts().length;
+    release();
+    await settle();
+    out.afterFail = [set.disabled, unmark.disabled, errorShown()];
+    select.value = "5";
+    await select.dispatch("change");
+    out.rechosen = set.disabled;
+  }
+  await settle();
+  out.after = page();
+  out.later = asked.slice(before).map((a) => a.method + " " + a.path);
+} else if (fixture.surface === "bar") {
+  const { mountSelectableTable } = await import(
+    pathToFileURL(root + "/static/selection.js").href);
+  let changed = 0;
+  const mount = mountSelectableTable(document.createElement("table"),
+    { onChanged: () => { changed += 1; } });
+  const bar = document.body.children.find((c) => c.className === "selection-bar");
+  const part = (cls) => bar.children.find((c) => c.className === cls);
+  const flakyBtn = part("selection-flaky-btn");
+  const cadence = part("selection-cadence-select");
+  const note = part("selection-note-input");
+  const tick = async () => {
+    for (const row of fixture.rows) {
+      const box = mount.rowCell(row).children[0];
+      box.checked = true;
+      await box.dispatch("change");
+    }
+  };
+  const seen = () => [flakyBtn.textContent, flakyBtn.disabled];
+  out.order = bar.children.map((c) => c.className || c.textContent);
+  const unmarkBtn = part("selection-unmark-btn");
+  if (fixture.act === "midflight") {
+    // Send a mark, then while it is out type, re-choose, tick a row and
+    // click both buttons: nothing may re-arm or send.
+    await tick();
+    cadence.value = "3";
+    await cadence.dispatch("change");
+    note.value = "race";
+    await note.dispatch("input");
+    flakyBtn.click();
+    await settle();
+    out.inFlight = [];
+    note.value = "race in teardown";
+    await note.dispatch("input");
+    out.inFlight.push([flakyBtn.disabled, unmarkBtn.disabled]);
+    await cadence.dispatch("change");
+    out.inFlight.push([flakyBtn.disabled, unmarkBtn.disabled]);
+    const box = mount.rowCell(fixture.extra).children[0];
+    box.checked = true;
+    await box.dispatch("change");
+    out.inFlight.push([flakyBtn.disabled, unmarkBtn.disabled]);
+    flakyBtn.click();
+    unmarkBtn.click();
+    await settle();
+    out.postsInFlight = posts().length;
+    release();
+    await settle();
+    out.afterRelease = [bar.hidden, changed];
+    out.posts = posts();
+    console.log(JSON.stringify(out));
+    process.exit(0);
+  }
+  await tick();
+  out.ticked = seen();
+  cadence.value = "3";
+  await cadence.dispatch("change");
+  out.withCadence = seen();
+  note.value = "race in teardown";
+  await note.dispatch("input");
+  out.withReason = seen();
+  await flakyBtn.click();
+  await settle();
+  out.afterMark = { hidden: bar.hidden, changed, note: note.value,
+    cadence: cadence.value };
+  await tick();
+  await part("selection-unmark-btn").click();
+  await settle();
+  out.afterUnmark = { hidden: bar.hidden, changed };
+} else {
+  const { toggleReview } = await import(
+    pathToFileURL(root + "/static/review.js").href);
+  let reloads = 0;
+  const tbody = document.createElement("tbody");
+  const row = document.createElement("tr");
+  row.appendChild(document.createElement("td"));
+  tbody.appendChild(row);
+  toggleReview(fixture.entry, row, document.createElement("button"),
+    { onMuted: () => { reloads += 1; } });
+  await settle();
+  const panel = row.nextSibling;
+  out.labels = panel.find((c) => c.className === "review-label")
+    .map((c) => c.textContent);
+  const group = panel.find((c) => c.className === "review-label"
+    && c.textContent === "Flaky")[0].parentNode;
+  out.group = group.children.map((c) => [c.tagName,
+    c.tagName === "SELECT" ? c.value
+      : c.tagName === "SPAN" ? c.children.map((x) => x.textContent)
+        : (c.placeholder || c.textContent)]);
+  if (fixture.act === "mark") {
+    await button(group, "Mark as flaky").click();
+    out.emptyError = errorShown();
+    out.emptyPosts = posts().length;
+    group.children.find((c) => c.tagName === "INPUT").value = "race in teardown";
+    group.children.find((c) => c.tagName === "SELECT").value = "3";
+    await button(group, "Mark as flaky").click();
+  } else if (fixture.act === "cadence") {
+    const select = group.children.find((c) => c.tagName === "SELECT");
+    const set = button(group, "Set cadence");
+    out.setDisabledAtFirst = set.disabled;
+    select.value = "5";
+    await select.dispatch("change");
+    out.setDisabledAfter = set.disabled;
+    await set.click();
+  } else if (fixture.act === "cadence-fail") {
+    const select = group.children.find((c) => c.tagName === "SELECT");
+    const set = button(group, "Set cadence");
+    const unmark = button(group, "Unmark");
+    select.value = "5";
+    await select.dispatch("change");
+    set.click();
+    await settle();
+    select.value = "3";
+    await select.dispatch("change");
+    out.inFlight = [set.disabled, unmark.disabled];
+    set.click();
+    unmark.click();
+    await settle();
+    out.postsInFlight = posts().length;
+    release();
+    await settle();
+    out.afterFail = [set.disabled, unmark.disabled, errorShown()];
+    select.value = "5";
+    await select.dispatch("change");
+    out.rechosen = set.disabled;
+  } else {
+    await button(group, "Unmark").click();
+  }
+  await settle();
+  out.reloads = reloads;
+}
+out.posts = posts();
+// ASCII only: the reader decodes stdout in the locale's encoding, and
+// the board's words carry "·" and "…".
+console.log(JSON.stringify(out).replace(/[\u007f-￿]/g,
+  (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")));
+process.exit(0);
+"""
+
+_ONE_TEST = {"environment": "env-a", "script": "s1.py",
+             "test_name": "t1"}  # type: Dict[str, Any]
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class FlakyMarkDomTest(unittest.TestCase):
+    """WP-44 item 5 over the DOM shim: the test page, the selection bar
+    and the Review panel, each made to mark, change a cadence and
+    unmark. No browser; it proves the requests and the DOM drawn, not
+    the look."""
+
+    #: A POST held until the walk releases it, then failing.
+    _HELD_FAILING = {"hold": True, "postStatus": 500}  # type: Dict[str, Any]
+
+    def _page(self, detail: Dict[str, Any], act: Any = None,
+              after: Any = None, **extra: Any) -> Dict[str, Any]:
+        fixture = {
+            "surface": "test", "act": act, "detail": detail, "after": after,
+            "ids": re.findall(r'id="([^"]+)"', read("test.html")),
+            "url": "http://127.0.0.1/test.html?environment=env-a"
+                   "&script=s1.py&test_name=t1"}  # type: Dict[str, Any]
+        fixture.update(extra)
+        return _shim(fixture, _FLAKY_SHIM_DRIVER)
+
+    def _bar(self, rows: List[Dict[str, Any]],
+             **extra: Any) -> Dict[str, Any]:
+        fixture = {"surface": "bar", "rows": rows, "ids": ["error-banner"],
+                   "url": "http://127.0.0.1/index.html"}  # type: Dict[str, Any]
+        fixture.update(extra)
+        return _shim(fixture, _FLAKY_SHIM_DRIVER)
+
+    def _panel(self, entry: Dict[str, Any], act: str,
+               **extra: Any) -> Dict[str, Any]:
+        fixture = {"surface": "panel", "entry": entry, "act": act,
+                   "ids": ["error-banner"],
+                   "url": "http://127.0.0.1/index.html"}  # type: Dict[str, Any]
+        fixture.update(extra)
+        return _shim(fixture, _FLAKY_SHIM_DRIVER)
+
+    def test_nothing_rearms_the_bar_while_a_flaky_request_is_out(
+            self) -> None:
+        """Review: a keystroke in the note box, a cadence change or a
+        ticked row re-enabled a Flaky button mid-flight, and a second
+        click sent a second request. One in-flight flag now holds both."""
+        answer = self._bar([dict(_ONE_TEST)], act="midflight", hold=True,
+                           extra=dict(_ONE_TEST, test_name="t2"))
+        self.assertEqual(answer["inFlight"],
+                         [[True, True], [True, True], [True, True]])
+        self.assertEqual(answer["postsInFlight"], 1)
+        self.assertEqual(answer["afterRelease"], [True, 1])
+        self.assertEqual([post[0] for post in answer["posts"]],
+                         ["api/flaky/bulk"])
+
+    def test_a_failed_set_cadence_returns_to_the_derived_state(
+            self) -> None:
+        """Review: a failure re-enabled every button, so Set cadence came
+        back enabled on the mark's own cadence. Now: disabled while out,
+        no second request, and after the failure disabled again while
+        the cadence is unchanged, enabled once it differs."""
+        marked = _test_detail("FAIL", _flaky("flaking", 1))
+        entry = dict(_ONE_TEST, run_id=7, result="FAIL",
+                     start_time="2026-11-10T02:14:00", assignee=None,
+                     mute=None, flaky=_flaky("flaking", 1))
+        for surface, answer in (
+                ("test page", self._page(marked, "cadence-fail",
+                                         **self._HELD_FAILING)),
+                ("panel", self._panel(entry, "cadence-fail",
+                                      **self._HELD_FAILING))):
+            with self.subTest(surface=surface):
+                self.assertEqual(answer["inFlight"], [True, True])
+                self.assertEqual(answer["postsInFlight"], 1)
+                self.assertEqual(answer["afterFail"],
+                                 [True, False, "server says no"])
+                self.assertFalse(answer["rechosen"])
+        self.assertEqual(self._panel(entry, "cadence-fail",
+                                     **self._HELD_FAILING)["reloads"], 0)
+
+    def test_an_unmarked_test_page_is_todays_page_with_the_offer(
+            self) -> None:
+        """No ``flaky`` field (an older server) and a null one draw the
+        same: the raw chip, no pill, no banner, no history, the card's
+        button, and the same requests."""
+        older = self._page(_test_detail("FAIL"))
+        newer = self._page(_test_detail("FAIL", None))
+        for answer in (older, newer):
+            first = answer["first"]
+            self.assertEqual(first["chip"], ["chip result-fail", "FAIL"])
+            self.assertIsNone(first["tag"])
+            self.assertIsNone(first["banner"])
+            self.assertTrue(first["historyHidden"])
+            self.assertEqual(first["card"], ["Mark as flaky"])
+            self.assertEqual(first["signal"], "flips often")
+            self.assertEqual(answer["posts"], [])
+        self.assertEqual(older["firstAsked"], newer["firstAsked"])
+        self.assertEqual(sorted(set(older["firstAsked"])), [
+            "GET api/tests/env-a/s1.py/t1",
+            "GET api/tests/env-a/s1.py/t1/comments",
+            "GET api/tests/env-a/s1.py/t1/history",
+            "GET api/tests/env-a/s1.py/t1/streams",
+            "GET api/users"])
+
+    def test_a_flaking_test_reads_FLAKING_with_banner_card_and_history(
+            self) -> None:
+        first = self._page(
+            _test_detail("FAIL", _flaky("flaking", 1)))["first"]
+        self.assertEqual(first["chip"], ["chip result-flaking", "FLAKING"])
+        self.assertIsNone(first["tag"])
+        self.assertEqual(first["banner"], [
+            "Marked flaky, 3 in a row",
+            "by dev1 · 12 days ago · race in teardown",
+            "Flaking: failed its last run; counts as failing at 3 in a row",
+            "Set cadence", "Unmark"])
+        self.assertEqual(first["card"], ["Marked flaky, 3 in a row"])
+        self.assertFalse(first["historyHidden"])
+        self.assertEqual(first["history"], [[
+            "mark", "dev1", "2026-11-01 02:00:00", "3 in a row",
+            "race in teardown"]])
+
+    def test_every_other_state_keeps_its_chip_and_carries_the_pill(
+            self) -> None:
+        cases = (
+            ("FAIL", _flaky("flaking", 2), _LIVE_MUTE,
+             ["chip result-fail", "FAIL"],
+             "Marked flaky; the mute comes first until it runs out"),
+            ("FAIL", _flaky("failing", 3, 3), None,
+             ["chip result-fail", "FAIL"],
+             "Failing: its last 3 runs all failed; marked flaky, 3 in a row"),
+            ("FAIL", _flaky("failing", 2, 2), None,
+             ["chip result-fail", "FAIL"],
+             "Failing: every run here has failed (2 of 2); marked flaky, "
+             "3 in a row"),
+            ("FAIL", _flaky("failing", 1, 1), None,
+             ["chip result-fail", "FAIL"],
+             "Failing: its only run here failed; marked flaky, 3 in a row"),
+            ("PASS", _flaky("passing", 0), None,
+             ["chip result-pass", "PASS"],
+             "Marked flaky: counts as failing once its last 3 runs have "
+             "failed"),
+            ("PASS", _flaky(None), None, ["chip result-pass", "PASS"],
+             "Marked flaky, 3 in a row; no run here yet"),
+        )
+        for result, flaky, mute, chip, sentence in cases:
+            with self.subTest(sentence=sentence):
+                first = self._page(_test_detail(result, flaky, mute))["first"]
+                self.assertEqual(first["chip"], chip)
+                self.assertEqual(first["tag"], ["flaky", sentence])
+                self.assertEqual(first["banner"][2], sentence)
+
+    def test_marking_from_the_card_asks_for_the_reason_first(self) -> None:
+        answer = self._page(_test_detail("FAIL", None), "mark",
+                            _test_detail("FAIL", _flaky("flaking", 1)))
+        self.assertEqual(answer["form"], ["INPUT", "SELECT", "BUTTON", "BUTTON"])
+        self.assertEqual(answer["emptyPosts"], 0)
+        self.assertTrue(answer["emptyError"].startswith("Say why"))
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [_ONE_TEST]}]])
+        # One request after the act, the detail, as after a mute.
+        self.assertEqual(answer["later"], [
+            "POST api/flaky/bulk", "GET api/tests/env-a/s1.py/t1"])
+        self.assertEqual(answer["after"]["chip"],
+                         ["chip result-flaking", "FLAKING"])
+        self.assertEqual(answer["after"]["card"], ["Marked flaky, 3 in a row"])
+
+    def test_the_banner_changes_the_cadence_and_unmarks(self) -> None:
+        marked = _test_detail("FAIL", _flaky("flaking", 1))
+        answer = self._page(marked, "cadence", marked)
+        self.assertEqual(answer["selectValue"], "3")
+        self.assertTrue(answer["setDisabledAtFirst"])
+        self.assertFalse(answer["setDisabledAfter"])
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "cadence": 5, "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["later"], [
+            "POST api/flaky/bulk", "GET api/tests/env-a/s1.py/t1"])
+        answer = self._page(marked, "unmark", _test_detail("FAIL", None))
+        self.assertEqual(answer["posts"], [["api/flaky/unmark", {
+            "username": "dev1", "tests": [_ONE_TEST]}]])
+        self.assertIsNone(answer["after"]["banner"])
+        self.assertEqual(answer["after"]["chip"], ["chip result-fail", "FAIL"])
+        self.assertEqual(answer["after"]["card"], ["Mark as flaky"])
+
+    def test_the_bar_marks_with_the_note_and_names_no_owner(self) -> None:
+        rows = [dict(_ONE_TEST),
+                dict(_ONE_TEST, test_name="t2", flaky=None)]
+        answer = self._bar(rows)
+        order = answer["order"]
+        self.assertLess(order.index("selection-unmute-btn"),
+                        order.index("Flaky "))
+        self.assertLess(order.index("Flaky "),
+                        order.index("selection-cadence-select"))
+        self.assertLess(order.index("selection-flaky-btn"),
+                        order.index("selection-unmark-btn"))
+        self.assertEqual(answer["ticked"], ["Mark as flaky", True])
+        self.assertEqual(answer["withCadence"], ["Mark as flaky", True])
+        self.assertEqual(answer["withReason"], ["Mark as flaky", False])
+        tests = [_ONE_TEST, dict(_ONE_TEST, test_name="t2")]
+        self.assertEqual(answer["posts"], [
+            ["api/flaky/bulk", {"username": "dev1", "cadence": 3,
+                                "reason": "race in teardown", "tests": tests}],
+            ["api/flaky/unmark", {"username": "dev1", "tests": tests}]])
+        self.assertEqual(answer["afterMark"], {
+            "hidden": True, "changed": 1, "note": "", "cadence": ""})
+        self.assertEqual(answer["afterUnmark"], {"hidden": True, "changed": 2})
+
+    def test_the_bar_sets_a_cadence_when_every_row_is_marked(self) -> None:
+        marked = dict(_ONE_TEST, flaky=_flaky("flaking", 1))
+        answer = self._bar([marked, dict(marked, test_name="t2")])
+        self.assertEqual(answer["ticked"], ["Set cadence", True])
+        self.assertEqual(answer["withCadence"], ["Set cadence", False])
+        mixed = self._bar([marked, dict(_ONE_TEST, test_name="t2")])
+        self.assertEqual(mixed["withCadence"], ["Mark as flaky", True])
+
+    def test_the_panel_marks_an_unmarked_row(self) -> None:
+        entry = dict(_ONE_TEST, run_id=7, result="FAIL",
+                     start_time="2026-11-10T02:14:00", assignee=None,
+                     mute=None, stream_id=4)
+        answer = self._panel(entry, "mark")
+        self.assertEqual(answer["labels"][-2:], ["Mute", "Flaky"])
+        self.assertEqual(answer["group"], [
+            ["LABEL", "Flaky"],
+            ["INPUT", "Why is this test flaky? (required)"],
+            ["SELECT", ""], ["BUTTON", "Mark as flaky"]])
+        self.assertEqual(answer["emptyPosts"], 0)
+        self.assertTrue(answer["emptyError"].startswith("Say why"))
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [dict(_ONE_TEST, stream_id=4)]}]])
+        self.assertEqual(answer["reloads"], 1)
+
+    def test_the_panel_changes_and_removes_a_mark(self) -> None:
+        entry = dict(_ONE_TEST, run_id=7, result="PASS",
+                     start_time="2026-11-10T02:14:00", assignee=None,
+                     mute=None, flaky=_flaky("passing", 0))
+        answer = self._panel(entry, "cadence")
+        self.assertEqual(answer["labels"][-1], "Flaky")
+        self.assertNotIn("Mute", answer["labels"])
+        self.assertEqual(answer["group"], [
+            ["LABEL", "Flaky"],
+            ["SPAN", ["Marked flaky: counts as failing once its last 3 "
+                      "runs have failed",
+                      "by dev1 · 12 days ago · race in teardown"]],
+            ["SELECT", "3"], ["BUTTON", "Set cadence"],
+            ["BUTTON", "Unmark"]])
+        self.assertTrue(answer["setDisabledAtFirst"])
+        self.assertFalse(answer["setDisabledAfter"])
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "cadence": 5, "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["reloads"], 1)
+        answer = self._panel(entry, "unmark")
+        self.assertEqual(answer["posts"], [["api/flaky/unmark", {
+            "username": "dev1", "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["reloads"], 1)
 
 
 if __name__ == "__main__":

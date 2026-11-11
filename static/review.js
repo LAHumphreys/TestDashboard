@@ -27,10 +27,18 @@ import {
   muteDurationSelect,
   assigneeSelect,
   clearNode,
+  FLAKY_CADENCE_TITLE,
+  FLAKY_REASON_LABEL,
+  FLAKY_REASON_PLACEHOLDER,
+  FLAKY_UNMARK_TITLE,
+  cadenceChanged,
   copyOutputButton,
   el,
   fetchJson,
   fillOutput,
+  flakyCadenceSelect,
+  flakyDetail,
+  flakySentence,
   getUsername,
   runStrip,
   postJson,
@@ -42,7 +50,9 @@ import {
   userPickerSelect,
 } from "./api.js";
 import {
+  bulkFlakyUrl,
   bulkMutesUrl,
+  unmarkFlakyUrl,
   unmuteUrl,
   pageUrl,
 } from "./urls.js";
@@ -95,6 +105,9 @@ export function reopenIfOpen(entry, row, button, options) {
  *   onRetired   — called after a successful retirement. Retirement
  *                 removes the test from every estate view, so a caller
  *                 usually has to reload rather than patch a row.
+ *   onMuted     — called after a mute or a flaky mark changes (WP-40,
+ *                 WP-44). Both move a test between queues and counts,
+ *                 so a caller reloads; without it, onChanged is called.
  */
 export function toggleReview(entry, row, button, options) {
   const opts = options || {};
@@ -198,8 +211,8 @@ async function buildReviewPanel(entry, container, opts) {
   }
 }
 
-/** This one test, in the shape the mute endpoints take. */
-function muteTests(entry) {
+/** This one test, in the shape the mute and flaky endpoints take. */
+function actTests(entry) {
   const test = {
     environment: entry.environment, script: entry.script,
     test_name: entry.test_name,
@@ -208,6 +221,28 @@ function muteTests(entry) {
     test.stream_id = entry.stream_id;
   }
   return [test];
+}
+
+/** After a mute or a flaky act: the caller's reload (see toggleReview's
+ * `onMuted`), else its onChanged, told which `kind` of act it was. The
+ * comparison page's panel has only onChanged, and reads `change.kind`. */
+function afterStandingChange(opts, kind) {
+  if (opts.onMuted) {
+    opts.onMuted();
+  } else if (opts.onChanged) {
+    opts.onChanged({ kind: kind, value: null });
+  }
+}
+
+/** The username to record an act against, or null after saying why. */
+function actor(recorded) {
+  const me = requireUsername();
+  if (!me) {
+    showError(
+      "Set a username first (the “Change” button, top right) "
+      + "— " + recorded + " are recorded against a name.");
+  }
+  return me;
 }
 
 /**
@@ -221,22 +256,8 @@ function muteTests(entry) {
 function buildMuteGroup(entry, opts) {
   const group = el("div", "review-group review-group-wide");
   group.appendChild(el("label", "review-label", "Mute"));
-  const done = () => {
-    if (opts.onMuted) {
-      opts.onMuted();
-    } else if (opts.onChanged) {
-      opts.onChanged();
-    }
-  };
-  const needUser = () => {
-    const me = requireUsername();
-    if (!me) {
-      showError(
-        "Set a username first (the “Change” button, top right) "
-        + "— mutes are recorded against a name.");
-    }
-    return me;
-  };
+  const done = () => afterStandingChange(opts, "muted");
+  const needUser = () => actor("mutes");
   const mute = entry.mute;
   if (mute && mute.live) {
     group.appendChild(el("span", "mute-line",
@@ -264,7 +285,7 @@ function buildMuteGroup(entry, opts) {
       try {
         await postJson(bulkMutesUrl(), {
           username: me, hours: hours, assignee: entry.assignee || me,
-          tests: muteTests(entry),
+          tests: actTests(entry),
         });
         done();
       } catch (err) {
@@ -282,7 +303,7 @@ function buildMuteGroup(entry, opts) {
       unmute.disabled = true;
       try {
         await postJson(unmuteUrl(), {
-          username: me, tests: muteTests(entry),
+          username: me, tests: actTests(entry),
         });
         done();
       } catch (err) {
@@ -332,7 +353,7 @@ function buildMuteGroup(entry, opts) {
     try {
       await postJson(bulkMutesUrl(), {
         username: me, reason: text, hours: hours,
-        assignee: owner.value || me, tests: muteTests(entry),
+        assignee: owner.value || me, tests: actTests(entry),
       });
       done();
     } catch (err) {
@@ -344,6 +365,111 @@ function buildMuteGroup(entry, opts) {
   group.appendChild(duration);
   group.appendChild(owner);
   group.appendChild(go);
+  return group;
+}
+
+/**
+ * The Flaky group (WP-44), for any test: a mark is a standing
+ * statement about the test, not about one failure. Marked -> the
+ * sentence saying where it stands, who marked it, when and why, the
+ * cadence select on its own cadence with "Set cadence", and "Unmark";
+ * otherwise a reason, a cadence and "Mark as flaky". The person acting
+ * owns the mark (decision 12), so no owner is picked here. Reads
+ * `entry.flaky` defensively: absent or null is an unmarked test.
+ */
+function buildFlakyGroup(entry, opts) {
+  const group = el("div", "review-group review-group-wide");
+  group.appendChild(el("label", "review-label", "Flaky"));
+  const flaky = entry.flaky || null;
+  // `derive` sets every button from the group's state, `inFlight`
+  // included, so nothing (a cadence change, a failed request) re-arms a
+  // button while a request is out or one that has nothing to send.
+  let inFlight = false;
+  let derive = () => {};
+  const send = async (url, body) => {
+    if (inFlight) {
+      return;
+    }
+    const me = actor("flaky marks");
+    if (!me) {
+      return;
+    }
+    body.username = me;
+    body.tests = actTests(entry);
+    inFlight = true;
+    derive();
+    try {
+      await postJson(url, body);
+      afterStandingChange(opts, "flaky");
+    } catch (err) {
+      showError(err.message);
+    } finally {
+      inFlight = false;
+      derive();
+    }
+  };
+
+  if (flaky) {
+    const muteLive = Boolean(entry.mute && entry.mute.live);
+    // The sentence, with who, when and why under it (a block sub-line).
+    const line = el("span", "mute-line");
+    line.appendChild(document.createTextNode(flakySentence(flaky, muteLive)));
+    line.appendChild(el("span", "row-sub", flakyDetail(flaky)));
+    group.appendChild(line);
+    const cadence = flakyCadenceSelect("review-cadence-select", flaky.cadence);
+    const change = el("button", "", "Set cadence");
+    change.type = "button";
+    change.title = FLAKY_CADENCE_TITLE;
+    const unmark = el("button", "", "Unmark");
+    unmark.type = "button";
+    unmark.title = FLAKY_UNMARK_TITLE;
+    // Nothing to send until the cadence differs from the mark's own.
+    derive = () => {
+      change.disabled = inFlight || !cadenceChanged(cadence, flaky);
+      unmark.disabled = inFlight;
+    };
+    derive();
+    cadence.addEventListener("change", derive);
+    change.addEventListener("click", () => send(
+      bulkFlakyUrl(), { cadence: Number(cadence.value) }));
+    unmark.addEventListener("click", () => send(unmarkFlakyUrl(), {}));
+    group.appendChild(cadence);
+    group.appendChild(change);
+    group.appendChild(unmark);
+    return group;
+  }
+
+  const reason = document.createElement("input");
+  reason.type = "text";
+  reason.className = "review-input";
+  reason.placeholder = FLAKY_REASON_PLACEHOLDER;
+  reason.setAttribute("aria-label", FLAKY_REASON_LABEL);
+  const cadence = flakyCadenceSelect("review-cadence-select");
+  const mark = el("button", "", "Mark as flaky");
+  mark.type = "button";
+  mark.title = "Tolerate this test's failures until they reach the "
+    + "cadence chosen, on mainline and every build, until the mark is "
+    + "removed. You own the mark, and your reason is posted as a comment.";
+  mark.addEventListener("click", () => {
+    const text = reason.value.trim();
+    if (!text) {
+      reason.focus();
+      showError("Say why this test is flaky — the reason is kept with "
+        + "the mark.");
+      return;
+    }
+    const chosen = Number(cadence.value);
+    if (!chosen) {
+      cadence.focus();
+      showError("Choose how many failures in a row count as failing.");
+      return;
+    }
+    send(bulkFlakyUrl(), { reason: text, cadence: chosen });
+  });
+  derive = () => { mark.disabled = inFlight; };
+  group.appendChild(reason);
+  group.appendChild(cadence);
+  group.appendChild(mark);
   return group;
 }
 
@@ -444,6 +570,9 @@ function buildReviewActions(entry, opts) {
   if (entry.result === "FAIL" || (entry.mute && entry.mute.live)) {
     actions.appendChild(buildMuteGroup(entry, opts));
   }
+
+  /* --- flaky: any test, marked or not (WP-44) --- */
+  actions.appendChild(buildFlakyGroup(entry, opts));
 
   /* --- retire: only offered where it makes sense --- */
   // Offered for any test that has stopped reporting, wherever it is

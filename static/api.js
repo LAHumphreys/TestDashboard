@@ -513,13 +513,16 @@ export function clearNode(node) {
   }
 }
 
-/** CSS marker class for a result value ("" for unknown values). */
+/** CSS marker class for a result value ("" for unknown values). FLAKING
+ * is a displayed result, never a wire one: displayResult() below makes
+ * it, and it has its own chip and row edge. */
 export function resultClass(result) {
   switch (result) {
     case "PASS": return "result-pass";
     case "FAIL": return "result-fail";
     case "FAILED_AS_EXPECTED": return "result-failed-as-expected";
     case "UNEXPECTED_PASS": return "result-unexpected-pass";
+    case "FLAKING": return "result-flaking";
     default: return "";
   }
 }
@@ -605,6 +608,35 @@ export function relativeExpiry(expiresAt, nowMs) {
   }
   const days = Math.round(ms / 86400000);
   return "in " + days + " days";
+}
+
+/**
+ * "3 days ago" / "1 hour ago" / "just now", from a real timestamp and
+ * the caller's own `nowMs` — always derived from the two actual values
+ * involved, never from a fixed window constant. This is the same
+ * discipline WindowWordingTest pins for every other page's recency
+ * wording (docs/STREAMS_PLAN.md §3.5: "let the UI phrase it from data").
+ * The server's timestamps are UTC with no zone suffix, hence the "Z":
+ * without it a date-time string is parsed as local time.
+ */
+export function ageText(iso, nowMs) {
+  if (!iso) {
+    return "never";
+  }
+  const ms = nowMs - new Date(iso + "Z").getTime();
+  if (ms < 90 * 1000) {
+    return "just now";
+  }
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 60) {
+    return minutes + (minutes === 1 ? " minute ago" : " minutes ago");
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return hours + (hours === 1 ? " hour ago" : " hours ago");
+  }
+  const days = Math.floor(hours / 24);
+  return days + (days === 1 ? " day ago" : " days ago");
 }
 
 /** "by alice · expires in 3 days · extended 2×" — the small print under
@@ -725,6 +757,175 @@ export function mutedTag(entry) {
   return tag;
 }
 
+/* ---------------- flaky marks (WP-44) ---------------- */
+
+/*
+ * Every word the board says about a flaky mark is made here and nowhere
+ * else: FLAKING, the sentence that explains where a marked test stands,
+ * "3 in a row". tests/test_frontend_calls.py's FlakyWordingTest fails
+ * the build if another file spells one, so no page can drift from the
+ * others. On screen "flaky" always means the mark (decision 6); the
+ * computed signal says "flips" instead (stabilitySentence below).
+ *
+ * Every helper reads a mark defensively: an entry with no `flaky`
+ * field, or a null one, is an unmarked test. Lists gain the field after
+ * the test detail does, and an older server sends none at all.
+ */
+
+/** The cadences a mark may have. The server takes a whole number from
+ * 2 to 10, and the UI offers every one of them. */
+const FLAKY_CADENCES = [2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+/**
+ * What a result reads as. A FAIL whose test is marked flaky and is
+ * under its cadence on this stream (`flakyState` "flaking"), with no
+ * live mute, reads FLAKING; a live mute wins over the mark. Anything
+ * else reads as itself.
+ *
+ * The ONE place the word is made. It returns a label and never touches
+ * the entry it was read from: sorting, filters and the wire stay on the
+ * real result, which is FAIL.
+ */
+export function displayResult(result, flakyState, muted) {
+  return result === "FAIL" && flakyState === "flaking" && !muted
+    ? "FLAKING" : result;
+}
+
+/** "3 in a row": a cadence, as its select and the sentences say it. */
+export function cadenceWords(cadence) {
+  return cadence + " in a row";
+}
+
+/** What a cadence means, as a clause: "counts as failing once its last
+ * 3 runs have failed". */
+export function cadenceSentence(cadence) {
+  return "counts as failing once its last " + cadence + " runs have failed";
+}
+
+/** "Marked flaky, 3 in a row": the mark itself, without its state. */
+export function flakyMarkWords(cadence) {
+  return "Marked flaky, " + cadenceWords(cadence);
+}
+
+/**
+ * The one sentence that says where a marked test stands on this stream:
+ * the title of its pill, the line in the Review panel and the test
+ * page's banner. A live mute comes first; then the mark's `state` from
+ * the server, with `streak` (failures in a row, capped at the cadence)
+ * and `runs` (how many runs the stream has, capped at the cadence, given
+ * when the state is failing). A null state is a stream the test has not
+ * run on yet.
+ */
+export function flakySentence(flaky, muteLive) {
+  const cadence = flaky.cadence;
+  if (muteLive) {
+    return "Marked flaky; the mute comes first until it runs out";
+  }
+  if (flaky.state === "flaking") {
+    const failed = flaky.streak > 1
+      ? "failed its last " + flaky.streak + " runs" : "failed its last run";
+    return "Flaking: " + failed + "; counts as failing at "
+      + cadenceWords(cadence);
+  }
+  if (flaky.state === "failing") {
+    const runs = typeof flaky.runs === "number" ? flaky.runs : cadence;
+    let failed;
+    if (runs >= cadence) {
+      failed = "its last " + cadence + " runs all failed";
+    } else if (runs === 1) {
+      failed = "its only run here failed";
+    } else {
+      failed = "every run here has failed (" + runs + " of " + runs + ")";
+    }
+    return "Failing: " + failed + "; marked flaky, " + cadenceWords(cadence);
+  }
+  if (flaky.state === "passing") {
+    return "Marked flaky: " + cadenceSentence(cadence);
+  }
+  return flakyMarkWords(cadence) + "; no run here yet";
+}
+
+/** "by alice · 12 days ago · race in teardown": who made a mark, how
+ * long ago, and why. The small print beside its sentence. */
+export function flakyDetail(flaky, nowMs) {
+  const parts = [
+    "by " + flaky.marked_by,
+    ageText(flaky.marked_at, nowMs === undefined ? Date.now() : nowMs),
+  ];
+  if (flaky.reason) {
+    parts.push(flaky.reason);
+  }
+  return parts.join(" · ");
+}
+
+/**
+ * The small "flaky" pill, for a marked test whose result does not read
+ * FLAKING (over its cadence, passing, or under a live mute); null for
+ * an unmarked test, and for one reading FLAKING, whose chip says it
+ * already. `entry` carries `result`, `flaky` and `mute` as a row does.
+ */
+export function flakyTag(entry) {
+  const flaky = entry && entry.flaky;
+  if (!flaky) {
+    return null;
+  }
+  const muteLive = Boolean(entry.mute && entry.mute.live);
+  if (displayResult(entry.result, flaky.state, muteLive) === "FLAKING") {
+    return null;
+  }
+  const tag = el("span", "flaky-tag", "flaky");
+  tag.title = flakySentence(flaky, muteLive);
+  return tag;
+}
+
+/** The titles of one marked test's "Set cadence" and "Unmark", in the
+ * Review panel and on the test page alike. */
+export const FLAKY_CADENCE_TITLE = "Change how many failures in a row "
+  + "count as failing. The mark keeps its owner.";
+export const FLAKY_UNMARK_TITLE = "Remove the flaky mark; a failure "
+  + "counts as failing again.";
+
+/** The reason box of a fresh mark, in the Review panel and on the test
+ * page: its placeholder and its accessible label. */
+export const FLAKY_REASON_PLACEHOLDER = "Why is this test flaky? (required)";
+export const FLAKY_REASON_LABEL = "Reason for marking the test flaky";
+
+/**
+ * Whether one marked test's "Set cadence" has anything to send: a
+ * cadence chosen, and not the mark's own. The panel and the test page
+ * derive the button from it on every change and after a failed request.
+ */
+export function cadenceChanged(select, flaky) {
+  return Boolean(select.value) && Number(select.value) !== flaky.cadence;
+}
+
+/**
+ * A <select> of the cadences behind a placeholder option "at…" (value
+ * ""), the flaky twin of muteDurationSelect(). `defaultValue` is the
+ * cadence to start on: a marked test's own, so changing it is one
+ * choice; a fresh mark starts on the placeholder, which keeps its
+ * button disabled until a cadence is chosen. Read the choice with
+ * Number(select.value) (0 when none).
+ */
+export function flakyCadenceSelect(className, defaultValue) {
+  const select = el("select", className);
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "at…";
+  select.appendChild(placeholder);
+  for (const cadence of FLAKY_CADENCES) {
+    const option = document.createElement("option");
+    option.value = String(cadence);
+    option.textContent = cadenceWords(cadence);
+    select.appendChild(option);
+  }
+  select.value = defaultValue === undefined || defaultValue === null
+    ? "" : String(defaultValue);
+  select.setAttribute("aria-label",
+    "How many failures in a row count as failing");
+  return select;
+}
+
 /** Select `name` in a userPickerSelect once its options exist. */
 export function preselectUser(select, name) {
   if (!name) {
@@ -763,7 +964,7 @@ export function formatDuration(seconds) {
   return hours + "h " + String(minutes).padStart(2, "0") + "m";
 }
 
-/* ---------------- stability: broken, or just flaky? ---------------- */
+/* ---------------- stability: broken, or flipping? ---------------- */
 
 /**
  * One sentence saying what a test has been DOING lately.
@@ -773,6 +974,10 @@ export function formatDuration(seconds) {
  * three". Those need completely different responses — one is a
  * regression to bisect, the other is a test to stabilise — and until
  * now they looked identical in every list.
+ *
+ * The analytics call the second kind "flaky"; the sentence says "flips"
+ * (WP-44, decision 6), because on screen "flaky" means a mark somebody
+ * made, and a test can flip without one.
  */
 export function stabilitySentence(stability) {
   if (!stability || !stability.runs) {
@@ -781,7 +986,7 @@ export function stabilitySentence(stability) {
   if (stability.classification === "flaky") {
     const period = Math.max(
       2, Math.round(stability.runs / Math.max(1, stability.transitions)));
-    return "flaky — flips about 1 run in " + period;
+    return "flips about 1 run in " + period;
   }
   if (stability.classification === "stable-fail") {
     return stability.transitions === 0
@@ -789,6 +994,13 @@ export function stabilitySentence(stability) {
       : "failing steadily since it broke";
   }
   return "passing steadily";
+}
+
+/** The test page's Flakiness card names the signal in a word: "flips
+ * often" for what the analytics classify "flaky" (decision 6, as for
+ * the sentence above), the classification itself otherwise. */
+export function stabilityWord(classification) {
+  return classification === "flaky" ? "flips often" : classification;
 }
 
 /**

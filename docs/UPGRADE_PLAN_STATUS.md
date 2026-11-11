@@ -4926,3 +4926,20 @@ unmark and the cadence change send a statement per test on MariaDB (carried
 into item 6), and every bulk endpoint, the existing ones included, resolves
 each entry's stream with two statements, +110 ms per 100 entries on MariaDB
 (predates the package; a candidate of its own).
+
+## WP-44 item 5: the controls for the flaky mark (2026-11-11)
+
+Item 5 is committed: Mark as flaky, Set cadence and Unmark on the selection
+bar, the Review panel and the test page; the test page's banner, card and
+mark history from the detail already fetched; the two mauve tokens; and the
+wording helpers, in `static/api.js` only, with `displayResult` the one
+place the word FLAKING is made. The computed signal now says "flips", so on
+screen "flaky" always means a mark. Each act costs what a mute costs on its
+surface and no first-paint request is added; off the trigger paths, so no
+measured pass. Fresh eyes found no defect and every sentence matched the
+design; four small findings were fixed before the commit (no Flaky button
+re-armed mid-flight, the derived state after a failed Set cadence, an
+accessible label, one source for two shared titles). Recorded and left as
+they were before the package: the Mute group has the same mid-flight hole,
+and the test page's refresh after an act swallows its own error. No browser
+has rendered it.

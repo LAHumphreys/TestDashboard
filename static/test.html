@@ -78,6 +78,11 @@
            mute and the test is failing, the same slot offers
            to make one. -->
       <div id="mute-banner" class="known-failure is-muted" hidden></div>
+      <!-- A flaky mark (WP-44): who accepted this test's flakiness, at
+           what cadence, and where it stands on this stream, with the
+           controls to change the cadence or remove it. Hidden when the
+           test is not marked; the Flakiness card offers the mark. -->
+      <div id="flaky-banner" class="known-failure is-flaky" hidden></div>
       <!-- Only shown when this page was opened with ?stream=<id> (WP-21,
            docs/STREAMS_PLAN.md §3.6): mainline's own result beside this
            branch's, for the SAME test. Absent entirely on every mainline
@@ -96,6 +101,7 @@
         <div class="card">
           <h3>Flakiness</h3>
           <div id="flakiness"></div>
+          <div id="flaky-mark" class="flaky-mark"></div>
         </div>
         <div class="card">
           <h3>Duration</h3>
@@ -203,6 +209,28 @@
               </tr>
             </thead>
             <tbody id="mute-history-body"></tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <!-- Every act on this test's flaky mark (WP-44), newest first. It
+         rides the test detail, so opening it fetches nothing. -->
+    <section id="flaky-history-section" hidden>
+      <details id="flaky-history-details" class="charts-details">
+        <summary class="charts-summary">Flaky mark history</summary>
+        <div class="table-wrap">
+          <table class="data-table small">
+            <thead>
+              <tr>
+                <th>Action</th>
+                <th>By</th>
+                <th>When (UTC)</th>
+                <th>Cadence</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="flaky-history-body"></tbody>
           </table>
         </div>
       </details>

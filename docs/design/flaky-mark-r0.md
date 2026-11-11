@@ -1337,7 +1337,7 @@ any interruption is the first line not `done` or `parked`.
 | 3 the mark, backend | done | the commit carrying this line | fresh eyes found no defect; a blank reason on a cadence change and a helper with no caller fixed before the commit; the three carriers of the "any mark" bit left to item 6 |
 | 3p measured pass | done | | Known slow rows the same with the tables empty; the detail of a marked test +0.07 to +0.27 ms on SQLite, +0.41 to +0.84 on a local MariaDB 12.3; the push path runs the same statements. Carried into item 6: unmark and cadence change send a statement per test on MariaDB. Recorded, outside the package: every bulk endpoint resolves each entry's stream with two statements |
 | 4 marks fixture | in flight | | |
-| 5 controls, UI | in flight | | |
+| 5 controls, UI | done | the commit carrying this line | four fresh-eyes findings fixed before the commit; the bar's Set cadence is reachable only once rows carry the mark (item 6); no browser has rendered it |
 | 6 state and counts, backend | in flight | | |
 | 6p measured pass | not started | | |
 | 6h dialect hook | only if a plan guard fails on CI's 10.3 legs | | |
