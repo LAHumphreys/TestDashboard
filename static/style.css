@@ -190,8 +190,10 @@ textarea {
 .chip.result-unexpected-pass,
 .toggle.result-unexpected-pass[aria-pressed="true"] { background: var(--c-up); color: #fff; border-color: transparent; }
 
-/* FLAKING is a displayed result, never a wire one (api.js's displayResult). */
-.chip.result-flaking { background: var(--c-flaking-strong); color: #fff; border-color: transparent; }
+/* FLAKING is a displayed result, never a wire one (api.js's displayResult),
+   and a browse filter value (WP-44): the pressed toggle takes the strong step. */
+.chip.result-flaking,
+.toggle.result-flaking[aria-pressed="true"] { background: var(--c-flaking-strong); color: #fff; border-color: transparent; }
 
 /* ---------- Filters ---------- */
 
@@ -238,6 +240,7 @@ textarea {
 .toggle.result-fail::before { background: var(--c-fail); }
 .toggle.result-failed-as-expected::before { background: var(--c-fae); }
 .toggle.result-unexpected-pass::before { background: var(--c-up); }
+.toggle.result-flaking::before { background: var(--c-flaking-strong); }
 
 .toggle[aria-pressed="true"]::before { background: rgba(255, 255, 255, 0.85); }
 .toggle.result-failed-as-expected[aria-pressed="true"]::before { background: rgba(0, 0, 0, 0.45); }
@@ -595,6 +598,7 @@ button.tile:focus-visible {
 .seg-fae { fill: var(--c-fae); }
 .seg-assigned { fill: var(--c-assigned); }
 .seg-muted { fill: var(--muted); opacity: 0.55; }
+.seg-flaking { fill: var(--c-flaking); }
 
 .trend-band.is-hover .seg { filter: brightness(1.18); }
 
@@ -861,7 +865,7 @@ button.bar-row:focus-visible {
 .browse-footer .muted { font-size: 12px; }
 
 /* Plain-toggle (Not run recently) active state. */
-.toggle[aria-pressed="true"]:not(.result-pass):not(.result-fail):not(.result-failed-as-expected):not(.result-unexpected-pass) {
+.toggle[aria-pressed="true"]:not(.result-pass):not(.result-fail):not(.result-failed-as-expected):not(.result-unexpected-pass):not(.result-flaking) {
   background: var(--ink);
   color: #fff;
   border-color: transparent;
@@ -1037,9 +1041,11 @@ button.bar-row:focus-visible {
 }
 
 /* A small pill beside a result chip: this failure is muted, or this
- * test carries a flaky mark it is not FLAKING under right now. */
+ * test carries a flaky mark it is not FLAKING under right now, or (the
+ * Flaky tab) the marked test is retired. */
 .mute-tag,
-.flaky-tag {
+.flaky-tag,
+.retired-tag {
   display: inline-block;
   margin-left: 6px;
   padding: 1px 7px;
@@ -1437,6 +1443,13 @@ button.bar-row:focus-visible {
   font-size: 13px;
   color: var(--muted);
 }
+
+/* The Flaky tab's order and its "N flaking now" link (WP-44): two
+   phrases that wrap at narrow widths rather than overflow. */
+.queue-flaky-note { flex-wrap: wrap; }
+
+/* The Flaky tab's pager, under its table. */
+.queue-more { margin: 10px 0 0; }
 
 /* ---------- Time drill-down (time.html) ---------- */
 

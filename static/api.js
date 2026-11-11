@@ -13,9 +13,6 @@
 /** localStorage key holding the self-identified username. */
 const USERNAME_KEY = "testboard.username";
 
-/** The four result values, in display order. Values match the server enum. */
-export const RESULTS = ["PASS", "FAIL", "FAILED_AS_EXPECTED", "UNEXPECTED_PASS"];
-
 /**
  * Fetch a URL and parse the JSON response.
  * On a non-2xx response, throws an Error whose message is the server's
@@ -719,12 +716,21 @@ export function newFailuresSub(flakyTotal) {
 
 /** The flaking part of a failing bar (WP-44): its legend key, tooltip
  * swatch and segment class, all in the chart token. Drawn after the
- * grey muted part, and keyed only where the scope has a mark. */
+ * grey muted part, and keyed only where the scope has a mark. The same
+ * object is the per-day chart's fourth series: `key` is the night's
+ * count in `parts=assigned_trend`, `segClass` its column segment. */
 export const FLAKING_BAR = {
+  key: "FAIL_FLAKING",
   label: "Flaking",
   swatchClass: "swatch-flaking",
   className: "bar-flaking",
+  segClass: "seg-flaking",
 };
+
+/** What the per-day chart's flaking series counts, said under the plot
+ * after the assigned/muted caption, where the series is drawn. */
+export const FLAKING_TREND_CAPTION =
+  " Flaking: the tests flaking that night, by today's marks.";
 
 /** A failing figure split (WP-43, WP-44): of the `failing` tests (muted
  * and flaking ones already out of it), the `assigned` ones someone has
@@ -855,6 +861,29 @@ export function displayResult(result, flakyState, muted) {
 }
 
 /**
+ * FLAKING as a filter value (WP-44, decision 24): the browse rows request
+ * takes `result=FLAKING` for the rows that read FLAKING, and FAIL alone
+ * then leaves exactly those out, so the two partition the failing tests.
+ * Made by displayResult(), the one place the word is spelled.
+ */
+export const FLAKING_FILTER = displayResult("FAIL", "flaking", false);
+
+/** The browse page's Result toggles, in order, and the values its
+ * `result=` URL parameter may carry: the wire results with FLAKING right
+ * after FAIL, the two halves of the failing tests side by side. */
+export const BROWSE_RESULTS = ["PASS", "FAIL", FLAKING_FILTER,
+  "FAILED_AS_EXPECTED", "UNEXPECTED_PASS"];
+
+/** FAIL and FLAKING together: every FAIL row, what `result=FAIL` alone
+ * meant before the mark. Open Actions' Failing mode sends both. */
+export const FAIL_AND_FLAKING = ["FAIL", FLAKING_FILTER];
+
+/** The FAIL toggle's title while the FLAKING one beside it is shown. */
+export function failToggleTitle() {
+  return "Failing, flaking tests left out";
+}
+
+/**
  * What a listed row's result reads as: displayResult() of the row's own
  * result, mark and mute. Every row builder takes ONE value from here and
  * gives it to both resultClass() (the row edge) and resultChip() (the
@@ -970,6 +999,34 @@ export function flakyTag(entry) {
   tag.title = flakySentence(flaky, muteLive);
   return tag;
 }
+
+/** "6 of its last 20 runs": how often a marked test has really failed,
+ * the Flaky tab's measure (decision 4). "0 of its last 20 runs" is a
+ * mark that may no longer be needed. */
+export function failedOfRuns(failures, runs) {
+  return runs === 1 ? failures + " of its only run"
+    : failures + " of its last " + runs + " runs";
+}
+
+/* The Flaky tab's words (WP-44, design §3 U8). */
+export const FLAKY_TAB_EMPTY = "No test is marked flaky here.";
+export const FLAKY_TAB_ORDER =
+  "Failing first, then flaking, then passing; newest mark first.";
+
+/** "4 flaking now": the tests reading FLAKING in scope, before the link
+ * that lists them in All tests. */
+export function flakingNowWords(count) {
+  return count.toLocaleString() + " flaking now";
+}
+
+/** The title of every link that opens All tests on FLAKING alone. */
+export const FLAKING_LINK_TITLE =
+  "List the tests flaking now in All tests";
+
+/** Open Actions' footer line where a mark exists (WP-44, §3 U9): what
+ * the page leaves out, said under its count. */
+export const OPEN_ACTIONS_FLAKING_NOTE = "Unassigned tests that are "
+  + "flaking are left out until they fail past their cadence.";
 
 /** The titles of one marked test's "Set cadence" and "Unmark", in the
  * Review panel and on the test page alike. */

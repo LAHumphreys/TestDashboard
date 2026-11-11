@@ -17,14 +17,18 @@
  * are all query parameters on /api/dashboard, and only the rows on screen
  * are ever in memory.
  *
- * Data, per refresh, all in parallel: /api/summary?parts=headline (the
- * tiles, charts, filters and every queue's COUNT — the fast part),
- * /api/summary?parts=assigned_trend (the trend's assigned/muted split,
- * WP-43: only the trend card waits for it), one /api/summary?parts=queue
- * for the active triage tab's rows, and one page of /api/dashboard. Each
+ * Data, per refresh, in parallel: /api/summary?parts=headline (the
+ * tiles, charts, filters and every queue's COUNT — the fast part), one
+ * /api/summary?parts=queue for the active triage tab's rows, and one
+ * page of /api/dashboard; then, once the headline has been drawn,
+ * /api/summary?parts=assigned_trend (the trend's assigned/muted/flaking
+ * split, WP-43: only the trend card waits for it, showing the headline's
+ * totals meanwhile on a first load; the part is never on the first
+ * paint). Each
  * section paints as its data lands, so the page is readable as soon as
  * the headline answers; the other queue tabs fetch their rows when first
- * opened. While refreshing, previous
+ * opened, the Flaky tab (WP-44) from its own GET /api/flaky, which no
+ * first paint asks for. While refreshing, previous
  * renders are held at reduced opacity (no skeletons, no layout jumps).
  * All data reaches the DOM via textContent only.
  */
@@ -32,8 +36,21 @@
 "use strict";
 
 import {
+  BROWSE_RESULTS,
+  FAIL_AND_FLAKING,
   FLAKING_BAR,
-  RESULTS,
+  FLAKING_FILTER,
+  FLAKING_LINK_TITLE,
+  FLAKING_TREND_CAPTION,
+  FLAKY_TAB_EMPTY,
+  FLAKY_TAB_ORDER,
+  cadenceWords,
+  displayResult,
+  failToggleTitle,
+  failedOfRuns,
+  flakingNowWords,
+  flakyDetail,
+  flakySentence,
   mutedTag,
   muteDetail,
   failingWithSetAside,
@@ -133,6 +150,13 @@ const state = {
   // not be had (failed, timed out, an older server's 400): the trend then
   // draws today's two series from the headline alone.
   trendSplit: null,
+  // The refresh generation (requestSeq) whose headline has been drawn:
+  // a split is asked for only for that generation, never ahead of it.
+  headlineDrawn: 0,
+  // How many splits have been asked for: each request takes the next
+  // number, and only the newest one's answer is drawn, so an older answer
+  // landing last never replaces a newer one.
+  splitSends: 0,
   // Queue rows by kind, fetched per tab on demand. Absent = not landed
   // yet for the current filters; renderQueueTable shows a loading line.
   queues: {},
@@ -249,9 +273,11 @@ function assignedTrendUrl() {
   return apiUrl("api/summary", { parts: "assigned_trend" }, apiScope());
 }
 
-/* How long the trend card waits for its split before drawing today's two
- * series without it. The part is one memoized statement; a server that
- * takes this long for it is in trouble, and the card must not hang. */
+/* How long the trend card waits for its split before drawing the
+ * headline's totals without it. The part reads the window's runs (and,
+ * where a flaky mark exists, every night's runs of the marked tests:
+ * four statements, memoized), off the first paint; a server that takes
+ * this long for it is in trouble, and the card must not hang. */
 const ASSIGNED_TREND_TIMEOUT_MS = 10000;
 
 /**
@@ -269,12 +295,89 @@ function fetchAssignedTrend() {
   });
 }
 
+/**
+ * Ask for the trend's split and draw it, AFTER the headline it belongs
+ * to has been drawn: refreshAll() calls this once its headline is on
+ * screen, and the coalescer once per burst, because the part is never on
+ * the first paint. `seq` is the refresh generation that asks:
+ *
+ * - nothing is asked for while that generation's headline is still to be
+ *   drawn (`state.headlineDrawn`): refreshAll() asks for it then, so a
+ *   burst that finishes first does not ask twice or draw ahead of it;
+ * - an answer is drawn only if its generation is still current and it is
+ *   the newest split asked for (`state.splitSends`), so neither an older
+ *   scope's split nor an older burst's, landing last, is ever drawn.
+ *
+ * A failure or a timeout draws the headline's totals and lifts the card's
+ * dim: a split never blocks or blanks anything else.
+ */
+async function loadTrendSplit(seq) {
+  if (seq !== state.requestSeq || state.headlineDrawn !== seq) {
+    return;
+  }
+  state.splitSends += 1;
+  const sent = state.splitSends;
+  const split = await fetchAssignedTrend();
+  if (seq !== state.requestSeq || sent !== state.splitSends) {
+    return;
+  }
+  state.trendSplit = split;
+  renderTrend();
+  document.getElementById("trend-card").classList.remove("is-loading");
+}
+
 /** URL for one triage queue's rows. */
 function queueUrl(kind) {
   return apiUrl(
     "api/summary",
     { parts: "queue", queue: kind, assignee: getUsername() },
     apiScope());
+}
+
+/** The Flaky tab's queue id (WP-44). Its rows are not a summary part. */
+const FLAKY_TAB = "flaky";
+
+/** Marks per page of the Flaky tab: the server's page, and its cap. */
+const FLAKY_PAGE = 100;
+
+/** URL for one page of the Flaky tab, in the page's scope. */
+function flakyUrl(offset) {
+  return apiUrl("api/flaky", { limit: FLAKY_PAGE, offset: offset },
+    apiScope());
+}
+
+/**
+ * One page of the Flaky tab as a queue payload, so the tab is cached,
+ * badged and refreshed like any queue. Each mark keeps the server's
+ * fields and gains `flaky`, the mark as a row carries it, which is what
+ * the selection bar reads to offer Set cadence. `total` counts the marks
+ * that are not retired (the badge's set); the retired ones come last in
+ * the same list, so the pager runs to `total + retired`.
+ */
+async function fetchFlakyPage(offset) {
+  const page = await fetchJson(flakyUrl(offset));
+  return {
+    generated_at: page.generated_at,
+    stale_before: null,
+    queue: {
+      tests: page.marks.map((mark) => Object.assign({}, mark, {
+        flaky: { cadence: mark.cadence, marked_by: mark.marked_by,
+          marked_at: mark.marked_at, reason: mark.reason,
+          state: mark.state },
+      })),
+      total: page.total,
+      retired: page.retired,
+    },
+  };
+}
+
+/**
+ * One tab's rows: a summary part, or for the Flaky tab its own request.
+ * Called by loadQueue() and the coalescer for the ACTIVE tab only, so
+ * /api/flaky is asked for once the tab has been opened and never before.
+ */
+function rowsRequest(kind) {
+  return kind === FLAKY_TAB ? fetchFlakyPage(0) : fetchJson(queueUrl(kind));
 }
 
 /** URL for one page of the test list under the current filters. */
@@ -296,12 +399,16 @@ function browseUrl(offset) {
 /**
  * Reload everything, painting each section as its data lands.
  *
- * Four requests go out together — the headline, the trend's split, the
- * active queue's rows, the first browse page — and each renders its own
- * section on arrival rather than waiting for the slowest. The trend card
- * is the one that needs two: it paints when the headline AND its split
- * have both landed, whichever is second; the tiles, the bars and the tab
- * badges paint on the headline alone (WP-43). The tiles, charts and
+ * Three requests go out together — the headline, the active queue's
+ * rows, the first browse page — and each renders its own section on
+ * arrival rather than waiting for the slowest. The trend's split is a
+ * fourth, sent once the headline has been drawn (loadTrendSplit()): it
+ * reads the runs of every night in the window, and with flaky marks a
+ * per-night read besides, so it is never on the first paint. On a first
+ * load the trend card draws the headline's totals and gains the split
+ * when it lands; on a later one it keeps the chart it has, dimmed, until
+ * the new split lands. The tiles, the bars and the tab badges paint on the headline
+ * alone (WP-43). The tiles, charts and
  * tab counts are a fraction of the old monolithic payload, so the page
  * is readable at once even when a queue takes its time. A section that
  * fails shows the error without blanking the ones that succeeded.
@@ -315,21 +422,19 @@ async function refreshAll() {
   clearError();
   setLoading(true);
   state.queues = {};  // the filters may have changed; refetch per tab
-  // The trend card's two inputs for THIS generation; it renders on the
-  // second to land, so it never pairs a new headline with an old split.
-  // It is the one card that waits for the split, so it carries its own
-  // dim, lifted when both have settled; the page-wide one below waits
-  // for the headline, the queue and the browse page only, as it always
-  // did (WP-43).
+  // A split belongs to the scope it was asked in, so this generation's
+  // starts empty. Where one was on screen, the card keeps that chart (the
+  // previous headline with its own split) dimmed until the new split
+  // lands, rather than stepping down to two series and back; only a
+  // first load, or one after a split that could not be had, draws the
+  // headline's totals first.
+  const hadSplit = state.trendSplit !== null;
+  state.trendSplit = null;
+  // The trend card carries its own dim until its split has settled; the
+  // page-wide one below waits for the headline, the queue and the browse
+  // page only, as it always did (WP-43).
   const trendCard = document.getElementById("trend-card");
   trendCard.classList.add("is-loading");
-  let trendInputs = 0;
-  const trendInputLanded = () => {
-    trendInputs += 1;
-    if (trendInputs === 2) {
-      renderTrend();
-    }
-  };
 
   const headlinePart = (async () => {
     try {
@@ -341,26 +446,22 @@ async function refreshAll() {
       renderHeadline();
       // First meaningful paint: the page is usable from here.
       document.getElementById("loading-state").hidden = true;
-      trendInputLanded();
+      // The split is asked for only now that the headline has been
+      // drawn: the part reads every night's runs, and it is never on the
+      // first paint. Until it lands the card shows the headline's totals
+      // if it had no split to keep (see hadSplit above).
+      state.headlineDrawn = seq;
+      if (!hadSplit) {
+        renderTrend();
+      }
+      loadTrendSplit(seq);
     } catch (err) {
       if (seq === state.requestSeq) {
         showError(err.message);
+        trendCard.classList.remove("is-loading");
       }
     }
   })();
-  const trendSplitPart = (async () => {
-    const split = await fetchAssignedTrend();
-    if (seq !== state.requestSeq) {
-      return;
-    }
-    state.trendSplit = split;
-    trendInputLanded();
-  })();
-  Promise.all([headlinePart, trendSplitPart]).then(() => {
-    if (seq === state.requestSeq) {
-      trendCard.classList.remove("is-loading");
-    }
-  });
   const queuePart = loadQueue(state.activeQueue, seq);
   const browsePart = (async () => {
     try {
@@ -395,7 +496,7 @@ async function refreshAll() {
  */
 async function loadQueue(kind, seq) {
   try {
-    const payload = await fetchJson(queueUrl(kind));
+    const payload = await rowsRequest(kind);
     if (seq !== state.requestSeq) {
       return;
     }
@@ -416,6 +517,43 @@ async function loadQueue(kind, seq) {
     if (seq === state.requestSeq) {
       showError(err.message);
     }
+  }
+}
+
+/**
+ * The Flaky tab's "Show more": the next page after the marks on screen,
+ * appended below them in the server's order (decision 16), the rows
+ * already ticked left ticked. A refresh started meanwhile wins.
+ */
+async function loadFlakyMore() {
+  const seq = state.requestSeq;
+  const queue = state.queues[FLAKY_TAB];
+  const more = document.getElementById("queue-more");
+  if (!queue || more.disabled) {
+    return;
+  }
+  // One page at a time: a second click before the first lands would ask
+  // for the same offset again and list its marks twice.
+  more.disabled = true;
+  try {
+    const payload = await fetchFlakyPage(queue.tests.length);
+    if (seq !== state.requestSeq || state.queues[FLAKY_TAB] !== queue) {
+      return;
+    }
+    const added = tagStream(payload.queue.tests);
+    queue.tests = queue.tests.concat(added);
+    queue.total = payload.queue.total;
+    queue.retired = payload.queue.retired;
+    if (state.activeQueue === FLAKY_TAB) {
+      appendFlakyRows(added);
+      renderQueueTabs();
+    }
+  } catch (err) {
+    if (seq === state.requestSeq) {
+      showError(err.message);
+    }
+  } finally {
+    more.disabled = false;
   }
 }
 
@@ -459,9 +597,12 @@ async function loadBrowse(append) {
  * still reflect the final action. A burst of any size costs two
  * requests rather than one per action.
  *
- * A refresh is now the headline, the trend's split (WP-43: so red turns
- * blue in all three charts after a "Take") and the ACTIVE queue's rows,
- * fetched together. The other queues' caches are dropped, not refetched: five
+ * A refresh is now the headline and the ACTIVE queue's rows, fetched
+ * together, then the trend's split (WP-43: so red turns blue in all
+ * three charts after a "Take"), asked for once per burst after the
+ * caller has drawn the new headline, as on the first paint: until it
+ * lands the trend keeps the headline and split it was drawn from, so it
+ * never pairs a new headline with an old split. The other queues' caches are dropped, not refetched: five
  * row payloads nobody is looking at, refetched on every "Take", is the
  * expense the parts split exists to avoid. Their tabs refetch on the
  * next click; their badge counts come fresh with the headline either
@@ -483,13 +624,11 @@ async function fetchSummary() {
     const kind = state.activeQueue;
     summaryInFlight = Promise.all([
       fetchJson(summaryUrl()),
-      fetchJson(queueUrl(kind)),
-      fetchAssignedTrend(),
+      rowsRequest(kind),
     ]);
     try {
       const results = await summaryInFlight;
       state.summary = results[0];
-      state.trendSplit = results[2];
       state.queues = {};
       tagStream(results[1].queue.tests);
       state.queues[kind] = results[1].queue;
@@ -497,6 +636,13 @@ async function fetchSummary() {
       summaryInFlight = null;
     }
   }
+  // The split, once for the burst, on the next turn: the caller awaiting
+  // this has drawn the headline by then. loadTrendSplit() asks for nothing
+  // while a refreshAll() of this generation is still to draw its own
+  // headline (it asks itself once it has), and draws only the newest
+  // split asked for.
+  const seq = state.requestSeq;
+  window.setTimeout(() => loadTrendSplit(seq), 0);
 }
 
 /** Reload the summary only (after a quick action like "Take"). */
@@ -505,7 +651,7 @@ async function refreshSummary() {
     await fetchSummary();
     renderStatus();
     renderEnvUpdated();
-    renderTrend();
+    // The trend is redrawn when its split lands (loadTrendSplit()).
     renderBars();
     renderQueues();
   } catch (err) {
@@ -527,9 +673,12 @@ function renderHeadline() {
   renderToolbar();
   renderStatus();
   renderEnvUpdated();
-  // The bars only: the trend card waits for its split (refreshAll).
+  // The bars only: the trend is drawn by refreshAll() (the headline's
+  // totals, where no split is on screen) and by loadTrendSplit().
   renderBars();
   renderQueues();
+  // The FLAKING toggle shows once the headline says the scope has a mark.
+  syncResultToggles();
   populateScriptOptions();
   updateProductColumn();
   const switcherMount = document.getElementById("product-switcher");
@@ -854,6 +1003,10 @@ const TREND_SPLIT_SERIES = [
     segClass: "seg-up", swatchClass: "swatch-up" },
 ];
 const FAILING_SPLIT_LEGEND = TREND_SPLIT_SERIES.slice(0, 3);
+/* WP-44 (design §3 U7): the flaking runs as a fourth part after the
+ * grey, where the scope has a mark. */
+const TREND_FLAKING_SERIES = FAILING_SPLIT_LEGEND.concat(
+  [FLAKING_BAR], TREND_SPLIT_SERIES.slice(3));
 
 /**
  * The headline's nights with the split merged in by date, the unassigned
@@ -861,8 +1014,12 @@ const FAILING_SPLIT_LEGEND = TREND_SPLIT_SERIES.slice(0, 3);
  * series: no split, or a night it does not carry. One series list per
  * chart, so one missing night means the whole card goes without, never
  * a night of everything-red claiming nobody owns it.
+ *
+ * `withFlaking` (WP-44) also takes each night's FAIL_FLAKING out of the
+ * unassigned part: the three parts are disjoint (counted once: muted,
+ * else flaking, else assigned).
  */
-function splitNights(nights, split) {
+function splitNights(nights, split, withFlaking) {
   if (!split || !split.trend || !Array.isArray(split.trend.nights)) {
     return null;
   }
@@ -874,29 +1031,50 @@ function splitNights(nights, split) {
         || typeof part.FAIL_MUTED !== "number") {
       return null;
     }
+    const flaking = withFlaking ? part.FAIL_FLAKING : 0;
     merged.push(Object.assign({}, night, {
       FAIL_UNASSIGNED: Math.max(
-        0, night.FAIL - part.FAIL_ASSIGNED - part.FAIL_MUTED),
+        0, night.FAIL - part.FAIL_ASSIGNED - part.FAIL_MUTED - flaking),
       FAIL_ASSIGNED: part.FAIL_ASSIGNED,
       FAIL_MUTED: part.FAIL_MUTED,
+      FAIL_FLAKING: flaking,
     }));
   }
   return merged;
 }
 
+/** Whether the trend draws its flaking series: the scope has a mark
+ * (decision 5) and every night of the split carries the count, so an
+ * older server's split draws today's chart. */
+function trendFlaking(split) {
+  return flakyScope() && Boolean(split) && Boolean(split.trend)
+    && Array.isArray(split.trend.nights)
+    && split.trend.nights.every(
+      (night) => typeof night.FAIL_FLAKING === "number");
+}
+
 /** 1. Failing runs per day (stacked columns) + its table twin. */
 function renderTrend() {
   const headlineNights = state.summary.trend.nights;
-  const merged = splitNights(headlineNights, state.trendSplit);
+  const flaking = trendFlaking(state.trendSplit);
+  const merged = splitNights(headlineNights, state.trendSplit, flaking);
   const isSplit = merged !== null;
   const nights = isSplit ? merged : headlineNights;
+  const splitSeries = flaking ? TREND_FLAKING_SERIES : TREND_SPLIT_SERIES;
   stackedColumnChart(
     document.getElementById("trend-chart"), nights,
-    isSplit ? TREND_SPLIT_SERIES : TREND_SERIES, { unit: "day" });
+    isSplit ? splitSeries : TREND_SERIES, { unit: "day" });
   document.getElementById("trend-split-caption").hidden = !isSplit;
+  const flakingCaption = document.getElementById("trend-mark-caption");
+  flakingCaption.hidden = !(isSplit && flaking);
+  flakingCaption.textContent = isSplit && flaking ? FLAKING_TREND_CAPTION : "";
   for (const th of document.querySelectorAll(
     "#trend-table th.trend-split-col")) {
     th.hidden = !isSplit;
+  }
+  for (const th of document.querySelectorAll(
+    "#trend-table th.trend-mark-col")) {
+    th.hidden = !(isSplit && flaking);
   }
   const twin = document.getElementById("trend-table-body");
   clearNode(twin);
@@ -905,7 +1083,8 @@ function renderTrend() {
     tr.appendChild(el("td", "", formatNight(night.date)));
     const counts = isSplit
       ? [night.FAIL, night.FAIL_UNASSIGNED, night.FAIL_ASSIGNED,
-        night.FAIL_MUTED, night.UNEXPECTED_PASS, night.total]
+        night.FAIL_MUTED].concat(flaking ? [night.FAIL_FLAKING] : [],
+        [night.UNEXPECTED_PASS, night.total])
       : [night.FAIL, night.UNEXPECTED_PASS, night.total];
     for (const count of counts) {
       tr.appendChild(el("td", "num", count.toLocaleString()));
@@ -1014,9 +1193,13 @@ function renderBars() {
     scriptItems.length !== 0;
 }
 
+/* A bar's click lists what the bar draws: FAIL, which leaves the flaking
+ * tests out once a mark exists, plus FLAKING when the bar has a flaking
+ * part (WP-44, design §3 U9). */
 function openScriptInBrowse(entry) {
   state.script = entry.script;
-  state.activeResults = new Set(["FAIL"]);
+  state.activeResults = new Set(
+    (entry.flaking || 0) > 0 ? FAIL_AND_FLAKING : ["FAIL"]);
   syncResultToggles();
   state.staleOnly = false;
   syncStaleToggle();
@@ -1037,6 +1220,9 @@ const QUEUE_TABS = [
   { id: "new_failures", label: "New failures" },
   { id: "still_failing", label: "Still failing" },
   { id: "muted", label: "Muted" },
+  // WP-44 (design §3 U8): every flaky mark in scope; the tab exists only
+  // where there is one (decision 5). See flakyTabShown().
+  { id: FLAKY_TAB, label: "Flaky" },
   { id: "fixed", label: "Fixed" },
   { id: "unexpected_passes", label: "Stale annotations" },
   { id: "not_run", label: "Not run" },
@@ -1047,6 +1233,7 @@ const QUEUE_EMPTY_TEXT = {
   new_failures: "No new failures — nothing broke that was passing before.",
   still_failing: "Nothing is stuck failing.",
   muted: "Nothing is muted.",
+  [FLAKY_TAB]: FLAKY_TAB_EMPTY,
   fixed: "No tests have gone from failing to passing.",
   unexpected_passes:
     "No stale annotations — every known failure still fails.",
@@ -1069,8 +1256,21 @@ function queueCount(queueId) {
   if (queue) {
     return queue.total;
   }
+  if (queueId === FLAKY_TAB) {
+    // The tab's badge is every mark in scope (WP-44): the headline's
+    // flaky_total, the set /api/flaky's `total` counts.
+    return state.summary ? state.summary.status.flaky_total || 0 : 0;
+  }
   const totals = state.summary && state.summary.queue_totals;
   return totals ? (totals[queueId] || 0) : 0;
+}
+
+/** Whether the Flaky tab is drawn: where the scope has a mark (decision
+ * 5), and while it is the open tab, so an act that removes the last mark
+ * leaves the reader on its empty state rather than on no tab at all. */
+function flakyTabShown() {
+  return state.activeQueue === FLAKY_TAB
+    || (Boolean(state.summary) && flakyScope());
 }
 
 /** True once SOMETHING can say how big `queueId` is. Before that a
@@ -1119,6 +1319,14 @@ async function refreshQueueCounts() {
     renderQueueTabs();
     renderStatus();
     renderEnvUpdated();
+    // The Flaky tab is paged: the coalescer has just replaced its rows
+    // with page one, so the tab is redrawn from that page (its rows, its
+    // pager and its "N flaking now" line), or the table would show pages
+    // the state no longer holds and the next "Show more" would list them
+    // twice. Its row's control has already saved, so nothing is lost.
+    if (state.activeQueue === FLAKY_TAB) {
+      renderQueueTable();
+    }
   } catch (err) {
     showError(err.message);
   }
@@ -1128,6 +1336,9 @@ function renderQueueTabs() {
   const tabs = document.getElementById("queue-tabs");
   clearNode(tabs);
   for (const tab of QUEUE_TABS) {
+    if (tab.id === FLAKY_TAB && !flakyTabShown()) {
+      continue;
+    }
     const count = queueCount(tab.id);
     const btn = el("button", "tab");
     btn.type = "button";
@@ -1167,8 +1378,9 @@ function renderQueueTabs() {
  * U6): the failing tests the claim leaves out, so a glance at a clear
  * board still says what is being tolerated. Muted is the two failing
  * tiles' muted figures; flaking is `status.flaking`. Both zero (or no
- * headline yet), no line. "3 muted" opens the Muted tab; "4 flaking" is
- * text until the browse filter it should open exists.
+ * headline yet), no line. "3 muted" opens the Muted tab; "4 flaking"
+ * opens All tests on FLAKING alone: the tests flaking now, where
+ * the Flaky tab lists every mark.
  */
 function renderAllClearAside() {
   const aside = document.getElementById("all-clear-aside");
@@ -1193,11 +1405,31 @@ function renderAllClearAside() {
       link.addEventListener("click", () => openQueue("muted"));
       aside.appendChild(link);
     } else {
-      // The flaking part: text for now; the one place it becomes a
-      // link into the browse list's flaking filter.
-      aside.appendChild(document.createTextNode(part.text));
+      aside.appendChild(flakingLink(part.text));
     }
   });
+}
+
+/** A link-styled button that opens All tests on FLAKING alone: "All
+ * clear"'s "4 flaking" and the Flaky tab's "List them in All tests". */
+function flakingLink(text) {
+  const link = el("button", "link-btn", text);
+  link.type = "button";
+  link.title = FLAKING_LINK_TITLE;
+  link.addEventListener("click", openFlakingInBrowse);
+  return link;
+}
+
+/** All tests on FLAKING alone (WP-44, design §3 U6): the other result
+ * toggles and "Not run recently" cleared, scrolled to, as "retired"
+ * does. The other filters are the reader's and stay. */
+function openFlakingInBrowse() {
+  state.activeResults = new Set([FLAKING_FILTER]);
+  state.staleOnly = false;
+  syncResultToggles();
+  syncStaleToggle();
+  refilterBrowse();
+  scrollTo("browse-section");
 }
 
 /** Column sets per queue: header + cell builder. */
@@ -1420,6 +1652,10 @@ function queueColumns(queueId) {
         commentCol,
         { header: "Assignee",
           cell: (entry) => el("td", "", entry.assignee || "—") }];
+    case FLAKY_TAB:
+      // The assignee cell every queue has: an assignment means the same
+      // in any state (design §3 U8).
+      return [testCol].concat(flakyColumns(), [assigneeCol]);
     case "unexpected_passes":
       return [testCol,
         { header: "Known-failure reason",
@@ -1442,6 +1678,110 @@ function queueColumns(queueId) {
       return [testCol, resultCol, failingSinceCol, commentCol,
         assigneeCol];
   }
+}
+
+/*
+ * The Flaky tab's own columns (WP-44, design §3 U8), between the test
+ * and the assignee. No sortKey anywhere: the list is paged by the server
+ * in an order it states above the table (decision 16), and sorting one
+ * page here would order that page, not the list. Every string from the
+ * server (the reason, the owner) goes in through textContent.
+ */
+function flakyColumns() {
+  return [
+    { header: "State",
+      cell: (entry, shown) => {
+        const cell = el("td");
+        cell.appendChild(resultChip(shown));
+        if (entry.muted) {
+          const tag = el("span", "mute-tag", "muted");
+          tag.title = flakySentence(entry.flaky, true);
+          cell.appendChild(tag);
+        }
+        if (entry.retired) {
+          cell.appendChild(el("span", "retired-tag", "retired"));
+        }
+        return cell;
+      } },
+    { header: "Mark",
+      cell: (entry) => {
+        const cell = el("td", "wrap comment-cell");
+        cell.appendChild(el("span", "comment-text", entry.reason));
+        cell.appendChild(el("span", "row-sub", flakyDetail(
+          { marked_by: entry.marked_by, marked_at: entry.marked_at },
+          Date.parse(serverClock() + "Z"))));
+        return cell;
+      } },
+    { header: "Cadence",
+      cell: (entry) => el("td", "", cadenceWords(entry.cadence)) },
+    { header: "Failed",
+      cell: (entry) => el("td", "",
+        failedOfRuns(entry.recent_failures, entry.recent_runs)) },
+  ];
+}
+
+/**
+ * The Flaky tab's table: one row per mark, in the server's order. The
+ * chip and the row edge take ONE value, displayResult() of the mark's
+ * result, state and live mute, as every other row's does. No Output
+ * column: an entry names a test, not a run.
+ */
+function renderFlakyTable(entries) {
+  const headRow = document.getElementById("queue-head-row");
+  headRow.appendChild(queueSelectionMount.headerCell());
+  for (const column of queueColumns(FLAKY_TAB)) {
+    headRow.appendChild(el("th", "", column.header));
+  }
+  appendFlakyRows(entries);
+  renderFlakyNote();
+  document.getElementById("queue-table").hidden = false;
+  document.getElementById("queue-empty").hidden = true;
+  document.getElementById("queue-cap-note").hidden = true;
+}
+
+/** Rows of the Flaky tab below those on screen, and the pager after
+ * them: "Show more" runs to `total + retired`, the retired marks being
+ * the last of the same list. */
+function appendFlakyRows(entries) {
+  const body = document.getElementById("queue-body");
+  const columns = queueColumns(FLAKY_TAB);
+  for (const entry of entries) {
+    const tr = document.createElement("tr");
+    const shown = displayResult(entry.result, entry.state, entry.muted);
+    const marker = resultClass(shown);
+    if (marker) {
+      tr.className = marker;
+    }
+    tr.appendChild(queueSelectionMount.rowCell(entry));
+    for (const column of columns) {
+      tr.appendChild(column.cell(entry, shown));
+    }
+    body.appendChild(tr);
+  }
+  const queue = state.queues[FLAKY_TAB];
+  const listed = queue.total + queue.retired;
+  const more = document.getElementById("queue-more");
+  more.hidden = queue.tests.length >= listed;
+  more.textContent = "Show "
+    + Math.min(FLAKY_PAGE, listed - queue.tests.length).toLocaleString()
+    + " more";
+}
+
+/** Above the Flaky tab: the order it is in, then "N flaking now · List
+ * them in All tests" where a test reads FLAKING (`status.flaking`). */
+function renderFlakyNote() {
+  const note = document.getElementById("queue-flaky-note");
+  clearNode(note);
+  note.appendChild(el("span", "", FLAKY_TAB_ORDER));
+  const flaking = state.summary ? state.summary.status.flaking || 0 : 0;
+  if (flaking > 0) {
+    const line = el("span");
+    line.appendChild(document.createTextNode(
+      flakingNowWords(flaking) + " · "));
+    line.appendChild(flakingLink("List them in All tests"));
+    note.appendChild(line);
+  }
+  note.hidden = false;
 }
 
 /* ---- inline review ----
@@ -1490,6 +1830,9 @@ function renderQueueTable() {
   // here, unlike the browse table) -- so every render is a fresh view,
   // and the selection made on the PREVIOUS render is cleared every time.
   queueSelectionMount.reset();
+  // The Flaky tab's note and pager: shown by renderFlakyTable() only.
+  document.getElementById("queue-flaky-note").hidden = true;
+  document.getElementById("queue-more").hidden = true;
 
   const invariant = QUEUE_INVARIANT_RESULT[queueId];
   resultNote.hidden = !invariant;
@@ -1512,7 +1855,8 @@ function renderQueueTable() {
     // a skeleton — refreshes keep the previous table dimmed, so this
     // shows only the first time a queue is opened.
     table.hidden = true;
-    emptyNote.textContent = "Loading queue…";
+    emptyNote.textContent = queueId === FLAKY_TAB ? "Loading…"
+      : "Loading queue…";
     emptyNote.hidden = false;
     capNote.hidden = true;
     resultNote.hidden = true;
@@ -1524,6 +1868,10 @@ function renderQueueTable() {
     emptyNote.hidden = false;
     capNote.hidden = true;
     resultNote.hidden = true;
+    return;
+  }
+  if (queueId === FLAKY_TAB) {
+    renderFlakyTable(allEntries);
     return;
   }
 
@@ -1815,9 +2163,12 @@ function updateSortIndicators() {
 
 /* ================= filter controls ================= */
 
+/* The toggles, in BROWSE_RESULTS' order: FLAKING (WP-44, decision 24)
+ * right after FAIL, its wire word as its label like its neighbours,
+ * shipped hidden; syncResultToggles() decides when it shows. */
 function buildResultToggles() {
   const container = document.getElementById("result-toggles");
-  for (const result of RESULTS) {
+  for (const result of BROWSE_RESULTS) {
     const btn = el("button", "toggle " + resultClass(result), result);
     btn.type = "button";
     btn.dataset.result = result;
@@ -1835,11 +2186,25 @@ function buildResultToggles() {
   }
 }
 
+/**
+ * Each toggle's pressed state. The FLAKING toggle is hidden until the
+ * headline says the scope has a mark (`status.flaky_total` > 0), and is
+ * shown whenever it is pressed, so a filter in force is never invisible
+ * (a link or the address bar can press it first). While it shows, FAIL
+ * is only the other half of the failing tests, and its title says so.
+ */
 function syncResultToggles() {
   const buttons = document.querySelectorAll("#result-toggles .toggle");
+  const flakingShown = state.activeResults.has(FLAKING_FILTER)
+    || (Boolean(state.summary) && flakyScope());
   for (const btn of buttons) {
     btn.setAttribute("aria-pressed",
       state.activeResults.has(btn.dataset.result) ? "true" : "false");
+    if (btn.dataset.result === FLAKING_FILTER) {
+      btn.hidden = !flakingShown;
+    } else if (btn.dataset.result === "FAIL" && (flakingShown || btn.title)) {
+      btn.title = flakingShown ? failToggleTitle() : "";
+    }
   }
 }
 
@@ -1897,8 +2262,9 @@ function wireMainlineControls() {
   // Read BEFORE buildResultToggles()/the sync calls below paint the
   // controls, so their initial aria-pressed state already matches —
   // reading it after would need a second render pass.
+  // FLAKING among them (WP-44): the toggle shows while it is pressed.
   for (const raw of url.searchParams.getAll("result")) {
-    if (RESULTS.indexOf(raw) !== -1) {
+    if (BROWSE_RESULTS.indexOf(raw) !== -1) {
       state.activeResults.add(raw);
     }
   }
@@ -1970,6 +2336,9 @@ function wireMainlineControls() {
     });
   document.getElementById("show-more").addEventListener("click", () => {
     loadBrowse(true);
+  });
+  document.getElementById("queue-more").addEventListener("click", () => {
+    loadFlakyMore();
   });
 
   for (const btn of

@@ -5046,3 +5046,32 @@ order, -10.3 in the other, equal statements) is unexplained and reads as
 an artefact of the page mode on a busy machine. MariaDB 10.3 has not run
 the plans. 3021 OK (skipped 1) and 4175 OK (skipped 90) green in the main checkout with
 item 9 beside it.
+
+## WP-44 item 9: the Flaky tab, the FLAKING filter, Open Actions and the chart follow the mark (2026-11-11)
+
+Item 9 is committed: the Flaky tab on Home (its request on the first
+click only, paging to `total + retired`); the FLAKING toggle on All tests
+and the links into it; Open Actions' footer line and its Failing mode
+sending `result=FAIL&result=FLAKING&open=1`; the per-day chart's fourth
+series; the What's new section. No first paint gained a request, and
+Home lost one: the measured pass of item 8 found `parts=assigned_trend`
+in Home's first batch (the design had it off every first paint), costing
+the page +12.5 ms (11%) at 50 marks and +118 ms (86%) at 1,000 on SQLite.
+The split is now sent after the headline has drawn; Home's first batch is
+three requests and, measured that way, the page is the base's. The chart
+gains its split one request later than before, with or without marks: for
+the owner to confirm.
+
+For the owner to confirm: the Failing mode now leaves out unassigned
+flaking tests (162 rows against 169 on the reference seed with 50 marks),
+the design's intent, and with no marks it lists the same rows by a
+statement that differs by the `open` term; the tab's badge counts `total`
+while the list also shows the retired marks last, each tagged; What's new
+is dated 2026-11-11 and the drop sets the real date.
+
+Fresh eyes found one defect, fixed: with two pages of the tab loaded, an
+assignment from a row's select refetched page one without redrawing, and
+the next "Show more" appended a page twice. No browser has rendered the
+feature; the pages and the API were read over HTTP on a seeded copy and
+the counts agreed. 3021 OK (skipped 1) and 4175 OK (skipped 90) green in the main
+checkout.

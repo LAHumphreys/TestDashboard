@@ -44,6 +44,41 @@
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
 
+    <section class="release" data-drop-date="2026-11-11">
+      <div class="section-head">
+        <h2 class="eyebrow">11 November 2026</h2>
+        <span class="muted">New: mark a test as flaky, and the board tells a flaking test from a failing one</span>
+      </div>
+
+      <h3>What's new</h3>
+      <ul>
+        <li><strong>Mark a test as flaky.</strong> Tick its rows and choose
+          <strong>Mark as flaky</strong>, or use the Flakiness card on its
+          test page, with a reason and how many failures in a row count as
+          failing, from 2 to 10. The mark covers mainline and every build
+          until someone chooses <strong>Unmark</strong>; <strong>Set
+          cadence</strong> changes the number.</li>
+        <li><strong>Flaking is its own state.</strong> A marked test that
+          fails, but fewer times in a row than its cadence, reads
+          <em>FLAKING</em> in its own colour, and the figures it is taken
+          out of say so beside them (&ldquo;+4 flaking&rdquo;); it still
+          counts against the pass rate. The charts draw it as its own part, after
+          muted. The night it fails past its cadence it is a new failure,
+          red again: <em>FLAKING &rarr; FAIL</em>.</li>
+        <li><strong>Open Actions leaves out unassigned tests that are
+          flaking</strong> until they fail past their cadence, and says so
+          under the count; an assigned one stays, reading FLAKING.
+          &ldquo;All clear&rdquo; on the home page names what is set
+          aside.</li>
+        <li><strong>All tests gains a FLAKING filter</strong>, beside FAIL,
+          once a test in view is marked; FAIL now leaves the flaking tests
+          out, and the two together are every failing test.</li>
+        <li><strong>A Flaky tab beside Muted</strong> lists every mark: its
+          reason, owner and age, its cadence, and how often the test has
+          really failed (&ldquo;6 of its last 20 runs&rdquo;).</li>
+      </ul>
+    </section>
+
     <section class="release" data-drop-date="2026-10-13">
       <div class="section-head">
         <h2 class="eyebrow">13 October 2026</h2>
@@ -524,7 +559,7 @@
           queue no longer means losing it.</li>
         <li><strong>Every failing row says when it last passed</strong> — and
           whether it broke or is just unreliable: <em>"failed every one of the
-          last 20 runs"</em> versus <em>"flaky — flips about 1 run in 3"</em>.
+          last 20 runs"</em> versus <em>"flips about 1 run in 3"</em>.
           Those need opposite responses and used to look identical. The open
           panel shows the last 20 runs as a strip.</li>
         <li><strong>Columns sort.</strong> Sorting covers the whole queue, not

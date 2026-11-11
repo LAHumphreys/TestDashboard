@@ -136,7 +136,7 @@
                suite's page for its individual executions. -->
           <h3>Failing runs per day</h3>
           <div id="trend-chart"></div>
-          <p id="trend-split-caption" class="chart-caption" hidden>Assigned and muted are as they stand now: a day's columns recolour as tests are taken.</p>
+          <p id="trend-split-caption" class="chart-caption" hidden>Assigned and muted are as they stand now: a day's columns recolour as tests are taken.<span id="trend-mark-caption" hidden></span></p>
           <details>
             <summary>Data table</summary>
             <table class="data-table small" id="trend-table">
@@ -147,6 +147,7 @@
                   <th class="num trend-split-col" hidden>Unassigned</th>
                   <th class="num trend-split-col" hidden>Assigned</th>
                   <th class="num trend-split-col" hidden>Muted</th>
+                  <th class="num trend-mark-col" hidden>Flaking</th>
                   <th class="num">Unexpected pass</th>
                   <th class="num">Runs</th>
                 </tr>
@@ -182,6 +183,9 @@
            A column of identical values is noise, and noise is what made
            these tables misread in the first place. -->
       <p id="queue-result-note" class="queue-result-note" hidden></p>
+      <!-- The Flaky tab's order and its "N flaking now" link (WP-44),
+           filled by app.js on that tab only. -->
+      <p id="queue-flaky-note" class="queue-result-note queue-flaky-note" hidden></p>
       <div id="all-clear" class="all-clear" hidden>
         <span class="all-clear-mark" aria-hidden="true">✓</span>
         <div>
@@ -200,6 +204,8 @@
       </div>
       <p id="queue-empty" class="empty-state" hidden></p>
       <p id="queue-cap-note" class="muted cap-note" hidden></p>
+      <!-- The Flaky tab's pager: its list is paged by the server. -->
+      <button id="queue-more" class="queue-more" type="button" hidden>Show more</button>
     </section>
 
     <!-- ============ All tests (browse) ============ -->
