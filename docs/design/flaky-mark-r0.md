@@ -834,6 +834,58 @@ An addendum to §3a; the code is unchanged from §B's base `652b0bb`. Numbers ma
   - **MariaDB plans:** proceed. No hook on 12.3; the 10.3 check stays.
   - **Bit carriers and join:** proceed. **History:** in the detail.
 
+## §3c Performance pass, round 2 (§P, performance-engineer, base `ee75e46`)
+
+Mine unless marked §B or estimate. Seed copies with §B's fixture; cold,
+in-process, alternated; paired medians B−A, ms. SQLite 24 calls (-h90 16),
+A/A ±0.3, B.5 reproduced within 0.5. MariaDB: perf-seed/1 in a local
+**12.3, not 10.3**, 40 calls; 0-mark bands ±2.5 rows, ±0.5 headline.
+
+| perf-seed/1 (MariaDB base ms) | MariaDB, 50 marks | MariaDB, 1,000 | SQLite, 50 ; 1,000 |
+|---|---|---|---|
+| Open Actions' rows, cold / warm (83 to 85) | +8.8 [+6.6, +11.3] / +2.7 | +10.0 [+8.6, +11.9] / −0.1 | +1.0 ; +1.2 / −1.3 ; −1.5 |
+| Open Actions' page, two workers (91 to 92; 0 marks −14.5) | −5.4 [−6.8, −3.1] | −1.0 [−2.7, +2.3] | |
+| Headline (44 to 46), 37 → 40 statements | +7.2 [+6.2, +7.9] | +15.2 [+14.3, +15.6] | +3.4 ; +6.5 (-h90 +3.3 ; +6.1) |
+| … of which the promotion and cadence 2 | +0.6 [−0.1, +1.2] | +1.4 [+0.3, +2.1] | +0.5 ; +0.5 |
+| Browse, no filter (10.9 to 12.2; 0 marks +0.13, the fold's row) | +0.69 | +0.48 | +0.27 ; +0.44, count same SQL |
+| Failing, cold / warm (3.2 to 3.8) | +6.7 / +0.4 | +7.4 / +0.3 | +3.0 ; +3.2 / +0.3 ; +0.2 |
+| Flaking, cold / warm | +4.2 / −1.9 | +7.6 / +0.3 | +0.6 ; +1.8 / −1.5 ; −0.9 |
+| Either with Passing, cold / warm (11.6 to 13.1) | +7.2 to +7.5 / +1.0 to +1.2 | +8.3 to +10.3 / +0.9 to +2.8 | +3.8 ; +4.6 / +0.5 ; +1.0 |
+| New failures queue rows: widened (B.3(d)) ; P bound | +0.73 ; +0.12 | +1.30 ; +0.29 | +0.24 ; +0.26 / +0.06 ; +0.07 |
+
+- **Keys form on browse.** With Passing it reads ~12,700 keys: +11.1 to
+  +12.3 warm against +0.5 to +1.0 bound (§B +12.1 to +12.6). Above the
+  ceiling +14.5 to +16.7 cold (§B), else as bound: only on SQLite before
+  3.32 with over ~330 of F in scope, an outage. MariaDB has no ceiling.
+- **Headline.** At 1,000: Q1 1.4, Qc 3.3, one Q2 of 83 tests 9.5, 27 of
+  them fix candidates. Q2's members parenthesised on MariaDB (a backend
+  spelling): −1.5 / −2.0, same rows. Splitting Qc: +0.4, no. §B's harness
+  leaves the candidates out of `flaky_total` (973 of 1,000).
+- **`_cadence_runs_cache`.** No act stales it. The push's drop is
+  correctness, not hygiene: a re-pushed or late older run changes the
+  window under one key. Size: a marked FAIL/FAIL test or candidate per
+  stream read (83 on mainline at 1,000).
+- **Measured pass.** `ab.py --marks 0/50/1000`, both seeds: Known slow at 0,
+  these rows, counts. MariaDB by hand: the same, `EXPLAIN` of all; on 10.3
+  the keep term, Q1's side, the parentheses. SQLite, 999 planted, F ≥ 340.
+
+**Verdicts.**
+- Keys form on browse: proceed with §2's split; no cheaper shape is worth it.
+- Browse unfiltered: proceed, at the bar. Failing, Flaking: proceed, off
+  first paint; exclude keeps the FAIL range, keep is a key range over F.
+- Open Actions: proceed, Q2 parenthesised on MariaDB; replaces §3b's
+  estimate (+11, +4) and its page figures (+2.6, +11.0).
+- Queues: proceed with P bound on New failures, `OR (lr.<triple>) IN
+  (<P>)` from the memo; §2's widening above the ceiling only.
+- `_cadence_runs_cache`: proceed if a push drops its stream's entries,
+  with `_streak_cache`'s 60 s TTL and a cap that clears in full.
+- Plans: proceed; no `STRAIGHT_JOIN` on 12.3 (Q1 from the marks at 50, the
+  FAIL range at 1,000; Q2 a `uq_runs_identity` range); 10.3 is the build's.
+- **Headline: ESCALATE.** Accept about +6 ms at 50 marks and +13 at 1,000
+  on Home's cold headline on MariaDB (measured +7.2, +15.2, less the
+  condition: estimates), or reverse decision 3's rule, which saves about 4
+  to 5 at 1,000 and nothing at 50 (estimate).
+
 ## §4 Decisions
 
 Each is written as the recommended position, with the alternative after
