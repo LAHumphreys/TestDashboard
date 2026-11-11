@@ -111,7 +111,7 @@ predate WP-43; remove when they unlock.
 | Plan | Spec | Branch | Status |
 |---|---|---|---|
 | WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8, status strip §9 (frozen 2026-10-13) | `wp-43-charts-assigned-split` | **built, every item done; drop PR #20 open**; one owner decision recorded in §7 |
-| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11) | `wp-44-flaky-mark`, to be cut from `design-flaky-mark` | **not started; waits for the owner's go** and the choice of `/overnight` or item by item. Fifteen items, the first three (Open Actions' names-only request) shippable on their own. Its item 3 claims migration 12 and moves the parked WP-15 to 13 |
+| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11) | `wp-44-flaky-mark`, cut from `design-flaky-mark` at `57d817b` | **in progress since 2026-11-11, unattended (`/overnight`), on the owner's go; all fifteen items ship as one drop.** The status strip is the doc's §12: the restart point is its first line not `done` or `parked`. Its item 3 claims migration 12 and moves the parked WP-15 to 13 |
 
 ## Needs a person, not a commit
 

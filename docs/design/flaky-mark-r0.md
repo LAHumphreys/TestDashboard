@@ -1318,3 +1318,31 @@ small path is the supervised alternative. The owner chooses at kickoff.
 with no marks on any read; the figures in its table with marks; MariaDB
 taken by hand on the local 12.3 and recorded in the log, with CI's 10.3
 legs the authority for correctness and for the plans.
+
+## §12 Build status strip (WP-44, `wp-44-flaky-mark`)
+
+The owner's go, 2026-11-11, verbatim: "Go for the build - all as one drop".
+So there is no early drop of items 1, 2 and 2p; the What's new section is
+item 9's alone. The run is unattended (`/overnight`), from a suite green on
+both backends at `57d817b`.
+
+One line per item of §11, kept current by the run; the restart point after
+any interruption is the first line not `done` or `parked`.
+
+| Item | Status | Commit | Note |
+|---|---|---|---|
+| 1 names-only request, backend | in flight | | |
+| 2 names-only request, UI | not started | | |
+| 2p measured pass | not started | | |
+| 3 the mark, backend | not started | | |
+| 3p measured pass | not started | | |
+| 4 marks fixture | not started | | |
+| 5 controls, UI | not started | | |
+| 6 state and counts, backend | not started | | |
+| 6p measured pass | not started | | |
+| 6h dialect hook | only if a plan guard fails on CI's 10.3 legs | | |
+| 7 state on Home and rows, UI | not started | | |
+| 8 lists and filters, backend | not started | | |
+| 8p measured pass | not started | | |
+| 9 lists and filters, UI | not started | | |
+| 10 the drop | not started | | |
