@@ -4830,3 +4830,32 @@ a time limit and a size cap; every MariaDB plan is rechecked on 10.3.
 
 No decision is open. Next: the contract reconciled, the sizing pass and the
 freeze. Nothing is built.
+
+## Design review: mark a test as flaky, frozen and sized as WP-44 (2026-11-11)
+
+The arc is closed: three rounds reviewed in one day, no decision open. The
+doc (`docs/design/flaky-mark-r0.md`) is marked frozen. Its §1 is the
+contract the two layers build against, rewritten after round 2; its §4
+carries twenty-five decisions, each with its verdict; its §11 is the master
+plan.
+
+The sizing pass makes one package, WP-44, on one branch, fifteen items in
+order, each one brief with its layer, its trigger status and its gate:
+Open Actions' names-only request first (backend, UI, a measured pass;
+shippable on its own); the mark itself with migration 12; the marks fixture
+in the performance harness; the controls; state and counts; state on Home
+and rows; lists and filters on each layer; the drop. Every backend item on
+the trigger paths has its own measured pass before review, held to the
+contract's cost bar, and a dialect hook for MariaDB exists as an item only
+if a plan guard fails on CI's 10.3 legs.
+
+What the build is held to, from the three performance passes (perf-seed/1,
+cold; SQLite, then MariaDB on a local 12.3): nothing on any read with no
+marks; Home's headline +3.4 and +7.2 ms at 50 marks, +6.5 and +15.2 ms at
+1,000, accepted by the owner; the browse rows on Home's first paint within
+0.7 ms; Open Actions' page faster than today at every mark count once the
+names-only request is in. A worse figure returns to the owner.
+
+Before the commit the main session read the doc whole and a fresh-eyes
+reviewer read it for coherence and for the publication gate. The build is
+registered in the handover and waits for the owner's go. Nothing is built.

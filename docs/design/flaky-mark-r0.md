@@ -1,21 +1,21 @@
-# Mark a test as flaky — design review, round 0
+# Mark a test as flaky — design, frozen
 
-**Status: ROUND 0 REVIEWED (2026-11-11); ROUND 1 OWED. Every one of §4's
-twenty-three decisions has a verdict and §5's six questions are answered; the
-review is captured verbatim in §8, which also lists what it changes in the
-sections below and who owes the rewrite. Until round 1 lands, §2, §3 and §3a
-read as written for round 0. Nothing is built.**
-Three sections were written by the owning agents against §0: §B (§2) by
-`backend-engineer`, §UI (§3) by `ui-engineer`, and §P (§3a), the performance
-design pass, by `performance-engineer` against the other two. §1 is the main
-session's reconciliation of them. Reading bar: twenty minutes; §0, §1, §4 and
-§5 are the review, and the sections are the reasoning behind them.
+**Status: FROZEN 2026-11-11. Three rounds were reviewed the same day; every
+decision in §4 has a verdict and no question is open. The master plan is
+§11 and the build is WP-44, registered in `docs/SESSION_HANDOVER.md`.
+Nothing is built.**
 
-Two things to know before reading the sections. They were written against a
-candidate contract, so where §2 or §3 says "§1" it means that candidate, and
-§1 as it stands now already answers their pushback. And verdict 17 arrived
-after they were written: what §B's question 2 and §3's U9 say of Open Actions
-predates it (decision 23).
+How to read it. §0 (what is being built), §1 (the contract the two layers
+build against), §4 (the decisions) and §11 (the plan) are the frozen design
+and are the twenty-minute read. §2 and §3 are the owning agents' sections as
+round 2 left them: `backend-engineer`'s and `ui-engineer`'s statements,
+wireframes, tests and reasoning. §3a, §3b and §3c are the performance
+engineer's three passes, each an addendum to the one before, so a number in
+an earlier pass may be replaced in a later one; §1's cost bar quotes the
+last. §5 and §6 are the questions as they were put and what the build
+carries. §7 to §10 are the owner's words, verbatim, in order. Where an
+earlier review and a later one disagree, the later one is right, and §1
+says how it came out.
 
 Terms the sections use: a **triple** is (environment, script, test name);
 **Q1** is the statement that reads the marks and **Q2** the bounded read of a
@@ -29,6 +29,14 @@ failing only once its N most recent runs have all failed. A marked test whose
 latest failure is under the cadence is **flaking**: its failure is tolerated.
 A marked test whose failures have reached the cadence is **over its cadence**
 and is an ordinary failure.
+
+Three sets the sections name. **F** is a stream's marked tests that are
+flaking under no live mute: exactly the rows that read FLAKING. **X** is F's
+members with no assignee, the only tests Open Actions leaves out. **P** is
+the tests promoted tonight: over their cadence on this run and not on the
+one before. The **keys form** is a read that returns the matched keys in
+order and lets Python drop a set before paging, used where a bound list
+would be too long.
 
 ## §0 What we are building
 
@@ -49,14 +57,15 @@ nobody's unless it is separately assigned, and the mark stays, so it is
 tolerated again after its next pass. A live mute wins over the mark: a muted
 test shows as muted until the mute runs out. The mark's owner is a record of
 who accepted the flakiness and is not an assignment: marking a test puts
-nothing on anyone's Open Actions. A flaking test is not an open issue: it
-leaves Open Actions' "Needs action" list until it goes over its cadence
-(verdict 17, added after this paragraph was agreed). That holds for a test
-that already has an assignee too: the assignment is kept but dormant, and the
-test returns to that person's list only if it goes over its cadence (§8,
-which supersedes verdict 6). In lists a flaking row carries its own chip and
-edge in the flaking colour, because flaking is a state in its own right
-(§8, decision 8). A Flaky tab
+nothing on anyone's Open Actions. An unassigned test that is flaking is not
+listed on Open Actions; an assigned test is listed whatever its state and
+reads FLAKING while it flakes, and everything else on that page is as it is
+today (§9, which replaced a wider reading of verdict 17). In lists a flaking
+row carries its own chip and edge in the flaking colour, because flaking is
+a state in its own right (§8, decision 8). The browse page's Result filter
+has a FLAKING value, and its FAIL value leaves flaking rows out (§9). On the
+night a marked test goes over its cadence it is a New failure, and Still
+failing after that (§9). A Flaky tab
 on Home, beside Muted, lists every mark with its owner, cadence, age and how
 often the test has actually failed, so a stale mark is visible without anyone
 being nagged. Any named user may remove a mark or change its cadence; every
@@ -66,7 +75,8 @@ those tests stop crowding the failures that need triage.
 
 Done means: mark, change and unmark from the selection bar and the test page;
 the tiles, the three home charts (a fourth segment), Watch, the browse rows,
-Open Actions and the Flaky tab all agree on what is flaking; mute behaves
+the browse filter, Open Actions and the Flaky tab all agree on what is
+flaking; mute behaves
 exactly as before; and the headline, browse and chart reads measure the same
 as today on an estate with no marks, on SQLite and MariaDB alike.
 
@@ -82,70 +92,125 @@ Actions (an easy way to deal with passing tests and clear them in bulk) is a
 follow-up design. An assigned test that is flaking is seen as a special case
 of that, which is why it stays on Open Actions here with only a state marker.
 
-## §1 The contract, reconciled
+## §1 The contract, as frozen
 
-The two layers wrote in parallel against a candidate contract (this branch's
-first commit carries it). This replaces it. Where §B, §UI and §P differed,
-the line says whose position stands; "decision N" points at §4.
+The main session's reconciliation of §2 and §3 after round 2. It is what
+the two layers build against; "decision N" points at §4.
 
 - **Identity.** A mark is per test in one environment: (environment, script,
   test name), the key an assignment uses. Fields: `cadence` (2 to 10),
   `marked_by` (the person making the mark; nobody else can be named, decision
   12), `marked_at`, `reason`.
 - **The rule, per stream.** A failure is `FAIL` and nothing else (decision 1).
-  The state is `passing`, `flaking` or `failing` by §B B.1's table, and `null`
-  where the test never ran on the stream.
+  The state is `passing`, `flaking` or `failing` by §2 B.1's table, and `null`
+  where the test never ran on the stream. A live mute wins over the mark.
 - **State on a row.** `flaky` is null or `{cadence, marked_by, marked_at,
   reason, state, streak, runs}`. `streak` is the consecutive failures ending
   at the latest run, capped at N. `runs` is how many runs the stream has of
   the test, capped at N, given when the state is `failing`: the one place the
-  UI reads it, to say "every run here has failed (2 of 2)". Both were asked
-  for by §UI (U12.1) and cost no read (§P). Carried by dashboard rows, queue
-  rows, Open Actions' rows and the test detail, which also carries
-  `flaky_history`. Comparison rows are decision 9.
-- **Counted once.** Muted, else flaking, else assigned, else unassigned (§B
-  and §UI agree). Flaking tests leave `new_failures`, `still_failing`, the
-  per-environment `failed`, the per-script `failing`, the `assigned` figure
-  the charts split on, and Watch's `unassigned_failing`. The pass rate's
-  inputs do not change.
+  UI reads it, to say "every run here has failed (2 of 2)". Carried by
+  dashboard rows, queue rows, Open Actions' rows and the test detail, which
+  also carries `flaky_history`, so opening the history fetches nothing.
+  Comparison rows carry nothing (decision 9).
+- **What reads FLAKING.** A row whose result is `FAIL`, whose state is
+  `flaking` and which has no live mute. The wire result stays `FAIL`; one
+  helper in `static/api.js` makes the word, the chip and the row edge.
+- **Counted once.** Muted, else flaking, else assigned, else unassigned.
+  Flaking tests leave `new_failures`, `still_failing`, the per-environment
+  `failed`, the per-script `failing`, the `assigned` figure the charts split
+  on, and Watch's `unassigned_failing`. The pass rate's inputs do not change.
+- **Going over the cadence** (decision 25). A marked test is in
+  `new_failures` and the New failures queue on the night it goes over its
+  cadence, which is exactly when run N+1 exists and is not a `FAIL`; after
+  that it is Still failing. With N+1 runs or fewer, all failures, it was over
+  already; a marked test failing on its first run on a stream is New, as any
+  test is today. A cadence change brings no run, so it never makes a test
+  new. Its
+  row needs no new field: a New failures row with `prev_result` `FAIL` and
+  state `failing` reads "FLAKING → FAIL (flaky)".
+- **Newly fixed** (decision 3). A marked test passing after a failure is
+  fixed only if it had been over its cadence; a pass after a tolerated
+  failure is in no Fixed figure, queue or delta.
 - **Counts.** `status.flaking`, `status.flaking_new_failures`,
-  `status.flaking_still_failing` (one per tile, §UI U12.2), `status.flaky_total`
-  (every mark in scope); `by_environment[].flaking`,
+  `status.flaking_still_failing` (one per tile), `status.flaky_total` (every
+  mark in scope); `by_environment[].flaking`,
   `top_failing_scripts[].flaking`, `products[].flaking`, and `flaking` on
-  Watch's environment and product cards. §UI notes nothing draws
-  `products[].flaking`; it stays, because the product's failing figure has the
-  flaking tests taken off it and the board never subtracts silently.
+  Watch's environment and product cards. Nothing draws `products[].flaking`;
+  it stays, because the product's failing figure has the flaking tests taken
+  off it and the board never subtracts silently.
 - **The trend.** `FAIL_FLAKING` per night, in `parts=assigned_trend` only,
-  disjoint from `FAIL_MUTED` and `FAIL_ASSIGNED`. What it means for a past
-  night is decision 2.
-- **The Flaky tab** is its own `GET /api/flaky` (§B D-B8), not a queue kind as
-  §UI assumed: a kind would add a statement to the full payload. Its badge is
-  `status.flaky_total`, not `queue_totals.flaky`. Entries carry `failed_runs`
-  and `runs` (§UI's `recent_failures` and `recent_runs`, under §B's names).
-  It is paged by the server; how it is ordered is decision 16.
+  disjoint from `FAIL_MUTED` and `FAIL_ASSIGNED`, each night as it stood
+  then under today's marks (decision 2).
+- **The Flaky tab** is its own `GET /api/flaky`, fetched on the tab's first
+  click. Its badge is `status.flaky_total`. Entries carry the mark, `result`,
+  `state`, `muted`, `retired`, `assignee` (the current assignee, as
+  anywhere) and `recent_failures` of `recent_runs`, the last 20 runs on the
+  stream. Paged by the server, 100 a page: failing first, then flaking, then
+  passing, newest mark first, retired last (decision 16). A mark on a test
+  with no run on the stream is absent from the tab and the badge (§8). A
+  retired test's mark is listed, flagged, and is in no count (decision 11):
+  the response gives `total` and, apart from it, `retired`.
 - **Acts.** `POST /api/flaky/bulk` with `{username, reason, cadence, tests}`
   returns `{marked, changed, unchanged, unknown}`; the reason is required for
   a fresh mark and optional for a cadence change. `POST /api/flaky/unmark`
-  with `{username, tests}`.
-- **Open Actions.** A flaking test is not on its "Needs action" list (verdict
-  17). Neither section designed that exclusion; it is decision 23, for
-  round 1.
-- **An older payload** without any of these fields, and a scope with no marks,
-  draw exactly today's page (§UI U7, U11).
-- **The cost bar, as §P leaves it.** With no marks, no read gains a statement;
-  the one exception is a primary-key join on the rows statements (decision
-  19). With marks, the headline reads only the marked tests that are failing
-  on the stream, and counts the marks in SQL (§P's cheaper shape, replacing
-  §B's Q1); only tests that have failed twice running under a cadence of 3 to
-  10 read the runs table, at most N rows each. §B's lower bound on that read
-  applies to build streams only: §P found it wrong for mainline on a migrated
-  database, which is production's case (decision 18).
+  with `{username, tests}` returns `{unmarked}`.
+- **Open Actions** (decision 23, as §9 narrowed it). An unassigned test that
+  is flaking is not listed; everything else on the page is as it is today.
+  An assigned test is listed whatever its state and reads FLAKING while it
+  flakes; a marked test at an unexpected pass stays. The rows, their `total`
+  and bulk assign agree on the set. Every open-assignment figure and queue
+  is unchanged: `status.assigned_open`, `queue_totals.assigned` and `.mine`,
+  the assigned and My actions queues. A footer line says what is left out,
+  only where a mark exists.
+- **Open Actions' names-only request** (decision 20), the build's first
+  item. `GET /api/summary?parts=names` returns `environments`, `assignees`,
+  `products`, `assignment_streams`, `stale_before` and `flaky_marks` (is
+  there any mark) under today's names; the page stops fetching the full
+  summary.
+- **The browse Result filter** (decision 24). `result=FLAKING` matches the
+  rows that read FLAKING; `result=FAIL` matches every other `FAIL` row, a
+  muted flaking one included; both together are exactly today's `FAIL`.
+  `result` stays repeatable and sorting stays on the wire value. The toggle
+  is on the browse page only and hidden where the scope has no mark. Because
+  `result=FAIL` alone now leaves flaking rows out once a mark exists, Open
+  Actions' Failing mode sends both values, and Watch's "failing, unassigned"
+  link and the scripts chart's click now list what their figures count.
+- **An older payload** without any of these fields, and a scope with no
+  marks, draw exactly today's page.
+- **The cost bar, as §3c leaves it.** With no marks, no read gains a
+  statement or a join, and the push path gains nothing with or without
+  them. With marks, cold, against today, on perf-seed/1; each cell is SQLite
+  then MariaDB (a local 12.3, not production's 10.3), in ms:
+
+  | Read | 50 marks | 1,000 marks |
+  |---|---|---|
+  | Home's headline (MariaDB base 44 to 46) | +3.4 ; +7.2 | +6.5 ; +15.2 |
+  | Browse, no filter, on Home's first paint | +0.3 ; +0.7 | +0.4 ; +0.5 |
+  | Browse with Failing chosen | +3.0 ; +6.7 | +3.2 ; +7.4 |
+  | Browse with Flaking chosen | +0.6 ; +4.2 | +1.8 ; +7.6 |
+  | Open Actions' rows (MariaDB base 83 to 85) | +1.0 ; +8.8 | +1.2 ; +10.0 |
+  | Open Actions' page, with the names-only request | faster ; −5.4 | faster ; −1.0 |
+
+  The owner accepted the headline's figures (§10: about 6 and 13 ms on
+  MariaDB once the runs statement's members are parenthesised, an estimate)
+  and Open Actions' rows (§9). The headline reads only the marked tests that
+  are failing, so it grows with a stream's failures and barely with its
+  marks. Once Home has been loaded the filters and Open Actions' rows are
+  within 0.4 ms of today or faster, bar Open Actions' rows on MariaDB at 50
+  marks (+2.7) and either filter with Passing also chosen (+0.5 to +2.8).
+  With no marks Open Actions' page is 27 ms faster than today
+  on SQLite and 14.5 ms faster on MariaDB. The per-day chart's part, off
+  every first paint, runs from 4.6 ms (14 days, 50 marks) to 366 ms (90
+  days, 1,000 marks) on SQLite and is decided with the open trend decision
+  (decision 21). A figure worse than these in the build's measured passes
+  returns to the owner before it ships.
 
 ## §2 Backend (§B, round 2, backend-engineer, base `028eb33`)
 
-Against §0, §1, §4, §8 and §9; the design as frozen. **Migration 12,
-create-only**; nothing on the push path. Numbers marked §P or §3b are the
-performance pass's, the rest this round's (B.5). Some cost is accepted.
+Against §0, §4, §8 and §9, and §1 as round 1 left it; the design as
+frozen. **Migration 12, create-only**; nothing on the push path. Numbers
+marked §P or §3b are the performance pass's, the rest this round's (B.5).
+Some cost is accepted.
 
 ### B.1 Definitions (round 2)
 
@@ -221,7 +286,7 @@ test detail: "flaky_history": [{id, action, cadence, reason, actor,
 
 **The Flaky tab (round 2).** `assignee` is the current assignee, as
 anywhere; nothing reads "dormant". The window figures are renamed
-`recent_failures`, `recent_runs` (§3 U12.2): `runs` is only a row's.
+`recent_failures`, `recent_runs` (§3 U12): `runs` is only a row's.
 
 ### B.3 Where the cadence is evaluated (round 2)
 
@@ -285,9 +350,11 @@ rows are never touched, so every other filter composes by AND.
 scope, unmuted, unretired. `new_failures` loses the flaking cells with
 prev not FAIL and gains |P|; `still_failing` loses the other flaking
 cells and |P|; Home's delta follows. When P is not empty the New failures
-queue's rows widen to `prev not FAIL OR fm.cadence IS NOT NULL` (decision
-19's join), over-fetch by the marked FAIL/FAIL rows in scope and keep P;
-Still failing drops F and P, over-fetching. Nothing bound; engine order.
+queue's rows bind it from the memo, `OR (lr.<triple>) IN (<P>)` (§3c's
+condition, replacing this round's wider read). Only above the parameter
+ceiling do they widen to `prev not FAIL OR fm.cadence IS NOT NULL`
+(decision 19's join), over-fetch by the marked FAIL/FAIL rows in scope
+and keep P. Still failing drops F and P, over-fetching; engine order.
 
 ### B.4 Memos, caches and the no-marks bit (round 2)
 
@@ -305,8 +372,11 @@ Still failing drops F and P, over-fetching. Nothing bound; engine order.
   retirement act (Q1 reads `ca`, `tm`, `tr`).
 - **Q2's answers survive every act** (§3b (c)): their own dict,
   `_cadence_runs_cache`, key (stream, triple, latest start, N), which no
-  act's full clear touches; deletes drop it, a push its stream's (hygiene,
-  never staleness). The name keeps it in the harness's cold sweep.
+  act's full clear touches; deletes drop it, and a push its stream's, for
+  correctness: a re-pushed or late run changes the window under one key
+  (§3c, correcting this round). It carries `_streak_cache`'s 60 s limit
+  and a size cap that clears in full (§3c). The name keeps it in the
+  harness's cold sweep.
 - **Unfiltered browse never runs Q1**: state from the row's own result,
   `prev_result` and cadence; Q2 only for the page's marked FAIL/FAIL rows
   of cadence 3 to 10, unless memoized.
@@ -420,11 +490,11 @@ cold, about +11 cold and +4 warm at 1,000 with (a) to (d) (estimate).
 
 ## §3 UI (§UI, round 2, ui-engineer, base `028eb33`)
 
-Against §0, §1, §4, §8 and §9; the design freezes here. A flaking row
-reads FLAKING, chip and edge in the strong mauve, no pill (decision 8).
-Open Actions follows §9's rule and nothing more. Browse's Result filter
-gains FLAKING. No marks: today's page. No browser has rendered any of
-this. `▒` is the flaking chart segment.
+Against §0, §4, §8 and §9, and §1 as round 1 left it; the design
+freezes here. A flaking row reads FLAKING, chip and edge in the strong
+mauve, no pill (decision 8). Open Actions follows §9's rule and nothing
+more. Browse's Result filter gains FLAKING. No marks: today's page. No
+browser has rendered any of this. `▒` is the flaking chart segment.
 
 ### U1 The colour for "flaking"
 
@@ -552,7 +622,7 @@ New failures 3 · Still failing 11 · Muted 2 · Flaky 7 · Fixed 4 · …
 Failing first, then flaking, then passing; newest mark first.
 1 flaking now · List them in All tests
 ☐ Test         State    Mark                    Cadence  Failed   Assignee
-☐ dad_timeout  FAIL     races the DAD · dev2    2 in a…  9 of 20  [Take]
+☐ dns_timeout  FAIL     races the DNS · dev2    2 in a…  9 of 20  [Take]
 ☐ login_retry  FLAKING  race in teardown · dev1 3 in a…  6 of 20  dev1
 ☐ cache_warm   PASS     slow mirror · dev2      5 in a…  0 of 20  [Take]
 ```
@@ -603,7 +673,7 @@ rows out, an assigned one included. The footer line shows only if
 
 ```
 ☐ login_retry  atlas  FLAKING                  dev1  2026-11-10 02:14
-☐ dad_timeout  atlas  FAIL (flaky)             —     2026-11-10 02:15
+☐ dns_timeout  atlas  FAIL (flaky)             —     2026-11-10 02:15
 ☐ cache_warm   atlas  UNEXPECTED_PASS (flaky)  dev2  2026-11-10 02:16
 42 open actions
 Unassigned tests that are flaking are left out until they fail past their
@@ -891,17 +961,22 @@ A/A ±0.3, B.5 reproduced within 0.5. MariaDB: perf-seed/1 in a local
 Each is written as the recommended position, with the alternative after
 "Or:". The owner's verdict goes in the slot: agree, change to X, or reject.
 The section named holds the reasoning. The first eleven change what a
-developer sees; the rest are how it is built.
+developer sees; the rest are how it is built. A decision reads as it was
+put, so a number in it may be a round 0 figure; its verdict carries what
+later rounds changed. Decisions 24 and 25 were added by the round 1 review.
+The Section column says where the reasoning stood when the decision was
+put: an id such as D-U5, U12.7 or a B.8 question is round 0's, and round 2
+folded those into §2 B.6 and §3 U1 to U12.
 
 | # | Decision (recommended position) | Section | Verdict |
 |---|---|---|---|
 | 1 | For the cadence a failure is a `FAIL` and nothing else, the definition the existing flakiness signal uses. An unexpected pass or an expected failure among the last N runs keeps the test flaking | §B B.1 | Agreed |
 | 2 | The per-day chart judges each past night **as it stood that night**, using today's mark: a spell over the cadence stays red there, as it was in the bars. Or: "marked now", every past failure of a marked test drawn as flaking, which colours as tolerated some runs the bars called failing; "that night" is 20 to 60 % dearer than it | §B D-B1, §P | Agreed |
-| 3 | A marked test that passes after a **tolerated** failure is not "Newly fixed" and does not move the "fewer failing than before" line; one that passes after being **over its cadence** is, because that was a real failure and its fix is news. §P measured the extra read at 0.1 to 0.4 ms. Or: a marked test is never in Fixed at all, which is simpler and hides a real fix. Neither section recommended one; this is the main session's position | §UI U12.7, §P | Agreed |
+| 3 | A marked test that passes after a **tolerated** failure is not "Newly fixed" and does not move the "fewer failing than before" line; one that passes after being **over its cadence** is, because that was a real failure and its fix is news. §P measured the extra read at 0.1 to 0.4 ms. Or: a marked test is never in Fixed at all, which is simpler and hides a real fix. Neither section recommended one; this is the main session's position | §UI U12.7, §P | Agreed, and kept at its measured cost, 2 to 3 ms of the headline at 1,000 marks on SQLite (§9, §10) |
 | 4 | The Flaky tab's measure is "failed X of its last 20 runs" on the stream. Or: failures since the mark was made, which grows with the mark's age and says less about now | §B D-B2 | Agreed |
 | 5 | The tab, the legend key, the tooltip row and the table column appear **only where the scope has a mark**; a product with no marks sees exactly today's page. Or: always shown, as the Muted tab is | §UI D-U4 | Agreed |
 | 6 | The word "flaky" on screen always means the mark. The computed signal on the test page and Open Actions changes from "flaky — flips about 1 run in 3" to "flips about 1 run in 3" (and "flips often" in the card). Or: keep both meanings | §UI D-U6 | Agreed |
-| 7 | The colour for flaking is a new token, a dusty mauve (`#a66993`), checked against every existing chart colour for normal and colour-blind vision. Or: a teal, which sits too close to the pass green | §UI U1 | Agreed |
+| 7 | The colour for flaking is a new token, a dusty mauve (`#a66993`), checked against every existing chart colour for normal and colour-blind vision. Or: a teal, which sits too close to the pass green | §UI U1 | Agreed; chips, row edges and the pressed filter take a darker step, `#8f638b`, the charts keep this one (§9) |
 | 8 | A row keeps its result's colour on the chip and the row edge; flaking is a pill beside it, as muted is. Or: a mauve row edge | §UI D-U5 | Changed: a flaking row has its own chip and edge, no pill (§8) |
 | 9 | The comparison page and Watch's build cards are **unchanged in this arc**: they take no account of mutes today either, and the comparison's pairs query is the slowest thing on the board. Its counts include flaking tests. Or: the flaky pill on the comparison's rows, which §P allows on the returned page only | §B D-B7, §UI U12.6, §P | Agreed |
 | 10 | The reason's comment is tagged with the stream the user was looking at when they marked the test, though the mark itself covers every stream. Or: no tag | §B D-B5 | Agreed |
@@ -911,17 +986,20 @@ developer sees; the rest are how it is built.
 | 14 | On the test page the button sits in the Flakiness card and opens its form there; the current mark shows as a banner under the mute banner, with its history below | §UI U5, D-U7 | Agreed |
 | 15 | Migration 12 creates two tables (the marks, and one row per act) and alters nothing; the parked WP-15 moves to 13. The server may stay up for the MariaDB step | §B B.2 | Agreed |
 | 16 | The Flaky tab is paged by the server in an order it knows without the measure: failing first, then flaking, then passing, newest mark first. §UI's "most failures first" would need the measure for every mark, an estimated 110 to 130 ms at 1,000 marks. Or: accept that growth, off the first paint. The order is the main session's reconciliation, for §B to confirm in round 1 | §P, §UI U8 | Agreed |
-| 17 | The cadence is judged when a page is read, from the latest and previous results the board already keeps, reading run history only for a test that has failed twice running under a cadence of 3 to 10. Nothing is added to the push path. Or: a failure count kept as results arrive, which saves under 2 ms and costs every estate a change to the hottest table | §B B.3 | Agreed |
-| 18 | The headline reads only the marked tests that are failing, so its cost grows with failures and not with marks: about +2.5 ms at 50 marks and +3.5 ms at 1,000 on SQLite, nothing at none. MariaDB pays more: the run-history read alone was about 5 ms for the fixture's 42 tests. That read is bounded below by a stream's first run on builds only | §P | Agreed |
-| 19 | Rows learn of their mark through a primary-key join on the rows statement: +0.09 ms per 250 rows on SQLite and +0.2 ms on MariaDB with no marks. This is the one place a board with no marks pays anything. Or: a separate lookup, a statement and a round trip on every cold page | §B B.9, §P | Agreed |
+| 17 | The cadence is judged when a page is read, from the latest and previous results the board already keeps, reading run history only for a test that has failed twice running under a cadence of 3 to 10. Nothing is added to the push path. Or: a failure count kept as results arrive, which saves under 2 ms and costs every estate a change to the hottest table | §B B.3 | Agreed; as designed in round 2 run history is also read for a cadence of 2 and for the "Newly fixed" candidates, on summary paths only (§2 B.3(a)) |
+| 18 | The headline reads only the marked tests that are failing, so its cost grows with failures and not with marks: about +2.5 ms at 50 marks and +3.5 ms at 1,000 on SQLite, nothing at none. MariaDB pays more: the run-history read alone was about 5 ms for the fixture's 42 tests. That read is bounded below by a stream's first run on builds only | §P | Agreed; as measured in round 2 the headline gains 3.4 ms at 50 marks and 6.5 ms at 1,000 on SQLite, 7.2 and 15.2 ms on MariaDB, accepted (§10) |
+| 19 | Rows learn of their mark through a primary-key join on the rows statement: +0.09 ms per 250 rows on SQLite and +0.2 ms on MariaDB with no marks. This is the one place a board with no marks pays anything. Or: a separate lookup, a statement and a round trip on every cold page | §B B.9, §P | Agreed; since round 1 the join is added only where a mark exists, so a board with no marks pays nothing |
 | 20 | The unsliced summary, which Open Actions fetches on its first paint, carries the counts so its queues agree with the headline's: nothing with no marks, +2 to 6 ms with marks on SQLite, an estimated +6 to 10 ms on MariaDB. §P recommends giving Open Actions a catalogue-only request as its own package, saving about 19 ms, more than this adds | §B D-B3, §P | Agreed, and the names-only request is built in this arc, first (§8) |
 | 21 | The per-day chart's cost at 90 days with 1,000 marks (366 ms on SQLite, off the first paint) joins the trend decision already open from the assigned split: accept, a covering index, or a cap. It is not decided here | §P | Agreed: decided with the open trend decision |
 | 22 | MariaDB is gated by CI's 10.3 legs running the cadence tests with at least 101 marked tests, so a full statement and a second one both execute, plus a by-hand `EXPLAIN` on a production-scale copy during the measured pass | §P | Agreed |
-| 23 | A flaking test is off Open Actions' "Needs action" list and returns when it goes over its cadence. No section designed this: the list is paged in SQL and "flaking" is computed, so how they are excluded and what it costs is unmeasured. Round 1 has §B design it and §P cost it; that page's rows are a Known slow row | §7 verdict 17, §B B.8 question 2 | Decided (verdict 17); design in round 1 |
+| 23 | A flaking test is off Open Actions' "Needs action" list and returns when it goes over its cadence. No section designed this: the list is paged in SQL and "flaking" is computed, so how they are excluded and what it costs is unmeasured. Round 1 has §B design it and §P cost it; that page's rows are a Known slow row | §7 verdict 17, §B B.8 question 2 | Decided, then narrowed (§9): only an unassigned flaking test is left out, and nothing else on the page changes. Designed in §2 B.3(b), measured in §3c |
+| 24 | The browse page's Result filter has a FLAKING value, and FAIL leaves flaking rows out, so the two partition the failing tests. Browse only; Open Actions keeps its modes. Or: no filter value, declined in round 0, which the owner called a mistake | §2 B.3(c), §3 U9 | Agreed (§9) |
+| 25 | On the night a marked test goes over its cadence it counts as a New failure and moves the "more failing than before" line; after that it is Still failing. Or: it appears under Still failing without ever having been new | §2 B.3(d), §3 U6 | Agreed (§9) |
 
 ## §5 Open questions
 
-**All six are answered in §8.** They stand here as they were put.
+**All six are answered in §8**, and the answer to question 1 was replaced in
+§9. They stand here as they were put.
 
 1. **Does verdict 17 replace verdict 6?** Verdict 17 says a flaking test is
    "not an open issue", in reply to the report that an unassigned flaking
@@ -952,26 +1030,53 @@ developer sees; the rest are how it is built.
 
 ## §6 Carried into the build, not decisions
 
+Conditions the performance passes set and facts the briefs must carry. Each
+names the pass or section it comes from.
+
 - Every statement on the marks table pins its driving side and has a plan
   guard: an inner join let SQLite scan the latest-runs table, 1.4 ms against
-  0.024 ms. (§P)
-- The "any mark exists" bit rides the mute epoch's memo entry beside the
-  epoch; the epoch's own return value does not change, because five callers
-  test it. (§P)
+  0.024 ms. The plan guards run in the MariaDB variants too, so CI's 10.3
+  legs are where production's plans are checked; every MariaDB number in
+  this doc is from a local 12.3. (§3a, §3c)
+- The "any mark exists" bit rides statements already run, and the mute
+  epoch's own return value does not change, because five callers test it.
+  The bit is estate-wide: once any product has a mark, a product with none
+  pays the rows' join, an estimated 0.1 ms on SQLite and 0.7 ms on MariaDB.
+  (§3a, §3b)
+- The New failures queue binds the promoted tests from the memo; it widens
+  its read only above the parameter ceiling. (§3c)
+- The cached runs answers are dropped by a push to their stream, as a matter
+  of correctness: a re-pushed or late run changes the window under the same
+  key. They carry the streak cache's 60 s time limit and a size cap that
+  clears in full. (§3c)
+- On MariaDB the runs statement's union members are written in parentheses:
+  1.5 to 2 ms less, same rows. (§3c)
+- SQLite before 3.32 allows 999 bound parameters, about 330 tests. Open
+  Actions uses the keys form on SQLite always; the browse filter and the New
+  failures queue use it only above the ceiling, which takes an outage to
+  reach and costs 14 to 17 ms cold there. A test plants the ceiling. (§3b,
+  §3c)
 - The Flaky tab's measure uses the bounded run-history read at 20 runs, not
-  the existing recent-results read, which took 52 ms for the same page. (§P)
-- The measured pass needs a marks fixture in the performance harness (0, 50
-  and 1,000 marks, with one marked test also muted and one also assigned), on
-  both seeds; §P lists the rows it times. (§P)
-- The summary memo holds 128 entries and clears completely when full; the new
-  per-environment entries add about seven per stream read to the 46 a cold
-  home load stores today. Watched in the measured pass. (§P)
-- MariaDB was checked by §P on a local 12.3, not production's 10.3: the
-  statements parse and plan as on SQLite, and the run-history read costs three
-  to four times SQLite's per test. (§P)
-- "All clear", the "fewer failing than before" line and "Newly fixed · worth
-  verifying" are the Home wordings that change meaning with decision 3 and
-  question 2. (§UI report)
+  the existing recent-results read, which took 52 ms for the same page.
+  (§3a)
+- The measured passes need a marks fixture in the performance harness (0, 50
+  and 1,000 marks, with one marked test also muted and one also assigned),
+  on both seeds. Its count of marks must include the "Newly fixed"
+  candidates, which the design-time script left out. (§3a, §3c)
+- The summary memo holds 128 entries and clears completely when full; the
+  new per-environment entries add about seven per stream read to the 46 a
+  cold home load stores today. Watched in the measured pass. (§3a)
+- Once a mark exists, `result=FAIL` alone leaves flaking rows out for every
+  caller of the rows request. An Open Actions page left open across the
+  upgrade misses assigned flaking tests in its Failing mode until it is
+  reloaded; the operator note says so. (§2 B.9)
+- The browse list includes tests that have not run recently, so the "4
+  flaking" link may open a list a row or two longer than the figure, as the
+  FAIL figure's does today. (§3)
+- The Home wordings that change meaning: "All clear" names what is set
+  aside; the New failures tile reads "were passing or flaking before" where
+  a mark exists; "Newly fixed" leaves out a pass after a tolerated failure.
+  (§3 U6)
 - No browser has rendered any surface in §3; the selection bar's width is an
   estimate. The operator note will say so, as every drop's does.
 
@@ -1166,3 +1271,50 @@ layers meet:
 
 **What this changes in the doc as written:** nothing in §2, §3 or §3c. §0,
 §1, §4 and §6 are brought into line with rounds 1 and 2 at the freeze.
+
+## §11 Master plan (sizing pass; the doc is frozen from here)
+
+One package, **WP-44**, one branch `wp-44-flaky-mark`, an ordered series of
+commits, one per item. Each item is one brief; its layer, its trigger
+status and its gate are stated so the performance passes are planned in
+rather than discovered. The contract every brief builds against is §1; the
+section named in each item holds the statements, wireframes and tests.
+
+| # | Item | Layer | Trigger paths | Gated on |
+|---|---|---|---|---|
+| 1 | **The names-only request, backend:** `GET /api/summary?parts=names` returning `environments`, `assignees`, `products`, `assignment_streams` and `stale_before` under today's names, with `NamesPartTest` and its cold statement count pinned (§2 B.2, B.7). `flaky_marks` joins the response in item 6 | backend-engineer | **yes**: api.py, Open Actions' first paint | nothing |
+| 2 | **The names-only request, UI:** Open Actions fetches the names part in place of the full summary; the "fetched once" gate becomes a loaded flag; `OpenActionsCatalogueTest`'s first half, the page never naming the full summary (§3 U9, U11) | ui-engineer | **first paint** (the request count stays at two; the guard is the gate) | item 1's commit |
+| 2p | **Measured pass** of items 1 and 2: Open Actions' page against the base on both seeds, SQLite and the local MariaDB; the Known slow table. Expected: 27 ms less on SQLite, 14.5 ms less on MariaDB (§3b, §3c) | performance-engineer | the gate for items 1 and 2 | items 1 and 2 |
+| 3 | **The mark, backend:** migration 12 with its ledger step, the registry row in the same commit (WP-15 moves to 13); the two tables in `ddl()`, the environment tables and the migration tool; `POST /api/flaky/bulk` and `/unmark` with history, the reason posted as a comment tagged with the stream, and the lifecycle of decision 11; B.1's state as a pure function with the bounded runs read; `flaky` and `flaky_history` on the test detail; the "any mark" bit and its carriers, bar the names part's, which is item 6's (§2 B.1, B.2, B.4; `FlakyMarkWriteTest`, `FlakyCadenceTest`, the migration and ledger tests) | backend-engineer | **yes**: storage.py, api.py; the test page gains the mark's read | item 1's commit (the backend items run in series) |
+| 3p | **Measured pass** of item 3: the Known slow table and the test page against the base with the tables present and empty, both seeds. The bar: the same | performance-engineer | the gate for item 3 | item 3 |
+| 4 | **The marks fixture in the performance harness:** `ab.py --marks 0/50/1000` on both seeds, one marked test also muted and one also assigned, the count of marks including the "Newly fixed" candidates; `tools/dev/perf/README.md` updated (§6) | performance-engineer | n/a (tooling) | item 3's commit (it writes the new tables) |
+| 5 | **Controls, UI:** the two colour tokens; the wording helpers in `api.js`; the selection bar's Flaky group; the Review panel; the test page's banner, card and history; the computed signal reworded (decision 6) (§3 U1 to U5; `FlakyWordingTest`, `FlakyMarkControlsTest`) | ui-engineer | no | item 3's commit |
+| 6 | **State and counts, backend:** the per-stream memo of marks and states, filled by whichever page reads first, and the runs cache with §6's conditions; `flaky` on browse, queue and Open Actions rows, the join only where a mark exists; every count in §1, and `flaky_marks` on the names part; "Newly fixed" by decision 3; the promotion in `new_failures`, the delta and the queues, bound not widened; Watch's cards; `analytics.py`'s docstrings reworded (§2 B.3(a), (d), B.4; `FlakyAgreesWithAnalyticsTest`, `PromotionTest`, `FixedRuleTest`, `TargetedInvalidationTest`, `NoMarksAddsNothingTest` and the cache and plan guards for these reads) | backend-engineer | **yes**: storage.py, api.py, Home's first paint | the commits of items 1 and 3 |
+| 6p | **Measured pass** of item 6 with the fixture: the headline, the unfiltered browse rows and count, the queues, Watch and the Known slow table at 0, 50 and 1,000 marks on both seeds; MariaDB by hand on the local server with `EXPLAIN` of every marks statement. The bars are §1's; a headline worse than the owner accepted returns to the owner (§10) | performance-engineer | the gate for item 6 | items 4 and 6 |
+| 6h | **Only if a plan guard fails on CI's 10.3 legs:** a `STRAIGHT_JOIN` dialect hook in `mariadb.py` for the statement that needs it, with its own guard; otherwise this item does not exist | backend-engineer | **yes**: storage.py, mariadb.py | item 6's CI run |
+| 7 | **State on Home and rows, UI:** one displayed result per row for chip and edge; the tags; the tiles' set-aside suffixes and sublines; "All clear" naming what is set aside; the promotion row; the fourth segment on the two bar charts; Watch's cards (§3 U6, U7, U9; `ResultEmphasisTest` and its siblings widened, `AllClearSetAsideTest`, `PromotionTransitionTest`, the DOM shim's five states) | ui-engineer | **first paint** (no request added; the sequencing guards are the gate) | item 6's commit |
+| 8 | **Lists and filters, backend:** Open Actions leaves out unassigned flaking tests, by the keys form on SQLite and the gated row-value term on MariaDB, rows, total and bulk assign agreeing; `result=FLAKING` and the narrowed `result=FAIL` on the rows request and its count; `GET /api/flaky`; `FAIL_FLAKING` in the trend part (§2 B.3(b), (c), B.2; `OpenActionsSetAsideTest`, `OpenAssignmentFiguresUnchangedTest`, `BrowseFlakingFilterTest` with the planted ceiling, `FlakyTabOrderTest`; `NoMarksAddsNothingTest` and the cache and plan guards widened to these reads and both filter terms) | backend-engineer | **yes**: storage.py, api.py | item 6's commit |
+| 8p | **Measured pass** of item 8 with the fixture: Open Actions' rows and page, the browse rows and count with Failing, with Flaking and with Passing beside each, the Flaky tab's page, the trend part at 14 and 90 days, the Known slow table; MariaDB by hand as in 6p. The bars are §1's | performance-engineer | the gate for item 8 | item 8 |
+| 9 | **Lists and filters, UI:** the Flaky tab; the browse page's FLAKING toggle and the links into it, the scripts chart's click included; Open Actions' footer line and its Failing mode sending both values; the per-day chart's fourth series; the What's new section (§3 U7, U8, U9; `FlakyTabTest`, `FlakingFilterTest`, `OpenActionsCatalogueTest`'s second half) | ui-engineer | **first paint** (no request added; the tab loads on its first click; guards are the gate) | the commits of items 7 and 8; ships in the same drop as item 8, never after it |
+| 10 | **The drop:** a "Flaky marks" section in the README; the operator note (migration 12, create-only, the server may stay up for the MariaDB step, a restart; an Open Actions page left open must be reloaded; no browser has rendered it); `/verify`, `/review`, `/drop` | main session | n/a | every item above |
+
+**Order and parallelism.** Each layer's items run in series on the one
+branch: the backend's 1, 3, 6, 8 and the UI's 2, 5, 7, 9. A UI item and a
+backend item may run side by side when neither is gated on the other, as
+items 5 and 6 are. Item 7 may be briefed when item 6's commit exists,
+before 6p finishes; a 6p finding goes back to item 6 and item 7 rebases.
+The same holds for items 8, 8p and 9. Every backend item carries the
+`test_api.py` shape and 400 tests of the endpoints it adds.
+
+**An early drop.** Items 1, 2 and 2p stand alone: they change nothing a
+developer can see except Open Actions loading sooner, and may ship as their
+own drop if the owner wants the saving early. If they do, item 2 carries
+its own What's new line.
+
+**How it runs.** Fifteen items is an `/overnight` plan; item by item on the
+small path is the supervised alternative. The owner chooses at kickoff.
+
+**What the measured passes hold the build to** is §1's cost bar: nothing
+with no marks on any read; the figures in its table with marks; MariaDB
+taken by hand on the local 12.3 and recorded in the log, with CI's 10.3
+legs the authority for correctness and for the plans.
