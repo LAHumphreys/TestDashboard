@@ -4995,3 +4995,19 @@ cadence-2 read (0.5, 1.7). Carried into item 8: the assigned queue's own
 runs read (+3.8 ms warm), browse's per-row Python at 1,000 marks, Open
 Actions' own runs read. MariaDB 10.3 has not run the plan guards. 2911
 and 4016 green in the main checkout.
+
+## WP-44 item 7: the mark's state on Home and on every row (2026-11-11)
+
+Item 7 is committed: one displayed result per row for the edge and the
+chip (browse, the script page, every Home queue, Not run, Open Actions),
+the "flaky" tag, the tiles' set-aside suffixes, "All clear" naming what
+is set aside, the promotion row reading FLAKING -> FAIL, the fourth
+segment on the two bar charts and Watch's cards. A live mute wins over
+the mark; run history and the compare strip stay raw. No request joins
+any first paint; off the trigger paths, so no measured pass. With no
+marks every region is byte-identical to the base except "All clear",
+which now names the muted failures whenever there are any. Fresh eyes
+found no defect; two points were fixed before the commit (a flaking Open
+Actions row assigned from a build had only its colour to say so; one
+docstring). 2934 and 4039 green in the main checkout with item 6 beneath
+it. No browser has rendered it.

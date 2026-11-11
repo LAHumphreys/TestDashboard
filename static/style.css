@@ -587,6 +587,7 @@ button.tile:focus-visible {
 .swatch-fae, .legend-swatch.swatch-fae { background: var(--c-fae); }
 .swatch-assigned, .legend-swatch.swatch-assigned { background: var(--c-assigned); }
 .swatch-muted, .legend-swatch.swatch-muted { background: var(--muted); opacity: 0.55; }
+.swatch-flaking, .legend-swatch.swatch-flaking { background: var(--c-flaking); }
 
 .seg-fail { fill: var(--c-fail); }
 .seg-up { fill: var(--c-up); }
@@ -694,6 +695,10 @@ button.bar-row:focus-visible {
    the muted grey. */
 .bar-assigned { background: var(--c-assigned); }
 
+/* WP-44: the flaking failures, after the muted grey, in the chart step
+   of the mauve (chips and row edges take the strong one). */
+.bar-flaking { background: var(--c-flaking); }
+
 .bar-value {
   font-size: 12px;
   font-weight: 600;
@@ -740,6 +745,7 @@ button.bar-row:focus-visible {
 .tt-key.swatch-fae { background: var(--c-fae); }
 .tt-key.swatch-assigned { background: var(--c-assigned); }
 .tt-key.swatch-muted { background: var(--muted); opacity: 0.55; }
+.tt-key.swatch-flaking { background: var(--c-flaking); }
 
 .tt-value {
   font-weight: 650;
@@ -1368,6 +1374,7 @@ button.bar-row:focus-visible {
 .chip.chip-ghost.result-fail { border-color: var(--c-fail); color: var(--c-fail); }
 .chip.chip-ghost.result-failed-as-expected { border-color: var(--c-fae); color: #8a6d00; }
 .chip.chip-ghost.result-unexpected-pass { border-color: var(--c-up); color: var(--c-up); }
+.chip.chip-ghost.result-flaking { border-color: var(--c-flaking-strong); color: var(--c-flaking-strong); }
 
 /* The arrow between a previous and current result. Muted on purpose:
    it is punctuation, not data. */

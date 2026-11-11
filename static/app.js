@@ -32,12 +32,18 @@
 "use strict";
 
 import {
+  FLAKING_BAR,
   RESULTS,
   mutedTag,
   muteDetail,
-  failingWithMuted,
+  failingWithSetAside,
   failingSplit,
-  mutedSuffix,
+  flakyTag,
+  newFailuresSub,
+  previousShown,
+  rowResult,
+  setAsideSuffix,
+  setAsideWords,
   clearError,
   clearNode,
   el,
@@ -707,12 +713,13 @@ function windowPhrase(summary) {
   return "since " + formatTime(summary.stale_before);
 }
 
-/** A tile's sub-line with " · +3 muted" appended when some of the
- * failures were muted (WP-40). There is no Muted tile: the muted ones
- * ride beside the number they were taken out of, and the Muted queue
- * tab lists every live mute. */
-function withMutedSuffix(text, muted) {
-  const suffix = mutedSuffix(muted || 0);
+/** A tile's sub-line with " · +3 muted · +4 flaking" appended for the
+ * failures set aside from its figure (WP-40, WP-44). There is no Muted
+ * tile and no Flaking one: they ride beside the number they were taken
+ * out of, and the Muted queue tab lists every live mute. Tiles are
+ * buttons, so the suffix is text, never a link. */
+function withSetAside(text, muted, flaking) {
+  const suffix = setAsideSuffix(muted, flaking);
   return suffix ? text + " · " + suffix : text;
 }
 
@@ -787,15 +794,16 @@ function renderStatus() {
     label: "New failures",
     value: status.new_failures.toLocaleString(),
     accent: status.new_failures > 0 ? "accent-fail" : "accent-zero",
-    sub: withMutedSuffix(
-      "were passing before", status.muted_new_failures),
+    sub: withSetAside(newFailuresSub(status.flaky_total),
+      status.muted_new_failures, status.flaking_new_failures),
     onClick: () => openQueue("new_failures"),
   }));
   container.appendChild(buildTile({
     label: "Still failing",
     value: status.still_failing.toLocaleString(),
     accent: status.still_failing > 0 ? "accent-fail-soft" : "accent-zero",
-    sub: withMutedSuffix("failed before too", status.muted_still_failing),
+    sub: withSetAside("failed before too", status.muted_still_failing,
+      status.flaking_still_failing),
     onClick: () => openQueue("still_failing"),
   }));
   container.appendChild(buildTile({
@@ -906,13 +914,23 @@ function renderTrend() {
   }
 }
 
+/** Whether the scope has a flaky mark (WP-44, decision 5): only then do
+ * the bars key, tooltip and name their flaking part. With none, every
+ * bar card is exactly the WP-43 card. */
+function flakyScope() {
+  return state.summary.status.flaky_total > 0;
+}
+
 /**
- * One failing bar. An entry carrying `assigned` (WP-43) is drawn three
- * ways, left to right: nobody's (red), someone's, muted (grey), with the
- * tooltip rows and the row's screen-reader name from failingSplit(). An
- * entry without it (an older server) is exactly the WP-40 bar: the
+ * One failing bar. An entry carrying `assigned` (WP-43) is drawn in up to
+ * four parts, left to right: nobody's (red), someone's, muted (grey),
+ * flaking (WP-44, the chart's mauve), with the tooltip rows and the row's
+ * screen-reader name from failingSplit(). A zero part after the first is
+ * not drawn, so with nothing flaking the bar is the WP-43 bar. An entry
+ * without `assigned` (an older server) is exactly the WP-40 bar: the
  * failing count with its muted failures as a grey extension, never all
- * red. The end label is the unmuted failing count either way.
+ * red. The end label is the failing count, muted and flaking ones out,
+ * either way.
  */
 function failingBar(item, entry, failing, failingLabel, moreRows) {
   if (typeof entry.assigned !== "number") {
@@ -920,10 +938,12 @@ function failingBar(item, entry, failing, failingLabel, moreRows) {
       value: failing,
       extra: entry.muted || 0,
       tooltipRows: [{ swatchClass: "swatch-fail", label: failingLabel,
-        value: failingWithMuted(failing, entry.muted) }].concat(moreRows),
+        value: failingWithSetAside(failing, entry.muted, entry.flaking) }]
+        .concat(moreRows),
     });
   }
-  const split = failingSplit(failing, entry.assigned, entry.muted);
+  const split = failingSplit(failing, entry.assigned, entry.muted,
+    flakyScope() ? entry.flaking || 0 : null);
   const name = item.sublabel
     ? item.label + " in " + item.sublabel : item.label;
   return Object.assign(item, {
@@ -932,6 +952,7 @@ function failingBar(item, entry, failing, failingLabel, moreRows) {
       { value: split.unassigned, className: "fill-fail" },
       { value: split.assigned, className: "bar-assigned" },
       { value: split.muted, className: "bar-muted" },
+      { value: split.flaking, className: FLAKING_BAR.className },
     ],
     tooltipRows: split.rows.concat(moreRows),
     ariaLabel: name + ": " + failing.toLocaleString() + " "
@@ -940,10 +961,14 @@ function failingBar(item, entry, failing, failingLabel, moreRows) {
 }
 
 /** The bar cards' legend, drawn whenever the payload carries the split
- * (zeros included, so a card's height never changes on a "Take"). */
+ * (zeros included, so a card's height never changes on a "Take"), with
+ * the flaking key after the muted one where the scope has a mark. */
 function failingLegend(entries) {
-  return entries.every((entry) => typeof entry.assigned === "number")
-    ? { legend: FAILING_SPLIT_LEGEND } : {};
+  if (!entries.every((entry) => typeof entry.assigned === "number")) {
+    return {};
+  }
+  return { legend: flakyScope()
+    ? FAILING_SPLIT_LEGEND.concat([FLAKING_BAR]) : FAILING_SPLIT_LEGEND };
 }
 
 /** 2 and 3: the two bar charts, from the headline alone. */
@@ -952,12 +977,15 @@ function renderBars() {
 
   // 2. Failing tests by environment (click to scope). The bar is the
   // UNMUTED failing count, split by assignment, with the muted failures
-  // after it in grey (WP-40, WP-43), sorted by the unmuted number; an
-  // environment whose failures are all muted still shows, grey only.
+  // after it in grey and the flaking ones after those (WP-40, WP-43,
+  // WP-44), sorted by the failing number; an environment whose failures
+  // are all muted or flaking still shows, grey or mauve only.
   const envItems = summary.by_environment
-    .filter((entry) => entry.failed > 0 || (entry.muted || 0) > 0)
+    .filter((entry) => entry.failed > 0 || (entry.muted || 0) > 0
+      || (entry.flaking || 0) > 0)
     .sort((a, b) => (b.failed - a.failed)
-      || ((b.muted || 0) - (a.muted || 0)))
+      || ((b.muted || 0) - (a.muted || 0))
+      || ((b.flaking || 0) - (a.flaking || 0)))
     .map((entry) => failingBar(
       { label: entry.environment,
         onClick: () => setEnvironment(entry.environment) },
@@ -1129,8 +1157,47 @@ function renderQueueTabs() {
   const known = ["new_failures", "still_failing", "unexpected_passes"]
     .every(queueCountKnown);
   document.getElementById("all-clear").hidden = !known || problems !== 0;
+  renderAllClearAside();
   document.getElementById("triage-meta").textContent =
     !known || problems === 0 ? "" : problems.toLocaleString() + " open items";
+}
+
+/**
+ * "Set aside: 3 muted · 4 flaking" under "All clear" (WP-44, design §3
+ * U6): the failing tests the claim leaves out, so a glance at a clear
+ * board still says what is being tolerated. Muted is the two failing
+ * tiles' muted figures; flaking is `status.flaking`. Both zero (or no
+ * headline yet), no line. "3 muted" opens the Muted tab; "4 flaking" is
+ * text until the browse filter it should open exists.
+ */
+function renderAllClearAside() {
+  const aside = document.getElementById("all-clear-aside");
+  clearNode(aside);
+  const status = state.summary ? state.summary.status : null;
+  const words = status ? setAsideWords(
+    (status.muted_new_failures || 0) + (status.muted_still_failing || 0),
+    status.flaking) : [];
+  aside.hidden = words.length === 0;
+  if (!words.length) {
+    return;
+  }
+  aside.appendChild(document.createTextNode("Set aside: "));
+  words.forEach((part, index) => {
+    if (index > 0) {
+      aside.appendChild(document.createTextNode(" · "));
+    }
+    if (part.key === "muted") {
+      const link = el("button", "link-btn", part.text);
+      link.type = "button";
+      link.title = "Open the Muted tab";
+      link.addEventListener("click", () => openQueue("muted"));
+      aside.appendChild(link);
+    } else {
+      // The flaking part: text for now; the one place it becomes a
+      // link into the browse list's flaking filter.
+      aside.appendChild(document.createTextNode(part.text));
+    }
+  });
 }
 
 /** Column sets per queue: header + cell builder. */
@@ -1150,7 +1217,14 @@ const QUEUE_INVARIANT_RESULT = {
   },
 };
 
+/*
+ * Every cell builder takes the entry and `shown`, the row's ONE displayed
+ * result (rowResult(), WP-44): renderQueueTable() computes it once per
+ * row and gives the same value to the row edge and to whichever cell
+ * draws the chip, so the two cannot disagree.
+ */
 function queueColumns(queueId) {
+  const invariant = Boolean(QUEUE_INVARIANT_RESULT[queueId]);
   const testCol = {
     header: "Test",
     sortKey: "test_name",
@@ -1176,6 +1250,13 @@ function queueColumns(queueId) {
       }, { product: null, baseline: null, stream: state.streamId });
       link.textContent = entry.test_name;
       cell.appendChild(link);
+      // A queue that states its one result above the table has no chip
+      // to stand beside, so a marked test's "flaky" tag (WP-44) follows
+      // its name instead.
+      const tag = invariant ? flakyTag(entry) : null;
+      if (tag) {
+        cell.appendChild(tag);
+      }
       cell.appendChild(el("span", "row-sub",
         entry.environment + " · " + entry.script));
       return cell;
@@ -1267,13 +1348,24 @@ function queueColumns(queueId) {
     },
   };
 
+  // A marked test's "flaky" pill (WP-44), appended after the chip in the
+  // cell it is given, as the browse list puts it after the "muted" one.
+  // Sorting stays on the wire value (`sortKey: "result"`), never on what
+  // the chip reads.
+  const withFlakyTag = (cell, entry) => {
+    const tag = flakyTag(entry);
+    if (tag) {
+      cell.appendChild(tag);
+    }
+    return cell;
+  };
   const resultCol = {
     header: "Result",
     sortKey: "result",
-    cell: (entry) => {
+    cell: (entry, shown) => {
       const cell = el("td");
-      cell.appendChild(resultChip(entry.result));
-      return cell;
+      cell.appendChild(resultChip(shown));
+      return withFlakyTag(cell, entry);
     },
   };
 
@@ -1285,19 +1377,24 @@ function queueColumns(queueId) {
   // so a new failure (previously PASS) read as a pass, and a fixed test
   // (previously FAIL) read as a failure. Reported from real use, and
   // wrong in the misleading direction in both queues.
+  //
+  // "was" is previousShown(): the raw previous result, except on the
+  // night a marked test goes over its cadence, when the failure before
+  // was within it and reads FLAKING ("FLAKING → FAIL", WP-44). "now" is
+  // the row's own displayed result.
   const transitionCol = {
     header: "Result",
     sortKey: "result",
-    cell: (entry) => resultTransition(
-      el("td"), entry.prev_result, entry.result),
+    cell: (entry, shown) => withFlakyTag(resultTransition(
+      el("td"), previousShown(entry), shown), entry),
   };
   // The Muted tab lists passing mutes as well as failing ones, so it
   // needs the same was -> now column under the name a reader looks for.
   const stateCol = {
     header: "State",
     sortKey: "result",
-    cell: (entry) => resultTransition(
-      el("td"), entry.prev_result, entry.result),
+    cell: (entry, shown) => withFlakyTag(resultTransition(
+      el("td"), previousShown(entry), shown), entry),
   };
 
   switch (queueId) {
@@ -1334,10 +1431,10 @@ function queueColumns(queueId) {
       return [testCol,
         when("Last seen", "start_time"),
         { header: "Last result",
-          cell: (entry) => {
+          cell: (entry, shown) => {
             const cell = el("td");
-            cell.appendChild(resultChip(entry.result));
-            return cell;
+            cell.appendChild(resultChip(shown));
+            return withFlakyTag(cell, entry);
           } },
         commentCol,
         assigneeCol];
@@ -1463,13 +1560,15 @@ function renderQueueTable() {
 
   for (const entry of entries) {
     const tr = document.createElement("tr");
-    const marker = resultClass(entry.result);
+    // One displayed result for the edge and the chip (WP-44).
+    const shown = rowResult(entry);
+    const marker = resultClass(shown);
     if (marker) {
       tr.className = marker;
     }
     tr.appendChild(queueSelectionMount.rowCell(entry));
     for (const column of columns) {
-      tr.appendChild(column.cell(entry));
+      tr.appendChild(column.cell(entry, shown));
     }
     const actionCell = el("td", "review-cell");
     const reviewBtn = el("button", "review-btn", "Review");
@@ -1620,7 +1719,10 @@ function renderBrowse(rows, append) {
 
 function buildRow(row) {
   const tr = document.createElement("tr");
-  const marker = resultClass(row.result);
+  // One displayed result for the edge and the chip (WP-44): FLAKING for
+  // a marked test under its cadence, the wire result otherwise.
+  const shown = rowResult(row);
+  const marker = resultClass(shown);
   if (marker) {
     tr.className = marker;
   }
@@ -1660,14 +1762,15 @@ function buildRow(row) {
   tr.appendChild(testCell);
 
   const resultCell = document.createElement("td");
-  const chip = resultChip(row.result);
+  const chip = resultChip(shown);
   if (row.known_failure_reason) {
     chip.title = "Known failure: " + row.known_failure_reason;
   }
   resultCell.appendChild(chip);
-  const muteTag = mutedTag(row);
-  if (muteTag) {
-    resultCell.appendChild(muteTag);
+  for (const tag of [mutedTag(row), flakyTag(row)]) {
+    if (tag) {
+      resultCell.appendChild(tag);
+    }
   }
   tr.appendChild(resultCell);
 

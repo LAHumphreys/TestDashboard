@@ -1341,7 +1341,7 @@ any interruption is the first line not `done` or `parked`.
 | 6 state and counts, backend | done | the commit carrying this line | **over the cost bar and committed on the main session's call, for the owner to confirm** (see 6p); fresh eyes found NamedTuple field defaults above the 3.6.0 floor, removed and now detected by the gate; a test is promoted only on a run that started after its cadence was set |
 | 6p measured pass | done | | Home headline: SQLite +6.2 ms (22% of base) at 50 marks and +11.4 (41%) at 1,000; local MariaDB 12.3 +17.0 (18%) and +35.8 (38%); the bar was 18% / 34% and 16% / 34%. No marks: no change, Known slow rows the same. Priced and not taken: a covering runs index, dropping decision 3, dropping the cadence-2 read. The marks fixture was dating its marks after the runs (no promoted tests); fixed in its own commit. Carried into item 8: the assigned queue's own runs read, browse's per-row Python |
 | 6h dialect hook | only if a plan guard fails on CI's 10.3 legs | | |
-| 7 state on Home and rows, UI | not started | | |
+| 7 state on Home and rows, UI | done | the commit carrying this line | two fresh-eyes points fixed before the commit; "All clear" names the muted failures even on a board with no marks (the one region that changes there); "N flaking" is text until item 9 links it; no browser has rendered it |
 | 8 lists and filters, backend | not started | | |
 | 8p measured pass | not started | | |
 | 9 lists and filters, UI | not started | | |

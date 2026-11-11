@@ -655,40 +655,102 @@ export function muteDetail(mute, withReason) {
   return parts.join(" · ");
 }
 
-/** "+3 muted", or "" for none: the wording every place that shows a
- * failing number uses for the muted failures left out of it (WP-40).
- * One helper so the format cannot drift between the tiles, the Watch
- * cards and the chart tooltips. */
-export function mutedSuffix(count) {
-  return count > 0 ? "+" + count.toLocaleString() + " muted" : "";
+/*
+ * What is set aside from a failing figure, said beside it (WP-40, WP-44).
+ * A failing number has the muted failures taken out of it, and the
+ * flaking ones (marked flaky, under their cadence, no live mute); the
+ * board never subtracts silently, so every place that shows such a
+ * figure names both beside it, in the forms below. With nothing flaking
+ * each prints exactly what its WP-40 predecessor printed
+ * (mutedSuffix, failingWithMuted), so a scope with no marks is unchanged.
+ */
+
+/** The non-zero set-aside parts, muted first: [{key, count}]. */
+function setAsideParts(muted, flaking) {
+  return [
+    { key: "muted", count: muted || 0 },
+    { key: "flaking", count: flaking || 0 },
+  ].filter((part) => part.count > 0);
 }
 
-/** "12" or "12 (+3 muted)": a failing figure with the muted failures
- * left out of it named beside it. */
-export function failingWithMuted(count, muted) {
-  const suffix = mutedSuffix(muted || 0);
-  return count.toLocaleString() + (suffix ? " (" + suffix + ")" : "");
+/** "+3 muted · +4 flaking", "+4 flaking", "+3 muted", or "" for none:
+ * a tile's sub-line ends with it. */
+export function setAsideSuffix(muted, flaking) {
+  return setAsideParts(muted, flaking)
+    .map((part) => "+" + part.count.toLocaleString() + " " + part.key)
+    .join(" · ");
 }
 
-/** A failing figure split three ways (WP-43): of the unmuted `failing`,
- * the `assigned` ones someone has and the rest nobody has yet, with the
- * `muted` failures beside them. Returns the three counts, `words` for a
- * screen reader ("8 unassigned, 6 assigned, 4 muted", zero parts left
- * out, "none failing" when all three are zero) and the tooltip's `rows`,
+/** " (+3 muted, +4 flaking)", or "" for none: what follows a failing
+ * figure in failingWithSetAside(). Watch's cards draw it in its own
+ * lighter span after the figure, so it is exported on its own; the
+ * words are made here either way. */
+export function setAsideBracket(muted, flaking) {
+  const said = setAsideParts(muted, flaking)
+    .map((part) => "+" + part.count.toLocaleString() + " " + part.key);
+  return said.length ? " (" + said.join(", ") + ")" : "";
+}
+
+/** "12" or "12 (+3 muted, +4 flaking)": a failing figure with what was
+ * set aside from it named beside it. */
+export function failingWithSetAside(count, muted, flaking) {
+  return count.toLocaleString() + setAsideBracket(muted, flaking);
+}
+
+/** The set-aside parts as words, one per non-zero part, muted first:
+ * [{key: "muted", text: "3 muted"}, {key: "flaking", text: "4 flaking"}],
+ * empty for none. "All clear" joins them with " · " and makes each part
+ * the control it should be, which is why they come apart. */
+export function setAsideWords(muted, flaking) {
+  return setAsideParts(muted, flaking).map((part) => ({
+    key: part.key,
+    text: part.count.toLocaleString() + " " + part.key,
+  }));
+}
+
+/** The New failures tile's sub-line before its suffix. On the night a
+ * marked test goes over its cadence it is a new failure that was
+ * flaking, not passing, so where the scope has any mark
+ * (`flakyTotal` > 0) the line says so; elsewhere it is today's. */
+export function newFailuresSub(flakyTotal) {
+  return flakyTotal > 0 ? "were passing or flaking before"
+    : "were passing before";
+}
+
+/** The flaking part of a failing bar (WP-44): its legend key, tooltip
+ * swatch and segment class, all in the chart token. Drawn after the
+ * grey muted part, and keyed only where the scope has a mark. */
+export const FLAKING_BAR = {
+  label: "Flaking",
+  swatchClass: "swatch-flaking",
+  className: "bar-flaking",
+};
+
+/** A failing figure split (WP-43, WP-44): of the `failing` tests (muted
+ * and flaking ones already out of it), the `assigned` ones someone has
+ * and the rest nobody has yet, with the `muted` failures and the
+ * `flaking` ones beside them. Returns the counts, `words` for a screen
+ * reader ("8 unassigned, 6 assigned, 4 muted, 2 flaking", zero parts
+ * left out, "none failing" when all are zero) and the tooltip's `rows`,
  * one per part in the bars' order, a zero part included: "0 unassigned"
- * is the good news. The one place the words are spelled, so the two bar
- * charts cannot drift apart. */
-export function failingSplit(failing, assigned, muted) {
+ * is the good news. `flaking` null or absent means the scope has no
+ * mark: no flaking row, exactly the WP-43 split; a number, zero
+ * included, adds one. The one place the words are spelled, so the two
+ * bar charts cannot drift apart. */
+export function failingSplit(failing, assigned, muted, flaking) {
+  const keyed = typeof flaking === "number";
   const parts = {
     assigned: assigned || 0,
     muted: muted || 0,
+    flaking: keyed ? flaking : 0,
   };
   parts.unassigned = Math.max(0, (failing || 0) - parts.assigned);
   const order = [
     { key: "unassigned", swatchClass: "swatch-fail" },
     { key: "assigned", swatchClass: "swatch-assigned" },
     { key: "muted", swatchClass: "swatch-muted" },
-  ];
+  ].concat(keyed
+    ? [{ key: "flaking", swatchClass: FLAKING_BAR.swatchClass }] : []);
   const said = order
     .filter((part) => parts[part.key] > 0)
     .map((part) => parts[part.key].toLocaleString() + " " + part.key);
@@ -696,6 +758,7 @@ export function failingSplit(failing, assigned, muted) {
     unassigned: parts.unassigned,
     assigned: parts.assigned,
     muted: parts.muted,
+    flaking: parts.flaking,
     words: said.length ? said.join(", ") : "none failing",
     rows: order.map((part) => ({
       swatchClass: part.swatchClass,
@@ -789,6 +852,36 @@ const FLAKY_CADENCES = [2, 3, 4, 5, 6, 7, 8, 9, 10];
 export function displayResult(result, flakyState, muted) {
   return result === "FAIL" && flakyState === "flaking" && !muted
     ? "FLAKING" : result;
+}
+
+/**
+ * What a listed row's result reads as: displayResult() of the row's own
+ * result, mark and mute. Every row builder takes ONE value from here and
+ * gives it to both resultClass() (the row edge) and resultChip() (the
+ * chip), so the two cannot disagree. Sorting and filters keep reading
+ * `entry.result`, the wire value.
+ */
+export function rowResult(entry) {
+  const flaky = entry.flaky;
+  return displayResult(entry.result, flaky ? flaky.state : null,
+    Boolean(entry.mute && entry.mute.live));
+}
+
+/**
+ * The result a "was → now" cell shows for before. On the night a marked
+ * test goes over its cadence (decision 25) its New failures row carries
+ * `prev_result` FAIL and state "failing": that earlier failure was within
+ * the cadence, so it reads FLAKING ("FLAKING → FAIL"). Every other row
+ * reads its raw `prev_result`: a run is what happened. Never fed from a
+ * row's own displayResult(), which describes now.
+ */
+export function previousShown(entry) {
+  const flaky = entry.flaky;
+  const promoted = Boolean(flaky) && flaky.state === "failing"
+    && entry.result === "FAIL" && entry.prev_result === "FAIL"
+    && !(entry.mute && entry.mute.live);
+  return promoted ? displayResult(entry.prev_result, "flaking", false)
+    : entry.prev_result;
 }
 
 /** "3 in a row": a cadence, as its select and the sentences say it. */

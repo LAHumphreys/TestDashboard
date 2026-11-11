@@ -187,6 +187,9 @@
         <div>
           <strong>All clear.</strong>
           <span class="muted">No new failures, nothing still failing, no stale annotations.</span>
+          <!-- What the claim leaves out: the failing tests that are muted
+               or flaking, filled by app.js; hidden when there are none. -->
+          <div id="all-clear-aside" class="muted" hidden></div>
         </div>
       </div>
       <div class="table-wrap">
