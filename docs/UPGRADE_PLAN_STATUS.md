@@ -4723,3 +4723,33 @@ and 1,000 marks joins the trend decision already open from WP-43. The
 `ui-engineer` agent type was still not registered; the UI section was
 written by a general-purpose Opus agent carrying the definition. No browser
 has rendered any surface. Nothing is built.
+
+## Design review: mark a test as flaky, round 0 reviewed (2026-11-11)
+
+The owner reviewed round 0 the same day: fifteen verdicts set in the Claude
+Doc, the rest answered in chat as questions with a recommended position
+each. Everything is captured verbatim in the doc's §8 before any section is
+rewritten. With the request came an instruction on how to weigh the rest:
+performance impact is to be minimised while accepting that the added
+function costs something.
+
+Every decision has a verdict. Twenty-one are the position as written. Two
+changed. Decision 8: "Flaking is a first class failure state", so a flaking
+row carries its own chip and edge in the flaking colour instead of a pill
+beside a red FAIL chip. Decision 20: Open Actions gets a names-only request
+as the first item of this build, so the flaking counts land on no page's
+first paint (the performance pass put that request's saving at about 19 ms,
+more than the feature adds). Decision 23 was extended: no flaking test is on
+anyone's Open Actions, an existing assignment is kept but dormant and
+returns the test to its assignee only if it goes over its cadence; the
+earlier answer that kept an assigned flaking test on that page is
+superseded. The trend's cost at 90 days and 1,000 marks stays with the trend
+decision open from WP-43.
+
+Owed in round 1, listed in §8 with the owning agent: the row's chip and edge
+and the "All clear" wording (UI); how Open Actions' paged list excludes a
+computed set and what that costs on a Known slow row, which is undesigned
+and unmeasured (backend, then performance); the names-only request's shape
+(backend, UI, performance); the performance pass's two corrections and the
+rules for "Newly fixed" and the Flaky tab's order written into the backend
+design. Nothing is built.

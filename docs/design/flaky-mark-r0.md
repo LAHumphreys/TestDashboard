@@ -1,9 +1,10 @@
 # Mark a test as flaky — design review, round 0
 
-**Status: ROUND 0, FOR THE OWNER'S REVIEW (2026-11-11). §0 is agreed in chat;
-the owner's seventeen verdicts so far are captured verbatim in §7; §4 holds
-twenty-three decisions with a verdict slot each and §5 six open questions.
-Nothing is built.**
+**Status: ROUND 0 REVIEWED (2026-11-11); ROUND 1 OWED. Every one of §4's
+twenty-three decisions has a verdict and §5's six questions are answered; the
+review is captured verbatim in §8, which also lists what it changes in the
+sections below and who owes the rewrite. Until round 1 lands, §2, §3 and §3a
+read as written for round 0. Nothing is built.**
 Three sections were written by the owning agents against §0: §B (§2) by
 `backend-engineer`, §UI (§3) by `ui-engineer`, and §P (§3a), the performance
 design pass, by `performance-engineer` against the other two. §1 is the main
@@ -50,9 +51,12 @@ test shows as muted until the mute runs out. The mark's owner is a record of
 who accepted the flakiness and is not an assignment: marking a test puts
 nothing on anyone's Open Actions. A flaking test is not an open issue: it
 leaves Open Actions' "Needs action" list until it goes over its cadence
-(verdict 17, added after this paragraph was agreed). Whether that also takes
-a flaking test off the list of the person it is assigned to, where verdict 6
-kept it with a "flaking" state marker, is open question 1. A Flaky tab
+(verdict 17, added after this paragraph was agreed). That holds for a test
+that already has an assignee too: the assignment is kept but dormant, and the
+test returns to that person's list only if it goes over its cadence (§8,
+which supersedes verdict 6). In lists a flaking row carries its own chip and
+edge in the flaking colour, because flaking is a state in its own right
+(§8, decision 8). A Flaky tab
 on Home, beside Muted, lists every mark with its owner, cadence, age and how
 often the test has actually failed, so a stale mark is visible without anyone
 being nagged. Any named user may remove a mark or change its cadence; every
@@ -706,31 +710,33 @@ developer sees; the rest are how it is built.
 
 | # | Decision (recommended position) | Section | Verdict |
 |---|---|---|---|
-| 1 | For the cadence a failure is a `FAIL` and nothing else, the definition the existing flakiness signal uses. An unexpected pass or an expected failure among the last N runs keeps the test flaking | §B B.1 | |
-| 2 | The per-day chart judges each past night **as it stood that night**, using today's mark: a spell over the cadence stays red there, as it was in the bars. Or: "marked now", every past failure of a marked test drawn as flaking, which colours as tolerated some runs the bars called failing; "that night" is 20 to 60 % dearer than it | §B D-B1, §P | |
-| 3 | A marked test that passes after a **tolerated** failure is not "Newly fixed" and does not move the "fewer failing than before" line; one that passes after being **over its cadence** is, because that was a real failure and its fix is news. §P measured the extra read at 0.1 to 0.4 ms. Or: a marked test is never in Fixed at all, which is simpler and hides a real fix. Neither section recommended one; this is the main session's position | §UI U12.7, §P | |
-| 4 | The Flaky tab's measure is "failed X of its last 20 runs" on the stream. Or: failures since the mark was made, which grows with the mark's age and says less about now | §B D-B2 | |
-| 5 | The tab, the legend key, the tooltip row and the table column appear **only where the scope has a mark**; a product with no marks sees exactly today's page. Or: always shown, as the Muted tab is | §UI D-U4 | |
-| 6 | The word "flaky" on screen always means the mark. The computed signal on the test page and Open Actions changes from "flaky — flips about 1 run in 3" to "flips about 1 run in 3" (and "flips often" in the card). Or: keep both meanings | §UI D-U6 | |
-| 7 | The colour for flaking is a new token, a dusty mauve (`#a66993`), checked against every existing chart colour for normal and colour-blind vision. Or: a teal, which sits too close to the pass green | §UI U1 | |
-| 8 | A row keeps its result's colour on the chip and the row edge; flaking is a pill beside it, as muted is. Or: a mauve row edge | §UI D-U5 | |
-| 9 | The comparison page and Watch's build cards are **unchanged in this arc**: they take no account of mutes today either, and the comparison's pairs query is the slowest thing on the board. Its counts include flaking tests. Or: the flaky pill on the comparison's rows, which §P allows on the returned page only | §B D-B7, §UI U12.6, §P | |
-| 10 | The reason's comment is tagged with the stream the user was looking at when they marked the test, though the mark itself covers every stream. Or: no tag | §B D-B5 | |
-| 11 | When a marked test is retired the mark is kept, uncounted and flagged on the tab; when an environment is dropped its marks go with it; deleting a build touches no mark | §B D-B4 | |
-| 12 | The mark's owner is the person making it. The selection bar's Assign-to box is not read, because a mark is not an assignment. A deactivated user cannot mark | §UI D-U2, §B D-B6 | |
-| 13 | The selection bar gains one Flaky group after Mute: a cadence select, "Mark as flaky" and "Unmark", sharing the note box. The button reads "Set cadence" when every ticked test is already marked. The bar is about 400 px wider and wraps to three rows below about 900 px (an estimate from the markup) | §UI U3, D-U3 | |
-| 14 | On the test page the button sits in the Flakiness card and opens its form there; the current mark shows as a banner under the mute banner, with its history below | §UI U5, D-U7 | |
-| 15 | Migration 12 creates two tables (the marks, and one row per act) and alters nothing; the parked WP-15 moves to 13. The server may stay up for the MariaDB step | §B B.2 | |
-| 16 | The Flaky tab is paged by the server in an order it knows without the measure: failing first, then flaking, then passing, newest mark first. §UI's "most failures first" would need the measure for every mark, an estimated 110 to 130 ms at 1,000 marks. Or: accept that growth, off the first paint. The order is the main session's reconciliation, for §B to confirm in round 1 | §P, §UI U8 | |
-| 17 | The cadence is judged when a page is read, from the latest and previous results the board already keeps, reading run history only for a test that has failed twice running under a cadence of 3 to 10. Nothing is added to the push path. Or: a failure count kept as results arrive, which saves under 2 ms and costs every estate a change to the hottest table | §B B.3 | |
-| 18 | The headline reads only the marked tests that are failing, so its cost grows with failures and not with marks: about +2.5 ms at 50 marks and +3.5 ms at 1,000 on SQLite, nothing at none. MariaDB pays more: the run-history read alone was about 5 ms for the fixture's 42 tests. That read is bounded below by a stream's first run on builds only | §P | |
-| 19 | Rows learn of their mark through a primary-key join on the rows statement: +0.09 ms per 250 rows on SQLite and +0.2 ms on MariaDB with no marks. This is the one place a board with no marks pays anything. Or: a separate lookup, a statement and a round trip on every cold page | §B B.9, §P | |
-| 20 | The unsliced summary, which Open Actions fetches on its first paint, carries the counts so its queues agree with the headline's: nothing with no marks, +2 to 6 ms with marks on SQLite, an estimated +6 to 10 ms on MariaDB. §P recommends giving Open Actions a catalogue-only request as its own package, saving about 19 ms, more than this adds | §B D-B3, §P | |
-| 21 | The per-day chart's cost at 90 days with 1,000 marks (366 ms on SQLite, off the first paint) joins the trend decision already open from the assigned split: accept, a covering index, or a cap. It is not decided here | §P | |
-| 22 | MariaDB is gated by CI's 10.3 legs running the cadence tests with at least 101 marked tests, so a full statement and a second one both execute, plus a by-hand `EXPLAIN` on a production-scale copy during the measured pass | §P | |
+| 1 | For the cadence a failure is a `FAIL` and nothing else, the definition the existing flakiness signal uses. An unexpected pass or an expected failure among the last N runs keeps the test flaking | §B B.1 | Agreed |
+| 2 | The per-day chart judges each past night **as it stood that night**, using today's mark: a spell over the cadence stays red there, as it was in the bars. Or: "marked now", every past failure of a marked test drawn as flaking, which colours as tolerated some runs the bars called failing; "that night" is 20 to 60 % dearer than it | §B D-B1, §P | Agreed |
+| 3 | A marked test that passes after a **tolerated** failure is not "Newly fixed" and does not move the "fewer failing than before" line; one that passes after being **over its cadence** is, because that was a real failure and its fix is news. §P measured the extra read at 0.1 to 0.4 ms. Or: a marked test is never in Fixed at all, which is simpler and hides a real fix. Neither section recommended one; this is the main session's position | §UI U12.7, §P | Agreed |
+| 4 | The Flaky tab's measure is "failed X of its last 20 runs" on the stream. Or: failures since the mark was made, which grows with the mark's age and says less about now | §B D-B2 | Agreed |
+| 5 | The tab, the legend key, the tooltip row and the table column appear **only where the scope has a mark**; a product with no marks sees exactly today's page. Or: always shown, as the Muted tab is | §UI D-U4 | Agreed |
+| 6 | The word "flaky" on screen always means the mark. The computed signal on the test page and Open Actions changes from "flaky — flips about 1 run in 3" to "flips about 1 run in 3" (and "flips often" in the card). Or: keep both meanings | §UI D-U6 | Agreed |
+| 7 | The colour for flaking is a new token, a dusty mauve (`#a66993`), checked against every existing chart colour for normal and colour-blind vision. Or: a teal, which sits too close to the pass green | §UI U1 | Agreed |
+| 8 | A row keeps its result's colour on the chip and the row edge; flaking is a pill beside it, as muted is. Or: a mauve row edge | §UI D-U5 | Changed: a flaking row has its own chip and edge, no pill (§8) |
+| 9 | The comparison page and Watch's build cards are **unchanged in this arc**: they take no account of mutes today either, and the comparison's pairs query is the slowest thing on the board. Its counts include flaking tests. Or: the flaky pill on the comparison's rows, which §P allows on the returned page only | §B D-B7, §UI U12.6, §P | Agreed |
+| 10 | The reason's comment is tagged with the stream the user was looking at when they marked the test, though the mark itself covers every stream. Or: no tag | §B D-B5 | Agreed |
+| 11 | When a marked test is retired the mark is kept, uncounted and flagged on the tab; when an environment is dropped its marks go with it; deleting a build touches no mark | §B D-B4 | Agreed |
+| 12 | The mark's owner is the person making it. The selection bar's Assign-to box is not read, because a mark is not an assignment. A deactivated user cannot mark | §UI D-U2, §B D-B6 | Agreed |
+| 13 | The selection bar gains one Flaky group after Mute: a cadence select, "Mark as flaky" and "Unmark", sharing the note box. The button reads "Set cadence" when every ticked test is already marked. The bar is about 400 px wider and wraps to three rows below about 900 px (an estimate from the markup) | §UI U3, D-U3 | Agreed |
+| 14 | On the test page the button sits in the Flakiness card and opens its form there; the current mark shows as a banner under the mute banner, with its history below | §UI U5, D-U7 | Agreed |
+| 15 | Migration 12 creates two tables (the marks, and one row per act) and alters nothing; the parked WP-15 moves to 13. The server may stay up for the MariaDB step | §B B.2 | Agreed |
+| 16 | The Flaky tab is paged by the server in an order it knows without the measure: failing first, then flaking, then passing, newest mark first. §UI's "most failures first" would need the measure for every mark, an estimated 110 to 130 ms at 1,000 marks. Or: accept that growth, off the first paint. The order is the main session's reconciliation, for §B to confirm in round 1 | §P, §UI U8 | Agreed |
+| 17 | The cadence is judged when a page is read, from the latest and previous results the board already keeps, reading run history only for a test that has failed twice running under a cadence of 3 to 10. Nothing is added to the push path. Or: a failure count kept as results arrive, which saves under 2 ms and costs every estate a change to the hottest table | §B B.3 | Agreed |
+| 18 | The headline reads only the marked tests that are failing, so its cost grows with failures and not with marks: about +2.5 ms at 50 marks and +3.5 ms at 1,000 on SQLite, nothing at none. MariaDB pays more: the run-history read alone was about 5 ms for the fixture's 42 tests. That read is bounded below by a stream's first run on builds only | §P | Agreed |
+| 19 | Rows learn of their mark through a primary-key join on the rows statement: +0.09 ms per 250 rows on SQLite and +0.2 ms on MariaDB with no marks. This is the one place a board with no marks pays anything. Or: a separate lookup, a statement and a round trip on every cold page | §B B.9, §P | Agreed |
+| 20 | The unsliced summary, which Open Actions fetches on its first paint, carries the counts so its queues agree with the headline's: nothing with no marks, +2 to 6 ms with marks on SQLite, an estimated +6 to 10 ms on MariaDB. §P recommends giving Open Actions a catalogue-only request as its own package, saving about 19 ms, more than this adds | §B D-B3, §P | Agreed, and the names-only request is built in this arc, first (§8) |
+| 21 | The per-day chart's cost at 90 days with 1,000 marks (366 ms on SQLite, off the first paint) joins the trend decision already open from the assigned split: accept, a covering index, or a cap. It is not decided here | §P | Agreed: decided with the open trend decision |
+| 22 | MariaDB is gated by CI's 10.3 legs running the cadence tests with at least 101 marked tests, so a full statement and a second one both execute, plus a by-hand `EXPLAIN` on a production-scale copy during the measured pass | §P | Agreed |
 | 23 | A flaking test is off Open Actions' "Needs action" list and returns when it goes over its cadence. No section designed this: the list is paged in SQL and "flaking" is computed, so how they are excluded and what it costs is unmeasured. Round 1 has §B design it and §P cost it; that page's rows are a Known slow row | §7 verdict 17, §B B.8 question 2 | Decided (verdict 17); design in round 1 |
 
 ## §5 Open questions
+
+**All six are answered in §8.** They stand here as they were put.
 
 1. **Does verdict 17 replace verdict 6?** Verdict 17 says a flaking test is
    "not an open issue", in reply to the report that an unassigned flaking
@@ -825,3 +831,60 @@ the owner wrote their own, it is quoted in full.
 | 15 | Should the test page's existing flakiness signal offer the action? | "Button beside the signal (Recommended)" |
 | 16 | Start round 0? | "Yes, start round 0" |
 | 17 | (Unprompted, while round 0 was being assembled, after the main session reported that an unassigned flaking test would still appear on Open Actions' default list and that this would come as an open question) | "flaking (not yet promoted to failure): not an open issue. The whole point is to declutter these from triage" |
+
+## §8 Round 0 review (2026-11-11, captured verbatim)
+
+The owner reviewed round 0 the same day, first in the Claude Doc (a verdict
+dropdown per decision) and then in chat, where the main session put what was
+left as questions with a recommended position each. Captured before anything
+is rewritten. Each item is classed as a decision (D), an answer to an open
+question (Q) or an instruction on how to work (S).
+
+**An instruction, given with the request to be asked what was left (S):**
+
+> I am keane to minimize perfomance impact whilst accepting its added
+> functionality so some loss is inevitable
+
+**In the Claude Doc.** Decisions 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14 and
+15: "Agree" (D). Decision 8: "Change (see note)", and the note in full (D):
+
+> Flaking is a first class failure state
+
+Decisions 3 and 16 to 22 and the six questions were left blank there and
+answered in chat, below. No comment threads were left on the doc.
+
+**In chat.** Where the answer is an option's label, the label is quoted; where
+the owner wrote their own, it is quoted in full.
+
+| Item | Question as put | Answer | Class |
+|---|---|---|---|
+| Decision 8 | Given the note, how should a flaking row look and behave in lists? | "Own chip and edge": the row's result chip reads FLAKING in mauve and the row edge is mauve, in place of the red FAIL chip; no separate pill; a marked test over its cadence is a red FAIL with a small "flaky" tag. (Offered and not taken: the same plus a Result filter value; a red chip with a mauve edge) | D |
+| Decision 3 | Does a marked test that passes after a tolerated failure show under "Newly fixed"? | "Only after a real failure (Recommended)" | D |
+| Question 1 | Does "not an open issue" replace the earlier answer that an assigned flaking test stays on its assignee's Open Actions? | "Off everyone's list. It shoudln't be assigned. There is an audit of who marked the test as flakey - it doesn't assign it" | D |
+| (follow-up) | What if a test already has an assignee when it is marked flaky? | "Assignment kept, dormant (Recommended)": it puts nothing on anyone's Open Actions while the test is flaking or passing, and the test returns to that person's list if it goes over its cadence | D |
+| Question 2 | What does "All clear" say when the only failures are flaking or muted? | "All clear, naming what is set aside (Recommended)" | Q |
+| Decision 20, question 4 | The flaking counts land on Open Actions' first paint through the full summary; a names-only request would save about 19 ms. What do we do? | "Slim request in this build (Recommended)": the first item of the build gives Open Actions a names-only request | D |
+| Decision 16 | How is the Flaky tab ordered? | "By state, newest mark first (Recommended)" | D |
+| Decision 21 | The per-day chart's cost at 90 days with 1,000 marks? | "Accept, decide with WP-43's (Recommended)" | D |
+| Decisions 17, 18, 19, 22, question 5 | The five build choices where the recommended position is the cheapest shape measured: agree? | "Agree all five (Recommended)" | D |
+| Question 3 | Is a mark shown on a build the test never ran on? | "Absent there (Recommended)" | Q |
+| Question 6 | Is the new position stated anywhere besides the reworded places? | "A README section (Recommended)" | Q |
+
+**What this changes in the doc as written, owed in round 1:**
+
+- §3 U9 and U8 (rows): a flaking row carries its own chip and edge, not a
+  pill beside a red FAIL chip. The guard that pins a row's chip to its result
+  is widened, not weakened. (`ui-engineer`)
+- §3 U9 (Open Actions) and §1: no flaking test is on Open Actions, so that
+  page needs no "flaking" marker; verdict 6 is superseded. How the paged list
+  excludes a computed set, with an existing assignment left dormant, and what
+  it costs on a Known slow row, is undesigned and unmeasured.
+  (`backend-engineer`, then `performance-engineer`)
+- §2 D-B3 and §3a: Open Actions gets a names-only request as the build's
+  first item, so the flaking counts land on no page's first paint. Its shape
+  is undesigned. (`backend-engineer`, `ui-engineer`, `performance-engineer`)
+- §2 B.3 and B.5: the performance pass's cheaper marks statement and the
+  lower bound on build streams only replace what §B wrote. (`backend-engineer`)
+- §2: the rule for "Newly fixed" (decision 3) and the Flaky tab's order
+  (decision 16) are written into the backend design. (`backend-engineer`)
+- §3 U6: the "All clear" banner names what is set aside. (`ui-engineer`)
