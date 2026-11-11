@@ -5075,3 +5075,16 @@ the next "Show more" appended a page twice. No browser has rendered the
 feature; the pages and the API were read over HTTP on a seeded copy and
 the counts agreed. 3021 OK (skipped 1) and 4175 OK (skipped 90) green in the main
 checkout.
+
+## WP-44 item 10: the documents; the build is complete and pushed for CI, not merged (2026-11-11)
+
+The README has its "Flaky marks" section, the corrected `result` row and
+the two summary parts it lacked (`parts=names`, and `parts=assigned_trend`
+from the 2026-10-13 drop). The operator note is docs/drops/2026-11-11.md,
+its date provisional. The handover is rewritten. Every item of the plan is
+committed; the branch is pushed and a pull request opened so that CI's
+MariaDB 10.3 legs run the plan guards, which no local run could. Nothing
+is merged or deployed: both are the owner's, with the decisions the
+handover lists (the headline over its bar, the trend part's cost with many
+marks, the chart's split after the headline, Open Actions' Failing mode).
+Item 6h (a dialect hook) exists only if a plan guard fails on those legs.
