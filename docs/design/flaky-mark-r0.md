@@ -1,11 +1,26 @@
 # Mark a test as flaky — design review, round 0
 
-**Status: ROUND 0 BEING WRITTEN (2026-11-11). §0 is agreed in chat; the owner's
-verdicts so far are captured verbatim in §7. Nothing is built.**
-The sections are written by the owning agents against §0 and the candidate
-contract in §1: §B by `backend-engineer`, §UI by `ui-engineer`, §P the
-performance design pass by `performance-engineer`. §4 and §5 collect every
-decision and open question in one place. Reading bar: twenty minutes.
+**Status: ROUND 0, FOR THE OWNER'S REVIEW (2026-11-11). §0 is agreed in chat;
+the owner's seventeen verdicts so far are captured verbatim in §7; §4 holds
+twenty-three decisions with a verdict slot each and §5 six open questions.
+Nothing is built.**
+Three sections were written by the owning agents against §0: §B (§2) by
+`backend-engineer`, §UI (§3) by `ui-engineer`, and §P (§3a), the performance
+design pass, by `performance-engineer` against the other two. §1 is the main
+session's reconciliation of them. Reading bar: twenty minutes; §0, §1, §4 and
+§5 are the review, and the sections are the reasoning behind them.
+
+Two things to know before reading the sections. They were written against a
+candidate contract, so where §2 or §3 says "§1" it means that candidate, and
+§1 as it stands now already answers their pushback. And verdict 17 arrived
+after they were written: what §B's question 2 and §3's U9 say of Open Actions
+predates it (decision 23).
+
+Terms the sections use: a **triple** is (environment, script, test name);
+**Q1** is the statement that reads the marks and **Q2** the bounded read of a
+test's recent runs; **the floor** is Q2's lower bound at a stream's first
+run; the **mute epoch** is the memo key that changes whenever a mute is
+created, lifted or expires; **Take** is the one-click assign-to-me action.
 
 Four terms used throughout. A **mark** is the standing record that a test is
 accepted as flaky. The **cadence** is the mark's number N: the test counts as
@@ -33,8 +48,11 @@ nobody's unless it is separately assigned, and the mark stays, so it is
 tolerated again after its next pass. A live mute wins over the mark: a muted
 test shows as muted until the mute runs out. The mark's owner is a record of
 who accepted the flakiness and is not an assignment: marking a test puts
-nothing on anyone's Open Actions, and a test that is assigned as well as
-marked stays on its assignee's list with a "flaking" state marker. A Flaky tab
+nothing on anyone's Open Actions. A flaking test is not an open issue: it
+leaves Open Actions' "Needs action" list until it goes over its cadence
+(verdict 17, added after this paragraph was agreed). Whether that also takes
+a flaking test off the list of the person it is assigned to, where verdict 6
+kept it with a "flaking" state marker, is open question 1. A Flaky tab
 on Home, beside Muted, lists every mark with its owner, cadence, age and how
 often the test has actually failed, so a stale mark is visible without anyone
 being nagged. Any named user may remove a mark or change its cadence; every
@@ -60,56 +78,64 @@ Actions (an easy way to deal with passing tests and clear them in bulk) is a
 follow-up design. An assigned test that is flaking is seen as a special case
 of that, which is why it stays on Open Actions here with only a state marker.
 
-## §1 The candidate contract
+## §1 The contract, reconciled
 
-Written by the main session for the two layers to write against in parallel.
-It is a starting position: either section may push back on any line, and the
-reconciled contract replaces this one when the sections are assembled.
+The two layers wrote in parallel against a candidate contract (this branch's
+first commit carries it). This replaces it. Where §B, §UI and §P differed,
+the line says whose position stands; "decision N" points at §4.
 
 - **Identity.** A mark is per test in one environment: (environment, script,
-  test name), the same key an assignment uses. At most one current mark per
-  test. Fields: `cadence` (integer, 2 to 10), `marked_by`, `marked_at`,
-  `reason`.
-- **The rule, per stream.** A marked test is **flaking** on a stream when its
-  latest result there is a failure and at least one of its N most recent runs
-  on that stream is not a failure. It is **over its cadence** when its latest
-  min(N, runs it has) runs on that stream are all failures. Which results
-  count as "a failure" for this rule is §B's to define; the existing
-  flakiness signal already has a definition and the two should not disagree.
-- **State on a row.** Every row that carries `mute` today also carries
-  `flaky`: null, or `{cadence, marked_by, marked_at, reason, state}` with
-  `state` one of `"passing"`, `"flaking"`, `"failing"` for the row's stream.
-  A live mute takes precedence in what is drawn and counted; the `flaky`
-  object is still present so the tag can be shown.
-- **Counts.** Wherever a payload carries `muted` beside a failing figure it
-  gains `flaking` beside it, defined the same way: failing, unretired, marked,
-  under the cadence, no live mute. Those tests leave `new_failures` and
-  `still_failing` and the per-environment and per-script failing figures, as
-  muted ones do; the pass-rate figures are unchanged. Candidate keys:
-  `status.flaking`, `status.flaky_total` (every mark), `by_environment[].flaking`,
-  `top_failing_scripts[].flaking`, `products[].flaking`, the Watch cards'
-  `flaking`.
-- **The trend.** The per-day chart gains a flaking series beside
-  `FAIL_ASSIGNED` and `FAIL_MUTED`, served by the same off-first-paint part.
-  What "flaking" means for a past day (as the test stands now, like the other
-  two, or as it stood that night) is an open decision for §B and §P.
-- **The Flaky tab.** A `flaky` queue beside `muted`, listing every mark
-  whatever the test's result, fetched only when the tab is opened. Each entry:
-  the test's key, `cadence`, `marked_by`, `marked_at`, `reason`, the state and
-  latest result on the request's stream, and a measure of how often the test
-  has actually failed (shape for §B to propose and cost).
+  test name), the key an assignment uses. Fields: `cadence` (2 to 10),
+  `marked_by` (the person making the mark; nobody else can be named, decision
+  12), `marked_at`, `reason`.
+- **The rule, per stream.** A failure is `FAIL` and nothing else (decision 1).
+  The state is `passing`, `flaking` or `failing` by §B B.1's table, and `null`
+  where the test never ran on the stream.
+- **State on a row.** `flaky` is null or `{cadence, marked_by, marked_at,
+  reason, state, streak, runs}`. `streak` is the consecutive failures ending
+  at the latest run, capped at N. `runs` is how many runs the stream has of
+  the test, capped at N, given when the state is `failing`: the one place the
+  UI reads it, to say "every run here has failed (2 of 2)". Both were asked
+  for by §UI (U12.1) and cost no read (§P). Carried by dashboard rows, queue
+  rows, Open Actions' rows and the test detail, which also carries
+  `flaky_history`. Comparison rows are decision 9.
+- **Counted once.** Muted, else flaking, else assigned, else unassigned (§B
+  and §UI agree). Flaking tests leave `new_failures`, `still_failing`, the
+  per-environment `failed`, the per-script `failing`, the `assigned` figure
+  the charts split on, and Watch's `unassigned_failing`. The pass rate's
+  inputs do not change.
+- **Counts.** `status.flaking`, `status.flaking_new_failures`,
+  `status.flaking_still_failing` (one per tile, §UI U12.2), `status.flaky_total`
+  (every mark in scope); `by_environment[].flaking`,
+  `top_failing_scripts[].flaking`, `products[].flaking`, and `flaking` on
+  Watch's environment and product cards. §UI notes nothing draws
+  `products[].flaking`; it stays, because the product's failing figure has the
+  flaking tests taken off it and the board never subtracts silently.
+- **The trend.** `FAIL_FLAKING` per night, in `parts=assigned_trend` only,
+  disjoint from `FAIL_MUTED` and `FAIL_ASSIGNED`. What it means for a past
+  night is decision 2.
+- **The Flaky tab** is its own `GET /api/flaky` (§B D-B8), not a queue kind as
+  §UI assumed: a kind would add a statement to the full payload. Its badge is
+  `status.flaky_total`, not `queue_totals.flaky`. Entries carry `failed_runs`
+  and `runs` (§UI's `recent_failures` and `recent_runs`, under §B's names).
+  It is paged by the server; how it is ordered is decision 16.
 - **Acts.** `POST /api/flaky/bulk` with `{username, reason, cadence, tests}`
-  marks unmarked tests and changes the cadence of marked ones (the owner does
-  not change); `POST /api/flaky/unmark` with `{username, tests}`. The reason
-  is required for a fresh mark and is posted as a comment on each test, as a
-  mute's is. Every act is a history row; the test detail carries the current
-  mark and its history.
-- **Open Actions.** Its rows carry the same `flaky` object so an assigned,
-  flaking test can show its state marker. Nothing is added to or removed from
-  the list by a mark.
-- **The cost bar.** With no marks, every existing read costs what it costs
-  today. With marks, the cadence is evaluated only for marked tests whose
-  latest result is a failure, and reads at most 10 runs each.
+  returns `{marked, changed, unchanged, unknown}`; the reason is required for
+  a fresh mark and optional for a cadence change. `POST /api/flaky/unmark`
+  with `{username, tests}`.
+- **Open Actions.** A flaking test is not on its "Needs action" list (verdict
+  17). Neither section designed that exclusion; it is decision 23, for
+  round 1.
+- **An older payload** without any of these fields, and a scope with no marks,
+  draw exactly today's page (§UI U7, U11).
+- **The cost bar, as §P leaves it.** With no marks, no read gains a statement;
+  the one exception is a primary-key join on the rows statements (decision
+  19). With marks, the headline reads only the marked tests that are failing
+  on the stream, and counts the marks in SQL (§P's cheaper shape, replacing
+  §B's Q1); only tests that have failed twice running under a cadence of 3 to
+  10 read the runs table, at most N rows each. §B's lower bound on that read
+  applies to build streams only: §P found it wrong for mainline on a migrated
+  database, which is production's case (decision 18).
 
 ## §2 Backend (§B, round 0, backend-engineer, base `e70c076`)
 
@@ -490,7 +516,7 @@ an older server: exactly the WP-43 charts.
 New failures 3 · Still failing 11 · Muted 2 · Flaky 7 · Fixed 4 · …
 ☐ Test           State           Mark                Cadence   Failed
 ☐ login_retry    FAIL [flaking]  race in teardown    3 in a    6 of last
-  lab-alpha·auth                 dev1 · 41 days     row       20 runs
+  lab-alpha·auth                 dev1 · 41 days      row       20 runs
 ☐ cache_warm     PASS [flaky]    slow mirror · dev2   5 in a row 0 of last 20
 ```
 
@@ -591,17 +617,172 @@ the mark [both meanings]. D-U7 button in the card, mark in the header.
 - **A Flaky tab beside Muted** lists every mark: owner, cadence, age, and
   how often the test has actually failed.
 
-## §3a Performance design pass (§P)
+## §3a Performance design pass (§P, round 0, performance-engineer, base `8d1e28a`)
 
-*To be written by `performance-engineer` against §B.*
+Numbers marked §B are B.5's. The rest are mine. They were taken on copies of the two seeds §B rebuilt (perf-seed/1 and -h90), with the 65-assignment fixture, 10 mutes and §B's marks fixture: the largest environment, current failures first, cadences 3,3,2,5,3,4,10,3. SQLite runs were in-process with memos cleared, as medians of 96 to 128 calls, alternated wherever a delta is quoted. MariaDB runs were by hand on the perf-seed/1 copy loaded into a local MariaDB 12.3 (not production's 10.3), as medians of 40 calls through the vendored driver. This machine ran fast today: on perf-seed/1 the cold headline took 17.5 ms, the unsliced `/api/summary` 36 ms and Open Actions' rows 20 ms, about a fifth of the Known slow figures, so only deltas compare. Estimates are labelled as estimates.
+
+- **The headline: proceed with a cheaper Q1.** §B's +2.2 to 2.7 ms at 50 marks stands. At 1,000 marks, Q1 hands Python every mark and the headline discards the 899 that are passing. The cheaper Q1 does two things:
+  - It is driven from the stream's FAIL rows: the covering range of `idx_latest_runs_result`, then the marks' primary key. That is 171 rows on mainline here, at any mark count.
+  - It counts `flaky_total` in SQL from the marks, by `CROSS JOIN`. That count takes 0.35 ms at 1,000 marks.
+
+  Measured Q1+Q2+fold, §B's shape against the cheaper one:
+
+  | Database, seed | 50 marks | 1,000 marks |
+  |---|---|---|
+  | SQLite, perf-seed/1 | the same (±0.3 ms) | 5.8 → 3.3 ms |
+  | SQLite, -h90 | the same | 6.6 → 3.7 ms |
+  | MariaDB, perf-seed/1 | the same | Q1 9.9 ms → 1.4 ms, plus the count at 2.3 ms |
+
+  MariaDB pays the most because the pure-Python driver decodes every row it is handed. With this shape the cost grows with the stream's failures, not with the number of marks, which is §1's own cost bar. The count can also carry the per-environment "marked and fixed" figure that U12.7 needs. It can be one statement (`UNION ALL`) or two.
+- **Plan trap (mine).** An inner `JOIN` on `test_flaky_marks` lets SQLite drive from `latest_runs`, a scan of the stream's partition. Written that way the count took 1.4 ms with 50 marks; written with `CROSS JOIN` it took 0.024 ms. Every statement on the marks needs its driving side pinned (`LEFT JOIN` or `CROSS JOIN` from the marks, or the FAIL range), and a plan guard on each.
+- **Against the bar.** The headline's A/A band is −0.4 to +3 ms (WP-43 §3a). 50 marks sits inside it. 1,000 marks in §B's shape (+6.5 ms) is outside it and would read SLOWER at the runner's 5 % threshold. With the cheaper Q1 it is +3.3 to 3.7 ms on SQLite. The growth is bounded by marks, never by the estate, so no cap is needed.
+- **Open Actions' first paint (D-B3): proceed with the cheaper Q1; recommend a catalogue-only request.** The unsliced payload (36 ms) is Open Actions' slower request (its rows take 20 ms), so whatever the counts add lands on that page's first paint in full:
+  - +2 to 6 ms on SQLite (§B).
+  - On MariaDB, an estimated +6 ms at 50 marks and +17 ms at 1,000 in §B's shape, or about +10 ms at 1,000 with the cheaper Q1. These are built from my statement timings: Q1 0.8 and 9.9 ms, Q2 5.1 and 6.7 ms.
+
+  The payload cannot drop the counts while its queues must agree with the headline's. The bigger saving is §B question 3's catalogue-only request: the queues Open Actions never reads already cost about 36 − 17.5 ≈ 19 ms of that payload, more than this feature adds at any mark count. Recommended as its own small package, scheduled by the owner.
+- **The rows' join (B.9): proceed with the join.**
+  - With no marks: +0.09 ms per 250 rows on SQLite (§B) and +0.2 ms on MariaDB (2.11 → 2.32 ms), inside the browse rows' ±1 ms band.
+  - With 1,000 marks: +0.7 ms on MariaDB.
+  - The strict alternative, a separate statement, is a round trip even on an empty table (0.19 ms), and 3.1 ms at 1,000 marks if it reads the marks whole.
+
+  Condition: the join goes on a rows statement only. Never on a `COUNT(*)`, and never on the comparison's pairs query (the 268 ms Known slow row): compare rows (U12.6) take it on the returned page only.
+- **The floor: sound for builds, unsound for mainline on a migrated database, which is production's case.** For builds, `first_seen` is widened at import and re-derived after a delete. With the floor, Q2 on -h90 went 4.9 → 1.7 ms on nightly/full and 6.2 → 0.4 ms on the branch, matching §B. Mainline is different:
+  - Migration 9, and its MariaDB ledger step, stamped mainline's `first_seen` with the clock at the time the migration ran.
+  - An import only ever moves `first_seen` earlier, and every later import is newer, so it never moves.
+  - So every mainline run older than that migration lies under the floor. A marked test with fewer than N mainline runs since then would wrongly read "failing".
+  - The seeds hide this: they are built fresh, so their `first_seen` is the first run.
+
+  Mainline gains nothing from the floor anyway (0.69 against 0.68 ms, 1.95 against 1.91 ms on -h90). **Condition: apply the floor on build streams only.** On a stream that runs a test rarely, Q2 reads every run of the test, on any stream, since its Nth-newest run on that stream, not just N runs. The floor bounds this by the stream's age.
+- **Q2 on MariaDB (mine, 12.3).** It parses, and plans as it does on SQLite: each derived table is a `range` on `uq_runs_identity` with an index condition.
+  - A full chunk of 100 is 34 KB on the wire, far under `max_allowed_packet`, and takes 12.6 to 13 ms.
+  - That is about 0.11 to 0.13 ms a test, three to four times SQLite's 0.035 ms. Q2 is the dearer half of the headline on production: 5.1 ms for the fixture's 42 tests at 50 marks.
+  - Parenthesised union members are 30 % cheaper, but SQLite rejects them. An `OR` over the triples reads every run since the floor, which is a year on mainline.
+  - The fixture is the worst case: it marks tests that fail every night. A marked test that fails 1 run in 3 needs Q2 about 1 time in 9 (estimate).
+
+  **Gate:** CI's 10.3 legs run `FlakyCadenceTest` on MariaDB with at least 101 tests, so that both a full chunk and a second statement are executed. On top of that, a by-hand `EXPLAIN` on a production-scale MariaDB copy during `/perf-ab` (WP-43 decision 12). An `EXPLAIN` assertion on CI's few-row tables proves nothing.
+- **The trend (D-B1): proceed with "as it stood that night".** At the default 14 days with 50 marks it costs 4.6 ms against 3.8 ms for "marked now" (§B), on top of the split's 23 ms. It is off the first paint, and only the trend card waits for it.
+  - On MariaDB both statements start from the marks. At 1,000 marks on perf-seed/1 the "that night" read took 26 ms against 19 ms for "marked now" (statement only, mine).
+  - "That night" ships every run through the driver, so its premium grows on MariaDB (estimate).
+  - There is no cheaper shape under either meaning: both read every run of each marked test in the window. The covering index in the open trend decision would serve this read, Q2 and the tab.
+
+  **ESCALATE only the 90-day × 1,000-mark corner** (248 and 366 ms, §B), as part of that existing decision (accept, index or cap), not as a new one.
+- **The Flaky tab (D-B2): proceed, on condition it uses Q2's shape.** Q2's shape at LIMIT 20 for a page of 100 marks: 5.7 ms on perf-seed/1 and 11.4 ms on -h90 (SQLite), 12.9 ms on MariaDB (perf-seed/1). §B estimated about 7 ms. `recent_results`, which today's stability figure reads, took 52 ms for the same page on -h90, so it must not be reused here.
+
+  **To reconcile:** §UI U8 orders by state and then by "most failures", sorting in the browser. That needs the measure for every mark, not one page: about 110 to 130 ms at 1,000 marks (estimate). Either the server pages in SQL by an order it knows without the measure, or that growth is accepted, off the first paint.
+- **The over-fetch (B.4) is exact.** The failing queues are capped lists with no offset. Measured +0.056 ms at F = 56 (§B).
+- **What the UI asks for (U12).**
+  - `streak` and `runs` cost nothing: B.1 decides them from `result` and `prev_result`, except in Q2's row, where Q2's up-to-N results give both.
+  - "A marked test is never in Fixed" costs one per-environment count and the same over-fetch.
+  - Telling a tolerated failure from a real fix is Q2 again, at LIMIT N+1, for marked tests that pass after a failure. At 1,000 marks that was 27 tests in 0.38 ms on perf-seed/1 and 8 tests in 0.12 ms on -h90, one statement either way. About 0.11 ms a test on MariaDB (estimate).
+  - Either Fixed rule is cost-neutral at realistic counts, so that choice is semantic.
+  - `"flaky": null` adds 13 bytes a row, 3.2 KB on a 250-row page. `"mute": null` is the precedent.
+- **Memos: proceed, on one condition.**
+  - A mark write drops every memo, as a mute does, at a human rate. The push path gains nothing: Q2's memo key carries the stream at index 1, so a push's targeted drop matches it.
+  - The summary memo's 60-second TTL means a glance pays the cold cost anyway.
+  - **Condition:** the fold must leave `mute_epoch()`'s return value unchanged. Five callers test it for `None` or put it in memo keys (for example, `muted_cells` returns `[]` on `None`). The marks bit goes in the same memo entry, beside it. The fold costs +0.02 to 0.1 ms on MariaDB.
+  - `flaky_states` adds one entry per environment of every stream read (7 on mainline here) to a 128-entry memo that clears completely when full. A cold home load stores 46 entries today.
+- **The measured pass, planned now.**
+  - **Fixture**, added to `tools/dev/perf` (`ab.py --marks N`, `seed.py --onto --marks N`): 0, 50 and 1,000 marks in §B's order and cadences, plus 10 marks in a second environment. It sits on the 65-assignment fixture, with at least one marked test also muted and one also assigned. Both seeds.
+  - **Rows timed:** the six Known slow rows (with 0 marks every one reads "same" with equal statement counts, the rows' join being the only change); the headline; the unsliced payload; Open Actions' rows; browse rows and count; Watch with an environment card; a build's headline (Q2 with the floor); `parts=assigned_trend` at 14 and 90 days on -h90; one `/api/flaky` page; the test detail.
+  - **Statement counts** for `summary_rollup`, `queue_counts`, `status_queue`, `mute_epoch` and the new marks reader.
+  - **MariaDB:** syntax on CI's 10.3 legs; plans and timings by hand on a production-scale copy (the migration tool loads perf-seed/1 in 4 s).
+- **Verdict.**
+  - Headline: proceed with the cheaper Q1.
+  - D-B3: proceed on the same condition; the catalogue-only request is recommended as its own package.
+  - Rows' join: proceed.
+  - Q2: proceed, with the floor on build streams only and the 101-test MariaDB case.
+  - D-B1 "that night": proceed; ESCALATE only the 90-day × 1,000-mark corner, as part of the open trend decision.
+  - D-B2: proceed with Q2's shape; §UI U8's sort to reconcile.
+  - U12: cost-neutral.
+  - Memos: proceed, leaving `mute_epoch()`'s return value unchanged.
 
 ## §4 Decisions
 
-*Assembled by the main session from the sections.*
+Each is written as the recommended position, with the alternative after
+"Or:". The owner's verdict goes in the slot: agree, change to X, or reject.
+The section named holds the reasoning. The first eleven change what a
+developer sees; the rest are how it is built.
+
+| # | Decision (recommended position) | Section | Verdict |
+|---|---|---|---|
+| 1 | For the cadence a failure is a `FAIL` and nothing else, the definition the existing flakiness signal uses. An unexpected pass or an expected failure among the last N runs keeps the test flaking | §B B.1 | |
+| 2 | The per-day chart judges each past night **as it stood that night**, using today's mark: a spell over the cadence stays red there, as it was in the bars. Or: "marked now", every past failure of a marked test drawn as flaking, which colours as tolerated some runs the bars called failing; "that night" is 20 to 60 % dearer than it | §B D-B1, §P | |
+| 3 | A marked test that passes after a **tolerated** failure is not "Newly fixed" and does not move the "fewer failing than before" line; one that passes after being **over its cadence** is, because that was a real failure and its fix is news. §P measured the extra read at 0.1 to 0.4 ms. Or: a marked test is never in Fixed at all, which is simpler and hides a real fix. Neither section recommended one; this is the main session's position | §UI U12.7, §P | |
+| 4 | The Flaky tab's measure is "failed X of its last 20 runs" on the stream. Or: failures since the mark was made, which grows with the mark's age and says less about now | §B D-B2 | |
+| 5 | The tab, the legend key, the tooltip row and the table column appear **only where the scope has a mark**; a product with no marks sees exactly today's page. Or: always shown, as the Muted tab is | §UI D-U4 | |
+| 6 | The word "flaky" on screen always means the mark. The computed signal on the test page and Open Actions changes from "flaky — flips about 1 run in 3" to "flips about 1 run in 3" (and "flips often" in the card). Or: keep both meanings | §UI D-U6 | |
+| 7 | The colour for flaking is a new token, a dusty mauve (`#a66993`), checked against every existing chart colour for normal and colour-blind vision. Or: a teal, which sits too close to the pass green | §UI U1 | |
+| 8 | A row keeps its result's colour on the chip and the row edge; flaking is a pill beside it, as muted is. Or: a mauve row edge | §UI D-U5 | |
+| 9 | The comparison page and Watch's build cards are **unchanged in this arc**: they take no account of mutes today either, and the comparison's pairs query is the slowest thing on the board. Its counts include flaking tests. Or: the flaky pill on the comparison's rows, which §P allows on the returned page only | §B D-B7, §UI U12.6, §P | |
+| 10 | The reason's comment is tagged with the stream the user was looking at when they marked the test, though the mark itself covers every stream. Or: no tag | §B D-B5 | |
+| 11 | When a marked test is retired the mark is kept, uncounted and flagged on the tab; when an environment is dropped its marks go with it; deleting a build touches no mark | §B D-B4 | |
+| 12 | The mark's owner is the person making it. The selection bar's Assign-to box is not read, because a mark is not an assignment. A deactivated user cannot mark | §UI D-U2, §B D-B6 | |
+| 13 | The selection bar gains one Flaky group after Mute: a cadence select, "Mark as flaky" and "Unmark", sharing the note box. The button reads "Set cadence" when every ticked test is already marked. The bar is about 400 px wider and wraps to three rows below about 900 px (an estimate from the markup) | §UI U3, D-U3 | |
+| 14 | On the test page the button sits in the Flakiness card and opens its form there; the current mark shows as a banner under the mute banner, with its history below | §UI U5, D-U7 | |
+| 15 | Migration 12 creates two tables (the marks, and one row per act) and alters nothing; the parked WP-15 moves to 13. The server may stay up for the MariaDB step | §B B.2 | |
+| 16 | The Flaky tab is paged by the server in an order it knows without the measure: failing first, then flaking, then passing, newest mark first. §UI's "most failures first" would need the measure for every mark, an estimated 110 to 130 ms at 1,000 marks. Or: accept that growth, off the first paint. The order is the main session's reconciliation, for §B to confirm in round 1 | §P, §UI U8 | |
+| 17 | The cadence is judged when a page is read, from the latest and previous results the board already keeps, reading run history only for a test that has failed twice running under a cadence of 3 to 10. Nothing is added to the push path. Or: a failure count kept as results arrive, which saves under 2 ms and costs every estate a change to the hottest table | §B B.3 | |
+| 18 | The headline reads only the marked tests that are failing, so its cost grows with failures and not with marks: about +2.5 ms at 50 marks and +3.5 ms at 1,000 on SQLite, nothing at none. MariaDB pays more: the run-history read alone was about 5 ms for the fixture's 42 tests. That read is bounded below by a stream's first run on builds only | §P | |
+| 19 | Rows learn of their mark through a primary-key join on the rows statement: +0.09 ms per 250 rows on SQLite and +0.2 ms on MariaDB with no marks. This is the one place a board with no marks pays anything. Or: a separate lookup, a statement and a round trip on every cold page | §B B.9, §P | |
+| 20 | The unsliced summary, which Open Actions fetches on its first paint, carries the counts so its queues agree with the headline's: nothing with no marks, +2 to 6 ms with marks on SQLite, an estimated +6 to 10 ms on MariaDB. §P recommends giving Open Actions a catalogue-only request as its own package, saving about 19 ms, more than this adds | §B D-B3, §P | |
+| 21 | The per-day chart's cost at 90 days with 1,000 marks (366 ms on SQLite, off the first paint) joins the trend decision already open from the assigned split: accept, a covering index, or a cap. It is not decided here | §P | |
+| 22 | MariaDB is gated by CI's 10.3 legs running the cadence tests with at least 101 marked tests, so a full statement and a second one both execute, plus a by-hand `EXPLAIN` on a production-scale copy during the measured pass | §P | |
+| 23 | A flaking test is off Open Actions' "Needs action" list and returns when it goes over its cadence. No section designed this: the list is paged in SQL and "flaking" is computed, so how they are excluded and what it costs is unmeasured. Round 1 has §B design it and §P cost it; that page's rows are a Known slow row | §7 verdict 17, §B B.8 question 2 | Decided (verdict 17); design in round 1 |
 
 ## §5 Open questions
 
-*Assembled by the main session from the sections.*
+1. **Does verdict 17 replace verdict 6?** Verdict 17 says a flaking test is
+   "not an open issue", in reply to the report that an unassigned flaking
+   test would stay on Open Actions. Verdict 6 kept an *assigned* flaking test
+   on its assignee's list, with a state marker, until the Open Actions
+   clean-up. Read plainly, verdict 17 covers both: a flaking test is on
+   nobody's Open Actions, the assignment is kept, and the test comes back
+   when it goes over its cadence. That is the main session's reading and
+   recommendation; the alternative keeps verdict 6 for assigned tests. Either
+   way the "flaking" state marker stays on the browse and queue rows.
+2. **"All clear" while tests are flaking.** The Home banner shows "All clear"
+   when nothing is failing, and does so today while failures are muted. Should
+   it name what is set aside when that is non-zero ("4 flaking, 3 muted set
+   aside")? (§UI question 4)
+3. **A build the test never ran on.** A marked test with no run on a build is
+   absent from that build's Flaky tab and counts. Confirm. (§B B.8 question 5)
+4. **Open Actions' catalogue-only request** (decision 20): as its own small
+   package soon, or folded into the Open Actions clean-up design?
+5. **The headline's cost with marks** (decision 18) is accepted with no cap on
+   the number of marks, because it grows with the stream's failures and barely
+   with the marks. Confirm.
+6. **Nothing tracked states "flaky tests are not tolerated" outright**, so
+   there is no tenet to reword. The build rewords the places that imply it:
+   the stability sentence and its comment in `static/api.js`, the Flakiness
+   card on the test page, and the docstrings in `testboard/analytics.py`. Is
+   there anywhere else the owner wants the new position stated, for example a
+   sentence in the README?
+
+## §6 Carried into the build, not decisions
+
+- Every statement on the marks table pins its driving side and has a plan
+  guard: an inner join let SQLite scan the latest-runs table, 1.4 ms against
+  0.024 ms. (§P)
+- The "any mark exists" bit rides the mute epoch's memo entry beside the
+  epoch; the epoch's own return value does not change, because five callers
+  test it. (§P)
+- The Flaky tab's measure uses the bounded run-history read at 20 runs, not
+  the existing recent-results read, which took 52 ms for the same page. (§P)
+- The measured pass needs a marks fixture in the performance harness (0, 50
+  and 1,000 marks, with one marked test also muted and one also assigned), on
+  both seeds; §P lists the rows it times. (§P)
+- The summary memo holds 128 entries and clears completely when full; the new
+  per-environment entries add about seven per stream read to the 46 a cold
+  home load stores today. Watched in the measured pass. (§P)
+- MariaDB was checked by §P on a local 12.3, not production's 10.3: the
+  statements parse and plan as on SQLite, and the run-history read costs three
+  to four times SQLite's per test. (§P)
+- "All clear", the "fewer failing than before" line and "Newly fixed · worth
+  verifying" are the Home wordings that change meaning with decision 3 and
+  question 2. (§UI report)
+- No browser has rendered any surface in §3; the selection bar's width is an
+  estimate. The operator note will say so, as every drop's does.
 
 ## §7 The owner's verdicts so far (2026-11-11, in chat, captured verbatim)
 
@@ -643,3 +824,4 @@ the owner wrote their own, it is quoted in full.
 | 14 | What are the states called on screen? | "Flaky mark, 'flaking' state (Recommended)": the action is "Mark as flaky" and the tab is "Flaky"; a tolerated failure carries the state marker "flaking"; a marked test that passed shows a small "flaky" tag; one over its cadence is just failing, with the tag |
 | 15 | Should the test page's existing flakiness signal offer the action? | "Button beside the signal (Recommended)" |
 | 16 | Start round 0? | "Yes, start round 0" |
+| 17 | (Unprompted, while round 0 was being assembled, after the main session reported that an unassigned flaking test would still appear on Open Actions' default list and that this would come as an open question) | "flaking (not yet promoted to failure): not an open issue. The whole point is to declutter these from triage" |

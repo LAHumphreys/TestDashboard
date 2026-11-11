@@ -4662,3 +4662,64 @@ three review findings on item 1, five on item 0, four on item 2), all
 fixed before the commits; no item parked. Suite in the main checkout on
 the final branch: SQLite 2751 OK (skipped 1); MariaDB (local 12.3) 3769 OK (skipped 79).
 No browser has rendered the UI.
+
+## Design review: mark a test as flaky, round 0 (2026-11-11)
+
+The owner asked for a first-class "Mark as flaky" action: products have been
+onboarded that accept some tests as flaky, and those tests should stop
+crowding the failures that need triage. §0 was settled in chat through
+sixteen questions, each put with a recommended position, and round 0 was
+written by the owning agents: `docs/design/flaky-mark-r0.md` on branch
+`design-flaky-mark`, cut from `6cba071` (the drop of 2026-10-13, merged as
+PR #20). The owner's answers are captured verbatim in the doc's §7.
+
+Agreed, in short: a standing, owned mark per test in one environment, across
+mainline and every build, with a cadence of N failures in a row (2 to 10);
+under the cadence a failure is "flaking", leaves the failing figures as a
+muted one does and still counts against the pass rate; over it the test is
+an ordinary failure and nobody's; a live mute wins; a build with fewer runs
+than the cadence is failing when every run it has failed; a reason is
+required; anyone may change or remove a mark, recorded; a Flaky tab on Home
+beside Muted; a fourth segment on the three home charts; available on every
+product. Three recommended positions were not taken and the doc says which.
+A seventeenth verdict arrived while the round was being assembled: a flaking
+test is not an open issue and leaves Open Actions' list; no section had
+designed that, so it is round 1's first item. A general clean-up of Open
+Actions is a follow-up design, by the owner's direction.
+
+Designed: migration 12, create-only, two tables (WP-15's reservation would
+move to 13; nothing is claimed until the build). The cadence is judged at
+read time from the latest and previous results already kept per stream;
+only a test that has failed twice running under a cadence of 3 to 10 reads
+the runs table, at most N rows. Nothing is added to the push path.
+
+Measured in round 0, on copies of perf-seed/1 and its 90-night variant with
+the 65-assignment fixture, SQLite, cold, in-process, alternated (the backend
+agent's medians of 24 to 400 calls; the performance engineer's of 96 to 128).
+The machine ran about five times faster than on the day the Known slow table
+was taken, so only deltas compare. The cold headline: nothing with no marks,
++2.2 to 2.7 ms at 50 marks, +6.3 to 6.5 ms at 1,000 as first designed and
++3.3 to 3.7 ms with the performance pass's cheaper statement, driven from
+the stream's failing rows. The rows statement's join: +0.09 ms per 250 rows
+with no marks. The trend series, off first paint: 4.6 ms at 14 days and 50
+marks, 366 ms at 90 days and 1,000 marks judged "as it stood that night",
+248 ms judged "marked now". The Flaky tab's measure: 11.4 ms a page of 100
+on the 90-night seed. MariaDB, by the performance engineer on a local 12.3
+and not production's 10.3, medians of 40 calls on a perf-seed/1 copy: the
+new statements parse and plan as on SQLite; the bounded runs read costs
+0.11 to 0.13 ms a test against SQLite's 0.035; the rows join +0.2 ms.
+
+Found by the performance pass and carried into the design: the lower bound
+the backend section put on the runs read is wrong for mainline on a
+migrated database, where the stream's first-seen stamp is the migration's
+clock and not its first run, so it applies to build streams only; and an
+inner join on the new table lets SQLite scan the latest-runs table (1.4 ms
+against 0.024 ms), so every statement on it pins its driving side.
+
+Open for the owner: twenty-two decisions with verdict slots and six
+questions, the first being whether the seventeenth verdict also takes an
+assigned flaking test off its assignee's list. The trend's cost at 90 days
+and 1,000 marks joins the trend decision already open from WP-43. The
+`ui-engineer` agent type was still not registered; the UI section was
+written by a general-purpose Opus agent carrying the definition. No browser
+has rendered any surface. Nothing is built.
