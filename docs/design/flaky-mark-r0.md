@@ -758,6 +758,55 @@ Numbers marked §B are B.5's. The rest are mine. They were taken on copies of th
   - U12: cost-neutral.
   - Memos: proceed, leaving `mute_epoch()`'s return value unchanged.
 
+## §3b Performance pass, round 1 (§P, performance-engineer, base `8cee580`)
+
+An addendum to §3a; the code is unchanged from §B's base `652b0bb`. Numbers marked §B are B.5's; the rest are mine unless marked as estimates. SQLite numbers come from copies of perf-seed/1 and -h90, with the 65-assignment fixture and §B's marks and cadences. They were taken in-process, cold (memos cleared before every call) and alternated, over 24 to 48 calls. Paired bands were ±0.3 to 1 ms. This machine ran SQLite at about a fifth of the Known slow figures (rows 20 to 24 ms against 97), so compare deltas only. The MariaDB numbers are from the perf-seed/1 copy loaded into a local **12.3, not production's 10.3**, over 30 to 40 calls through the vendored driver. Bands there were ±3 to 5 ms, and a 0-mark A/B read +0.5 [−2.0, +4.8].
+
+- **Open Actions' rows, §B rechecked.** On SQLite I reproduce §B: +3.0 to 3.4 ms at 50 marks, +5.8 to 6.4 at 1,000. §B's head also ran Q1's flaky_total member (`'c'`), which the rows never read. Without it the cost is +3.1 and +5.6 ms. On -h90 it is +2.5 and −0.3, because the replacement rows carry cheaper streaks. **MariaDB (12.3), from a base of 80 to 83 ms:** +9.2 [+6.9, +12.2] cold at 50 marks and +19.1 [+16.3, +22.0] at 1,000; 0 marks reads the same. At 1,000 marks the cold extra breaks down as Q1 `f` 1.6 ms, `d` 0.4, `c` 3.4 and Q2 5.2. The rest is the walk and the predicate.
+- **Is "the rows walk further" inherent?** Yes, and it has a ceiling. The rows statement walks the stream's partition in sort order until it has 100 open rows. Excluding X moves the 100th match deeper. Its worst case is a walk of the whole partition: 4.8 → 6.9 ms on SQLite, 15.3 → 22.7 ms on MariaDB. Base already pays that on its own second page or on a quiet night. With the predicate alone (Q1 and Q2 taken from a memo) the cost is +0.6 and +2.2 ms on SQLite at 50 and 1,000 marks. The same shape on a smaller open set does not cost more.
+- **Cheaper shapes for the rows**, each measured unless marked:
+  - (a) **No `'c'` member on the rows path**: −0.8 ms on SQLite and −3.4 ms on MariaDB at 1,000 marks. B.4 already says so; B.5 measured with it in.
+  - (b) **One memo entry for Q1+Q2 per stream, filled by whichever page reads first, with Qc kept apart.** After a Home glance (60 s TTL, no push or act since), the rows cost +0.7 and +2.4 ms on SQLite and +3.0 and +8.4 on MariaDB, against +3.1 and +5.6, +9.2 and +19.1 cold.
+  - (c) **Q2's entries survive assignment, mute and mark acts.** Their key already pins the latest start and N, so they cannot go stale; only deletes need to drop them. A cold rerun after an act then pays Q1 only: about 2 ms on MariaDB instead of about 7 (estimate, from the statement times).
+  - (d) **On MariaDB, bind X as a row-value list**, `(lr.environment, lr.script, lr.test_name) IN ((?, ?, ?), …)`, still gated. At 1,000 marks the rows statement takes 22.9 ms against 26.1 for the groups, and the count 11.5 against 13.0: −4.7 ms. On SQLite the two forms are equal within 0.2 ms.
+  - The page needs all of Q1 `f`+`d` and Q2. X's flaking members need Q2, and the page's own "over its cadence" rows need streak and runs, so nothing smaller is exact. **With (a) and (d), the MariaDB cost at 1,000 marks is about +11 ms cold and +4 ms warm (estimate).**
+- **What a developer meets.** Open Actions fetches the catalogue only on its first `refresh()` (`static/actions.js` 203–206). Every later refresh fetches only the rows, so it pays the rows' delta with nothing taken off. That covers filters, sort, bulk assign, mute and retire. A per-row assignment patches the row in place and sends no request, but it drops the memos on the server, so the next refresh is cold.
+- **The page as a whole: §B's claim holds on SQLite and fails on MariaDB.** I measured it as the page makes it: two requests on two long-lived worker threads in one process, sharing the GIL, cold.
+  - **SQLite:** today's page waits 52.4 ms. After the change it waits 24.9 ms with no marks and 33.0 at 1,000: 27 and 20 ms less, better than §B's 12 to 18.
+  - **MariaDB:** the rows are the slower request already (82 ms alone, against 72 for the full payload), and the page waits 95 to 100 ms. After the change the gain is −11.7 ms with no marks, +2.6 at 50 marks and +11.0 at 1,000 (§B's shape, `'c'` in).
+  - So on production's backend, `parts=names` pays for the marks only up to about 50. With (a) and (d), 1,000 marks would read about +3 ms (estimate).
+- **`parts=names`.** SQLite: 2.4 ms cold, 14 statements (15 product-scoped), matching §B. MariaDB: 18.9 to 19.3 ms against the full payload's 70.5, a saving of 51 ms.
+  - It is not the floor. Nine of the statements build `stale_before` through the pass view: 13.1 of MariaDB's 19 ms, memoized, so warm after any summary read. Only the review panel's retire gate reads `stale_before` (`actions.js` 545).
+  - Trimming it would not move the first paint, which waits for the rows on both backends. Leave it.
+  - **`flaky_marks`** (U12.1) costs 0.005 to 0.015 ms on SQLite and 0.056 ms on MariaDB as its own statement. As a `UNION ALL` row on the products statement it costs no extra round trip. Grant it.
+- **The parameter ceiling.** The authoritative target, Python 3.6.8 on RHEL 8, links SQLite 3.26, which allows 999 parameters. MariaDB has no parameter ceiling, because the driver interpolates the values.
+  - §B's form needs 213 parameters at X 56, 705 at X 356 (a synthetic outage: 300 marked tests flaking at once) and 1,345 at X 856. At 1,345, with a 999 limit planted, SQLite answers "too many SQL variables". In this seed's shape the limit falls at X ≈ 500 to 600; §B's ~300 is the worst case of one test per script.
+  - Not at the fixture's X ≤ 57: X is bounded by the stream's marked failures plus the dormant assignments. Reachable when an outage fails hundreds of marked tests in one night.
+  - **§B's fallback, measured** (keys in order, X dropped in Python, then the page fetched by key): the same page and `total` every time. On SQLite it is **cheaper** than the bound predicate at every X: −1.4 ms [−3.0, −0.5] at X 56, −3.6 at 356, −5.0 at 856. On MariaDB it brings nothing (+4.5 [+1.2, +10.4] at 50 marks, −2.0 [−8.8, +4.3] at 1,000).
+- **Decision 3 at the headline handler.** On SQLite, adding the "Newly fixed" candidates costs +3.1 ms [+2.3, +3.9] on perf-seed/1 (27 candidates) and +2.1 [+1.2, +3.4] on -h90 (8), at 1,000 marks. That is not §B's +0.5 to 1.5: statement timings miss the cold page cache.
+  - The headline then reads +6.3 to +6.9 ms at 1,000 marks, against decision 18's agreed +3.5. At 50 marks it reads +2.8 to +3.0, because the fixture has no candidates there.
+  - One Q2 statement for both lists saves 0.7 ms [0.3, 1.0].
+  - On MariaDB, Qc with the candidates takes 3.43 ms against 1.97 without, and Q2 at N+1 takes 3.18 ms for 27: about +4.7 ms (statements).
+- **MariaDB plans (12.3).** `CROSS JOIN` is not pinned: the optimizer reorders. Its choices were the cheap ones each time, so no `STRAIGHT_JOIN` hook is needed on 12.3; 10.3 is still to check.
+  - Q1 `f` drives from the marks at 50 (0.65 ms) and from `idx_latest_runs_result` at 1,000 (1.58 ms). `STRAIGHT_JOIN` measured 0.89 and 1.30 ms.
+  - `d` drives from the marks at 50, and from `idx_current_assignments_assignee` at 1,000.
+  - Qc scans the marks with a temporary table and a filesort. It is inherent, since it counts every mark: 0.37 and 3.43 ms.
+  - The predicate leaves both plans unchanged: the covering range for the count, a primary-key walk for the rows.
+  - The fold's `MIN` is "Select tables optimized away": 0.096 ms against 0.091.
+- **The three bit carriers and the join: sound.** No marks costs nothing, measured on both backends. The bit is estate-wide, though: one mark anywhere turns on Q1, the fold and the join for every product. That costs about 0.1 ms on SQLite and 0.7 on MariaDB in a product with no marks (estimate, from Q1 `f`'s statement times).
+- **The test page's mark history**: in the detail. One key-range statement takes about 0.06 ms on MariaDB (estimate, from the `MIN` round trip). Fetching it when the section opens would cost a request on every open.
+- **The measured pass, replanned.** The harness gains `--marks N` and a two-worker page mode. That mode is mine; it is this pass's `p_page.py`.
+  - **Item 1, `parts=names` alone:** names against the full payload, and the two-worker page, on both seeds and MariaDB, with its 14/15 statements pinned.
+  - **The flaky build:** the six Known slow rows at 0 marks. Open Actions' rows at 0, 50 and 1,000 marks, cold and warm (a headline call first), on both seeds and MariaDB. The page at 1,000 marks on MariaDB. The headline with decision 3. The outage case at X ≥ 300 on SQLite with 999 planted. MariaDB plans by hand on a production-scale copy, on 10.3 if one can be had.
+- **Verdicts.**
+  - **Rows: ESCALATE, recommending accept with (a) to (d).** The owner chooses between this cost on Open Actions' first paint and every refresh, and reversing decision 23, which costs nothing.
+  - **Whole page:** proceed with `parts=names` first. §B's 12 to 18 ms claim holds on SQLite only and must be rewritten.
+  - **`parts=names`:** proceed as designed. Grant `flaky_marks`.
+  - **Ceiling:** proceed. Use the keys form as SQLite's only form, which removes the ceiling and is cheaper there. Use (d) on MariaDB.
+  - **Decision 3:** proceed with one Q2. The owner should know it measures 2 to 3 ms on SQLite and about 4.7 on MariaDB at 1,000 marks, not 0.1 to 0.4.
+  - **MariaDB plans:** proceed. No hook on 12.3; the 10.3 check stays.
+  - **Bit carriers and join:** proceed. **History:** in the detail.
+
 ## §4 Decisions
 
 Each is written as the recommended position, with the alternative after
@@ -945,3 +994,65 @@ the owner wrote their own, it is quoted in full.
 - §2: the rule for "Newly fixed" (decision 3) and the Flaky tab's order
   (decision 16) are written into the backend design. (`backend-engineer`)
 - §3 U6: the "All clear" banner names what is set aside. (`ui-engineer`)
+
+## §9 Round 1 review (2026-11-11, in chat, captured verbatim)
+
+Round 1's sections (§2, §3) and the round 1 performance pass (§3b) were put
+to the owner as questions, each with a recommended position. Captured before
+anything is rewritten. Classes as in §8: a decision (D), an answer to an open
+question (Q), an instruction on how to work (S).
+
+**Before round 1 began (S):** asked whether to measure the undesigned pieces
+before freezing, or freeze and measure in the build:
+
+> 1: yes agree. Let's get it measured now and then freeze.
+
+**After it:**
+
+| Question as put | Answer | Class |
+|---|---|---|
+| Keeping flaking tests off Open Actions makes its rows request slower whenever marks exist: on MariaDB +9 ms at 50 marks and +19 ms at 1,000 as first designed, an estimated +11 ms cold and +4 ms warm at 1,000 with the performance pass's four reductions; +3 to +6 ms on SQLite. Accept? | "Accept, with the reductions (Recommended)" | D |
+| The "Newly fixed only after a real failure" rule measures +2 to 3 ms on SQLite and about +5 ms on MariaDB at 1,000 marks, not the 0.1 to 0.4 ms first quoted. Keep the rule? | "Keep the rule (Recommended)" | D |
+| Should the night a marked test goes over its cadence be shown as new? | "Counts as a New failure (Recommended)": it appears under New failures and moves the "more failing" line that night, and is Still failing after | D |
+| Should the browse page's "Failing" filter include flaking rows, a separate Flaking value having been declined? | "That was my mistake - there should have been a falking filter. " | D |
+| With a Flaking value, what does "Failing" show? | "Failing excludes flaking (Recommended)" | D |
+| Where does the Flaking filter value appear? | "Browse page only (Recommended)" | D |
+| How is the Flaking filter costed? | "Short measured pass, then freeze (Recommended)" | S |
+| Does a marked test at an unexpected pass stay on Open Actions? | "Stays listed (Recommended)" | Q |
+| A test assigned from a build, flaking on mainline and over its cadence on the build: is the assignment dormant on Open Actions? | "Once a test is assigned it shows up in open actions. Full stop. Flaking doesn't stop that. Flaking stops an unassigned 'failing' test from polluting open actions if its still within flakeyness threshold. The design needs to rip out anything that is goinjg ruther than that when it comes to the action list" | D |
+| Chips and row edges in a darker step of the mauve (`#8f638b`), the charts keeping `#a66993`? | "Two steps of mauve (Recommended)" | D |
+
+**The Open Actions rule, as it now stands.** The last-but-one answer
+replaces the main session's reading of verdict 17 and the "assignment kept,
+dormant" answer in §8, which went further than the owner meant. The rule is
+one sentence: **an unassigned test that is flaking is not listed on Open
+Actions; everything else on that page is as it is today.** An assigned test
+is listed whatever its state, as verdict 6 first said, and reads FLAKING
+when it is. Nothing is dormant. The figures that count open assignments are
+unchanged.
+
+**What this changes in the doc as written, owed in round 2:**
+
+- §2 B.1 and B.3(b): the dormant assignment is removed. The set left out of
+  Open Actions is the unassigned flaking tests only; Q1 loses its dormant
+  member; the open-assignment figures and queues are untouched. Round 1's
+  measured cost is an upper bound on the smaller set. (`backend-engineer`)
+- §2, new: a Flaking value in the browse page's Result filter, and "Failing"
+  leaving flaking tests out, on the rows and their count. Undesigned and
+  unmeasured; the browse count is a Known slow row. (`backend-engineer`,
+  then `performance-engineer`)
+- §2, new: a marked test counts as a New failure on the night it goes over
+  its cadence. The extra run read is estimated, not measured.
+  (`backend-engineer`, then `performance-engineer`)
+- §2: the performance pass's round 1 conditions folded in: the rows skip the
+  count member; one memo for the marks and runs reads per stream, shared with
+  Home; cached runs reads survive assign, mute and mark acts; on MariaDB the
+  set is bound as a row-value list; on SQLite the keys form is the only form,
+  which removes the parameter ceiling; one runs statement for both of
+  decision 3's lists; the mark's history comes with the test detail; the
+  names-only response carries the "any mark" flag. (`backend-engineer`)
+- §3 U8 and U9: Open Actions lists an assigned flaking test, reading
+  FLAKING; "dormant" goes from the Flaky tab; the footer line says only
+  unassigned flaking tests are left out; the browse Result filter gains
+  Flaking; a test going over its cadence reads as a New failure.
+  (`ui-engineer`)

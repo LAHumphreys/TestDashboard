@@ -4753,3 +4753,41 @@ and unmeasured (backend, then performance); the names-only request's shape
 (backend, UI, performance); the performance pass's two corrections and the
 rules for "Newly fixed" and the Flaky tab's order written into the backend
 design. Nothing is built.
+
+## Design review: mark a test as flaky, round 1 measured and reviewed (2026-11-11)
+
+The owner asked for the undesigned pieces to be measured before the plan is
+frozen. Round 1 was written by the owning agents and reviewed in chat the
+same day; the answers are verbatim in the doc's §9.
+
+Measured (copies of perf-seed/1 and its 90-night variant, the 65-assignment
+fixture, cold, in-process, alternated; SQLite medians of 24 to 48 calls with
+bands of ±0.3 to 1 ms; MariaDB on a local 12.3, not production's 10.3, 30 to
+40 calls, bands of ±3 to 5 ms). Open Actions' rows with flaking tests left
+out: nothing with no marks on either backend; SQLite +3.1 ms at 50 marks and
++5.6 ms at 1,000; MariaDB +9.2 and +19.1 ms on a base of 80 to 83 ms. The
+names-only request, a part of the summary endpoint: 3.0 ms and 374 bytes
+against the full payload's 38.7 ms and 161 KB on SQLite; 19 ms against 70.5
+on MariaDB. The page as a whole, two requests on two worker threads: on
+SQLite 27 ms less than today with no marks and 20 ms less at 1,000 marks;
+on MariaDB, where the rows are already the slower request, 11.7 ms less
+with no marks, 2.6 ms more at 50 and 11.0 ms more at 1,000. The "Newly
+fixed" rule at the headline handler: +2.1 to 3.1 ms at 1,000 marks on
+SQLite, the headline then +6.3 to 6.9 ms.
+
+Decided: the rows cost is accepted with the performance pass's four
+reductions (estimated +11 ms cold and +4 ms warm at 1,000 marks on MariaDB);
+the "Newly fixed" rule is kept; a marked test counts as a New failure on the
+night it goes over its cadence; the browse page's Result filter gains a
+Flaking value and "Failing" leaves flaking tests out; chips and row edges
+take a darker step of the mauve. Corrected: the main session had read the
+owner's "not an open issue" as taking assigned flaking tests off Open
+Actions with the assignment dormant. The owner's rule is that an unassigned
+flaking test is not listed and everything else on that page is as today;
+the dormant assignment leaves the design.
+
+Owed in round 2, a short measured pass before the freeze: the Flaking
+filter and the "Failing" exclusion on the browse rows and count; the
+narrowed Open Actions rule; the read that tells the night a test goes over
+its cadence; the performance pass's conditions folded into the backend
+section. Nothing is built.
