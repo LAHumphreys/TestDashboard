@@ -6,6 +6,12 @@
   --c-fae: #f9a825;
   --c-up: #7b1fa2;
   --c-assigned: #3b6cc0;  /* WP-43: failing, and someone has it; no result colour */
+  /* WP-44: a marked test failing under its cadence. Two steps of one
+     mauve: the chart segment, and a darker step for chips, row edges
+     and pressed toggles, where white text needs 4.5:1 (4.85 here; the
+     chart step gives 4.15). */
+  --c-flaking: #a66993;
+  --c-flaking-strong: #8f638b;
   --ink: #1f1f1c;
   --muted: #6b6b66;
   --border: #e3e3df;
@@ -184,6 +190,11 @@ textarea {
 .chip.result-unexpected-pass,
 .toggle.result-unexpected-pass[aria-pressed="true"] { background: var(--c-up); color: #fff; border-color: transparent; }
 
+/* FLAKING is a displayed result, never a wire one (api.js's displayResult),
+   and a browse filter value (WP-44): the pressed toggle takes the strong step. */
+.chip.result-flaking,
+.toggle.result-flaking[aria-pressed="true"] { background: var(--c-flaking-strong); color: #fff; border-color: transparent; }
+
 /* ---------- Filters ---------- */
 
 .filter-row {
@@ -229,6 +240,7 @@ textarea {
 .toggle.result-fail::before { background: var(--c-fail); }
 .toggle.result-failed-as-expected::before { background: var(--c-fae); }
 .toggle.result-unexpected-pass::before { background: var(--c-up); }
+.toggle.result-flaking::before { background: var(--c-flaking-strong); }
 
 .toggle[aria-pressed="true"]::before { background: rgba(255, 255, 255, 0.85); }
 .toggle.result-failed-as-expected[aria-pressed="true"]::before { background: rgba(0, 0, 0, 0.45); }
@@ -289,6 +301,7 @@ tr.result-pass { box-shadow: inset 3px 0 0 var(--c-pass); }
 tr.result-fail { box-shadow: inset 3px 0 0 var(--c-fail); }
 tr.result-failed-as-expected { box-shadow: inset 3px 0 0 var(--c-fae); }
 tr.result-unexpected-pass { box-shadow: inset 3px 0 0 var(--c-up); }
+tr.result-flaking { box-shadow: inset 3px 0 0 var(--c-flaking-strong); }
 
 /* ---------- Detail page ---------- */
 
@@ -577,6 +590,7 @@ button.tile:focus-visible {
 .swatch-fae, .legend-swatch.swatch-fae { background: var(--c-fae); }
 .swatch-assigned, .legend-swatch.swatch-assigned { background: var(--c-assigned); }
 .swatch-muted, .legend-swatch.swatch-muted { background: var(--muted); opacity: 0.55; }
+.swatch-flaking, .legend-swatch.swatch-flaking { background: var(--c-flaking); }
 
 .seg-fail { fill: var(--c-fail); }
 .seg-up { fill: var(--c-up); }
@@ -584,6 +598,7 @@ button.tile:focus-visible {
 .seg-fae { fill: var(--c-fae); }
 .seg-assigned { fill: var(--c-assigned); }
 .seg-muted { fill: var(--muted); opacity: 0.55; }
+.seg-flaking { fill: var(--c-flaking); }
 
 .trend-band.is-hover .seg { filter: brightness(1.18); }
 
@@ -684,6 +699,10 @@ button.bar-row:focus-visible {
    the muted grey. */
 .bar-assigned { background: var(--c-assigned); }
 
+/* WP-44: the flaking failures, after the muted grey, in the chart step
+   of the mauve (chips and row edges take the strong one). */
+.bar-flaking { background: var(--c-flaking); }
+
 .bar-value {
   font-size: 12px;
   font-weight: 600;
@@ -730,6 +749,7 @@ button.bar-row:focus-visible {
 .tt-key.swatch-fae { background: var(--c-fae); }
 .tt-key.swatch-assigned { background: var(--c-assigned); }
 .tt-key.swatch-muted { background: var(--muted); opacity: 0.55; }
+.tt-key.swatch-flaking { background: var(--c-flaking); }
 
 .tt-value {
   font-weight: 650;
@@ -845,7 +865,7 @@ button.bar-row:focus-visible {
 .browse-footer .muted { font-size: 12px; }
 
 /* Plain-toggle (Not run recently) active state. */
-.toggle[aria-pressed="true"]:not(.result-pass):not(.result-fail):not(.result-failed-as-expected):not(.result-unexpected-pass) {
+.toggle[aria-pressed="true"]:not(.result-pass):not(.result-fail):not(.result-failed-as-expected):not(.result-unexpected-pass):not(.result-flaking) {
   background: var(--ink);
   color: #fff;
   border-color: transparent;
@@ -977,13 +997,50 @@ button.bar-row:focus-visible {
   border-left-color: #b8860b;
 }
 
-.mute-reason-input {
+/* A flaky mark (WP-44): the same annotation, edged in the flaking
+ * colour. The sentence takes a line of its own so the controls wrap
+ * under it rather than beside a long title. */
+.known-failure.is-flaky {
+  flex-wrap: wrap;
+  border-color: var(--grid);
+  border-left-color: var(--c-flaking-strong);
+}
+
+/* The same slot offering a mark on an unmarked test, quieter than the
+ * mark: no tint, a neutral edge and a muted label, so an unmarked
+ * passing test's page carries no caution-coloured box. */
+.known-failure.is-flaky.is-offer {
+  border-left-color: var(--grid);
+  background: none;
+}
+
+.known-failure.is-flaky.is-offer .kf-label { color: var(--muted); }
+
+.flaky-sentence {
+  flex: 1 0 100%;
+  font-size: 13px;
+}
+
+/* The Flakiness card's mark: the mark in words, or the link that opens
+ * the form in the header's slot. */
+.flaky-mark {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.mute-reason-input,
+.flaky-reason-input {
   flex: 1 1 220px;
   min-width: 160px;
 }
 
 .review-duration-select,
-.selection-duration-select {
+.selection-duration-select,
+.review-cadence-select,
+.selection-cadence-select {
   font: inherit;
   padding: 4px 6px;
 }
@@ -993,8 +1050,10 @@ button.bar-row:focus-visible {
   margin-right: 8px;
 }
 
-/* A small pill beside a result chip: this failure is muted. */
-.mute-tag {
+/* A small pill beside a result chip: this failure is muted, or this
+ * test carries a flaky mark it is not FLAKING under right now. */
+.mute-tag,
+.flaky-tag {
   display: inline-block;
   margin-left: 6px;
   padding: 1px 7px;
@@ -1329,6 +1388,7 @@ button.bar-row:focus-visible {
 .chip.chip-ghost.result-fail { border-color: var(--c-fail); color: var(--c-fail); }
 .chip.chip-ghost.result-failed-as-expected { border-color: var(--c-fae); color: #8a6d00; }
 .chip.chip-ghost.result-unexpected-pass { border-color: var(--c-up); color: var(--c-up); }
+.chip.chip-ghost.result-flaking { border-color: var(--c-flaking-strong); color: var(--c-flaking-strong); }
 
 /* The arrow between a previous and current result. Muted on purpose:
    it is punctuation, not data. */
@@ -2456,6 +2516,8 @@ body.has-selection-bar { padding-bottom: 60px; }
 .selection-comment-btn:disabled,
 .selection-mute-btn:disabled,
 .selection-unmute-btn:disabled,
+.selection-flaky-btn:disabled,
+.selection-unmark-btn:disabled,
 .selection-unassign-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;

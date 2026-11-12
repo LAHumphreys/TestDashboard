@@ -4662,3 +4662,634 @@ three review findings on item 1, five on item 0, four on item 2), all
 fixed before the commits; no item parked. Suite in the main checkout on
 the final branch: SQLite 2751 OK (skipped 1); MariaDB (local 12.3) 3769 OK (skipped 79).
 No browser has rendered the UI.
+
+## Design review: mark a test as flaky, round 0 (2026-11-11)
+
+The owner asked for a first-class "Mark as flaky" action: products have been
+onboarded that accept some tests as flaky, and those tests should stop
+crowding the failures that need triage. §0 was settled in chat through
+sixteen questions, each put with a recommended position, and round 0 was
+written by the owning agents: `docs/design/flaky-mark-r0.md` on branch
+`design-flaky-mark`, cut from `6cba071` (the drop of 2026-10-13, merged as
+PR #20). The owner's answers are captured verbatim in the doc's §7.
+
+Agreed, in short: a standing, owned mark per test in one environment, across
+mainline and every build, with a cadence of N failures in a row (2 to 10);
+under the cadence a failure is "flaking", leaves the failing figures as a
+muted one does and still counts against the pass rate; over it the test is
+an ordinary failure and nobody's; a live mute wins; a build with fewer runs
+than the cadence is failing when every run it has failed; a reason is
+required; anyone may change or remove a mark, recorded; a Flaky tab on Home
+beside Muted; a fourth segment on the three home charts; available on every
+product. Three recommended positions were not taken and the doc says which.
+A seventeenth verdict arrived while the round was being assembled: a flaking
+test is not an open issue and leaves Open Actions' list; no section had
+designed that, so it is round 1's first item. A general clean-up of Open
+Actions is a follow-up design, by the owner's direction.
+
+Designed: migration 12, create-only, two tables (WP-15's reservation would
+move to 13; nothing is claimed until the build). The cadence is judged at
+read time from the latest and previous results already kept per stream;
+only a test that has failed twice running under a cadence of 3 to 10 reads
+the runs table, at most N rows. Nothing is added to the push path.
+
+Measured in round 0, on copies of perf-seed/1 and its 90-night variant with
+the 65-assignment fixture, SQLite, cold, in-process, alternated (the backend
+agent's medians of 24 to 400 calls; the performance engineer's of 96 to 128).
+The machine ran about five times faster than on the day the Known slow table
+was taken, so only deltas compare. The cold headline: nothing with no marks,
++2.2 to 2.7 ms at 50 marks, +6.3 to 6.5 ms at 1,000 as first designed and
++3.3 to 3.7 ms with the performance pass's cheaper statement, driven from
+the stream's failing rows. The rows statement's join: +0.09 ms per 250 rows
+with no marks. The trend series, off first paint: 4.6 ms at 14 days and 50
+marks, 366 ms at 90 days and 1,000 marks judged "as it stood that night",
+248 ms judged "marked now". The Flaky tab's measure: 11.4 ms a page of 100
+on the 90-night seed. MariaDB, by the performance engineer on a local 12.3
+and not production's 10.3, medians of 40 calls on a perf-seed/1 copy: the
+new statements parse and plan as on SQLite; the bounded runs read costs
+0.11 to 0.13 ms a test against SQLite's 0.035; the rows join +0.2 ms.
+
+Found by the performance pass and carried into the design: the lower bound
+the backend section put on the runs read is wrong for mainline on a
+migrated database, where the stream's first-seen stamp is the migration's
+clock and not its first run, so it applies to build streams only; and an
+inner join on the new table lets SQLite scan the latest-runs table (1.4 ms
+against 0.024 ms), so every statement on it pins its driving side.
+
+Open for the owner: twenty-two decisions with verdict slots and six
+questions, the first being whether the seventeenth verdict also takes an
+assigned flaking test off its assignee's list. The trend's cost at 90 days
+and 1,000 marks joins the trend decision already open from WP-43. The
+`ui-engineer` agent type was still not registered; the UI section was
+written by a general-purpose Opus agent carrying the definition. No browser
+has rendered any surface. Nothing is built.
+
+## Design review: mark a test as flaky, round 0 reviewed (2026-11-11)
+
+The owner reviewed round 0 the same day: fifteen verdicts set in the Claude
+Doc, the rest answered in chat as questions with a recommended position
+each. Everything is captured verbatim in the doc's §8 before any section is
+rewritten. With the request came an instruction on how to weigh the rest:
+performance impact is to be minimised while accepting that the added
+function costs something.
+
+Every decision has a verdict. Twenty-one are the position as written. Two
+changed. Decision 8: "Flaking is a first class failure state", so a flaking
+row carries its own chip and edge in the flaking colour instead of a pill
+beside a red FAIL chip. Decision 20: Open Actions gets a names-only request
+as the first item of this build, so the flaking counts land on no page's
+first paint (the performance pass put that request's saving at about 19 ms,
+more than the feature adds). Decision 23 was extended: no flaking test is on
+anyone's Open Actions, an existing assignment is kept but dormant and
+returns the test to its assignee only if it goes over its cadence; the
+earlier answer that kept an assigned flaking test on that page is
+superseded. The trend's cost at 90 days and 1,000 marks stays with the trend
+decision open from WP-43.
+
+Owed in round 1, listed in §8 with the owning agent: the row's chip and edge
+and the "All clear" wording (UI); how Open Actions' paged list excludes a
+computed set and what that costs on a Known slow row, which is undesigned
+and unmeasured (backend, then performance); the names-only request's shape
+(backend, UI, performance); the performance pass's two corrections and the
+rules for "Newly fixed" and the Flaky tab's order written into the backend
+design. Nothing is built.
+
+## Design review: mark a test as flaky, round 1 measured and reviewed (2026-11-11)
+
+The owner asked for the undesigned pieces to be measured before the plan is
+frozen. Round 1 was written by the owning agents and reviewed in chat the
+same day; the answers are verbatim in the doc's §9.
+
+Measured (copies of perf-seed/1 and its 90-night variant, the 65-assignment
+fixture, cold, in-process, alternated; SQLite medians of 24 to 48 calls with
+bands of ±0.3 to 1 ms; MariaDB on a local 12.3, not production's 10.3, 30 to
+40 calls, bands of ±3 to 5 ms). Open Actions' rows with flaking tests left
+out: nothing with no marks on either backend; SQLite +3.1 ms at 50 marks and
++5.6 ms at 1,000; MariaDB +9.2 and +19.1 ms on a base of 80 to 83 ms. The
+names-only request, a part of the summary endpoint: 3.0 ms and 374 bytes
+against the full payload's 38.7 ms and 161 KB on SQLite; 19 ms against 70.5
+on MariaDB. The page as a whole, two requests on two worker threads: on
+SQLite 27 ms less than today with no marks and 20 ms less at 1,000 marks;
+on MariaDB, where the rows are already the slower request, 11.7 ms less
+with no marks, 2.6 ms more at 50 and 11.0 ms more at 1,000. The "Newly
+fixed" rule at the headline handler: +2.1 to 3.1 ms at 1,000 marks on
+SQLite, the headline then +6.3 to 6.9 ms.
+
+Decided: the rows cost is accepted with the performance pass's four
+reductions (estimated +11 ms cold and +4 ms warm at 1,000 marks on MariaDB);
+the "Newly fixed" rule is kept; a marked test counts as a New failure on the
+night it goes over its cadence; the browse page's Result filter gains a
+Flaking value and "Failing" leaves flaking tests out; chips and row edges
+take a darker step of the mauve. Corrected: the main session had read the
+owner's "not an open issue" as taking assigned flaking tests off Open
+Actions with the assignment dormant. The owner's rule is that an unassigned
+flaking test is not listed and everything else on that page is as today;
+the dormant assignment leaves the design.
+
+Owed in round 2, a short measured pass before the freeze: the Flaking
+filter and the "Failing" exclusion on the browse rows and count; the
+narrowed Open Actions rule; the read that tells the night a test goes over
+its cadence; the performance pass's conditions folded into the backend
+section. Nothing is built.
+
+## Design review: mark a test as flaky, round 2 measured and reviewed (2026-11-11)
+
+Round 2 disposed of the owner's review of round 1: Open Actions narrowed to
+the owner's rule, a Flaking value on the browse page's Result filter, and a
+marked test counted as a New failure on the night it goes over its cadence.
+Both sections were rewritten by the owning agents, the performance engineer
+checked the numbers, and the one escalated item was put to the owner in
+chat; the answer is verbatim in the doc's §10.
+
+Measured (copies of perf-seed/1 and its 90-night variant with the backend
+section's fixture; cold, in-process, alternated; SQLite 24 to 32 calls,
+noise about 0.3 ms; MariaDB on a local 12.3, not production's 10.3, 40
+calls, noise 0.5 to 2.5 ms). Open Actions' rows, leaving out only unassigned
+flaking tests: SQLite +1.0 to +1.2 ms at 50 marks and +1.2 to +1.4 ms at
+1,000; MariaDB +8.8 ms cold and +2.7 ms warm at 50, +10.0 ms cold and
+nothing warm at 1,000, on a base of 83 to 85 ms. With the names-only
+request the page as a whole is faster than today on MariaDB at every mark
+count: 14.5 ms less with no marks, 5.4 less at 50, 1.0 less at 1,000. The
+browse page with no filter chosen, on Home's first paint: unchanged with no
+marks, +0.2 to +0.4 ms on SQLite and +0.5 to +0.7 ms on MariaDB with marks,
+its count statement the same SQL. With Failing or Flaking chosen: +0.6 to
++3.2 ms cold on SQLite, +4 to +8 ms cold on MariaDB, within 0.4 ms warm.
+Home's headline: SQLite +3.4 ms at 50 marks and +6.5 ms at 1,000; MariaDB
++7.2 and +15.2 ms on a base of 44 to 46 ms, of which the promotion's read
+is 0.6 and 1.4 ms.
+
+Decided: the owner accepts the headline's cost on MariaDB, about 6 ms at 50
+marks and 13 ms at 1,000 once the runs statement's members are parenthesised
+(an estimate from the measured figures), with the "Newly fixed" rule kept;
+a worse figure in the build returns to the owner before it ships. The
+backend section binds the flaking set on the browse page and keeps the keys
+form for Open Actions, and the performance pass confirmed the split. Carried
+into the build as conditions: the New failures queue binds the promoted
+tests; cached runs answers are dropped by a push to their stream and carry
+a time limit and a size cap; every MariaDB plan is rechecked on 10.3.
+
+No decision is open. Next: the contract reconciled, the sizing pass and the
+freeze. Nothing is built.
+
+## Design review: mark a test as flaky, frozen and sized as WP-44 (2026-11-11)
+
+The arc is closed: three rounds reviewed in one day, no decision open. The
+doc (`docs/design/flaky-mark-r0.md`) is marked frozen. Its §1 is the
+contract the two layers build against, rewritten after round 2; its §4
+carries twenty-five decisions, each with its verdict; its §11 is the master
+plan.
+
+The sizing pass makes one package, WP-44, on one branch, fifteen items in
+order, each one brief with its layer, its trigger status and its gate:
+Open Actions' names-only request first (backend, UI, a measured pass;
+shippable on its own); the mark itself with migration 12; the marks fixture
+in the performance harness; the controls; state and counts; state on Home
+and rows; lists and filters on each layer; the drop. Every backend item on
+the trigger paths has its own measured pass before review, held to the
+contract's cost bar, and a dialect hook for MariaDB exists as an item only
+if a plan guard fails on CI's 10.3 legs.
+
+What the build is held to, from the three performance passes (perf-seed/1,
+cold; SQLite, then MariaDB on a local 12.3): nothing on any read with no
+marks; Home's headline +3.4 and +7.2 ms at 50 marks, +6.5 and +15.2 ms at
+1,000, accepted by the owner; the browse rows on Home's first paint within
+0.7 ms; Open Actions' page faster than today at every mark count once the
+names-only request is in. A worse figure returns to the owner.
+
+Before the commit the main session read the doc whole and a fresh-eyes
+reviewer read it for coherence and for the publication gate. The build is
+registered in the handover and waits for the owner's go. Nothing is built.
+
+## WP-44, the build starts; item 1, the names-only summary part (2026-11-11)
+
+The owner gave the go for the build with every item in one drop. The run is
+unattended, on branch `wp-44-flaky-mark`, from a suite green on both
+backends at the frozen design; the status strip is the design doc's §12.
+
+Item 1, `GET /api/summary?parts=names`, is committed: the catalogue the Open
+Actions page reads from the summary, as its own part. `products` carries the
+names only, because the full payload's per-product counts are the headline's
+own pass and the page reads the name and the length; the other four fields
+are held equal to the full payload's in eight scopes. A guard refuses
+sixteen headline, trend and queue reads on the part on both backends, and
+the cold statement count is pinned. The implementer's fast feedback, a copy
+of perf-seed/1 on SQLite, cold: 15.9 to 19.7 ms and 14 or 15 statements
+against 181 to 256 ms for the full payload on the same calls. The measured
+pass of record is 2p, after the UI item. Fresh eyes found nothing to send
+back. Main checkout: 2758 OK (skipped 1) on SQLite, 3783 OK (skipped 80)
+with the MariaDB variants.
+
+## WP-44 items 2 and 2p: Open Actions on the names part, measured (2026-11-11)
+
+Item 2 is committed: the Open Actions page fetches
+`/api/summary?parts=names` in place of the full summary. Its "fetched once"
+gate is a loaded flag (the old gate refetched the whole summary on every
+refresh of an estate with no assignee), a catalogue that fails to load no
+longer stops the rows drawing, and a load-more retries a catalogue that is
+still missing; the last came from the fresh-eyes review and was fixed before
+the commit.
+
+The measured pass of items 1 and 2 (2p; cold, in-process, alternated, base
+`3e7a10c`): the names part reads 6 to 8 ms against 73 to 155 for the full
+payload on SQLite (perf-seed/1 and the 90-night seed) and 40 to 44 against
+164 to 209 on a local MariaDB 12.3, in 14, 15 or 17 statements against 46 to
+55. The page as it loads, two workers: 81.3 to 42.9 ms on perf-seed/1 and
+248.9 to 171.9 on the 90-night seed, SQLite; on MariaDB four runs read −9.5
+to −36.7 ms with two bands clear of zero, the page there being bound by the
+rows request. The six Known slow rows are the same. Recorded for the owner:
+Open Actions no longer warms Home's headline memo as a side effect, so Home
+opened straight after it pays its own cold headline (84.6 ms against 3.6 on
+that one journey, perf-seed/1, SQLite; Home on its own is unchanged).
+
+## WP-44 items 3 and 3p: the flaky mark, backend, measured (2026-11-11)
+
+Item 3 is committed: migration 12 (create-only: `test_flaky_marks`,
+`flaky_mark_history`; the registry row moves the parked WP-15 to 13), the
+ledger step, `POST /api/flaky/bulk` and `/unmark` with history and the
+reason as a tagged comment, the cadence rule as one pure function
+(`analytics.flaky_state`), the bounded runs read (`Storage.cadence_runs`)
+and `flaky` with `flaky_history` on the test detail. The detail's mark and
+history ride its existing mute-history statement, so it runs the same number
+of statements marked or not. The three carriers of the "any mark" bit are
+left to item 6, where their first consumer is. Fresh eyes found no defect;
+a blank reason on a cadence change (it was refused) and a helper with no
+caller were fixed before the commit.
+
+The measured pass (3p; cold, in-process, alternated, base `152820e`): the
+six Known slow rows the same on both seeds with the tables empty; the
+detail of an unmarked test the same on SQLite (0.81 to 0.79 ms on
+perf-seed/1) and +0.21 ms on a local MariaDB 12.3; the detail of a marked
+test +0.07 to +0.27 ms on SQLite and +0.41 to +0.84 on MariaDB; an import
+of 1,000 runs runs the same 7,169 statements; the upgrade step creates two
+tables and an index in 0.55 s. Two findings off every first paint: the
+unmark and the cadence change send a statement per test on MariaDB (carried
+into item 6), and every bulk endpoint, the existing ones included, resolves
+each entry's stream with two statements, +110 ms per 100 entries on MariaDB
+(predates the package; a candidate of its own).
+
+## WP-44 item 5: the controls for the flaky mark (2026-11-11)
+
+Item 5 is committed: Mark as flaky, Set cadence and Unmark on the selection
+bar, the Review panel and the test page; the test page's banner, card and
+mark history from the detail already fetched; the two mauve tokens; and the
+wording helpers, in `static/api.js` only, with `displayResult` the one
+place the word FLAKING is made. The computed signal now says "flips", so on
+screen "flaky" always means a mark. Each act costs what a mute costs on its
+surface and no first-paint request is added; off the trigger paths, so no
+measured pass. Fresh eyes found no defect and every sentence matched the
+design; four small findings were fixed before the commit (no Flaky button
+re-armed mid-flight, the derived state after a failed Set cadence, an
+accessible label, one source for two shared titles). Recorded and left as
+they were before the package: the Mute group has the same mid-flight hole,
+and the test page's refresh after an act swallows its own error. No browser
+has rendered it.
+
+## WP-44 item 4: the marks fixture and the page mode in the performance harness (2026-11-11)
+
+Item 4 is committed, tooling only. `ab.py --marks N` (0, 50, 1,000) and
+`seed.py --onto COPY --marks N` apply a deterministic marks fixture,
+written through the product's own `Storage.mark_flaky`, that composes with
+`--assign`. With 65 assignments it reproduces the design-time fixture's
+sets exactly on mainline (perf-seed/1: F 11, X 7, P 8 at 50 marks and F 56,
+X 22, P 9 at 1,000; the 90-night seed: 11, 6, 7 and 57, 21, 7), so the
+build's figures read against the ones the owner accepted. It differs where
+the design asked: the "Newly fixed" candidates are counted (27 of the 1,000
+on perf-seed/1), every cadence is used, and one marked test is also muted,
+one assigned and two retired at every N. `mark_census()`, the harness's own
+reading of the rule, and the fixture digest are compared across the two
+sides before anything is timed. `--page-mode` times a page's first-paint
+requests on long-lived workers, cold, alternated. Fresh eyes found nothing
+unfair between the sides; seven hardening points were fixed before the
+commit. An A/A at 50 and 1,000 marks on both seeds read every row "same".
+
+## WP-44 item 6 and 6p: the board acts on the mark; its cost accepted over the bar, for the owner to confirm (2026-11-11)
+
+Item 6 is committed: `flaky` on every browse, queue and Open Actions row;
+the flaking figures on the headline, the charts' data, the products and
+Watch's cards; the promotion of a test that fails past its cadence into
+every new-failures figure and queue; "Newly fixed" by decision 3; the
+memo of marks and states per stream and the runs cache a push drops. A
+test is promoted only on a run that started at or after its cadence was
+last set. With no marks every read is the base's, statement for
+statement. Fresh eyes found ten NamedTuple field defaults (3.6.1, above
+the 3.6.0 floor): removed, and the 3.6 gate now detects them.
+
+6p, cold, alternated, with the fixture corrected to date its marks before
+the runs (its own commit): the Home headline is +6.2 ms on 28.6 (22%) at
+50 marks and +11.4 on 27.6 (41%) at 1,000 on SQLite; +17.0 on 93.0 (18%)
+and +35.8 on 95.0 (38%) on a local MariaDB 12.3. The accepted bar was 18%
+and 34% on SQLite, 16% and 34% on MariaDB. Unfiltered browse is +0.4 and
++1.1 ms; the New failures queue's bound term costs nothing warm; no marks,
+no change, the Known slow rows included. Q2 is about half of the
+headline's cost.
+
+**Over the bar, and committed.** The main session accepted the figures
+under the owner's instruction to finish the build overnight and decide
+pragmatically; the owner confirms or overturns it. The cost exists only
+where marks exist and only cold; at 50 marks it is 2 to 4 points over;
+MariaDB is at the bar within its band. The cheaper shapes, priced at 1,000
+marks, each cost more than they save: a covering runs index (4.6 ms of
+the SQLite headline, for a migration, about 19% more database and 12% on
+a push); dropping decision 3 (3.0 ms SQLite, 8.8 MariaDB); dropping the
+cadence-2 read (0.5, 1.7). Carried into item 8: the assigned queue's own
+runs read (+3.8 ms warm), browse's per-row Python at 1,000 marks, Open
+Actions' own runs read. MariaDB 10.3 has not run the plan guards. 2911
+and 4016 green in the main checkout.
+
+## WP-44 item 7: the mark's state on Home and on every row (2026-11-11)
+
+Item 7 is committed: one displayed result per row for the edge and the
+chip (browse, the script page, every Home queue, Not run, Open Actions),
+the "flaky" tag, the tiles' set-aside suffixes, "All clear" naming what
+is set aside, the promotion row reading FLAKING -> FAIL, the fourth
+segment on the two bar charts and Watch's cards. A live mute wins over
+the mark; run history and the compare strip stay raw. No request joins
+any first paint; off the trigger paths, so no measured pass. With no
+marks every region is byte-identical to the base except "All clear",
+which now names the muted failures whenever there are any. Fresh eyes
+found no defect; two points were fixed before the commit (a flaking Open
+Actions row assigned from a build had only its colour to say so; one
+docstring). 2934 and 4039 green in the main checkout with item 6 beneath
+it. No browser has rendered it.
+
+## WP-44 item 8 and 8p: the lists follow the mark; two costs found by the measured pass and removed; the trend's cost for the owner (2026-11-11)
+
+Item 8 is committed: Open Actions leaves out the unassigned flaking tests
+(rows, total and bulk assign on one set); `result=FLAKING` and the
+narrowed `result=FAIL`; `GET /api/flaky`; `FAIL_FLAKING` on every night
+of `parts=assigned_trend`. With no marks every read is the base's,
+statement for statement, on both seeds and on MariaDB.
+
+8p ran twice. The first pass found two costs. A cold Open Actions or
+filtered browse read ran the stream's whole environment list (6 to 10
+ms): replaced by the environments that hold a mark, carried on a
+statement the read already ran. And `parts=assigned_trend` turned out to
+be in Home's first batch, where the design had it off every first paint:
+with marks it cost Home +12.5 ms (11%) at 50 marks and +118 ms (86%) at
+1,000 on SQLite; item 9 moves the request after the headline. The second
+pass confirmed both on the final tree: every list and filter row is
+inside the design's bar (Open Actions' rows -8% on SQLite and in band on
+MariaDB; browse with Failing +1.3 ms and +6.1; with Passing 64 to 84% of
+base against a bar of 78 to 94%). The package as a whole against the tree
+before it, as pages, cold: Home the same at 0 and 50 marks on SQLite,
++11 ms on MariaDB at 50, +14 to +20 ms (20 to 26%) at 1,000; Open Actions
+25 to 48% faster on SQLite and 10% faster to level on MariaDB; All tests
+the same to +3.7 ms; Watch the same to +11%.
+
+**For the owner.** The trend part with many marks is worse than the
+design's worst recorded figure: on the 90-night seed, 90 days at 1,000
+marks, +909 to +1,047 ms against 366. It is off first paint, so it delays
+the chart's split and not the page. Priced and not taken: a covering runs
+index (968 ms to 399; a migration, 23% more database, about 12% on a
+push). One MariaDB reading (Home as a page with no marks, +9.6 ms in one
+order, -10.3 in the other, equal statements) is unexplained and reads as
+an artefact of the page mode on a busy machine. MariaDB 10.3 has not run
+the plans. 3021 OK (skipped 1) and 4175 OK (skipped 90) green in the main checkout with
+item 9 beside it.
+
+## WP-44 item 9: the Flaky tab, the FLAKING filter, Open Actions and the chart follow the mark (2026-11-11)
+
+Item 9 is committed: the Flaky tab on Home (its request on the first
+click only, paging to `total + retired`); the FLAKING toggle on All tests
+and the links into it; Open Actions' footer line and its Failing mode
+sending `result=FAIL&result=FLAKING&open=1`; the per-day chart's fourth
+series; the What's new section. No first paint gained a request, and
+Home lost one: the measured pass of item 8 found `parts=assigned_trend`
+in Home's first batch (the design had it off every first paint), costing
+the page +12.5 ms (11%) at 50 marks and +118 ms (86%) at 1,000 on SQLite.
+The split is now sent after the headline has drawn; Home's first batch is
+three requests and, measured that way, the page is the base's. The chart
+gains its split one request later than before, with or without marks: for
+the owner to confirm.
+
+For the owner to confirm: the Failing mode now leaves out unassigned
+flaking tests (162 rows against 169 on the reference seed with 50 marks),
+the design's intent, and with no marks it lists the same rows by a
+statement that differs by the `open` term; the tab's badge counts `total`
+while the list also shows the retired marks last, each tagged; What's new
+is dated 2026-11-11 and the drop sets the real date.
+
+Fresh eyes found one defect, fixed: with two pages of the tab loaded, an
+assignment from a row's select refetched page one without redrawing, and
+the next "Show more" appended a page twice. No browser has rendered the
+feature; the pages and the API were read over HTTP on a seeded copy and
+the counts agreed. 3021 OK (skipped 1) and 4175 OK (skipped 90) green in the main
+checkout.
+
+## WP-44 item 10: the documents; the build is complete and pushed for CI, not merged (2026-11-11)
+
+The README has its "Flaky marks" section, the corrected `result` row and
+the two summary parts it lacked (`parts=names`, and `parts=assigned_trend`
+from the 2026-10-13 drop). The operator note is docs/drops/2026-11-11.md,
+its date provisional. The handover is rewritten. Every item of the plan is
+committed; the branch is pushed and a pull request opened so that CI's
+MariaDB 10.3 legs run the plan guards, which no local run could. Nothing
+is merged or deployed: both are the owner's, with the decisions the
+handover lists (the headline over its bar, the trend part's cost with many
+marks, the chart's split after the headline, Open Actions' Failing mode).
+Item 6h (a dialect hook) exists only if a plan guard fails on those legs.
+
+## WP-44: the first CI run; 10.3 passes the plan guards, item 6h not needed; a test-harness fault fixed (2026-11-12)
+
+The build's first push ran CI. Both MariaDB 10.3 legs ran all 4,175 tests
+and every plan guard of WP-44 passed there: item 6h is not needed. One
+test failed on every Linux leg and passed on Windows: the DOM shim's
+drivers ended with a log and an exit, and on Linux the exit cut any
+answer longer than a pipe's 64 KB buffer; the Flaky tab's paging walk was
+the first to pass it. The shim now writes the answer and exits from the
+write's callback, for every driver, with a guard and a 300 KB round trip
+(`ShimAnswerTest`). The two Python 3.8 legs fail at the interpreter's
+setup, before any test: the hosted runner image no longer offers 3.8.
+Left for the owner; not this build's.
+
+## WP-44: the owner's first look overturns the Flaky tab; items 11 to 15, the Flaking tab as a triage queue (2026-11-12)
+
+The owner tried the build on a local server and overturned the tab twice
+in one morning. First: triage's new tab should hold only the tests in a
+flaking state, every other marked test sorting by its state (design §13).
+Then, when the walkthrough of that rework reported that the tab had no
+Output column and no Review panel: it must have the same review options
+as the other tabs, and each row its streak (§14). §14 records how the
+first design came about. The rule adopted is in `CLAUDE.md` and the UI
+agent's definition
+(`fec3d34`): every triage tab is a queue like its neighbours, and a
+triage design is compared with New failures and Still failing column by
+column and act by act, every difference put to the owner by name.
+
+Built as two commits. `b6f0162` (items 11 and 14, backend): the tab's
+rows are `GET /api/summary?parts=queue&queue=flaking`, a virtual kind
+whose set is the entries `status.flaking` counts and whose rows are
+queue rows key for key, nearest to their cadence first; `GET /api/flaky`
+and its read are removed. `6da4512` (items 12 and 15, UI): the tab is
+"Flaking", drawn by the shared queue loop with Output and Review, with a
+Streak column ("2 in a row, failing at 3") where Still failing has
+"Failing since" and "Last pass"; its bespoke renderer and pager are
+removed; `QueueTabReviewTest` fails the build if any triage tab's row
+lacks the Review button. Items 11 and 12 (the old endpoint narrowed, the
+bespoke tab relabelled) were verified and reviewed and never committed
+alone; they are carried in those two commits and superseded there.
+
+Measured (14p; perf-seed/1, SQLite, in-process, alternated, 65
+assignments; the old endpoint, then the queue): on the click after the
+headline 1.0 to 0.7 ms at 50 marks and 5.7 to 2.0 at 1,000; cold 3.0 to
+5.9 and 9.3 to 8.1. The cold cost at 50 marks is the prefix every queue
+request pays (11 statements cold on mainline, 3 after the headline) and
+the old endpoint did not; the queue itself adds four statements cold and
+one after the headline, against Still failing's eight and five, and runs
+in about half of Still failing's time. A local MariaDB 12.3: 1.9 to 2.3
+ms and 11.5 to 5.4 after the headline; 7.1 to 23.0 and 17.8 to 27.7
+cold. The other queue kinds and the six Known slow rows read the same
+with equal statement counts, against the tree before the day's work too.
+The rows read is by key; its plan on 12.3 is a range on the full primary
+key, the 600-key case included. **10.3 has not run it: CI decides
+whether a fallback spelling of the keys is needed, and it is not built.**
+
+Found on the way and fixed: a guard lost with a deleted test (the two
+writers of the marked-environments memo must store the same value); a
+sort key carried from another tab reordering a tab that has no such
+column, for every tab; a one-state line that called flaking tests
+"failing". Found and left, older than this work: every build-scoped
+summary part reads its stream twice, and two of the prefix's reads are
+not memoized (eight prefix statements after the headline on a build
+against three on mainline); the DOM shim's `querySelectorAll` matches one
+class only. For the owner: a Flaking row shows no time where New
+failures has "Failed at" (the row carries it; not built); "failed N of
+its last 20 runs" went with the old tab.
+
+A correction to this run's own first commit: it recorded the handover's
+suite counts as nine too high. They were right. Nine Tcl feeder tests
+exist only where `tclsh` is on PATH, and without it nothing is reported
+as skipped: the count is simply nine lower. Final counts in the main
+checkout, with it: 3055 OK (skipped 1) on SQLite and 4229 OK (skipped
+91) with the MariaDB variants on a local 12.3. No browser has rendered
+the tab.
+
+## WP-44 item 16: CI's 3.6.8 jobs catch the keyed read on an old SQLite; fixed (2026-11-12)
+
+The rework's first push went red on all six Python 3.6.8 jobs for one
+test, item 14's plan guard for the Flaking queue's rows. The SQLite of
+that target (3.26) cannot drive an index from a row-value `IN` over a
+list of rows, so `_rows_by_key` read every `latest_runs` row of the
+stream to find 53. The answer was right; the cost was the stream. Every
+interpreter on the development machine carries a newer SQLite that plans
+the form by the key, so no local run could show it. **The MariaDB
+variant of the same guard passed on both 10.3 jobs: production's stream
+reads those rows by the full key**, which was the question left open for
+CI, and MariaDB's statement is unchanged.
+
+The fault was older than the queue: Open Actions' page by keys on SQLite
+has used `_rows_by_key` since item 8, and its guard was green on 3.6.8
+only because it accepted any index search, the stream-wide one included.
+
+On SQLite the read is now driven from the keys (a compound select of the
+keys, `CROSS JOIN latest_runs` on the four key columns), which SQLite
+documents as fixing the loop order whatever the version or the
+statistics; 250 keys a statement as before. Rejected in the design pass:
+an OR of key terms, a cost-based choice that can lose to the read being
+escaped. The implementer built SQLite 3.26 from the public amalgamation
+in a scratch directory: the tree before fails the guard as CI did, the
+fixed tree passes. Measured (16p, perf-seed/1, SQLite 3.50): no change
+in any cell of the queue or of Open Actions' rows, statements equal,
+Known slow rows the same; forcing the old plan costs 4.3 to 5.7 ms more
+on every call of either read, on a queue call of 1.2 to 3.3 ms after the
+headline. The guards now require the full key for both keyed reads on
+both backends and name the SQLite version; two guards that accepted any
+index search name their index. Noted: the code's SQLite floor is 3.15
+(row values in two filter terms) and is stated nowhere. Main checkout,
+`tclsh` on PATH: 3056 OK (skipped 1) and 4231 OK (skipped 91) on the
+fix, then two more tests of the keys-driven read added by the review
+(`tests.test_storage`: 709 OK). CI on the push is the proof on 3.6.8.
+
+## WP-44: CI green on the keyed read; item 17, the test page offers the mark in its header (2026-11-12)
+
+CI on `77f12d2` passed all twelve jobs: the six Python 3.6.8 jobs that
+had failed on the old SQLite, and both MariaDB 10.3 jobs with the plan
+guards of the Flaking queue and of Open Actions' page by keys. The
+question left for CI is answered on both backends.
+
+Item 17 came from the owner trying the build: "Mark as flaky" on a
+test's own page was inside the Flakiness card of the Analytics section
+(the design's answer to its question 15, beside the computed signal),
+and the owner had to ask where it was. Every other act on that page is
+in the header. The offer is now there, in the slot the mark's banner
+uses, beside the Mute offer: "Flaky" and a "Mark as flaky" button that
+opens the form in place, for a test whatever its latest result. The
+card keeps a link that opens the header's one form. The walkthrough
+compared the offer with the Mute offer act by act and changed two
+things: the label, which was "Not marked flaky" and read as a status on
+a passing test's page, and the offer's look, which kept the mark's
+cream background and amber label; it now has no background, a neutral
+edge and a muted label, with a guard against the tint returning. No
+request is added to the page's load.
+
+`static/test.js` held a literal NUL character in a sentinel string,
+which made git store it as binary and tools refuse to edit it. It is
+respelt as the escape `\u0000`, the same string at run time;
+`NoNulByteTest` scans `static/` and holds its exceptions equal to what
+it finds. One is left, named there: `static/actions.js`, the same kind
+of literal in its "unassigned" sentinel.
+
+Final counts in the main checkout, `tclsh` and `node` on PATH: 3066 OK
+(skipped 1) on SQLite and 4241 OK (skipped 91) with the MariaDB variants
+on a local 12.3. No browser has rendered the page.
+
+## WP-44: CI green at the branch head; item 18, the cadence select opens on "fail after…" (2026-11-12)
+
+CI on `65ec790` passed all twelve jobs, so the test page's offer and its
+guards are green on Python 3.6.8, 3.8, 3.14 and both MariaDB 10.3 jobs.
+
+Item 18 came from the owner trying the build: the cadence select's
+placeholder read "at…" and should read "fail after…". It is one string in
+`flakyCadenceSelect()`, the builder the selection bar, the Review panel
+and a test's page all use, so the three change together. A new guard,
+`FlakyMarkControlsTest.test_the_placeholders_say_what_is_chosen`, holds
+that text and the Mute select's "for…" (neither was held before), each as
+one ellipsis character on an option of value "" drawn before the choices.
+The select is no wider: a closed select takes the width of its widest
+option, and "10 in a row" is wider than the new placeholder in the fonts
+measured; no rule in `static/` changes how a select is sized.
+
+The walkthrough named one thing to the owner and changed nothing for it:
+the sentence beside the select ("counts as failing at 3 in a row") and
+the Flaking tab's Streak cell ("2 in a row, failing at 3") say "at" where
+the select now says "after". Both mean the third failure in a row; "after
+3" can also be read as the fourth. Whether those follow the select or
+stay is the owner's.
+
+No performance pass: one string in a select built on demand, off the
+trigger paths. Counts in the main checkout, `tclsh` and `node` on PATH:
+3067 OK (skipped 1) on SQLite and 4242 OK (skipped 91) with the MariaDB
+variants on a local 12.3, one more than before on each, the new guard.
+No browser has rendered it.
+
+## WP-44 item 19: the sentence and the Streak cell say "after", as the select does (2026-11-12)
+
+CI on `3d287b5` passed all twelve jobs. The owner, shown the difference
+item 18 left ("at" in the text beside a select that says "after"),
+decided it: "Change them to match: "after"".
+
+The mark's flaking sentence now reads "counts as failing after 3 in a
+row" (the Review panel's line, a test page's banner, the title of the
+"flaky" tag on list rows and of the Streak cell) and the Flaking tab's
+Streak cell "2 in a row, failing after 3". What's new quotes the cell's
+new text; the design doc's sketches and the operator note follow. A
+sweep of `static/` found no other place that words the cadence with
+"at"; the wordings that never did are unchanged ("counts as failing once
+its last 3 runs have failed", "3 in a row", "fail past their cadence").
+
+The statement is true as written: a marked test is failing when its
+newest N results are all failures, so at a cadence of 3 the third
+failure in a row is the one that counts, and the flaking sentence is
+only shown below it.
+
+Every guard that held either string holds the new one, none loosened:
+the source check of the Streak words, the byte-for-byte test, the walks
+of the Flaking tab, the Review panel and the test page's banner. The
+sentence is now also held from the source, so a run without `node`
+checks it. Nothing can newly wrap: the Streak cell does not wrap, and
+the sentence is shorter than the failing one drawn in the same place.
+
+No performance pass: two strings built in the browser, off the trigger
+paths. Counts in the main checkout, `tclsh` and `node` on PATH: 3067 OK
+(skipped 1) on SQLite and 4242 OK (skipped 91) with the MariaDB variants
+on a local 12.3, unchanged. No browser has rendered it.

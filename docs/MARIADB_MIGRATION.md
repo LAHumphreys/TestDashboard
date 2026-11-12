@@ -578,7 +578,7 @@ breaks you will not know which change did it.
 
 | SQLite | MariaDB | Note |
 |---|---|---|
-| `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT AUTO_INCREMENT PRIMARY KEY` | `BIGINT`, not `INT`: ids are consumed by re-imports (§B.5), so they run ahead of the row count. Five sites: `runs`, `comments`, `assignments`, `streams` (migration 9) and `mute_history` (migration 11); `tests/test_sql_portability.py::InventoryTest` pins the count. |
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT AUTO_INCREMENT PRIMARY KEY` | `BIGINT`, not `INT`: ids are consumed by re-imports (§B.5), so they run ahead of the row count. Six sites: `runs`, `comments`, `assignments`, `streams` (migration 9), `mute_history` (migration 11) and `flaky_mark_history` (migration 12); `tests/test_sql_portability.py::InventoryTest` pins the count. |
 | `TEXT` (identity) | `VARCHAR(n)` per §B.1 | Bounded, or it cannot be indexed. |
 | `TEXT` (`result`) | `VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin` | Values are `PASS`, `FAIL`, `FAILED_AS_EXPECTED`, `UNEXPECTED_PASS`. Do **not** use a MariaDB `ENUM` — the Python `Result` enum is the authority and an ENUM would give you two definitions that can drift. |
 | `TEXT` (`source_link`) | `VARCHAR(1024)` | Not indexed. The audit checks nothing exceeds it. |
@@ -1260,7 +1260,7 @@ code keeps serving through the upgrade (that is how the 2026-08-11 run
 went) and refuses only at its next start. What decides it is the
 ledger's own declaration of which existing tables a step rewrites:
 
-- **A step that only creates tables** (migration 11's shape) touches
+- **A step that only creates tables** (migrations 11 and 12) touches
   nothing the running server reads or writes. Run it with the server
   up; the only gap is the restart into the new code, which every drop
   has. A push landing during the step is just a push.
@@ -1418,6 +1418,25 @@ commit. `docs/UPGRADE_PLAN.md` §1 says the same at the registry.
 5. The drop's operator note says **"a migration runs"**, names the
    version, and points here. Its rollback section says "restore the
    dump", not "git checkout".
+
+### G.6 The steps in the ledger
+
+What `LEDGER` holds, so an operator can see from here what a run will
+do before the dry run says it. `alters` empty means the server may keep
+serving through the step (G.3).
+
+| Step | Package | Creates | Rewrites (`alters`) |
+|---|---|---|---|
+| 7 → 8 | WP-20 | `environment_products` | nothing |
+| 8 → 9 | WP-21 | `streams`; `stream_id` on `runs`, `comments`, `assignments`, `current_assignments`, `latest_runs` | `runs`, `comments`, `assignments`, `current_assignments`, `latest_runs` (stop the server) |
+| 9 → 10 | WP-23 | `stream_id` in the keys of `activity_hours`, `script_hours` | `activity_hours`, `script_hours` (stop the server) |
+| 10 → 11 | WP-40 | `test_mutes`, `mute_history`, two indexes | nothing |
+| 11 → 12 | WP-44 | `test_flaky_marks` (keyed by the triple, no stream), `flaky_mark_history`, `idx_flaky_mark_history_triple` | nothing |
+
+Step 11 → 12 is the flaky mark's: two new tables, no backfill, nothing
+existing touched; the tables start empty. Rollback is the G.2 dump,
+or, with the old code redeployed, dropping the two tables and setting
+`schema_version` back to 11 (every mark and its history goes with them).
 
 ---
 

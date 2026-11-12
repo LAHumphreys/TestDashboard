@@ -21,7 +21,7 @@ import threading
 import time
 import unittest
 from typing import (
-    Any, Callable, Dict, List, Optional, Sequence, Tuple,
+    Any, Callable, Dict, List, Optional, Sequence, Set, Tuple,
 )
 
 from testboard import analytics, model, storage
@@ -7554,6 +7554,139 @@ class TargetedInvalidationTest(StorageTestBase):
         self.assertEqual(self.store.memo_report()["clears"], 1)
         self.assertGreater(self.store.memo_report()["entries"], 0)
 
+    # -- WP-44 item 6: Q2's answers, _cadence_runs_cache ---------------
+
+    def _fill_cadence_runs(self) -> None:
+        """test_a FAIL then FAIL on both streams, marked at cadence 3, so
+        a summary read puts one Q2 answer per stream in the cache."""
+        # A run is unique by (triple, start): one start per stream.
+        for build, hours in ((None, 3), ("feat/x", 4)):
+            self.store.upsert_runs([make_record(
+                test_name="test_a", result=Result.FAIL, build=build,
+                start=BASE + datetime.timedelta(hours=hours))])
+        self.store.ensure_user("alice", CREATED)
+        self.store.mark_flaky(
+            [("linux-sim", "suite.py", "test_a", None)], 3, "why", "alice",
+            CREATED)
+        for stream_id in (self.mainline, self.build):
+            self.store.flaky_view(stream_id, self.NOW,
+                                  marks=True)
+        self.assertEqual(
+            sorted(key[0] for key in self.store._cadence_runs_cache),
+            sorted([self.mainline, self.build]))
+
+    def test_acts_leave_the_cadence_runs_filled(self) -> None:
+        """No act moves a window: an assignment, a comment, a mute, a
+        retirement and a mark all drop the summary memo and leave Q2's
+        answers, so the next cold read runs Q1 and not Q2."""
+        self._fill_cadence_runs()
+        before = dict(self.store._cadence_runs_cache)
+        self.store.set_assignee(
+            "linux-sim", "suite.py", "test_a", "alice", "amy", CREATED)
+        self.store.add_comment(
+            "linux-sim", "suite.py", "test_a", "amy", "note", CREATED)
+        self.store.mute_tests(
+            [("linux-sim", "suite.py", "test_a", self.mainline)], "infra",
+            24, "alice", "amy", self.NOW)
+        self.store.set_retired(
+            "linux-sim", "suite.py", "test_b", True, "amy", "gone", CREATED)
+        self.store.mark_flaky(
+            [("linux-sim", "suite.py", "test_b", None)], 4, "why", "alice",
+            CREATED)
+        self.store.unmark_flaky(
+            [("linux-sim", "suite.py", "test_b")], "alice", CREATED)
+        self.assertEqual(self.store._cadence_runs_cache, before)
+        # ...and the summary memo did go.
+        self.assertIsNone(self.store._cached_summary(
+            ("flaky_states", self.mainline, "linux-sim")))
+
+    def test_a_push_drops_its_streams_cadence_runs_and_no_other(
+            self) -> None:
+        """Correctness, not hygiene: a re-pushed or late run changes the
+        window under the same key (design §3c)."""
+        self._fill_cadence_runs()
+        self._push("feat/x")
+        self.assertEqual(
+            [key[0] for key in self.store._cadence_runs_cache],
+            [self.mainline])
+        self._push(None, test_name="test_m")
+        self.assertEqual(self.store._cadence_runs_cache, {})
+
+    def test_a_late_older_run_is_read_again(self) -> None:
+        """The case the push's drop is for: a run older than the latest,
+        pushed late, lands inside the window of an unchanged key; the
+        state must follow it."""
+        self.store.upsert_runs([
+            make_record(test_name="test_c", result=Result.FAIL,
+                        start=BASE + datetime.timedelta(days=day))
+            for day in (1, 2)])
+        self.store.ensure_user("alice", CREATED)
+        self.store.mark_flaky(
+            [("linux-sim", "suite.py", "test_c", None)], 3, "why", "alice",
+            CREATED)
+        triple = ("linux-sim", "suite.py", "test_c")
+        now = BASE + datetime.timedelta(days=5)
+        # Two runs, both FAIL, cadence 3: every run it has failed.
+        self.assertEqual(
+            self.store.flaky_view(self.mainline, now).states[triple].state,
+            "failing")
+        # A PASS older than both, pushed late: the latest run and its
+        # previous result are unchanged, so is Q2's key; the window is
+        # not.
+        self.store.upsert_runs([make_record(
+            test_name="test_c", result=Result.PASS,
+            start=BASE + datetime.timedelta(hours=12))])
+        self.assertEqual(
+            self.store.flaky_view(self.mainline, now).states[triple],
+            storage.FlakyState(state="flaking", streak=2, runs=None))
+
+    def test_a_delete_drops_every_cadence_run(self) -> None:
+        self._fill_cadence_runs()
+        self.store.delete_stream_environment(self.build, "linux-sim")
+        self.assertEqual(self.store._cadence_runs_cache, {})
+        self._fill_cadence_runs_mainline_only()
+        self.store.delete_environment("linux-sim")
+        self.assertEqual(self.store._cadence_runs_cache, {})
+
+    def _fill_cadence_runs_mainline_only(self) -> None:
+        self.store.flaky_view(self.mainline, self.NOW)
+        self.assertEqual(
+            [key[0] for key in self.store._cadence_runs_cache],
+            [self.mainline])
+
+    def test_the_cadence_runs_cache_has_the_streak_memos_limits(
+            self) -> None:
+        """60 s like the memos, and a cap that clears in full."""
+        self._fill_cadence_runs()
+        key = next(iter(self.store._cadence_runs_cache))
+        stored, value = self.store._cadence_runs_cache[key]
+        self.store._cadence_runs_cache[key] = (
+            stored - storage._TREND_CACHE_TTL_SECONDS - 1, value)
+        self.store._invalidate_summary_cache()
+        conn = self.store._conn()
+        if isinstance(self.store._backend, storage._SqliteBackend):
+            seen = []  # type: List[str]
+            trace_sql_into(conn, seen)
+            try:
+                self.store.flaky_view(key[0], self.NOW)
+            finally:
+                conn.set_trace_callback(None)
+            self.assertEqual(
+                len([s for s in seen if "FROM runs" in s]), 1, seen)
+        else:
+            self.store.flaky_view(key[0], self.NOW)
+        self.assertGreater(self.store._cadence_runs_cache[key][0], stored)
+        original = storage._CADENCE_RUNS_CACHE_MAX_ENTRIES
+        storage._CADENCE_RUNS_CACHE_MAX_ENTRIES = 1
+        try:
+            self.store._invalidate_summary_cache()
+            self.store._cadence_runs_cache.clear()
+            self.store.flaky_view(self.mainline, self.NOW)
+            self.store.flaky_view(self.build, self.NOW)
+            self.assertEqual(len(self.store._cadence_runs_cache), 1)
+        finally:
+            storage._CADENCE_RUNS_CACHE_MAX_ENTRIES = original
+
 
 class DropStreamTest(StorageTestBase):
     """count_stream_rows / delete_stream — the storage half of
@@ -9588,3 +9721,3121 @@ class AssignedTrendTest(StorageTestBase):
             self.assertTrue(runs, plan)
             for line in runs:
                 self.assertTrue(line.startswith("SEARCH"), plan)
+
+
+class FlakyMarkWriteTest(StorageTestBase):
+    """WP-44: the flaky mark's two acts (migration 12).
+
+    A mark is per TRIPLE and covers every stream; the person marking
+    owns it and nobody else can be named; a cadence change keeps the
+    owner; anyone known and active may change or remove a mark; every
+    act is a history row; the reason is a comment tagged with the stream
+    the selection was made on; a dropped environment takes its marks,
+    a retirement or a build's deletion does not.
+    """
+
+    NOW = datetime.datetime(2026, 7, 2, 12, 0, 0)
+    LATER = NOW + datetime.timedelta(hours=1)
+    ENV = "linux-sim"
+    SCRIPT = "suite.py"
+
+    def setUp(self) -> None:
+        super().setUp()
+        later = BASE + datetime.timedelta(hours=1)
+        self.store.upsert_runs([
+            make_record(test_name="t1", result=Result.FAIL),
+            make_record(test_name="t1", result=Result.FAIL, start=later),
+            make_record(test_name="t2", result=Result.PASS, start=later),
+            make_record(test_name="t3", result=Result.FAIL, start=later),
+            make_record(test_name="t1", result=Result.FAIL, build="b1",
+                        start=later + datetime.timedelta(hours=1)),
+            make_record(environment="win-sim", test_name="w1",
+                        result=Result.FAIL, start=later),
+        ])
+        for name in ("alice", "bob", "carol"):
+            self.store.ensure_user(name, CREATED)
+        self.store.set_user_active("carol", False, "bob", CREATED)
+        self.build = self.store.list_streams("")[0].stream_id
+
+    def _key(self, test: str, sid: Optional[int] = None,
+             env: Optional[str] = None
+             ) -> Tuple[str, str, str, Optional[int]]:
+        return (env or self.ENV, self.SCRIPT, test, sid)
+
+    def _mark(self, tests: Sequence[str], cadence: int = 3,
+              reason: Optional[str] = "race in teardown",
+              by: str = "alice", sid: Optional[int] = None,
+              when: Optional[datetime.datetime] = None,
+              ) -> Tuple[int, int, int, int]:
+        result = self.store.mark_flaky(
+            [self._key(t, sid) for t in tests], cadence, reason, by,
+            when or self.NOW)
+        return (result.marked, result.changed, result.unchanged,
+                result.unknown)
+
+    def _acts(self, test: str, env: Optional[str] = None
+              ) -> "storage.TestActs":
+        return self.store.test_acts(env or self.ENV, self.SCRIPT, test)
+
+    def _count(self, table: str) -> int:
+        return int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM {0}".format(table)).fetchone()[0])
+
+    def _written(self) -> Tuple[int, int, int, int]:
+        return (self._count("test_flaky_marks"),
+                self._count("flaky_mark_history"),
+                self._count("comments"), self._count("users"))
+
+    # -- marking ----------------------------------------------------
+
+    def test_a_fresh_mark_is_recorded_owned_and_commented(self) -> None:
+        self.assertEqual(self._mark(["t1"], cadence=3), (1, 0, 0, 0))
+        acts = self._acts("t1")
+        self.assertEqual(
+            acts.flaky_mark,
+            storage.FlakyMark(
+                environment=self.ENV, script=self.SCRIPT, test_name="t1",
+                cadence=3, reason="race in teardown", marked_by="alice",
+                marked_at=self.NOW))
+        self.assertEqual(
+            [(a.action, a.cadence, a.reason, a.actor, a.acted_at)
+             for a in acts.flaky_history],
+            [("mark", 3, "race in teardown", "alice", self.NOW)])
+        comments = self.store.comments(self.ENV, self.SCRIPT, "t1")
+        self.assertEqual(
+            [(c.author, c.text, c.stream_id, c.created_at)
+             for c in comments],
+            [("alice", "race in teardown", None, self.NOW)])
+        # A mark is not an assignment.
+        self.assertIsNone(
+            self.store.current_assignee(self.ENV, self.SCRIPT, "t1"))
+
+    def test_the_comment_is_tagged_with_the_stream_it_was_made_from(
+        self,
+    ) -> None:
+        self._mark(["t1"], sid=self.build)
+        self._mark(["t3"], sid=storage.MAINLINE_STREAM_ID)
+        self.assertEqual(
+            [c.stream_id for c in self.store.comments(
+                self.ENV, self.SCRIPT, "t1")], [self.build])
+        self.assertEqual(
+            [c.stream_id for c in self.store.comments(
+                self.ENV, self.SCRIPT, "t3")], [None])
+        # The mark itself names no stream: it covers them all.
+        self.assertEqual(self._acts("t1").flaky_mark.cadence, 3)
+
+    def test_a_fresh_mark_needs_a_reason_and_writes_nothing_without(
+        self,
+    ) -> None:
+        self._mark(["t2"])
+        before = self._written()
+        for reason in (None, "", "   "):
+            with self.assertRaises(ValueError) as caught:
+                self._mark(["t1", "t2"], cadence=4, reason=reason)
+            self.assertTrue(
+                str(caught.exception).startswith("reason is required"),
+                caught.exception)
+            self.assertIn("1 of these tests is not yet marked",
+                          str(caught.exception))
+        self.assertEqual(self._written(), before)
+        self.assertEqual(self._acts("t2").flaky_mark.cadence, 3)
+
+    def test_a_cadence_change_keeps_the_owner_and_needs_no_reason(
+        self,
+    ) -> None:
+        self._mark(["t1"], cadence=3, by="alice")
+        comments = len(self.store.comments(self.ENV, self.SCRIPT, "t1"))
+        self.assertEqual(
+            self._mark(["t1"], cadence=5, reason=None, by="bob",
+                       when=self.LATER),
+            (0, 1, 0, 0))
+        mark = self._acts("t1").flaky_mark
+        self.assertEqual(
+            (mark.cadence, mark.marked_by, mark.marked_at, mark.reason),
+            (5, "alice", self.NOW, "race in teardown"))
+        self.assertEqual(
+            [(a.action, a.cadence, a.reason, a.actor)
+             for a in self._acts("t1").flaky_history],
+            [("cadence", 5, None, "bob"),
+             ("mark", 3, "race in teardown", "alice")])
+        self.assertEqual(
+            len(self.store.comments(self.ENV, self.SCRIPT, "t1")), comments)
+
+    def test_a_cadence_change_with_a_reason_replaces_it_and_posts_it(
+        self,
+    ) -> None:
+        self._mark(["t1"], cadence=3, by="alice")
+        self._mark(["t1"], cadence=2, reason="worse now", by="bob",
+                   sid=self.build, when=self.LATER)
+        mark = self._acts("t1").flaky_mark
+        self.assertEqual((mark.cadence, mark.marked_by, mark.reason),
+                         (2, "alice", "worse now"))
+        last = self.store.comments(self.ENV, self.SCRIPT, "t1")[-1]
+        self.assertEqual((last.author, last.text, last.stream_id),
+                         ("bob", "worse now", self.build))
+
+    def test_the_same_cadence_writes_nothing(self) -> None:
+        self._mark(["t1"], cadence=3)
+        before = self._written()
+        self.assertEqual(self._mark(["t1"], cadence=3, reason="again"),
+                         (0, 0, 1, 0))
+        self.assertEqual(self._written(), before)
+
+    def test_one_selection_counts_every_case_once(self) -> None:
+        self._mark(["t1", "t2"], cadence=3)
+        result = self._mark(
+            ["t1", "t2", "t3", "t3", "nope"], cadence=4, by="bob")
+        self.assertEqual(result, (1, 2, 0, 1))
+        result = self._mark(["t1", "t2", "t3"], cadence=4, by="bob")
+        self.assertEqual(result, (0, 0, 3, 0))
+        self.assertEqual(self._count("test_flaky_marks"), 3)
+
+    def test_a_test_named_from_two_streams_is_one_mark_one_comment(
+        self,
+    ) -> None:
+        result = self.store.mark_flaky(
+            [self._key("t1", self.build),
+             self._key("t1", storage.MAINLINE_STREAM_ID)],
+            3, "why", "alice", self.NOW)
+        self.assertEqual(result.marked, 1)
+        self.assertEqual(
+            [c.stream_id for c in self.store.comments(
+                self.ENV, self.SCRIPT, "t1")], [self.build])
+        self.assertEqual(len(self._acts("t1").flaky_history), 1)
+
+    def test_the_cadence_is_two_to_ten(self) -> None:
+        for bad in (1, 11, 0, -3, True, "3", 2.5, None):
+            with self.assertRaises(ValueError) as caught:
+                self.store.mark_flaky(
+                    [self._key("t1")], bad, "why", "alice",  # type: ignore
+                    self.NOW)
+            self.assertTrue(str(caught.exception).startswith("cadence:"))
+        self.assertEqual(self._count("test_flaky_marks"), 0)
+        self.assertEqual(self._mark(["t1"], cadence=2), (1, 0, 0, 0))
+        self.assertEqual(self._mark(["t1"], cadence=10), (0, 1, 0, 0))
+
+    def test_an_unknown_or_deactivated_user_cannot_act(self) -> None:
+        self._mark(["t1"])
+        before = self._written()
+        for who in ("nobody", "carol"):
+            with self.assertRaises(ValueError) as caught:
+                self._mark(["t3"], by=who)
+            self.assertTrue(str(caught.exception).startswith("username:"))
+            with self.assertRaises(ValueError):
+                self._mark(["t1"], cadence=5, by=who)
+            with self.assertRaises(ValueError):
+                self.store.unmark_flaky(
+                    [(self.ENV, self.SCRIPT, "t1")], who, self.NOW)
+        # Nothing written, and nobody created.
+        self.assertEqual(self._written(), before)
+        self.assertIsNone(self.store.get_user("nobody"))
+
+    # -- unmarking ----------------------------------------------------
+
+    def test_anyone_active_may_unmark_and_it_is_recorded(self) -> None:
+        self._mark(["t1", "t3"], cadence=4, by="alice")
+        removed = self.store.unmark_flaky(
+            [(self.ENV, self.SCRIPT, "t1"), (self.ENV, self.SCRIPT, "t1"),
+             (self.ENV, self.SCRIPT, "t2")], "bob", self.LATER)
+        self.assertEqual(removed, 1)
+        acts = self._acts("t1")
+        self.assertIsNone(acts.flaky_mark)
+        self.assertEqual(
+            [(a.action, a.cadence, a.reason, a.actor, a.acted_at)
+             for a in acts.flaky_history],
+            [("unmark", 4, None, "bob", self.LATER),
+             ("mark", 4, "race in teardown", "alice", self.NOW)])
+        self.assertIsNotNone(self._acts("t3").flaky_mark)
+        history = self._count("flaky_mark_history")
+        self.assertEqual(self.store.unmark_flaky(
+            [(self.ENV, self.SCRIPT, "t1")], "bob", self.LATER), 0)
+        self.assertEqual(self._count("flaky_mark_history"), history)
+
+    # -- what the acts drop, and what they leave --------------------------
+
+    def test_every_act_drops_the_memos_and_no_push_cost_is_added(
+        self,
+    ) -> None:
+        def probe() -> None:
+            self.store._store_summary(("probe",), 1, 1)
+
+        probe()
+        self._mark(["t1"])
+        self.assertIsNone(self.store._cached_summary(("probe",)))
+        probe()
+        self._mark(["t1"], cadence=5)
+        self.assertIsNone(self.store._cached_summary(("probe",)))
+        probe()
+        self.store.unmark_flaky([(self.ENV, self.SCRIPT, "t1")], "bob",
+                                self.NOW)
+        self.assertIsNone(self.store._cached_summary(("probe",)))
+        # An act that writes nothing drops nothing.
+        probe()
+        self.store.unmark_flaky([(self.ENV, self.SCRIPT, "t1")], "bob",
+                                self.NOW)
+        self.assertEqual(self.store._cached_summary(("probe",)), 1)
+
+    def test_a_push_leaves_the_mark_alone(self) -> None:
+        self._mark(["t1"])
+        self.store.upsert_runs([make_record(
+            test_name="t1", result=Result.PASS,
+            start=BASE + datetime.timedelta(days=1))])
+        self.assertEqual(self._acts("t1").flaky_mark.cadence, 3)
+
+    def test_retiring_a_marked_test_keeps_the_mark(self) -> None:
+        self._mark(["t1"])
+        self.store.set_retired(self.ENV, self.SCRIPT, "t1", True, "bob",
+                               "gone", self.LATER)
+        self.assertEqual(self._acts("t1").flaky_mark.cadence, 3)
+        self.store.set_retired(self.ENV, self.SCRIPT, "t1", False, "bob",
+                               "back", self.LATER)
+        self.assertEqual(self._acts("t1").flaky_mark.cadence, 3)
+
+    def test_deleting_a_build_touches_no_mark(self) -> None:
+        self._mark(["t1"], sid=self.build)
+        self.store.delete_stream_environment(self.build, self.ENV)
+        self.assertEqual(self._acts("t1").flaky_mark.cadence, 3)
+        self.store.delete_stream(self.build)
+        acts = self._acts("t1")
+        self.assertEqual(acts.flaky_mark.cadence, 3)
+        self.assertEqual(len(acts.flaky_history), 1)
+
+    def test_dropping_an_environment_takes_its_marks_and_history(
+        self,
+    ) -> None:
+        self._mark(["t1"])
+        self.store.mark_flaky(
+            [("win-sim", self.SCRIPT, "w1", None)], 3, "why", "alice",
+            self.NOW)
+        self.store.unmark_flaky([("win-sim", self.SCRIPT, "w1")], "bob",
+                                self.NOW)
+        self.store.mark_flaky(
+            [("win-sim", self.SCRIPT, "w1", None)], 2, "again", "alice",
+            self.LATER)
+        self.store.delete_environment("win-sim")
+        acts = self._acts("w1", env="win-sim")
+        self.assertIsNone(acts.flaky_mark)
+        self.assertEqual(acts.flaky_history, [])
+        kept = self._acts("t1")
+        self.assertEqual(kept.flaky_mark.cadence, 3)
+        self.assertEqual(len(kept.flaky_history), 1)
+
+    def test_the_acts_read_returns_mutes_and_marks_apart(self) -> None:
+        self.store.mute_tests(
+            [(self.ENV, self.SCRIPT, "t1", storage.MAINLINE_STREAM_ID)],
+            "infra", 24, "alice", "bob", self.NOW)
+        self._mark(["t1"])
+        self._mark(["t1"], cadence=6, when=self.LATER)
+        acts = self._acts("t1")
+        self.assertEqual([a.action for a in acts.mute_history], ["mute"])
+        self.assertEqual(
+            acts.mute_history,
+            self.store.mute_history(self.ENV, self.SCRIPT, "t1"))
+        self.assertEqual([a.action for a in acts.flaky_history],
+                         ["cadence", "mark"])
+        self.assertGreater(acts.flaky_history[0].id,
+                           acts.flaky_history[1].id)
+        self.assertEqual(acts.flaky_mark.cadence, 6)
+        empty = self._acts("t2")
+        self.assertEqual(
+            (empty.mute_history, empty.flaky_mark, empty.flaky_history),
+            ([], None, []))
+
+
+class FlakyActStatementsTest(StorageTestBase):
+    """WP-44 item 6, carried from item 3's measured pass: an unmark and a
+    cadence change of many tests send a number of statements that grows
+    by one per chunk of 100 tests, never by one per test.
+
+    On MariaDB the count is the server's own (``Questions``, the
+    statements the session sent): the vendored driver batches only an
+    INSERT whose VALUES are all placeholders, so an executemany of a
+    DELETE or an UPDATE was a statement per test (204 and 105 for 100
+    tests before the fix). On SQLite, where every statement is in
+    process, the trace pins the same shape: the DELETE and the UPDATE
+    once per chunk (the history INSERT's executemany traces per row
+    there, and is one statement on the server)."""
+
+    ENV = "linux-sim"
+    SCRIPT = "suite.py"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.ensure_user("alice", CREATED)
+        self.store.upsert_runs([
+            make_record(test_name="t{0:03d}".format(i), result=Result.FAIL)
+            for i in range(205)])
+
+    def _tests(self, count: int) -> List[Tuple[str, str, str]]:
+        return [(self.ENV, self.SCRIPT, "t{0:03d}".format(i))
+                for i in range(count)]
+
+    def _mark(self, count: int, cadence: int) -> None:
+        self.store.mark_flaky(
+            [t + (None,) for t in self._tests(count)], cadence, None
+            if cadence != 3 else "why", "alice", CREATED)
+
+    def _counted(self, call: Callable[[], Any]) -> Tuple[int, List[str]]:
+        """On MariaDB ``(server statements, [])``; on SQLite ``(0, the
+        traced statements)``."""
+        conn = self.store._conn()
+        if isinstance(self.store._backend, storage._SqliteBackend):
+            seen = []  # type: List[str]
+            trace_sql_into(conn, seen)
+            try:
+                call()
+            finally:
+                conn.set_trace_callback(None)
+            return 0, seen
+
+        def questions() -> int:
+            row = conn.execute(
+                "SHOW SESSION STATUS LIKE 'Questions'").fetchone()
+            return int(row[1])
+
+        before = questions()
+        call()
+        # The second SHOW counts itself.
+        return questions() - before - 1, []
+
+    def _check(self, count: int, call: Callable[[], Any],
+               verb: str) -> None:
+        chunks = (count + 99) // 100
+        server, traced = self._counted(call)
+        if traced:
+            verbs = [s for s in traced if s.lstrip().upper().startswith(verb)]
+            self.assertEqual(len(verbs), chunks, verbs)
+            others = [s for s in traced
+                      if not s.lstrip().upper().startswith(("INSERT", verb))]
+            # BEGIN, the user check, a SELECT per chunk, COMMIT.
+            self.assertEqual(len(others), 3 + chunks, others)
+            return
+        # START TRANSACTION, the user check, a SELECT and a write per
+        # chunk, the history INSERT as one statement, COMMIT.
+        self.assertEqual(server, 4 + 2 * chunks, (count, verb))
+
+    def test_an_unmark_is_a_statement_per_chunk(self) -> None:
+        for count in (100, 205):
+            self._mark(count, 3)
+            self._check(count, lambda: self.store.unmark_flaky(
+                self._tests(count), "alice", CREATED), "DELETE")
+            self.assertEqual(int(self.store._conn().execute(
+                "SELECT COUNT(*) FROM test_flaky_marks").fetchone()[0]), 0)
+        unmarks = self.store._conn().execute(
+            "SELECT COUNT(*), MIN(action), MAX(action), MIN(cadence), "
+            "MAX(reason) FROM flaky_mark_history WHERE action = ?",
+            ("unmark",)).fetchone()
+        self.assertEqual(tuple(unmarks), (305, "unmark", "unmark", 3, None))
+
+    def test_a_cadence_change_is_a_statement_per_chunk(self) -> None:
+        for count, cadence in ((100, 4), (205, 5)):
+            self._mark(205, 3)
+            self._check(count, lambda: self._mark(count, cadence), "UPDATE")
+            rows = self.store._conn().execute(
+                "SELECT cadence, COUNT(*) FROM test_flaky_marks "
+                "GROUP BY cadence ORDER BY cadence").fetchall()
+            expected = [(cadence, count)]
+            if count < 205:
+                expected.insert(0, (3, 205 - count))
+            self.assertEqual([tuple(r) for r in rows], expected)
+            self.store.unmark_flaky(self._tests(205), "alice", CREATED)
+        # The owner and the reason stay; the history says what moved.
+        changes = self.store._conn().execute(
+            "SELECT COUNT(*) FROM flaky_mark_history WHERE action = ? "
+            "AND reason IS NULL", ("cadence",)).fetchone()
+        self.assertEqual(int(changes[0]), 305)
+
+
+class FlakyCadenceTest(StorageTestBase):
+    """WP-44: the cadence rule (design §2 B.1), one pure function, and
+    Q2, the bounded runs read it is fed from (:meth:`Storage.cadence_runs`).
+
+    Every row of B.1's table; each non-FAIL result inside the window
+    and just outside it; the floor (a stream with fewer runs than the
+    cadence is failing only when every run it has failed) and Q2's
+    floor bound on builds; Q2 over more than one statement's worth of
+    tests, so the MariaDB variant executes a full statement and a
+    second one (decision 22).
+    """
+
+    F = Result.FAIL
+    P = Result.PASS
+    UP = Result.UNEXPECTED_PASS
+    FAE = Result.FAILED_AS_EXPECTED
+    NON_FAIL = (Result.PASS, Result.UNEXPECTED_PASS,
+                Result.FAILED_AS_EXPECTED)
+    ENV = "linux-sim"
+    SCRIPT = "suite.py"
+
+    def _state(self, cadence: int, results: Sequence[Result]
+               ) -> Optional[Tuple[str, int, Optional[int]]]:
+        state = analytics.flaky_state(cadence, results)
+        return None if state is None else tuple(state)  # type: ignore
+
+    # -- the pure rule -------------------------------------------------
+
+    def test_every_row_of_the_table(self) -> None:
+        F, P = self.F, self.P
+        for cadence in range(2, 11):
+            # Latest not FAIL: passing, whatever came before.
+            for latest in self.NON_FAIL:
+                for history in ([], [F], [P], [F] * 12):
+                    self.assertEqual(
+                        self._state(cadence, [latest] + history),
+                        ("passing", 0, None), (cadence, latest, history))
+            # FAIL with no previous run: failing (verdict 8), 1 of 1.
+            self.assertEqual(self._state(cadence, [F]), ("failing", 1, 1))
+            # FAIL after a non-FAIL: flaking.
+            for prev in self.NON_FAIL:
+                self.assertEqual(self._state(cadence, [F, prev, F, F]),
+                                 ("flaking", 1, None))
+            # No run on the stream: absent there.
+            self.assertIsNone(self._state(cadence, []))
+        # FAIL, FAIL at cadence 2: failing, 2 of 2.
+        self.assertEqual(self._state(2, [F, F, P]), ("failing", 2, 2))
+        self.assertEqual(self._state(2, [F, F]), ("failing", 2, 2))
+        # FAIL, FAIL at 3..10: flaking while one of the newest N is not
+        # a FAIL, failing once all N are; streak is the leading FAILs.
+        for cadence in range(3, 11):
+            for streak in range(2, cadence):
+                results = [F] * streak + [P] + [F] * 10
+                self.assertEqual(self._state(cadence, results),
+                                 ("flaking", streak, None))
+            self.assertEqual(self._state(cadence, [F] * cadence + [P]),
+                             ("failing", cadence, cadence))
+            # More FAILs than N: capped at N.
+            self.assertEqual(self._state(cadence, [F] * (cadence + 5)),
+                             ("failing", cadence, cadence))
+
+    def test_each_non_fail_inside_the_window_keeps_it_flaking(self) -> None:
+        for cadence in range(2, 11):
+            for other in self.NON_FAIL:
+                for position in range(1, cadence):
+                    results = [self.F] * (cadence + 1)
+                    results[position] = other
+                    state = self._state(cadence, results)
+                    self.assertEqual(
+                        state, ("flaking", position, None),
+                        (cadence, other, position))
+                # Just outside the window it no longer counts.
+                results = [self.F] * cadence + [other]
+                self.assertEqual(self._state(cadence, results),
+                                 ("failing", cadence, cadence))
+
+    def test_fewer_runs_than_the_cadence_fail_only_if_all_failed(
+        self,
+    ) -> None:
+        for cadence in range(2, 11):
+            for count in range(1, cadence):
+                self.assertEqual(self._state(cadence, [self.F] * count),
+                                 ("failing", count, count))
+                if count > 1:
+                    results = [self.F] * (count - 1) + [self.UP]
+                    self.assertEqual(self._state(cadence, results),
+                                     ("flaking", count - 1, None))
+
+    def test_the_latest_two_decide_all_but_fail_fail_at_three_or_more(
+        self,
+    ) -> None:
+        results = list(Result)
+        for cadence in range(2, 11):
+            for latest in results:
+                for prev in results + [None]:  # type: ignore
+                    if (cadence >= 3 and latest is self.F
+                            and prev is self.F):
+                        continue
+                    # The latest two decide it, whatever came before.
+                    pair = [latest] if prev is None else [latest, prev]
+                    for older in ([], [self.F] * 10, [self.P] * 10):
+                        full = pair + (older if prev is not None else [])
+                        self.assertEqual(
+                            self._state(cadence, pair),
+                            self._state(cadence, full),
+                            (cadence, latest, prev, older))
+
+    def test_a_cadence_outside_two_to_ten_is_refused(self) -> None:
+        for bad in (0, 1, 11):
+            with self.assertRaises(ValueError):
+                analytics.flaky_state(bad, [self.F])
+
+    # -- Q2: the bounded runs read ------------------------------------
+
+    def _night(self, day: int) -> datetime.datetime:
+        return BASE + datetime.timedelta(days=day)
+
+    def _seed_history(self) -> None:
+        """t_hist on mainline: ten nights, newest first F F P F F F F F
+        F F; a build that ran it twice (FAIL, FAIL) after mainline's
+        sixth night; t_other untouched by the build."""
+        nightly = [self.F, self.F, self.F, self.F, self.F, self.F, self.F,
+                   self.P, self.F, self.F]  # oldest first
+        records = [
+            make_record(test_name="t_hist", result=result,
+                        start=self._night(day))
+            for day, result in enumerate(nightly)
+        ]
+        records.append(make_record(test_name="t_other", result=self.P,
+                                   start=self._night(3)))
+        records.extend([
+            make_record(test_name="t_hist", result=self.F, build="b1",
+                        start=self._night(5) + datetime.timedelta(hours=2)),
+            make_record(test_name="t_hist", result=self.F, build="b1",
+                        start=self._night(6) + datetime.timedelta(hours=2)),
+        ])
+        self.store.upsert_runs(records)
+
+    def test_q2_reads_the_newest_n_no_later_than_the_latest_start(
+        self,
+    ) -> None:
+        self._seed_history()
+        mainline = storage.MAINLINE_STREAM_ID
+        triple = (self.ENV, self.SCRIPT, "t_hist")
+        got = self.store.cadence_runs(
+            mainline, [triple + (self._night(9), 4)])
+        self.assertEqual(got, {triple: [self.F, self.F, self.P, self.F]})
+        # No later than the latest start the caller holds.
+        got = self.store.cadence_runs(
+            mainline, [triple + (self._night(6), 3)])
+        self.assertEqual(got, {triple: [self.F, self.F, self.F]})
+        # A test with no run on the stream is in the answer, empty.
+        missing = (self.ENV, self.SCRIPT, "t_missing")
+        other = (self.ENV, self.SCRIPT, "t_other")
+        got = self.store.cadence_runs(
+            mainline, [missing + (self._night(9), 3),
+                       other + (self._night(9), 3),
+                       triple + (self._night(9), 2),
+                       triple + (self._night(9), 9)])
+        self.assertEqual(got, {missing: [], other: [self.P],
+                               triple: [self.F, self.F]})
+        self.assertEqual(self.store.cadence_runs(mainline, []), {})
+        with self.assertRaises(ValueError):
+            self.store.cadence_runs(mainline, [triple + (self._night(9), 0)])
+
+    def test_q2_reads_one_stream_and_the_floor_bounds_a_build(self) -> None:
+        self._seed_history()
+        build = self.store.list_streams("")[0]
+        triple = (self.ENV, self.SCRIPT, "t_hist")
+        latest = self._night(6) + datetime.timedelta(hours=2)
+        without = self.store.cadence_runs(
+            build.stream_id, [triple + (latest, 5)])
+        with_floor = self.store.cadence_runs(
+            build.stream_id, [triple + (latest, 5)], build.first_seen)
+        # The floor never changes the answer: the build's own two runs.
+        self.assertEqual(without, {triple: [self.F, self.F]})
+        self.assertEqual(with_floor, without)
+        self.assertEqual(build.first_seen,
+                         self._night(5) + datetime.timedelta(hours=2))
+        # ...and is applied: a floor past the first run cuts it.
+        cut = self.store.cadence_runs(
+            build.stream_id, [triple + (latest, 5)], latest)
+        self.assertEqual(cut, {triple: [self.F]})
+        # A build that ran a test fewer times than the cadence, every
+        # run a FAIL, is over it (verdict 8); mainline is flaking.
+        self.assertEqual(
+            self._state(5, with_floor[triple]), ("failing", 2, 2))
+        mainline = self.store.cadence_runs(
+            storage.MAINLINE_STREAM_ID, [triple + (self._night(9), 5)])
+        self.assertEqual(self._state(5, mainline[triple]),
+                         ("flaking", 2, None))
+
+    def _seed_many(self, count: int) -> List[Tuple[str, str, str]]:
+        """*count* tests, three nights each: PASS, FAIL, FAIL."""
+        records = []  # type: List[RunRecord]
+        names = ["t{0:03d}".format(index) for index in range(count)]
+        for name in names:
+            for day, result in enumerate((self.P, self.F, self.F)):
+                records.append(make_record(
+                    test_name=name, result=result, start=self._night(day)))
+        self.store.upsert_runs(records)
+        return [(self.ENV, self.SCRIPT, name) for name in names]
+
+    def test_q2_over_more_than_one_statement(self) -> None:
+        """Decision 22: 105 tests is a full statement of 100 and a
+        second of 5; on MariaDB both run, parenthesised."""
+        triples = self._seed_many(105)
+        got = self.store.cadence_runs(
+            storage.MAINLINE_STREAM_ID,
+            [t + (self._night(2), 3) for t in triples])
+        self.assertEqual(len(got), 105)
+        for triple in triples:
+            self.assertEqual(got[triple], [self.F, self.F, self.P], triple)
+            self.assertEqual(self._state(3, got[triple]),
+                             ("flaking", 2, None))
+            self.assertEqual(self._state(2, got[triple]),
+                             ("failing", 2, 2))
+
+    def test_q2_costs_one_statement_per_hundred_tests(self) -> None:
+        triples = self._seed_many(205)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            self.store.cadence_runs(
+                storage.MAINLINE_STREAM_ID,
+                [t + (self._night(2), 3) for t in triples])
+            self.store.cadence_runs(
+                storage.MAINLINE_STREAM_ID,
+                [triples[0] + (self._night(2), 3)])
+        finally:
+            conn.set_trace_callback(None)
+        selects = [s for s in seen
+                   if s.strip().upper().startswith("SELECT")]
+        self.assertEqual(len(selects), 3 + 1, selects)
+        self.assertEqual(selects[0].count("UNION ALL"), 99)
+        self.assertEqual(selects[2].count("UNION ALL"), 4)
+        self.assertNotIn("UNION", selects[3])
+
+    def _q2_sql(self, members: int, floor: bool) -> Tuple[str, List[Any]]:
+        """Q2's statement as cadence_runs builds it, with its params,
+        captured through the connection rather than re-spelled here."""
+        captured = []  # type: List[Tuple[str, List[Any]]]
+        store = self.store
+        real = store._conn
+
+        class Spy(object):
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                captured.append((sql, list(params)))
+                return self._conn.execute(sql, params)
+
+        store._conn = lambda: Spy(real())  # type: ignore
+        try:
+            triples = [(self.ENV, self.SCRIPT, "t{0:03d}".format(i))
+                       for i in range(members)]
+            store.cadence_runs(
+                storage.MAINLINE_STREAM_ID,
+                [t + (self._night(2), 3) for t in triples],
+                self._night(0) if floor else None)
+        finally:
+            del store._conn  # type: ignore
+        self.assertEqual(len(captured), 1)
+        return captured[0]
+
+    def test_q2_is_a_runs_unique_range_on_both_backends(self) -> None:
+        """The plan guard (design §6): every member reads runs by its
+        UNIQUE (environment, script, test_name, start_time) index, never
+        by the start-time index and never by a scan. On SQLite by
+        EXPLAIN QUERY PLAN, on MariaDB by EXPLAIN; CI's 10.3 legs are
+        where production's plan is checked."""
+        self._seed_many(105)
+        mariadb = not isinstance(self.store._backend, storage._SqliteBackend)
+        for members, floor in ((1, False), (3, False), (3, True),
+                               (100, False)):
+            sql, params = self._q2_sql(members, floor)
+            if mariadb:
+                self.assertTrue(sql.startswith("(") or members == 1, sql)
+                rows = self.store._conn().execute(
+                    "EXPLAIN " + sql, params).fetchall()
+                runs_rows = [row for row in rows if row[2] == "runs"]
+                self.assertEqual(len(runs_rows), members, rows)
+                for row in runs_rows:
+                    self.assertEqual(row[5], "uq_runs_identity", rows)
+                continue
+            plan = [str(row[-1]).upper() for row in self.store._conn().execute(
+                "EXPLAIN QUERY PLAN " + sql, params).fetchall()]
+            reads = [line for line in plan
+                     if line.startswith(("SCAN", "SEARCH"))
+                     and " RUNS" in line]
+            self.assertEqual(len(reads), members, plan)
+            for line in reads:
+                self.assertTrue(line.startswith("SEARCH"), plan)
+                self.assertIn("SQLITE_AUTOINDEX_RUNS_1", line, plan)
+                self.assertNotIn("IDX_RUNS_START_TIME_RESULT", line, plan)
+
+    def test_the_marks_reads_are_driven_by_their_keys(self) -> None:
+        """Every statement on the marks table pins its driving side
+        (design §6): the acts' existence read walks latest_runs by the
+        triple index and reaches the mark by its key; the detail's acts
+        read is three key reads. SQLite's plan (excluded on MariaDB)."""
+        if not isinstance(self.store._backend, storage._SqliteBackend):
+            self.skipTest("SQLite's planner")
+        self._seed_many(3)
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        self.store.ensure_user("alice", CREATED)
+        trace_sql_into(conn, seen)
+        try:
+            self.store.mark_flaky(
+                [(self.ENV, self.SCRIPT, "t000", None),
+                 (self.ENV, self.SCRIPT, "t001", None)],
+                3, "why", "alice", BASE)
+            self.store.test_acts(self.ENV, self.SCRIPT, "t000")
+        finally:
+            conn.set_trace_callback(None)
+        reads = [s for s in seen if s.strip().upper().startswith("SELECT")
+                 and "flaky" in s.lower()]
+        self.assertEqual(len(reads), 2, reads)
+        for statement in reads:
+            plan = [str(row[-1]).upper() for row in conn.execute(
+                "EXPLAIN QUERY PLAN " + statement).fetchall()]
+            for line in plan:
+                self.assertFalse(line.startswith("SCAN"), plan)
+            self.assertTrue(
+                any("TEST_FLAKY_MARKS" in line and "INDEX" in line
+                    for line in plan), plan)
+
+
+class FlakyEstateBase(StorageTestBase):
+    """WP-44 item 6: an estate with a marked test in every state the
+    board acts on, and the unmarked tests beside them.
+
+    Mainline, ``linux-sim``/``suite.py``, one run a night, the last on
+    night 9; each history below is OLDEST FIRST. Cadence 3 unless named.
+    ``env-many`` holds 101 more marked tests (decision 22: so Q2 runs a
+    full statement and a second one, and the New failures queue binds
+    more than 100 tests), alternately promoted and flaking.
+    """
+
+    ENV = "linux-sim"
+    SCRIPT = "suite.py"
+    MANY = "env-many"
+    F = Result.FAIL
+    P = Result.PASS
+    UP = Result.UNEXPECTED_PASS
+    #: name -> (cadence or None, results oldest first)
+    HISTORIES = {
+        # Flaking: a FAIL after a pass, and two FAILs under 3.
+        "t_flaking_new": (3, [P, F]),
+        "t_flaking_still": (3, [P, F, F]),
+        # Over the cadence on this run: New tonight (decision 25).
+        "t_promoted": (3, [P, F, F, F]),
+        # Over the run before already: Still failing.
+        "t_over": (3, [F, F, F, F, F]),
+        # A first run that failed: failing, New, as any test.
+        "t_first": (3, [F]),
+        # Fewer runs than N+1, all FAIL: over already (verdict 8).
+        "t_short": (5, [F, F]),
+        "t_exact": (3, [F, F, F]),
+        # Cadence 2.
+        "t_c2_promoted": (2, [P, F, F]),
+        "t_c2_over": (2, [F, F, F]),
+        # Over at 2 since the night before; over at 3 only now.
+        "t_c2_late": (2, [P, F, F, F]),
+        # Decision 3: a pass after a failure.
+        "t_tolerated": (3, [F, P, F, P]),
+        "t_realfix": (3, [P, F, F, F, P]),
+        "t_onlyfail_then_pass": (3, [F, P]),
+        "t_marked_up": (3, [F, F, F, UP]),
+        # Marked and also muted, assigned or retired.
+        "t_muted": (3, [P, F, F]),
+        "t_muted_tolerated": (3, [F, P, F, P]),
+        "t_assigned": (3, [P, F]),
+        "t_retired": (3, [P, F, F]),
+        # A marked test that passes.
+        "t_marked_pass": (4, [F, P, P]),
+        # Unmarked.
+        "t_new": (None, [P, F]),
+        "t_still": (None, [F, F]),
+        "t_fixed": (None, [F, P]),
+        "t_up": (None, [UP]),
+    }
+    MUTED = ("t_muted", "t_muted_tolerated")
+    ASSIGNED = ("t_assigned",)
+    RETIRED = ("t_retired",)
+    NIGHTS = 10
+    NOW = BASE + datetime.timedelta(days=9, hours=10)
+    STALE = BASE - datetime.timedelta(days=30)
+
+    def _night(self, day: int) -> datetime.datetime:
+        return BASE + datetime.timedelta(days=day)
+
+    def _many(self) -> Dict[str, Tuple[Optional[int], List[Result]]]:
+        P, F = self.P, self.F
+        return {
+            "m{0:03d}".format(index): (
+                3, [P, F, F, F] if index % 2 == 0 else [P, F, F])
+            for index in range(101)
+        }
+
+    def setUp(self) -> None:
+        super().setUp()
+        records = []  # type: List[RunRecord]
+        marks = {}  # type: Dict[int, List[Tuple[str, str, str, Optional[int]]]]
+        for environment, histories in ((self.ENV, self.HISTORIES),
+                                       (self.MANY, self._many())):
+            for name, (cadence, results) in histories.items():
+                first = self.NIGHTS - len(results)
+                for offset, result in enumerate(results):
+                    records.append(make_record(
+                        environment=environment, test_name=name,
+                        result=result, start=self._night(first + offset)))
+                if cadence is not None:
+                    marks.setdefault(cadence, []).append(
+                        (environment, self.SCRIPT, name, None))
+        self.store.upsert_runs(records)
+        for name in ("alice", "bob"):
+            self.store.ensure_user(name, CREATED)
+        for cadence, tests in sorted(marks.items()):
+            self.store.mark_flaky(tests, cadence, "why", "alice", CREATED)
+        self.store.mute_tests(
+            [(self.ENV, self.SCRIPT, name, storage.MAINLINE_STREAM_ID)
+             for name in self.MUTED],
+            "infra", 24, "bob", "alice", self.NOW - datetime.timedelta(
+                hours=1))
+        for name in self.ASSIGNED:
+            self.store.set_assignee(
+                self.ENV, self.SCRIPT, name, "bob", "alice", CREATED)
+        for name in self.RETIRED:
+            self.store.set_retired(
+                self.ENV, self.SCRIPT, name, True, "alice", "gone", CREATED)
+
+    # -- the oracle: each test's whole history, analytics alone ----------
+
+    def _marks(self) -> Dict[Tuple[str, str, str], int]:
+        out = {}  # type: Dict[Tuple[str, str, str], int]
+        for environment, histories in ((self.ENV, self.HISTORIES),
+                                       (self.MANY, self._many())):
+            for name, (cadence, _results) in histories.items():
+                if cadence is not None:
+                    out[(environment, self.SCRIPT, name)] = cadence
+        return out
+
+    def oracle(self, environment: Optional[str] = None) -> Dict[str, Any]:
+        """Every figure the board shows, by test, from each test's
+        stored history and the pure functions only: no flaky read of
+        storage's is consulted."""
+        marks = self._marks()
+        out = {
+            "new_failures": set(), "still_failing": set(), "fixed": set(),
+            "flaking_new": set(), "flaking_still": set(),
+            "flaky_total": set(), "promoted": set(), "tolerated": set(),
+        }  # type: Dict[str, Set[Tuple[str, str, str]]]
+        states = {}  # type: Dict[Tuple[str, str, str], Any]
+        for row in self.store.dashboard(include_retired=True):
+            if environment is not None and row.environment != environment:
+                continue
+            triple = (row.environment, row.script, row.test_name)
+            runs = [run.result for run in self.store.run_history(
+                row.environment, row.script, row.test_name, limit=1000)]
+            latest = runs[0]
+            prev = runs[1] if len(runs) > 1 else None
+            cadence = marks.get(triple)
+            if cadence is not None:
+                states[triple] = analytics.flaky_state(cadence, runs)
+            if row.test_name in self.RETIRED:
+                continue
+            if cadence is not None:
+                out["flaky_total"].add(triple)
+            muted = row.test_name in self.MUTED
+            if latest is Result.FAIL:
+                if muted:
+                    continue
+                if (cadence is not None
+                        and states[triple].state == "flaking"):
+                    out["flaking_still" if prev is Result.FAIL
+                        else "flaking_new"].add(triple)
+                    continue
+                if prev is not Result.FAIL:
+                    out["new_failures"].add(triple)
+                elif (cadence is not None and analytics.flaky_went_over(
+                        cadence, runs[:cadence + 1])):
+                    out["promoted"].add(triple)
+                    out["new_failures"].add(triple)
+                else:
+                    out["still_failing"].add(triple)
+            elif prev is Result.FAIL:
+                if (cadence is not None and not muted
+                        and not analytics.flaky_fix_counts(
+                            cadence, runs[:cadence + 1])):
+                    out["tolerated"].add(triple)
+                    continue
+                out["fixed"].add(triple)
+        result = dict(out)  # type: Dict[str, Any]
+        result["states"] = states
+        return result
+
+    def _names(self, triples: Any) -> List[str]:
+        return sorted(t[2] for t in triples if t[0] == self.ENV)
+
+
+class FlakyAgreesWithAnalyticsTest(FlakyEstateBase):
+    """WP-44 item 6: the SQL counts and lists agree with the pure
+    functions over every test's whole history: queue_counts, each
+    queue's count and its rows, the headline's figures from
+    ``analytics.summarize_rollup``, and every row's state. On MariaDB
+    with 101 marked tests in one environment (decision 22)."""
+
+    def _cutoff(self) -> datetime.datetime:
+        return self.NOW - datetime.timedelta(hours=36)
+
+    def test_the_hand_reading_of_the_fixture(self) -> None:
+        """The oracle itself, against the design's table, by name."""
+        oracle = self.oracle(self.ENV)
+        self.assertEqual(self._names(oracle["flaking_new"]),
+                         ["t_assigned", "t_flaking_new"])
+        self.assertEqual(self._names(oracle["flaking_still"]),
+                         ["t_flaking_still"])
+        self.assertEqual(self._names(oracle["promoted"]),
+                         ["t_c2_promoted", "t_promoted"])
+        self.assertEqual(
+            self._names(oracle["new_failures"]),
+            ["t_c2_promoted", "t_first", "t_new", "t_promoted"])
+        self.assertEqual(
+            self._names(oracle["still_failing"]),
+            ["t_c2_late", "t_c2_over", "t_exact", "t_over", "t_short",
+             "t_still"])
+        self.assertEqual(self._names(oracle["tolerated"]), ["t_tolerated"])
+        self.assertEqual(
+            self._names(oracle["fixed"]),
+            ["t_fixed", "t_marked_up", "t_muted_tolerated",
+             "t_onlyfail_then_pass", "t_realfix"])
+
+    def test_queue_counts_and_every_queue_agree(self) -> None:
+        oracle = self.oracle()
+        cutoff = self._cutoff()
+        counts = self.store.queue_counts(stale_before=cutoff, now=self.NOW)
+        for kind in ("new_failures", "still_failing", "fixed"):
+            self.assertEqual(counts[kind], len(oracle[kind]), kind)
+            self.assertEqual(
+                self.store.status_queue_count(
+                    kind, stale_before=cutoff, now=self.NOW),
+                len(oracle[kind]), kind)
+            rows = self.store.status_queue(
+                kind, stale_before=cutoff, now=self.NOW)
+            self.assertEqual(
+                sorted((r.environment, r.script, r.test_name) for r in rows),
+                sorted(oracle[kind]), kind)
+        # The open-assignment figures do not move for a mark.
+        self.assertEqual(counts["assigned"], 2)  # t_assigned + a mute's
+        self.assertEqual(
+            counts["muted"], self.store.status_queue_count(
+                "muted", stale_before=cutoff, now=self.NOW))
+
+    def test_the_headline_agrees(self) -> None:
+        oracle = self.oracle()
+        cutoff = self._cutoff()
+        view = self.store.flaky_view(
+            storage.MAINLINE_STREAM_ID, self.NOW, marks=True)
+        estate = analytics.summarize_rollup(
+            self.store.summary_rollup(cutoff), 0,
+            muted=self.store.muted_cells(self.NOW, cutoff),
+            assigned=self.store.assigned_cells(self.NOW),
+            flaky=view.counted, flaky_total=view.marks)
+        status = estate.status
+        self.assertEqual(status.new_failures, len(oracle["new_failures"]))
+        self.assertEqual(status.still_failing, len(oracle["still_failing"]))
+        self.assertEqual(status.fixed, len(oracle["fixed"]))
+        self.assertEqual(status.flaking_new_failures,
+                         len(oracle["flaking_new"]))
+        self.assertEqual(status.flaking_still_failing,
+                         len(oracle["flaking_still"]))
+        self.assertEqual(status.flaking, len(oracle["flaking_new"])
+                         + len(oracle["flaking_still"]))
+        self.assertEqual(status.flaky_total, len(oracle["flaky_total"]))
+        # The pass rate's inputs do not change; the mutes are as before.
+        self.assertEqual(status.results[Result.FAIL],
+                         sum(1 for name, (_c, runs) in self.HISTORIES.items()
+                             if runs[-1] is Result.FAIL
+                             and name not in self.RETIRED) + 101)
+        self.assertEqual(status.muted, 1)
+        by_env = {row.environment: row for row in estate.by_environment}
+        linux = by_env[self.ENV]
+        flaking = [t for t in oracle["flaking_new"] | oracle["flaking_still"]
+                   if t[0] == self.ENV]
+        self.assertEqual(linux.flaking, len(flaking))
+        fails = [name for name, (_c, runs) in self.HISTORIES.items()
+                 if runs[-1] is Result.FAIL and name not in self.RETIRED]
+        self.assertEqual(linux.failed, len(fails) - 1 - len(flaking))
+        # t_assigned is flaking, so it leaves "assigned" (counted once);
+        # t_muted's assignee is beside it, muted.
+        self.assertEqual(linux.assigned, 0)
+        self.assertEqual(
+            linux.new_failures,
+            len([t for t in oracle["new_failures"] if t[0] == self.ENV]))
+
+    def test_every_rows_state_is_the_rules(self) -> None:
+        oracle = self.oracle()
+        cutoff = self._cutoff()
+        seen = 0
+        rows = list(self.store.dashboard(with_flaky=True, now=self.NOW,
+                                         include_retired=True))
+        for kind in storage.QUEUE_KINDS:
+            rows.extend(self.store.status_queue(
+                kind, stale_before=cutoff, now=self.NOW, marks=True))
+        for row in rows:
+            triple = (row.environment, row.script, row.test_name)
+            if triple not in oracle["states"]:
+                self.assertIsNone(row.flaky, triple)
+                continue
+            seen += 1
+            self.assertEqual(row.flaky.state, oracle["states"][triple],
+                             (triple, row))
+            self.assertEqual(row.flaky.mark.cadence,
+                             self._marks()[triple])
+            self.assertEqual(row.flaky.mark.marked_by, "alice")
+        self.assertGreater(seen, 101)
+
+    def test_a_capped_queue_is_exact_at_every_cap(self) -> None:
+        """Over-fetch and drop: the first *limit* rows of each queue are
+        the first *limit* of the whole, in the queue's order."""
+        cutoff = self._cutoff()
+        for kind in ("new_failures", "still_failing", "fixed"):
+            whole = [
+                (r.environment, r.test_name) for r in self.store.status_queue(
+                    kind, stale_before=cutoff, now=self.NOW)]
+            for limit in (1, 2, 3, 5, len(whole)):
+                self.store._invalidate_summary_cache()
+                capped = [
+                    (r.environment, r.test_name)
+                    for r in self.store.status_queue(
+                        kind, limit=limit, stale_before=cutoff,
+                        now=self.NOW)]
+                self.assertEqual(capped, whole[:limit], (kind, limit))
+
+    def test_one_environment_in_scope(self) -> None:
+        oracle = self.oracle(self.ENV)
+        cutoff = self._cutoff()
+        counts = self.store.queue_counts(
+            environment=self.ENV, stale_before=cutoff, now=self.NOW)
+        for kind in ("new_failures", "still_failing", "fixed"):
+            self.assertEqual(counts[kind], len(oracle[kind]), kind)
+        view = self.store.flaky_view(
+            storage.MAINLINE_STREAM_ID, self.NOW, environment=self.ENV, marks=True)
+        self.assertEqual(view.marks, len(oracle["flaky_total"]))
+        self.assertTrue(all(entry.environment == self.ENV
+                            for entry in view.counted))
+
+
+class PromotionTest(FlakyEstateBase):
+    """Decision 25 (design §1 "Going over the cadence", §2 B.3(d)): on
+    the night a marked test goes over its cadence it is a New failure,
+    and Still failing after; cadence 2; N+1 runs or fewer, all FAIL,
+    was over already; a cadence change never makes a test new; the
+    queue row says so with ``prev_result`` FAIL and state failing."""
+
+    def _cutoff(self) -> datetime.datetime:
+        return self.NOW - datetime.timedelta(hours=36)
+
+    def _new(self) -> List[str]:
+        return sorted(
+            row.test_name for row in self.store.status_queue(
+                "new_failures", environment=self.ENV,
+                stale_before=self._cutoff(), now=self.NOW))
+
+    def _still(self) -> List[str]:
+        return sorted(
+            row.test_name for row in self.store.status_queue(
+                "still_failing", environment=self.ENV,
+                stale_before=self._cutoff(), now=self.NOW))
+
+    def test_new_that_night_and_still_after(self) -> None:
+        self.assertIn("t_promoted", self._new())
+        self.assertNotIn("t_promoted", self._still())
+        self.store.upsert_runs([make_record(
+            test_name="t_promoted", result=Result.FAIL,
+            start=self._night(self.NIGHTS))])
+        self.assertNotIn("t_promoted", self._new())
+        self.assertIn("t_promoted", self._still())
+
+    def test_cadence_two(self) -> None:
+        self.assertIn("t_c2_promoted", self._new())
+        self.assertIn("t_c2_over", self._still())
+
+    def test_n_plus_one_runs_or_fewer_were_over_already(self) -> None:
+        for name in ("t_short", "t_exact", "t_over"):
+            self.assertIn(name, self._still())
+            self.assertNotIn(name, self._new())
+
+    def test_a_cadence_change_never_makes_a_test_new(self) -> None:
+        """A cadence change brings no run, so it never makes a test New
+        (design §1): a test it puts over its cadence is Still failing.
+        Read as runs alone, "run N+1 exists and is not a FAIL" would call
+        both of these New tonight: t_flaking_still (P F F) lowered from 3
+        to 2, and t_c2_late (P F F F, over at 2 since the night before)
+        raised to 3. Their latest runs are older than the change."""
+        self.assertIn("t_c2_late", self._still())
+        for name, cadence in (("t_flaking_still", 2), ("t_c2_late", 3)):
+            self.store.mark_flaky(
+                [(self.ENV, self.SCRIPT, name, None)], cadence, None, "bob",
+                self.NOW)
+            self.assertIn(name, self._still())
+            self.assertNotIn(name, self._new())
+        # The next run that keeps it over is not the night either...
+        self.store.upsert_runs([make_record(
+            test_name="t_c2_late", result=Result.FAIL,
+            start=self._night(self.NIGHTS))])
+        self.assertIn("t_c2_late", self._still())
+        # ...and a test whose newest N+1 all failed is never New.
+        for cadence in (4, 2):
+            self.store.mark_flaky(
+                [(self.ENV, self.SCRIPT, "t_over", None)], cadence, None,
+                "bob", self.NOW)
+            self.assertIn("t_over", self._still())
+            self.assertNotIn("t_over", self._new())
+
+    def test_a_mark_on_a_failing_test_does_not_make_it_new(self) -> None:
+        """The same for a fresh mark: an unmarked test failing since the
+        night before (t_still, F F) and one over a cadence it is now
+        given (P F F at 2) stay where they were."""
+        self.store.upsert_runs([
+            make_record(test_name="t_late", result=result,
+                        start=self._night(day))
+            for day, result in ((6, self.P), (7, self.F), (8, self.F))])
+        self.assertIn("t_late", self._still())
+        self.store.mark_flaky(
+            [(self.ENV, self.SCRIPT, name, None)
+             for name in ("t_still", "t_late")], 2, "why", "bob", self.NOW)
+        self.assertIn("t_late", self._still())
+        self.assertIn("t_still", self._still())
+        self.assertNotIn("t_late", self._new())
+
+    def test_the_queue_row_says_flaking_to_fail(self) -> None:
+        rows = {row.test_name: row for row in self.store.status_queue(
+            "new_failures", environment=self.ENV,
+            stale_before=self._cutoff(), now=self.NOW)}
+        promoted = rows["t_promoted"]
+        self.assertIs(promoted.prev_result, Result.FAIL)
+        self.assertEqual(promoted.flaky.state,
+                         storage.FlakyState("failing", 3, 3))
+        first = rows["t_first"]
+        self.assertIsNone(first.prev_result)
+        self.assertEqual(first.flaky.state,
+                         storage.FlakyState("failing", 1, 1))
+        self.assertIsNone(rows["t_new"].flaky)
+
+    def test_homes_delta_follows(self) -> None:
+        """The delta is new_failures - fixed: a promotion moves it up,
+        a flaking failure and a tolerated pass leave it alone."""
+        cutoff = self._cutoff()
+        counts = self.store.queue_counts(
+            environment=self.ENV, stale_before=cutoff, now=self.NOW)
+        self.assertEqual(counts["new_failures"] - counts["fixed"], 4 - 5)
+        self.store.unmark_flaky(
+            [(self.ENV, self.SCRIPT, name) for name in self.HISTORIES],
+            "bob", self.NOW)
+        counts = self.store.queue_counts(
+            environment=self.ENV, stale_before=cutoff, now=self.NOW)
+        # Unmarked: t_flaking_new and t_assigned are new; the promotions
+        # are still failing; t_tolerated's pass is a fix.
+        self.assertEqual(counts["new_failures"] - counts["fixed"],
+                         (4 - 2 + 2) - (5 + 1))
+
+    def test_the_bound_list_and_the_widened_read_agree(self) -> None:
+        """Above the backend's parameter ceiling the New failures queue
+        widens to every marked test and keeps P (design §6: a test
+        plants the ceiling). Same rows, same order, at every cap."""
+        cutoff = self._cutoff()
+
+        def queue(limit: Optional[int]) -> List[str]:
+            self.store._invalidate_summary_cache()
+            return [row.test_name for row in self.store.status_queue(
+                "new_failures", limit=limit, stale_before=cutoff,
+                now=self.NOW)]
+
+        bound = queue(None)
+        self.assertEqual(
+            len([n for n in bound if n.startswith("m")]), 51)
+        self.store._backend.max_bound_parameters = 50
+        try:
+            self.assertEqual(queue(None), bound)
+            for limit in (1, 4, 10, 60):
+                self.assertEqual(queue(limit), bound[:limit], limit)
+        finally:
+            del self.store._backend.max_bound_parameters
+        if isinstance(self.store._backend, storage._SqliteBackend):
+            self.assertEqual(self.store._backend.max_bound_parameters,
+                             storage._SqliteBackend.max_bound_parameters)
+
+
+class FixedRuleTest(FlakyEstateBase):
+    """Decision 3 (design §2 B.1): a marked, unmuted, unretired test
+    passing after a FAIL is fixed only if runs 2 to N+1 of its newest
+    N+1 all FAIL, or all it had; otherwise it is in no Fixed figure,
+    queue or delta."""
+
+    def _fixed(self) -> List[str]:
+        return sorted(
+            row.test_name for row in self.store.status_queue(
+                "fixed", environment=self.ENV,
+                stale_before=self.NOW - datetime.timedelta(hours=36),
+                now=self.NOW))
+
+    def test_a_pass_after_a_tolerated_failure_is_not_a_fix(self) -> None:
+        self.assertNotIn("t_tolerated", self._fixed())
+
+    def test_a_pass_after_being_over_is_a_fix(self) -> None:
+        fixed = self._fixed()
+        for name in ("t_realfix", "t_onlyfail_then_pass", "t_marked_up",
+                     "t_fixed"):
+            self.assertIn(name, fixed)
+
+    def test_a_live_mute_wins(self) -> None:
+        self.assertIn("t_muted_tolerated", self._fixed())
+        # Once the mute has run out, the mark's rule applies.
+        later = self.NOW + datetime.timedelta(days=2)
+        self.assertNotIn("t_muted_tolerated", [
+            row.test_name for row in self.store.status_queue(
+                "fixed", environment=self.ENV,
+                stale_before=later - datetime.timedelta(hours=36),
+                now=later)])
+        self.assertEqual(
+            self.store.status_queue_count(
+                "fixed", environment=self.ENV,
+                stale_before=later - datetime.timedelta(hours=36),
+                now=later), 4)
+
+    def test_the_pure_rule(self) -> None:
+        F, P, UP = self.F, self.P, self.UP
+        for cadence in range(2, 11):
+            self.assertTrue(analytics.flaky_fix_counts(cadence, [P, F]))
+            self.assertTrue(analytics.flaky_fix_counts(
+                cadence, [P] + [F] * cadence + [P]))
+            self.assertFalse(analytics.flaky_fix_counts(
+                cadence, [P] + [F] * (cadence - 1) + [P]))
+            self.assertFalse(analytics.flaky_fix_counts(
+                cadence, [UP, F, UP] + [F] * cadence))
+        self.assertTrue(analytics.flaky_fix_counts(3, []))
+
+    def test_the_went_over_rule(self) -> None:
+        F, P = self.F, self.P
+        for cadence in range(2, 11):
+            self.assertTrue(analytics.flaky_went_over(
+                cadence, [F] * cadence + [P]))
+            self.assertFalse(analytics.flaky_went_over(
+                cadence, [F] * (cadence + 1)))
+            self.assertFalse(analytics.flaky_went_over(
+                cadence, [F] * cadence))
+            self.assertFalse(analytics.flaky_went_over(
+                cadence, [F] * (cadence - 1) + [P, F]))
+
+
+class FlakyStatementsTest(FlakyEstateBase):
+    """The cache guards of the flaky reads (design §2 B.7), by
+    sqlite3's trace (excluded on MariaDB, whose values the classes
+    above compare): Q1, Qc and one Q2 per 100 tests cold, nothing warm;
+    after an act Q1 and Qc again but no Q2; the rows' join only where a
+    mark exists and never on a count."""
+
+    def _statements(self, call: Callable[[], Any]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            call()
+        finally:
+            conn.set_trace_callback(None)
+        return [" ".join(s.split()) for s in seen
+                if s.strip().upper().startswith("SELECT")]
+
+    def _view(self) -> Any:
+        return self.store.flaky_view(
+            storage.MAINLINE_STREAM_ID, self.NOW, marks=True)
+
+    def _prime(self) -> None:
+        """What every summary read has made before the view: the mute
+        epoch (which carries the bit) and the stream's environments."""
+        self.store.flaky_marks_exist(storage.MAINLINE_STREAM_ID, self.NOW)
+        self.store._stream_environment_names(storage.MAINLINE_STREAM_ID)
+
+    def test_cold_q1_qc_and_a_q2_per_hundred_warm_nothing(self) -> None:
+        self.store._invalidate_summary_cache()
+        self.store._cadence_runs_cache.clear()
+        self._prime()
+        cold = self._statements(self._view)
+        q1 = [s for s in cold if "CROSS JOIN test_flaky_marks" in s]
+        qc = [s for s in cold if "FROM test_flaky_marks AS fm CROSS" in s]
+        q2 = [s for s in cold if "FROM runs" in s]
+        self.assertEqual((len(q1), len(qc)), (1, 1), cold)
+        # 101 in env-many, 7 on linux-sim and 4 fix candidates: two.
+        self.assertEqual(len(q2), 2, cold)
+        self.assertEqual(len(cold), 4, cold)
+        self.assertEqual(self._statements(self._view), [])
+
+    def test_after_an_act_q1_and_qc_but_no_q2(self) -> None:
+        self._view()
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "t_new", "bob", "alice", CREATED)
+        self._prime()
+        after = self._statements(self._view)
+        self.assertEqual(len(after), 2, after)
+        self.assertFalse([s for s in after if "FROM runs" in s])
+
+    def test_a_push_to_one_environment_rereads_that_one(self) -> None:
+        self._view()
+        self.store.upsert_runs([make_record(
+            environment=self.MANY, test_name="m000", result=Result.FAIL,
+            start=self._night(self.NIGHTS))])
+        self._prime()
+        after = self._statements(self._view)
+        q1 = [s for s in after if "CROSS JOIN test_flaky_marks" in s]
+        self.assertEqual(len(q1), 1, after)
+        self.assertIn("lr.environment IN (", q1[0])
+        # linux-sim's states are its memo's; env-many's 101 and the
+        # candidates' are read again.
+        self.assertEqual(len([s for s in after if "FROM runs" in s]), 2)
+
+    def test_with_no_mark_nothing_is_read(self) -> None:
+        self.store.unmark_flaky(
+            [triple for triple in self._marks()], "bob", self.NOW)
+        self._prime()
+        self.assertEqual(self._statements(self._view), [])
+        self.assertIsNone(self._view())
+
+    def test_unfiltered_rows_never_run_q1(self) -> None:
+        """The rows read their marks by a join and the state from their
+        own result pair; only FAIL after FAIL at 3 to 10 reads runs, once
+        for the page."""
+        self.store._invalidate_summary_cache()
+        self.store._cadence_runs_cache.clear()
+        seen = self._statements(lambda: self.store.dashboard(
+            with_flaky=True, limit=250, now=self.NOW))
+        self.assertEqual(len(seen), 1 + 2, seen)
+        self.assertIn("LEFT JOIN test_flaky_marks AS fm", seen[0])
+        self.assertFalse([s for s in seen
+                          if "CROSS JOIN test_flaky_marks" in s])
+        count = self._statements(lambda: self.store.dashboard_count(
+            now=self.NOW))
+        self.assertEqual(len(count), 1)
+        self.assertNotIn("flaky", count[0].lower())
+        # The page's runs are memoized: a second page costs the rows.
+        again = self._statements(lambda: self.store.dashboard(
+            with_flaky=True, limit=250, now=self.NOW))
+        self.assertEqual(len(again), 1, again)
+
+    def test_the_new_failures_queue_binds_p(self) -> None:
+        cutoff = self.NOW - datetime.timedelta(hours=36)
+        self._view()
+        rows = self._statements(lambda: self.store.status_queue(
+            "new_failures", stale_before=cutoff, now=self.NOW, marks=True))
+        self.assertEqual(len(rows), 1, rows)
+        # The trace shows the statement with its values bound.
+        self.assertIn(
+            "(lr.environment, lr.script, lr.test_name) IN (VALUES (", rows[0])
+        self.assertEqual(rows[0].count("', 'suite.py', '"), 51 + 2)
+        counts = self._statements(lambda: self.store.status_queue_count(
+            "new_failures", stale_before=cutoff, now=self.NOW))
+        self.assertEqual(len(counts), 1, counts)
+        self.assertNotIn("JOIN TEST_FLAKY_MARKS", counts[0].upper())
+
+    def test_the_lists_read_q1_and_a_q2_per_hundred_cold_none_warm(
+            self) -> None:
+        """WP-44 item 8 (design §2 B.7): Open Actions and browse with
+        Failing or Flaking, cold, are their two statements (rows and
+        count; by keys, the keys and the page) plus Q1 and one Q2 per 100
+        tests (here 101 in env-many and linux-sim's: two). Q1's memo is
+        kept for the environments that hold a mark: called alone, one
+        read of the marks' key finds them; after /api/dashboard's
+        products read (which carries them) none does, and the stream's
+        environment list is read by neither. Warm, the two. Failing and
+        Flaking together read no Q1."""
+        reads = {
+            "open": lambda: self.store.dashboard_page(
+                open_items=True, with_flaky=True, limit=100, now=self.NOW),
+            "fail": lambda: self.store.dashboard_page(
+                results=[Result.FAIL], flaking=False, with_flaky=True,
+                limit=250, now=self.NOW),
+            "flaking": lambda: self.store.dashboard_page(
+                results=[Result.FAIL], flaking=True, with_flaky=True,
+                limit=250, now=self.NOW),
+        }  # type: Dict[str, Callable[[], Any]]
+        for name, read in reads.items():
+            self.store._invalidate_summary_cache()
+            self.store._cadence_runs_cache.clear()
+            cold = self._statements(read)
+            q1 = [s for s in cold if "CROSS JOIN test_flaky_marks" in s]
+            q2 = [s for s in cold if "FROM runs" in s]
+            names = [s for s in cold
+                     if s.startswith("SELECT DISTINCT environment FROM")]
+            self.assertEqual((len(q1), len(q2), len(names)), (1, 2, 1),
+                             (name, cold))
+            self.assertEqual(
+                names[0], "SELECT DISTINCT environment FROM test_flaky_marks")
+            self.assertEqual(len(cold), 2 + 4, (name, cold))
+            self.assertEqual(len(self._statements(read)), 2, name)
+            # After the products read that carries the marked
+            # environments: Q1 and the Q2s only.
+            self.store._invalidate_summary_cache()
+            self.store._cadence_runs_cache.clear()
+            self.store.environment_products_and_marks()
+            carried = self._statements(read)
+            self.assertFalse([s for s in carried if "DISTINCT environment"
+                              in s], (name, carried))
+            self.assertEqual(len(carried), 2 + 3, (name, carried))
+        self.store._invalidate_summary_cache()
+        both = self._statements(lambda: self.store.dashboard_page(
+            results=[Result.FAIL], with_flaky=True, limit=250, now=self.NOW))
+        self.assertFalse([s for s in both
+                          if "CROSS JOIN test_flaky_marks" in s], both)
+
+    def test_after_a_home_load_the_lists_read_no_runs(self) -> None:
+        """WP-44 item 8: the assigned queue, My actions and
+        Open Actions, after the headline's view, read no Q2, a muted test
+        (t_muted, P F F at 3, assigned by its mute) included: the view
+        decides an un-retired muted test too, and counts it nowhere."""
+        cutoff = self.NOW - datetime.timedelta(hours=36)
+        self.store._invalidate_summary_cache()
+        self.store._cadence_runs_cache.clear()
+        self._prime()
+        self._view()
+        self.store._cadence_runs_cache.clear()  # the memo alone serves
+        reads = (
+            lambda: self.store.status_queue(
+                "assigned", stale_before=cutoff, now=self.NOW, marks=True),
+            lambda: self.store.status_queue(
+                "assigned", assignee="bob", stale_before=cutoff,
+                now=self.NOW, marks=True),
+            lambda: self.store.dashboard_page(
+                open_items=True, with_flaky=True, limit=100, now=self.NOW),
+            lambda: self.store.dashboard_page(
+                results=[Result.FAIL], flaking=True, with_flaky=True,
+                limit=250, now=self.NOW),
+        )
+        for read in reads:
+            seen = self._statements(read)
+            self.assertFalse([s for s in seen if "FROM runs" in s], seen)
+        muted = [row for row in self.store.status_queue(
+            "assigned", stale_before=cutoff, now=self.NOW, marks=True)
+            if row.test_name == "t_muted"]
+        self.assertEqual(muted[0].flaky.state.state, "flaking")
+
+    def test_the_lists_ask_no_runs_a_pair_decides(self) -> None:
+        """Open Actions cold reads runs only for a FAIL after a FAIL at a
+        cadence of 3 to 10: at 2 the pair says "failing", and only
+        whether it went over tonight, which no list asks, needs runs."""
+        asked = []  # type: List[Tuple[str, str, str]]
+        real = self.store._cadence_runs_iso
+
+        def spy(stream_id: int, tests: Any, floor: Any = None) -> Any:
+            asked.extend((t[0], t[1], t[2]) for t in tests)
+            return real(stream_id, tests, floor)
+
+        self.store._cadence_runs_iso = spy  # type: ignore
+        try:
+            self.store._invalidate_summary_cache()
+            self.store._cadence_runs_cache.clear()
+            rows = self.store.dashboard_page(
+                open_items=True, with_flaky=True, environment=self.ENV,
+                now=self.NOW)[0]
+        finally:
+            del self.store._cadence_runs_iso  # type: ignore
+        names = sorted(t[2] for t in asked)
+        self.assertTrue(names)
+        self.assertFalse([n for n in names if n.startswith("t_c2_")], names)
+        self.assertNotIn("t_retired", names)
+        states = {row.test_name: row.flaky.state for row in rows
+                  if row.flaky is not None}
+        oracle = self.oracle(self.ENV)["states"]
+        for name, state in states.items():
+            self.assertEqual(state, oracle[(self.ENV, self.SCRIPT, name)])
+
+    #: The Flaking queue's rows read (item 14): the capped keys by the
+    #: partition's primary key, nothing else of latest_runs. SQLite's
+    #: spelling since item 16 (this class runs on SQLite only): the keys
+    #: drive the read.
+    QUEUE_ROWS_READ = ") AS k CROSS JOIN latest_runs AS lr ON "
+
+    def _flaking_queue(self) -> Any:
+        """The queue part's two calls for ``queue=flaking``: the count
+        (which carries the bit) and the rows at the queue's cap."""
+        total, marked = self.store.status_queue_count_and_marks(
+            storage.FLAKING_QUEUE, now=self.NOW)
+        rows = self.store.status_queue(
+            storage.FLAKING_QUEUE, limit=500, with_latest_comment=True,
+            now=self.NOW, marks=marked)
+        return total, rows
+
+    def test_the_flaking_queue_reads_its_view_and_its_rows_by_key(
+            self) -> None:
+        """Item 14 (design §14) widens item 11's tab guard, whose marks
+        read and runs read at 20 no longer exist: cold, the bit (the
+        mute epoch's statement), the marked environments, Q1, Q2 at N+1
+        (101 FAIL-after-FAIL tests in env-many and more on linux-sim:
+        two) and ONE rows statement for the 53 keys, by key; no count
+        statement and no other runs read. After the headline's view, the
+        rows statement alone; warm, nothing."""
+        self.store._invalidate_summary_cache()
+        self.store._cadence_runs_cache.clear()
+        cold = self._statements(self._flaking_queue)
+        self.assertIn("(SELECT MIN(environment) FROM test_flaky_marks)",
+                      cold[0])
+        self.assertEqual(
+            cold[1], "SELECT DISTINCT environment FROM test_flaky_marks")
+        self.assertEqual(
+            len([s for s in cold if "CROSS JOIN test_flaky_marks" in s]), 1,
+            cold)
+        self.assertEqual(len([s for s in cold if "FROM runs" in s]), 2, cold)
+        self.assertEqual(len([s for s in cold if "LIMIT 4" in s]), 2, cold)
+        rows = [s for s in cold if self.QUEUE_ROWS_READ in s]
+        self.assertEqual(len(rows), 1, cold)
+        self.assertEqual(rows, [cold[-1]])
+        self.assertFalse([s for s in cold if "COUNT(" in s.upper()], cold)
+        self.assertEqual(len(cold), 6, cold)
+        self.assertEqual(self._statements(self._flaking_queue), [])
+        self.store._invalidate_summary_cache()
+        self._prime()
+        self._view()
+        after = self._statements(self._flaking_queue)
+        self.assertEqual(len(after), 1, after)
+        self.assertIn(self.QUEUE_ROWS_READ, after[0])
+
+    def test_the_flaking_queue_rows_are_one_statement_per_250_keys(
+            self) -> None:
+        """At a planted ceiling of 31 bound parameters, ten keys a
+        statement: the 53 flaking tests are six rows statements, the
+        same rows in the same order (at the default ceiling, one: the
+        test above)."""
+        whole = self.store.status_queue(
+            storage.FLAKING_QUEUE, now=self.NOW, marks=True)
+        self.assertEqual(len(whole), 53)
+        self.store._invalidate_summary_cache()
+        self._view()
+        self.store.status_queue(
+            storage.FLAKING_QUEUE, limit=1, now=self.NOW, marks=True)
+        self.store._backend.max_bound_parameters = 31  # type: ignore
+        try:
+            seen = self._statements(lambda: self.store.status_queue(
+                storage.FLAKING_QUEUE, now=self.NOW, marks=True))
+            chunked = self.store.status_queue(
+                storage.FLAKING_QUEUE, now=self.NOW, marks=True)
+        finally:
+            del self.store._backend.max_bound_parameters  # type: ignore
+        self.assertEqual(len(seen), 6, seen)
+        self.assertEqual(chunked, whole)
+
+    def test_the_keys_driven_read_refuses_a_join_of_another_shape(
+            self) -> None:
+        """Item 16: SQLite's keys-driven read replaces the join's leading
+        ``FROM latest_runs AS lr`` with ``k CROSS JOIN latest_runs``, so
+        a join that starts otherwise is refused at once with a
+        ValueError, never spliced into a wrong statement. Both real
+        callers' joins (Open Actions' and the Flaking queue's, with and
+        without the marks) are accepted and run."""
+        key = (self.ENV, self.SCRIPT, "t_flaking_new")
+        columns = self.store._STATUS_COLUMNS
+        flaky = self.store._LATEST_JOIN + " " + self.store._FLAKY_JOIN
+        for join in (self.store._LATEST_JOIN, flaky):
+            sql, params = self.store._keys_driven_rows(
+                storage.MAINLINE_STREAM_ID, [key], columns, join)
+            rows = self.store._conn().execute(sql, params).fetchall()
+            self.assertEqual([tuple(row[:3]) for row in rows], [key])
+        for join in (
+                self.store._LATEST_COUNT_JOIN.replace(
+                    "FROM latest_runs AS lr ", "FROM latest_runs lr "),
+                "FROM runs AS r JOIN latest_runs AS lr "
+                "ON lr.run_id = r.id",
+                " " + self.store._LATEST_JOIN,
+                self.store._FLAKY_JOIN):
+            with self.assertRaises(ValueError) as caught:
+                self.store._keys_driven_rows(
+                    storage.MAINLINE_STREAM_ID, [key], columns, join)
+            self.assertIn("reads latest_runs AS lr first",
+                          str(caught.exception))
+
+    def test_the_keys_driven_read_stays_under_the_compound_limit(
+            self) -> None:
+        """Item 16: SQLite refuses a compound select of more than 500
+        arms (``SQLITE_MAX_COMPOUND_SELECT``, default 500), and the keys
+        drive the read as one arm a key. So no statement may carry more
+        than 250 arms whatever the ceiling on bound parameters: at the
+        default, planted high (a million, and None, MariaDB's "no
+        ceiling") and planted low (31: ten a statement). 1,001 keys, the
+        stream's real ones and made-up ones, give the same rows in the
+        same order at every ceiling; counted on the statements run."""
+        real = [tuple(row) for row in self.store._conn().execute(
+            "SELECT environment, script, test_name FROM latest_runs "
+            "WHERE stream_id = ? ORDER BY test_name DESC",
+            (storage.MAINLINE_STREAM_ID,)).fetchall()]
+        keys = real + [("env-none", "s.py", "missing{0:04d}".format(index))
+                       for index in range(1001 - len(real))]
+        self.assertEqual(len(keys), 1001)
+        unset = object()
+        answers = []  # type: List[Any]
+        for ceiling, most in ((unset, 250), (10 ** 6, 250), (None, 250),
+                              (31, 10)):
+            if ceiling is not unset:
+                self.store._backend.max_bound_parameters = (  # type: ignore
+                    ceiling)
+            try:
+                found = []  # type: List[Any]
+                seen = self._statements(lambda: found.extend(
+                    self.store._rows_by_key(
+                        storage.MAINLINE_STREAM_ID, keys,
+                        self.store._STATUS_COLUMNS,
+                        self.store._LATEST_JOIN)))
+            finally:
+                if ceiling is not unset:
+                    del self.store._backend.max_bound_parameters  # type: ignore
+            arms = [s.count(" UNION ALL ") + 1 for s in seen]
+            self.assertTrue(all(") AS k CROSS JOIN latest_runs AS lr ON "
+                                in s for s in seen), ceiling)
+            self.assertEqual(sum(arms), 1001, (ceiling, arms))
+            self.assertEqual(max(arms), most, (ceiling, arms))
+            self.assertLessEqual(max(arms), 250, (ceiling, arms))
+            answers.append([tuple(row[:3]) for row in found])
+        self.assertEqual(answers[0], real)
+        for answer in answers[1:]:
+            self.assertEqual(answer, answers[0])
+
+    def test_with_no_mark_the_flaking_queue_reads_the_bit_alone(
+            self) -> None:
+        """No marks: the mute epoch's statement, which carries the bit
+        and which every failing queue kind reads; then nothing."""
+        self.store.unmark_flaky(list(self._marks()), "bob", self.NOW)
+        self.store._invalidate_summary_cache()
+        cold = self._statements(self._flaking_queue)
+        self.assertEqual(len(cold), 1, cold)
+        self.assertIn("FROM test_mutes WHERE stream_id = ", cold[0])
+        self.assertEqual(self._statements(self._flaking_queue), [])
+        self.assertEqual(self._flaking_queue(), (0, []))
+
+    def test_the_trend_reads_once_and_the_runs_before_its_window(
+            self) -> None:
+        self._prime()
+        cold = self._statements(lambda: self.store.daily_flaking_failures(
+            BASE + datetime.timedelta(days=8), self.NOW))
+        self.assertEqual(len([s for s in cold if "CROSS JOIN runs AS r"
+                              in s]), 1, cold)
+        # Every marked test whose first run in the window failed: over
+        # 100 of them, two statements.
+        self.assertEqual(len(cold), 3, cold)
+        self.assertEqual(self._statements(
+            lambda: self.store.daily_flaking_failures(
+                BASE + datetime.timedelta(days=8), self.NOW)), [])
+
+
+class FlakyPlanTest(FlakyEstateBase):
+    """Every statement on the marks table pins its driving side (design
+    §6): an inner join let SQLite scan latest_runs, 1.4 ms against
+    0.024. On SQLite by EXPLAIN QUERY PLAN; on MariaDB by EXPLAIN, so a
+    wrong plan on CI's 10.3 legs fails here by name (item 6h, the
+    STRAIGHT_JOIN hook, exists only if one does).
+
+    MariaDB plans by its estimates, so the estate is given production's
+    shape first: far more tests than marks (1,200 more passing tests
+    here, unmarked, against about 120 marks). On the bare fixture, with
+    as many marks as tests, 12.3 reasonably reads latest_runs whole; at
+    any real ratio that plan is a scan of the partition, and it is what
+    these guards refuse."""
+
+    WIDE = 1200
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(environment="env-wide", test_name="w{0:05d}".format(
+                index), start=self._night(self.NIGHTS - 1))
+            for index in range(self.WIDE)])
+
+    #: How each statement may read latest_runs on MariaDB: by its key
+    #: from a mark (eq_ref/ref on the primary key or the triple index),
+    #: or, for Q1, the stream's FAIL range. Anything else (ALL, index,
+    #: a range of the partition by its key) reads the stream whole.
+    _BY_KEY = (("eq_ref", "PRIMARY"), ("eq_ref", "idx_latest_runs_triple"),
+               ("ref", "idx_latest_runs_triple"))
+
+    def _captured(self, call: Callable[[], Any]) -> List[Tuple[str, List[Any]]]:
+        captured = []  # type: List[Tuple[str, List[Any]]]
+        store = self.store
+        real = store._conn
+
+        class Spy(object):
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                captured.append((sql, list(params)))
+                return self._conn.execute(sql, params)
+
+        store._conn = lambda: Spy(real())  # type: ignore
+        try:
+            call()
+        finally:
+            del store._conn  # type: ignore
+        return captured
+
+    def _statement(self, call: Callable[[], Any], marker: str
+                   ) -> Tuple[str, List[Any]]:
+        found = [c for c in self._captured(call) if marker in c[0]]
+        self.assertEqual(len(found), 1, [c[0][:80] for c in found])
+        return found[0]
+
+    def _mariadb(self) -> bool:
+        return not isinstance(self.store._backend, storage._SqliteBackend)
+
+    def _explain(self, sql: str, params: List[Any]) -> List[Any]:
+        if self._mariadb():
+            return list(self.store._conn().execute(
+                "EXPLAIN " + sql, params).fetchall())
+        return [str(row[-1]).upper() for row in self.store._conn().execute(
+            "EXPLAIN QUERY PLAN " + sql, params).fetchall()]
+
+    def _q1(self) -> Tuple[str, List[Any]]:
+        self.store._invalidate_summary_cache()
+        return self._statement(
+            lambda: self.store._flaky_failing(storage.MAINLINE_STREAM_ID),
+            "CROSS JOIN test_flaky_marks")
+
+    def _qc(self) -> Tuple[str, List[Any]]:
+        self.store._invalidate_summary_cache()
+        return self._statement(
+            lambda: self.store._flaky_marked(storage.MAINLINE_STREAM_ID),
+            "FROM test_flaky_marks AS fm CROSS JOIN")
+
+    def test_q1_starts_from_the_streams_fail_rows(self) -> None:
+        sql, params = self._q1()
+        plan = self._explain(sql, params)
+        if self._mariadb():
+            for row in plan:
+                table, kind, key = row[2], row[3], row[5]
+                if table == "lr":
+                    self.assertTrue(
+                        (kind, key) in self._BY_KEY
+                        or (kind in ("range", "ref")
+                            and key == "idx_latest_runs_result"),
+                        "Q1 reads latest_runs by {0} ({1}), neither the "
+                        "stream's FAIL range nor its key from each mark: "
+                        "{2}".format(key, kind, plan))
+                if table == "fm":
+                    self.assertTrue(
+                        kind in ("eq_ref", "ALL", "index"),
+                        "Q1 reaches the marks by {0}: {1}".format(
+                            kind, plan))
+            # The mark's newest act: its history by the triple index.
+            history = [row for row in plan if row[2] == "h"]
+            self.assertEqual(len(history), 1, plan)
+            self.assertEqual(
+                (history[0][3], history[0][5]),
+                ("ref", "idx_flaky_mark_history_triple"),
+                "Q1 reads the mark's history by {0} ({1}): {2}".format(
+                    history[0][5], history[0][3], plan))
+            return
+        lr = [line for line in plan if " LR " in line + " "]
+        fm = [line for line in plan if " FM " in line + " "]
+        history = [line for line in plan if " H " in line + " "]
+        self.assertEqual(len(history), 1, plan)
+        self.assertTrue(history[0].startswith("SEARCH"), plan)
+        self.assertIn("IDX_FLAKY_MARK_HISTORY_TRIPLE", history[0], plan)
+        self.assertTrue(lr and lr[0].startswith("SEARCH"), plan)
+        self.assertIn("IDX_LATEST_RUNS_RESULT", lr[0], plan)
+        self.assertTrue(fm and fm[0].startswith("SEARCH"), plan)
+        self.assertIn("TEST_FLAKY_MARKS", fm[0], plan)
+        self.assertLess(plan.index(lr[0]), plan.index(fm[0]), plan)
+
+    def test_qc_starts_from_the_marks(self) -> None:
+        sql, params = self._qc()
+        plan = self._explain(sql, params)
+        if self._mariadb():
+            lr_rows = [row for row in plan if row[2] == "lr"]
+            self.assertEqual(len(lr_rows), 2, plan)
+            for row in lr_rows:
+                self.assertIn(
+                    (row[3], row[5]), self._BY_KEY,
+                    "Qc reads latest_runs by {0} ({1}), not by its key "
+                    "from each mark: {2}".format(row[5], row[3], plan))
+            return
+        lr = [line for line in plan if " LR " in line + " "]
+        self.assertEqual(len(lr), 2, plan)
+        for line in lr:
+            self.assertTrue(line.startswith("SEARCH"), plan)
+            self.assertIn("SQLITE_AUTOINDEX_LATEST_RUNS_1", line, plan)
+
+    def test_the_rows_join_reaches_each_mark_by_its_key(self) -> None:
+        cutoff = self.NOW - datetime.timedelta(hours=36)
+        reads = (
+            (lambda: self.store.dashboard(
+                with_flaky=True, limit=250, now=self.NOW)),
+            (lambda: self.store.status_queue(
+                "new_failures", stale_before=cutoff, now=self.NOW,
+                marks=True)),
+        )
+        for read in reads:
+            self.store._invalidate_summary_cache()
+            sql, params = self._statement(
+                read, "LEFT JOIN test_flaky_marks AS fm")
+            plan = self._explain(sql, params)
+            if self._mariadb():
+                fm = [row for row in plan if row[2] == "fm"]
+                self.assertEqual(len(fm), 1, plan)
+                self.assertEqual((fm[0][3], fm[0][5]), ("eq_ref", "PRIMARY"),
+                                 plan)
+                continue
+            fm = [line for line in plan if " FM " in line + " "]
+            self.assertTrue(fm and fm[0].startswith("SEARCH"), plan)
+            self.assertIn("TEST_FLAKY_MARKS", fm[0], plan)
+
+    def test_the_bit_is_a_read_of_the_marks_key(self) -> None:
+        for statement in (
+                "SELECT MIN(environment) FROM test_flaky_marks",):
+            plan = self._explain(statement, [])
+            if self._mariadb():
+                self.assertIn("optimized away", str(plan[0][-1]), plan)
+                continue
+            for line in plan:
+                self.assertFalse(line.startswith("SCAN"), plan)
+
+    # -- WP-44 item 8: the lists' reads ----------------------------------
+
+    def _lr_by_key_or_range(self, plan: List[Any], what: str) -> None:
+        """No read of latest_runs is a scan: on SQLite every ``lr`` line
+        is a SEARCH; on MariaDB no ``lr`` row reads ALL or a full index."""
+        if self._mariadb():
+            for row in plan:
+                if row[2] == "lr":
+                    self.assertNotIn(
+                        row[3], ("ALL", "index"),
+                        "{0} reads latest_runs whole: {1}".format(
+                            what, plan))
+            return
+        lr = [line for line in plan if " LR " in line + " "]
+        self.assertTrue(lr, (what, plan))
+        for line in lr:
+            self.assertTrue(line.startswith("SEARCH"), (what, plan))
+
+    def _sqlite_fail_range(self, plan: List[Any], what: str) -> None:
+        """SQLite only: a statement whose row-value term is a filter
+        reaches ``lr`` by the stream's FAIL range, never by the term and
+        never by ``stream_id`` alone; the message names the version."""
+        note = ("{0} on SQLite {1}".format(what, sqlite3.sqlite_version),
+                plan)
+        lr = [line for line in plan if " LR " in line + " "]
+        self.assertEqual(len(lr), 1, note)
+        self.assertTrue(lr[0].startswith("SEARCH"), note)
+        self.assertIn("IDX_LATEST_RUNS_RESULT (STREAM_ID=? AND RESULT=?)",
+                      lr[0], note)
+
+    def test_the_filter_terms_keep_the_fail_range(self) -> None:
+        """Browse with Failing and with Flaking: the F term reads ``lr``
+        alone and leaves the rows and the count on the stream's FAIL
+        range (design §3c), and the count joins no mark.
+
+        Item 16 widens it: :meth:`_lr_by_key_or_range` accepts any
+        SEARCH, which a read of the stream's whole partition is (CI's
+        SQLite 3.26 read the keyed rows so). On SQLite each statement
+        must now reach ``lr`` by ``idx_latest_runs_result`` on the
+        stream and FAIL; MariaDB's assertion is unchanged."""
+        for flaking in (False, True):
+            for marker in ("SELECT COUNT(*)", "LEFT JOIN test_flaky_marks"):
+                self.store._invalidate_summary_cache()
+                sql, params = self._statement(
+                    lambda: self.store.dashboard_page(
+                        results=[Result.FAIL], flaking=flaking,
+                        with_flaky=True, limit=250, now=self.NOW),
+                    marker)
+                self.assertIn("(lr.environment, lr.script, lr.test_name) IN",
+                              sql)
+                if marker == "SELECT COUNT(*)":
+                    self.assertNotIn("TEST_FLAKY_MARKS", sql.upper())
+                plan = self._explain(sql, params)
+                self._lr_by_key_or_range(plan, (flaking, marker))
+                if not self._mariadb():
+                    self._sqlite_fail_range(
+                        plan, "the browse filter's term {0!r}".format(
+                            (flaking, marker)))
+
+    def test_the_promoted_term_keeps_the_fail_range(self) -> None:
+        """Item 16: the New failures queue's promoted term (P, a
+        row-value ``IN`` beside "previous result not FAIL") is a filter
+        on the stream's FAIL range, never the way into latest_runs. No
+        guard pinned ``lr`` for it; on SQLite it must be a SEARCH of
+        ``idx_latest_runs_result`` on the stream and FAIL, on MariaDB no
+        read of latest_runs whole."""
+        cutoff = self.NOW - datetime.timedelta(hours=36)
+        self.store._invalidate_summary_cache()
+        sql, params = self._statement(
+            lambda: self.store.status_queue(
+                "new_failures", stale_before=cutoff, now=self.NOW,
+                marks=True),
+            "LEFT JOIN test_flaky_marks AS fm")
+        self.assertIn("OR (lr.environment, lr.script, lr.test_name) IN (",
+                      sql)
+        plan = self._explain(sql, params)
+        self._lr_by_key_or_range(plan, "the promoted term")
+        if not self._mariadb():
+            self._sqlite_fail_range(plan, "the promoted term")
+
+    def test_open_actions_terms_and_keys_read_no_partition_whole(
+            self) -> None:
+        """Open Actions: the bound X term (MariaDB's form) on the rows and
+        the count, and the keys form's two statements (SQLite's), on
+        both engines: no read of latest_runs is a scan.
+
+        Item 16 widens it: the keys form's page by key is
+        :meth:`Storage._rows_by_key`, the statement CI's SQLite 3.26 read
+        by ``stream_id`` alone (a SEARCH, so this guard passed it), and
+        it now carries the Flaking queue's full-key assertion on both
+        engines. The reads are found by ``latest_runs AS lr``, which the
+        keys-driven spelling joins rather than starts from."""
+        for by_keys in (False, True):
+            self.store._backend.set_aside_by_keys = by_keys  # type: ignore
+            try:
+                self.store._invalidate_summary_cache()
+                captured = self._captured(
+                    lambda: self.store.dashboard_page(
+                        open_items=True, with_flaky=True, limit=100,
+                        now=self.NOW))
+            finally:
+                del self.store._backend.set_aside_by_keys  # type: ignore
+            reads = [c for c in captured
+                     if "latest_runs AS lr" in c[0]
+                     and "CROSS JOIN test_flaky_marks" not in c[0]]
+            self.assertEqual(len(reads), 2, [c[0][:60] for c in reads])
+            by_key = [c for c in reads
+                      if ") AS k CROSS JOIN latest_runs AS lr" in c[0]
+                      or "WHERE lr.stream_id = ? AND (lr.environment, "
+                         "lr.script, lr.test_name) IN (" in c[0]]
+            self.assertEqual(len(by_key), 1 if by_keys else 0,
+                             [c[0][:60] for c in reads])
+            for sql, params in reads:
+                if by_keys:
+                    self.assertNotIn("ca.assignee IS NULL AND", sql)
+                else:
+                    self.assertIn("ca.assignee IS NULL AND (lr.environment",
+                                  sql)
+                plan = self._explain(sql, params)
+                self._lr_by_key_or_range(plan, (by_keys, sql[:60]))
+                if (sql, params) in by_key:
+                    # A page of 66 keys on this fixture: a list, not one.
+                    self.assertGreater(len(params), 1 + 3 * 50, sql[:200])
+                    self._full_key_read(plan, "Open Actions' page by key")
+
+    def _full_key_read(self, plan: List[Any], what: str) -> None:
+        """A :meth:`Storage._rows_by_key` statement's plan reads
+        latest_runs by its whole primary key, on either engine."""
+        if self._mariadb():
+            full = self._full_key_len()
+            lr = [row for row in plan if row[2] == "lr"]
+            self.assertEqual(len(lr), 1, plan)
+            self.assertEqual(
+                (lr[0][5], str(lr[0][6])), ("PRIMARY", full),
+                "{0} reads latest_runs by {1} at key_len {2} ({3}), not by "
+                "the whole primary key (key_len {4}): {5}".format(
+                    what, lr[0][5], lr[0][6], lr[0][3], full, plan))
+            self.assertNotIn(lr[0][3], ("ALL", "index"), plan)
+            return
+        self._sqlite_full_key_read(plan, what)
+
+    def _full_key_len(self) -> str:
+        """MariaDB's ``key_len`` for latest_runs' whole primary key: the
+        plan of one row by all four of its columns, on this server's
+        column definitions and character set."""
+        plan = self._explain(
+            "SELECT lr.run_id FROM latest_runs AS lr WHERE lr.stream_id = ? "
+            "AND lr.environment = ? AND lr.script = ? AND lr.test_name = ?",
+            [storage.MAINLINE_STREAM_ID, self.ENV, self.SCRIPT,
+             "t_flaking_new"])
+        self.assertEqual(len(plan), 1, plan)
+        self.assertEqual(plan[0][5], "PRIMARY", plan)
+        return str(plan[0][6])
+
+    def test_the_flaking_queue_reads_its_rows_by_the_full_key(self) -> None:
+        """Item 14 (design §14) replaces item 11's tab guard, whose marks
+        read no longer exists. The queue's one read of latest_runs besides
+        Q1 (whose plan test_q1_starts_from_the_streams_fail_rows pins) is
+        its rows, by the capped keys. Cold, so it runs every statement it
+        can; on the wide fixture (1,200 more tests than marks).
+
+        :meth:`_lr_by_key_or_range` refuses only a scan: a range on the
+        primary key's leading ``stream_id`` alone, which is a read of the
+        whole partition, would pass it. This guard requires the FULL key:
+        on SQLite a SEARCH by all four columns of the partition's primary
+        key; on MariaDB the primary key at its whole ``key_len`` (that of
+        a lookup by all four columns), never ALL, index or a prefix.
+
+        Item 16: CI's Python 3.6.8 jobs (SQLite 3.26) read the row-value
+        ``IN`` by ``stream_id`` alone, the whole partition, where 3.50
+        read it by the key. SQLite's statement is now driven from the
+        keys (``k CROSS JOIN lr``), and on SQLite this guard also
+        requires ``k`` scanned before the one ``lr`` line and no list or
+        OR plan anywhere, and names the SQLite version it ran on."""
+        self.store._invalidate_summary_cache()
+        captured = self._captured(lambda: self.store.status_queue(
+            storage.FLAKING_QUEUE, limit=500, with_latest_comment=True,
+            now=self.NOW))
+        touching = [c for c in captured if "latest_runs" in c[0]]
+        self.assertEqual(len(touching), 2, [c[0][:80] for c in captured])
+        self.assertEqual(touching[0][0], self._q1()[0])
+        sql, params = touching[1]
+        if self.store._backend.rows_by_key_from_keys:
+            self.assertIn(
+                "FROM (SELECT ? AS environment, ? AS script, ? AS test_name "
+                "UNION ALL SELECT ?, ?, ? ", sql)
+            self.assertIn(
+                ") AS k CROSS JOIN latest_runs AS lr ON lr.stream_id = ? "
+                "AND lr.environment = k.environment AND lr.script = k.script "
+                "AND lr.test_name = k.test_name ", sql)
+            self.assertNotIn(") IN (", sql)
+        else:
+            self.assertIn("WHERE lr.stream_id = ? AND (lr.environment, "
+                          "lr.script, lr.test_name) IN (", sql)
+        self.assertEqual(len(params), 1 + 3 * 53, sql[:200])
+        self._full_key_read(
+            self._explain(sql, params), "the Flaking queue's rows")
+
+    def _sqlite_full_key_read(self, plan: List[Any], what: str) -> None:
+        """SQLite's plan of a :meth:`Storage._rows_by_key` statement: the
+        keys ``k`` scanned first (``SCAN K`` on a current SQLite, ``SCAN
+        SUBQUERY n AS K`` on 3.26), then exactly one ``lr`` line, a
+        SEARCH (``SEARCH LR`` or ``SEARCH TABLE LATEST_RUNS AS LR``, by
+        version) by all four columns of the partition's primary key; no
+        list subquery and no multi-index OR anywhere. Every message names
+        the SQLite version the plan came from."""
+        version = "{0} on SQLite {1}".format(what, sqlite3.sqlite_version)
+        note = (version, plan)
+        lr = [line for line in plan if " LR " in line + " "]
+        self.assertEqual(len(lr), 1, note)
+        self.assertTrue(lr[0].startswith("SEARCH"), note)
+        self.assertIn("SQLITE_AUTOINDEX_LATEST_RUNS_1", lr[0], note)
+        self.assertIn(
+            "(STREAM_ID=? AND ENVIRONMENT=? AND SCRIPT=? AND TEST_NAME=?)",
+            lr[0], note)
+        k = [index for index, line in enumerate(plan)
+             if line.startswith("SCAN") and " K " in line + " "]
+        self.assertEqual(len(k), 1, note)
+        self.assertLess(k[0], plan.index(lr[0]), note)
+        for line in plan:
+            self.assertNotIn("LIST SUBQUERY", line, note)
+            self.assertNotIn("MULTI-INDEX OR", line, note)
+
+    def test_the_trend_reaches_runs_from_each_mark(self) -> None:
+        """SQLite's plan only: the runs member reads each mark's range of
+        the runs UNIQUE index. On MariaDB this test is excluded by name:
+        on this fixture's few-row runs table MariaDB reasonably scans
+        runs, where at production scale it reads each mark's range, so
+        its plan is checked by hand on a production-scale copy in the
+        measured pass, as AssignedTrendTest's is (WP-43 decision 12)."""
+        sql, params = self._statement(
+            lambda: self.store.daily_flaking_failures(
+                BASE, self.NOW),
+            "CROSS JOIN runs AS r")
+        plan = self._explain(sql, params)
+        runs = [line for line in plan if " R " in line + " "]
+        self.assertEqual(len(runs), 1, plan)
+        self.assertTrue(runs[0].startswith("SEARCH"), plan)
+        self.assertIn("START_TIME>?", runs[0].replace(" ", ""), plan)
+
+
+class FlakyListsBase(FlakyEstateBase):
+    """WP-44 item 8: FlakyEstateBase with the sets the lists act on,
+    from the oracle (each test's whole history and the pure rule):
+
+    - F: marked, flaking, under no live mute; retired ones only when the
+      read keeps retired tests (they read FLAKING there);
+    - X: F's members with no assignee, not retired.
+
+    On linux-sim F is t_flaking_new, t_flaking_still and t_assigned
+    (t_muted flakes under a mute, t_retired is retired) and X the first
+    two; env-many adds its 50 odd tests (P F F at 3) to both."""
+
+    def _f(self, include_retired: bool = False
+           ) -> Set[Tuple[str, str, str]]:
+        out = set()  # type: Set[Tuple[str, str, str]]
+        for triple, state in self.oracle()["states"].items():
+            if state is None or state.state != "flaking":
+                continue
+            if triple[2] in self.MUTED:
+                continue
+            if triple[2] in self.RETIRED and not include_retired:
+                continue
+            out.add(triple)
+        return out
+
+    def _x(self) -> Set[Tuple[str, str, str]]:
+        return {t for t in self._f() if t[2] not in self.ASSIGNED}
+
+    @staticmethod
+    def _keys(rows: Sequence[Any]) -> List[Tuple[str, str, str]]:
+        return [(row.environment, row.script, row.test_name) for row in rows]
+
+
+class FlakyEnvironmentsTest(FlakyListsBase):
+    """WP-44 item 8: the marks' memo is kept for the environments that
+    hold a mark, not the stream's whole environment list. An environment
+    with no mark answers as it did; a stream with marks in two
+    environments decides both; a mark in a new environment and a push
+    into a marked one are seen. On MariaDB too."""
+
+    PLAIN = "env-plain"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(environment=self.PLAIN, test_name=name,
+                        result=result, start=self._night(night))
+            for name, results in (("p_flaky", (self.P, self.F)),
+                                  ("p_still", (self.F, self.F)),
+                                  ("p_pass", (self.P, self.P)))
+            for night, result in zip((8, 9), results)])
+        self.store._invalidate_summary_cache()
+
+    def _flaking(self, **scope: Any) -> List[Tuple[str, str, str]]:
+        rows, total = self.store.dashboard_page(
+            results=[Result.FAIL], flaking=True, with_flaky=True,
+            now=self.NOW, **scope)
+        self.assertEqual(total, len(rows))
+        return self._keys(rows)
+
+    def test_an_environment_with_no_mark_answers_as_before(self) -> None:
+        plain = {"environment": self.PLAIN}
+        today = self._keys(self.store.dashboard(
+            results=[Result.FAIL], now=self.NOW, **plain))
+        open_today = self._keys(self.store.dashboard(
+            open_items=True, now=self.NOW, **plain))
+        for first in ("lists", "headline"):
+            self.store._invalidate_summary_cache()
+            if first == "headline":
+                # The stream's names memoized first, as Home's rollup
+                # does: the memo then keeps an empty entry here.
+                self.store._stream_environment_names(
+                    storage.MAINLINE_STREAM_ID)
+            self.assertEqual(self._flaking(**plain), [], first)
+            fail, total = self.store.dashboard_page(
+                results=[Result.FAIL], flaking=False, with_flaky=True,
+                now=self.NOW, **plain)
+            self.assertEqual((self._keys(fail), total),
+                             (today, len(today)), first)
+            rows, total = self.store.dashboard_page(
+                open_items=True, with_flaky=True, now=self.NOW, **plain)
+            self.assertEqual((self._keys(rows), total),
+                             (open_today, len(open_today)), first)
+            self.assertTrue(all(row.flaky is None for row in rows))
+            view = self.store.flaky_view(
+                storage.MAINLINE_STREAM_ID, self.NOW, environment=self.PLAIN,
+                marks=True)
+            self.assertEqual((view.counted, view.marks, view.states),
+                             ([], 0, {}), first)
+        # Read first through the marked environments, no entry is kept
+        # for an environment with no mark.
+        self.store._invalidate_summary_cache()
+        self._flaking()
+        self.assertIsNone(self.store._cached_summary(
+            ("flaky_states", storage.MAINLINE_STREAM_ID, self.PLAIN)))
+
+    def test_marks_in_two_environments_are_both_decided(self) -> None:
+        self.store._invalidate_summary_cache()
+        entries = self.store._flaky_failing(storage.MAINLINE_STREAM_ID)
+        self.assertEqual(sorted(entries), [self.MANY, self.ENV])
+        self.assertEqual(set(self._flaking()), self._f())
+        self.assertEqual(
+            {t[0] for t in self._flaking()}, {self.ENV, self.MANY})
+
+    def test_a_mark_in_a_new_environment_is_seen(self) -> None:
+        self.assertEqual(self._flaking(environment=self.PLAIN), [])
+        self.store.mark_flaky([(self.PLAIN, self.SCRIPT, "p_flaky", None)],
+                              3, "why", "bob", self.NOW)
+        self.assertEqual(self._flaking(environment=self.PLAIN),
+                         [(self.PLAIN, self.SCRIPT, "p_flaky")])
+        self.store.unmark_flaky([(self.PLAIN, self.SCRIPT, "p_flaky")],
+                                "bob", self.NOW)
+        self.assertEqual(self._flaking(environment=self.PLAIN), [])
+
+    def test_a_push_into_a_marked_environment_is_seen(self) -> None:
+        before = self._flaking(environment=self.ENV)
+        self.assertNotIn("t_marked_pass", [t[2] for t in before])
+        # F P P then a FAIL, at a cadence of 4: flaking.
+        self.store.upsert_runs([make_record(
+            test_name="t_marked_pass", result=Result.FAIL,
+            start=self._night(self.NIGHTS))])
+        self.assertIn("t_marked_pass",
+                      [t[2] for t in self._flaking(environment=self.ENV)])
+
+    def test_both_writers_store_the_same_marked_environments(self) -> None:
+        """The marked-environments memo has two writers:
+        /api/dashboard's products statement
+        (:meth:`environment_products_and_marks`) and
+        :meth:`_flaky_environments`' DISTINCT read. Each, cold, stores
+        exactly the other's value, on mainline and on a build alike (the
+        marks carry no stream, so the value is the estate's). Kept from
+        item 11's test_the_unscoped_read_fills_the_memo_as_its_other_
+        writers when item 14 removed the tab's read, its third writer."""
+        key = self.store._MARKED_ENVIRONMENTS_KEY
+        self.store.upsert_runs([make_record(
+            test_name="t_flaking_new", result=Result.FAIL, build="rc1",
+            start=self._night(self.NIGHTS))])
+        build = [s.stream_id for s in self.store.list_streams("")
+                 if s.stream_id != storage.MAINLINE_STREAM_ID][0]
+        self.store._invalidate_summary_cache()
+        self.assertIsNone(self.store._cached_summary(key))
+        self.store.environment_products_and_marks()
+        by_dashboard = self.store._cached_summary(key)
+        # env-plain has runs and no mark: in neither writer's value.
+        self.assertEqual(by_dashboard, sorted([self.ENV, self.MANY]))
+        for stream in (storage.MAINLINE_STREAM_ID, build):
+            self.store._invalidate_summary_cache()
+            self.assertIsNone(self.store._cached_summary(key))
+            self.assertEqual(self.store._flaky_environments(stream),
+                             by_dashboard, stream)
+            self.assertEqual(self.store._cached_summary(key), by_dashboard,
+                             stream)
+
+
+class OpenActionsSetAsideTest(FlakyListsBase):
+    """WP-44 item 8 (design §1 "Open Actions", §2 B.3(b), §9): ``open=1``
+    leaves out X and nothing else, in every mode and owner filter; an
+    assigned test is listed whatever its state, a marked test at an
+    unexpected pass stays, an unassigned test over its cadence stays.
+    The rows, their total and bulk assign agree, by both forms (SQLite's
+    keys, MariaDB's bound term) on each engine. On MariaDB with 101
+    marked tests in one environment (decision 22)."""
+
+    def _page(self, **kwargs: Any) -> Tuple[List[Tuple[str, str, str]], int]:
+        rows, total = self.store.dashboard_page(
+            open_items=True, with_flaky=True, now=self.NOW, **kwargs)
+        return self._keys(rows), total
+
+    def _today(self, **kwargs: Any) -> List[Tuple[str, str, str]]:
+        """Today's Open Actions: the read without the mark's bit."""
+        return self._keys(self.store.dashboard(
+            open_items=True, now=self.NOW, **kwargs))
+
+    def test_only_x_leaves(self) -> None:
+        x = self._x()
+        self.assertEqual(self._names(x), ["t_flaking_new", "t_flaking_still"])
+        self.assertEqual(len(x), 2 + 50)
+        today = self._today()
+        rows, total = self._page()
+        self.assertEqual(rows, [t for t in today if t not in x])
+        self.assertEqual(total, len(rows))
+        self.assertEqual(len(today) - len(rows), len(x))
+        # dashboard() and dashboard_count() alone agree with the page.
+        self.assertEqual(self._keys(self.store.dashboard(
+            open_items=True, with_flaky=True, now=self.NOW)), rows)
+        self.assertEqual(self.store.dashboard_count(
+            open_items=True, now=self.NOW), total)
+
+    def test_assigned_flaking_and_marked_unexpected_pass_stay(self) -> None:
+        rows = {row.test_name: row for row in self.store.dashboard_page(
+            open_items=True, with_flaky=True, now=self.NOW,
+            environment=self.ENV)[0]}
+        self.assertEqual(rows["t_assigned"].assignee, "bob")
+        self.assertEqual(rows["t_assigned"].flaky.state.state, "flaking")
+        self.assertIs(rows["t_marked_up"].result, Result.UNEXPECTED_PASS)
+        for name in ("t_promoted", "t_over", "t_first", "t_short",
+                     "t_c2_over", "t_new", "t_still", "t_up"):
+            self.assertIn(name, rows)
+        for name in ("t_flaking_new", "t_flaking_still"):
+            self.assertNotIn(name, rows)
+
+    def test_a_live_mute_wins(self) -> None:
+        """A test flaking under a live mute is no FLAKING row; it is
+        listed (a mute is owned). Unassigned, which drops its mute, it is
+        X and leaves."""
+        names = [t[2] for t in self._page(environment=self.ENV)[0]]
+        self.assertIn("t_muted", names)
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "t_muted", None, "alice", CREATED)
+        names = [t[2] for t in self._page(environment=self.ENV)[0]]
+        self.assertNotIn("t_muted", names)
+
+    def test_every_mode_and_owner_filter(self) -> None:
+        x = self._x()
+        cases = [
+            {}, {"include_unassigned": True}, {"assignees": ["bob"]},
+            {"assignees": ["bob"], "include_unassigned": True},
+            {"assigned_only": True}, {"results": [Result.FAIL]},
+            {"results": [Result.UNEXPECTED_PASS]},
+            {"results": [Result.FAIL, Result.UNEXPECTED_PASS]},
+            {"environment": self.ENV}, {"environments": [self.MANY]},
+            {"script": self.SCRIPT}, {"include_retired": True},
+            {"q": "flaking"},
+        ]  # type: List[Dict[str, Any]]
+        for case in cases:
+            expected = [t for t in self._today(**case) if t not in x]
+            rows, total = self._page(**case)
+            self.assertEqual(rows, expected, case)
+            self.assertEqual(total, len(expected), case)
+
+    def test_failing_mode_sends_both_values(self) -> None:
+        """Open Actions' Failing mode sends FAIL and FLAKING (flaking
+        None): today's FAIL less X, t_assigned in it. FAIL alone would
+        leave every flaking test out, an assigned one included (§2 B.9)."""
+        x = self._x()
+        today = self._today(results=[Result.FAIL])
+        both, total = self._page(results=[Result.FAIL])
+        self.assertEqual(both, [t for t in today if t not in x])
+        self.assertEqual(total, len(both))
+        self.assertIn("t_assigned", [t[2] for t in both])
+        alone, total = self._page(results=[Result.FAIL], flaking=False)
+        self.assertEqual(alone, [t for t in today if t not in self._f()])
+        self.assertNotIn("t_assigned", [t[2] for t in alone])
+        self.assertEqual(total, len(alone))
+
+    def test_total_is_the_rows_paged_at_every_sort(self) -> None:
+        x = self._x()
+        for sort in storage.DASHBOARD_SORTS:
+            for descending in (False, True):
+                expected = [t for t in self._today(
+                    sort=sort, descending=descending) if t not in x]
+                paged = []  # type: List[Tuple[str, str, str]]
+                for offset in range(0, len(expected) + 9, 9):
+                    rows, total = self._page(
+                        sort=sort, descending=descending, limit=9,
+                        offset=offset)
+                    self.assertEqual(total, len(expected), sort)
+                    paged.extend(rows)
+                self.assertEqual(paged, expected, (sort, descending))
+
+    def test_both_forms_agree_on_either_engine(self) -> None:
+        x = self._x()
+        expected = [t for t in self._today(sort="test_name") if t not in x]
+        for by_keys in (True, False):
+            self.store._backend.set_aside_by_keys = by_keys  # type: ignore
+            try:
+                self.store._invalidate_summary_cache()
+                rows, total = self._page(sort="test_name", limit=40,
+                                         offset=20)
+                count = self.store.dashboard_count(
+                    open_items=True, now=self.NOW)
+            finally:
+                del self.store._backend.set_aside_by_keys  # type: ignore
+            self.assertEqual(rows, expected[20:60], by_keys)
+            self.assertEqual((total, count), (len(expected),) * 2, by_keys)
+
+    def test_the_ceiling_counts_only_the_terms_bound(self) -> None:
+        """With no FLAKING mode only X's term is bound, so F does not
+        count toward the parameter ceiling: a ceiling above X's term and
+        below X's and F's together keeps the bound form."""
+        _values, aside = self.store._set_aside(
+            storage.MAINLINE_STREAM_ID, None, None, None, None, False, [],
+            False, False, True, None, self.NOW, None, True)
+        assert aside is not None
+        self.assertIsNone(aside.keep)
+        self.assertEqual((len(aside.unowned), len(aside.flaking)),
+                         (52, 53))
+        bound = 3
+        x_only = 1 + 3 * len(aside.unowned)
+        self.store._backend.set_aside_by_keys = False  # type: ignore
+        self.store._backend.max_bound_parameters = (  # type: ignore
+            bound + x_only + 2 + 10)
+        try:
+            self.assertFalse(self.store._set_aside_by_keys(aside, bound))
+            self.store._backend.max_bound_parameters = (  # type: ignore
+                bound + x_only + 2 - 1)
+            self.assertTrue(self.store._set_aside_by_keys(aside, bound))
+        finally:
+            del self.store._backend.set_aside_by_keys  # type: ignore
+            del self.store._backend.max_bound_parameters  # type: ignore
+
+    def test_bulk_assign_acts_on_the_same_set(self) -> None:
+        rows, total = self._page(include_unassigned=True)
+        updated = self.store.bulk_set_assignee(
+            "carol", "alice", CREATED, open_items=True,
+            include_unassigned=True, now=self.NOW)
+        self.assertEqual(updated, total)
+        carol = self._keys(self.store.dashboard(
+            assignees=["carol"], include_retired=True))
+        self.assertEqual(sorted(carol), sorted(rows))
+        for triple in self._x():
+            self.assertNotIn(triple, carol)
+
+    def test_with_no_mark_today_exactly(self) -> None:
+        self.store.unmark_flaky(list(self._marks()), "bob", self.NOW)
+        today = self._today()
+        self.assertEqual(self._page(), (today, len(today)))
+        self.assertEqual(self.store.bulk_set_assignee(
+            "carol", "alice", CREATED, open_items=True, now=self.NOW),
+            len(today))
+
+
+class OpenAssignmentFiguresUnchangedTest(FlakyListsBase):
+    """WP-44 item 8 (design §1, §2 B.1, replacing DormantFiguresTest):
+    every open-assignment figure and queue is the same with and without
+    the marks, bar the rows' ``flaky``: ``assigned_open``, the assigned
+    queue's count and rows, and one person's (My actions)."""
+
+    def _figures(self) -> Dict[str, Any]:
+        cutoff = self.NOW - datetime.timedelta(hours=36)
+        self.store._invalidate_summary_cache()
+
+        def bare(rows: Sequence[Any]) -> List[Any]:
+            return [row._replace(flaky=None) for row in rows]
+
+        counts = self.store.queue_counts(
+            assignee="bob", stale_before=cutoff, now=self.NOW)
+        return {
+            "assigned_open": self.store.assigned_open_count(),
+            "assigned": counts["assigned"],
+            "mine": counts["mine"],
+            "assigned_rows": bare(self.store.status_queue(
+                "assigned", stale_before=cutoff, now=self.NOW,
+                with_latest_comment=True)),
+            "mine_rows": bare(self.store.status_queue(
+                "assigned", assignee="bob", stale_before=cutoff,
+                now=self.NOW, with_latest_comment=True)),
+            "mine_count": self.store.status_queue_count(
+                "assigned", assignee="bob", stale_before=cutoff,
+                now=self.NOW),
+            "open_bob": self._keys(self.store.dashboard_page(
+                open_items=True, assignees=["bob"], with_flaky=True,
+                now=self.NOW)[0]),
+        }
+
+    def test_byte_identical_with_and_without_the_marks(self) -> None:
+        marked = self._figures()
+        self.assertIn(("linux-sim", "suite.py", "t_assigned"),
+                      [(r.environment, r.script, r.test_name)
+                       for r in marked["assigned_rows"]])
+        self.store.unmark_flaky(list(self._marks()), "bob", self.NOW)
+        self.assertEqual(self._figures(), marked)
+
+
+class BrowseFlakingFilterTest(FlakyListsBase):
+    """WP-44 item 8 (design §1 "The browse Result filter", §2 B.3(c),
+    decision 24): FLAKING matches F, FAIL alone every other FAIL row (a
+    muted flaking one included), and the two partition today's FAIL,
+    rows and total; paging across a boundary at every sort; with
+    Passing; a planted parameter ceiling answers alike by keys; bulk
+    agrees. On MariaDB with 101 marked tests (decision 22)."""
+
+    def _read(self, flaking: Optional[bool], **kwargs: Any
+              ) -> Tuple[List[Tuple[str, str, str]], int]:
+        kwargs.setdefault("results", [Result.FAIL])
+        rows, total = self.store.dashboard_page(
+            flaking=flaking, with_flaky=True, now=self.NOW, **kwargs)
+        return self._keys(rows), total
+
+    def _today(self, **kwargs: Any) -> List[Tuple[str, str, str]]:
+        kwargs.setdefault("results", [Result.FAIL])
+        return self._keys(self.store.dashboard(now=self.NOW, **kwargs))
+
+    def test_fail_and_flaking_partition_todays_fail(self) -> None:
+        f = self._f()
+        today = self._today()
+        fail, fail_total = self._read(False)
+        flaking, flaking_total = self._read(True)
+        self.assertEqual(set(flaking), f)
+        self.assertEqual(flaking, [t for t in today if t in f])
+        self.assertEqual(fail, [t for t in today if t not in f])
+        self.assertEqual((fail_total, flaking_total),
+                         (len(fail), len(flaking)))
+        self.assertEqual(fail_total + flaking_total, len(today))
+        both, total = self._read(None)
+        self.assertEqual((both, total), (today, len(today)))
+        # The muted flaking test is under FAIL; the assigned one FLAKING.
+        self.assertIn("t_muted", [t[2] for t in fail])
+        self.assertIn("t_assigned", [t[2] for t in flaking])
+        # Every row FLAKING returns reads FLAKING: a flaking state and no
+        # live mute; its wire result stays FAIL.
+        rows = self.store.dashboard_page(
+            results=[Result.FAIL], flaking=True, with_flaky=True,
+            now=self.NOW)[0]
+        for row in rows:
+            self.assertIs(row.result, Result.FAIL)
+            self.assertEqual(row.flaky.state.state, "flaking")
+            self.assertTrue(row.mute is None
+                            or row.mute.expires_at <= self.NOW)
+
+    def test_retired_flaking_reads_flaking_where_retired_are_kept(
+            self) -> None:
+        flaking, _total = self._read(True, include_retired=True)
+        self.assertEqual(set(flaking), self._f(include_retired=True))
+        self.assertIn("t_retired", [t[2] for t in flaking])
+        fail, _total = self._read(False, include_retired=True)
+        self.assertNotIn("t_retired", [t[2] for t in fail])
+
+    def test_paging_across_a_boundary_at_every_sort(self) -> None:
+        f = self._f()
+        for sort in storage.DASHBOARD_SORTS:
+            for descending in (False, True):
+                today = self._today(sort=sort, descending=descending)
+                for flaking, wanted in ((True, [t for t in today if t in f]),
+                                        (False,
+                                         [t for t in today if t not in f])):
+                    paged = []  # type: List[Tuple[str, str, str]]
+                    for offset in range(0, len(wanted) + 11, 11):
+                        rows, total = self._read(
+                            flaking, sort=sort, descending=descending,
+                            limit=11, offset=offset)
+                        self.assertEqual(total, len(wanted))
+                        paged.extend(rows)
+                    self.assertEqual(paged, wanted,
+                                     (sort, descending, flaking))
+
+    def test_with_passing_also_chosen(self) -> None:
+        f = self._f()
+        results = [Result.FAIL, Result.PASS]
+        today = self._today(results=results)
+        passing = [t for t in today if t not in self._today()]
+        self.assertTrue(passing)
+        flaking, total = self._read(True, results=results)
+        self.assertEqual(flaking, [t for t in today
+                                   if t in f or t in passing])
+        self.assertEqual(total, len(flaking))
+        fail, total = self._read(False, results=results)
+        self.assertEqual(fail, [t for t in today if t not in f])
+        self.assertEqual(total, len(fail))
+
+    def test_scoped_to_the_environment_and_script(self) -> None:
+        f = self._f()
+        for scope in ({"environment": self.ENV}, {"script": self.SCRIPT},
+                      {"environments": [self.MANY]},
+                      {"environments": []}):
+            today = self._today(**scope)
+            self.assertEqual(self._read(True, **scope)[0],
+                             [t for t in today if t in f], scope)
+            self.assertEqual(self._read(False, **scope)[0],
+                             [t for t in today if t not in f], scope)
+
+    def test_a_planted_ceiling_answers_alike(self) -> None:
+        """Above the backend's ceiling on bound parameters (999 before
+        SQLite 3.32, about 330 of F) the terms give way to the keys form,
+        which answers exactly (design §6: a test plants the ceiling)."""
+        expected = {
+            (flaking, offset): self._read(
+                flaking, sort="start_time", descending=True, limit=13,
+                offset=offset)
+            for flaking in (True, False) for offset in (0, 13, 50)}
+        self.store._backend.max_bound_parameters = 60  # type: ignore
+        try:
+            for (flaking, offset), answer in expected.items():
+                self.store._invalidate_summary_cache()
+                self.assertEqual(self._read(
+                    flaking, sort="start_time", descending=True, limit=13,
+                    offset=offset), answer, (flaking, offset))
+                self.assertEqual(self.store.dashboard_count(
+                    results=[Result.FAIL], flaking=flaking, now=self.NOW),
+                    answer[1])
+        finally:
+            del self.store._backend.max_bound_parameters  # type: ignore
+
+    def test_bulk_assign_agrees(self) -> None:
+        f = self._f()
+        flaking, total = self._read(True)
+        updated = self.store.bulk_set_assignee(
+            "carol", "alice", CREATED, results=[Result.FAIL], flaking=True,
+            now=self.NOW)
+        self.assertEqual(updated, total)
+        carol = self._keys(self.store.dashboard(assignees=["carol"]))
+        self.assertEqual(set(carol), f)
+
+    def test_with_no_mark_flaking_alone_reads_nothing(self) -> None:
+        self.store.unmark_flaky(list(self._marks()), "bob", self.NOW)
+        self.assertEqual(self.store.dashboard_page(
+            results=[Result.FAIL], flaking=True, with_flaky=False,
+            now=self.NOW), ([], 0))
+        self.assertEqual(self.store.dashboard_count(
+            results=[Result.FAIL], flaking=True, now=self.NOW), 0)
+        today = self._today()
+        self.assertEqual(self._read(False)[0], today)
+        # With Passing too, FLAKING adds nothing to PASS.
+        passing = self._today(results=[Result.PASS])
+        self.assertEqual(self._read(
+            True, results=[Result.FAIL, Result.PASS])[0], passing)
+
+
+class FlakingQueueTest(FlakyListsBase):
+    """WP-44 item 14 (design §14, replacing item 11's tab read and its
+    ``FlakyTabOrderTest``): the Flaking queue,
+    ``status_queue(FLAKING_QUEUE)``, is the tests flaking now and nothing
+    else, F of :class:`FlakyListsBase` in scope, each an ordinary queue
+    row (:class:`storage.TestStatusRow`, its ``flaky`` never None);
+    nearest to counting as a failure first (``cadence - streak``), then
+    environment, script, test name; capped as every queue, its count the
+    headline view's ``flaking`` entries, uncapped. On MariaDB with 101
+    marked tests (decision 22)."""
+
+    def _queue(self, **kwargs: Any) -> List[Any]:
+        kwargs.setdefault("now", self.NOW)
+        return self.store.status_queue(storage.FLAKING_QUEUE, **kwargs)
+
+    def _total(self, **kwargs: Any) -> int:
+        kwargs.setdefault("now", self.NOW)
+        return self.store.status_queue_count(storage.FLAKING_QUEUE, **kwargs)
+
+    def _flaking_counts(self, **scope: Any) -> Set[Tuple[str, str, str]]:
+        """The headline view's ``flaking`` entries in *scope*."""
+        view = self.store.flaky_view(
+            storage.MAINLINE_STREAM_ID, self.NOW, scope.get("environment"),
+            scope.get("environments"), marks=True)
+        return set((c.environment, c.script, c.test_name)
+                   for c in view.counted
+                   if c.role == storage.FLAKY_ROLE_FLAKING)
+
+    def test_the_set_is_the_flaking_tests_alone(self) -> None:
+        rows = self._queue()
+        f = self._f()
+        self.assertEqual(set(self._keys(rows)), f)
+        self.assertEqual(len(rows), len(f))
+        self.assertEqual(self._total(), len(f))
+        names = [row.test_name for row in rows if row.environment == self.ENV]
+        # Flaking under a live mute, flaking and retired, promoted, over
+        # the cadence, passing, a pass after a tolerated failure, and an
+        # unmarked failure: all absent.
+        for absent in ("t_muted", "t_retired", "t_promoted", "t_over",
+                       "t_first", "t_short", "t_exact", "t_marked_pass",
+                       "t_tolerated", "t_marked_up", "t_new", "t_still"):
+            self.assertNotIn(absent, names)
+        self.assertEqual(sorted(names),
+                         ["t_assigned", "t_flaking_new", "t_flaking_still"])
+        states = self.oracle()["states"]
+        for row in rows:
+            triple = (row.environment, row.script, row.test_name)
+            self.assertIsInstance(row, storage.TestStatusRow)
+            self.assertIsNotNone(row.flaky, triple)
+            self.assertEqual(row.flaky.state, states[triple], triple)
+            self.assertEqual(row.flaky.state.state, "flaking")
+            self.assertIs(row.result, Result.FAIL)
+            self.assertIsNone(row.mute, triple)
+            self.assertIsNone(row.retired_at, triple)
+
+    def test_total_is_the_views_flaking_count_in_every_scope(self) -> None:
+        for scope in ({}, {"environment": self.ENV},
+                      {"environment": self.MANY},
+                      {"environments": [self.ENV]},
+                      {"environments": [self.ENV, self.MANY]},
+                      {"environment": self.ENV,
+                       "environments": [self.MANY]}):
+            self.store._invalidate_summary_cache()
+            flaking = self._flaking_counts(**scope)
+            for cold in (True, False):
+                if cold:
+                    self.store._invalidate_summary_cache()
+                self.assertEqual(self._total(**scope), len(flaking), scope)
+                self.assertEqual(set(self._keys(self._queue(**scope))),
+                                 flaking, scope)
+
+    def test_the_streak_is_the_fails_in_a_row_at_the_latest_run(
+            self) -> None:
+        rows = self._queue()
+        self.assertEqual(len(rows), 53)
+        for row in rows:
+            results = [run.result for run in self.store.run_history(
+                row.environment, row.script, row.test_name, limit=1000)]
+            streak = 0
+            for result in results:
+                if result is not Result.FAIL:
+                    break
+                streak += 1
+            self.assertEqual(row.flaky.state.streak, streak, row.test_name)
+            self.assertGreaterEqual(row.flaky.state.streak, 1)
+            self.assertLess(row.flaky.state.streak, row.flaky.mark.cadence)
+
+    def test_the_order(self) -> None:
+        """Nearest to counting as a failure first: env-many's 50 and
+        t_flaking_still are one FAIL from their cadence of 3, t_assigned
+        two; t_flaking_new, marked again at 5, four."""
+        self.store.unmark_flaky(
+            [(self.ENV, self.SCRIPT, "t_flaking_new")], "bob", self.NOW)
+        self.store.mark_flaky(
+            [(self.ENV, self.SCRIPT, "t_flaking_new", None)], 5, "again",
+            "bob", self.NOW)
+        rows = self._queue()
+        self.assertEqual(
+            [row.test_name for row in rows],
+            ["m{0:03d}".format(index) for index in range(1, 101, 2)]
+            + ["t_flaking_still", "t_assigned", "t_flaking_new"])
+        self.assertEqual(
+            rows, sorted(rows, key=lambda row: (
+                row.flaky.mark.cadence - row.flaky.state.streak,
+                row.environment, row.script, row.test_name)))
+        self.assertEqual(rows[-1].flaky.mark.cadence, 5)
+
+    def test_a_capped_queue_is_the_head_of_the_whole_and_total_exact(
+            self) -> None:
+        whole = self._keys(self._queue())
+        for limit in (1, 2, 50, 51, 52, len(whole), len(whole) + 5):
+            self.store._invalidate_summary_cache()
+            self.assertEqual(self._keys(self._queue(limit=limit)),
+                             whole[:limit], limit)
+            self.assertEqual(self._total(), len(whole), limit)
+
+    def test_more_flaking_tests_than_a_rows_chunk_and_the_cap(self) -> None:
+        """600 more flaking tests in env-wide (653 in all): at the API's
+        cap of 500 the rows are the first 500 in the queue's order, read
+        by key in two statements of at most 250 (fewer under SQLite's
+        older ceiling of 999 parameters: still two), and ``total`` is
+        653. A third of them FAIL after FAIL at cadence 4, so the view's
+        Q2 decides them; a third are four FAILs from a cadence of 5."""
+        wide = "env-wide"
+        P, F = self.P, self.F
+        shapes = {0: (2, [P, F]), 1: (4, [P, F, F, F]), 2: (5, [P, F])}
+        records = []  # type: List[RunRecord]
+        by_cadence = {}  # type: Dict[int, List[Tuple[str, str, str, Optional[int]]]]
+        expected = []  # type: List[Tuple[int, str, str, str]]
+        for index in range(600):
+            name = "x{0:04d}".format(index)
+            cadence, results = shapes[index % 3]
+            first = self.NIGHTS - len(results)
+            for offset, result in enumerate(results):
+                records.append(make_record(
+                    environment=wide, test_name=name, result=result,
+                    start=self._night(first + offset)))
+            by_cadence.setdefault(cadence, []).append(
+                (wide, self.SCRIPT, name, None))
+            streak = len(results) - 1
+            expected.append((cadence - streak, wide, self.SCRIPT, name))
+        self.store.upsert_runs(records)
+        for cadence, tests in sorted(by_cadence.items()):
+            self.store.mark_flaky(tests, cadence, "why", "alice", CREATED)
+        for triple in self._f():
+            name = triple[2]
+            streak = 2 if (name.startswith("m")
+                           or name == "t_flaking_still") else 1
+            expected.append((3 - streak,) + triple)
+        expected.sort()
+        self.assertEqual(len(expected), 653)
+        self.store._invalidate_summary_cache()
+        self.store._cadence_runs_cache.clear()
+        self.assertEqual(self._total(), 653)
+        seen = self._statements_of(lambda: self._queue(
+            limit=500, with_latest_comment=True))
+        rows = self._queue(limit=500, with_latest_comment=True)
+        self.assertEqual(len(rows), 500)
+        self.assertEqual(self._keys(rows),
+                         [item[1:] for item in expected[:500]])
+        reads = [s for s in seen if "JOIN runs AS r ON r.id = lr.run_id" in s]
+        self.assertEqual(len(reads), 2, [s[:80] for s in seen])
+        # Each by key, in the backend's spelling (item 16: on SQLite the
+        # keys drive the read; FlakyPlanTest pins each spelling's plan).
+        spelling = (") AS k CROSS JOIN latest_runs AS lr ON "
+                    if self.store._backend.rows_by_key_from_keys
+                    else "lr.test_name) IN (")
+        for statement in reads:
+            self.assertIn(spelling, statement)
+        # The whole set when uncapped; the count unchanged.
+        self.assertEqual(len(self._queue()), 653)
+        self.assertEqual(self._total(), 653)
+
+    def test_on_a_build_its_own_runs_decide(self) -> None:
+        """A mark covers every stream; each judges the cadence on its own
+        runs. A marked test with no run on the build is absent there; one
+        flaking there is listed, whatever it does on mainline."""
+        self.store.upsert_runs([
+            make_record(test_name="t_new", result=result, build="rc1",
+                        start=self._night(self.NIGHTS + day))
+            for day, result in enumerate((Result.PASS, Result.FAIL))])
+        build = [s for s in self.store.list_streams("")
+                 if s.stream_id != storage.MAINLINE_STREAM_ID][0]
+        floor = self._night(self.NIGHTS)
+        on_build = {"stream_id": build.stream_id, "floor": floor}
+        self.assertEqual((self._queue(**on_build), self._total(**on_build)),
+                         ([], 0))
+        self.store.mark_flaky([(self.ENV, self.SCRIPT, "t_new", None)], 3,
+                              "why", "bob", self.NOW)
+        rows = self._queue(**on_build)
+        self.assertEqual([row.test_name for row in rows], ["t_new"])
+        self.assertEqual(self._total(**on_build), 1)
+        self.assertEqual((rows[0].flaky.state.state, rows[0].flaky.state.streak),
+                         ("flaking", 1))
+        # On mainline t_new is P F, flaking there too, and listed there.
+        self.assertIn("t_new", [row.test_name for row in self._queue(
+            environment=self.ENV)])
+
+    def test_scoped_by_environment_and_product(self) -> None:
+        many = self._queue(environments=[self.MANY])
+        self.assertEqual((len(many), self._total(environments=[self.MANY])),
+                         (50, 50))
+        self.assertTrue(all(row.environment == self.MANY for row in many))
+        self.assertEqual(self._queue(environments=[]), [])
+        self.assertEqual(self._total(environments=[]), 0)
+        self.assertEqual(self._total(environment="nowhere"), 0)
+        self.assertEqual(self._total(environment=self.ENV,
+                                     environments=[self.MANY]), 0)
+        self.assertEqual(self._queue(environment=self.ENV,
+                                     environments=[self.MANY]), [])
+
+    def test_assignee_and_cutoff_do_not_apply(self) -> None:
+        whole = self._queue()
+        self.store._invalidate_summary_cache()
+        self.assertEqual(
+            self._queue(assignee="bob", stale_before=self.STALE), whole)
+        self.assertEqual(self.store.status_queue_count_and_marks(
+            storage.FLAKING_QUEUE, assignee="bob", stale_before=self.STALE,
+            now=self.NOW), (len(whole), True))
+
+    def test_with_no_mark_an_empty_queue(self) -> None:
+        self.store.unmark_flaky(list(self._marks()), "bob", self.NOW)
+        self.assertEqual(self._queue(), [])
+        self.assertEqual(self.store.status_queue_count_and_marks(
+            storage.FLAKING_QUEUE, now=self.NOW), (0, False))
+
+    def test_disjoint_from_the_failing_and_fixed_queues(self) -> None:
+        """No flaking test is in New failures, Still failing or Fixed; the
+        muted flaking test is in Muted and in no other of them."""
+        cutoff = self.NOW - datetime.timedelta(hours=36)
+        flaking = set(self._keys(self._queue()))
+        others = {}  # type: Dict[str, Set[Tuple[str, str, str]]]
+        for kind in ("new_failures", "still_failing", "fixed", "muted"):
+            others[kind] = set(self._keys(self.store.status_queue(
+                kind, stale_before=cutoff, now=self.NOW)))
+            self.assertEqual(flaking & others[kind], set(), kind)
+        muted = (self.ENV, self.SCRIPT, "t_muted")
+        self.assertEqual(self.oracle()["states"][muted].state, "flaking")
+        self.assertEqual(
+            [kind for kind, keys in sorted(others.items()) if muted in keys],
+            ["muted"])
+        self.assertNotIn(muted, flaking)
+
+    def test_the_rows_are_total_up_to_the_cap_in_every_scope(self) -> None:
+        """With no race, every flaking test the count counts has its row:
+        ``len(rows) == min(total, limit)`` in every scope, at a cap above
+        and below the set, cold and after the headline's view."""
+        for scope in ({}, {"environment": self.ENV},
+                      {"environment": self.MANY},
+                      {"environments": [self.ENV]},
+                      {"environments": [self.ENV, self.MANY]},
+                      {"environments": []}):
+            for after_headline in (False, True):
+                for limit in (10, 500):
+                    self.store._invalidate_summary_cache()
+                    self.store._cadence_runs_cache.clear()
+                    if after_headline:
+                        self.store.flaky_view(
+                            storage.MAINLINE_STREAM_ID, self.NOW,
+                            scope.get("environment"),
+                            scope.get("environments"), marks=True)
+                    total = self._total(**scope)
+                    rows = self._queue(limit=limit, **scope)
+                    self.assertEqual(len(rows), min(total, limit),
+                                     (scope, after_headline, limit))
+
+    def test_every_act_and_a_push_drop_the_memo(self) -> None:
+        """The queue's memo entry goes with every write that drops the
+        other kinds': each step warms the queue, writes, and the next
+        read reflects the write, never the warm rows."""
+        later = self.NOW - datetime.timedelta(minutes=30)
+        key = (self.ENV, self.SCRIPT)
+
+        def names() -> List[str]:
+            return [row.test_name for row in self._queue()]
+
+        def row_of(name: str) -> Any:
+            return [row for row in self._queue() if row.test_name == name][0]
+
+        steps = (
+            ("push", lambda: self.store.upsert_runs([make_record(
+                test_name="t_flaking_new", result=Result.PASS,
+                start=self.NOW - datetime.timedelta(hours=1))]),
+             lambda: self.assertNotIn("t_flaking_new", names())),
+            ("assign", lambda: self.store.set_assignee(
+                self.ENV, self.SCRIPT, "t_assigned", "alice", "bob", later),
+             lambda: self.assertEqual(row_of("t_assigned").assignee,
+                                      "alice")),
+            ("mute", lambda: self.store.mute_tests(
+                [key + ("t_flaking_still", storage.MAINLINE_STREAM_ID)],
+                "infra", 24, "bob", "alice", later),
+             lambda: self.assertNotIn("t_flaking_still", names())),
+            ("unmute", lambda: self.store.unmute_tests(
+                [key + ("t_muted", storage.MAINLINE_STREAM_ID)], "alice",
+                later),
+             lambda: self.assertIn("t_muted", names())),
+            ("mark", lambda: self.store.mark_flaky(
+                [key + ("t_new", None)], 3, "why", "alice", later),
+             lambda: self.assertIn("t_new", names())),
+            ("unmark", lambda: self.store.unmark_flaky(
+                [(self.MANY, self.SCRIPT, "m001")], "alice", later),
+             lambda: self.assertNotIn("m001", names())),
+            ("cadence", lambda: self.store.mark_flaky(
+                [(self.MANY, self.SCRIPT, "m003", None)], 5, "why", "alice",
+                later),
+             lambda: self.assertEqual(row_of("m003").flaky.mark.cadence, 5)),
+            ("retire", lambda: self.store.set_retired(
+                self.MANY, self.SCRIPT, "m005", True, "alice", "gone",
+                later),
+             lambda: self.assertNotIn("m005", names())),
+        )  # type: Tuple[Tuple[str, Callable[[], Any], Callable[[], None]], ...]
+        for name, act, check in steps:
+            with self.subTest(name):
+                warm = self._queue()
+                self.assertEqual(self._queue(), warm, name)
+                act()
+                check()
+                self.assertEqual(self._total(), len(self._queue()), name)
+
+    def test_a_lapsed_mute_puts_its_test_back_with_no_write(self) -> None:
+        """The memo is keyed on the mute epoch: when t_muted's mute lapses
+        (it was muted an hour before NOW, for 24 hours) the next read has
+        it, flaking, with nothing written in between."""
+        muted = (self.ENV, self.SCRIPT, "t_muted")
+        before = self._keys(self._queue())
+        self.assertNotIn(muted, before)
+        later = self.NOW + datetime.timedelta(hours=24)
+        after = self._queue(now=later)
+        self.assertIn(muted, self._keys(after))
+        self.assertEqual(self._total(now=later), len(before) + 1)
+        row = [r for r in after if self._keys([r])[0] == muted][0]
+        self.assertEqual((row.flaky.state.state, row.flaky.state.streak),
+                         ("flaking", 2))
+        self.assertEqual(self._keys(self._queue()), before)
+
+    # -- the reads disagreeing: a write this process's memos have not
+    # seen (another process's, which they outlive until their time
+    # limit, or one that lands between the view and the rows) ---------
+
+    def _drop_queue_entries(self) -> None:
+        """Drop the ``status_queue`` entries alone, as their time limit
+        would while the view's entry is still served."""
+        with self.store._summary_lock:
+            for key in [k for k in self.store._summary_cache
+                        if k[0] == "status_queue"]:
+                del self.store._summary_cache[key]
+
+    def _assert_left_out(self, rows: List[Any], absent: str) -> None:
+        names = [row.test_name for row in rows]
+        self.assertNotIn(absent, names)
+        self.assertTrue(names)
+        for row in rows:
+            self.assertIsNotNone(row.flaky, row.test_name)
+            self.assertIs(row.result, Result.FAIL)
+
+    def test_a_row_whose_mark_is_gone_is_left_out(self) -> None:
+        """The view (served) still holds a test another process has
+        unmarked: its row is left out, never listed with no mark."""
+        self.assertIn("t_flaking_new", [
+            row.test_name for row in self._queue(environment=self.ENV)])
+        self.store._conn().execute(
+            "DELETE FROM test_flaky_marks WHERE environment = ? "
+            "AND script = ? AND test_name = ?",
+            (self.ENV, self.SCRIPT, "t_flaking_new"))
+        self._drop_queue_entries()
+        self._assert_left_out(self._queue(environment=self.ENV),
+                              "t_flaking_new")
+
+    def test_a_row_no_longer_failing_is_left_out(self) -> None:
+        """The view (served) still holds a test whose latest result
+        another process has changed: its row is left out."""
+        self.assertIn("t_flaking_still", [
+            row.test_name for row in self._queue(environment=self.ENV)])
+        self.store._conn().execute(
+            "UPDATE latest_runs SET result = ? WHERE stream_id = ? "
+            "AND environment = ? AND script = ? AND test_name = ?",
+            (Result.PASS.value, storage.MAINLINE_STREAM_ID, self.ENV,
+             self.SCRIPT, "t_flaking_still"))
+        self._drop_queue_entries()
+        self._assert_left_out(self._queue(environment=self.ENV),
+                              "t_flaking_still")
+
+    def test_unmarked_between_the_view_and_the_rows_is_left_out(
+            self) -> None:
+        """An unmark landing after the view and before the rows: no
+        raise, and the test is not listed with no mark."""
+        real = self.store._rows_by_key
+        acted = []  # type: List[bool]
+
+        def unmark_first(*args: Any, **kwargs: Any) -> Any:
+            if not acted:
+                acted.append(True)
+                self.store.unmark_flaky(
+                    [(self.ENV, self.SCRIPT, "t_assigned")], "bob",
+                    self.NOW)
+            return real(*args, **kwargs)
+
+        self.store._invalidate_summary_cache()
+        self.store._rows_by_key = unmark_first  # type: ignore
+        try:
+            rows = self._queue(environment=self.ENV)
+        finally:
+            del self.store._rows_by_key  # type: ignore
+        self.assertEqual(acted, [True])
+        self._assert_left_out(rows, "t_assigned")
+        self.assertEqual(sorted(row.test_name for row in rows),
+                         ["t_flaking_new", "t_flaking_still"])
+
+    def _statements_of(self, call: Callable[[], Any]) -> List[str]:
+        """The statements *call* sends, on either backend."""
+        captured = []  # type: List[str]
+        store = self.store
+        real = store._conn
+
+        class Spy(object):
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                captured.append(sql)
+                return self._conn.execute(sql, params)
+
+        store._conn = lambda: Spy(real())  # type: ignore
+        try:
+            call()
+        finally:
+            del store._conn  # type: ignore
+        return captured
+
+
+class FlakyTrendTest(FlakyListsBase):
+    """WP-44 item 8 (design §1 "The trend", decision 2): each night's
+    tolerated failures of marked tests as the night stood then, under
+    today's marks, no live mute now, against the pure rule over every
+    test's whole history; the runs before the window are read where the
+    window's first run needs them; the assigned ones are counted once."""
+
+    def _oracle(self, since: datetime.datetime
+                ) -> Dict[datetime.date, Tuple[int, int]]:
+        marks = self._marks()
+        out = {}  # type: Dict[datetime.date, Tuple[int, int]]
+        for triple, cadence in marks.items():
+            if triple[2] in self.MUTED:
+                continue
+            runs = list(reversed(self.store.run_history(
+                triple[0], triple[1], triple[2], limit=1000)))
+            flags = analytics.flaking_that_night(
+                cadence, [run.result for run in runs])
+            for run, flaking in zip(runs, flags):
+                if not flaking or run.start_time < since:
+                    continue
+                day = run.start_time.date()
+                count, assigned = out.get(day, (0, 0))
+                out[day] = (count + 1, assigned + (
+                    1 if triple[2] in self.ASSIGNED else 0))
+        return out
+
+    def _read(self, since: datetime.datetime
+              ) -> Dict[datetime.date, Tuple[int, int]]:
+        self.store._invalidate_summary_cache()
+        return {entry.day: (entry.flaking, entry.assigned)
+                for entry in self.store.daily_flaking_failures(
+                    since, self.NOW)}
+
+    def test_each_night_as_it_stood(self) -> None:
+        for days in (0, 6, 8, 9):
+            since = BASE + datetime.timedelta(days=days)
+            self.assertEqual(self._read(since), self._oracle(since), days)
+        whole = self._read(BASE)
+        self.assertTrue(any(assigned for _c, assigned in whole.values()))
+
+    def test_the_window_reads_the_runs_before_it(self) -> None:
+        """t_flaking_still (P F F) seen from night 8: alone, its two
+        FAILs would be over a cadence of 3; with night 7's pass, both
+        flake."""
+        since = BASE + datetime.timedelta(days=8)
+        self.store._invalidate_summary_cache()
+        got = {e.day: e.flaking for e in self.store.daily_flaking_failures(
+            since, self.NOW, environment=self.ENV)}
+        oracle = self._oracle(since)
+        linux = {}  # type: Dict[datetime.date, int]
+        for triple, cadence in self._marks().items():
+            if triple[0] != self.ENV or triple[2] in self.MUTED:
+                continue
+            runs = list(reversed(self.store.run_history(
+                triple[0], triple[1], triple[2], limit=1000)))
+            for run, flaking in zip(runs, analytics.flaking_that_night(
+                    cadence, [run.result for run in runs])):
+                if flaking and run.start_time >= since:
+                    linux[run.start_time.date()] = linux.get(
+                        run.start_time.date(), 0) + 1
+        self.assertEqual(got, linux)
+        self.assertLess(sum(linux.values()),
+                        sum(count for count, _a in oracle.values()))
+        night8 = (BASE + datetime.timedelta(days=8)).date()
+        self.assertGreaterEqual(got[night8], 1)
+
+    def test_a_live_mute_wins_and_expires(self) -> None:
+        later = self.NOW + datetime.timedelta(days=2)
+        self.store._invalidate_summary_cache()
+        now_total = sum(e.flaking for e in self.store.daily_flaking_failures(
+            BASE, self.NOW, environment=self.ENV))
+        later_total = sum(
+            e.flaking for e in self.store.daily_flaking_failures(
+                BASE, later, environment=self.ENV))
+        # t_muted (P F F) flakes on both its FAILs once the mute is out;
+        # t_muted_tolerated (F P F P) on its second FAIL.
+        self.assertEqual(later_total - now_total, 3)
+
+    def test_with_no_mark_nothing(self) -> None:
+        self.store.unmark_flaky(list(self._marks()), "bob", self.NOW)
+        self.assertEqual(self.store.daily_flaking_failures(
+            BASE, self.NOW), [])
+
+    def test_the_pure_rule(self) -> None:
+        F, P, UP = self.F, self.P, self.UP
+        self.assertEqual(analytics.flaking_that_night(3, [P, F, F, F, P, F]),
+                         [False, True, True, False, False, True])
+        self.assertEqual(analytics.flaking_that_night(2, [F, F, UP, F]),
+                         [False, False, False, True])
+        # A window shorter than N, all FAIL: over, not flaking.
+        self.assertEqual(analytics.flaking_that_night(3, [F, F]),
+                         [False, False])
+        self.assertEqual(analytics.flaking_that_night(
+            3, [P, F, F, F], first=2), [True, False])

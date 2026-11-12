@@ -143,6 +143,35 @@ class LedgerTest(unittest.TestCase):
                       upgrade.rewritten_tables([streams]))
         self.assertIn((9, "runs"), upgrade.rewritten_tables([streams]))
 
+    def test_the_flaky_mark_step_creates_only(self) -> None:
+        """WP-44: step 11 to 12 creates the two flaky tables and their
+        index and rewrites nothing, so the dry run says the server may
+        keep running; its CREATE TABLEs are the exporter's (the oracle
+        ``verify`` diffs against on a live server), whitespace aside."""
+        step = [s for s in upgrade.LEDGER if s.from_version == 11][0]
+        self.assertEqual(step.package, "WP-44")
+        self.assertEqual(step.alters, ())
+        self.assertEqual(upgrade.rewritten_tables([step]), [])
+        self.assertEqual(
+            sorted(probe.table for probe in step.probes),
+            ["flaky_mark_history", "test_flaky_marks"])
+        sizes = exporter.Sizes(64, 255, 255)
+        statements = step.statements(sizes, "2026-01-01T00:00:00.000000")
+        oracle = " ".join(exporter.ddl(sizes).split())
+        creates = [s for s in statements if s.startswith("CREATE TABLE")]
+        self.assertEqual(len(creates), 2)
+        for statement in creates:
+            flat = " ".join(statement.split())
+            self.assertIn(flat, oracle.replace(";", ""), statement)
+        self.assertIn(
+            "CREATE INDEX idx_flaky_mark_history_triple ON "
+            "flaky_mark_history (environment, script, test_name, id)",
+            " ".join(exporter.INDEXES.split()))
+        self.assertIn(
+            "CREATE INDEX idx_flaky_mark_history_triple "
+            "ON flaky_mark_history (environment, script, test_name, id)",
+            statements)
+
     def test_row_count_tables_are_the_altered_ones_runs_first(
             self) -> None:
         self.assertEqual(upgrade._ROW_COUNT_TABLES[0], "runs")

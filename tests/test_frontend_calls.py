@@ -32,6 +32,8 @@ begins with a second one.
 Python 3.6 compatible; standard library only.
 """
 
+import datetime
+import hashlib
 import io
 import json
 import os
@@ -40,6 +42,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import urllib.parse
 from typing import Any, Dict, List, Tuple
 
 STATIC_DIR = os.path.join(
@@ -123,6 +126,52 @@ class CoverageTest(unittest.TestCase):
             "such a file can be read")
         for name in with_nul:
             self.assertGreater(len(scripts()[name]), 1000, name)
+
+
+#: Files under static/ still spelling a NUL as the byte itself rather
+#: than as the escape "\u0000" (the same string at run time). Each is
+#: named so that this list can only shrink: respelling one fails
+#: NoNulByteTest until its name is removed here. (actions.js is outside
+#: WP-44 item 17's scope; CoverageTest's NUL read relies on it.)
+_NUL_BYTE_FILES = ("actions.js",)
+
+
+def _nul_byte_files(directory: str) -> List[str]:
+    """The files under *directory*, recursively and by path relative to
+    it, that contain a NUL byte."""
+    found = []  # type: List[str]
+    for parent, _dirs, names in os.walk(directory):
+        for name in names:
+            path = os.path.join(parent, name)
+            with io.open(path, "rb") as handle:
+                if b"\x00" in handle.read():
+                    found.append(
+                        os.path.relpath(path, directory).replace(os.sep, "/"))
+    return sorted(found)
+
+
+class NoNulByteTest(unittest.TestCase):
+    """WP-44 item 17: test.js held a literal NUL inside a string, which
+    made search tools call it binary and the editing tools refuse it. A
+    NUL in a string is spelled as its escape; no file under static/
+    holds the byte, bar the ones named in _NUL_BYTE_FILES."""
+
+    def test_no_static_file_holds_a_nul_byte(self) -> None:
+        self.assertEqual(_nul_byte_files(STATIC_DIR),
+                         sorted(_NUL_BYTE_FILES))
+
+    def test_the_sentinel_is_spelled_as_its_escape(self) -> None:
+        self.assertIn('const NEW_USER_SENTINEL = "\\u0000new-user";',
+                      read("test.js"))
+
+    def test_the_detector_can_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            os.mkdir(os.path.join(scratch, "sub"))
+            for name, data in (("clean.js", b'const a = "\\u0000x";\n'),
+                               ("sub/key.js", b'const a = "\x00x";\n')):
+                with io.open(os.path.join(scratch, name), "wb") as handle:
+                    handle.write(data)
+            self.assertEqual(_nul_byte_files(scratch), ["sub/key.js"])
 
 
 class UrlsModuleTest(unittest.TestCase):
@@ -573,6 +622,109 @@ class ResultEmphasisTest(unittest.TestCase):
         for queue in ("still_failing", "unexpected_passes"):
             self.assertIn(queue, code)
 
+    #: Every list row builder of WP-44 design §3 U9: (file, signature).
+    _ROW_BUILDERS = (("app.js", "function buildRow("),
+                     ("app.js", "function renderQueueTable("),
+                     ("script.js", "function renderTests("),
+                     ("actions.js", "function buildRow("))
+
+    def test_every_row_builder_shows_one_displayed_result(self) -> None:
+        """WP-44 item 7 (design §3 U9, decision 8 as changed): a flaking
+        row has its own chip and edge. Each row builder takes ONE value
+        from rowResult() (displayResult() of the row's result, mark and
+        mute) and gives it to resultClass(), the edge, and resultChip(),
+        the chip, so the two cannot disagree; neither reads the raw
+        result any more."""
+        api = _strip_comments(read("api.js"))
+        self.assertRegex(
+            _function_body(api, "export function rowResult(entry)"),
+            r"return displayResult\(entry\.result, flaky \? flaky\.state "
+            r": null,\s*Boolean\(entry\.mute && entry\.mute\.live\)\);")
+        for name, signature in self._ROW_BUILDERS:
+            with self.subTest(builder=name + " " + signature):
+                body = _strip_comments(_function_body(read(name), signature))
+                self.assertEqual(body.count("const shown = rowResult("), 1)
+                self.assertIn("const marker = resultClass(shown);", body)
+                for raw in ("resultClass(row.result)",
+                            "resultClass(entry.result)",
+                            "resultChip(row.result)",
+                            "resultChip(entry.result)"):
+                    self.assertNotIn(raw, body)
+                if signature == "function renderQueueTable(":
+                    self.assertIn("column.cell(entry, shown)", body)
+                else:
+                    self.assertIn("resultChip(shown)", body)
+        # The queue's cells draw the value they are handed.
+        columns = _strip_comments(_function_body(
+            read("app.js"), "function queueColumns("))
+        self.assertEqual(columns.count("resultChip(shown)"), 2)
+        self.assertNotIn("entry.result", columns)
+
+    def test_the_flaky_pill_stands_beside_the_chip(self) -> None:
+        """Wherever the "muted" pill goes the "flaky" one follows it; a
+        queue that states its one result above the table puts the pill
+        after the test's name instead."""
+        for name, signature in (("app.js", "function buildRow("),
+                                ("actions.js", "function buildRow(")):
+            body = _strip_comments(_function_body(read(name), signature))
+            self.assertIn("for (const tag of [mutedTag(row), flakyTag(row)])",
+                          body, name)
+        self.assertIn("flakyTag(row)", _strip_comments(_function_body(
+            read("script.js"), "function renderTests(")))
+        columns = _strip_comments(_function_body(
+            read("app.js"), "function queueColumns("))
+        self.assertIn("const tag = invariant ? flakyTag(entry) : null;",
+                      columns)
+        # The Result, the two was -> now and Not run's Last result cells.
+        self.assertEqual(columns.count("withFlakyTag("), 4)
+
+    def test_runs_stay_raw(self) -> None:
+        """Decision 9: a run is what happened. Run history, the execution
+        breakdown, the compare strip, the comparison page, the timeline
+        and Watch's build cards never read the displayed result."""
+        displayed = re.compile(r"\b(?:displayResult|rowResult)\s*\(")
+        for name in ("compare.js", "timeline.js", "time.js"):
+            self.assertIsNone(displayed.search(_strip_comments(read(name))),
+                              name)
+        test = _strip_comments(read("test.js"))
+        self.assertIn("resultCell.appendChild(resultChip(run.result));", test)
+        execution = _strip_comments(_function_body(
+            read("script.js"), "function buildExecutionRow("))
+        self.assertIn("resultChip(name)", execution)
+        self.assertIsNone(displayed.search(execution))
+        actions = _strip_comments(_function_body(
+            read("actions.js"), "function buildRow("))
+        self.assertIn("renderCompareStrip(resultCell, originStream, "
+                      "row.result,", actions)
+
+    def test_every_flaking_rule_takes_its_own_step(self) -> None:
+        """Chips, row edges, the outlined chip and (item 9) a pressed
+        toggle take the strong mauve; the chart parts take the chart's.
+        A pressed FLAKING toggle, once it exists, must also be named in
+        the pressed-toggle ink rule's :not() list, or that rule wins on
+        specificity and paints it grey."""
+        css = read_text("style.css")
+        ink_prefix = '.toggle[aria-pressed="true"]:not('
+        # Widened for the FLAKING toggle: the ink rule names .result-flaking only to
+        # leave it out, so it is checked on its own below, not as a
+        # flaking rule.
+        flaking = [line for line in css.split("\n")
+                   if "result-flaking" in line and "{" in line
+                   and not line.startswith(ink_prefix)]
+        self.assertGreaterEqual(len(flaking), 3)
+        for rule in flaking:
+            self.assertIn("var(--c-flaking-strong)", rule)
+            self.assertNotIn("var(--c-flaking)", rule)
+        if ".toggle.result-flaking" in css:
+            ink = [line for line in css.split("\n")
+                   if line.startswith(ink_prefix)]
+            self.assertTrue(ink and ":not(.result-flaking)" in ink[0])
+        for selector in (".bar-flaking {", ".tt-key.swatch-flaking {",
+                         ".swatch-flaking, .legend-swatch.swatch-flaking {"):
+            rule = css[css.index(selector):]
+            rule = rule[:rule.index("}")]
+            self.assertIn("var(--c-flaking)", rule, selector)
+
 
 class SharedControlStylingTest(unittest.TestCase):
     """The Build picker looked "out of place" — browser-default, not
@@ -668,6 +820,19 @@ class SortingTest(unittest.TestCase):
         """It holds the whole level, so reordering shows everything."""
         code = _strip_comments(read("time.js"))
         self.assertIn("sortRows(state.items", code)
+
+    def test_sorting_stays_on_the_wire_result(self) -> None:
+        """WP-44 item 7: a row that reads FLAKING is FAIL on the wire, and
+        every sort keeps the wire value, so a flaking row sorts with the
+        failures. The result columns sort by ``result``; nothing that
+        sorts reads the displayed result."""
+        displayed = re.compile(r"\b(?:displayResult|rowResult)\s*\(")
+        self.assertIsNone(displayed.search(_strip_comments(read("sorting.js"))))
+        columns = _strip_comments(_function_body(
+            read("app.js"), "function queueColumns("))
+        self.assertEqual(columns.count('sortKey: "result"'), 3)
+        self.assertNotIn("sortKey: \"shown\"", columns)
+        self.assertIn('data-key="result">Result', read("index.html"))
 
     def test_sorting_is_implemented_once(self) -> None:
         offenders = [
@@ -1162,16 +1327,29 @@ class SummaryPartsFetchTest(unittest.TestCase):
 
         A third site is the per-action pile-up coming back, one queue
         at a time.
+
+        Widened for the Flaky tab (WP-44): the two sites share rowsRequest(),
+        which asks for the Flaky tab's own request in place of a queue
+        part when that tab is the one asked for, so the one fetch of a
+        queue part lives there and rowsRequest() has exactly the two
+        callers the queue part had.
         """
-        source = read("app.js")
+        source = _strip_comments(read("app.js"))
         sites = [
             number for number, line in enumerate(source.split("\n"), 1)
             if "fetchJson(queueUrl(" in line
         ]
         self.assertEqual(
-            len(sites), 2,
-            "app.js should fetch queue rows in exactly two places "
-            "(loadQueue and fetchSummary); found lines " + repr(sites))
+            len(sites), 1,
+            "app.js should fetch queue rows in one place, rowsRequest(); "
+            "found lines " + repr(sites))
+        self.assertIn("fetchJson(queueUrl(kind))",
+                      _function_body(source, "function rowsRequest("))
+        self.assertEqual(len(_call_arguments(source, "rowsRequest")), 2)
+        for caller in ("async function loadQueue(",
+                       "async function fetchSummary()"):
+            self.assertIn("rowsRequest(kind)",
+                          _function_body(source, caller), caller)
 
     def test_a_tab_click_does_not_refetch_a_cached_queue(self) -> None:
         """Clicking between tabs must cost zero requests once loaded."""
@@ -3459,9 +3637,13 @@ class WatchUnassignedStatLinkTest(unittest.TestCase):
         Widened for WP-40 (not weakened): the signature may now carry
         ONE more argument, the count of muted failures to name beside a
         failing figure -- "(+3 muted)" -- and the href ban stands, as
-        does the rule that a stat is a plain value and a label."""
+        does the rule that a stat is a plain value and a label.
+
+        Widened again for WP-44 item 7 (not weakened): one more count,
+        the flaking failures set aside beside the muted ones -- "(+3
+        muted, +4 flaking)"; still no href and no link."""
         body = _function_body(read("watch.js"), "function buildStat(")
-        self.assertIn("function buildStat(label, value, muted)", body)
+        self.assertIn("function buildStat(label, value, muted, flaking)", body)
         self.assertNotIn("href", _strip_comments(body))
         self.assertNotIn("<a", _strip_comments(body))
         self.assertNotIn("createElement(\"a\")", _strip_comments(body))
@@ -3483,22 +3665,205 @@ class OpenActionsSummaryScopeTest(unittest.TestCase):
     """
 
     def test_summary_is_fetched_through_the_scoped_helper(self) -> None:
-        """WP-24: the appendProduct(qs) helper is gone -- summaryUrl()
+        """WP-24: the appendProduct(qs) helper is gone -- the helper
         now calls apiUrl() with a product scope from
         selectedProductScope() (getSelectedProduct() || null, so it is
         OMITTED rather than sent empty when nothing is selected -- the
         same behaviour appendProduct()'s `if (product)` guard gave).
         Same assertion intent (the summary fetch carries the product
-        scope), now checking the apiUrl() call site."""
+        scope), now checking the apiUrl() call site.
+
+        WP-44: the page's one summary request is the names part, and its
+        helper is ``namesUrl()`` (was ``summaryUrl()``); widened to that
+        helper and to the relative spelling of a bare fetch, every scope
+        assertion kept."""
         src = read("actions.js")
-        self.assertIn("function summaryUrl()", src)
-        self.assertIn("fetchJson(summaryUrl())", src)
-        self.assertNotIn('fetchJson("/api/summary")', src,
-                         "a bare unscoped summary fetch is the bug "
-                         "coming back")
-        body = _function_body(src, "function summaryUrl()")
+        self.assertIn("function namesUrl()", src)
+        self.assertIn("fetchJson(namesUrl())", src)
+        for bare in ('fetchJson("/api/summary")', 'fetchJson("api/summary")'):
+            self.assertNotIn(bare, src,
+                             "a bare unscoped summary fetch is the bug "
+                             "coming back")
+        body = _function_body(src, "function namesUrl()")
         self.assertIn("apiUrl(", body)
         self.assertIn("selectedProductScope()", body)
+
+
+def _unsliced_summary_requests(source: str) -> List[int]:
+    """Line numbers where comment-stripped *source* names ``api/summary``
+    in a statement that does not ask for the names part.
+
+    Each ``api/summary`` is read to the end of its statement (the next
+    ``;``), which must carry ``parts: "names"`` (the apiUrl() params
+    spelling) or ``parts=names`` (a hand-built query string)."""
+    code = _strip_comments(source)
+    hits = []  # type: List[int]
+    for match in re.finditer(r"api/summary", code):
+        end = code.find(";", match.end())
+        statement = code[match.start():end if end != -1 else len(code)]
+        if not re.search(r'parts:\s*"names"|parts=names\b', statement):
+            hits.append(code.count("\n", 0, match.start()) + 1)
+    return hits
+
+
+class OpenActionsCatalogueTest(unittest.TestCase):
+    """WP-44: Open Actions takes its catalogue from the names part.
+
+    The page reads five fields of the summary (environments, assignees,
+    products, assignment streams, stale_before) and used to wait for the
+    whole unsliced payload, every headline number and queue of the
+    board, on its first paint. ``GET /api/summary?parts=names`` returns
+    those five and nothing else. Reverting to the full summary still
+    WORKS, it is only slow again, so it is pinned here the way
+    ``SummaryPartsFetchTest`` pins the home page's split.
+
+    First half: the names request. Second half: the Failing mode
+    sends FAIL and FLAKING, and the footer line says what the list
+    leaves out where a flaky mark exists.
+    """
+
+    def test_every_summary_request_asks_for_the_names_part(self) -> None:
+        src = read("actions.js")
+        self.assertIn("api/summary", _strip_comments(src),
+                      "nothing to check: the page names no summary request")
+        self.assertEqual(
+            _unsliced_summary_requests(src), [],
+            "actions.js requests /api/summary without parts=names: the "
+            "Open Actions first paint waits on the whole board again")
+        self.assertIn('parts: "names"',
+                      _function_body(src, "function namesUrl()"))
+
+    def test_the_detector_catches_a_full_summary_request(self) -> None:
+        """Planted: the shipped helper with its part dropped, a bare
+        fetch, another part, and a hand-built query string."""
+        src = read("actions.js")
+        self.assertIn('{ parts: "names" }', src)
+        dropped = src.replace('{ parts: "names" }', "{}")
+        self.assertNotEqual(_unsliced_summary_requests(dropped), [])
+        for planted in (
+            'const s = await fetchJson("api/summary");\n',
+            'const u = apiUrl("api/summary", { parts: "headline" }, {});\n',
+            'fetchJson("api/summary?product=" + p);\n',
+            'fetchJson("api/summary?parts=namesake");\n',
+        ):
+            with self.subTest(planted=planted):
+                self.assertEqual(
+                    _unsliced_summary_requests(src + planted),
+                    [len(_strip_comments(src + planted).split("\n")) - 1])
+        self.assertEqual(_unsliced_summary_requests(
+            'fetchJson("api/summary?parts=names&product=" + p);\n'), [])
+
+    def test_the_catalogue_gate_is_a_loaded_flag(self) -> None:
+        """With nobody assigned, ``state.assignees.length`` stayed 0 and
+        every refresh refetched the catalogue. The flag is set where the
+        answer is applied, after the stale-answer check, and nowhere
+        else, so a failed or superseded request leaves it unset."""
+        code = _strip_comments(read("actions.js"))
+        body = _function_body(code, "async function refresh(")
+        self.assertNotIn("assignees.length", body)
+        self.assertIn("catalogueLoaded: false,", code)
+        # The flag alone: an append asks again while it is unset, or its
+        # clearError() hides the failure behind empty filters.
+        self.assertRegex(body, r"state\.catalogueLoaded\s*\?")
+        self.assertNotIn("catalogueLoaded || append", body)
+        self.assertEqual(code.count("state.catalogueLoaded = true"), 1)
+        self.assertNotIn("catalogueLoaded = false", code)
+        self.assertLess(body.index("seq !== state.seq"),
+                        body.index("state.catalogueLoaded = true"))
+
+    def test_first_paint_is_still_names_and_rows_then_expiring(self) -> None:
+        """Two awaited requests started together, names first, then the
+        expiring mutes, which nothing awaits (WP-40); nothing added."""
+        body = _function_body(
+            _strip_comments(read("actions.js")), "async function refresh(")
+        order = [body.index(token) for token in (
+            "Promise.all([", "fetchJson(namesUrl())",
+            "fetchJson(listUrl(offset))", "loadExpiring();",
+            "await requests")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(body.count("fetchJson("), 2)
+        self.assertEqual(body.count("await "), 1)
+        self.assertNotIn("await loadExpiring", body)
+
+    def test_a_failed_catalogue_still_draws_the_rows(self) -> None:
+        """The names request's own failure is caught beside it, so the
+        rows still draw; its message is shown after them."""
+        body = _function_body(
+            _strip_comments(read("actions.js")), "async function refresh(")
+        self.assertIn("fetchJson(namesUrl()).catch(", body)
+        self.assertLess(body.index("renderRows(page.tests, append)"),
+                        body.index("showError(namesError.message)"))
+
+    # ---- second half: the Failing mode sends FAIL and FLAKING; the
+    # footer line. ----
+
+    def test_the_failing_mode_sends_fail_and_flaking(self) -> None:
+        """FAIL alone now leaves out every row reading FLAKING, an
+        assigned one included (design §2 B.3(b)); the two together are
+        every failing test. The values come from api.js, the one place
+        FLAKING is spelled, and are shared by the rows and bulk assign."""
+        body = _strip_comments(_function_body(
+            read("actions.js"), "function filterParams("))
+        self.assertIn('const failing = state.result === "FAIL";', body)
+        self.assertRegex(body, r"const results = open \? null\s*: \(failing "
+                               r"\? FAIL_AND_FLAKING : \[state\.result\]\);")
+        self.assertIn('open: open || failing ? "1" : null', body)
+        api = _strip_comments(read("api.js"))
+        self.assertIn('export const FAIL_AND_FLAKING = ["FAIL", '
+                      'FLAKING_FILTER];', api)
+        self.assertIn('export const FLAKING_FILTER = displayResult("FAIL", '
+                      '"flaking", false);', api)
+        for caller in ("function listUrl(", "function bulkUrl("):
+            self.assertIn("filterParams()", _function_body(
+                read("actions.js"), caller), caller)
+
+    def test_the_failing_mode_detector_can_fail(self) -> None:
+        """Planted: Failing sending FAIL alone, the regression that drops
+        an assigned flaking test from the mode."""
+        body = _strip_comments(_function_body(
+            read("actions.js"), "function filterParams("))
+        planted = body.replace("(failing ? FAIL_AND_FLAKING : "
+                               "[state.result])", "[state.result]")
+        self.assertNotEqual(planted, body)
+        self.assertIsNone(re.search(r"\? FAIL_AND_FLAKING :", planted))
+
+    def test_the_footer_line_shows_only_where_a_mark_exists(self) -> None:
+        html = read("actions.html")
+        footer = html[html.index('<div class="browse-footer">'):]
+        footer = footer[:footer.index("</section>")]
+        self.assertIn('<p id="actions-flaky-note" class="muted cap-note" '
+                      'hidden></p>', footer)
+        self.assertLess(footer.index('id="actions-count"'),
+                        footer.index('id="actions-flaky-note"'))
+        body = _strip_comments(_function_body(
+            read("actions.js"), "async function refresh("))
+        self.assertIn("flakyNote.hidden = !names.flaky_marks;", body)
+        self.assertIn("? OPEN_ACTIONS_FLAKING_NOTE", body)
+        self.assertNotIn("innerHTML", body)
+
+    # NODE is defined further down this module; the decorator runs here.
+    @unittest.skipIf(shutil.which("node") is None, "node is not on PATH: "
+                     "the DOM-shim walks are optional dev tooling, the "
+                     "source guards still run")
+    def test_each_mode_and_the_footer_over_the_shim(self) -> None:
+        """The real actions.js: the rows request of each mode, and the
+        footer under the count only where ``flaky_marks`` is true (an
+        older server sends no such field)."""
+        for marks in (True, False, None):
+            with self.subTest(flaky_marks=marks):
+                answer = _actions_modes_walk(marks)
+                self.assertEqual(answer["modes"], {
+                    "open": [["open", "1"]],
+                    "FAIL": [["result", "FAIL"], ["result", "FLAKING"],
+                             ["open", "1"]],
+                    "UNEXPECTED_PASS": [["result", "UNEXPECTED_PASS"]],
+                })
+                if marks:
+                    self.assertEqual(answer["note"], [
+                        False, "Unassigned tests that are flaking are left "
+                        "out until they fail past their cadence."])
+                else:
+                    self.assertEqual(answer["note"], [True, ""])
 
 
 class OpenActionsOriginFilterTest(unittest.TestCase):
@@ -3565,8 +3930,10 @@ class OpenActionsOriginFilterTest(unittest.TestCase):
         self.assertIn("row.assignment_stream_id === null", body)
 
     def test_summary_and_page_streams_are_both_read(self) -> None:
+        """WP-44: the summary's answer is the names part now, held as
+        ``names`` (was ``summary``); the same field is read from it."""
         code = _strip_comments(read("actions.js"))
-        self.assertIn("summary.assignment_streams", code)
+        self.assertIn("names.assignment_streams", code)
         self.assertIn("page.streams", code)
 
     def test_a_build_originated_row_links_to_the_streams_own_test_page(
@@ -3637,12 +4004,20 @@ class OpenActionsTruthfulResultTest(unittest.TestCase):
         self
     ) -> None:
         """Zero visible change for a mainline-origin row: the plain
-        resultChip() path, not the compare strip."""
+        resultChip() path, not the compare strip.
+
+        Widened for WP-44 item 7: the plain chip draws the row's one
+        displayed result (rowResult(row), FLAKING for an assigned test
+        under its cadence), the value the row edge takes too; the
+        compare strip above still gets the raw `row.result`."""
         body = _strip_comments(
             _function_body(read("actions.js"), "function buildRow("))
         self.assertIn("} else {", body)
         else_at = body.index("} else {", body.index("if (originStream) {"))
-        self.assertIn("resultChip(row.result)", body[else_at:])
+        self.assertIn("resultChip(shown)", body[else_at:])
+        self.assertIn("const shown = rowResult(row);", body)
+        self.assertLess(body.index("const shown = rowResult(row);"),
+                        body.index("if (originStream) {"))
 
     def test_no_innerHTML(self) -> None:
         self.assertNotIn("innerHTML", _strip_comments(read("actions.js")))
@@ -5064,18 +5439,27 @@ class OpenActionsNeedsActionIncludesAssignedTest(unittest.TestCase):
         rather than duplicating it."""
         body = _function_body(read("actions.js"), "function filterParams(")
         self.assertIn('const open = state.result === "open"', body)
-        self.assertIn("const results = open ? null : [state.result]",
-                      body)
-        self.assertIn('open: open ? "1" : null', body)
+        # WP-44: Failing's two values join the expression; the
+        # default mode still sends no result at all.
+        self.assertRegex(body, r"const results = open \? null\s*:")
+        self.assertRegex(body, r'open: open (\|\| failing )?\? "1" : null')
         list_body = _function_body(read("actions.js"), "function listUrl(")
         self.assertIn("filterParams()", list_body)
 
     def test_the_narrow_modes_send_their_result_and_no_open(self) -> None:
         """FAIL/UNEXPECTED_PASS stay plain result filters — `open` is
         the default mode's composite, never a standing param. WP-26:
-        checked against filterParams(), where this now lives."""
+        checked against filterParams(), where this now lives.
+
+        Widened for WP-44 (design §2 B.3(b)): Failing also sends
+        `open=1`, the composite the server leaves its unassigned flaking
+        tests out of, beside FAIL and FLAKING; Stale annotations is still
+        a plain result filter. The requests each mode makes are pinned
+        over the shim in OpenActionsCatalogueTest's second half."""
         body = _function_body(read("actions.js"), "function filterParams(")
         self.assertNotIn('open: "1",', body)
+        self.assertIn('const failing = state.result === "FAIL";', body)
+        self.assertIn('open: open || failing ? "1" : null', body)
 
 
 class TestPageTimelineLinkTest(unittest.TestCase):
@@ -5523,8 +5907,11 @@ class RootAbsoluteApiUrlTest(unittest.TestCase):
     #: files) precisely because a first-pass grep skipped them without
     #: comment. ``scripts()``/``read()`` decode bytes explicitly and
     #: are immune, but this asserts the scan actually reached them
-    #: rather than trusting that silently.
-    _NUL_FILES = ("actions.js", "test.js")
+    #: rather than trusting that silently. (WP-44 item 17: test.js now
+    #: spells its NUL as the escape and left this list; the list is the
+    #: one NoNulByteTest holds equal to every NUL-bearing file under
+    #: static/, so the scan is asserted to reach all of them.)
+    _NUL_FILES = _NUL_BYTE_FILES
 
     def test_the_nul_byte_files_are_still_in_scope(self) -> None:
         found = scripts()
@@ -5705,10 +6092,48 @@ class MutedBesideFailingTest(unittest.TestCase):
         self.assertIn('className: "bar-muted"', charts)
 
     def test_the_watch_failing_stat_carries_the_suffix(self) -> None:
+        """Widened for WP-44 item 7: the Failing stat names the flaking
+        failures beside the muted ones, from one bracket helper, and a
+        stream card still names neither (decision 9)."""
         card = _strip_comments(_function_body(
             read("watch.js"), "function buildOkCard("))
-        self.assertIn('buildStat("Failing", card.failing, card.muted)', card)
+        self.assertRegex(card, r'buildStat\("Failing", card\.failing, '
+                               r'card\.muted,\s*card\.flaking\)')
         self.assertNotIn('buildStat("Muted"', card)
+        self.assertNotIn('buildStat("Flaking"', card)
+        stat = _strip_comments(_function_body(
+            read("watch.js"), "function buildStat("))
+        self.assertIn("setAsideBracket(muted, flaking)", stat)
+        stream = _strip_comments(_function_body(
+            read("watch.js"), "function buildStreamCard("))
+        self.assertIn("buildStat(CATEGORY_LABELS[key], card[key])", stream)
+        self.assertNotIn("flaking", stream)
+
+    def test_the_tiles_name_the_flaking_failures_too(self) -> None:
+        """WP-44 item 7 (design §3 U6): each failing tile's suffix names
+        its own flaking figure after its muted one, through the one
+        set-aside helper, and the New failures line says "or flaking"
+        only where the scope has a mark."""
+        status = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        self.assertRegex(status, r"withSetAside\(newFailuresSub\("
+                                 r"status\.flaky_total\),\s*status\."
+                                 r"muted_new_failures, status\."
+                                 r"flaking_new_failures\)")
+        self.assertRegex(status, r'withSetAside\("failed before too", '
+                                 r"status\.muted_still_failing,\s*status\."
+                                 r"flaking_still_failing\)")
+        helper = _strip_comments(_function_body(
+            read("app.js"), "function withSetAside("))
+        self.assertIn("setAsideSuffix(muted, flaking)", helper)
+        api = _strip_comments(read("api.js"))
+        self.assertIn('"were passing or flaking before"', _function_body(
+            api, "export function newFailuresSub("))
+        self.assertIn('"were passing before"', _function_body(
+            api, "export function newFailuresSub("))
+        for gone in ("mutedSuffix", "failingWithMuted", "withMutedSuffix"):
+            for name, source in scripts().items():
+                self.assertNotIn(gone, _strip_comments(source), name)
 
 
 class AssignedSplitTest(unittest.TestCase):
@@ -5730,14 +6155,32 @@ class AssignedSplitTest(unittest.TestCase):
         self.assertEqual(bars.count("failingLegend("), 2)
 
     def test_the_bars_split_unassigned_assigned_muted(self) -> None:
+        """Widened for WP-44 item 7 (design §3 U7): a fourth part, the
+        flaking failures, after the grey, in the chart's mauve; the split
+        is told the flaking count only where the scope has a mark, so a
+        scope with none is the three-part split exactly."""
         bar = _function_body(self._app(), "function failingBar(")
         order = [bar.index(token) for token in (
             '{ value: split.unassigned, className: "fill-fail" }',
             '{ value: split.assigned, className: "bar-assigned" }',
-            '{ value: split.muted, className: "bar-muted" }')]
+            '{ value: split.muted, className: "bar-muted" }',
+            "{ value: split.flaking, className: FLAKING_BAR.className }")]
         self.assertEqual(order, sorted(order))
-        self.assertIn("failingSplit(failing, entry.assigned, entry.muted)",
-                      bar)
+        self.assertRegex(
+            bar, r"failingSplit\(failing, entry\.assigned, entry\.muted,"
+                 r"\s*flakyScope\(\) \? entry\.flaking \|\| 0 : null\)")
+        self.assertIn("return state.summary.status.flaky_total > 0;",
+                      _function_body(self._app(), "function flakyScope()"))
+        legend = _function_body(self._app(), "function failingLegend(")
+        self.assertIn("FAILING_SPLIT_LEGEND.concat([FLAKING_BAR])", legend)
+        self.assertIn("flakyScope()", legend)
+        api = _strip_comments(read("api.js"))
+        split = _function_body(api, "export function failingSplit(")
+        self.assertIn('const keyed = typeof flaking === "number";', split)
+        self.assertIn('[{ key: "flaking", swatchClass: '
+                      'FLAKING_BAR.swatchClass }] : []', split)
+        self.assertRegex(api, r'className: "bar-flaking"')
+        self.assertRegex(api, r'swatchClass: "swatch-flaking"')
         self.assertIn("tooltipRows: split.rows.concat(moreRows)", bar)
         self.assertIn("split.words", bar)
         # An older payload: the WP-40 bar, never all red.
@@ -5753,12 +6196,26 @@ class AssignedSplitTest(unittest.TestCase):
         self.assertEqual(tuple(keys), self._ORDER)
         self.assertIn("const FAILING_SPLIT_LEGEND = "
                       "TREND_SPLIT_SERIES.slice(0, 3)", app)
+        # WP-44 (design §3 U7): the flaking runs after the grey,
+        # before unexpected passes, in the chart token.
+        self.assertRegex(app, r"const TREND_FLAKING_SERIES = "
+                              r"FAILING_SPLIT_LEGEND\.concat\(\s*\[FLAKING_BAR\],"
+                              r" TREND_SPLIT_SERIES\.slice\(3\)\)")
+        bar = _strip_comments(read("api.js"))
+        bar = bar[bar.index("export const FLAKING_BAR = {"):]
+        bar = bar[:bar.index("};")]
+        self.assertIn('key: "FAIL_FLAKING"', bar)
+        self.assertIn('segClass: "seg-flaking"', bar)
 
     def test_the_unassigned_part_is_derived_and_floored(self) -> None:
+        """Widened for WP-44 (design §3 U7): where the flaking series is drawn
+        its runs leave the unassigned part too (counted once)."""
         body = _function_body(self._app(), "function splitNights(")
         self.assertRegex(
             body, r"FAIL_UNASSIGNED: Math\.max\(\s*0, night\.FAIL - "
-                  r"part\.FAIL_ASSIGNED - part\.FAIL_MUTED\)")
+                  r"part\.FAIL_ASSIGNED - part\.FAIL_MUTED - flaking\)")
+        self.assertIn("const flaking = withFlaking ? part.FAIL_FLAKING : 0;",
+                      body)
         # Merged by date, and a night the part does not carry means the
         # whole card draws today's two series.
         self.assertIn("byDate.get(night.date)", body)
@@ -5767,7 +6224,11 @@ class AssignedSplitTest(unittest.TestCase):
     def test_the_home_trend_counts_days(self) -> None:
         body = _function_body(self._app(), "function renderTrend()")
         self.assertIn('{ unit: "day" }', body)
-        self.assertIn("isSplit ? TREND_SPLIT_SERIES : TREND_SERIES", body)
+        # Widened for WP-44 (design §3 U7): the split's series gain the flaking
+        # part where trendFlaking() says so; no split is still two.
+        self.assertIn("isSplit ? splitSeries : TREND_SERIES", body)
+        self.assertIn("const splitSeries = flaking ? TREND_FLAKING_SERIES "
+                      ": TREND_SPLIT_SERIES;", body)
 
     def test_the_caption_ships_under_the_plot(self) -> None:
         html = read("index.html")
@@ -5787,17 +6248,23 @@ class AssignedSplitTest(unittest.TestCase):
         html = read("index.html")
         table = html[html.index('id="trend-table"'):]
         table = table[:table.index("</thead>")]
+        # Widened for WP-44 (design §3 U7): a Flaking column after Muted, hidden
+        # unless the flaking series is drawn.
         self.assertEqual(
             re.findall(r"<th[^>]*>([^<]+)</th>", table),
-            ["Day", "Failed", "Unassigned", "Assigned", "Muted",
+            ["Day", "Failed", "Unassigned", "Assigned", "Muted", "Flaking",
              "Unexpected pass", "Runs"])
         self.assertEqual(table.count("trend-split-col"), 3)
         self.assertEqual(table.count('trend-split-col" hidden>'), 3)
+        self.assertEqual(table.count('<th class="num trend-mark-col" '
+                                     'hidden>Flaking</th>'), 1)
         body = _function_body(self._app(), "function renderTrend()")
         self.assertRegex(
             body, r"\[night\.FAIL, night\.FAIL_UNASSIGNED, "
-                  r"night\.FAIL_ASSIGNED,\s*night\.FAIL_MUTED, "
-                  r"night\.UNEXPECTED_PASS, night\.total\]")
+                  r"night\.FAIL_ASSIGNED,\s*night\.FAIL_MUTED\]\.concat\("
+                  r"flaking \? \[night\.FAIL_FLAKING\] : \[\],\s*"
+                  r"\[night\.UNEXPECTED_PASS, night\.total\]\)")
+        self.assertIn("th.hidden = !(isSplit && flaking);", body)
 
     def test_the_words_have_one_helper(self) -> None:
         api = _strip_comments(read("api.js"))
@@ -5828,6 +6295,15 @@ class AssignedSplitTest(unittest.TestCase):
                      ".legend-swatch.swatch-assigned",
                      ".legend-swatch.swatch-muted"):
             self.assertIn(rule, css)
+        # Widened for WP-44 item 7: the flaking part's two classes, named
+        # in api.js because they spell a flaky word.
+        self.assertIn("--c-flaking: #a66993;", css)
+        for name in ("swatch-flaking", "bar-flaking", "seg-flaking"):
+            self.assertRegex(css, r"\." + name + r"\b", name)
+            self.assertIn('"' + name + '"', _strip_comments(read("api.js")),
+                          name)
+        for rule in (".tt-key.swatch-flaking", ".legend-swatch.swatch-flaking"):
+            self.assertIn(rule, css)
 
     def test_barrows_draws_segments_on_one_path(self) -> None:
         body = _strip_comments(_function_body(
@@ -5852,11 +6328,40 @@ def _unassigned_literals(source: str) -> List[str]:
     ]
 
 
+#: Spellings of a request for the trend's split.
+_TREND_REQUEST_TOKENS = ("fetchAssignedTrend(", "loadTrendSplit(",
+                         "assignedTrendUrl(")
+
+
+def _trend_before_headline(source: str) -> List[str]:
+    """Requests for the trend's split in *source*'s refreshAll() that go
+    out before the headline has been drawn: anywhere but the headline's
+    own block after its ``renderHeadline();``. The part is never on the
+    first paint, so the first batch never names it."""
+    refresh = _function_body(_strip_comments(source),
+                             "async function refreshAll(")
+    start = refresh.find("renderHeadline();")
+    end = refresh.find("const queuePart = ")
+    if end == -1:
+        end = len(refresh)
+    found = []  # type: List[str]
+    for token in _TREND_REQUEST_TOKENS:
+        for match in re.finditer(re.escape(token), refresh):
+            if start == -1 or not start < match.start() < end:
+                found.append("{} at {}".format(token, match.start()))
+    return found
+
+
 class AssignedTrendFetchTest(unittest.TestCase):
-    """WP-43 §1, decisions 8 and 13: the trend's split is its own part,
-    sent in the SAME parallel batch as the headline and never chained
-    after it; only the trend card waits for it. A chained or awaited
-    split would still work, just later, which is why it is pinned."""
+    """WP-43 §1, decisions 8 and 13: the trend's split is its own part.
+    Since WP-44 the part also reads every night's flaking runs, so it is
+    never on the first paint: Home's first batch is three requests (the
+    headline, the active queue, the browse page), and the split is sent
+    once the headline has been drawn, by one function on every path (the
+    first load, every refreshAll(), and the coalescer once per burst).
+    Only the trend card waits for it, drawing the headline's totals until
+    it lands. A split back in the first batch would still work, only
+    making the first paint pay for it, which is why it is pinned."""
 
     def _app(self) -> str:
         return _strip_comments(read("app.js"))
@@ -5868,37 +6373,88 @@ class AssignedTrendFetchTest(unittest.TestCase):
         self.assertIn("apiScope()", url)
         self.assertIn("apiScope()", _function_body(app, "function summaryUrl()"))
 
-    def test_it_is_fetched_in_the_batch_and_after_a_take(self) -> None:
+    def test_it_is_fetched_after_the_headline_and_after_a_take(
+            self) -> None:
+        """The pin is now: one request site, inside loadTrendSplit(),
+        called once by refreshAll() after renderHeadline() and once by
+        the coalescer after its loop. Nothing is asked for before the
+        generation's headline has been drawn, and only the newest split
+        asked for, in a current generation, is drawn."""
         app = self._app()
         self.assertEqual(app.count("fetchJson(assignedTrendUrl())"), 1)
-        self.assertEqual(len(_call_arguments(app, "fetchAssignedTrend")), 2)
+        self.assertEqual(len(_call_arguments(app, "fetchAssignedTrend")), 1)
+        load = _function_body(app, "async function loadTrendSplit(")
+        self.assertIn("await fetchAssignedTrend()", load)
+        self.assertLess(
+            load.index("if (seq !== state.requestSeq || state.headlineDrawn "
+                       "!== seq) {"),
+            load.index("await fetchAssignedTrend()"))
+        self.assertLess(load.index("const sent = state.splitSends;"),
+                        load.index("await fetchAssignedTrend()"))
+        guard = ("if (seq !== state.requestSeq || sent !== state.splitSends) "
+                 "{")
+        self.assertLess(load.index("await fetchAssignedTrend()"),
+                        load.index(guard))
+        self.assertLess(load.index(guard),
+                        load.index("state.trendSplit = split;"))
+        refresh_all = _function_body(app, "async function refreshAll(")
+        self.assertLess(refresh_all.index("state.headlineDrawn = seq;"),
+                        refresh_all.index("loadTrendSplit(seq);"))
+        self.assertIn("renderTrend();", load)
+        self.assertIn('getElementById("trend-card").classList.remove('
+                      '"is-loading")', load)
+        self.assertEqual(len(_call_arguments(app, "loadTrendSplit")), 2)
         refresh = _function_body(app, "async function refreshAll(")
         # The page-wide dim waits for the headline, the queue and the
         # browse page only; the trend card's own dim waits for the split.
         self.assertIn(
             "await Promise.all([headlinePart, queuePart, browsePart])",
             refresh)
-        self.assertIn(
-            "Promise.all([headlinePart, trendSplitPart]).then(", refresh)
         self.assertIn('trendCard.classList.add("is-loading")', refresh)
         self.assertIn('trendCard.classList.remove("is-loading")', refresh)
-        headline = refresh[refresh.index("const headlinePart = "):
-                           refresh.index("const trendSplitPart = ")]
-        self.assertNotIn("trendSplit", headline.replace(
-            "trendInputLanded()", ""))
-        self.assertNotIn("fetchAssignedTrend", headline)
+        self.assertEqual(_trend_before_headline(read("app.js")), [])
+        # A new generation never draws an older scope's split.
+        self.assertLess(refresh.index("state.trendSplit = null;"),
+                        refresh.index("const headlinePart = "))
         coalescer = _function_body(app, "async function fetchSummary(")
-        self.assertIn("fetchAssignedTrend(),", coalescer)
-        self.assertIn("state.trendSplit = results[2]", coalescer)
+        self.assertNotIn("fetchAssignedTrend", coalescer)
+        loop_end = coalescer.index("summaryInFlight = null;")
+        self.assertIn("loadTrendSplit(seq)", coalescer[loop_end:])
+        self.assertIn("window.setTimeout(() => loadTrendSplit(seq), 0);",
+                      coalescer)
 
     def test_the_first_paint_does_not_wait_for_it(self) -> None:
+        """The headline draws the trend's totals itself (renderTrend()
+        in refreshAll() after renderHeadline()), never a split."""
         app = self._app()
         headline = _function_body(app, "function renderHeadline()")
         self.assertIn("renderBars()", headline)
         self.assertNotIn("renderTrend()", headline)
         self.assertNotIn("renderCharts()", headline)
         refresh = _function_body(app, "async function refreshAll(")
-        self.assertIn("if (trendInputs === 2)", refresh)
+        part = refresh[refresh.index("const headlinePart = "):
+                       refresh.index("const queuePart = ")]
+        order = [part.index(token) for token in (
+            "renderHeadline();", "renderTrend();", "loadTrendSplit(seq);")]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("renderTrend()", _function_body(
+            app, "async function refreshSummary()"))
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: the split back in the first batch, beside the
+        headline, or before the headline has been drawn."""
+        source = read("app.js")
+        at = source.index("  const headlinePart = (async () => {")
+        for planted in ("  const trendPart = fetchAssignedTrend();\n",
+                        "  loadTrendSplit(seq);\n"):
+            with self.subTest(planted=planted):
+                self.assertNotEqual(_trend_before_headline(
+                    source[:at] + planted + source[at:]), [])
+        early = source.replace(
+            "      renderHeadline();\n",
+            "      loadTrendSplit(seq);\n      renderHeadline();\n", 1)
+        self.assertNotEqual(early, source)
+        self.assertNotEqual(_trend_before_headline(early), [])
 
     def test_it_never_rejects_and_never_hangs(self) -> None:
         body = _function_body(self._app(), "function fetchAssignedTrend()")
@@ -5994,28 +6550,127 @@ if (fixture.bars) {
     tableRow: firstRow ? firstRow.children.map((td) => td.textContent) : null,
   });
 }
-console.log(JSON.stringify(out));
-process.exit(0);
+await driverAnswer(out);
+"""
+
+#: Prepended by _shim() to every driver: the one way a driver answers.
+#: Its JSON goes out on one line, ASCII only (the reader decodes stdout
+#: in the locale's encoding, and the board's words carry "·" and "…"),
+#: and the process ends only from the write's callback, once the whole
+#: line has been handed to the pipe. On POSIX a pipe write is
+#: asynchronous past the pipe's buffer: a process.exit() straight after
+#: console.log() ends node with all but the first 64 KB of a large answer
+#: unwritten. The promise it returns never settles, so ``await
+#: driverAnswer(x)`` also stops a driver that answers early.
+_DRIVER_PRELUDE = r"""
+globalThis.driverAnswer = (value) => {
+  const line = JSON.stringify(value).replace(/[\u007f-￿]/g,
+    (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  process.stdout.write(line + "\n", () => process.exit(0));
+  return new Promise(() => {});
+};
 """
 
 
-def _shim(fixture: Dict[str, Any]) -> Dict[str, Any]:
-    """Run the shim driver over *fixture*; its JSON answer, typed at the
-    boundary by the caller's assertions."""
+def _driver_endings(source: str) -> List[str]:
+    """The ways *source*, a shim driver, could end node before its answer
+    is out: any process.exit() or console.log() of its own (the prelude
+    holds the one exit, in the write's callback), or no awaited
+    driverAnswer() at all."""
+    found = [token for token in ("process.exit(", "console.log(",
+                                 "process.stdout.write(")
+             if token in source]
+    if "await driverAnswer(" not in source:
+        found.append("no await driverAnswer(")
+    return found
+
+
+def _shim(
+    fixture: Dict[str, Any], source: str = _SHIM_DRIVER,
+    root: str = REPO_DIR
+) -> Dict[str, Any]:
+    """Run the shim driver *source* (the home page's by default) over
+    *fixture*, against the static files under *root* (the repository's,
+    or a planted copy); its JSON answer, typed at the boundary by the
+    caller's assertions. The driver answers through _DRIVER_PRELUDE's
+    driverAnswer(), so an answer of any size arrives whole."""
     with tempfile.TemporaryDirectory() as scratch:
         driver = os.path.join(scratch, "driver.mjs")
         data = os.path.join(scratch, "fixture.json")
         with io.open(driver, "w", encoding="utf-8") as handle:
-            handle.write(_SHIM_DRIVER)
+            handle.write(_DRIVER_PRELUDE + source)
         with io.open(data, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(fixture))
         done = subprocess.run(
-            [str(NODE), driver, REPO_DIR, data], stdout=subprocess.PIPE,
+            [str(NODE), driver, root, data], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
     if done.returncode != 0:
         raise AssertionError("shim driver failed: " + done.stderr[-2000:])
     answer = json.loads(done.stdout.strip().split("\n")[-1])  # type: Dict[str, Any]
     return answer
+
+
+#: A driver whose answer is as large as its fixture says, with one
+#: non-ASCII character at the end. argv: repo root, fixture path.
+_BIG_ANSWER_DRIVER = r"""
+import { readFileSync } from "node:fs";
+const fixture = JSON.parse(readFileSync(process.argv[3], "utf-8"));
+await driverAnswer({ size: fixture.size,
+  big: "x".repeat(fixture.size) + "·" });
+"""
+
+
+def _drivers() -> Dict[str, str]:
+    """Every shim driver in this module, by name."""
+    return {name: value for name, value in sorted(globals().items())
+            if name.endswith("_DRIVER") and isinstance(value, str)}
+
+
+class ShimAnswerTest(unittest.TestCase):
+    """A shim driver's answer arrives whole, whatever its size. On POSIX
+    node writes to a pipe asynchronously past the pipe's 64 KB buffer, so
+    a driver that ended with ``console.log(...); process.exit(0)`` handed
+    the reader its first 65,536 characters and nothing more. Every driver
+    now answers through _DRIVER_PRELUDE's driverAnswer(), which exits only
+    from the write's callback."""
+
+    def test_every_driver_answers_through_the_prelude(self) -> None:
+        drivers = _drivers()
+        self.assertGreaterEqual(len(drivers), 8, sorted(drivers))
+        self.assertEqual(
+            {name: found for name, found in
+             ((name, _driver_endings(source))
+              for name, source in drivers.items()) if found}, {})
+
+    def test_the_prelude_ends_node_only_once_the_line_is_written(
+            self) -> None:
+        self.assertEqual(_DRIVER_PRELUDE.count("process.exit("), 1)
+        self.assertIn('process.stdout.write(line + "\\n", () => '
+                      'process.exit(0));', _DRIVER_PRELUDE)
+        self.assertNotIn("console.log(", _DRIVER_PRELUDE)
+        self.assertIn("return new Promise(() => {});", _DRIVER_PRELUDE)
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: the ending that cut answers at 64 KB, an exit of its
+        own anywhere, and a driver that never answers."""
+        for planted in (
+                "console.log(JSON.stringify(out));\nprocess.exit(0);\n",
+                "await driverAnswer(out);\nprocess.exit(0);\n",
+                'process.stdout.write(JSON.stringify(out));\n'
+                'await driverAnswer(out);\n',
+                "const out = {};\n"):
+            with self.subTest(planted=planted):
+                self.assertNotEqual(_driver_endings(planted), [])
+        self.assertEqual(_driver_endings("await driverAnswer(out);\n"), [])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_a_300_kb_answer_arrives_whole(self) -> None:
+        size = 300 * 1024
+        answer = _shim({"size": size}, _BIG_ANSWER_DRIVER)
+        self.assertEqual(answer["size"], size)
+        self.assertEqual(len(answer["big"]), size + 1)
+        self.assertEqual(answer["big"][-2:], "x·")
 
 
 #: The class lists and widths ``barRows`` drew at the base commit
@@ -6209,18 +6864,22 @@ class AssignedSplitDomTest(unittest.TestCase):
         self.assertEqual(answer["envLegend"], ["Unassigned", "Assigned", "Muted"])
 
     def test_a_hung_part_holds_up_nothing_but_the_trend(self) -> None:
-        """The fetch-sequencing gate, behaviourally: the part is asked
-        for beside the headline, before either answers, and while it
-        hangs the tiles and both bar charts paint and the trend waits."""
+        """The fetch-sequencing gate, behaviourally. The pin is now: the
+        part is never on the first paint, so it is asked for after the
+        three requests of the first batch, once the headline has been
+        drawn; while it hangs the tiles and both bar charts paint, and
+        the trend shows the headline's totals and keeps its dim."""
         answer = _shim({"ids": _index_ids(),
                         "headline": _headline(True), "part": "hang"})
         asked = answer["asked"]
         self.assertIn("assigned_trend", asked)
         self.assertLess(asked.index("headline"), asked.index("queue"))
-        self.assertLess(asked.index("assigned_trend"), asked.index("queue"))
+        for first in ("headline", "queue", "/api/dashboard"):
+            self.assertLess(asked.index(first), asked.index("assigned_trend"))
+        self.assertEqual(asked.count("assigned_trend"), 1)
         self.assertTrue(answer["tilesPainted"])
         self.assertEqual(answer["envLegend"], ["Unassigned", "Assigned", "Muted"])
-        self.assertIsNone(answer["trendLegend"])
+        self.assertEqual(answer["trendLegend"], ["Failed", "Unexpected pass"])
         # Only the trend card is still dimmed; every section has lifted.
         self.assertEqual(answer["dimmed"], ["trend-card"])
 
@@ -6446,6 +7105,3255 @@ class PlantedCopyOutputRegressionTest(unittest.TestCase):
                    "const a = copyOutputButton(() => f(run).output);\n")
         self.assertEqual(_call_arguments(planted, "copyOutputButton"),
                          ["() => f(run).output"])
+
+
+#: The Open Actions walk: the real actions.js over the shim, fetch
+#: answered from the fixture and every request recorded. It loads the
+#: page, presses load-more, changes the environment filter, then presses
+#: Reload, and reports what was asked for at each stage. argv: repo root,
+#: fixture path.
+_ACTIONS_SHIM_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom, Element } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, "http://127.0.0.1/actions.html");
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+// The markup marks the switcher host-managed, nests "Extend all" in a
+// header the duration select is inserted into, and init() swaps its
+// username slot for a picker; the shim parses no HTML and has no
+// replaceWith, so all three are supplied here as the page would find
+// them.
+byId["product-switcher"].setAttribute("data-host-managed", "");
+new Element("div").appendChild(byId["extend-all-btn"]);
+Element.prototype.replaceWith = function (node) {
+  if (node.id) byId[node.id] = node;
+};
+let namesFailures = fixture.namesFailures;
+const asked = [];
+globalThis.fetch = (url) => {
+  const u = new URL(String(url), "http://127.0.0.1/");
+  const part = u.searchParams.get("parts");
+  const path = u.pathname.replace(/^\//, "");
+  asked.push(part ? path + "?parts=" + part : path);
+  let status = 200;
+  let body = {};
+  if (path === "api/summary") {
+    if (namesFailures > 0) {
+      namesFailures -= 1;
+      status = 500;
+      body = { error: "names unavailable" };
+    } else {
+      body = fixture.names;
+    }
+  } else if (path === "api/dashboard") {
+    body = { tests: [fixture.row], total: 1, streams: fixture.streams || {} };
+  } else if (path === "api/mutes") {
+    body = { mutes: [] };
+  } else if (path === "api/users") {
+    body = { users: [] };
+  }
+  return Promise.resolve({ ok: status < 400, status,
+    text: async () => JSON.stringify(body) });
+};
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+const banner = () => (byId["error-banner"].hidden
+  ? null : byId["error-banner"].textContent);
+await import(pathToFileURL(root + "/static/actions.js").href);
+await settle();
+// The first row's edge and its result cell's chip and pills (WP-44).
+const firstTr = byId["actions-body"].children[0];
+const resultTd = firstTr ? firstTr.children.find((td) => td.children.some(
+  (c) => String(c.className).startsWith("chip"))) : null;
+const out = {
+  first: asked.slice(),
+  firstBanner: banner(),
+  firstRows: byId["actions-body"].children.length,
+  envOptions: byId["filter-environment"].children.map((o) => o.value),
+  firstRow: resultTd ? [firstTr.className].concat(resultTd.children.map(
+    (c) => c.className + ":" + c.textContent)) : null,
+};
+await byId["show-more"].click();
+await settle();
+Object.assign(out, {
+  more: asked.slice(out.first.length),
+  moreBanner: banner(),
+  moreRows: byId["actions-body"].children.length,
+  moreEnvOptions: byId["filter-environment"].children.map((o) => o.value),
+});
+const beforeLater = asked.length;
+byId["filter-environment"].value = fixture.names.environments[0];
+await byId["filter-environment"].dispatch("change");
+await settle();
+await byId["reload-btn"].click();
+await settle();
+Object.assign(out, {
+  later: asked.slice(beforeLater),
+  laterBanner: banner(),
+  laterRows: byId["actions-body"].children.length,
+  laterEnvOptions: byId["filter-environment"].children.map((o) => o.value),
+});
+await driverAnswer(out);
+"""
+
+
+def _actions_ids() -> List[str]:
+    return re.findall(r'id="([^"]+)"', read("actions.html"))
+
+
+def _names_part(assignees: List[str]) -> Dict[str, Any]:
+    """A ``parts=names`` answer in the server's shape (WP-44 item 1)."""
+    return {
+        "generated_at": "2026-11-11T12:00:00", "environment": None,
+        "product": None, "stream": 1, "products": [],
+        "environments": ["env-a", "env-b"], "assignees": assignees,
+        "assignment_streams": [], "stale_before": "2026-11-10T00:00:00",
+    }
+
+
+#: One Open Actions row in ``/api/dashboard``'s shape (with_comment,
+#: with_streak), as the play server returned it.
+_ACTIONS_ROW = {
+    "environment": "env-a", "product": "", "script": "s1.py",
+    "test_name": "test_one", "run_id": 7, "result": "FAIL",
+    "start_time": "2026-11-11T02:07:13", "end_time": "2026-11-11T02:07:17",
+    "duration_seconds": 3.4, "known_failure_reason": None,
+    "source_link": None, "assignee": None, "assignment_stream_id": None,
+    "retired_at": None, "retired_by": None, "mute": None,
+    "latest_comment": None, "failing_since": "2026-11-09T02:07:37",
+    "last_pass_time": "2026-11-08T02:07:04",
+    "stability": {"classification": "no-data", "transitions": 0,
+                  "score": 0.0, "runs": 0, "recent_results": []},
+}  # type: Dict[str, Any]
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class OpenActionsCatalogueDomTest(unittest.TestCase):
+    """WP-44 over the DOM shim: the real actions.js, its requests
+    recorded through a load, a filter change and a Reload. No browser;
+    it proves which requests are made and what is drawn, not how."""
+
+    def _walk(self, assignees: List[str], failures: int) -> Dict[str, Any]:
+        return _shim({"ids": _actions_ids(), "names": _names_part(assignees),
+                      "row": _ACTIONS_ROW, "namesFailures": failures},
+                     _ACTIONS_SHIM_DRIVER)
+
+    def test_first_paint_asks_for_names_then_rows_then_expiring(self) -> None:
+        answer = self._walk(["alice"], 0)
+        self.assertEqual(
+            [entry for entry in answer["first"] if entry != "api/users"],
+            ["api/summary?parts=names", "api/dashboard", "api/mutes"])
+        self.assertEqual(answer["envOptions"], ["", "env-a", "env-b"])
+        self.assertEqual(answer["firstRows"], 1)
+        self.assertIsNone(answer["firstBanner"])
+
+    def test_nobody_assigned_still_fetches_the_catalogue_once(self) -> None:
+        """The old gate, ``state.assignees.length``, refetched it on the
+        filter change and on Reload when nobody was assigned."""
+        answer = self._walk([], 0)
+        self.assertEqual(answer["first"].count("api/summary?parts=names"), 1)
+        self.assertNotIn("api/summary?parts=names", answer["later"])
+        self.assertEqual(answer["later"].count("api/dashboard"), 2)
+        self.assertEqual(answer["laterEnvOptions"], ["", "env-a", "env-b"])
+
+    def test_load_more_with_the_catalogue_loaded_is_one_request(self) -> None:
+        for assignees in (["alice"], []):
+            with self.subTest(assignees=assignees):
+                answer = self._walk(assignees, 0)
+                self.assertEqual(answer["more"], ["api/dashboard"])
+                self.assertEqual(answer["moreRows"], 2)
+
+    def test_a_failed_catalogue_shows_its_message_draws_rows_and_retries(
+            self) -> None:
+        """The first refresh after the failure asks again, a load-more
+        included, and lands it; nothing after that asks."""
+        answer = self._walk(["alice"], 1)
+        self.assertEqual(answer["firstBanner"], "names unavailable")
+        self.assertEqual(answer["firstRows"], 1)
+        self.assertEqual(answer["envOptions"], [],
+                         "nothing to fill the filter from yet")
+        self.assertEqual(answer["more"],
+                         ["api/summary?parts=names", "api/dashboard"])
+        self.assertIsNone(answer["moreBanner"])
+        self.assertEqual(answer["moreRows"], 2)
+        self.assertEqual(answer["moreEnvOptions"], ["", "env-a", "env-b"])
+        self.assertNotIn("api/summary?parts=names", answer["later"])
+        self.assertIsNone(answer["laterBanner"])
+
+    def test_load_more_never_hides_a_catalogue_that_is_still_missing(
+            self) -> None:
+        """Found by review: load-more's clearError() wiped the message
+        and, the gate skipping the catalogue on an append, left a page
+        that looked healthy with no filters. Failing twice, the message
+        is still up after load-more, the rows appended."""
+        answer = self._walk(["alice"], 2)
+        self.assertEqual(answer["more"],
+                         ["api/summary?parts=names", "api/dashboard"])
+        self.assertEqual(answer["moreBanner"], "names unavailable")
+        self.assertEqual(answer["moreRows"], 2)
+        self.assertEqual(answer["moreEnvOptions"], [])
+        self.assertEqual(answer["later"].count("api/summary?parts=names"), 1)
+        self.assertEqual(answer["later"][0], "api/summary?parts=names")
+        self.assertIsNone(answer["laterBanner"])
+        self.assertEqual(answer["laterEnvOptions"], ["", "env-a", "env-b"])
+
+
+#: The words a flaky mark is spoken in (WP-44, docs/design/flaky-mark-r0.md
+#: §3 U2), matched case-insensitively inside string literals: FLAKING and
+#: the sentences that say where a marked test stands, and "flips", the
+#: computed signal's word since decision 6 gave "flaky" to the mark.
+_FLAKY_WORDS = ("flaking", "marked flaky", "flips")
+
+#: Any one-line JavaScript string literal, in either quote, or a template.
+_STRING_LITERAL_RE = re.compile(
+    r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|`(?:[^`\\]|\\.)*`')
+
+
+def _flaky_wording_offenders(source: str) -> List[str]:
+    """The string literals in *source*'s code that spell a flaky word,
+    or start the way cadenceWords() ends (" in a row", someone rebuilding
+    "3 in a row" by hand)."""
+    found = []  # type: List[str]
+    for literal in _STRING_LITERAL_RE.findall(_strip_comments(source)):
+        text = literal[1:-1].lower()
+        if (any(word in text for word in _FLAKY_WORDS)
+                or re.match(r"\s*in a row", text)):
+            found.append(literal[1:-1])
+    return found
+
+
+#: The helpers the surfaces call (U2's list as built so far, item 5's
+#: then item 7's; the rest of U2 arrives with the items that call it).
+_FLAKY_HELPERS = (
+    "displayResult", "flakyTag", "flakySentence", "flakyDetail",
+    "flakyMarkWords", "cadenceWords", "cadenceSentence",
+    "flakyCadenceSelect", "stabilityWord",
+    "rowResult", "previousShown", "setAsideSuffix", "setAsideBracket",
+    "failingWithSetAside", "setAsideWords", "newFailuresSub", "failingSplit",
+    # The Flaking tab's and the browse filter's. (WP-44 item 15:
+    # failedOfRuns() went with the tab's "Failed" column, and the Streak
+    # column's flakyStreakWords() takes its place.)
+    "flakyStreakWords", "failToggleTitle",
+)
+
+
+class FlakyWordingTest(unittest.TestCase):
+    """WP-44: every word about a flaky mark is made in api.js and nowhere
+    else, so the selection bar, the Review panel, the test page and the
+    lists to come cannot drift apart. FLAKING is a displayed result made
+    by one helper; the wire, sorting and filters keep FAIL."""
+
+    def test_the_flaky_words_are_spelled_only_in_api_js(self) -> None:
+        offenders = {
+            name: _flaky_wording_offenders(source)
+            for name, source in scripts().items() if name != "api.js"
+        }
+        self.assertEqual(
+            {name: found for name, found in offenders.items() if found}, {},
+            "flaky wording outside api.js; call its helpers instead")
+        # And api.js does spell them, or the scan proves nothing.
+        api = _flaky_wording_offenders(read("api.js"))
+        for needle in ("FLAKING", "Flaking: ", "Marked flaky, ",
+                       " in a row", "flips about 1 run in ", "flips often"):
+            self.assertTrue(any(needle in text for text in api), needle)
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: each way a page could make the words itself."""
+        for planted in (
+                'resultCell.appendChild(el("span", "chip", "FLAKING"));',
+                'if (entry.flaky && entry.flaky.state === "flaking") {}',
+                "const words = cadence + ' in a row';",
+                'line.textContent = "Marked flaky, " + n;',
+                'return "flaky — flips about 1 run in " + period;'):
+            self.assertTrue(_flaky_wording_offenders(planted), planted)
+        self.assertEqual(_flaky_wording_offenders(
+            '// FLAKING is made in api.js\nconst a = "Mark as flaky";'), [])
+
+    def test_displayResult_is_the_one_place_FLAKING_is_made(self) -> None:
+        api = _strip_comments(read("api.js"))
+        body = _function_body(
+            api, "export function displayResult(result, flakyState, muted)")
+        self.assertIn('"FLAKING"', body)
+        self.assertIn('flakyState === "flaking"', body)
+        self.assertIn("!muted", body)
+        # It returns a label; it never rewrites the entry it read.
+        self.assertIsNone(re.search(r"\.result\s*=[^=]", body))
+        allowed = sum(
+            _function_body(api, signature).count('"FLAKING"')
+            for signature in ("export function displayResult(",
+                              "export function resultClass(",
+                              "export function flakyTag("))
+        self.assertEqual(api.count('"FLAKING"'), allowed)
+        self.assertIn('case "FLAKING": return "result-flaking";',
+                      _function_body(api, "export function resultClass("))
+
+    def test_every_flaky_helper_has_a_caller(self) -> None:
+        """No dead helpers: each one this item writes is called."""
+        code = {name: _strip_comments(source)
+                for name, source in scripts().items()}
+        api_exports = _exported_names(read("api.js"))
+        for helper in _FLAKY_HELPERS:
+            self.assertIn(helper, api_exports, helper)
+            calls = sum(
+                len(_call_arguments(source, helper))
+                for source in code.values())
+            self.assertGreater(calls, 0, helper + " has no caller")
+
+    def test_the_computed_signal_says_flips(self) -> None:
+        """Decision 6: "flaky" on screen means the mark."""
+        api = _strip_comments(read("api.js"))
+        sentence = _function_body(api, "export function stabilitySentence(")
+        self.assertIn('"flips about 1 run in "', sentence)
+        self.assertNotIn("flaky —", sentence)
+        self.assertIn('"flips often"',
+                      _function_body(api, "export function stabilityWord("))
+        card = _function_body(
+            _strip_comments(read("test.js")), "function renderFlakiness(")
+        self.assertIn("stabilityWord(flakiness.classification)", card)
+        self.assertNotIn('"big", flakiness.classification', card)
+
+    def test_the_two_tokens_and_the_flaking_class(self) -> None:
+        css = read_text("style.css")
+        root = css[css.index(":root {"):css.index("}", css.index(":root {"))]
+        self.assertIn("--c-flaking: #a66993;", root)
+        self.assertIn("--c-flaking-strong: #8f638b;", root)
+        # Whole rules, selector groups and all: each selector naming
+        # .result-flaking, with the declarations it takes.
+        rules = {}  # type: Dict[str, str]
+        for match in re.finditer(r"([^{}]+)\{([^}]*)\}",
+                                 re.sub(r"/\*.*?\*/", "", css, flags=re.S)):
+            for selector in match.group(1).split(","):
+                selector = selector.strip()
+                if "result-flaking" in selector:
+                    rules[selector] = match.group(2)
+        ink = [selector for selector in rules
+               if selector.startswith('.toggle[aria-pressed="true"]:not(')]
+        # Widened for WP-44 item 7: the outlined chip of a promotion
+        # row's "FLAKING → FAIL" joins them, in the same strong step;
+        # the browse filter: the pressed FLAKING toggle and its dot, and the pressed
+        # ink rule, which names it only to leave it out.
+        self.assertEqual(len(ink), 1)
+        self.assertTrue(ink[0].endswith(":not(.result-flaking)"))
+        del rules[ink[0]]
+        self.assertEqual(sorted(rules),
+                         [".chip.chip-ghost.result-flaking",
+                          ".chip.result-flaking",
+                          ".toggle.result-flaking::before",
+                          '.toggle.result-flaking[aria-pressed="true"]',
+                          "tr.result-flaking"])
+        for selector, body in rules.items():
+            # Chips, row edges and the toggle take the strong step, never
+            # the chart's.
+            self.assertIn("var(--c-flaking-strong)", body, selector)
+            self.assertNotIn("var(--c-flaking)", body, selector)
+        for selector in (".chip.result-flaking",
+                         '.toggle.result-flaking[aria-pressed="true"]'):
+            self.assertIn("color: #fff", rules[selector], selector)
+
+
+#: Spellings that would name an owner for a mark (decision 12): the
+#: person marking owns it, so a flaky act never reads the bar's
+#: "Assign to" box nor sends an assignee.
+_FLAKY_OWNER_TOKENS = ("userSelectEl", "userPickerSelect", "assignee",
+                       "marked_by")
+
+
+def _owner_tokens(body: str) -> List[str]:
+    return [token for token in _FLAKY_OWNER_TOKENS if token in body]
+
+
+def _offer_tints(body: str) -> List[str]:
+    """The declarations in a CSS rule *body* that would tint the test
+    page's flaky offer like the mark (WP-44 item 17): any background
+    other than ``none``, or anything in the flaking colour."""
+    found = []  # type: List[str]
+    for declaration in body.split(";"):
+        name, _colon, value = declaration.partition(":")
+        name, value = name.strip(), value.strip()
+        if ((name.startswith("background") and value != "none")
+                or "flaking" in value):
+            found.append(name + ": " + value)
+    return found
+
+
+class FlakyMarkControlsTest(unittest.TestCase):
+    """WP-44 item 5: mark, change the cadence and unmark from the
+    selection bar, the Review panel and the test page, each built like
+    its mute sibling and refreshed the way a mute refreshes."""
+
+    def test_the_two_urls_clear_every_scope_level(self) -> None:
+        urls = _strip_comments(read("urls.js"))
+        for signature, endpoint in (
+                ("export function bulkFlakyUrl(", '"api/flaky/bulk"'),
+                ("export function unmarkFlakyUrl(", '"api/flaky/unmark"')):
+            body = _function_body(urls, signature)
+            self.assertIn(endpoint, body)
+            for level in ("product", "stream", "baseline", "environment"):
+                self.assertIn(level + ": null", body, signature + level)
+
+    def test_the_bar_group_follows_mute(self) -> None:
+        bar = _function_body(
+            _strip_comments(read("selection.js")), "function ensureBar(")
+        order = [bar.index(needle) for needle in (
+            "barEl.appendChild(unmuteBtnEl)",
+            'flakyCadenceEl = flakyCadenceSelect("selection-cadence-select")',
+            "barEl.appendChild(flakyBtnEl)",
+            "barEl.appendChild(unmarkBtnEl)",
+            '"Clear selection"')]
+        self.assertEqual(order, sorted(order))
+
+    def test_the_placeholders_say_what_is_chosen(self) -> None:
+        """WP-44 item 18: the cadence select opens on "fail after…", so
+        it reads "fail after… / 3 in a row"; its twin, the mute duration,
+        opens on "for…". Each is one ellipsis character, on an option of
+        value "" drawn before the choices; the bar, the Review panel and
+        the test page all build theirs from these two."""
+        api = _strip_comments(read("api.js"))
+        for signature, words in (
+                ("export function flakyCadenceSelect(", "fail after…"),
+                ("export function muteDurationSelect(", "for…")):
+            body = _function_body(api, signature)
+            self.assertIn('placeholder.value = "";', body, signature)
+            self.assertIn('placeholder.textContent = "' + words + '";',
+                          body, signature)
+            self.assertLess(body.index("select.appendChild(placeholder)"),
+                            body.index("for (const "), signature)
+        self.assertNotIn('"at…"', api)
+
+    def test_the_bar_asks_for_the_reason_before_the_server_does(
+            self) -> None:
+        code = _strip_comments(read("selection.js"))
+        gate = _function_body(code, "function updateFlakyButtonState(")
+        for needle in ("selected.size === 0", "!flakyCadenceEl.value",
+                       "noteInputEl.value.trim()", "allSelectedMarked()",
+                       '"Set cadence"', '"Mark as flaky"'):
+            self.assertIn(needle, gate)
+        self.assertIn("updateFlakyButtonState()", _function_body(
+            code, "function updateCommentButtonState("))
+        self.assertIn(
+            'flakyCadenceEl.addEventListener("change", updateFlakyButtonState)',
+            code)
+        self.assertIn("marked: Boolean(entry.flaky)",
+                      _function_body(code, "function rowCell("))
+
+    def test_the_bar_acts_post_the_mark_and_name_no_owner(self) -> None:
+        code = _strip_comments(read("selection.js"))
+        mark = _function_body(code, "async function doMarkFlaky(")
+        unmark = _function_body(code, "async function doUnmarkFlaky(")
+        gate = _function_body(code, "function updateFlakyButtonState(")
+        for needle in ("postJson(bulkFlakyUrl(), body)", "cadence: cadence",
+                       "tests: testsPayload()", "body.reason = reason",
+                       'noteInputEl.value = ""', 'flakyCadenceEl.value = ""',
+                       "clearSelection()", "notifyChanged()"):
+            self.assertIn(needle, mark)
+        self.assertIn(
+            "postJson(unmarkFlakyUrl(), { username: me, tests: testsPayload() })",
+            unmark)
+        for body in (mark, unmark, gate):
+            self.assertEqual(_owner_tokens(body), [])
+
+    def test_an_owner_read_would_be_caught(self) -> None:
+        planted = ("async function doMarkFlaky() {\n"
+                   "  const owner = userSelectEl.value;\n"
+                   "  await postJson(bulkFlakyUrl(), { assignee: owner });\n"
+                   "}\n")
+        self.assertEqual(_owner_tokens(planted), ["userSelectEl", "assignee"])
+
+    def test_the_review_panel_offers_both_forms(self) -> None:
+        code = _strip_comments(read("review.js"))
+        group = _function_body(code, "function buildFlakyGroup(")
+        for needle in ("entry.flaky || null", "flakySentence(flaky, muteLive)",
+                       "flakyDetail(flaky)",
+                       'flakyCadenceSelect("review-cadence-select", flaky.cadence)',
+                       'flakyCadenceSelect("review-cadence-select")',
+                       '"Set cadence"', '"Unmark"', '"Mark as flaky"',
+                       "bulkFlakyUrl()", "unmarkFlakyUrl()",
+                       'afterStandingChange(opts, "flaky")'):
+            self.assertIn(needle, group)
+        self.assertEqual(_owner_tokens(group), [])
+        self.assertIn("buildFlakyGroup(entry, opts)",
+                      _function_body(code, "function buildReviewActions("))
+        # A mark refreshes exactly as a mute does.
+        self.assertIn('afterStandingChange(opts, "muted")',
+                      _function_body(code, "function buildMuteGroup("))
+
+    def test_the_test_page_draws_the_mark_from_the_detail(self) -> None:
+        """The mark and its history ride the detail: nothing fetches."""
+        code = _strip_comments(read("test.js"))
+        self.assertIn("detail.flaky || null",
+                      _function_body(code, "function renderFlaky("))
+        self.assertIn("detail.flaky_history",
+                      _function_body(code, "function renderFlaky("))
+        for signature in ("function renderFlaky(", "function renderFlakyBanner(",
+                          "function renderFlakyCard(", "function openFlakyForm(",
+                          "function renderFlakyHistory("):
+            body = _function_body(code, signature)
+            self.assertTrue(body, signature)
+            self.assertNotIn("fetchJson(", body, signature)
+            self.assertEqual(_owner_tokens(body), [], signature)
+        refresh = _function_body(code, "async function refreshActs(")
+        for needle in ("fetchJson(detailUrl())", "renderLatest(detail.latest, detail)",
+                       "renderMute(detail)", "renderFlaky(detail)"):
+            self.assertIn(needle, refresh)
+        self.assertIn("await refreshActs()",
+                      _function_body(code, "async function postAct("))
+        html = read("test.html")
+        self.assertLess(html.index('id="mute-banner"'),
+                        html.index('id="flaky-banner"'))
+        self.assertLess(html.index('id="flakiness"'),
+                        html.index('id="flaky-mark"'))
+        history = html[html.index('id="flaky-history-section"'):]
+        history = history[:history.index("</section>")]
+        self.assertEqual(re.findall(r"<th>([^<]+)</th>", history),
+                         ["Action", "By", "When (UTC)", "Cadence", "Reason"])
+
+    def test_one_form_in_the_header_and_a_link_in_the_card(self) -> None:
+        """WP-44 item 17: every act on the test sits in the header. The
+        offer is drawn in the mark's slot for any unmarked test, whatever
+        its result; the form is drawn there and nowhere else; the card's
+        link opens it and draws none of its own."""
+        code = _strip_comments(read("test.js"))
+        banner = _function_body(code, "function renderFlakyBanner(")
+        for needle in ('classList.toggle("is-offer", !flaky)',
+                       'el("span", "kf-label", "Flaky")', '"Mark as flaky"',
+                       'addEventListener("click", openFlakyForm)',
+                       "open.title = MARK_FLAKY_TITLE"):
+            self.assertIn(needle, banner)
+        # A mark is made while the test passes too: nothing but the mark
+        # gates the offer, neither the result nor a mute.
+        offer = banner[:banner.index("return;")]
+        self.assertIn("if (!flaky) {", offer)
+        for needle in ("latest", "FAIL", "failing", "if (muteLive"):
+            self.assertNotIn(needle, offer)
+        form = _function_body(code, "function openFlakyForm(")
+        self.assertIn('document.getElementById("flaky-banner")', form)
+        self.assertIn("renderFlakyBanner(null)", form)
+        # The submit explains the act as the opener does, as Mute's act
+        # button carries its own: one constant, used twice.
+        self.assertIn("mark.title = MARK_FLAKY_TITLE", form)
+        self.assertEqual(code.count("MARK_FLAKY_TITLE"), 3)
+        card = _function_body(code, "function renderFlakyCard(")
+        for needle in ('el("button", "linkish", "Mark as flaky")',
+                       "openFlakyForm()",
+                       'getElementById("flaky-banner").scrollIntoView('):
+            self.assertIn(needle, card)
+        for needle in ("createElement(", "flakyCadenceSelect(",
+                       "bulkFlakyUrl(", "postAct("):
+            self.assertNotIn(needle, card)
+        # One form on the page: one reason box, one mark request with a
+        # reason.
+        self.assertEqual(code.count("FLAKY_REASON_PLACEHOLDER;"), 1)
+        self.assertEqual(code.count("reason: text, cadence: chosen"), 1)
+        # The offer is quieter than the mark: no tint, a neutral edge and
+        # a muted label, and no rule naming the offer may tint it again.
+        css = re.sub(r"/\*.*?\*/", "", read_text("style.css"), flags=re.S)
+        rules = {}  # type: Dict[str, str]
+        for match in re.finditer(r"([^{}]+)\{([^}]*)\}", css):
+            for selector in match.group(1).split(","):
+                if "is-offer" in selector:
+                    rules[selector.strip()] = match.group(2)
+        self.assertEqual(sorted(rules), [
+            ".known-failure.is-flaky.is-offer",
+            ".known-failure.is-flaky.is-offer .kf-label"])
+        slot = rules[".known-failure.is-flaky.is-offer"]
+        self.assertIn("border-left-color: var(--grid)", slot)
+        self.assertIn("background: none", slot)
+        self.assertEqual(_offer_tints(slot), [])
+        self.assertEqual(
+            rules[".known-failure.is-flaky.is-offer .kf-label"].strip(),
+            "color: var(--muted);")
+        # The mark's banner keeps the annotation's tint.
+        self.assertIn("background: #fdf8ec",
+                      re.search(r"\n\.known-failure\s*\{([^}]*)\}",
+                                css).group(1))
+
+    def test_a_tinted_offer_would_be_caught(self) -> None:
+        for planted in ("background: #fdf8ec;", "background-color: #fff;",
+                        "border-left-color: var(--c-flaking-strong);",
+                        "background: none; background: #fdf8ec;"):
+            self.assertTrue(_offer_tints(planted), planted)
+        self.assertEqual(_offer_tints(
+            "border-left-color: var(--grid);\n  background: none;"), [])
+
+    def test_the_header_reads_the_mark_and_history_stays_raw(self) -> None:
+        """Decision 9: a run is what happened, so run history and the
+        compare strip show the wire result; the header shows what the
+        test reads as now."""
+        code = _strip_comments(read("test.js"))
+        latest = _function_body(code, "function renderLatest(")
+        self.assertRegex(latest, r"resultChip\(\s*displayResult\(latest\.result")
+        self.assertNotIn("resultChip(latest.result)", latest)
+        self.assertIn("flakyTag(", latest)
+        self.assertIn("resultChip(run.result)",
+                      _function_body(code, "function appendHistoryRow("))
+        for signature in ("function appendHistoryRow(",
+                          "async function loadCompareStrip("):
+            self.assertNotIn("displayResult(", _function_body(code, signature))
+
+    def test_one_mark_controls_share_their_words_from_api_js(self) -> None:
+        """Review: the panel's and the page's titles were two copies,
+        and only the page's reason box had an accessible label."""
+        api = _strip_comments(read("api.js"))
+        for name in ("FLAKY_CADENCE_TITLE", "FLAKY_UNMARK_TITLE",
+                     "FLAKY_REASON_PLACEHOLDER", "FLAKY_REASON_LABEL"):
+            self.assertIn("export const " + name + " = ", api)
+        for name in ("review.js", "test.js"):
+            code = _strip_comments(read(name))
+            for needle in ("change.title = FLAKY_CADENCE_TITLE",
+                           "unmark.title = FLAKY_UNMARK_TITLE",
+                           "reason.placeholder = FLAKY_REASON_PLACEHOLDER",
+                           'reason.setAttribute("aria-label", '
+                           "FLAKY_REASON_LABEL)",
+                           "cadenceChanged(cadence, flaky)"):
+                self.assertIn(needle, code, name)
+            for words in ("The mark keeps its owner", "Remove the flaky mark",
+                          "Why is this test flaky"):
+                self.assertNotIn(words, code, name)
+
+    def test_no_user_string_reaches_innerHTML(self) -> None:
+        for name in ("selection.js", "review.js", "test.js", "api.js"):
+            self.assertNotIn("innerHTML", _strip_comments(read(name)), name)
+
+
+def _iso_days_ago(days: float) -> str:
+    moment = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=days))
+    return moment.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _flaky(state: Any, streak: Any = None, runs: Any = None) -> Dict[str, Any]:
+    """A test detail's or a row's ``flaky`` in the server's shape,
+    marked 12 days ago."""
+    return {"cadence": 3, "marked_by": "dev1",
+            "marked_at": _iso_days_ago(12.1), "reason": "race in teardown",
+            "state": state, "streak": streak, "runs": runs}
+
+
+_LIVE_MUTE = {
+    "live": True, "muted_by": "dev2", "reason": "infra outage",
+    "expires_at": _iso_days_ago(-2), "extensions": 0,
+}  # type: Dict[str, Any]
+
+
+def _test_detail(result: str, flaky: Any = "absent",
+                 mute: Any = None) -> Dict[str, Any]:
+    """``GET /api/tests/...`` in the server's shape; ``flaky="absent"``
+    is a server from before WP-44."""
+    detail = {
+        "environment": "env-a", "script": "s1.py", "test_name": "t1",
+        "source_link": None, "assignee": None,
+        "latest": {"run_id": 7, "result": result,
+                   "start_time": "2026-11-10T02:14:00",
+                   "duration_seconds": 41.2, "known_failure_reason": None},
+        "analytics": {
+            "window": {"max_days": 90, "max_runs": 200, "run_count": 12,
+                       "from": "2026-10-01T02:00:00",
+                       "to": "2026-11-10T02:14:00"},
+            "failing_since": None, "last_pass_before_failure": None,
+            "flakiness": {"classification": "flaky", "score": 0.4,
+                          "transitions": 5},
+            "duration_seconds": None, "day_of_week": [], "by_day": [],
+        },
+        "stream": None, "stream_identity": None, "mute": mute,
+        "mute_history": [],
+    }  # type: Dict[str, Any]
+    if flaky != "absent":
+        detail["flaky"] = flaky
+        detail["flaky_history"] = [] if flaky is None else [
+            {"id": 1, "action": "mark", "cadence": 3,
+             "reason": "race in teardown", "actor": "dev1",
+             "acted_at": "2026-11-01T02:00:00"}]
+    return detail
+
+
+#: The flaky walks: the real test.js, selection.js or review.js over the
+#: shim, fetch answered from the fixture and every request recorded, one
+#: act performed. argv: repo root, fixture path.
+_FLAKY_SHIM_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom, Element } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, fixture.url);
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+window.localStorage.setItem("testboard.username", "dev1");
+// What took the focus last and what was scrolled to, by class or id.
+let focused = null;
+const scrolled = [];
+Element.prototype.focus = function () { focused = this.className; };
+Element.prototype.scrollIntoView = function () {
+  scrolled.push(Object.keys(byId).find((id) => byId[id] === this)
+    || this.className);
+};
+const asked = [];
+let acted = false;
+globalThis.fetch = (url, opts) => {
+  const u = new URL(String(url), "http://127.0.0.1/");
+  const path = decodeURIComponent(u.pathname.replace(/^\//, ""));
+  const method = (opts && opts.method) || "GET";
+  asked.push({ path, method,
+    body: opts && opts.body ? JSON.parse(opts.body) : null });
+  let body = {};
+  if (method === "POST") {
+    acted = true;
+    body = path.endsWith("unmark") ? { unmarked: 1 }
+      : { marked: 1, changed: 0, unchanged: 0, unknown: 0 };
+  } else if (path === "api/users") {
+    body = { users: [] };
+  } else if (path.startsWith("api/runs/")) {
+    body = { output: "boom" };
+  } else if (path.endsWith("/history")) {
+    body = { runs: [] };
+  } else if (path.endsWith("/comments")) {
+    body = { comments: [], streams: {} };
+  } else if (path.endsWith("/streams")) {
+    body = { results: [], product: null };
+  } else if (path.startsWith("api/tests/")) {
+    body = acted && fixture.after ? fixture.after : fixture.detail;
+  }
+  const answer = (status) => ({ ok: status < 400, status,
+    text: async () => JSON.stringify(
+      status < 400 ? body : { error: "server says no" }) });
+  if (method === "POST" && fixture.hold) {
+    // Held until the walk calls release(), answering postStatus then.
+    return new Promise((resolve) => {
+      release = () => resolve(answer(fixture.postStatus || 200));
+    });
+  }
+  return Promise.resolve(answer(200));
+};
+let release = null;
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+const button = (node, text) => node.find(
+  (c) => c.tagName === "BUTTON" && c.textContent === text)[0] || null;
+const errorShown = () => (byId["error-banner"].hidden
+  ? null : byId["error-banner"].textContent);
+const posts = () => asked.filter((a) => a.method === "POST")
+  .map((a) => [a.path, a.body]);
+const words = (node) => node.children
+  .filter((c) => c.tagName !== "SELECT").map((c) => c.textContent);
+const out = {};
+if (fixture.surface === "test") {
+  const page = () => {
+    const latest = byId["latest-run"];
+    const chip = latest.children.find(
+      (c) => String(c.className).startsWith("chip"));
+    const tag = latest.children.find((c) => c.className === "flaky-tag");
+    return {
+      chip: chip ? [chip.className, chip.textContent] : null,
+      tag: tag ? [tag.textContent, tag.title] : null,
+      banner: byId["flaky-banner"].hidden ? null : words(byId["flaky-banner"]),
+      offer: byId["flaky-banner"].classList.contains("is-offer"),
+      card: words(byId["flaky-mark"]),
+      cardTags: byId["flaky-mark"].children.map((c) => c.tagName),
+      signal: byId["flakiness"].children[0].textContent,
+      historyHidden: byId["flaky-history-section"].hidden,
+      history: byId["flaky-history-body"].children.map((tr) => words(tr)),
+    };
+  };
+  await import(pathToFileURL(root + "/static/test.js").href);
+  await settle();
+  out.first = page();
+  out.firstAsked = asked.map((a) => a.method + " " + a.path);
+  const before = asked.length;
+  const banner = byId["flaky-banner"];
+  const form = () => banner.children.map((c) => c.tagName);
+  const reasonBox = () => banner.children.find((c) => c.tagName === "INPUT");
+  const fill = () => {
+    reasonBox().value = "race in teardown";
+    banner.children.find((c) => c.tagName === "SELECT").value = "3";
+  };
+  if (fixture.act === "mark") {
+    // The header's offer opens the form in the same slot.
+    await button(banner, "Mark as flaky").click();
+    out.form = form();
+    out.formWords = words(banner);
+    out.focused = focused;
+    out.cardWhileOpen = byId["flaky-mark"].children.map((c) => c.tagName);
+    await button(banner, "Mark as flaky").click();
+    out.emptyError = errorShown();
+    out.emptyPosts = posts().length;
+    fill();
+    await button(banner, "Mark as flaky").click();
+  } else if (fixture.act === "card") {
+    // The card's link: the header's form, focused and scrolled to; again
+    // while open, what was typed stays; Cancel, the offer; then mark.
+    const link = button(byId["flaky-mark"], "Mark as flaky");
+    out.linkClass = link.className;
+    await link.click();
+    out.form = form();
+    out.focused = focused;
+    out.scrolled = scrolled.slice();
+    out.cardWhileOpen = byId["flaky-mark"].children.map((c) => c.tagName);
+    reasonBox().value = "race";
+    focused = null;
+    await link.click();
+    out.again = [form(), reasonBox().value, focused];
+    await button(banner, "Cancel").click();
+    out.cancelled = [words(banner), banner.classList.contains("is-offer")];
+    await link.click();
+    out.fresh = reasonBox().value;
+    fill();
+    await button(banner, "Mark as flaky").click();
+  } else if (fixture.act === "cadence") {
+    const banner = byId["flaky-banner"];
+    const select = banner.children.find((c) => c.tagName === "SELECT");
+    const set = button(banner, "Set cadence");
+    out.selectValue = select.value;
+    out.setDisabledAtFirst = set.disabled;
+    select.value = "5";
+    await select.dispatch("change");
+    out.setDisabledAfter = set.disabled;
+    await set.click();
+  } else if (fixture.act === "unmark") {
+    await button(byId["flaky-banner"], "Unmark").click();
+  } else if (fixture.act === "cadence-fail") {
+    // Choose 5, send, and while it is out go back to the mark's own 3;
+    // the request then fails.
+    const banner = byId["flaky-banner"];
+    const select = banner.children.find((c) => c.tagName === "SELECT");
+    const set = button(banner, "Set cadence");
+    const unmark = button(banner, "Unmark");
+    select.value = "5";
+    await select.dispatch("change");
+    set.click();
+    await settle();
+    select.value = "3";
+    await select.dispatch("change");
+    out.inFlight = [set.disabled, unmark.disabled];
+    set.click();
+    unmark.click();
+    await settle();
+    out.postsInFlight = posts().length;
+    release();
+    await settle();
+    out.afterFail = [set.disabled, unmark.disabled, errorShown()];
+    select.value = "5";
+    await select.dispatch("change");
+    out.rechosen = set.disabled;
+  }
+  await settle();
+  out.after = page();
+  out.later = asked.slice(before).map((a) => a.method + " " + a.path);
+} else if (fixture.surface === "bar") {
+  const { mountSelectableTable } = await import(
+    pathToFileURL(root + "/static/selection.js").href);
+  let changed = 0;
+  const mount = mountSelectableTable(document.createElement("table"),
+    { onChanged: () => { changed += 1; } });
+  const bar = document.body.children.find((c) => c.className === "selection-bar");
+  const part = (cls) => bar.children.find((c) => c.className === cls);
+  const flakyBtn = part("selection-flaky-btn");
+  const cadence = part("selection-cadence-select");
+  const note = part("selection-note-input");
+  const tick = async () => {
+    for (const row of fixture.rows) {
+      const box = mount.rowCell(row).children[0];
+      box.checked = true;
+      await box.dispatch("change");
+    }
+  };
+  const seen = () => [flakyBtn.textContent, flakyBtn.disabled];
+  out.order = bar.children.map((c) => c.className || c.textContent);
+  const unmarkBtn = part("selection-unmark-btn");
+  if (fixture.act === "midflight") {
+    // Send a mark, then while it is out type, re-choose, tick a row and
+    // click both buttons: nothing may re-arm or send.
+    await tick();
+    cadence.value = "3";
+    await cadence.dispatch("change");
+    note.value = "race";
+    await note.dispatch("input");
+    flakyBtn.click();
+    await settle();
+    out.inFlight = [];
+    note.value = "race in teardown";
+    await note.dispatch("input");
+    out.inFlight.push([flakyBtn.disabled, unmarkBtn.disabled]);
+    await cadence.dispatch("change");
+    out.inFlight.push([flakyBtn.disabled, unmarkBtn.disabled]);
+    const box = mount.rowCell(fixture.extra).children[0];
+    box.checked = true;
+    await box.dispatch("change");
+    out.inFlight.push([flakyBtn.disabled, unmarkBtn.disabled]);
+    flakyBtn.click();
+    unmarkBtn.click();
+    await settle();
+    out.postsInFlight = posts().length;
+    release();
+    await settle();
+    out.afterRelease = [bar.hidden, changed];
+    out.posts = posts();
+    await driverAnswer(out);
+  }
+  await tick();
+  out.ticked = seen();
+  cadence.value = "3";
+  await cadence.dispatch("change");
+  out.withCadence = seen();
+  note.value = "race in teardown";
+  await note.dispatch("input");
+  out.withReason = seen();
+  await flakyBtn.click();
+  await settle();
+  out.afterMark = { hidden: bar.hidden, changed, note: note.value,
+    cadence: cadence.value };
+  await tick();
+  await part("selection-unmark-btn").click();
+  await settle();
+  out.afterUnmark = { hidden: bar.hidden, changed };
+} else {
+  const { toggleReview } = await import(
+    pathToFileURL(root + "/static/review.js").href);
+  let reloads = 0;
+  const tbody = document.createElement("tbody");
+  const row = document.createElement("tr");
+  row.appendChild(document.createElement("td"));
+  tbody.appendChild(row);
+  toggleReview(fixture.entry, row, document.createElement("button"),
+    { onMuted: () => { reloads += 1; } });
+  await settle();
+  const panel = row.nextSibling;
+  out.labels = panel.find((c) => c.className === "review-label")
+    .map((c) => c.textContent);
+  const group = panel.find((c) => c.className === "review-label"
+    && c.textContent === "Flaky")[0].parentNode;
+  out.group = group.children.map((c) => [c.tagName,
+    c.tagName === "SELECT" ? c.value
+      : c.tagName === "SPAN" ? c.children.map((x) => x.textContent)
+        : (c.placeholder || c.textContent)]);
+  if (fixture.act === "mark") {
+    await button(group, "Mark as flaky").click();
+    out.emptyError = errorShown();
+    out.emptyPosts = posts().length;
+    group.children.find((c) => c.tagName === "INPUT").value = "race in teardown";
+    group.children.find((c) => c.tagName === "SELECT").value = "3";
+    await button(group, "Mark as flaky").click();
+  } else if (fixture.act === "cadence") {
+    const select = group.children.find((c) => c.tagName === "SELECT");
+    const set = button(group, "Set cadence");
+    out.setDisabledAtFirst = set.disabled;
+    select.value = "5";
+    await select.dispatch("change");
+    out.setDisabledAfter = set.disabled;
+    await set.click();
+  } else if (fixture.act === "cadence-fail") {
+    const select = group.children.find((c) => c.tagName === "SELECT");
+    const set = button(group, "Set cadence");
+    const unmark = button(group, "Unmark");
+    select.value = "5";
+    await select.dispatch("change");
+    set.click();
+    await settle();
+    select.value = "3";
+    await select.dispatch("change");
+    out.inFlight = [set.disabled, unmark.disabled];
+    set.click();
+    unmark.click();
+    await settle();
+    out.postsInFlight = posts().length;
+    release();
+    await settle();
+    out.afterFail = [set.disabled, unmark.disabled, errorShown()];
+    select.value = "5";
+    await select.dispatch("change");
+    out.rechosen = set.disabled;
+  } else {
+    await button(group, "Unmark").click();
+  }
+  await settle();
+  out.reloads = reloads;
+}
+out.posts = posts();
+await driverAnswer(out);
+"""
+
+_ONE_TEST = {"environment": "env-a", "script": "s1.py",
+             "test_name": "t1"}  # type: Dict[str, Any]
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class FlakyMarkDomTest(unittest.TestCase):
+    """WP-44 item 5 over the DOM shim: the test page, the selection bar
+    and the Review panel, each made to mark, change a cadence and
+    unmark. No browser; it proves the requests and the DOM drawn, not
+    the look."""
+
+    #: A POST held until the walk releases it, then failing.
+    _HELD_FAILING = {"hold": True, "postStatus": 500}  # type: Dict[str, Any]
+
+    def _page(self, detail: Dict[str, Any], act: Any = None,
+              after: Any = None, **extra: Any) -> Dict[str, Any]:
+        fixture = {
+            "surface": "test", "act": act, "detail": detail, "after": after,
+            "ids": re.findall(r'id="([^"]+)"', read("test.html")),
+            "url": "http://127.0.0.1/test.html?environment=env-a"
+                   "&script=s1.py&test_name=t1"}  # type: Dict[str, Any]
+        fixture.update(extra)
+        return _shim(fixture, _FLAKY_SHIM_DRIVER)
+
+    def _bar(self, rows: List[Dict[str, Any]],
+             **extra: Any) -> Dict[str, Any]:
+        fixture = {"surface": "bar", "rows": rows, "ids": ["error-banner"],
+                   "url": "http://127.0.0.1/index.html"}  # type: Dict[str, Any]
+        fixture.update(extra)
+        return _shim(fixture, _FLAKY_SHIM_DRIVER)
+
+    def _panel(self, entry: Dict[str, Any], act: str,
+               **extra: Any) -> Dict[str, Any]:
+        fixture = {"surface": "panel", "entry": entry, "act": act,
+                   "ids": ["error-banner"],
+                   "url": "http://127.0.0.1/index.html"}  # type: Dict[str, Any]
+        fixture.update(extra)
+        return _shim(fixture, _FLAKY_SHIM_DRIVER)
+
+    def test_nothing_rearms_the_bar_while_a_flaky_request_is_out(
+            self) -> None:
+        """Review: a keystroke in the note box, a cadence change or a
+        ticked row re-enabled a Flaky button mid-flight, and a second
+        click sent a second request. One in-flight flag now holds both."""
+        answer = self._bar([dict(_ONE_TEST)], act="midflight", hold=True,
+                           extra=dict(_ONE_TEST, test_name="t2"))
+        self.assertEqual(answer["inFlight"],
+                         [[True, True], [True, True], [True, True]])
+        self.assertEqual(answer["postsInFlight"], 1)
+        self.assertEqual(answer["afterRelease"], [True, 1])
+        self.assertEqual([post[0] for post in answer["posts"]],
+                         ["api/flaky/bulk"])
+
+    def test_a_failed_set_cadence_returns_to_the_derived_state(
+            self) -> None:
+        """Review: a failure re-enabled every button, so Set cadence came
+        back enabled on the mark's own cadence. Now: disabled while out,
+        no second request, and after the failure disabled again while
+        the cadence is unchanged, enabled once it differs."""
+        marked = _test_detail("FAIL", _flaky("flaking", 1))
+        entry = dict(_ONE_TEST, run_id=7, result="FAIL",
+                     start_time="2026-11-10T02:14:00", assignee=None,
+                     mute=None, flaky=_flaky("flaking", 1))
+        for surface, answer in (
+                ("test page", self._page(marked, "cadence-fail",
+                                         **self._HELD_FAILING)),
+                ("panel", self._panel(entry, "cadence-fail",
+                                      **self._HELD_FAILING))):
+            with self.subTest(surface=surface):
+                self.assertEqual(answer["inFlight"], [True, True])
+                self.assertEqual(answer["postsInFlight"], 1)
+                self.assertEqual(answer["afterFail"],
+                                 [True, False, "server says no"])
+                self.assertFalse(answer["rechosen"])
+        self.assertEqual(self._panel(entry, "cadence-fail",
+                                     **self._HELD_FAILING)["reloads"], 0)
+
+    def test_an_unmarked_test_page_is_todays_page_with_the_offer(
+            self) -> None:
+        """No ``flaky`` field (an older server) and a null one draw the
+        same: the raw chip, no pill, no history, the offer in the
+        header's slot (WP-44 item 17, widened from "no banner": the
+        slot now offers the mark, in the offer's edge, not the mark's),
+        the card's link, and the same requests."""
+        older = self._page(_test_detail("FAIL"))
+        newer = self._page(_test_detail("FAIL", None))
+        for answer in (older, newer):
+            first = answer["first"]
+            self.assertEqual(first["chip"], ["chip result-fail", "FAIL"])
+            self.assertIsNone(first["tag"])
+            self.assertEqual(first["banner"],
+                             ["Flaky", "Mark as flaky"])
+            self.assertTrue(first["offer"])
+            self.assertTrue(first["historyHidden"])
+            self.assertEqual(first["card"], ["Mark as flaky"])
+            self.assertEqual(first["cardTags"], ["BUTTON"])
+            self.assertEqual(first["signal"], "flips often")
+            self.assertEqual(answer["posts"], [])
+        self.assertEqual(older["firstAsked"], newer["firstAsked"])
+        self.assertEqual(sorted(set(older["firstAsked"])), [
+            "GET api/tests/env-a/s1.py/t1",
+            "GET api/tests/env-a/s1.py/t1/comments",
+            "GET api/tests/env-a/s1.py/t1/history",
+            "GET api/tests/env-a/s1.py/t1/streams",
+            "GET api/users"])
+
+    def test_the_offer_shows_whatever_the_result_and_beside_a_mute(
+            self) -> None:
+        """WP-44 item 17: a mark is a standing property of the test, so
+        the header offers it for a passing test as for a failing one,
+        and beside a live mute (the card offered it there too); the
+        requests are the failing page's, so nothing is fetched for it."""
+        failing = self._page(_test_detail("FAIL", None))
+        for name, detail in (
+                ("passing", _test_detail("PASS", None)),
+                ("muted", _test_detail("FAIL", None, _LIVE_MUTE))):
+            with self.subTest(name):
+                answer = self._page(detail)
+                first = answer["first"]
+                self.assertEqual(first["banner"],
+                                 ["Flaky", "Mark as flaky"])
+                self.assertTrue(first["offer"])
+                self.assertEqual(first["card"], ["Mark as flaky"])
+                self.assertEqual(sorted(set(answer["firstAsked"])),
+                                 sorted(set(failing["firstAsked"])))
+
+    def test_a_flaking_test_reads_FLAKING_with_banner_card_and_history(
+            self) -> None:
+        first = self._page(
+            _test_detail("FAIL", _flaky("flaking", 1)))["first"]
+        self.assertEqual(first["chip"], ["chip result-flaking", "FLAKING"])
+        self.assertIsNone(first["tag"])
+        self.assertEqual(first["banner"], [
+            "Marked flaky, 3 in a row",
+            "by dev1 · 12 days ago · race in teardown",
+            "Flaking: failed its last run; counts as failing after 3 in a "
+            "row",
+            "Set cadence", "Unmark"])
+        # Marked: the mark's banner in the mark's edge, no offer anywhere.
+        self.assertFalse(first["offer"])
+        self.assertEqual(first["card"], ["Marked flaky, 3 in a row"])
+        self.assertFalse(first["historyHidden"])
+        self.assertEqual(first["history"], [[
+            "mark", "dev1", "2026-11-01 02:00:00", "3 in a row",
+            "race in teardown"]])
+
+    def test_every_other_state_keeps_its_chip_and_carries_the_pill(
+            self) -> None:
+        cases = (
+            ("FAIL", _flaky("flaking", 2), _LIVE_MUTE,
+             ["chip result-fail", "FAIL"],
+             "Marked flaky; the mute comes first until it runs out"),
+            ("FAIL", _flaky("failing", 3, 3), None,
+             ["chip result-fail", "FAIL"],
+             "Failing: its last 3 runs all failed; marked flaky, 3 in a row"),
+            ("FAIL", _flaky("failing", 2, 2), None,
+             ["chip result-fail", "FAIL"],
+             "Failing: every run here has failed (2 of 2); marked flaky, "
+             "3 in a row"),
+            ("FAIL", _flaky("failing", 1, 1), None,
+             ["chip result-fail", "FAIL"],
+             "Failing: its only run here failed; marked flaky, 3 in a row"),
+            ("PASS", _flaky("passing", 0), None,
+             ["chip result-pass", "PASS"],
+             "Marked flaky: counts as failing once its last 3 runs have "
+             "failed"),
+            ("PASS", _flaky(None), None, ["chip result-pass", "PASS"],
+             "Marked flaky, 3 in a row; no run here yet"),
+        )
+        for result, flaky, mute, chip, sentence in cases:
+            with self.subTest(sentence=sentence):
+                first = self._page(_test_detail(result, flaky, mute))["first"]
+                self.assertEqual(first["chip"], chip)
+                self.assertEqual(first["tag"], ["flaky", sentence])
+                self.assertEqual(first["banner"][2], sentence)
+
+    def test_marking_from_the_header_asks_for_the_reason_first(self) -> None:
+        """WP-44 item 17 (widened from the card's form, which moved): the
+        header's offer opens the one form in its slot, the label kept as
+        the Mute offer keeps its own; the act, its refusals, the request
+        and the refresh are the card's form's, unchanged."""
+        answer = self._page(_test_detail("FAIL", None), "mark",
+                            _test_detail("FAIL", _flaky("flaking", 1)))
+        self.assertEqual(answer["form"],
+                         ["SPAN", "INPUT", "SELECT", "BUTTON", "BUTTON"])
+        self.assertEqual(answer["formWords"],
+                         ["Flaky", "", "Mark as flaky", "Cancel"])
+        self.assertEqual(answer["focused"], "flaky-reason-input")
+        self.assertEqual(answer["cardWhileOpen"], ["BUTTON"])
+        self.assertEqual(answer["emptyPosts"], 0)
+        self.assertTrue(answer["emptyError"].startswith("Say why"))
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [_ONE_TEST]}]])
+        # One request after the act, the detail, as after a mute.
+        self.assertEqual(answer["later"], [
+            "POST api/flaky/bulk", "GET api/tests/env-a/s1.py/t1"])
+        self.assertEqual(answer["after"]["chip"],
+                         ["chip result-flaking", "FLAKING"])
+        self.assertEqual(answer["after"]["banner"][0],
+                         "Marked flaky, 3 in a row")
+        self.assertFalse(answer["after"]["offer"])
+        self.assertEqual(answer["after"]["card"], ["Marked flaky, 3 in a row"])
+
+    def test_a_passing_test_and_a_build_page_mark_from_the_header(
+            self) -> None:
+        """The act is the same whatever the result; on a page opened for
+        a build the request carries the page's stream, as the card's
+        form always sent it (the mark itself covers every stream)."""
+        passing = self._page(_test_detail("PASS", None), "mark",
+                             _test_detail("PASS", _flaky("passing", 0)))
+        self.assertEqual(passing["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [_ONE_TEST]}]])
+        self.assertFalse(passing["after"]["offer"])
+        build = self._page(
+            _test_detail("FAIL", None), "mark",
+            _test_detail("FAIL", _flaky("flaking", 1)),
+            url="http://127.0.0.1/test.html?environment=env-a"
+                "&script=s1.py&test_name=t1&stream=4")
+        self.assertTrue(build["first"]["offer"])
+        self.assertEqual(build["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [dict(_ONE_TEST, stream_id=4)]}]])
+        self.assertEqual(build["later"][0], "POST api/flaky/bulk")
+
+    def test_the_cards_link_opens_the_header_form(self) -> None:
+        """WP-44 item 17: the Flakiness card keeps an entry point, a
+        link-styled button, that opens the header's form, puts the focus
+        in its reason box and scrolls the slot into view; it draws no
+        form of its own, and a second click keeps what was typed."""
+        answer = self._page(_test_detail("FAIL", None), "card",
+                            _test_detail("FAIL", _flaky("flaking", 1)))
+        self.assertEqual(answer["linkClass"], "linkish")
+        self.assertEqual(answer["form"],
+                         ["SPAN", "INPUT", "SELECT", "BUTTON", "BUTTON"])
+        self.assertEqual(answer["focused"], "flaky-reason-input")
+        self.assertEqual(answer["scrolled"], ["flaky-banner"])
+        self.assertEqual(answer["cardWhileOpen"], ["BUTTON"])
+        self.assertEqual(answer["again"], [
+            ["SPAN", "INPUT", "SELECT", "BUTTON", "BUTTON"], "race",
+            "flaky-reason-input"])
+        self.assertEqual(answer["cancelled"],
+                         [["Flaky", "Mark as flaky"], True])
+        self.assertEqual(answer["fresh"], "")
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["after"]["card"], ["Marked flaky, 3 in a row"])
+        self.assertFalse(answer["after"]["offer"])
+
+    def test_the_banner_changes_the_cadence_and_unmarks(self) -> None:
+        marked = _test_detail("FAIL", _flaky("flaking", 1))
+        answer = self._page(marked, "cadence", marked)
+        self.assertEqual(answer["selectValue"], "3")
+        self.assertTrue(answer["setDisabledAtFirst"])
+        self.assertFalse(answer["setDisabledAfter"])
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "cadence": 5, "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["later"], [
+            "POST api/flaky/bulk", "GET api/tests/env-a/s1.py/t1"])
+        answer = self._page(marked, "unmark", _test_detail("FAIL", None))
+        self.assertEqual(answer["posts"], [["api/flaky/unmark", {
+            "username": "dev1", "tests": [_ONE_TEST]}]])
+        # Widened for WP-44 item 17 (was: no banner): after Unmark the
+        # slot offers the mark again.
+        self.assertEqual(answer["after"]["banner"],
+                         ["Flaky", "Mark as flaky"])
+        self.assertTrue(answer["after"]["offer"])
+        self.assertEqual(answer["after"]["chip"], ["chip result-fail", "FAIL"])
+        self.assertEqual(answer["after"]["card"], ["Mark as flaky"])
+
+    def test_the_bar_marks_with_the_note_and_names_no_owner(self) -> None:
+        rows = [dict(_ONE_TEST),
+                dict(_ONE_TEST, test_name="t2", flaky=None)]
+        answer = self._bar(rows)
+        order = answer["order"]
+        self.assertLess(order.index("selection-unmute-btn"),
+                        order.index("Flaky "))
+        self.assertLess(order.index("Flaky "),
+                        order.index("selection-cadence-select"))
+        self.assertLess(order.index("selection-flaky-btn"),
+                        order.index("selection-unmark-btn"))
+        self.assertEqual(answer["ticked"], ["Mark as flaky", True])
+        self.assertEqual(answer["withCadence"], ["Mark as flaky", True])
+        self.assertEqual(answer["withReason"], ["Mark as flaky", False])
+        tests = [_ONE_TEST, dict(_ONE_TEST, test_name="t2")]
+        self.assertEqual(answer["posts"], [
+            ["api/flaky/bulk", {"username": "dev1", "cadence": 3,
+                                "reason": "race in teardown", "tests": tests}],
+            ["api/flaky/unmark", {"username": "dev1", "tests": tests}]])
+        self.assertEqual(answer["afterMark"], {
+            "hidden": True, "changed": 1, "note": "", "cadence": ""})
+        self.assertEqual(answer["afterUnmark"], {"hidden": True, "changed": 2})
+
+    def test_the_bar_sets_a_cadence_when_every_row_is_marked(self) -> None:
+        marked = dict(_ONE_TEST, flaky=_flaky("flaking", 1))
+        answer = self._bar([marked, dict(marked, test_name="t2")])
+        self.assertEqual(answer["ticked"], ["Set cadence", True])
+        self.assertEqual(answer["withCadence"], ["Set cadence", False])
+        mixed = self._bar([marked, dict(_ONE_TEST, test_name="t2")])
+        self.assertEqual(mixed["withCadence"], ["Mark as flaky", True])
+
+    def test_the_panel_marks_an_unmarked_row(self) -> None:
+        entry = dict(_ONE_TEST, run_id=7, result="FAIL",
+                     start_time="2026-11-10T02:14:00", assignee=None,
+                     mute=None, stream_id=4)
+        answer = self._panel(entry, "mark")
+        self.assertEqual(answer["labels"][-2:], ["Mute", "Flaky"])
+        self.assertEqual(answer["group"], [
+            ["LABEL", "Flaky"],
+            ["INPUT", "Why is this test flaky? (required)"],
+            ["SELECT", ""], ["BUTTON", "Mark as flaky"]])
+        self.assertEqual(answer["emptyPosts"], 0)
+        self.assertTrue(answer["emptyError"].startswith("Say why"))
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [dict(_ONE_TEST, stream_id=4)]}]])
+        self.assertEqual(answer["reloads"], 1)
+
+    def test_the_panel_changes_and_removes_a_mark(self) -> None:
+        entry = dict(_ONE_TEST, run_id=7, result="PASS",
+                     start_time="2026-11-10T02:14:00", assignee=None,
+                     mute=None, flaky=_flaky("passing", 0))
+        answer = self._panel(entry, "cadence")
+        self.assertEqual(answer["labels"][-1], "Flaky")
+        self.assertNotIn("Mute", answer["labels"])
+        self.assertEqual(answer["group"], [
+            ["LABEL", "Flaky"],
+            ["SPAN", ["Marked flaky: counts as failing once its last 3 "
+                      "runs have failed",
+                      "by dev1 · 12 days ago · race in teardown"]],
+            ["SELECT", "3"], ["BUTTON", "Set cadence"],
+            ["BUTTON", "Unmark"]])
+        self.assertTrue(answer["setDisabledAtFirst"])
+        self.assertFalse(answer["setDisabledAfter"])
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "cadence": 5, "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["reloads"], 1)
+        answer = self._panel(entry, "unmark")
+        self.assertEqual(answer["posts"], [["api/flaky/unmark", {
+            "username": "dev1", "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["reloads"], 1)
+
+
+#: The Home walk of WP-44 item 7: the real app.js over the shim, every
+#: request answered from the fixture, each queue tab opened in turn and
+#: the browse rows ticked in the sets the fixture names. Every region is
+#: serialized whole (tag, class, hidden, title, aria-label, width, own
+#: text, children), so a digest of it pins a DOM byte for byte.
+#: argv: repo root, fixture path.
+_HOME_STATE_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom, Element } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, "http://127.0.0.1/index.html");
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+window.localStorage.setItem("testboard.username", "dev1");
+Element.prototype.focus = function () {};
+const asked = [];
+globalThis.fetch = (url) => {
+  const u = new URL(String(url), "http://127.0.0.1/");
+  const part = u.searchParams.get("parts");
+  asked.push(part || u.pathname.replace(/^\//, ""));
+  let body = {};
+  if (part === "headline") {
+    body = fixture.headline;
+  } else if (part === "assigned_trend") {
+    body = fixture.part;
+  } else if (part === "queue") {
+    body = { generated_at: fixture.headline.generated_at,
+      stale_before: fixture.headline.stale_before,
+      queue: fixture.queues[u.searchParams.get("queue")]
+        || { tests: [], total: 0 } };
+  } else if (u.pathname.endsWith("api/dashboard")) {
+    body = fixture.dashboard;
+  } else if (u.pathname.endsWith("api/users")) {
+    body = { users: [] };
+  }
+  return Promise.resolve({ ok: true, status: 200,
+    text: async () => JSON.stringify(body) });
+};
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+const dom = (node) => (node.children === undefined ? ["#", node.textContent]
+  : [node.tagName, String(node.className || ""), node.hidden ? "hidden" : "",
+    node.title || "", node.attributes["aria-label"] || "",
+    node.style.width || "", node._text, node.children.map(dom)]);
+await import(pathToFileURL(root + "/static/app.js").href);
+await new Promise((resolve) => setTimeout(resolve, 150));
+const out = { asked: asked.slice(), regions: {}, queues: {}, ticked: [] };
+for (const id of fixture.regions) {
+  out.regions[id] = dom(byId[id]);
+}
+const tabLabel = (tab) => tab.children[0].textContent;
+const activeTab = () => byId["queue-tabs"].children.filter(
+  (t) => t.attributes["aria-selected"] === "true").map(tabLabel);
+const aside = byId["all-clear-aside"];
+out.aside = { hidden: aside.hidden, text: aside.textContent,
+  parts: aside.children.map((c) => (c.tagName ? c.tagName : "#")
+    + ":" + c.textContent) };
+const labels = byId["queue-tabs"].children.map(tabLabel);
+for (const label of labels) {
+  const tab = byId["queue-tabs"].children.find((t) => tabLabel(t) === label);
+  await tab.click();
+  await settle();
+  out.queues[label] = ["queue-result-note", "queue-head-row", "queue-body",
+    "queue-empty"].map((id) => dom(byId[id]));
+}
+// After the tabs, so the walk opens them in the same order as at base.
+await byId["queue-tabs"].children.find(
+  (t) => tabLabel(t) === "New failures").click();
+await settle();
+const asideLink = aside.children.find((c) => c.tagName === "BUTTON");
+if (asideLink) {
+  await asideLink.click();
+  await settle();
+  out.aside.opened = activeTab();
+}
+const bar = document.body.children.find((c) => c.className === "selection-bar");
+const boxes = byId["dashboard-body"].children.map(
+  (tr) => tr.children[0].children[0]);
+for (const set of fixture.tick || []) {
+  for (const index of set) {
+    boxes[index].checked = true;
+    await boxes[index].dispatch("change");
+  }
+  const flakyBtn = bar.children.find(
+    (c) => c.className === "selection-flaky-btn");
+  out.ticked.push(flakyBtn.textContent);
+  for (const index of set) {
+    boxes[index].checked = false;
+    await boxes[index].dispatch("change");
+  }
+}
+await driverAnswer(out);
+"""
+
+#: The regions of Home the state walk serializes.
+_HOME_REGIONS = ("stat-tiles", "all-clear", "triage-meta", "env-chart",
+                 "scripts-chart", "dashboard-body")
+
+#: The rows of the walk, one per state of design §3 U9 and two more:
+#: name -> (result, flaky, mute, prev_result, assignee).
+_STATE_ROWS = (
+    ("flaking", "FAIL", ("flaking", 1, None), None, "PASS", None),
+    ("over", "FAIL", ("failing", 3, 3), None, "FAIL", None),
+    ("passing", "PASS", ("passing", 0, None), None, "FAIL", None),
+    ("up", "UNEXPECTED_PASS", ("passing", 0, None), None, "FAIL", None),
+    ("muted", "FAIL", ("flaking", 2, None), "live", "FAIL", None),
+    ("plain", "FAIL", None, None, "PASS", None),
+    ("mine", "FAIL", ("flaking", 1, None), None, "FAIL", "dev1"),
+)  # type: Tuple[Tuple[str, str, Any, Any, str, Any], ...]
+
+
+def _state_row(name: str, marks: str) -> Dict[str, Any]:
+    """One row of the walk in the server's shape. *marks* is "flaky"
+    (the mark as the state table has it), "zero" (``flaky: null``, a
+    scope with no marks) or "older" (no ``flaky`` field at all)."""
+    for row_name, result, flaky, mute, prev, assignee in _STATE_ROWS:
+        if row_name == name:
+            break
+    row = {
+        "environment": "env-a", "product": "", "script": "s1.py",
+        "test_name": name, "run_id": 1, "result": result,
+        "prev_result": prev, "start_time": "2026-10-03T02:00:00",
+        "end_time": "2026-10-03T02:00:05", "duration_seconds": 5.0,
+        "known_failure_reason": None, "source_link": None,
+        "assignee": assignee, "assignment_stream_id": None,
+        "retired_at": None, "retired_by": None, "latest_comment": None,
+        "failing_since": "2026-10-01T02:00:00" if result == "FAIL" else None,
+        "last_pass_time": None,
+        "mute": dict(_LIVE_MUTE) if mute else None,
+    }  # type: Dict[str, Any]
+    if marks == "flaky":
+        row["flaky"] = None if flaky is None else _flaky(*flaky)
+    elif marks == "zero":
+        row["flaky"] = None
+    return row
+
+
+def _state_fixture(marks: str, clear: bool = False, tick: Any = None,
+                   muted: int = 3) -> Dict[str, Any]:
+    """The Home walk's fixture. ``clear`` empties the three queues "All
+    clear" is about, with *muted* (and, marked, 6) failing tests set
+    aside: *muted* new and *muted* plus three still failing."""
+    headline = _headline(True)
+    status = headline["status"]
+    status.update({"muted_new_failures": muted,
+                   "muted_still_failing": muted + 3 if muted else 0})
+    if marks != "older":
+        flaky = marks == "flaky"
+        status.update({
+            "flaking": 6 if flaky else 0,
+            "flaking_new_failures": 4 if flaky else 0,
+            "flaking_still_failing": 2 if flaky else 0,
+            "flaky_total": 9 if flaky else 0})
+        for entry, count in zip(headline["by_environment"], (3, 0)):
+            entry["flaking"] = count if flaky else 0
+        headline["by_environment"].append({
+            "environment": "env-c", "total_tests": 10, "failed": 0,
+            "new_failures": 0, "unexpected_passes": 0, "not_run": 0,
+            "muted": 0, "assigned": 0, "flaking": 2 if flaky else 0})
+        headline["top_failing_scripts"][0]["flaking"] = 2 if flaky else 0
+    rows = {name: _state_row(name, marks) for name, *_ in _STATE_ROWS}
+    queues = {
+        "new_failures": [rows["over"], rows["plain"]],
+        "still_failing": [rows["over"], dict(rows["plain"], prev_result="FAIL")],
+        "muted": [rows["muted"]],
+        # The Flaking tab's queue (WP-44 item 15), asked for only where
+        # the tab is drawn: never with no mark, so the base digests hold.
+        "flaking": [rows["flaking"]],
+        "fixed": [rows["passing"]],
+        "unexpected_passes": [rows["up"]],
+        "not_run": [rows["flaking"]],
+        "mine": [rows["mine"]],
+    }
+    if clear:
+        status.update({"new_failures": 0, "still_failing": 0})
+        status["results"]["UNEXPECTED_PASS"] = 0
+        for kind in ("new_failures", "still_failing", "unexpected_passes"):
+            queues[kind] = []
+            headline["queue_totals"][kind] = 0
+    return {
+        "ids": _index_ids(), "headline": headline, "part": _part(),
+        "regions": list(_HOME_REGIONS),
+        "queues": {kind: {"tests": tests, "total": len(tests)}
+                   for kind, tests in queues.items()},
+        "dashboard": {"tests": [rows[name] for name, *_ in _STATE_ROWS],
+                      "total": len(_STATE_ROWS)},
+        "tick": tick or [],
+    }
+
+
+#: The digests of Home's regions and every queue tab as the base of WP-44
+#: item 7 drew them (commit 531348e, the WP-43 DOM), captured over the
+#: shim from that commit's static files before any of item 7 was
+#: written, keyed by (clear, muted). The older payload and a scope with
+#: ``flaky_total: 0`` must still draw exactly these.
+_BASE_HOME_DIGESTS = {
+    (False, 3):
+        "ef1a9e2433b2bc928c6e04c450007b0a216f396f84142897130142195f90910e",
+    (True, 3):
+        "a02dbc651b442c4ac6456975b9d564761479fdb5125a381f0654370ad97824cf",
+    (True, 0):
+        "fafe7bb5226953eaabaad858df0b8446d47a9acf2b58115333bf7bc0b677d7d4",
+}  # type: Dict[Tuple[bool, int], str]
+
+
+def _home_digest(answer: Dict[str, Any]) -> str:
+    blob = json.dumps([answer["regions"], answer["queues"]], sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _dom_text(node: Any) -> str:
+    """A serialized node's textContent."""
+    if node[0] == "#":
+        return str(node[1])
+    return "".join(_dom_text(kid) for kid in node[7]) + str(node[6] or "")
+
+
+def _dom_walk(node: Any) -> List[Any]:
+    """A serialized node's element descendants, in document order."""
+    found = []  # type: List[Any]
+    for kid in node[7]:
+        if kid[0] != "#":
+            found.append(kid)
+            found.extend(_dom_walk(kid))
+    return found
+
+
+def _row_shape(tr: Any) -> List[Any]:
+    """A row's edge class, then each chip and pill in it, in order: the
+    class and text, and a flaky pill's title."""
+    marks = []  # type: List[Any]
+    for node in _dom_walk(tr):
+        classes = str(node[1]).split()
+        if "chip" in classes or "mute-tag" in classes:
+            marks.append([node[1], _dom_text(node)])
+        elif "flaky-tag" in classes:
+            marks.append([node[1], _dom_text(node), node[3]])
+    return [tr[1], marks]
+
+
+def _ghost_offenders(source: str) -> List[str]:
+    """Calls in *source* that draw a row's displayed result as its
+    previous one: a ghostChip(), or the "was" argument of a
+    resultTransition(), fed from displayResult() or rowResult()."""
+    displayed = re.compile(r"\b(?:displayResult|rowResult)\s*\(")
+    code = _strip_comments(source)
+    found = [
+        "ghostChip(" + args + ")"
+        for args in _call_arguments(code, "ghostChip")
+        if displayed.search(args)
+    ]
+    for args in _call_arguments(code, "resultTransition"):
+        depth = 0
+        start = 0
+        parts = []  # type: List[str]
+        for index, char in enumerate(args):
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                parts.append(args[start:index])
+                start = index + 1
+        parts.append(args[start:])
+        if len(parts) > 1 and displayed.search(parts[1]):
+            found.append("resultTransition(" + args + ")")
+    return found
+
+
+class AllClearSetAsideTest(unittest.TestCase):
+    """WP-44 item 7 (design §3 U6, §13): "All clear" names what it leaves
+    out, "Set aside: 3 muted · 4 flaking", so a clear board still says
+    what is tolerated. Each part opens the tab that lists it: "3 muted"
+    the Muted tab, "4 flaking" the Flaking tab."""
+
+    def test_the_line_ships_hidden_inside_the_banner(self) -> None:
+        html = read("index.html")
+        banner = html[html.index('id="all-clear"'):]
+        banner = banner[:banner.index('<div class="table-wrap">')]
+        self.assertIn('<div id="all-clear-aside" class="muted" hidden></div>',
+                      banner)
+
+    def test_it_is_drawn_from_the_set_aside_words(self) -> None:
+        app = _strip_comments(read("app.js"))
+        self.assertIn("renderAllClearAside();",
+                      _function_body(app, "function renderQueueTabs()"))
+        body = _function_body(app, "function renderAllClearAside()")
+        self.assertRegex(body, r"setAsideWords\(\s*\(status\.muted_new_failures"
+                               r" \|\| 0\) \+ \(status\.muted_still_failing"
+                               r" \|\| 0\),\s*status\.flaking\)")
+        self.assertIn("aside.hidden = words.length === 0;", body)
+        self.assertIn('const muted = part.key === "muted";', body)
+        # Each part a link-styled button opening its tab (design §13: the
+        # flaking part opens the Flaking tab, no longer the browse
+        # filter), its words through textContent, never markup.
+        self.assertIn('el("button", "link-btn", part.text)', body)
+        self.assertIn('link.title = muted ? "Open the Muted tab" : '
+                      'FLAKING_LINK_TITLE;', body)
+        self.assertIn('openQueue(muted ? "muted" : FLAKING_QUEUE)', body)
+        self.assertNotIn("innerHTML", body)
+        for gone in ("function flakingLink(", "openFlakingInBrowse"):
+            self.assertNotIn(gone, app)
+        api = _strip_comments(read("api.js"))
+        self.assertIn('export const FLAKING_LINK_TITLE = "Open the Flaking '
+                      'tab";', api)
+        words = _function_body(api, "export function setAsideWords(")
+        self.assertIn("setAsideParts(muted, flaking)", words)
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_flaking_part_opens_the_flaking_tab(self) -> None:
+        """"6 flaking" opens the Flaking tab and asks for its queue, and
+        nothing else: the browse filters are left as they were. The
+        scripts chart's bar still opens All tests (FlakingFilterTest)."""
+        load, opened = _lists_walk("flaky", [["asideLink", "6 flaking"]],
+                                   clear=True)
+        self.assertEqual(opened["asked"], [_FLAKING_QUEUE_ASK])
+        self.assertEqual([tab[0] for tab in opened["tabs"]
+                          if tab[2] == "true"], ["Flaking"])
+        self.assertEqual([t[2] for t in opened["toggles"]],
+                         [t[2] for t in load["toggles"]])
+        self.assertEqual(opened["head"], _FLAKING_HEAD)
+
+
+class PromotionTransitionTest(unittest.TestCase):
+    """WP-44 item 7 (design §3 U6, decision 25): on the night a marked
+    test goes over its cadence its New failures row reads "FLAKING →
+    FAIL" with the "flaky" pill: the failure before was within the
+    cadence. The previous result is previousShown(), never the row's own
+    displayResult(), which says what the test is now."""
+
+    def test_previousShown_is_the_one_promotion_rule(self) -> None:
+        api = _strip_comments(read("api.js"))
+        body = _function_body(api, "export function previousShown(entry)")
+        for clause in ('flaky.state === "failing"', 'entry.result === "FAIL"',
+                       'entry.prev_result === "FAIL"',
+                       "!(entry.mute && entry.mute.live)"):
+            self.assertIn(clause, body)
+        # The word comes from displayResult(), the one place it is made.
+        self.assertIn('displayResult(entry.prev_result, "flaking", false)',
+                      body)
+        self.assertIn(": entry.prev_result;", body)
+
+    def test_both_transition_columns_use_it(self) -> None:
+        columns = _strip_comments(_function_body(
+            read("app.js"), "function queueColumns("))
+        self.assertEqual(columns.count(
+            'el("td"), previousShown(entry), shown), entry)'), 2)
+        self.assertNotIn("entry.prev_result", columns)
+
+    def test_ghost_chips_never_take_the_displayed_result(self) -> None:
+        offenders = {name: _ghost_offenders(source)
+                     for name, source in scripts().items()}
+        self.assertEqual({k: v for k, v in offenders.items() if v}, {})
+
+    def test_the_ghost_detector_can_fail(self) -> None:
+        for planted in (
+                "wrap.appendChild(ghostChip(displayResult(r, s, m)));",
+                'resultTransition(el("td"), rowResult(entry), shown);',
+                'resultTransition(el("td"),\n  displayResult(entry.prev_result,'
+                ' s, m), shown);'):
+            self.assertTrue(_ghost_offenders(planted), planted)
+        for fine in (
+                'resultTransition(el("td"), previousShown(entry), shown);',
+                'resultTransition(el("td"), entry.prev_result, rowResult(e));',
+                "ghostChip(previous)"):
+            self.assertEqual(_ghost_offenders(fine), [], fine)
+
+
+#: Calls into api.js's helpers over the shim: the real module, each
+#: ``[name, args]`` of the fixture answered with its JSON-able result.
+#: argv: repo root, fixture path.
+_API_SHIM_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+installDom([], "http://127.0.0.1/index.html");
+const api = await import(pathToFileURL(root + "/static/api.js").href);
+const out = fixture.calls.map(([name, args]) => {
+  const value = api[name](...args);
+  return value === undefined ? "undefined" : value;
+});
+await driverAnswer(out);
+"""
+
+
+def _api_calls(calls: List[Tuple[str, List[Any]]]) -> List[Any]:
+    answer = _shim({"calls": [[name, args] for name, args in calls]},
+                   _API_SHIM_DRIVER)  # type: Any
+    return list(answer)
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class FlakyStateDomTest(unittest.TestCase):
+    """WP-44 item 7 over the DOM shim: Home, the real app.js, with every
+    queue tab opened, U9's five states on the rows, the tiles, "All
+    clear", the two bar charts and the selection bar; Open Actions' row;
+    api.js's set-aside helpers byte for byte. No browser; it proves the
+    DOM drawn and the requests made, not colour or layout."""
+
+    _walks = {}  # type: Dict[Tuple[str, bool, int], Dict[str, Any]]
+
+    def _walk(self, marks: str, clear: bool = False,
+              muted: int = 3) -> Dict[str, Any]:
+        key = (marks, clear, muted)
+        if key not in self._walks:
+            self._walks[key] = _shim(
+                _state_fixture(marks, clear, [[0, 1], [1, 5]], muted),
+                _HOME_STATE_DRIVER)
+        return self._walks[key]
+
+    def test_no_marks_draws_the_base_dom(self) -> None:
+        """The older payload (no new field anywhere) and a scope with no
+        marks (``flaky: null``, every new figure 0) draw the WP-43 DOM,
+        byte for byte, in the tiles, "All clear", both bar charts, the
+        browse rows and every queue tab, with the same requests."""
+        for marks in ("older", "zero"):
+            for (clear, muted), digest in _BASE_HOME_DIGESTS.items():
+                with self.subTest(marks=marks, clear=clear, muted=muted):
+                    answer = self._walk(marks, clear, muted)
+                    self.assertEqual(_home_digest(answer), digest)
+                    self.assertEqual(answer["ticked"],
+                                     ["Mark as flaky", "Mark as flaky"])
+        # The one line the design adds with no mark: "All clear" names
+        # the muted failures it leaves out (design §3 U6).
+        self.assertTrue(self._walk("zero", True, 0)["aside"]["hidden"])
+        self.assertEqual(self._walk("zero", True, 0)["aside"]["text"], "")
+        self.assertEqual(self._walk("older", True, 3)["aside"]["text"],
+                         "Set aside: 9 muted")
+
+    def test_no_request_is_added(self) -> None:
+        """Home stays at four data requests (with the product list and
+        the user list): the figures ride the headline and the rows. The
+        pin is now: three in the first batch, then the trend's split once
+        the headline has been drawn, never on the first paint."""
+        asked = ["api/products", "api/users", "headline", "queue",
+                 "api/dashboard", "assigned_trend"]
+        for marks in ("older", "zero", "flaky"):
+            with self.subTest(marks=marks):
+                self.assertEqual(self._walk(marks)["asked"], asked)
+
+    def test_the_five_states_on_the_browse_rows(self) -> None:
+        rows = [_row_shape(tr) for tr in
+                self._walk("flaky")["regions"]["dashboard-body"][7]]
+        self.assertEqual(rows, [
+            # Under its cadence, no mute: FLAKING, its own edge, no pill.
+            ["result-flaking", [["chip result-flaking", "FLAKING"]]],
+            # Over its cadence: FAIL, red, the pill.
+            ["result-fail", [
+                ["chip result-fail", "FAIL"],
+                ["flaky-tag", "flaky", "Failing: its last 3 runs all "
+                 "failed; marked flaky, 3 in a row"]]],
+            # Marked and passing.
+            ["result-pass", [
+                ["chip result-pass", "PASS"],
+                ["flaky-tag", "flaky", "Marked flaky: counts as failing "
+                 "once its last 3 runs have failed"]]],
+            # Marked, at an unexpected pass: its own chip, the pill.
+            ["result-unexpected-pass", [
+                ["chip result-unexpected-pass", "UNEXPECTED_PASS"],
+                ["flaky-tag", "flaky", "Marked flaky: counts as failing "
+                 "once its last 3 runs have failed"]]],
+            # A live mute wins: the result, "muted", "flaky".
+            ["result-fail", [
+                ["chip result-fail", "FAIL"], ["mute-tag", "muted"],
+                ["flaky-tag", "flaky", "Marked flaky; the mute comes first "
+                 "until it runs out"]]],
+            # Unmarked: today's row.
+            ["result-fail", [["chip result-fail", "FAIL"]]],
+            # Assigned and flaking: FLAKING, as anywhere.
+            ["result-flaking", [["chip result-flaking", "FLAKING"]]],
+        ])
+
+    def test_every_queue_tab_shows_one_result_per_row(self) -> None:
+        queues = self._walk("flaky")["queues"]
+
+        def rows(label: str) -> List[Any]:
+            return [_row_shape(tr) for tr in queues[label][2][7]]
+
+        over_title = ("Failing: its last 3 runs all failed; marked flaky, "
+                      "3 in a row")
+        self.assertEqual(rows("Not run"), [
+            ["result-flaking", [["chip result-flaking", "FLAKING"]]]])
+        self.assertEqual(rows("My actions"), [
+            ["result-flaking", [["chip result-flaking", "FLAKING"]]]])
+        # The invariant queues state their chip once; the pill follows
+        # the test's name.
+        self.assertEqual(rows("Still failing"), [
+            ["result-fail", [["flaky-tag", "flaky", over_title]]],
+            ["result-fail", []]])
+        self.assertEqual(rows("Stale annotations"), [
+            ["result-unexpected-pass", [["flaky-tag", "flaky", "Marked "
+             "flaky: counts as failing once its last 3 runs have failed"]]]])
+        # The Flaking tab (item 15): every row reads FLAKING, said once
+        # above the table, so the row has its edge and no chip or pill.
+        self.assertEqual(rows("Flaking"), [["result-flaking", []]])
+        # A live mute: raw before and now, the pill.
+        self.assertEqual(rows("Muted"), [["result-fail", [
+            ["chip chip-ghost result-fail", "FAIL"],
+            ["chip result-fail", "FAIL"],
+            ["flaky-tag", "flaky", "Marked flaky; the mute comes first "
+             "until it runs out"]]]])
+
+    def test_the_promotion_row_and_the_fix(self) -> None:
+        queues = self._walk("flaky")["queues"]
+        new = [_row_shape(tr) for tr in queues["New failures"][2][7]]
+        self.assertEqual(new, [
+            ["result-fail", [
+                ["chip chip-ghost result-flaking", "FLAKING"],
+                ["chip result-fail", "FAIL"],
+                ["flaky-tag", "flaky", "Failing: its last 3 runs all "
+                 "failed; marked flaky, 3 in a row"]]],
+            ["result-fail", [["chip chip-ghost result-pass", "PASS"],
+                             ["chip result-fail", "FAIL"]]]])
+        fixed = [_row_shape(tr) for tr in queues["Fixed"][2][7]]
+        self.assertEqual(fixed, [["result-pass", [
+            ["chip chip-ghost result-fail", "FAIL"],
+            ["chip result-pass", "PASS"],
+            ["flaky-tag", "flaky", "Marked flaky: counts as failing once "
+             "its last 3 runs have failed"]]]])
+
+    def test_the_tiles_name_what_is_set_aside(self) -> None:
+        tiles = self._walk("flaky")["regions"]["stat-tiles"][7]
+        subs = {_dom_text(tile[7][0]): _dom_text(tile[7][2])
+                for tile in tiles}
+        self.assertEqual(
+            subs["New failures"],
+            "were passing or flaking before · +3 muted · +4 flaking")
+        self.assertEqual(subs["Still failing"],
+                         "failed before too · +6 muted · +2 flaking")
+        # Tiles stay buttons; the suffix is their text.
+        self.assertEqual([tile[0] for tile in tiles[2:4]],
+                         ["BUTTON", "BUTTON"])
+        self.assertFalse(any(node[0] in ("A", "BUTTON")
+                             for tile in tiles for node in _dom_walk(tile)))
+
+    def test_all_clear_names_what_is_set_aside(self) -> None:
+        aside = self._walk("flaky", True)["aside"]
+        self.assertFalse(aside["hidden"])
+        self.assertEqual(aside["text"], "Set aside: 9 muted · 6 flaking")
+        # Each part is a link to the tab that lists it: "9 muted" the
+        # Muted tab, "6 flaking" the Flaking tab (design §13).
+        self.assertEqual(aside["parts"], [
+            "#:Set aside: ", "BUTTON:9 muted", "#: · ", "BUTTON:6 flaking"])
+        self.assertEqual(aside["opened"], ["Muted"])
+        flaking_only = self._walk("flaky", True, 0)["aside"]
+        self.assertEqual(flaking_only["parts"],
+                         ["#:Set aside: ", "BUTTON:6 flaking"])
+        self.assertEqual(flaking_only["opened"], ["Flaking"])
+
+    def test_the_bars_gain_a_flaking_segment_and_key(self) -> None:
+        regions = self._walk("flaky")["regions"]
+        env = regions["env-chart"][7]
+        self.assertEqual([_dom_text(item) for item in env[0][7]],
+                         ["Unassigned", "Assigned", "Muted", "Flaking"])
+        self.assertEqual(
+            [str(item[7][0][1]) for item in env[0][7]][-1],
+            "legend-swatch swatch-flaking")
+        bars = [row for row in env if row[1] == "bar-row"]
+        self.assertEqual([row[4] for row in bars], [
+            "env-a: 14 failing, 8 unassigned, 6 assigned, 4 muted, "
+            "3 flaking",
+            "env-b: 0 failing, 2 muted",
+            # All flaking: shown as an all-muted environment is, its
+            # failing figure 0.
+            "env-c: 0 failing, 2 flaking"])
+        fills = [[fill[1] for fill in row[7][1][7]] for row in bars]
+        self.assertEqual(fills[0], [
+            "bar-fill fill-fail bar-fill-open",
+            "bar-fill bar-assigned bar-fill-open",
+            "bar-fill bar-muted bar-fill-open", "bar-fill bar-flaking"])
+        self.assertEqual(fills[2], ["bar-fill fill-fail bar-fill-open",
+                                    "bar-fill bar-flaking"])
+        scripts_chart = regions["scripts-chart"][7]
+        self.assertEqual([_dom_text(item) for item in scripts_chart[0][7]],
+                         ["Unassigned", "Assigned", "Muted", "Flaking"])
+        self.assertEqual(scripts_chart[1][4],
+                         "s1.py in env-a: 5 failing tests, 3 unassigned, "
+                         "2 assigned, 1 muted, 2 flaking")
+
+    def test_the_bar_offers_set_cadence_for_marked_rows_only(self) -> None:
+        """Item 5's Set cadence is reachable now that rows carry the
+        mark: two marked rows ticked offer it; a marked and an unmarked
+        row offer Mark as flaky."""
+        self.assertEqual(self._walk("flaky")["ticked"],
+                         ["Set cadence", "Mark as flaky"])
+
+    def test_an_assigned_flaking_row_on_open_actions(self) -> None:
+        def first_row(row: Dict[str, Any], streams: Any = None) -> Any:
+            return _shim({"ids": _actions_ids(), "names": _names_part([]),
+                          "row": row, "namesFailures": 0,
+                          "streams": streams or {}},
+                         _ACTIONS_SHIM_DRIVER)["firstRow"]
+
+        # Assigned from a build: the compare strip stays raw (decision 9)
+        # and the displayed result is said beside it, in words.
+        build = {"4": {"id": 4, "kind": "build", "name": "2026.9.0",
+                       "product": ""}}
+        from_build = dict(_ACTIONS_ROW, assignee="dev1",
+                          assignment_stream_id=4, origin_result="FAIL")
+        self.assertEqual(first_row(dict(
+            from_build, flaky=_flaky("flaking", 1)), build), [
+            "result-flaking", "chip-transition:mainlineFAILbuild:2026.9.0FAIL",
+            "chip result-flaking:FLAKING"])
+        for flaky in (None, _flaky("failing", 3, 3)):
+            shape = first_row(dict(from_build, flaky=flaky), build)
+            self.assertEqual(shape[:2], [
+                "result-fail",
+                "chip-transition:mainlineFAILbuild:2026.9.0FAIL"])
+            self.assertNotIn("chip result-fail:FAIL", shape)
+
+        self.assertEqual(first_row(dict(
+            _ACTIONS_ROW, assignee="dev1", flaky=_flaky("flaking", 1))),
+            ["result-flaking", "chip result-flaking:FLAKING"])
+        self.assertEqual(first_row(dict(
+            _ACTIONS_ROW, flaky=_flaky("failing", 3, 3))),
+            ["result-fail", "chip result-fail:FAIL", "flaky-tag:flaky"])
+        for row in (_ACTIONS_ROW, dict(_ACTIONS_ROW, flaky=None)):
+            self.assertEqual(first_row(row),
+                             ["result-fail", "chip result-fail:FAIL"])
+
+    def test_the_set_aside_helpers_byte_for_byte(self) -> None:
+        """With nothing flaking each prints what mutedSuffix() and
+        failingWithMuted() printed before them."""
+        promoted = {"result": "FAIL", "prev_result": "FAIL", "mute": None,
+                    "flaky": _flaky("failing", 3, 3)}
+        answer = _api_calls([
+            ("setAsideSuffix", [3, 0]), ("setAsideSuffix", [3, 4]),
+            ("setAsideSuffix", [0, 4]), ("setAsideSuffix", [0, None]),
+            ("failingWithSetAside", [12, 3, None]),
+            ("failingWithSetAside", [1234, 0, None]),
+            ("failingWithSetAside", [12, 3, 4]),
+            ("setAsideBracket", [0, 4]), ("setAsideBracket", [None, None]),
+            ("setAsideWords", [3, 4]), ("setAsideWords", [0, 0]),
+            ("newFailuresSub", [9]), ("newFailuresSub", [0]),
+            ("newFailuresSub", [None]),
+            ("previousShown", [promoted]),
+            ("previousShown", [dict(promoted, mute=_LIVE_MUTE)]),
+            ("previousShown", [dict(promoted, prev_result="PASS")]),
+            ("previousShown", [dict(promoted, flaky=_flaky("flaking", 2))]),
+            ("previousShown", [dict(promoted, flaky=None)]),
+            ("rowResult", [dict(promoted, flaky=_flaky("flaking", 2))]),
+            ("rowResult", [dict(promoted, flaky=_flaky("flaking", 2),
+                                mute=_LIVE_MUTE)]),
+            ("rowResult", [{"result": "FAIL"}]),
+            ("failingSplit", [5, 2, 1, None]), ("failingSplit", [5, 2, 1, 0]),
+        ])
+        self.assertEqual(answer[:14], [
+            "+3 muted", "+3 muted · +4 flaking", "+4 flaking", "",
+            "12 (+3 muted)", "1,234", "12 (+3 muted, +4 flaking)",
+            " (+4 flaking)", "",
+            [{"key": "muted", "text": "3 muted"},
+             {"key": "flaking", "text": "4 flaking"}], [],
+            "were passing or flaking before", "were passing before",
+            "were passing before"])
+        self.assertEqual(answer[14:19],
+                         ["FLAKING", "FAIL", "PASS", "FAIL", "FAIL"])
+        self.assertEqual(answer[19:22], ["FLAKING", "FAIL", "FAIL"])
+        unkeyed, keyed = answer[22], answer[23]
+        self.assertEqual([row["label"] for row in unkeyed["rows"]],
+                         ["unassigned", "assigned", "muted"])
+        self.assertEqual(unkeyed["words"], "3 unassigned, 2 assigned, 1 muted")
+        self.assertEqual([row["label"] for row in keyed["rows"]],
+                         ["unassigned", "assigned", "muted", "flaking"])
+        self.assertEqual(keyed["rows"][-1],
+                         {"swatchClass": "swatch-flaking", "label": "flaking",
+                          "value": "0"})
+        self.assertEqual(keyed["words"], unkeyed["words"])
+
+
+#: Home over the shim, driven by a list of steps (WP-44): every
+#: data request is recorded with its query, and a snapshot of the parts
+#: the lists draw is taken after the load and after each step. argv: repo
+#: root, fixture path.
+_LISTS_HOME_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom, Element } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, fixture.url);
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+window.localStorage.setItem("testboard.username", "dev1");
+Element.prototype.focus = function () {};
+// The shim keeps the queue's header row (#queue-head-row) apart from its
+// table, so attachSorting() would find no header buttons there; its one
+// query is pointed at that row, so a header click sorts as in a browser.
+const ownQuery = Element.prototype.querySelectorAll;
+Element.prototype.querySelectorAll = function (selector) {
+  if (selector === "thead .sort-btn" && this === byId["queue-table"]) {
+    return byId["queue-head-row"].find((c) => c.className === "sort-btn");
+  }
+  return ownQuery.call(this, selector);
+};
+let asked = [];
+// An act (any request that is not a GET) moves the board on: from then
+// on the headline is `headlineAfter` and the queues are `queuesAfter`,
+// where the fixture gives them; every act is kept in `posts`.
+let headline = fixture.headline;
+let queues = fixture.queues;
+let posts = [];
+globalThis.fetch = (url, opts) => {
+  const u = new URL(String(url), "http://127.0.0.1/");
+  const path = u.pathname.replace(/^\//, "");
+  const part = u.searchParams.get("parts");
+  if (path !== "api/users" && path !== "api/products") {
+    asked.push(path + u.search);
+  }
+  if (opts && opts.method && opts.method !== "GET") {
+    headline = fixture.headlineAfter || headline;
+    queues = fixture.queuesAfter || queues;
+    posts.push([path, opts.body ? JSON.parse(opts.body) : null]);
+  }
+  let body = {};
+  if (part === "headline") {
+    body = headline;
+  } else if (part === "assigned_trend") {
+    // `parts`, where given, answers each split request in turn.
+    body = fixture.parts && fixture.parts.length
+      ? fixture.parts.shift() : fixture.part;
+  } else if (part === "queue") {
+    // `queueRow`, where given, is every queue's one row, whatever kind
+    // is asked for (QueueTabReviewTest).
+    body = { generated_at: fixture.headline.generated_at,
+      stale_before: fixture.headline.stale_before,
+      queue: fixture.queueRow ? { tests: [fixture.queueRow], total: 1 }
+        : queues[u.searchParams.get("queue")] || { tests: [], total: 0 } };
+  } else if (path.startsWith("api/runs/")) {
+    body = { output: "boom" };
+  } else if (path === "api/dashboard") {
+    body = fixture.dashboard;
+  } else if (path === "api/users") {
+    body = { users: [] };
+  }
+  const answer = { ok: true, status: 200,
+    text: async () => JSON.stringify(body) };
+  // `headlineDelay` holds every headline's answer back, so what is asked
+  // for before it has been drawn can be seen; `delays` gives the
+  // headline and the split one hold each, in the order they are asked.
+  const queued = (fixture.delays || {})[part];
+  const held = queued && queued.length ? queued.shift()
+    : (part === "headline" ? fixture.headlineDelay || 0 : 0);
+  events.push("ask:" + (part || path));
+  return new Promise((resolve) => setTimeout(() => {
+    events.push("land:" + (part || path));
+    resolve(answer);
+  }, held));
+};
+let events = [];
+const delay = fixture.headlineDelay || 0;
+const settle = (wait) => new Promise((resolve) => setTimeout(
+  resolve, wait === undefined || wait === null ? 50 + delay : wait));
+const tabLabel = (tab) => tab.children[0].textContent;
+const legend = (node) => {
+  const row = node.children.find((c) => c.className === "chart-legend");
+  return row ? row.children.map((item) => item.textContent) : null;
+};
+const describe = (c) => c.className + ":" + c.textContent
+  + (c.title ? ":" + c.title : "");
+// The queue's header after the selection column: a sortable one as
+// "sort:" and its key (the shim drops a button's own text once the
+// arrow span is appended to it, as a browser would not), the rest by
+// their text.
+const headCells = () => byId["queue-head-row"].children.slice(1).map((th) => {
+  const sort = th.children.find((c) => c.className === "sort-btn");
+  return sort ? "sort:" + sort.dataset.key : th.textContent;
+});
+// The queue's test rows, and the open Review panel's row if any.
+const testRows = () => byId["queue-body"].children.filter(
+  (tr) => tr.className !== "review-row");
+const panelRow = () => byId["queue-body"].children.find(
+  (tr) => tr.className === "review-row") || null;
+// What an open Review panel offers: its groups' labels, and the Flaky
+// group's line (the sentence, then the small print) and controls.
+const panelShape = () => {
+  const panel = panelRow();
+  if (!panel) {
+    return null;
+  }
+  const labels = panel.find((c) => c.className === "review-label");
+  const flaky = labels.find((c) => c.textContent === "Flaky");
+  return {
+    labels: labels.map((c) => c.textContent),
+    flaky: flaky ? flaky.parentNode.children.slice(1).map((c) => [c.tagName,
+      c.tagName === "SELECT" ? c.value
+        : c.tagName === "SPAN" ? c.children.map((x) => x.textContent)
+          : c.textContent]) : null,
+  };
+};
+const snap = () => {
+  const note = byId["queue-result-note"];
+  const firstNight = byId["trend-table-body"].children[0];
+  const out = {
+    asked,
+    posts,
+    tabs: byId["queue-tabs"].children.map((t) => [tabLabel(t),
+      t.children[1].textContent, t.attributes["aria-selected"]]),
+    toggles: byId["result-toggles"].children.map((b) => [b.textContent,
+      b.hidden, b.attributes["aria-pressed"], b.title || "", b.className]),
+    head: headCells(),
+    rows: testRows().map((tr) => ({
+      edge: tr.className,
+      cells: tr.children.slice(1, 6).map((td) => td.textContent),
+      titles: tr.children.slice(1, 6).map((td) => td.title || ""),
+      take: tr.find((c) => c.className === "take-btn").length,
+      review: tr.find((c) => c.className === "review-btn")
+        .map((c) => c.textContent),
+      marks: tr.find((c) => /^(chip|mute-tag|flaky-tag)/
+        .test(String(c.className))).map(describe),
+    })),
+    panel: panelShape(),
+    // The header showing a sort arrow, as "key:direction".
+    sorted: byId["queue-head-row"].children.slice(1).filter((th) =>
+      th.attributes["aria-sort"] && th.attributes["aria-sort"] !== "none")
+      .map((th) => th.children[0].dataset.key + ":"
+        + th.attributes["aria-sort"]),
+    tableHidden: byId["queue-table"].hidden,
+    sortOff: byId["queue-table"].classList.contains("sort-disabled"),
+    empty: [byId["queue-empty"].hidden, byId["queue-empty"].textContent],
+    cap: [byId["queue-cap-note"].hidden, byId["queue-cap-note"].textContent],
+    // The one-state line above the table: hidden, its text, and every
+    // chip and control in it.
+    note: [note.hidden, note.textContent,
+      note.find((c) => c.tagName === "BUTTON"
+        || /^chip/.test(String(c.className))).map(describe)],
+    trendLegend: legend(byId["trend-chart"]),
+    trendDim: byId["trend-card"].classList.contains("is-loading"),
+    events,
+    trendRow: firstNight ? firstNight.children.map((td) => td.textContent)
+      : null,
+    caption: [byId["trend-split-caption"].hidden,
+      byId["trend-mark-caption"].hidden,
+      byId["trend-mark-caption"].textContent],
+    aside: byId["all-clear-aside"].children.map(
+      (c) => (c.tagName ? c.tagName : "#") + ":" + c.textContent),
+  };
+  asked = [];
+  events = [];
+  posts = [];
+  return out;
+};
+await import(pathToFileURL(root + "/static/app.js").href);
+let early = null;
+if (delay) {
+  await new Promise((resolve) => setTimeout(resolve, delay / 2));
+  early = asked.slice();
+}
+await new Promise((resolve) => setTimeout(resolve, 150 + delay));
+const snaps = [Object.assign(snap(), { early })];
+const bar = () => document.body.children.find(
+  (c) => c.className === "selection-bar");
+for (const [action, arg, wait] of fixture.steps) {
+  if (action === "wait") {
+    // Nothing but the wait: a snapshot of what has landed by then.
+  } else if (action === "tab") {
+    await byId["queue-tabs"].children.find((t) => tabLabel(t) === arg).click();
+  } else if (action === "click") {
+    await byId[arg].click();
+  } else if (action === "asideLink") {
+    await byId["all-clear-aside"].children.find(
+      (c) => c.tagName === "BUTTON" && c.textContent === arg).click();
+  } else if (action === "scriptBar") {
+    await byId["scripts-chart"].children.filter(
+      (c) => c.className === "bar-row")[arg].click();
+  } else if (action === "take") {
+    await byId["queue-body"].find((c) => c.className === "take-btn")[0]
+      .click();
+  } else if (action === "env") {
+    await byId["env-updated"].children.find(
+      (c) => c.tagName === "BUTTON").click();
+  } else if (action === "assign") {
+    const select = byId["queue-body"].find(
+      (c) => String(c.className).startsWith("assignee-select"))[0];
+    select.value = arg;
+    await select.dispatch("change");
+  } else if (action === "sort") {
+    // A click on the header whose sort key is arg.
+    await byId["queue-head-row"].find((c) => c.className === "sort-btn"
+      && c.dataset.key === arg)[0].click();
+  } else if (action === "review") {
+    // Open the Review panel of the arg-th row, by its Output column.
+    await testRows()[arg].find((c) => c.className === "review-btn")[0]
+      .click();
+  } else if (action === "panelUnmark") {
+    await panelRow().find((c) => c.tagName === "BUTTON"
+      && c.textContent === "Unmark")[0].click();
+  } else if (action === "barUnmark") {
+    const boxes = testRows().map((tr) => tr.children[0].children[0]);
+    for (const index of arg) {
+      boxes[index].checked = true;
+      await boxes[index].dispatch("change");
+    }
+    await bar().children.find(
+      (c) => c.className === "selection-unmark-btn").click();
+  } else if (action === "reviewEach") {
+    // Every tab drawn, in turn: its rows' Review buttons, and what one
+    // click on the first opens (QueueTabReviewTest).
+    const each = [];
+    const labels = byId["queue-tabs"].children.map(tabLabel);
+    for (const label of labels) {
+      await byId["queue-tabs"].children.find(
+        (t) => tabLabel(t) === label).click();
+      await settle(wait);
+      const rows = testRows();
+      const buttons = rows.map((tr) => tr.find(
+        (c) => c.className === "review-btn").length);
+      const review = rows.length && buttons[0]
+        ? rows[0].find((c) => c.className === "review-btn")[0] : null;
+      if (review) {
+        await review.click();
+        await settle(wait);
+      }
+      each.push({ tab: label, head: headCells(), buttons,
+        panel: panelShape() });
+      if (review) {
+        // Closed again: every tab's one row is the same test, and a panel
+        // left open would be reopened on the next tab's row by itself.
+        await review.click();
+      }
+    }
+    snaps.push({ each });
+    continue;
+  } else if (action === "tick") {
+    const boxes = testRows().map((tr) => tr.children[0].children[0]);
+    for (const index of arg) {
+      boxes[index].checked = true;
+      await boxes[index].dispatch("change");
+    }
+    const flakyBtn = bar().children.find(
+      (c) => c.className === "selection-flaky-btn");
+    const unmark = bar().children.find(
+      (c) => c.className === "selection-unmark-btn");
+    snaps.push({ ticked: [flakyBtn.textContent,
+      unmark ? unmark.disabled : null] });
+    for (const index of arg) {
+      boxes[index].checked = false;
+      await boxes[index].dispatch("change");
+    }
+    continue;
+  }
+  await settle(wait);
+  snaps.push(snap());
+}
+await driverAnswer(snaps);
+"""
+
+
+def _flaking_row(name: str, streak: int, cadence: int = 3,
+                 **extra: Any) -> Dict[str, Any]:
+    """One row of ``queue=flaking`` in the server's shape (design §14): a
+    queue row, key for key what ``still_failing`` returns, FAIL, no live
+    mute, its ``flaky`` never null: state "flaking", ``streak`` at least
+    1 and below ``cadence``."""
+    row = _state_row("plain", "flaky")
+    row.update({"test_name": name, "prev_result": "FAIL",
+                "flaky": dict(_flaky("flaking", streak), cadence=cadence)})
+    row.update(extra)
+    return row
+
+
+#: The Flaking tab's rows in the server's order, nearest to their cadence
+#: first (one run left, one run left, two), then environment, script and
+#: name; not alphabetical, so a page that re-sorted them would show it.
+_FLAKING_ROWS = [
+    _flaking_row("dns_timeout", 2),
+    _flaking_row("login_retry", 4, 5, environment="env-b", assignee="dev1",
+                 latest_comment={"text": "retry storm", "author": "dev1",
+                                 "created_at": "2026-10-02T09:00:00"}),
+    _flaking_row("cache_warm", 1),
+]
+
+#: The Flaking tab's one request, as any queue's: its queue part.
+_FLAKING_QUEUE_ASK = "api/summary?parts=queue&queue=flaking&assignee=dev1"
+
+#: The Flaking tab's columns: Still failing's, the Streak where its two
+#: times stand (design §14), the Output column's Review last. Sortable
+#: ones by their key (the lists driver's headCells()): Test, Streak (by
+#: the runs left), Latest comment, Assignee, Output.
+_FLAKING_HEAD = ["sort:test_name", "sort:runs_left", "Latest comment",
+                 "sort:assignee", "Output"]
+
+
+def _trend_part(flaking: Any) -> Dict[str, Any]:
+    """``parts=assigned_trend`` with FAIL_FLAKING; *flaking* None is a
+    server from before it (no FAIL_FLAKING)."""
+    part = _part()
+    for night in part["trend"]["nights"]:
+        if flaking is not None:
+            night["FAIL_FLAKING"] = flaking
+    return part
+
+
+def _lists_walk(marks: str, steps: List[List[Any]], clear: bool = False,
+                url: str = "http://127.0.0.1/index.html",
+                rows: Any = None, total: Any = None, part: Any = "flaking",
+                flaking: Any = None, flaking_after: Any = None,
+                headline_delay: int = 0, delays: Any = None,
+                parts: Any = None, rows_after: Any = None,
+                queue_row: Any = None,
+                root: str = REPO_DIR) -> List[Dict[str, Any]]:
+    """Home over the shim with the lists driver. *marks* as
+    ``_state_fixture`` ("flaky", "zero", "older"); *rows* the Flaking
+    tab's queue (default _FLAKING_ROWS) and *total* its ``total``
+    (default its length), *rows_after* its rows once an act has been
+    sent; *queue_row*, where given, every queue's one row whatever kind
+    is asked for; *part* the trend part ("flaking": with FAIL_FLAKING, 1
+    a night; "older": a server that sends none); *flaking* overrides
+    ``status.flaking``, and *flaking_after* is its value once an act has
+    been sent; *headline_delay* (ms) holds every headline answer back,
+    and the load's snapshot then carries ``early``, what was asked for
+    halfway through that wait. *delays* holds the headline and the split
+    back by request, in order (``{"headline": [0, 300]}``); *parts*
+    answers each split request in turn (None: no split to be had);
+    *root* is the tree whose static files are walked. A step may carry a
+    third element, the ms to wait before its snapshot."""
+    fixture = _state_fixture(marks, clear)
+    if flaking is not None:
+        fixture["headline"]["status"]["flaking"] = flaking
+    if flaking_after is not None:
+        after = json.loads(json.dumps(fixture["headline"]))
+        after["status"]["flaking"] = flaking_after
+        fixture["headlineAfter"] = after
+    flaking_rows = _FLAKING_ROWS if rows is None else rows
+    fixture["queues"]["flaking"] = {
+        "tests": flaking_rows,
+        "total": len(flaking_rows) if total is None else total}
+    if rows_after is not None:
+        fixture["queuesAfter"] = dict(fixture["queues"], flaking={
+            "tests": rows_after, "total": len(rows_after)})
+    fixture["part"] = _trend_part(1 if part == "flaking" else None)
+    fixture.update({
+        "url": url, "steps": steps, "headlineDelay": headline_delay,
+        "delays": delays or {}, "parts": parts or [], "queueRow": queue_row,
+    })
+    answer = _shim(fixture, _LISTS_HOME_DRIVER, root)  # type: Any
+    return list(answer)
+
+
+def _query(asked: str) -> List[List[str]]:
+    """The query of a recorded request as [name, value] pairs, in order."""
+    query = asked.split("?", 1)[1] if "?" in asked else ""
+    return [list(pair) for pair in urllib.parse.parse_qsl(query)]
+
+
+def _results_of(asked: List[str]) -> List[List[str]]:
+    """The ``result=`` values of every browse rows request in *asked*."""
+    return [[value for name, value in _query(entry) if name == "result"]
+            for entry in asked if entry.startswith("api/dashboard")]
+
+
+#: Functions of app.js that must never name the Flaking tab's rows: the
+#: refresh, the coalescer and the first paint around them. They reach
+#: its queue only as the open tab's, through loadQueue(state.activeQueue)
+#: and the coalescer's rowsRequest(kind), as any tab's (WP-44 item 15).
+_NO_FLAKY_REQUEST_IN = ("async function refreshAll(",
+                        "async function fetchSummary()",
+                        "function renderHeadline()", "function init()")
+_FLAKY_REQUEST_TOKENS = ("api/flaky", "FLAKING_QUEUE")
+
+
+def _flaky_request_offenders(source: str) -> List[str]:
+    """The guarded functions of *source* that name the tab's request."""
+    code = _strip_comments(source)
+    return [signature for signature in _NO_FLAKY_REQUEST_IN
+            if any(token in _function_body(code, signature)
+                   for token in _FLAKY_REQUEST_TOKENS)]
+
+
+#: What the Flaking tab drew before it was a queue (WP-44 items 9 and 12),
+#: gone with item 15: its own request and pager, its own table and
+#: columns, their wording and their rule.
+_FLAKING_TAB_GONE = (
+    "FLAKY_TAB", "FLAKY_PAGE", "flakyUrl", "fetchFlakyPage",
+    "loadFlakyMore", "renderFlakyTable", "appendFlakyRows", "flakyColumns",
+    "failedOfRuns", "queue-more", "Newest mark first", "recent_failures",
+    "recent_runs")
+
+
+class FlakyTabTest(unittest.TestCase):
+    """WP-44 (design §13 and §14): the Flaking tab lists the tests
+    flaking now, marked and failing within their cadence, and nothing
+    else, and is a queue like its neighbours: its rows are the queue part
+    ``queue=flaking``, asked for through queueUrl() and rowsRequest() on
+    the tab's first click and as the open tab's rows after that, never by
+    the first paint; drawn by renderQueueTable()'s shared loop with the
+    Output column's Review on every row; Still failing's columns with the
+    Streak where Failing since and Last pass stand. It is drawn only
+    where ``status.flaking`` is above zero, or while it is the open tab.
+    The one state is said once above the table, with the order."""
+
+    def test_the_rows_are_a_queue_part(self) -> None:
+        code = _strip_comments(read("app.js"))
+        self.assertEqual(_flaky_request_offenders(read("app.js")), [])
+        self.assertRegex(_function_body(code, "function rowsRequest("),
+                         r"^function rowsRequest\(kind\) \{\s+return "
+                         r"fetchJson\(queueUrl\(kind\)\);\s+\}$")
+        self.assertIn('export const FLAKING_QUEUE = "flaking";',
+                      _strip_comments(read("api.js")))
+        # Nothing asks for GET /api/flaky any more: the only addresses
+        # under it are the two acts' POSTs.
+        for name, source in scripts().items():
+            for literal in _STRING_LITERAL_RE.findall(
+                    _strip_comments(source)):
+                if "api/flaky" in literal:
+                    self.assertIn(literal[1:-1], ("api/flaky/bulk",
+                                                  "api/flaky/unmark"), name)
+        for name in list(scripts()) + ["index.html", "style.css"]:
+            text = read_text(name)
+            for gone in _FLAKING_TAB_GONE:
+                self.assertNotIn(gone, text, name + ": " + gone)
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: the tab's request in the refresh, the coalescer and
+        the first paint."""
+        source = read("app.js")
+        for signature, planted in (
+                ("async function refreshAll(",
+                 "  fetchJson(queueUrl(FLAKING_QUEUE));\n"),
+                ("async function fetchSummary()",
+                 '  fetchJson("api/flaky");\n'),
+                ("function renderHeadline()",
+                 "  loadQueue(FLAKING_QUEUE, state.requestSeq);\n")):
+            at = source.index(signature)
+            at = source.index("{", at) + 1
+            with self.subTest(signature=signature):
+                self.assertEqual(_flaky_request_offenders(
+                    source[:at] + "\n" + planted + source[at:]), [signature])
+
+    def test_the_tab_sits_beside_muted_and_shows_only_while_flaking(
+            self) -> None:
+        code = _strip_comments(read("app.js"))
+        tabs = code[code.index("const QUEUE_TABS = ["):]
+        tabs = tabs[:tabs.index("];")]
+        self.assertLess(
+            tabs.index('{ id: "muted"'),
+            tabs.index("{ id: FLAKING_QUEUE, label: FLAKING_TAB_LABEL }"))
+        self.assertLess(tabs.index("{ id: FLAKING_QUEUE"),
+                        tabs.index('{ id: "fixed"'))
+        self.assertIn('export const FLAKING_TAB_LABEL = "Flaking";',
+                      _strip_comments(read("api.js")))
+        self.assertIn("if (tab.id === FLAKING_QUEUE && !flakyTabShown()) {",
+                      _function_body(code, "function renderQueueTabs()"))
+        # Drawn by the tests flaking now, not by any mark (design §13):
+        # `status.flaky_total` stays the FLAKING toggle's and the charts'.
+        shown = _function_body(code, "function flakyTabShown()")
+        self.assertIn(
+            "state.activeQueue === FLAKING_QUEUE || flakingNow() > 0", shown)
+        # The badge: `status.flaking` until the queue's own total lands
+        # (a virtual kind, not in `queue_totals`).
+        count = _function_body(code, "function queueCount(")
+        self.assertLess(count.index("return queue.total;"),
+                        count.index("return flakingNow();"))
+        self.assertIn("state.summary.status.flaking || 0",
+                      _function_body(code, "function flakingNow()"))
+        for body in (shown, count):
+            self.assertNotIn("flaky_total", body)
+            self.assertNotIn("flakyScope()", body)
+
+    def test_the_rows_are_drawn_by_the_shared_loop(self) -> None:
+        """No branch of the tab's own anywhere in the loop, the fetch or
+        the refresh: its row is built, edged and given Review as every
+        queue's is."""
+        code = _strip_comments(read("app.js"))
+        for signature in ("function renderQueueTable()",
+                          "async function loadQueue(",
+                          "async function refreshQueueCounts()",
+                          "function rowsRequest("):
+            self.assertNotIn("FLAKING_QUEUE", _function_body(code, signature),
+                             signature)
+        columns = _function_body(code, "function queueColumns(")
+        # Still failing's row, the Streak where its two times stand: the
+        # one difference (design §14).
+        self.assertRegex(columns, r"case FLAKING_QUEUE:\s+return \[testCol, "
+                                  r"streakCol, commentCol, assigneeCol\];")
+        self.assertRegex(columns, r'case "still_failing":\s+return \[testCol, '
+                                  r'failingSinceCol,\s+when\("Last pass", '
+                                  r'"last_pass_time"\),\s+commentCol,\s+'
+                                  r'assigneeCol\];')
+
+    def test_the_streak_column(self) -> None:
+        """Its words from api.js's helper beside flakySentence(), its
+        title that sentence, and its order the runs left before the test
+        counts as failing, as the server orders the rows."""
+        code = _strip_comments(read("app.js"))
+        columns = _function_body(code, "function queueColumns(")
+        streak = columns[columns.index("const streakCol = {"):]
+        streak = streak[:streak.index("\n  };") + 4]
+        self.assertIn('header: "Streak",', streak)
+        self.assertIn('sortKey: "runs_left",', streak)
+        # Read defensively, as the Review panel reads a mark: a row with
+        # no `flaky` draws an empty cell and sorts last (null).
+        self.assertRegex(streak, r"sortValue: \(entry\) => \(entry\.flaky\s+"
+                                 r"\? entry\.flaky\.cadence - "
+                                 r"entry\.flaky\.streak : null\),")
+        self.assertRegex(streak, r"if \(entry\.flaky\) \{\s+cell\.textContent"
+                                 r" = flakyStreakWords\(entry\.flaky\);\s+"
+                                 r"cell\.title = flakySentence\(entry\.flaky,")
+        self.assertNotIn("innerHTML", streak)
+        # The loop sorts on a column's sortValue where it names one, by
+        # the one shared sortRows(), and not past the cap.
+        render = _function_body(code, "function renderQueueTable()")
+        self.assertIn("const sortValue = sortColumn ? sortColumn.sortValue "
+                      ": null;", render)
+        self.assertIn("if (!capped && sortValue) {", render)
+        self.assertIn("value: sortValue(entry)", render)
+        # Only a key one of this tab's columns has sorts it (QueueSortTest).
+        self.assertIn("} else if (!capped && sortColumn) {", render)
+        self.assertNotIn("state.queueSortKey || \"\"", render)
+        api = _strip_comments(read("api.js"))
+        self.assertIn(
+            'return cadenceWords(flaky.streak) + ", failing after " '
+            '+ flaky.cadence;',
+            _function_body(api, "export function flakyStreakWords(flaky)"))
+        # The sentence beside it (its title) says the cadence the same
+        # way, "after", as the select's "fail after…" does; held here
+        # too so a run without node still sees it.
+        self.assertIn(
+            'return "Flaking: " + failed + "; counts as failing after "\n'
+            '      + cadenceWords(cadence);',
+            _function_body(api, "export function flakySentence("))
+        self.assertLess(api.index("export function flakySentence("),
+                        api.index("export function flakyStreakWords("))
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_streak_words_byte_for_byte(self) -> None:
+        """They agree with the sentence (its title) and the cadence's own
+        words: "N in a row" is cadenceWords(), "failing after" the
+        sentence's "counts as failing after", as the select's "fail
+        after…" says it."""
+        answer = _api_calls([
+            ("flakyStreakWords", [_flaky("flaking", 1)]),
+            ("flakyStreakWords", [_flaky("flaking", 2)]),
+            ("flakyStreakWords",
+             [dict(_flaky("flaking", 9), cadence=10)]),
+            ("flakySentence", [_flaky("flaking", 2), False]),
+            ("cadenceWords", [3]),
+        ])
+        self.assertEqual(answer, [
+            "1 in a row, failing after 3", "2 in a row, failing after 3",
+            "9 in a row, failing after 10",
+            "Flaking: failed its last 2 runs; counts as failing after 3 in "
+            "a row",
+            "3 in a row"])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_a_row_without_its_mark_still_draws(self) -> None:
+        """A row with ``flaky: null`` (an older server behind a reload, a
+        race) draws whole, with its Review, an empty Streak cell and no
+        title, and sorts last by Streak in either direction."""
+        bare = dict(_FLAKING_ROWS[0], test_name="no_mark", flaky=None)
+        opened, ascending, descending = _lists_walk(
+            "flaky", [["tab", "Flaking"], ["sort", "runs_left"],
+                      ["sort", "runs_left"]],
+            rows=[bare, _FLAKING_ROWS[0], _FLAKING_ROWS[2]])[1:]
+        self.assertEqual([row["cells"][0][:7] for row in opened["rows"]],
+                         ["no_mark", "dns_tim", "cache_w"])
+        self.assertEqual(opened["rows"][0]["cells"][1], "")
+        self.assertEqual(opened["rows"][0]["titles"][1], "")
+        self.assertEqual([row["review"] for row in opened["rows"]],
+                         [["Review"]] * 3)
+        self.assertEqual([row["cells"][0][:7] for row in ascending["rows"]],
+                         ["dns_tim", "cache_w", "no_mark"])
+        self.assertEqual([row["cells"][0][:7] for row in descending["rows"]],
+                         ["cache_w", "dns_tim", "no_mark"])
+
+    def test_the_one_state_is_said_once_above_the_table(self) -> None:
+        """By QUEUE_INVARIANT_RESULT, the mechanism Still failing and
+        Stale annotations use, its words from api.js; the old order line,
+        its element, its rule and its "N flaking now" link are gone."""
+        code = _strip_comments(read("app.js"))
+        self.assertIn("[FLAKING_QUEUE]: { result: FLAKING_FILTER, text: "
+                      "FLAKING_TAB_NOTE },", code)
+        api = _strip_comments(read("api.js"))
+        # Not "failing": a mark changes what counts as a failure, and a
+        # test on this tab is by that definition not failing.
+        self.assertIn('export const FLAKING_TAB_NOTE = "Every test here '
+                      'failed its latest run, "\n  + "but fewer times in a '
+                      'row than its cadence. Nearest to its cadence "\n'
+                      '  + "first.";', api.replace("\r\n", "\n"))
+        self.assertIn('export const FLAKING_TAB_EMPTY = "Nothing is '
+                      'flaking.";', api)
+        for name, text in (("app.js", code), ("api.js", api),
+                           ("index.html", read("index.html")),
+                           ("style.css", read_text("style.css"))):
+            for gone in ("queue-flaky-note", "flakingNowWords",
+                         "FLAKY_TAB_ORDER", "List them in All tests",
+                         "renderFlakyNote", "retired-tag"):
+                self.assertNotIn(gone, text, name + ": " + gone)
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_nothing_flaking_no_tab_and_no_request(self) -> None:
+        """No mark, or marks with none flaking now (``flaky_total`` 9,
+        ``flaking`` 0): no tab, and the tab's queue is never asked for."""
+        for marks, flaking in (("zero", None), ("older", None),
+                               ("flaky", 0)):
+            with self.subTest(marks=marks, flaking=flaking):
+                load = _lists_walk(marks, [], flaking=flaking)[0]
+                self.assertEqual([tab[0] for tab in load["tabs"]], [
+                    "New failures", "Still failing", "Muted", "Fixed",
+                    "Stale annotations", "Not run", "My actions"])
+                self.assertFalse(any("queue=flaking" in a or
+                                     a.startswith("api/flaky")
+                                     for a in load["asked"]))
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_first_click_asks_once_and_draws_the_rows(self) -> None:
+        load, opened, again, reopened = _lists_walk("flaky", [
+            ["tab", "Flaking"], ["tab", "Muted"], ["tab", "Flaking"]],
+            flaking=3)
+        # Before the tab's own answer, its badge is `status.flaking`.
+        self.assertEqual([tab[:2] for tab in load["tabs"]][2:4],
+                         [["Muted", "6"], ["Flaking", "3"]])
+        self.assertFalse(any("queue=flaking" in a for a in load["asked"]))
+        # Home's load is still four data requests: three in the first
+        # batch, then the trend's split once the headline is drawn.
+        self.assertEqual(len(load["asked"]), 4)
+        self.assertTrue(load["asked"][-1].startswith(
+            "api/summary?parts=assigned_trend"))
+        self.assertEqual(opened["asked"], [_FLAKING_QUEUE_ASK])
+        self.assertEqual(again["asked"],
+                         ["api/summary?parts=queue&queue=muted&assignee=dev1"])
+        self.assertEqual(reopened["asked"], [])
+        # The badge is the tab's own total once it has landed: the rows.
+        self.assertEqual(opened["tabs"][3], ["Flaking", "3", "true"])
+        self.assertEqual(opened["head"], _FLAKING_HEAD)
+        self.assertFalse(opened["tableHidden"])
+        self.assertEqual(opened["note"], [
+            False, "FLAKINGEvery test here failed its latest run, but fewer "
+            "times in a row than its cadence. Nearest to its cadence first.",
+            ["chip result-flaking:FLAKING"]])
+        rows = opened["rows"]
+        # In the server's order, nearest to its cadence first: the test,
+        # the streak, the latest comment.
+        self.assertEqual([row["cells"][:2] for row in rows], [
+            ["dns_timeoutenv-a · s1.py", "2 in a row, failing after 3"],
+            ["login_retryenv-b · s1.py", "4 in a row, failing after 5"],
+            ["cache_warmenv-a · s1.py", "1 in a row, failing after 3"]])
+        self.assertEqual([row["cells"][2][:18] for row in rows],
+                         ["—", "retry stormdev1 · ", "—"])
+        self.assertEqual([row["cells"][4] for row in rows], ["Review"] * 3)
+        self.assertEqual([row["titles"][1] for row in rows], [
+            "Flaking: failed its last 2 runs; counts as failing after "
+            "3 in a row",
+            "Flaking: failed its last 4 runs; counts as failing after "
+            "5 in a row",
+            "Flaking: failed its last run; counts as failing after 3 in "
+            "a row"])
+        # The row's edge reads flaking; no chip, no pill in the row.
+        self.assertEqual([row["edge"] for row in rows], ["result-flaking"] * 3)
+        self.assertEqual([row["marks"] for row in rows], [[], [], []])
+        # The assignee cell every queue has, Take where nobody has it,
+        # and the Output column's Review on every row.
+        self.assertEqual([row["take"] for row in rows], [1, 0, 1])
+        self.assertEqual([row["review"] for row in rows], [["Review"]] * 3)
+        self.assertEqual(opened["cap"][0], True)
+        self.assertFalse(opened["sortOff"])
+        # Another tab draws its own line (Muted has none).
+        self.assertEqual(again["note"][:2], [True, ""])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_cap_note_and_sort_as_on_every_tab(self) -> None:
+        """A queue capped below its total says so and switches its sorts
+        off with the reason, the Flaking tab's as every tab's; the badge
+        is the queue's ``total``."""
+        opened = _lists_walk("flaky", [["tab", "Flaking"]], flaking=600,
+                             total=600)[1]
+        self.assertEqual(len(opened["rows"]), 3)
+        self.assertEqual(opened["tabs"][3][:2], ["Flaking", "600"])
+        self.assertEqual(opened["cap"], [
+            False, "Showing the first 3 of 600 — filter by environment to "
+            "narrow the queue."])
+        self.assertTrue(opened["sortOff"])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_states_loading_and_empty(self) -> None:
+        # Loading reads as every queue's does: the tab is one of them.
+        render = _strip_comments(_function_body(
+            read("app.js"), "function renderQueueTable()"))
+        self.assertIn('emptyNote.textContent = "Loading queue…";', render)
+        self.assertNotIn('"Loading…"', render)
+        empty = _lists_walk("flaky", [["tab", "Flaking"]], rows=[])[1]
+        self.assertTrue(empty["tableHidden"])
+        self.assertEqual(empty["empty"], [False, "Nothing is flaking."])
+        self.assertTrue(empty["note"][0])
+        self.assertEqual(empty["tabs"][3], ["Flaking", "0", "true"])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_an_act_refetches_the_queue_and_the_counts(self) -> None:
+        """Take (the coalescer) and Reload (``refreshAll``) each ask for
+        the open tab's queue again with the headline, as on any tab; on
+        another tab they do not."""
+        opened, take, reload = _lists_walk("flaky", [
+            ["tab", "Flaking"], ["take", None], ["click", "reload-btn"]])[1:]
+        self.assertIn(_FLAKING_QUEUE_ASK, take["asked"])
+        self.assertTrue(any("parts=headline" in a for a in take["asked"]))
+        self.assertIn(_FLAKING_QUEUE_ASK, reload["asked"])
+        self.assertTrue(any("parts=headline" in a for a in reload["asked"]))
+        elsewhere = _lists_walk("flaky", [["click", "reload-btn"]])[1]
+        self.assertFalse(any("queue=flaking" in a
+                             for a in elsewhere["asked"]))
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_selection_bar_works_on_its_rows(self) -> None:
+        """Every row is marked, so ticking any of them offers Set cadence
+        and Unmark, as on any queue's rows."""
+        ticked = _lists_walk("flaky", [["tab", "Flaking"], ["tick", [0, 1]]])[2]
+        self.assertEqual(ticked["ticked"], ["Set cadence", False])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_review_on_a_flaking_row_and_unmark_from_the_panel(self) -> None:
+        """Review on a Flaking row opens the panel Still failing's opens,
+        group for group: assign, comment, mute and the Flaky group with
+        the mark's sentence, owner, age and reason, Set cadence and
+        Unmark. Unmark from it posts the one test, and the reload that
+        follows brings the queue back without it, the badge with it."""
+        still = _lists_walk("flaky", [["tab", "Still failing"],
+                                      ["review", 0]])[2]
+        load, _, flaking, unmarked = _lists_walk(
+            "flaky", [["tab", "Flaking"], ["review", 0],
+                      ["panelUnmark", None]], flaking=3, flaking_after=2,
+            rows_after=_FLAKING_ROWS[1:])
+        self.assertEqual(load["tabs"][3][:2], ["Flaking", "3"])
+        self.assertEqual(flaking["panel"]["labels"], still["panel"]["labels"])
+        self.assertEqual(flaking["panel"]["labels"],
+                         ["Assign to", "Add a comment", "Mute", "Flaky"])
+        self.assertEqual(flaking["panel"]["flaky"], [
+            ["SPAN", ["Flaking: failed its last 2 runs; counts as failing "
+                      "after 3 in a row", "by dev1 · 12 days ago · race in "
+                      "teardown"]],
+            ["SELECT", "3"], ["BUTTON", "Set cadence"], ["BUTTON", "Unmark"]])
+        self.assertEqual([row["review"] for row in flaking["rows"]][0],
+                         ["Close"])
+        self.assertEqual(unmarked["posts"], [["api/flaky/unmark", {
+            "username": "dev1", "tests": [{
+                "environment": "env-a", "script": "s1.py",
+                "test_name": "dns_timeout"}]}]])
+        self.assertIn(_FLAKING_QUEUE_ASK, unmarked["asked"])
+        self.assertEqual([row["cells"][0] for row in unmarked["rows"]],
+                         ["login_retryenv-b · s1.py",
+                          "cache_warmenv-a · s1.py"])
+        self.assertEqual(unmarked["tabs"][3], ["Flaking", "2", "true"])
+        self.assertIsNone(unmarked["panel"])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_unmark_from_the_selection_bar(self) -> None:
+        """The bar's Unmark on a ticked Flaking row: the one test posted,
+        then the board reloaded, the row gone and the badge following."""
+        acted = _lists_walk("flaky", [["tab", "Flaking"],
+                                      ["barUnmark", [2]]],
+                            flaking=3, flaking_after=2,
+                            rows_after=_FLAKING_ROWS[:2])[2]
+        self.assertEqual(acted["posts"], [["api/flaky/unmark", {
+            "username": "dev1", "tests": [{
+                "environment": "env-a", "script": "s1.py",
+                "test_name": "cache_warm"}]}]])
+        self.assertIn(_FLAKING_QUEUE_ASK, acted["asked"])
+        self.assertEqual([row["cells"][0] for row in acted["rows"]],
+                         ["dns_timeoutenv-a · s1.py",
+                          "login_retryenv-b · s1.py"])
+        self.assertEqual(acted["tabs"][3], ["Flaking", "2", "true"])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_act_that_clears_the_last_row_leaves_the_empty_state(
+            self) -> None:
+        """Unmarking the last test flaking leaves the reader on the open
+        tab's empty state; leaving it, the tab is gone."""
+        cleared, left = _lists_walk(
+            "flaky", [["tab", "Flaking"], ["review", 0],
+                      ["panelUnmark", None], ["tab", "Muted"]],
+            rows=_FLAKING_ROWS[:1], flaking=1, flaking_after=0,
+            rows_after=[])[3:]
+        self.assertEqual(cleared["tabs"][3], ["Flaking", "0", "true"])
+        self.assertTrue(cleared["tableHidden"])
+        self.assertEqual(cleared["empty"], [False, "Nothing is flaking."])
+        self.assertNotIn("Flaking", [tab[0] for tab in left["tabs"]])
+
+
+#: Triage tabs allowed to draw a row without the Output column's Review,
+#: each with its reason. None: Triage is the morning touch point, and
+#: every tab in it is a queue with the run's output and the Review panel
+#: on every row (CLAUDE.md, "Triage is the morning touch point"; design
+#: flaky-mark-r0 §14). A tab added here needs the owner's word, named in
+#: the reason.
+_TABS_WITHOUT_REVIEW = {}  # type: Dict[str, str]
+
+
+def _tabs_without_review(each: List[Dict[str, Any]]) -> List[str]:
+    """The tabs of a ``reviewEach`` walk whose row has no Review button,
+    or whose Review opens no panel with the groups every tab's has."""
+    return [tab["tab"] for tab in each
+            if tab["buttons"] != [1] or tab["head"][-1:] != ["Output"]
+            or not tab["panel"]
+            or tab["panel"]["labels"][:2] != ["Assign to", "Add a comment"]
+            or "Flaky" not in tab["panel"]["labels"]]
+
+
+class QueueTabReviewTest(unittest.TestCase):
+    """WP-44 item 15: every Triage tab's row has the Output column's
+    Review, and it opens the panel. The Flaking tab was built without
+    them, as a table of its own beside the shared loop, and nothing
+    failed; this walks every tab in QUEUE_TABS, each given the same one
+    row, so a tab added later without them fails here unless it is named
+    in _TABS_WITHOUT_REVIEW with its reason."""
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_every_tabs_row_has_review_and_it_opens_the_panel(self) -> None:
+        each = _lists_walk("flaky", [["reviewEach", None]], flaking=1,
+                           queue_row=_FLAKING_ROWS[0])[1]["each"]
+        code = _strip_comments(read("app.js"))
+        tabs = code[code.index("const QUEUE_TABS = ["):]
+        tabs = tabs[:tabs.index("];")]
+        # Every tab of QUEUE_TABS was drawn and walked.
+        self.assertEqual(len(each), tabs.count("{ id: "))
+        self.assertEqual(len(each), 8)
+        self.assertEqual(
+            [label for label in _tabs_without_review(each)
+             if label not in _TABS_WITHOUT_REVIEW], [])
+        # The same row opens the same panel on every tab.
+        self.assertEqual(
+            {json.dumps(tab["panel"]) for tab in each
+             if tab["tab"] not in _TABS_WITHOUT_REVIEW},
+            {json.dumps(each[0]["panel"])})
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: a copy of the static tree whose Fixed tab draws its
+        rows without Review, as the Flaking tab once did."""
+        with tempfile.TemporaryDirectory() as scratch:
+            shutil.copytree(STATIC_DIR, os.path.join(scratch, "static"))
+            os.makedirs(os.path.join(scratch, "tools", "dev", "net"))
+            shutil.copy(
+                os.path.join(REPO_DIR, "tools", "dev", "net", "domshim.mjs"),
+                os.path.join(scratch, "tools", "dev", "net"))
+            app = os.path.join(scratch, "static", "app.js")
+            with io.open(app, encoding="utf-8") as handle:
+                source = handle.read()
+            planted = source.replace(
+                "    actionCell.appendChild(reviewBtn);\n",
+                '    if (queueId !== "fixed") {\n'
+                "      actionCell.appendChild(reviewBtn);\n    }\n", 1)
+            self.assertNotEqual(planted, source)
+            with io.open(app, "w", encoding="utf-8") as handle:
+                handle.write(planted)
+            each = _lists_walk("flaky", [["reviewEach", None]], flaking=1,
+                               queue_row=_FLAKING_ROWS[0],
+                               root=scratch)[1]["each"]
+        self.assertEqual(_tabs_without_review(each), ["Fixed"])
+
+
+class QueueSortTest(unittest.TestCase):
+    """The reader's sort key is kept across the Triage tabs, and applies
+    only where it names one of the open tab's own columns. Every queue row
+    carries ``start_time``, ``failing_since`` and the rest, so before this
+    a key from another tab's column reordered a tab's rows with no arrow
+    on any header, under a line stating the server's order ("Nearest to
+    its cadence first"); now such a key leaves the server's order."""
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_only_a_key_the_tab_has_sorts_it(self) -> None:
+        # Started at different times, so a sort on New failures' "Failed
+        # at" would put them in another order than the server's.
+        rows = [dict(row, start_time=at) for row, at in zip(
+            _FLAKING_ROWS, ("2026-10-03T03:00:00", "2026-10-03T01:00:00",
+                            "2026-10-03T02:00:00"))]
+        def names(snap: Dict[str, Any]) -> List[str]:
+            return [row["cells"][0].split("env-")[0] for row in snap["rows"]]
+
+        failed_at, flaking, by_assignee, muted, back = _lists_walk(
+            "flaky", [["sort", "start_time"], ["tab", "Flaking"],
+                      ["sort", "assignee"], ["tab", "Muted"],
+                      ["tab", "Flaking"]], rows=rows)[1:]
+        self.assertEqual(failed_at["sorted"], ["start_time:ascending"])
+        # Another tab's key: the server's order, and no arrow.
+        self.assertEqual(names(flaking),
+                         ["dns_timeout", "login_retry", "cache_warm"])
+        self.assertEqual(flaking["sorted"], [])
+        # A key this tab has sorts it, with its arrow (nobody's last).
+        self.assertEqual(names(by_assignee),
+                         ["login_retry", "dns_timeout", "cache_warm"])
+        self.assertEqual(by_assignee["sorted"], ["assignee:ascending"])
+        # And carries to another tab that has the column, and back.
+        self.assertEqual(muted["sorted"], ["assignee:ascending"])
+        self.assertEqual(back["sorted"], ["assignee:ascending"])
+        self.assertEqual(names(back), names(by_assignee))
+
+
+class FlakingFilterTest(unittest.TestCase):
+    """WP-44 (design §3 U9, decision 24): All tests' Result filter
+    gains FLAKING, right after FAIL, its wire word as its label. It is a
+    value on the rows request already made, never a request of its own;
+    hidden until the headline says the scope has a mark, or while it is
+    pressed; read from the address bar at load by the same loop as the
+    other values. While it shows, FAIL's title says FAIL leaves flaking
+    tests out."""
+
+    def test_after_fail_in_one_list(self) -> None:
+        api = _strip_comments(read("api.js"))
+        self.assertIn('export const BROWSE_RESULTS = ["PASS", "FAIL", '
+                      'FLAKING_FILTER,\n  "FAILED_AS_EXPECTED", '
+                      '"UNEXPECTED_PASS"];', api.replace("\r\n", "\n"))
+        self.assertNotIn("export const RESULTS", api)
+        code = _strip_comments(read("app.js"))
+        self.assertIn("for (const result of BROWSE_RESULTS) {",
+                      _function_body(code, "function buildResultToggles("))
+        self.assertIn("BROWSE_RESULTS.indexOf(raw) !== -1",
+                      _function_body(code, "function wireMainlineControls("))
+        self.assertIn('return "Failing, flaking tests left out";',
+                      _function_body(api, "export function failToggleTitle("))
+
+    def test_it_rides_the_existing_rows_request(self) -> None:
+        code = _strip_comments(read("app.js"))
+        self.assertIn("result: state.activeResults,",
+                      _function_body(code, "function browseUrl("))
+        sync = _function_body(code, "function syncResultToggles()")
+        self.assertNotIn("fetch", sync)
+        self.assertIn("state.activeResults.has(FLAKING_FILTER)", sync)
+        self.assertIn("(Boolean(state.summary) && flakyScope())", sync)
+        self.assertIn("btn.hidden = !flakingShown;", sync)
+        self.assertIn("failToggleTitle()", sync)
+        self.assertIn("syncResultToggles();",
+                      _function_body(code, "function renderHeadline()"))
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_hidden_until_a_mark_then_shown_after_fail(self) -> None:
+        for marks in ("zero", "older"):
+            with self.subTest(marks=marks):
+                toggles = _lists_walk(marks, [])[0]["toggles"]
+                self.assertEqual([t[0] for t in toggles], [
+                    "PASS", "FAIL", "FLAKING", "FAILED_AS_EXPECTED",
+                    "UNEXPECTED_PASS"])
+                self.assertEqual([t[0] for t in toggles if not t[1]], [
+                    "PASS", "FAIL", "FAILED_AS_EXPECTED", "UNEXPECTED_PASS"])
+                self.assertEqual(toggles[1][3], "", "FAIL keeps no title")
+        toggles = _lists_walk("flaky", [])[0]["toggles"]
+        self.assertEqual(toggles[2], ["FLAKING", False, "false", "",
+                                      "toggle result-flaking"])
+        self.assertEqual(toggles[1][3], "Failing, flaking tests left out")
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_read_at_load_and_shown_while_pressed(self) -> None:
+        """A link (or a bookmark) pressing FLAKING on a scope with no mark
+        still shows the toggle it pressed; on a build it opens "Its own
+        results", as any ``result=`` does."""
+        load = _lists_walk("zero", [], url="http://127.0.0.1/index.html"
+                           "?result=FLAKING&result=FAIL")[0]
+        self.assertEqual(load["toggles"][2][:3], ["FLAKING", False, "true"])
+        self.assertEqual(load["toggles"][1][:3], ["FAIL", False, "true"])
+        self.assertEqual(_results_of(load["asked"]), [["FLAKING", "FAIL"]])
+        self.assertIn("params.getAll(\"result\").length > 0", _function_body(
+            _strip_comments(read("app.js")), "function urlAsksForBrowseFilters("))
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_scripts_bar_lists_what_it_draws(self) -> None:
+        """FAIL, plus FLAKING when the bar has a flaking part; with no
+        mark, FAIL alone, as before."""
+        flaky = _lists_walk("flaky", [["scriptBar", 0]])[1]
+        self.assertEqual(_results_of(flaky["asked"]), [["FAIL", "FLAKING"]])
+        plain = _lists_walk("zero", [["scriptBar", 0]])[1]
+        self.assertEqual(_results_of(plain["asked"]), [["FAIL"]])
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class FlakingTrendTest(unittest.TestCase):
+    """WP-44 (design §3 U7, decisions 2 and 5): the per-day chart's
+    fourth series, FAIL_FLAKING from ``parts=assigned_trend``, after the
+    grey, with key, tooltip row, table column and caption only where the
+    scope has a mark; an older part without the field draws today's."""
+
+    def test_drawn_where_the_scope_has_a_mark(self) -> None:
+        load = _lists_walk("flaky", [])[0]
+        self.assertEqual(load["trendLegend"], [
+            "Unassigned", "Assigned", "Muted", "Flaking", "Unexpected pass"])
+        # Failed 9 = 3 unassigned + 3 assigned + 2 muted + 1 flaking.
+        self.assertEqual(load["trendRow"],
+                         ["Oct 1", "9", "3", "3", "2", "1", "2", "62"])
+        self.assertEqual(load["caption"], [
+            False, False,
+            " Flaking: the tests flaking that night, by today's marks."])
+
+    def test_no_mark_or_an_older_part_draws_todays_chart(self) -> None:
+        for marks, part in (("zero", "flaking"), ("older", "flaking"),
+                            ("flaky", "older")):
+            with self.subTest(marks=marks, part=part):
+                load = _lists_walk(marks, [], part=part)[0]
+                self.assertEqual(load["trendLegend"], [
+                    "Unassigned", "Assigned", "Muted", "Unexpected pass"])
+                self.assertEqual(load["trendRow"],
+                                 ["Oct 1", "9", "4", "3", "2", "2", "62"])
+                self.assertEqual(load["caption"], [False, True, ""])
+
+
+def _parts(asked: List[str]) -> List[str]:
+    """Each recorded data request as its summary part, or its path."""
+    named = []  # type: List[str]
+    for entry in asked:
+        parts = [value for name, value in _query(entry) if name == "parts"]
+        named.append(parts[0] if parts else entry.split("?")[0])
+    return named
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class TrendSplitAfterHeadlineDomTest(unittest.TestCase):
+    """The trend's split is never on the first paint (WP-43's part reads
+    every night's runs, and with flaky marks a per-night read besides):
+    Home's first batch is the headline, the active queue and the browse
+    page; the split goes out once the headline has been drawn, once per
+    load and per refresh. Every headline answer is held back here, so
+    what is asked for before it is drawn can be seen."""
+
+    _DELAY = 200
+
+    def test_the_first_batch_is_three_and_the_split_follows(self) -> None:
+        for marks in ("zero", "flaky"):
+            with self.subTest(marks=marks):
+                load = _lists_walk(marks, [],
+                                   headline_delay=self._DELAY)[0]
+                self.assertEqual(sorted(_parts(load["early"])),
+                                 ["api/dashboard", "headline", "queue"])
+                self.assertEqual(_parts(load["asked"])[-1], "assigned_trend")
+                self.assertEqual(_parts(load["asked"]).count(
+                    "assigned_trend"), 1)
+                # Once it lands, the trend carries the split.
+                self.assertEqual(load["trendLegend"][:3],
+                                 ["Unassigned", "Assigned", "Muted"])
+
+    def test_every_refresh_asks_once_after_its_headline(self) -> None:
+        """Reload, an environment chosen and a Take (the coalescer)."""
+        load, reload, scoped, take = _lists_walk(
+            "flaky", [["click", "reload-btn"], ["env", None],
+                      ["take", None]], headline_delay=self._DELAY)
+        for name, snap in (("reload", reload), ("environment", scoped),
+                           ("take", take)):
+            with self.subTest(refresh=name):
+                parts = _parts(snap["asked"])
+                self.assertEqual(parts.count("assigned_trend"), 1, parts)
+                self.assertEqual(parts.count("headline"), 1, parts)
+                self.assertLess(parts.index("headline"),
+                                parts.index("assigned_trend"))
+                self.assertEqual(snap["trendLegend"][:3],
+                                 ["Unassigned", "Assigned", "Muted"])
+
+    _SPLIT = ["Unassigned", "Assigned", "Muted", "Flaking", "Unexpected pass"]
+    _TOTALS = ["Failed", "Unexpected pass"]
+
+    def test_a_reload_keeps_its_chart_until_the_new_split(self) -> None:
+        """Where a split is on screen, a reload does not redraw the chart
+        between its headline and its split: the previous chart stays,
+        dimmed, and the new split replaces it. A first load draws the
+        headline's totals meanwhile; so does a load after a split that
+        could not be had, which ends with the totals drawn, undimmed."""
+        load, mid, landed = _lists_walk(
+            "flaky", [["click", "reload-btn", 120], ["wait", None, 400]],
+            delays={"assigned_trend": [0, 300]})
+        self.assertEqual((load["trendLegend"], load["trendDim"]),
+                         (self._SPLIT, False))
+        self.assertIn("land:headline", mid["events"])
+        self.assertIn("ask:assigned_trend", mid["events"])
+        self.assertNotIn("land:assigned_trend", mid["events"])
+        self.assertEqual((mid["trendLegend"], mid["trendDim"]),
+                         (self._SPLIT, True))
+        self.assertEqual((landed["trendLegend"], landed["trendDim"]),
+                         (self._SPLIT, False))
+        first, after = _lists_walk(
+            "flaky", [["wait", None, 400]],
+            delays={"assigned_trend": [300]})
+        self.assertEqual((first["trendLegend"], first["trendDim"]),
+                         (self._TOTALS, True))
+        self.assertEqual((after["trendLegend"], after["trendDim"]),
+                         (self._SPLIT, False))
+        load, failed, mid, landed = _lists_walk(
+            "flaky", [["click", "reload-btn"], ["click", "reload-btn", 120],
+                      ["wait", None, 400]],
+            parts=[_trend_part(1), None, _trend_part(1)],
+            delays={"assigned_trend": [0, 0, 300]})
+        self.assertEqual((failed["trendLegend"], failed["trendDim"]),
+                         (self._TOTALS, False))
+        self.assertEqual(failed["caption"][0], True)
+        self.assertEqual((mid["trendLegend"], mid["trendDim"]),
+                         (self._TOTALS, True))
+        self.assertEqual(landed["trendLegend"], self._SPLIT)
+
+    def test_an_act_before_a_reloads_headline_asks_once_after_it(
+            self) -> None:
+        """A Take whose refresh finishes while a reload's headline is
+        still held back asks for no split of its own: the reload asks,
+        once, after its headline has landed and been drawn."""
+        _, reload, take = _lists_walk(
+            "flaky", [["click", "reload-btn", 0], ["take", None, 600]],
+            delays={"headline": [0, 300, 0]})
+        self.assertNotIn("ask:assigned_trend", reload["events"])
+        events = take["events"]
+        self.assertEqual(events.count("ask:assigned_trend"), 1, events)
+        last_headline = max(index for index, event in enumerate(events)
+                            if event == "land:headline")
+        self.assertGreater(events.index("ask:assigned_trend"), last_headline)
+        self.assertEqual(events.count("land:headline"), 2, events)
+        self.assertEqual((take["trendLegend"], take["trendDim"]),
+                         (self._SPLIT, False))
+
+    def test_an_older_bursts_split_landing_last_is_not_drawn(self) -> None:
+        """Two Takes in one refresh generation: the first burst's split is
+        answered after the second's, and the second's is what stays
+        drawn (Assigned 2, not 1)."""
+        def part(assigned: int) -> Dict[str, Any]:
+            answer = _trend_part(1)
+            for night in answer["trend"]["nights"]:
+                night["FAIL_ASSIGNED"] = assigned
+            return answer
+
+        _, first, second = _lists_walk(
+            "flaky", [["take", None, 100], ["take", None, 600]],
+            parts=[part(3), part(1), part(2)],
+            delays={"assigned_trend": [0, 400, 0]})
+        self.assertEqual(first["events"].count("ask:assigned_trend"), 1)
+        self.assertNotIn("land:assigned_trend", first["events"])
+        self.assertEqual(second["events"].count("land:assigned_trend"), 2)
+        # Failed 9 = 4 unassigned + 2 assigned + 2 muted + 1 flaking.
+        self.assertEqual(second["trendRow"],
+                         ["Oct 1", "9", "4", "2", "2", "1", "2", "62"])
+        self.assertFalse(second["trendDim"])
+
+
+#: Open Actions over the shim (WP-44): the rows request of each
+#: Result mode, and the footer line. argv: repo root, fixture path.
+_ACTIONS_MODES_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom, Element } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, "http://127.0.0.1/actions.html");
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+byId["product-switcher"].setAttribute("data-host-managed", "");
+new Element("div").appendChild(byId["extend-all-btn"]);
+Element.prototype.replaceWith = function (node) {
+  if (node.id) byId[node.id] = node;
+};
+let rows = [];
+globalThis.fetch = (url) => {
+  const u = new URL(String(url), "http://127.0.0.1/");
+  const path = u.pathname.replace(/^\//, "");
+  let body = {};
+  if (path === "api/summary") {
+    body = fixture.names;
+  } else if (path === "api/dashboard") {
+    rows.push(Array.from(u.searchParams.entries()).filter(
+      ([name]) => name === "result" || name === "open"));
+    body = { tests: [fixture.row], total: 1, streams: {} };
+  } else if (path === "api/mutes") {
+    body = { mutes: [] };
+  } else if (path === "api/users") {
+    body = { users: [] };
+  }
+  return Promise.resolve({ ok: true, status: 200,
+    text: async () => JSON.stringify(body) });
+};
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+await import(pathToFileURL(root + "/static/actions.js").href);
+await settle();
+const note = byId["actions-flaky-note"];
+const out = { note: [note.hidden, note.textContent], modes: {} };
+out.modes.open = rows[0];
+for (const mode of ["FAIL", "UNEXPECTED_PASS"]) {
+  rows = [];
+  byId["filter-result"].value = mode;
+  await byId["filter-result"].dispatch("change");
+  await settle();
+  out.modes[mode] = rows[0];
+}
+const firstTr = byId["actions-body"].children[0];
+out.firstRow = firstTr ? [firstTr.className].concat(firstTr.find(
+  (c) => String(c.className).startsWith("chip")).map(
+  (c) => c.className + ":" + c.textContent)) : null;
+await driverAnswer(out);
+"""
+
+
+def _actions_modes_walk(marks: Any, row: Any = None) -> Dict[str, Any]:
+    """Open Actions with ``flaky_marks`` *marks* (None: an older server
+    that sends no such field)."""
+    names = _names_part([])
+    if marks is not None:
+        names["flaky_marks"] = marks
+    answer = _shim({"ids": _actions_ids(), "names": names,
+                    "row": row or _ACTIONS_ROW},
+                   _ACTIONS_MODES_DRIVER)  # type: Dict[str, Any]
+    return answer
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class OpenActionsFlakingDomTest(unittest.TestCase):
+    """WP-44 over the shim: an assigned flaking row on Open
+    Actions reads FLAKING, with the footer line under the count."""
+
+    def test_an_assigned_flaking_row_reads_flaking_above_the_footer(
+            self) -> None:
+        answer = _actions_modes_walk(True, dict(
+            _ACTIONS_ROW, assignee="dev1", flaky=_flaky("flaking", 1)))
+        self.assertEqual(answer["firstRow"],
+                         ["result-flaking", "chip result-flaking:FLAKING"])
+        self.assertFalse(answer["note"][0])
+        self.assertTrue(answer["note"][1].startswith("Unassigned tests that "
+                                                     "are flaking"))
 
 
 if __name__ == "__main__":

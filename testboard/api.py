@@ -53,14 +53,21 @@ from testboard.storage import (
     MUTE_MAX_HOURS,
     COMPARE_CATEGORIES,
     DASHBOARD_SORTS,
+    FLAKY_CADENCE_MAX,
+    FLAKY_CADENCE_MIN,
+    FLAKY_ROLE_FLAKING,
+    FLAKING_QUEUE,
     MAINLINE_STREAM_ID,
     QUEUE_KINDS,
+    FlakyMark,
     Mute,
     Comment,
     CompareCounts,
     CompareRow,
     DerivedTablesDisagree,
     FailureStreak,
+    FlakyCount,
+    FlakyRow,
     RollupCount,
     Storage,
     Stream,
@@ -128,6 +135,9 @@ _TIMELINE_MAX_RUNS = 5000
 #: Queues whose entries report failing_since / last_pass_time. Only these
 #: pay for the per-row streak seeks; the others describe a test whose
 #: latest run is not a failure, or show the previous result instead.
+#: WP-44 item 14: not the Flaking queue either: its rows carry the two
+#: keys null, as New failures' do, and ``flaky.streak`` says how many
+#: runs in a row it has failed (two to three statements a call saved).
 _STREAK_QUEUES = ("still_failing",)
 
 #: Window used for the list-view stability signal ("broken since Tuesday"
@@ -400,9 +410,48 @@ def _mute_json(
     }
 
 
+def _flaky_row_json(
+    flaky: Optional[FlakyRow],
+    shared: Optional[Dict[Tuple[Any, ...], Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """A listed row's ``flaky`` (WP-44 item 6, design §1 "State on a
+    row"): None for an unmarked test, else the mark and its state on
+    the row's stream. ``streak`` and ``runs`` are capped at the cadence;
+    ``runs`` is given only when the state is ``failing``. The wire
+    ``result`` stays ``FAIL``; what reads FLAKING (state ``flaking``,
+    no live mute) is the page's to say, from this and ``mute``.
+
+    *shared* is the caller's per-response dict of the objects already
+    built: a bulk act gives many rows the same mark fields and a page
+    repeats a few states, so equal values are one object, built once,
+    serialized wherever it appears. Nothing mutates them."""
+    if flaky is None:
+        return None
+    state = flaky.state
+    key = (flaky.mark.cadence, flaky.mark.marked_by, flaky.mark.marked_at,
+           flaky.mark.reason, state)
+    if shared is not None:
+        found = shared.get(key)
+        if found is not None:
+            return found
+    built = {
+        "cadence": flaky.mark.cadence,
+        "marked_by": flaky.mark.marked_by,
+        "marked_at": model.format_iso(flaky.mark.marked_at),
+        "reason": flaky.mark.reason,
+        "state": None if state is None else state.state,
+        "streak": None if state is None else state.streak,
+        "runs": None if state is None else state.runs,
+    }
+    if shared is not None:
+        shared[key] = built
+    return built
+
+
 def _summary_row_json(
     row: TestSummaryRow, product: str = "",
     now_value: Optional[datetime.datetime] = None,
+    flaky_shared: Optional[Dict[Tuple[Any, ...], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Serialize one dashboard row to its JSON shape.
 
@@ -440,6 +489,9 @@ def _summary_row_json(
         "retired_by": row.retired_by,
         "mute": _mute_json(
             row.mute, now_value or model.utcnow()),
+        # WP-44 item 6: the mark and its state on this stream, or null.
+        "flaky": (None if row.flaky is None
+                  else _flaky_row_json(row.flaky, flaky_shared)),
     }  # type: Dict[str, Any]
     if row.latest_comment is not None:
         payload["latest_comment"] = {
@@ -620,23 +672,54 @@ def _parse_int_param(
     return value
 
 
-def _parse_results_param(request: Request) -> Optional[List[Result]]:
-    """Parse repeated ``result=`` params into Result members, 400 on unknown."""
+#: WP-44 item 8 (design §1 "The browse Result filter", decision 24): the
+#: Result filter's one value that is not a :class:`Result`. It matches
+#: the rows that read FLAKING; the wire result of those rows stays FAIL.
+_FLAKING_FILTER = "FLAKING"
+
+
+def _parse_results_param(
+    request: Request,
+) -> Tuple[Optional[List[Result]], Optional[bool]]:
+    """Parse repeated ``result=`` params, FLAKING included (WP-44 item 8):
+    the results to bind, and the FLAKING mode storage applies to the FAIL
+    rows among them.
+
+    FLAKING maps to the raw ``FAIL`` plus a mode. FAIL alone (no FLAKING)
+    leaves the flaking rows out (False): every other FAIL row, a muted
+    flaking one included. FLAKING alone keeps only them among the FAIL
+    rows (True). Both, or neither, is today's FAIL (None). The parameter
+    stays repeatable and every other value is a :class:`Result`, 400 on
+    anything else, naming FLAKING among the values expected."""
     raw_results = request.query.get("result")
     if raw_results is None:
-        return None
+        return None, None
     results = []  # type: List[Result]
     for raw in raw_results:
+        if raw == _FLAKING_FILTER:
+            if Result.FAIL not in results:
+                results.append(Result.FAIL)
+            continue
         try:
-            results.append(Result[raw])
+            result = Result[raw]
         except KeyError:
             raise _HttpError(
                 400,
                 "result: unknown value '{}' (expected one of {})".format(
-                    raw, ", ".join(r.name for r in Result)
+                    raw, ", ".join(
+                        [r.name for r in Result] + [_FLAKING_FILTER])
                 ),
             )
-    return results
+        if result not in results:
+            results.append(result)
+    asked_fail = Result.FAIL.name in raw_results
+    asked_flaking = _FLAKING_FILTER in raw_results
+    flaking = None  # type: Optional[bool]
+    if asked_flaking and not asked_fail:
+        flaking = True
+    elif asked_fail and not asked_flaking:
+        flaking = False
+    return results, flaking
 
 
 #: How long one environment must be quiet before its next block of runs
@@ -811,20 +894,34 @@ def _resolve_stream_id(
     product/environment NAME, so there is no "empty result" reading —
     a stream either exists or the request is wrong).
     """
+    return _resolve_stream(storage, request, param)[0]
+
+
+def _resolve_stream(
+    storage: Storage, request: Request, param: str = "stream"
+) -> Tuple[int, Optional[datetime.datetime]]:
+    """:func:`_resolve_stream_id`, and the stream's FLOOR for the
+    marked tests' runs read (WP-44 item 6): a build's first run, or
+    None on mainline (its ``first_seen`` predates its migrated history,
+    design §3a). From the stream row the validation already reads, so
+    it costs nothing; absent, the stream is mainline."""
     raw = _query_single(request.query, param)
     if raw is None:
-        return MAINLINE_STREAM_ID
+        return MAINLINE_STREAM_ID, None
     try:
         stream_id = int(raw)
     except ValueError:
         raise _HttpError(
             400, "{}: must be an integer, got '{}'".format(param, raw)
         )
-    if storage.get_stream(stream_id) is None:
+    stream = storage.get_stream(stream_id)
+    if stream is None:
         raise _HttpError(
             404, "unknown stream: {}".format(stream_id)
         )
-    return stream_id
+    floor = (None if stream.kind == "mainline"
+             or stream_id == MAINLINE_STREAM_ID else stream.first_seen)
+    return stream_id, floor
 
 
 def _validate_optional_stream_id(
@@ -869,6 +966,9 @@ class _DashboardFilters(NamedTuple):
     product: Optional[str]
     with_comment: bool
     with_streak: bool
+    #: WP-44 item 6: a build stream's first run, bounding its marked
+    #: tests' runs read; None on mainline. Not a filter.
+    floor: Optional[datetime.datetime]
 
 
 def _parse_dashboard_filters(
@@ -890,10 +990,10 @@ def _parse_dashboard_filters(
     environment = _query_single(request.query, "environment")
     script = _query_single(request.query, "script")
     q = _query_single(request.query, "q")
-    results = _parse_results_param(request)
+    results, flaking = _parse_results_param(request)
     product = _query_single(request.query, "product")
     environments = _resolve_product_environments(storage, product)
-    stream_id = _resolve_stream_id(storage, request)
+    stream_id, floor = _resolve_stream(storage, request)
 
     stale_before = None  # type: Optional[datetime.datetime]
     if _query_single(request.query, "stale") in ("1", "true"):
@@ -969,10 +1069,13 @@ def _parse_dashboard_filters(
         "open_items": open_items,
         "muted": muted,
         "now": now(),
+        # WP-44 item 8: the FLAKING mode of the Result filter, applied
+        # by storage to the FAIL rows (see _parse_results_param).
+        "flaking": flaking,
     }  # type: Dict[str, Any]
     return _DashboardFilters(
         filters=filters, product=product, with_comment=with_comment,
-        with_streak=with_streak,
+        with_streak=with_streak, floor=floor,
     )
 
 
@@ -1016,16 +1119,24 @@ def _handle_dashboard(
     )
     offset = _parse_int_param(request, "offset", 0, 0, _MAX_OFFSET)
 
-    rows = storage.dashboard(
-        sort=sort, descending=(order == "desc"), limit=limit,
-        offset=offset, with_latest_comment=with_comment, **filters
-    )
     # One tiny lookup, not a join per row: the same map every OTHER
-    # product-aware endpoint reads from environment_products.
-    env_to_product = storage.environment_products_map()
+    # product-aware endpoint reads from environment_products. WP-44
+    # item 6: read FIRST, because the "any mark" bit rides it as one
+    # UNION ALL row, and the rows join the marks only when one exists.
+    env_to_product, marked = storage.environment_products_and_marks()
+    # WP-44 item 8: the page and its total in one call, because where a
+    # read leaves flaking tests out by the keys form (Open Actions on
+    # SQLite), one statement answers both.
+    rows, total = storage.dashboard_page(
+        sort=sort, descending=(order == "desc"), limit=limit,
+        offset=offset, with_latest_comment=with_comment,
+        with_flaky=marked, floor=parsed.floor, **filters
+    )
+    flaky_shared = {}  # type: Dict[Tuple[Any, ...], Dict[str, Any]]
     payload = [
         _summary_row_json(
-            row, env_to_product.get(row.environment, ""), filters["now"])
+            row, env_to_product.get(row.environment, ""), filters["now"],
+            flaky_shared)
         for row in rows
     ]
     if with_streak:
@@ -1078,7 +1189,7 @@ def _handle_dashboard(
         200,
         {
             "tests": payload,
-            "total": storage.dashboard_count(**filters),
+            "total": total,
             "limit": limit,
             "offset": offset,
             "with_streak": with_streak,
@@ -1160,6 +1271,7 @@ def _status_row_json(
     streak: Optional[FailureStreak],
     product: str = "",
     now_value: Optional[datetime.datetime] = None,
+    flaky_shared: Optional[Dict[Tuple[Any, ...], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Serialize one queue entry (a status row plus optional streak info).
 
@@ -1205,6 +1317,11 @@ def _status_row_json(
         ),
         "mute": _mute_json(
             row.mute, now_value or model.utcnow()),
+        # WP-44 item 6: the mark and its state on this stream, or null.
+        # A New failures row with prev_result FAIL and state "failing"
+        # is a test that went over its cadence tonight (decision 25).
+        "flaky": (None if row.flaky is None
+                  else _flaky_row_json(row.flaky, flaky_shared)),
     }
 
 
@@ -1220,14 +1337,28 @@ def _summary_queue_json(
     stream_id: int = MAINLINE_STREAM_ID,
     queue_counts: Optional[Dict[str, int]] = None,
     now_value: Optional[datetime.datetime] = None,
+    marks: Optional[bool] = None,
+    floor: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
     """Serialize one triage queue: exact total plus capped, enriched entries.
+
+    WP-44 item 6: *marks* is the "any mark" bit when the caller has it
+    (the full payload, from the mute epoch its headline read). Without
+    it — the single-queue ``parts=queue`` path — the count is read FIRST
+    and carries the bit (:meth:`Storage.status_queue_count_and_marks`),
+    so the rows know whether to join the marks at no statement of the
+    bit's own. *floor* is a build stream's first run, bounding the
+    marked tests' runs read (None on mainline).
 
     *kind* is any storage queue kind, or ``"mine"`` — the assignee's
     open items, which resolves to the ``assigned`` predicate filtered to
     *assignee* in SQL (picking a user's tests out of an already-capped
     queue would hide their work behind other people's) and is empty
-    without an assignee.
+    without an assignee. Or ``"flaking"`` (WP-44 item 14,
+    :data:`testboard.storage.FLAKING_QUEUE`): the tests flaking now, in
+    storage's own order (nearest to counting as a failure first), its
+    total the headline's ``status.flaking`` from the view with no count
+    statement; *assignee* is ignored for it.
 
     Streak bounds cost three index seeks per row; computed for the
     queues that report ``failing_since``/``last_pass_time``
@@ -1266,13 +1397,26 @@ def _summary_queue_json(
             return {"total": 0, "tests": []}
         storage_kind = "assigned"
         queue_assignee = assignee
+    # The Flaking queue (WP-44 item 14) passes as itself, with no
+    # assignee: like `mine`, a virtual kind storage reads by its own path.
     with_streaks = kind in _STREAK_QUEUES or kind == "mine"
 
+    total = None  # type: Optional[int]
+    if queue_counts is not None:
+        total = queue_counts[kind]
+    else:
+        total, counted_marks = storage.status_queue_count_and_marks(
+            storage_kind, environment, assignee=queue_assignee,
+            stale_before=recent_cutoff, environments=environments,
+            stream_id=stream_id, now=now_value, floor=floor,
+        )
+        if marks is None:
+            marks = counted_marks
     rows = storage.status_queue(
         storage_kind, environment, limit=_SUMMARY_QUEUE_CAP,
         assignee=queue_assignee, stale_before=recent_cutoff,
         with_latest_comment=True, environments=environments,
-        stream_id=stream_id, now=now_value,
+        stream_id=stream_id, now=now_value, marks=marks, floor=floor,
     )
     if with_streaks:
         needed = [
@@ -1285,6 +1429,7 @@ def _summary_queue_json(
             streaks.update(
                 storage.failure_streak_bounds_many(needed, stream_id)
             )
+    flaky_shared = {}  # type: Dict[Tuple[Any, ...], Dict[str, Any]]
     entries = [
         _status_row_json(
             row,
@@ -1294,20 +1439,13 @@ def _summary_queue_json(
             ),
             products.get(row.environment, ""),
             now_value,
+            flaky_shared,
         )
         for row in rows
     ]
     if kind == "still_failing":
         # Oldest neglected regression first — the point of the queue.
         entries.sort(key=lambda entry: entry["failing_since"] or "")
-    total = (
-        queue_counts[kind] if queue_counts is not None
-        else storage.status_queue_count(
-            storage_kind, environment, assignee=queue_assignee,
-            stale_before=recent_cutoff, environments=environments,
-            stream_id=stream_id, now=now_value,
-        )
-    )
     return {
         "total": total,
         "tests": entries,
@@ -1322,6 +1460,7 @@ def _summary_queue_totals(
     environments: Optional[Sequence[str]] = None,
     stream_id: int = MAINLINE_STREAM_ID,
     now_value: Optional[datetime.datetime] = None,
+    floor: Optional[datetime.datetime] = None,
 ) -> Dict[str, int]:
     """Exact size of every queue, without fetching a single row.
 
@@ -1335,11 +1474,12 @@ def _summary_queue_totals(
     return storage.queue_counts(
         environment, assignee, stale_before=recent_cutoff,
         environments=environments, stream_id=stream_id, now=now_value,
+        floor=floor,
     )
 
 
 #: Valid values of /api/summary's ``parts`` parameter.
-_SUMMARY_PARTS = ("headline", "queue", "assigned_trend")
+_SUMMARY_PARTS = ("headline", "queue", "assigned_trend", "names")
 
 
 def _assigned_trend_nights(
@@ -1349,9 +1489,11 @@ def _assigned_trend_nights(
     environment: Optional[str],
     environments: Optional[Sequence[str]],
     stream_id: int,
+    floor: Optional[datetime.datetime] = None,
 ) -> Dict[str, Dict[str, int]]:
-    """WP-43: the trend's split, ``{date: {"FAIL_ASSIGNED", "FAIL_MUTED"}}``
-    for every day of the same window the trend covers, zero-filled.
+    """WP-43: the trend's split, ``{date: {"FAIL_ASSIGNED", "FAIL_MUTED",
+    "FAIL_FLAKING"}}`` for every day of the same window the trend
+    covers, zero-filled.
 
     Of each day's ``FAIL`` runs, those whose test has an assignee now
     and no live mute now, and those under a live mute now: disjoint,
@@ -1360,6 +1502,14 @@ def _assigned_trend_nights(
     own part (``parts=assigned_trend``) and by no first-paint request:
     not the headline, not the full payload (WP-43 decision 8).
     Memoized by :meth:`Storage.daily_assigned_failures`.
+
+    WP-44 item 8 (decision 2): ``FAIL_FLAKING``, the day's tolerated
+    failures of marked tests as each night stood then under today's
+    marks, no live mute now (:meth:`Storage.daily_flaking_failures`),
+    counted once: an assigned test's flaking runs leave
+    ``FAIL_ASSIGNED``, so the three stay disjoint. With no mark it reads
+    nothing and is 0. *floor* is a build's first run, bounding the runs
+    read before the window.
     """
     first_day = current.date() - datetime.timedelta(days=days - 1)
     since = datetime.datetime.combine(first_day, datetime.time())
@@ -1369,13 +1519,23 @@ def _assigned_trend_nights(
             stream_id=stream_id,
         )
     }
+    flaking = {
+        entry.day: entry for entry in storage.daily_flaking_failures(
+            since, current, environment, environments=environments,
+            stream_id=stream_id, floor=floor,
+        )
+    }
     nights = {}  # type: Dict[str, Dict[str, int]]
     for offset in range(days):
         day = first_day + datetime.timedelta(days=offset)
         entry = split.get(day)
+        tolerated = flaking.get(day)
         nights[day.isoformat()] = {
-            "FAIL_ASSIGNED": 0 if entry is None else entry.assigned,
+            "FAIL_ASSIGNED": (
+                (0 if entry is None else entry.assigned)
+                - (0 if tolerated is None else tolerated.assigned)),
             "FAIL_MUTED": 0 if entry is None else entry.muted,
+            "FAIL_FLAKING": 0 if tolerated is None else tolerated.flaking,
         }
     return nights
 
@@ -1385,6 +1545,8 @@ def _products_summary(
     recent_cutoff: datetime.datetime,
     rollup_rows: Optional[List[RollupCount]] = None,
     muted: Sequence[RollupCount] = (),
+    flaky: Optional[Sequence[FlakyCount]] = None,
+    now_value: Optional[datetime.datetime] = None,
 ) -> List[Dict[str, Any]]:
     """The ``products[]`` breakdown of ``/api/summary`` (WP-20 §2.2).
 
@@ -1416,6 +1578,13 @@ def _products_summary(
     SAME estate-wide mainline scope — the caller fetches it once; every
     product's ``failing``/``new_failures`` exclude its FAIL cells and
     ``muted`` reports them beside them.
+
+    *flaky* (WP-44 item 6) is :meth:`Storage.flaky_view`'s ``counted``
+    for the same estate-wide mainline scope, when the caller has it (an
+    unscoped request); None reads mainline's here, at *now_value*, and
+    only when a product is declared. Each product's ``flaking`` is its
+    flaking tests, taken off ``failing``/``new_failures``; a promoted
+    test is a new failure and a tolerated pass leaves ``fixed``.
     """
     products = storage.distinct_products()
     if not products:
@@ -1424,16 +1593,20 @@ def _products_summary(
         rollup_rows if rollup_rows is not None
         else storage.summary_rollup(recent_cutoff)
     )
+    if flaky is None:
+        view = storage.flaky_view(
+            MAINLINE_STREAM_ID, now_value, marks=True)
+        flaky = [] if view is None else view.counted
     by_product = {
         row.product: row
         for row in analytics.summarize_by_product(
             rows, storage.environment_products_map(),
-            muted=muted,
+            muted=muted, flaky=flaky,
         )
     }
     zero = analytics.ProductRollup(
         product="", failing=0, new_failures=0, fixed=0,
-        unexpected_passes=0, muted=0,
+        unexpected_passes=0, muted=0, flaking=0,
     )
     return [
         {
@@ -1444,9 +1617,78 @@ def _products_summary(
             "unexpected_passes": by_product.get(
                 product, zero).unexpected_passes,
             "muted": by_product.get(product, zero).muted,
+            # WP-44: drawn nowhere on Home; here because "failing" has
+            # these taken off it, and the board never subtracts
+            # silently.
+            "flaking": by_product.get(product, zero).flaking,
         }
         for product in products
     ]
+
+
+def _assignment_streams_json(storage: Storage) -> List[Dict[str, Any]]:
+    """``assignment_streams`` of ``/api/summary`` (WP-21): every
+    non-mainline stream currently annotating an assignment, resolved to
+    its identity and ordered by id (dict iteration order is not a
+    promised sort). Shared by the full payload and ``parts=names``.
+    """
+    assignment_stream_ids = storage.assignment_stream_ids()
+    assignment_streams_by_id = storage.stream_identities(
+        assignment_stream_ids)
+    return [
+        _stream_json(assignment_streams_by_id[sid])
+        for sid in assignment_stream_ids
+        if sid in assignment_streams_by_id
+    ]
+
+
+def _summary_names(
+    storage: Storage,
+    current: datetime.datetime,
+    environment: Optional[str],
+    product: Optional[str],
+    environments: Optional[Sequence[str]],
+    catalog_environments: Optional[Sequence[str]],
+    stream_id: int,
+) -> Dict[str, Any]:
+    """``parts=names`` (WP-44): the catalogue the Open Actions page
+    takes from the summary, and nothing else.
+
+    ``environments``, ``assignees``, ``assignment_streams`` and
+    ``stale_before`` are computed by the same call, with the same
+    arguments, as the full payload's key of the same name for the same
+    query string, so the two cannot drift
+    (``tests/test_api.py::NamesPartTest``). ``products`` is the same
+    list of products in the same order, each entry carrying ``product``
+    only: the shape ``/api/products`` already serves and the switcher
+    reads. The full payload's per-product counts are a pass over
+    mainline's ``latest_runs`` per environment (the headline's own
+    cost, about 80 ms cold on perf-seed/1) that this page never reads.
+    No headline status, trend, queue, ``queue_totals`` or
+    per-environment "last reported" work; ``stale_before`` is the pass
+    view, memoized.
+
+    ``flaky_marks`` (WP-44 item 6): is there a flaky mark anywhere, so
+    the page knows whether to say what it leaves out. It rides the
+    products statement as one ``UNION ALL`` row
+    (:meth:`Storage.distinct_products_and_marks`): no statement of its
+    own.
+    """
+    recent_cutoff = _recent_cutoff(storage, current, environments, stream_id)
+    products, marked = storage.distinct_products_and_marks()
+    return {
+        "generated_at": model.format_iso(current),
+        "environment": environment,
+        "product": product,
+        "stream": stream_id,
+        "products": [{"product": name} for name in products],
+        "environments": storage.environments(
+            environments=catalog_environments),
+        "assignees": storage.assignees(),
+        "assignment_streams": _assignment_streams_json(storage),
+        "stale_before": model.format_iso(recent_cutoff),
+        "flaky_marks": marked,
+    }
 
 
 def _handle_metrics(
@@ -1550,9 +1792,12 @@ def _handle_summary(
       (status, trend, rollups, filters, ``queue_totals`` for the tab
       badges);
     - ``parts=queue&queue=<kind>`` — one queue's rows. ``kind`` is a
-      :data:`testboard.storage.QUEUE_KINDS` entry or ``mine``;
+      :data:`testboard.storage.QUEUE_KINDS` entry, ``mine`` or
+      ``flaking`` (WP-44 item 14: the tests flaking now, the Flaking
+      tab's rows, ``total`` the headline's ``status.flaking``);
     - ``parts=assigned_trend`` (WP-43) — ``{"trend": {"days", "from",
-      "to", "nights": [{"date", "FAIL_ASSIGNED", "FAIL_MUTED"}]}}`` for
+      "to", "nights": [{"date", "FAIL_ASSIGNED", "FAIL_MUTED",
+      "FAIL_FLAKING"}]}}`` (``FAIL_FLAKING``: WP-44 item 8) for
       the same ``days``/``environment``/``product``/``stream``: the
       trend's split by who owns each failing test now. The page sends
       it in the same parallel batch as the headline. It is the ONLY
@@ -1562,6 +1807,15 @@ def _handle_summary(
       the one figure here that reads ``runs`` (measured +14-19 ms cold
       there on the production-scale seed, growing with assignments x
       window x streams).
+    - ``parts=names`` (WP-44) — ``environments``, ``assignees``,
+      ``assignment_streams`` and ``stale_before``, each equal to the
+      full payload's key for the same query string, and ``products``
+      as names only (``[{"product"}]``, the full payload's list without
+      its counts), plus the ``generated_at``/``environment``/
+      ``product``/``stream`` envelope: the catalogue the Open Actions
+      page reads, without the headline, trend and queue work of the
+      full payload it used to fetch on its first paint. See
+      :func:`_summary_names`.
 
     Nothing here is proportional to the size of the estate. The headline
     counts come from a GROUP BY (a few dozen rows however many tests
@@ -1588,14 +1842,15 @@ def _handle_summary(
     # WP-23: a long-running branch's "own results" tab is this same
     # endpoint, scoped — absent, the default (mainline) means every
     # deployed caller from before this drop sees no change at all.
-    stream_id = _resolve_stream_id(storage, request)
+    stream_id, floor = _resolve_stream(storage, request)
 
     if part == "assigned_trend":
         # WP-43: nothing else the headline computes (no pass view, no
         # catalogues): this part is the one memoized read of runs.
         current = now()
         split = _assigned_trend_nights(
-            storage, current, days, environment, environments, stream_id)
+            storage, current, days, environment, environments, stream_id,
+            floor)
         return _json_response(200, {
             "generated_at": model.format_iso(current),
             "environment": environment,
@@ -1610,6 +1865,8 @@ def _handle_summary(
                         "date": date,
                         "FAIL_ASSIGNED": split[date]["FAIL_ASSIGNED"],
                         "FAIL_MUTED": split[date]["FAIL_MUTED"],
+                        # WP-44 item 8: disjoint from both above.
+                        "FAIL_FLAKING": split[date]["FAIL_FLAKING"],
                     }
                     for date in sorted(split)
                 ],
@@ -1637,6 +1894,13 @@ def _handle_summary(
             catalog_environments = storage.environments_for_product(
                 scoped_stream.product
             )
+    if part == "names":
+        # WP-44: the Open Actions page's catalogue. Branches before the
+        # queues' environment-product lookup, which it does not need.
+        return _json_response(200, _summary_names(
+            storage, now(), environment, product, environments,
+            catalog_environments, stream_id,
+        ))
     # One lookup, threaded through every queue below rather than
     # re-fetched per queue (see _summary_queue_json's docstring).
     env_to_product = storage.environment_products_map()
@@ -1664,7 +1928,9 @@ def _handle_summary(
 
     if part == "queue":
         kind = _query_single(request.query, "queue")
-        valid_kinds = QUEUE_KINDS + ("mine",)
+        # `mine` and `flaking` (WP-44 item 14) are virtual kinds: valid
+        # here, in no queue_totals figure and not in the unsliced payload.
+        valid_kinds = QUEUE_KINDS + ("mine", FLAKING_QUEUE)
         if kind not in valid_kinds:
             raise _HttpError(
                 400,
@@ -1686,7 +1952,7 @@ def _handle_summary(
                     storage, kind, environment, assignee, recent_cutoff,
                     {}, environments=environments,
                     env_to_product=env_to_product, stream_id=stream_id,
-                    now_value=current,
+                    now_value=current, floor=floor,
                 ),
             },
         )
@@ -1714,6 +1980,17 @@ def _handle_summary(
         current, environment, environments=environments,
         stream_id=stream_id,
     )
+    # WP-44 item 6: the marked tests that move a count, in this scope.
+    # Nothing at all with no mark (the bit rides the mute epoch's
+    # statement, read above); with marks, Q1, Qc and one Q2 at LIMIT
+    # N+1, memoized per (stream, environment), and every count below a
+    # sum over the one list, as the mutes are.
+    flaky = storage.flaky_view(
+        stream_id, current, environment, environments,
+        marks=True, floor=floor,
+    )
+    flaky_counted = (
+        [] if flaky is None else flaky.counted)  # type: List[FlakyCount]
     estate = analytics.summarize_rollup(
         estate_rollup,
         storage.assigned_open_count(
@@ -1721,6 +1998,8 @@ def _handle_summary(
         ),
         muted=muted_cells,
         assigned=assigned_cells,
+        flaky=flaky_counted,
+        flaky_total=0 if flaky is None else flaky.marks,
     )
     assigned_by_script = {}  # type: Dict[Tuple[str, str], int]
     for assigned_cell in assigned_cells:
@@ -1728,6 +2007,18 @@ def _handle_summary(
             script_key = (assigned_cell.environment, assigned_cell.script)
             assigned_by_script[script_key] = (
                 assigned_by_script.get(script_key, 0) + assigned_cell.count)
+    # WP-44: a flaking test leaves its script's failing figure, and its
+    # assigned one when it has an owner (counted once).
+    flaking_by_script = {}  # type: Dict[Tuple[str, str], int]
+    for entry in flaky_counted:
+        if entry.role != FLAKY_ROLE_FLAKING:
+            continue
+        script_key = (entry.environment, entry.script)
+        flaking_by_script[script_key] = (
+            flaking_by_script.get(script_key, 0) + 1)
+        if entry.assigned:
+            assigned_by_script[script_key] = (
+                assigned_by_script.get(script_key, 0) - 1)
     # WP-23 perf pass: _products_summary always needs the estate-wide
     # MAINLINE rollup, regardless of this request's own scope. When the
     # request itself IS that exact scope (no environment=, no product=,
@@ -1779,14 +2070,7 @@ def _handle_summary(
     # filter reads this the same way it already reads `assignees`
     # below: the available VALUES to filter by, and (empty list) the
     # "zero visible change" signal that no assignment carries a stream.
-    assignment_stream_ids = storage.assignment_stream_ids()
-    assignment_streams_by_id = storage.stream_identities(
-        assignment_stream_ids)
-    assignment_streams = [
-        _stream_json(assignment_streams_by_id[sid])
-        for sid in assignment_stream_ids
-        if sid in assignment_streams_by_id
-    ]
+    assignment_streams = _assignment_streams_json(storage)
     # WP-23 perf pass: every queue's exact total, ONE grouped query
     # (Storage.queue_counts) — reused below for both the headline
     # tab-badge field and, in the full-payload branch, every queue's own
@@ -1796,6 +2080,7 @@ def _handle_summary(
     queue_totals = _summary_queue_totals(
         storage, environment, assignee, recent_cutoff,
         environments=environments, stream_id=stream_id, now_value=current,
+        floor=floor,
     )
     payload = {
             "generated_at": model.format_iso(current),
@@ -1821,7 +2106,8 @@ def _handle_summary(
             # product-shaped at all.
             "products": _products_summary(
                 storage, recent_cutoff, products_rollup,
-                products_muted),
+                products_muted,
+                None if products_scoped else flaky_counted, current),
             "environments": storage.environments(
                 environments=catalog_environments),
             "scripts": storage.scripts(
@@ -1880,6 +2166,16 @@ def _handle_summary(
                 "muted_new_failures": status.muted_new_failures,
                 "muted_still_failing": status.muted_still_failing,
                 "muted_total": status.muted_total,
+                # WP-44: new_failures/still_failing above EXCLUDE the
+                # flaking failures (marked, under their cadence, no live
+                # mute); shown beside them, one figure per tile, never
+                # subtracted silently, and still in ``results``.
+                # ``flaky_total`` is every mark in scope whose test has
+                # run on the stream, retired excluded: the tab's badge.
+                "flaking": status.flaking,
+                "flaking_new_failures": status.flaking_new_failures,
+                "flaking_still_failing": status.flaking_still_failing,
+                "flaky_total": status.flaky_total,
             },
             "trend": {
                 "days": days,
@@ -1898,6 +2194,9 @@ def _handle_summary(
                     "muted": rollup.muted,
                     # WP-43: of "failed", those with an assignee now.
                     "assigned": rollup.assigned,
+                    # WP-44: beside "failed", "muted" and "assigned",
+                    # inside none of them.
+                    "flaking": rollup.flaking,
                 }
                 for rollup in estate.by_environment
             ],
@@ -1915,11 +2214,14 @@ def _handle_summary(
                     # own statement and memo are unchanged.
                     "assigned": assigned_by_script.get(
                         (entry.environment, entry.script), 0),
+                    # WP-44: its flaking tests, taken off "failing" (and
+                    # off "assigned" for those with an owner).
+                    "flaking": entry.flaking,
                 }
                 for entry in storage.top_failing_scripts(
                     environment, _SUMMARY_TOP_SCRIPTS,
                     environments=environments, stream_id=stream_id,
-                    now=current,
+                    now=current, flaking=flaking_by_script,
                 )
             ],
             # Every queue's exact size, row payloads not included. The
@@ -1941,12 +2243,14 @@ def _handle_summary(
     # runs measured +14-19 ms cold there on the production-scale seed.
     # parts=assigned_trend only.
     streaks = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
+    # WP-44 item 6: the bit the headline read with the mute epoch.
+    marked = flaky is not None
     queues = {
         kind: _summary_queue_json(
             storage, kind, environment, None, recent_cutoff, streaks,
             environments=environments, env_to_product=env_to_product,
             stream_id=stream_id, queue_counts=queue_totals,
-            now_value=current,
+            now_value=current, marks=marked, floor=floor,
         )
         for kind in QUEUE_KINDS
     }
@@ -1954,7 +2258,7 @@ def _handle_summary(
         storage, "mine", environment, assignee, recent_cutoff, streaks,
         environments=environments, env_to_product=env_to_product,
         stream_id=stream_id, queue_counts=queue_totals,
-        now_value=current,
+        now_value=current, marks=marked, floor=floor,
     )
     payload["queues"] = queues
     return _json_response(200, payload)
@@ -2001,6 +2305,12 @@ def _handle_test_detail(
         max_days=_ANALYTICS_MAX_DAYS,
         max_runs=_ANALYTICS_MAX_RUNS,
     )
+    assignee = storage.current_assignee(environment, script, test_name)
+    mute = storage.mute_for(stream_id, environment, script, test_name)
+    # WP-40's mute history read, which since WP-44 also carries the
+    # flaky mark and its history: one statement either way, in the
+    # same place in the sequence.
+    acts = storage.test_acts(environment, script, test_name)
     return _json_response(
         200,
         {
@@ -2008,9 +2318,7 @@ def _handle_test_detail(
             "script": script,
             "test_name": test_name,
             "source_link": latest.source_link,
-            "assignee": storage.current_assignee(
-                environment, script, test_name
-            ),
+            "assignee": assignee,
             "latest": _run_json(latest),
             "analytics": analytics.analytics_to_dict(
                 summary, max_runs=_ANALYTICS_MAX_RUNS
@@ -2021,11 +2329,7 @@ def _handle_test_detail(
             # WP-40: THIS stream's current mute (live or
             # expired, `live` says which) and every act on the test,
             # across streams, newest first.
-            "mute": _mute_json(
-                storage.mute_for(
-                    stream_id, environment, script, test_name),
-                now_dt,
-            ),
+            "mute": _mute_json(mute, now_dt),
             "mute_history": [
                 {
                     "id": act.id,
@@ -2038,11 +2342,75 @@ def _handle_test_detail(
                     "actor": act.actor,
                     "acted_at": model.format_iso(act.acted_at),
                 }
-                for act in storage.mute_history(
-                    environment, script, test_name)
+                for act in acts.mute_history
+            ],
+            # WP-44: the test's flaky mark (one per test, every stream)
+            # with its state on THIS stream, and every act on it, newest
+            # first, so opening the history fetches nothing.
+            "flaky": _flaky_detail_json(
+                storage, acts.flaky_mark, stream, latest, runs),
+            "flaky_history": [
+                {
+                    "id": act.id,
+                    "action": act.action,
+                    "cadence": act.cadence,
+                    "reason": act.reason,
+                    "actor": act.actor,
+                    "acted_at": model.format_iso(act.acted_at),
+                }
+                for act in acts.flaky_history
             ],
         },
     )
+
+
+def _flaky_detail_json(
+    storage: Storage,
+    mark: Optional[FlakyMark],
+    stream: Optional[Stream],
+    latest: StoredRun,
+    runs: Sequence[StoredRun],
+) -> Optional[Dict[str, Any]]:
+    """The test detail's ``flaky``: the mark and its state on the
+    detail's stream (WP-44), or None for a test with no mark.
+
+    The state needs the stream's newest N results. The detail already
+    holds its analytics window (*runs*: this stream's runs of the test
+    over 90 days, at most 200, newest first), and whenever that window
+    has N runs, or a non-FAIL among those it has, the state is decided
+    from it with no statement at all. Only a test that ran fewer than N
+    times in the window (none, if its latest run is older), every one a
+    FAIL, reads further back: one :meth:`Storage.cadence_runs` (Q2) of
+    at most N rows from *latest*, bounded below on a build by the
+    build's first run. *stream* is None on mainline, as the detail
+    holds it.
+    """
+    if mark is None:
+        return None
+    cadence = mark.cadence
+    results = [run.result for run in runs]
+    if (len(results) < cadence
+            and all(result is Result.FAIL for result in results)):
+        stream_id = (MAINLINE_STREAM_ID if stream is None
+                     else stream.stream_id)
+        floor = (None if stream is None or stream.kind == "mainline"
+                 else stream.first_seen)
+        results = storage.cadence_runs(
+            stream_id,
+            [(mark.environment, mark.script, mark.test_name,
+              latest.start_time, cadence)],
+            floor,
+        )[(mark.environment, mark.script, mark.test_name)]
+    state = analytics.flaky_state(cadence, results)
+    return {
+        "cadence": cadence,
+        "marked_by": mark.marked_by,
+        "marked_at": model.format_iso(mark.marked_at),
+        "reason": mark.reason,
+        "state": None if state is None else state.state,
+        "streak": None if state is None else state.streak,
+        "runs": None if state is None else state.runs,
+    }
 
 
 def _handle_test_streams(
@@ -2643,6 +3011,135 @@ def _handle_mutes_list(
     )
 
 
+def _parse_flaky_cadence(obj: Dict[str, Any]) -> int:
+    """``cadence``: a whole number 2..10 (WP-44). Absent, null, a
+    string, a bool, a float or out of range are all the same 400."""
+    cadence = obj.get("cadence")
+    if (not isinstance(cadence, int) or isinstance(cadence, bool)
+            or cadence < FLAKY_CADENCE_MIN or cadence > FLAKY_CADENCE_MAX):
+        raise _HttpError(
+            400,
+            "cadence: must be a whole number from {} to {}".format(
+                FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX),
+        )
+    return cadence
+
+
+#: Fields a flaky act refuses rather than ignores: a mark's owner is the
+#: person making it and nobody else can be named (decision 12), so a
+#: client that thinks it is naming one is told, not silently overruled.
+_FLAKY_OWNER_FIELDS = ("marked_by", "assignee")
+
+
+def _refuse_a_named_owner(obj: Dict[str, Any]) -> None:
+    for field in _FLAKY_OWNER_FIELDS:
+        if field in obj:
+            raise _HttpError(
+                400,
+                "{}: a flaky mark belongs to the user making it "
+                "(username) and cannot name anyone else".format(field),
+            )
+
+
+def _storage_value_error(exc: ValueError) -> _HttpError:
+    """A storage refusal of a flaky act as the API's 400, naming the
+    field the way every other 400 here does."""
+    message = str(exc)
+    if message.startswith("reason is required"):
+        message = "reason: is required" + message[
+            len("reason is required"):]
+    return _HttpError(400, message)
+
+
+def _handle_flaky_bulk(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/flaky/bulk — mark a selection of tests as flaky, or
+    change the cadence of their marks (WP-44).
+
+    Body: ``{"username", "reason"?, "cadence", "tests": [{environment,
+    script, test_name, stream_id?}, ...]}``. ``cadence`` is 2..10. A
+    mark is per test and covers every stream; an entry's ``stream_id``
+    is the stream the selection was made on and tags the reason's
+    comment (decision 10). The owner is ``username``, a known and active
+    user, and nobody else can be named (decision 12): ``marked_by`` or
+    ``assignee`` in the body is a 400. ``reason`` is required for a test
+    not yet marked and optional for a cadence change, which keeps the
+    mark's owner; a blank one (empty or whitespace) is no reason. If any
+    test the request names is not yet marked and there is no reason, the
+    whole request is a 400 naming the field and nothing is written. A
+    test with no result on any stream is counted ``unknown`` and
+    skipped.
+
+    Response: ``{"marked": n, "changed": n, "unchanged": n,
+    "unknown": n}``.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    _refuse_a_named_owner(obj)
+    cadence = _parse_flaky_cadence(obj)
+    # The note box is sent as it stands: absent, null, empty and
+    # whitespace-only all mean "no reason", which a cadence change may
+    # have. Whether a reason was REQUIRED (a test not yet marked) is
+    # storage's to decide, for the whole request before anything is
+    # written.
+    reason = None  # type: Optional[str]
+    raw_reason = obj.get("reason")
+    if raw_reason is not None and not (
+            isinstance(raw_reason, str) and not raw_reason.strip()):
+        reason = _validate_comment_text(obj, field="reason")
+    if "tests" not in obj:
+        raise _HttpError(400, "tests: required field is missing")
+    entries = _parse_test_entries(storage, obj["tests"])
+    if not entries:
+        raise _HttpError(400, "tests: must name at least one test")
+    try:
+        result = storage.mark_flaky(
+            entries, cadence, reason, username, now())
+    except ValueError as exc:
+        raise _storage_value_error(exc)
+    return _json_response(
+        200,
+        {
+            "marked": result.marked,
+            "changed": result.changed,
+            "unchanged": result.unchanged,
+            "unknown": result.unknown,
+        },
+    )
+
+
+def _handle_flaky_unmark(
+    storage: Storage,
+    request: Request,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """POST /api/flaky/unmark — remove the flaky mark of each listed
+    test that has one (WP-44). Anyone known and active may; each removal
+    is recorded in the mark's history.
+
+    Body: ``{"username", "tests": [...]}``, the bulk endpoint's list.
+    Response: ``{"unmarked": n}``.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    if "tests" not in obj:
+        raise _HttpError(400, "tests: required field is missing")
+    entries = _parse_test_entries(storage, obj["tests"])
+    if not entries:
+        raise _HttpError(400, "tests: must name at least one test")
+    try:
+        unmarked = storage.unmark_flaky(
+            [(environment, script, test_name)
+             for environment, script, test_name, _stream in entries],
+            username, now())
+    except ValueError as exc:
+        raise _storage_value_error(exc)
+    return _json_response(200, {"unmarked": unmarked})
+
+
 def _handle_bulk_assignments_list(
     storage: Storage,
     obj: Dict[str, Any],
@@ -2746,9 +3243,10 @@ def _handle_bulk_assignments(
 
     assignee, assigned_by, comment_text = _parse_bulk_assignment_body(
         storage, obj)
-    filters = _parse_dashboard_filters(storage, request, now).filters
+    parsed = _parse_dashboard_filters(storage, request, now)
     updated = storage.bulk_set_assignee(
-        assignee, assigned_by, now(), comment_text=comment_text, **filters
+        assignee, assigned_by, now(), comment_text=comment_text,
+        floor=parsed.floor, **parsed.filters
     )
     return _json_response(200, {"updated": updated})
 
@@ -4220,23 +4718,37 @@ def _handle_watch(
     # mute input; they are unchanged.
     watch_muted = storage.muted_cells(
         now_value, estate_cutoff)
+    # WP-44 item 6: mainline's marked tests that move a count, unscoped,
+    # shared by every e:/p: card like the mutes above (the bit rides the
+    # mute epoch muted_cells has just read; with no mark, nothing). A
+    # flaking test leaves a card's failing, new and unassigned figures
+    # and is its "flaking"; s: cards are unchanged (decision 9).
+    watch_flaky_view = storage.flaky_view(
+        MAINLINE_STREAM_ID, now_value, marks=True)
+    watch_flaky = (
+        [] if watch_flaky_view is None else watch_flaky_view.counted
+    )  # type: List[FlakyCount]
+    for entry in watch_flaky:
+        if entry.role == FLAKY_ROLE_FLAKING and not entry.assigned:
+            unassigned_by_env[entry.environment] = (
+                unassigned_by_env.get(entry.environment, 0) - 1)
     by_environment = {
         row.product: row
         for row in analytics.summarize_by_product(
             rollup_counts, {e: e for e in known_environments},
-            muted=watch_muted,
+            muted=watch_muted, flaky=watch_flaky,
         )
     }
     by_product = {
         row.product: row
         for row in analytics.summarize_by_product(
             rollup_counts, env_to_product,
-            muted=watch_muted,
+            muted=watch_muted, flaky=watch_flaky,
         )
     }
     zero = analytics.ProductRollup(
         product="", failing=0, new_failures=0, fixed=0,
-        unexpected_passes=0, muted=0,
+        unexpected_passes=0, muted=0, flaking=0,
     )
 
     def card_cutoff(card_environments: Sequence[str]) -> datetime.datetime:
@@ -4272,6 +4784,9 @@ def _handle_watch(
                 "fixed": verdict.fixed,
                 "unexpected_passes": verdict.unexpected_passes,
                 "muted": verdict.muted,
+                # WP-44: taken off "failing", "new_failures" and
+                # "unassigned_failing", reported here.
+                "flaking": verdict.flaking,
                 "stale_before": model.format_iso(card_cutoff([name])),
                 "last_reported": (
                     None if env_last_reported is None
@@ -4307,6 +4822,9 @@ def _handle_watch(
                 "fixed": verdict.fixed,
                 "unexpected_passes": verdict.unexpected_passes,
                 "muted": verdict.muted,
+                # WP-44: taken off "failing", "new_failures" and
+                # "unassigned_failing", reported here.
+                "flaking": verdict.flaking,
                 "stale_before": model.format_iso(
                     card_cutoff(product_envs)),
                 # No single "last reported" for a multi-environment
@@ -4588,6 +5106,14 @@ def _route(
     if rest == ["mutes", "bulk"]:
         _check_method(request.method, ("POST",))
         return _handle_mutes_bulk(storage, request, now)
+
+    if rest == ["flaky", "bulk"]:
+        _check_method(request.method, ("POST",))
+        return _handle_flaky_bulk(storage, request, now)
+
+    if rest == ["flaky", "unmark"]:
+        _check_method(request.method, ("POST",))
+        return _handle_flaky_unmark(storage, request, now)
 
     if rest == ["mutes", "unmute"]:
         _check_method(request.method, ("POST",))

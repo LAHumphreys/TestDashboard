@@ -17,11 +17,14 @@
  * are all query parameters on /api/dashboard, and only the rows on screen
  * are ever in memory.
  *
- * Data, per refresh, all in parallel: /api/summary?parts=headline (the
- * tiles, charts, filters and every queue's COUNT — the fast part),
- * /api/summary?parts=assigned_trend (the trend's assigned/muted split,
- * WP-43: only the trend card waits for it), one /api/summary?parts=queue
- * for the active triage tab's rows, and one page of /api/dashboard. Each
+ * Data, per refresh, in parallel: /api/summary?parts=headline (the
+ * tiles, charts, filters and every queue's COUNT — the fast part), one
+ * /api/summary?parts=queue for the active triage tab's rows, and one
+ * page of /api/dashboard; then, once the headline has been drawn,
+ * /api/summary?parts=assigned_trend (the trend's assigned/muted/flaking
+ * split, WP-43: only the trend card waits for it, showing the headline's
+ * totals meanwhile on a first load; the part is never on the first
+ * paint). Each
  * section paints as its data lands, so the page is readable as soon as
  * the headline answers; the other queue tabs fetch their rows when first
  * opened. While refreshing, previous
@@ -32,12 +35,29 @@
 "use strict";
 
 import {
-  RESULTS,
+  BROWSE_RESULTS,
+  FAIL_AND_FLAKING,
+  FLAKING_BAR,
+  FLAKING_FILTER,
+  FLAKING_LINK_TITLE,
+  FLAKING_QUEUE,
+  FLAKING_TAB_EMPTY,
+  FLAKING_TAB_LABEL,
+  FLAKING_TAB_NOTE,
+  FLAKING_TREND_CAPTION,
+  failToggleTitle,
+  flakySentence,
+  flakyStreakWords,
   mutedTag,
   muteDetail,
-  failingWithMuted,
+  failingWithSetAside,
   failingSplit,
-  mutedSuffix,
+  flakyTag,
+  newFailuresSub,
+  previousShown,
+  rowResult,
+  setAsideSuffix,
+  setAsideWords,
   clearError,
   clearNode,
   el,
@@ -127,6 +147,13 @@ const state = {
   // not be had (failed, timed out, an older server's 400): the trend then
   // draws today's two series from the headline alone.
   trendSplit: null,
+  // The refresh generation (requestSeq) whose headline has been drawn:
+  // a split is asked for only for that generation, never ahead of it.
+  headlineDrawn: 0,
+  // How many splits have been asked for: each request takes the next
+  // number, and only the newest one's answer is drawn, so an older answer
+  // landing last never replaces a newer one.
+  splitSends: 0,
   // Queue rows by kind, fetched per tab on demand. Absent = not landed
   // yet for the current filters; renderQueueTable shows a loading line.
   queues: {},
@@ -243,9 +270,11 @@ function assignedTrendUrl() {
   return apiUrl("api/summary", { parts: "assigned_trend" }, apiScope());
 }
 
-/* How long the trend card waits for its split before drawing today's two
- * series without it. The part is one memoized statement; a server that
- * takes this long for it is in trouble, and the card must not hang. */
+/* How long the trend card waits for its split before drawing the
+ * headline's totals without it. The part reads the window's runs (and,
+ * where a flaky mark exists, every night's runs of the marked tests:
+ * four statements, memoized), off the first paint; a server that takes
+ * this long for it is in trouble, and the card must not hang. */
 const ASSIGNED_TREND_TIMEOUT_MS = 10000;
 
 /**
@@ -263,12 +292,52 @@ function fetchAssignedTrend() {
   });
 }
 
+/**
+ * Ask for the trend's split and draw it, AFTER the headline it belongs
+ * to has been drawn: refreshAll() calls this once its headline is on
+ * screen, and the coalescer once per burst, because the part is never on
+ * the first paint. `seq` is the refresh generation that asks:
+ *
+ * - nothing is asked for while that generation's headline is still to be
+ *   drawn (`state.headlineDrawn`): refreshAll() asks for it then, so a
+ *   burst that finishes first does not ask twice or draw ahead of it;
+ * - an answer is drawn only if its generation is still current and it is
+ *   the newest split asked for (`state.splitSends`), so neither an older
+ *   scope's split nor an older burst's, landing last, is ever drawn.
+ *
+ * A failure or a timeout draws the headline's totals and lifts the card's
+ * dim: a split never blocks or blanks anything else.
+ */
+async function loadTrendSplit(seq) {
+  if (seq !== state.requestSeq || state.headlineDrawn !== seq) {
+    return;
+  }
+  state.splitSends += 1;
+  const sent = state.splitSends;
+  const split = await fetchAssignedTrend();
+  if (seq !== state.requestSeq || sent !== state.splitSends) {
+    return;
+  }
+  state.trendSplit = split;
+  renderTrend();
+  document.getElementById("trend-card").classList.remove("is-loading");
+}
+
 /** URL for one triage queue's rows. */
 function queueUrl(kind) {
   return apiUrl(
     "api/summary",
     { parts: "queue", queue: kind, assignee: getUsername() },
     apiScope());
+}
+
+/**
+ * One tab's rows, the Flaking tab's included (WP-44, design §14): its
+ * queue part. Called by loadQueue() and the coalescer for the ACTIVE tab
+ * only, so a tab's rows are asked for once it has been opened.
+ */
+function rowsRequest(kind) {
+  return fetchJson(queueUrl(kind));
 }
 
 /** URL for one page of the test list under the current filters. */
@@ -290,12 +359,16 @@ function browseUrl(offset) {
 /**
  * Reload everything, painting each section as its data lands.
  *
- * Four requests go out together — the headline, the trend's split, the
- * active queue's rows, the first browse page — and each renders its own
- * section on arrival rather than waiting for the slowest. The trend card
- * is the one that needs two: it paints when the headline AND its split
- * have both landed, whichever is second; the tiles, the bars and the tab
- * badges paint on the headline alone (WP-43). The tiles, charts and
+ * Three requests go out together — the headline, the active queue's
+ * rows, the first browse page — and each renders its own section on
+ * arrival rather than waiting for the slowest. The trend's split is a
+ * fourth, sent once the headline has been drawn (loadTrendSplit()): it
+ * reads the runs of every night in the window, and with flaky marks a
+ * per-night read besides, so it is never on the first paint. On a first
+ * load the trend card draws the headline's totals and gains the split
+ * when it lands; on a later one it keeps the chart it has, dimmed, until
+ * the new split lands. The tiles, the bars and the tab badges paint on the headline
+ * alone (WP-43). The tiles, charts and
  * tab counts are a fraction of the old monolithic payload, so the page
  * is readable at once even when a queue takes its time. A section that
  * fails shows the error without blanking the ones that succeeded.
@@ -309,21 +382,19 @@ async function refreshAll() {
   clearError();
   setLoading(true);
   state.queues = {};  // the filters may have changed; refetch per tab
-  // The trend card's two inputs for THIS generation; it renders on the
-  // second to land, so it never pairs a new headline with an old split.
-  // It is the one card that waits for the split, so it carries its own
-  // dim, lifted when both have settled; the page-wide one below waits
-  // for the headline, the queue and the browse page only, as it always
-  // did (WP-43).
+  // A split belongs to the scope it was asked in, so this generation's
+  // starts empty. Where one was on screen, the card keeps that chart (the
+  // previous headline with its own split) dimmed until the new split
+  // lands, rather than stepping down to two series and back; only a
+  // first load, or one after a split that could not be had, draws the
+  // headline's totals first.
+  const hadSplit = state.trendSplit !== null;
+  state.trendSplit = null;
+  // The trend card carries its own dim until its split has settled; the
+  // page-wide one below waits for the headline, the queue and the browse
+  // page only, as it always did (WP-43).
   const trendCard = document.getElementById("trend-card");
   trendCard.classList.add("is-loading");
-  let trendInputs = 0;
-  const trendInputLanded = () => {
-    trendInputs += 1;
-    if (trendInputs === 2) {
-      renderTrend();
-    }
-  };
 
   const headlinePart = (async () => {
     try {
@@ -335,26 +406,22 @@ async function refreshAll() {
       renderHeadline();
       // First meaningful paint: the page is usable from here.
       document.getElementById("loading-state").hidden = true;
-      trendInputLanded();
+      // The split is asked for only now that the headline has been
+      // drawn: the part reads every night's runs, and it is never on the
+      // first paint. Until it lands the card shows the headline's totals
+      // if it had no split to keep (see hadSplit above).
+      state.headlineDrawn = seq;
+      if (!hadSplit) {
+        renderTrend();
+      }
+      loadTrendSplit(seq);
     } catch (err) {
       if (seq === state.requestSeq) {
         showError(err.message);
+        trendCard.classList.remove("is-loading");
       }
     }
   })();
-  const trendSplitPart = (async () => {
-    const split = await fetchAssignedTrend();
-    if (seq !== state.requestSeq) {
-      return;
-    }
-    state.trendSplit = split;
-    trendInputLanded();
-  })();
-  Promise.all([headlinePart, trendSplitPart]).then(() => {
-    if (seq === state.requestSeq) {
-      trendCard.classList.remove("is-loading");
-    }
-  });
   const queuePart = loadQueue(state.activeQueue, seq);
   const browsePart = (async () => {
     try {
@@ -389,7 +456,7 @@ async function refreshAll() {
  */
 async function loadQueue(kind, seq) {
   try {
-    const payload = await fetchJson(queueUrl(kind));
+    const payload = await rowsRequest(kind);
     if (seq !== state.requestSeq) {
       return;
     }
@@ -453,9 +520,12 @@ async function loadBrowse(append) {
  * still reflect the final action. A burst of any size costs two
  * requests rather than one per action.
  *
- * A refresh is now the headline, the trend's split (WP-43: so red turns
- * blue in all three charts after a "Take") and the ACTIVE queue's rows,
- * fetched together. The other queues' caches are dropped, not refetched: five
+ * A refresh is now the headline and the ACTIVE queue's rows, fetched
+ * together, then the trend's split (WP-43: so red turns blue in all
+ * three charts after a "Take"), asked for once per burst after the
+ * caller has drawn the new headline, as on the first paint: until it
+ * lands the trend keeps the headline and split it was drawn from, so it
+ * never pairs a new headline with an old split. The other queues' caches are dropped, not refetched: five
  * row payloads nobody is looking at, refetched on every "Take", is the
  * expense the parts split exists to avoid. Their tabs refetch on the
  * next click; their badge counts come fresh with the headline either
@@ -477,13 +547,11 @@ async function fetchSummary() {
     const kind = state.activeQueue;
     summaryInFlight = Promise.all([
       fetchJson(summaryUrl()),
-      fetchJson(queueUrl(kind)),
-      fetchAssignedTrend(),
+      rowsRequest(kind),
     ]);
     try {
       const results = await summaryInFlight;
       state.summary = results[0];
-      state.trendSplit = results[2];
       state.queues = {};
       tagStream(results[1].queue.tests);
       state.queues[kind] = results[1].queue;
@@ -491,6 +559,13 @@ async function fetchSummary() {
       summaryInFlight = null;
     }
   }
+  // The split, once for the burst, on the next turn: the caller awaiting
+  // this has drawn the headline by then. loadTrendSplit() asks for nothing
+  // while a refreshAll() of this generation is still to draw its own
+  // headline (it asks itself once it has), and draws only the newest
+  // split asked for.
+  const seq = state.requestSeq;
+  window.setTimeout(() => loadTrendSplit(seq), 0);
 }
 
 /** Reload the summary only (after a quick action like "Take"). */
@@ -499,7 +574,7 @@ async function refreshSummary() {
     await fetchSummary();
     renderStatus();
     renderEnvUpdated();
-    renderTrend();
+    // The trend is redrawn when its split lands (loadTrendSplit()).
     renderBars();
     renderQueues();
   } catch (err) {
@@ -521,9 +596,12 @@ function renderHeadline() {
   renderToolbar();
   renderStatus();
   renderEnvUpdated();
-  // The bars only: the trend card waits for its split (refreshAll).
+  // The bars only: the trend is drawn by refreshAll() (the headline's
+  // totals, where no split is on screen) and by loadTrendSplit().
   renderBars();
   renderQueues();
+  // The FLAKING toggle shows once the headline says the scope has a mark.
+  syncResultToggles();
   populateScriptOptions();
   updateProductColumn();
   const switcherMount = document.getElementById("product-switcher");
@@ -707,12 +785,13 @@ function windowPhrase(summary) {
   return "since " + formatTime(summary.stale_before);
 }
 
-/** A tile's sub-line with " · +3 muted" appended when some of the
- * failures were muted (WP-40). There is no Muted tile: the muted ones
- * ride beside the number they were taken out of, and the Muted queue
- * tab lists every live mute. */
-function withMutedSuffix(text, muted) {
-  const suffix = mutedSuffix(muted || 0);
+/** A tile's sub-line with " · +3 muted · +4 flaking" appended for the
+ * failures set aside from its figure (WP-40, WP-44). There is no Muted
+ * tile and no Flaking one: they ride beside the number they were taken
+ * out of, and the Muted queue tab lists every live mute. Tiles are
+ * buttons, so the suffix is text, never a link. */
+function withSetAside(text, muted, flaking) {
+  const suffix = setAsideSuffix(muted, flaking);
   return suffix ? text + " · " + suffix : text;
 }
 
@@ -787,15 +866,16 @@ function renderStatus() {
     label: "New failures",
     value: status.new_failures.toLocaleString(),
     accent: status.new_failures > 0 ? "accent-fail" : "accent-zero",
-    sub: withMutedSuffix(
-      "were passing before", status.muted_new_failures),
+    sub: withSetAside(newFailuresSub(status.flaky_total),
+      status.muted_new_failures, status.flaking_new_failures),
     onClick: () => openQueue("new_failures"),
   }));
   container.appendChild(buildTile({
     label: "Still failing",
     value: status.still_failing.toLocaleString(),
     accent: status.still_failing > 0 ? "accent-fail-soft" : "accent-zero",
-    sub: withMutedSuffix("failed before too", status.muted_still_failing),
+    sub: withSetAside("failed before too", status.muted_still_failing,
+      status.flaking_still_failing),
     onClick: () => openQueue("still_failing"),
   }));
   container.appendChild(buildTile({
@@ -846,6 +926,10 @@ const TREND_SPLIT_SERIES = [
     segClass: "seg-up", swatchClass: "swatch-up" },
 ];
 const FAILING_SPLIT_LEGEND = TREND_SPLIT_SERIES.slice(0, 3);
+/* WP-44 (design §3 U7): the flaking runs as a fourth part after the
+ * grey, where the scope has a mark. */
+const TREND_FLAKING_SERIES = FAILING_SPLIT_LEGEND.concat(
+  [FLAKING_BAR], TREND_SPLIT_SERIES.slice(3));
 
 /**
  * The headline's nights with the split merged in by date, the unassigned
@@ -853,8 +937,12 @@ const FAILING_SPLIT_LEGEND = TREND_SPLIT_SERIES.slice(0, 3);
  * series: no split, or a night it does not carry. One series list per
  * chart, so one missing night means the whole card goes without, never
  * a night of everything-red claiming nobody owns it.
+ *
+ * `withFlaking` (WP-44) also takes each night's FAIL_FLAKING out of the
+ * unassigned part: the three parts are disjoint (counted once: muted,
+ * else flaking, else assigned).
  */
-function splitNights(nights, split) {
+function splitNights(nights, split, withFlaking) {
   if (!split || !split.trend || !Array.isArray(split.trend.nights)) {
     return null;
   }
@@ -866,29 +954,50 @@ function splitNights(nights, split) {
         || typeof part.FAIL_MUTED !== "number") {
       return null;
     }
+    const flaking = withFlaking ? part.FAIL_FLAKING : 0;
     merged.push(Object.assign({}, night, {
       FAIL_UNASSIGNED: Math.max(
-        0, night.FAIL - part.FAIL_ASSIGNED - part.FAIL_MUTED),
+        0, night.FAIL - part.FAIL_ASSIGNED - part.FAIL_MUTED - flaking),
       FAIL_ASSIGNED: part.FAIL_ASSIGNED,
       FAIL_MUTED: part.FAIL_MUTED,
+      FAIL_FLAKING: flaking,
     }));
   }
   return merged;
 }
 
+/** Whether the trend draws its flaking series: the scope has a mark
+ * (decision 5) and every night of the split carries the count, so an
+ * older server's split draws today's chart. */
+function trendFlaking(split) {
+  return flakyScope() && Boolean(split) && Boolean(split.trend)
+    && Array.isArray(split.trend.nights)
+    && split.trend.nights.every(
+      (night) => typeof night.FAIL_FLAKING === "number");
+}
+
 /** 1. Failing runs per day (stacked columns) + its table twin. */
 function renderTrend() {
   const headlineNights = state.summary.trend.nights;
-  const merged = splitNights(headlineNights, state.trendSplit);
+  const flaking = trendFlaking(state.trendSplit);
+  const merged = splitNights(headlineNights, state.trendSplit, flaking);
   const isSplit = merged !== null;
   const nights = isSplit ? merged : headlineNights;
+  const splitSeries = flaking ? TREND_FLAKING_SERIES : TREND_SPLIT_SERIES;
   stackedColumnChart(
     document.getElementById("trend-chart"), nights,
-    isSplit ? TREND_SPLIT_SERIES : TREND_SERIES, { unit: "day" });
+    isSplit ? splitSeries : TREND_SERIES, { unit: "day" });
   document.getElementById("trend-split-caption").hidden = !isSplit;
+  const flakingCaption = document.getElementById("trend-mark-caption");
+  flakingCaption.hidden = !(isSplit && flaking);
+  flakingCaption.textContent = isSplit && flaking ? FLAKING_TREND_CAPTION : "";
   for (const th of document.querySelectorAll(
     "#trend-table th.trend-split-col")) {
     th.hidden = !isSplit;
+  }
+  for (const th of document.querySelectorAll(
+    "#trend-table th.trend-mark-col")) {
+    th.hidden = !(isSplit && flaking);
   }
   const twin = document.getElementById("trend-table-body");
   clearNode(twin);
@@ -897,7 +1006,8 @@ function renderTrend() {
     tr.appendChild(el("td", "", formatNight(night.date)));
     const counts = isSplit
       ? [night.FAIL, night.FAIL_UNASSIGNED, night.FAIL_ASSIGNED,
-        night.FAIL_MUTED, night.UNEXPECTED_PASS, night.total]
+        night.FAIL_MUTED].concat(flaking ? [night.FAIL_FLAKING] : [],
+        [night.UNEXPECTED_PASS, night.total])
       : [night.FAIL, night.UNEXPECTED_PASS, night.total];
     for (const count of counts) {
       tr.appendChild(el("td", "num", count.toLocaleString()));
@@ -906,13 +1016,23 @@ function renderTrend() {
   }
 }
 
+/** Whether the scope has a flaky mark (WP-44, decision 5): only then do
+ * the bars key, tooltip and name their flaking part. With none, every
+ * bar card is exactly the WP-43 card. */
+function flakyScope() {
+  return state.summary.status.flaky_total > 0;
+}
+
 /**
- * One failing bar. An entry carrying `assigned` (WP-43) is drawn three
- * ways, left to right: nobody's (red), someone's, muted (grey), with the
- * tooltip rows and the row's screen-reader name from failingSplit(). An
- * entry without it (an older server) is exactly the WP-40 bar: the
+ * One failing bar. An entry carrying `assigned` (WP-43) is drawn in up to
+ * four parts, left to right: nobody's (red), someone's, muted (grey),
+ * flaking (WP-44, the chart's mauve), with the tooltip rows and the row's
+ * screen-reader name from failingSplit(). A zero part after the first is
+ * not drawn, so with nothing flaking the bar is the WP-43 bar. An entry
+ * without `assigned` (an older server) is exactly the WP-40 bar: the
  * failing count with its muted failures as a grey extension, never all
- * red. The end label is the unmuted failing count either way.
+ * red. The end label is the failing count, muted and flaking ones out,
+ * either way.
  */
 function failingBar(item, entry, failing, failingLabel, moreRows) {
   if (typeof entry.assigned !== "number") {
@@ -920,10 +1040,12 @@ function failingBar(item, entry, failing, failingLabel, moreRows) {
       value: failing,
       extra: entry.muted || 0,
       tooltipRows: [{ swatchClass: "swatch-fail", label: failingLabel,
-        value: failingWithMuted(failing, entry.muted) }].concat(moreRows),
+        value: failingWithSetAside(failing, entry.muted, entry.flaking) }]
+        .concat(moreRows),
     });
   }
-  const split = failingSplit(failing, entry.assigned, entry.muted);
+  const split = failingSplit(failing, entry.assigned, entry.muted,
+    flakyScope() ? entry.flaking || 0 : null);
   const name = item.sublabel
     ? item.label + " in " + item.sublabel : item.label;
   return Object.assign(item, {
@@ -932,6 +1054,7 @@ function failingBar(item, entry, failing, failingLabel, moreRows) {
       { value: split.unassigned, className: "fill-fail" },
       { value: split.assigned, className: "bar-assigned" },
       { value: split.muted, className: "bar-muted" },
+      { value: split.flaking, className: FLAKING_BAR.className },
     ],
     tooltipRows: split.rows.concat(moreRows),
     ariaLabel: name + ": " + failing.toLocaleString() + " "
@@ -940,10 +1063,14 @@ function failingBar(item, entry, failing, failingLabel, moreRows) {
 }
 
 /** The bar cards' legend, drawn whenever the payload carries the split
- * (zeros included, so a card's height never changes on a "Take"). */
+ * (zeros included, so a card's height never changes on a "Take"), with
+ * the flaking key after the muted one where the scope has a mark. */
 function failingLegend(entries) {
-  return entries.every((entry) => typeof entry.assigned === "number")
-    ? { legend: FAILING_SPLIT_LEGEND } : {};
+  if (!entries.every((entry) => typeof entry.assigned === "number")) {
+    return {};
+  }
+  return { legend: flakyScope()
+    ? FAILING_SPLIT_LEGEND.concat([FLAKING_BAR]) : FAILING_SPLIT_LEGEND };
 }
 
 /** 2 and 3: the two bar charts, from the headline alone. */
@@ -952,12 +1079,15 @@ function renderBars() {
 
   // 2. Failing tests by environment (click to scope). The bar is the
   // UNMUTED failing count, split by assignment, with the muted failures
-  // after it in grey (WP-40, WP-43), sorted by the unmuted number; an
-  // environment whose failures are all muted still shows, grey only.
+  // after it in grey and the flaking ones after those (WP-40, WP-43,
+  // WP-44), sorted by the failing number; an environment whose failures
+  // are all muted or flaking still shows, grey or mauve only.
   const envItems = summary.by_environment
-    .filter((entry) => entry.failed > 0 || (entry.muted || 0) > 0)
+    .filter((entry) => entry.failed > 0 || (entry.muted || 0) > 0
+      || (entry.flaking || 0) > 0)
     .sort((a, b) => (b.failed - a.failed)
-      || ((b.muted || 0) - (a.muted || 0)))
+      || ((b.muted || 0) - (a.muted || 0))
+      || ((b.flaking || 0) - (a.flaking || 0)))
     .map((entry) => failingBar(
       { label: entry.environment,
         onClick: () => setEnvironment(entry.environment) },
@@ -986,9 +1116,13 @@ function renderBars() {
     scriptItems.length !== 0;
 }
 
+/* A bar's click lists what the bar draws: FAIL, which leaves the flaking
+ * tests out once a mark exists, plus FLAKING when the bar has a flaking
+ * part (WP-44, design §3 U9). */
 function openScriptInBrowse(entry) {
   state.script = entry.script;
-  state.activeResults = new Set(["FAIL"]);
+  state.activeResults = new Set(
+    (entry.flaking || 0) > 0 ? FAIL_AND_FLAKING : ["FAIL"]);
   syncResultToggles();
   state.staleOnly = false;
   syncStaleToggle();
@@ -1009,6 +1143,10 @@ const QUEUE_TABS = [
   { id: "new_failures", label: "New failures" },
   { id: "still_failing", label: "Still failing" },
   { id: "muted", label: "Muted" },
+  // WP-44 (design §13, §14): the tests flaking now, marked and failing
+  // within their cadence, a queue like its neighbours; the tab exists
+  // only where there is one. See flakyTabShown().
+  { id: FLAKING_QUEUE, label: FLAKING_TAB_LABEL },
   { id: "fixed", label: "Fixed" },
   { id: "unexpected_passes", label: "Stale annotations" },
   { id: "not_run", label: "Not run" },
@@ -1019,6 +1157,7 @@ const QUEUE_EMPTY_TEXT = {
   new_failures: "No new failures — nothing broke that was passing before.",
   still_failing: "Nothing is stuck failing.",
   muted: "Nothing is muted.",
+  [FLAKING_QUEUE]: FLAKING_TAB_EMPTY,
   fixed: "No tests have gone from failing to passing.",
   unexpected_passes:
     "No stale annotations — every known failure still fails.",
@@ -1041,8 +1180,27 @@ function queueCount(queueId) {
   if (queue) {
     return queue.total;
   }
+  if (queueId === FLAKING_QUEUE) {
+    // The tab's badge is the tests flaking now (WP-44, design §14): the
+    // headline's `status.flaking`, the set its queue's `total` counts. A
+    // virtual kind, as "mine" is, so not in `queue_totals`.
+    return flakingNow();
+  }
   const totals = state.summary && state.summary.queue_totals;
   return totals ? (totals[queueId] || 0) : 0;
+}
+
+/** The tests flaking now in scope, by the headline; 0 before it lands. */
+function flakingNow() {
+  return state.summary ? state.summary.status.flaking || 0 : 0;
+}
+
+/** Whether the Flaking tab is drawn: where a test in scope is flaking now
+ * (design §13), and while it is the open tab, so the act that clears the
+ * last one leaves the reader on its empty state rather than on no tab at
+ * all. */
+function flakyTabShown() {
+  return state.activeQueue === FLAKING_QUEUE || flakingNow() > 0;
 }
 
 /** True once SOMETHING can say how big `queueId` is. Before that a
@@ -1100,6 +1258,9 @@ function renderQueueTabs() {
   const tabs = document.getElementById("queue-tabs");
   clearNode(tabs);
   for (const tab of QUEUE_TABS) {
+    if (tab.id === FLAKING_QUEUE && !flakyTabShown()) {
+      continue;
+    }
     const count = queueCount(tab.id);
     const btn = el("button", "tab");
     btn.type = "button";
@@ -1129,8 +1290,43 @@ function renderQueueTabs() {
   const known = ["new_failures", "still_failing", "unexpected_passes"]
     .every(queueCountKnown);
   document.getElementById("all-clear").hidden = !known || problems !== 0;
+  renderAllClearAside();
   document.getElementById("triage-meta").textContent =
     !known || problems === 0 ? "" : problems.toLocaleString() + " open items";
+}
+
+/**
+ * "Set aside: 3 muted · 4 flaking" under "All clear" (WP-44, design §3
+ * U6): the failing tests the claim leaves out, so a glance at a clear
+ * board still says what is being tolerated. Muted is the two failing
+ * tiles' muted figures; flaking is `status.flaking`. Both zero (or no
+ * headline yet), no line. Each part opens the tab that lists it: "3
+ * muted" the Muted tab, "4 flaking" the Flaking tab (design §13).
+ */
+function renderAllClearAside() {
+  const aside = document.getElementById("all-clear-aside");
+  clearNode(aside);
+  const status = state.summary ? state.summary.status : null;
+  const words = status ? setAsideWords(
+    (status.muted_new_failures || 0) + (status.muted_still_failing || 0),
+    status.flaking) : [];
+  aside.hidden = words.length === 0;
+  if (!words.length) {
+    return;
+  }
+  aside.appendChild(document.createTextNode("Set aside: "));
+  words.forEach((part, index) => {
+    if (index > 0) {
+      aside.appendChild(document.createTextNode(" · "));
+    }
+    const muted = part.key === "muted";
+    const link = el("button", "link-btn", part.text);
+    link.type = "button";
+    link.title = muted ? "Open the Muted tab" : FLAKING_LINK_TITLE;
+    link.addEventListener("click",
+      () => openQueue(muted ? "muted" : FLAKING_QUEUE));
+    aside.appendChild(link);
+  });
 }
 
 /** Column sets per queue: header + cell builder. */
@@ -1148,9 +1344,19 @@ const QUEUE_INVARIANT_RESULT = {
     result: "UNEXPECTED_PASS",
     text: "Every test here passed while annotated as a known failure.",
   },
+  // WP-44 (design §13, §14): every row is a test flaking now, and the
+  // rows come in the server's order, said here once with the state.
+  [FLAKING_QUEUE]: { result: FLAKING_FILTER, text: FLAKING_TAB_NOTE },
 };
 
+/*
+ * Every cell builder takes the entry and `shown`, the row's ONE displayed
+ * result (rowResult(), WP-44): renderQueueTable() computes it once per
+ * row and gives the same value to the row edge and to whichever cell
+ * draws the chip, so the two cannot disagree.
+ */
 function queueColumns(queueId) {
+  const invariant = Boolean(QUEUE_INVARIANT_RESULT[queueId]);
   const testCol = {
     header: "Test",
     sortKey: "test_name",
@@ -1176,6 +1382,13 @@ function queueColumns(queueId) {
       }, { product: null, baseline: null, stream: state.streamId });
       link.textContent = entry.test_name;
       cell.appendChild(link);
+      // A queue that states its one result above the table has no chip
+      // to stand beside, so a marked test's "flaky" tag (WP-44) follows
+      // its name instead.
+      const tag = invariant ? flakyTag(entry) : null;
+      if (tag) {
+        cell.appendChild(tag);
+      }
       cell.appendChild(el("span", "row-sub",
         entry.environment + " · " + entry.script));
       return cell;
@@ -1225,6 +1438,28 @@ function queueColumns(queueId) {
       return cell;
     },
   };
+  // How close a flaking test is to counting as failing (WP-44, design
+  // §14): the Flaking tab's answer to what Failing since and Last pass
+  // say on Still failing, its streak against its cadence. It sorts by
+  // the runs left before the test counts as failing, the server's order,
+  // and its title is the sentence the Review panel's Flaky group says.
+  // Read defensively, as the panel reads it: a row with no `flaky` (an
+  // older server, a race) draws an empty cell and sorts last (null).
+  const streakCol = {
+    header: "Streak",
+    sortKey: "runs_left",
+    sortValue: (entry) => (entry.flaky
+      ? entry.flaky.cadence - entry.flaky.streak : null),
+    cell: (entry) => {
+      const cell = el("td");
+      if (entry.flaky) {
+        cell.textContent = flakyStreakWords(entry.flaky);
+        cell.title = flakySentence(entry.flaky,
+          Boolean(entry.mute && entry.mute.live));
+      }
+      return cell;
+    },
+  };
   // What someone already found out. Without it, triage means opening
   // each test to discover it was looked at yesterday.
   const commentCol = {
@@ -1267,13 +1502,24 @@ function queueColumns(queueId) {
     },
   };
 
+  // A marked test's "flaky" pill (WP-44), appended after the chip in the
+  // cell it is given, as the browse list puts it after the "muted" one.
+  // Sorting stays on the wire value (`sortKey: "result"`), never on what
+  // the chip reads.
+  const withFlakyTag = (cell, entry) => {
+    const tag = flakyTag(entry);
+    if (tag) {
+      cell.appendChild(tag);
+    }
+    return cell;
+  };
   const resultCol = {
     header: "Result",
     sortKey: "result",
-    cell: (entry) => {
+    cell: (entry, shown) => {
       const cell = el("td");
-      cell.appendChild(resultChip(entry.result));
-      return cell;
+      cell.appendChild(resultChip(shown));
+      return withFlakyTag(cell, entry);
     },
   };
 
@@ -1285,19 +1531,24 @@ function queueColumns(queueId) {
   // so a new failure (previously PASS) read as a pass, and a fixed test
   // (previously FAIL) read as a failure. Reported from real use, and
   // wrong in the misleading direction in both queues.
+  //
+  // "was" is previousShown(): the raw previous result, except on the
+  // night a marked test goes over its cadence, when the failure before
+  // was within it and reads FLAKING ("FLAKING → FAIL", WP-44). "now" is
+  // the row's own displayed result.
   const transitionCol = {
     header: "Result",
     sortKey: "result",
-    cell: (entry) => resultTransition(
-      el("td"), entry.prev_result, entry.result),
+    cell: (entry, shown) => withFlakyTag(resultTransition(
+      el("td"), previousShown(entry), shown), entry),
   };
   // The Muted tab lists passing mutes as well as failing ones, so it
   // needs the same was -> now column under the name a reader looks for.
   const stateCol = {
     header: "State",
     sortKey: "result",
-    cell: (entry) => resultTransition(
-      el("td"), entry.prev_result, entry.result),
+    cell: (entry, shown) => withFlakyTag(resultTransition(
+      el("td"), previousShown(entry), shown), entry),
   };
 
   switch (queueId) {
@@ -1323,6 +1574,10 @@ function queueColumns(queueId) {
         commentCol,
         { header: "Assignee",
           cell: (entry) => el("td", "", entry.assignee || "—") }];
+    case FLAKING_QUEUE:
+      // Still failing's row with the streak where its two times stand
+      // (design §14): the one difference.
+      return [testCol, streakCol, commentCol, assigneeCol];
     case "unexpected_passes":
       return [testCol,
         { header: "Known-failure reason",
@@ -1334,10 +1589,10 @@ function queueColumns(queueId) {
       return [testCol,
         when("Last seen", "start_time"),
         { header: "Last result",
-          cell: (entry) => {
+          cell: (entry, shown) => {
             const cell = el("td");
-            cell.appendChild(resultChip(entry.result));
-            return cell;
+            cell.appendChild(resultChip(shown));
+            return withFlakyTag(cell, entry);
           } },
         commentCol,
         assigneeCol];
@@ -1429,7 +1684,6 @@ function renderQueueTable() {
     resultNote.hidden = true;
     return;
   }
-
   const columns = queueColumns(queueId);
   // These queues are CAPPED slices of a larger set, so sorting them in
   // the browser is only honest while nothing has been cut off. Past the
@@ -1438,9 +1692,26 @@ function renderQueueTable() {
   // actions on server-side sorting. The controls are switched off with
   // a reason rather than quietly reordering a truncated list.
   const capped = queueCount(queueId) > allEntries.length;
-  const entries = capped
-    ? allEntries
-    : sortRows(allEntries, state.queueSortKey || "", state.queueSortDesc);
+  // The sort key is the reader's last header click, kept across tabs. It
+  // applies only where it names one of THIS tab's columns, which then
+  // shows its arrow; a key from another tab's column (every queue row
+  // carries `start_time`, `failing_since`, ..., so it would reorder them
+  // with no arrow on any header) leaves the rows in the server's order,
+  // the order the line above the table states.
+  const sortColumn = state.queueSortKey ? columns.find(
+    (column) => column.sortKey === state.queueSortKey) : null;
+  // A column whose order is not one field of the row names a `sortValue`
+  // (the Flaking tab's Streak: the runs left before its cadence); its
+  // rows are sorted by sortRows() on that value, read once per row.
+  const sortValue = sortColumn ? sortColumn.sortValue : null;
+  let entries = allEntries;
+  if (!capped && sortValue) {
+    entries = sortRows(
+      allEntries.map((entry) => ({ entry: entry, value: sortValue(entry) })),
+      "value", state.queueSortDesc).map((pair) => pair.entry);
+  } else if (!capped && sortColumn) {
+    entries = sortRows(allEntries, sortColumn.sortKey, state.queueSortDesc);
+  }
 
   headRow.appendChild(queueSelectionMount.headerCell());
   for (const column of columns) {
@@ -1463,13 +1734,15 @@ function renderQueueTable() {
 
   for (const entry of entries) {
     const tr = document.createElement("tr");
-    const marker = resultClass(entry.result);
+    // One displayed result for the edge and the chip (WP-44).
+    const shown = rowResult(entry);
+    const marker = resultClass(shown);
     if (marker) {
       tr.className = marker;
     }
     tr.appendChild(queueSelectionMount.rowCell(entry));
     for (const column of columns) {
-      tr.appendChild(column.cell(entry));
+      tr.appendChild(column.cell(entry, shown));
     }
     const actionCell = el("td", "review-cell");
     const reviewBtn = el("button", "review-btn", "Review");
@@ -1620,7 +1893,10 @@ function renderBrowse(rows, append) {
 
 function buildRow(row) {
   const tr = document.createElement("tr");
-  const marker = resultClass(row.result);
+  // One displayed result for the edge and the chip (WP-44): FLAKING for
+  // a marked test under its cadence, the wire result otherwise.
+  const shown = rowResult(row);
+  const marker = resultClass(shown);
   if (marker) {
     tr.className = marker;
   }
@@ -1660,14 +1936,15 @@ function buildRow(row) {
   tr.appendChild(testCell);
 
   const resultCell = document.createElement("td");
-  const chip = resultChip(row.result);
+  const chip = resultChip(shown);
   if (row.known_failure_reason) {
     chip.title = "Known failure: " + row.known_failure_reason;
   }
   resultCell.appendChild(chip);
-  const muteTag = mutedTag(row);
-  if (muteTag) {
-    resultCell.appendChild(muteTag);
+  for (const tag of [mutedTag(row), flakyTag(row)]) {
+    if (tag) {
+      resultCell.appendChild(tag);
+    }
   }
   tr.appendChild(resultCell);
 
@@ -1712,9 +1989,12 @@ function updateSortIndicators() {
 
 /* ================= filter controls ================= */
 
+/* The toggles, in BROWSE_RESULTS' order: FLAKING (WP-44, decision 24)
+ * right after FAIL, its wire word as its label like its neighbours,
+ * shipped hidden; syncResultToggles() decides when it shows. */
 function buildResultToggles() {
   const container = document.getElementById("result-toggles");
-  for (const result of RESULTS) {
+  for (const result of BROWSE_RESULTS) {
     const btn = el("button", "toggle " + resultClass(result), result);
     btn.type = "button";
     btn.dataset.result = result;
@@ -1732,11 +2012,25 @@ function buildResultToggles() {
   }
 }
 
+/**
+ * Each toggle's pressed state. The FLAKING toggle is hidden until the
+ * headline says the scope has a mark (`status.flaky_total` > 0), and is
+ * shown whenever it is pressed, so a filter in force is never invisible
+ * (a link or the address bar can press it first). While it shows, FAIL
+ * is only the other half of the failing tests, and its title says so.
+ */
 function syncResultToggles() {
   const buttons = document.querySelectorAll("#result-toggles .toggle");
+  const flakingShown = state.activeResults.has(FLAKING_FILTER)
+    || (Boolean(state.summary) && flakyScope());
   for (const btn of buttons) {
     btn.setAttribute("aria-pressed",
       state.activeResults.has(btn.dataset.result) ? "true" : "false");
+    if (btn.dataset.result === FLAKING_FILTER) {
+      btn.hidden = !flakingShown;
+    } else if (btn.dataset.result === "FAIL" && (flakingShown || btn.title)) {
+      btn.title = flakingShown ? failToggleTitle() : "";
+    }
   }
 }
 
@@ -1794,8 +2088,9 @@ function wireMainlineControls() {
   // Read BEFORE buildResultToggles()/the sync calls below paint the
   // controls, so their initial aria-pressed state already matches —
   // reading it after would need a second render pass.
+  // FLAKING among them (WP-44): the toggle shows while it is pressed.
   for (const raw of url.searchParams.getAll("result")) {
-    if (RESULTS.indexOf(raw) !== -1) {
+    if (BROWSE_RESULTS.indexOf(raw) !== -1) {
       state.activeResults.add(raw);
     }
   }

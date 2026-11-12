@@ -25,7 +25,7 @@ import re
 import sqlite3
 import unittest
 import urllib.parse
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from testboard import api
 from testboard.model import format_iso
@@ -64,6 +64,8 @@ DASHBOARD_ROW_KEYS = {
     "retired_at",
     "retired_by",
     "mute",
+    # WP-44 item 6: the mark and its state on the stream, or null.
+    "flaky",
 }
 IMPORT_ERROR_KEYS = {
     "index",
@@ -112,7 +114,9 @@ def test_path(
 #: WP-43: the two keys only ``parts=assigned_trend`` carries. Neither
 #: the headline nor the full payload has them: the full payload is the
 #: Open Actions page's first-paint request, and the split reads runs.
-ASSIGNED_SPLIT_KEYS = ("FAIL_ASSIGNED", "FAIL_MUTED")
+#: WP-44 item 8 widens it to the third, ``FAIL_FLAKING``, which reads
+#: every run of every marked test in the window.
+ASSIGNED_SPLIT_KEYS = ("FAIL_ASSIGNED", "FAIL_MUTED", "FAIL_FLAKING")
 
 
 def assert_no_trend_split(case: unittest.TestCase,
@@ -651,8 +655,13 @@ class TestDetail(ApiCase):
                 "stream_identity",
                 "mute",
                 "mute_history",
+                # WP-44: the flaky mark and its history.
+                "flaky",
+                "flaky_history",
             },
         )
+        self.assertIsNone(data["flaky"])
+        self.assertEqual(data["flaky_history"], [])
         self.assertEqual(data["environment"], self.ENV)
         self.assertEqual(data["script"], self.SCRIPT)
         self.assertEqual(data["test_name"], self.NAME)
@@ -2514,6 +2523,8 @@ SUMMARY_QUEUE_ENTRY_KEYS = {
     "failing_since",
     "last_pass_time",
     "mute",
+    # WP-44 item 6.
+    "flaky",
 }
 
 
@@ -2653,7 +2664,7 @@ class TestSummary(ApiCase):
         self.assertEqual(
             data["top_failing_scripts"],
             [{"environment": "env2", "script": "smoke.py", "failing": 1,
-              "muted": 0, "assigned": 0}],
+              "muted": 0, "assigned": 0, "flaking": 0}],
         )
         # The environments list stays unfiltered (it feeds the picker).
         self.assertEqual(data["environments"], ["env2", "linux-sim"])
@@ -2674,7 +2685,7 @@ class TestSummary(ApiCase):
         self.assertEqual(
             data["top_failing_scripts"][0],
             {"environment": "linux-sim", "script": "suite/alpha.py",
-             "failing": 2, "muted": 0, "assigned": 0},
+             "failing": 2, "muted": 0, "assigned": 0, "flaking": 0},
         )
 
     def test_assigned_queue_after_assignment(self) -> None:
@@ -7289,10 +7300,12 @@ class SummaryAssignedSplitTest(ApiCase):
             ["2026-07-{:02d}".format(day) for day in range(20, 27)])
         for night in trend["nights"]:
             self.assertEqual(
-                sorted(night), ["FAIL_ASSIGNED", "FAIL_MUTED", "date"])
+                sorted(night),
+                ["FAIL_ASSIGNED", "FAIL_FLAKING", "FAIL_MUTED", "date"])
         self.assertEqual(
-            [(n["FAIL_ASSIGNED"], n["FAIL_MUTED"]) for n in trend["nights"]],
-            [(0, 0)] * 4 + [(1, 0)] * 3)
+            [(n["FAIL_ASSIGNED"], n["FAIL_MUTED"], n["FAIL_FLAKING"])
+             for n in trend["nights"]],
+            [(0, 0, 0)] * 4 + [(1, 0, 0)] * 3)
         full = self.call("GET", "/api/summary", query={"days": ["7"]})
         self.assertEqual(
             [night["date"] for night in trend["nights"]],
@@ -7439,3 +7452,1667 @@ class SummaryAssignedSplitTest(ApiCase):
         self.assertEqual(len(cold), 2, cold)
         self.assertIn("MIN(EXPIRES_AT)", " ".join(cold[0].split()).upper())
         self.assertEqual(self._selects(query), [])
+
+
+class NamesPartTest(ApiCase):
+    """WP-44: ``parts=names``, the catalogue the Open Actions page reads
+    from the summary on its first paint, without the headline, trend
+    and queue work of the full payload it used to fetch for it.
+
+    Every name is compared against the full payload for the same query
+    string, in every scope the page can ask for, rather than against
+    hand-written values: the contract is "the part cannot drift from
+    the whole". ``products`` is the whole's list by name only; its
+    per-product counts are the headline's per-environment pass.
+    """
+
+    seed = TestSummary.seed
+
+    #: The five names the full payload shares, and the envelope every
+    #: summary part carries. ``flaky_marks`` (WP-44 item 6) is the
+    #: part's own: is there a mark anywhere.
+    NAMES = ("assignees", "assignment_streams", "environments", "products",
+             "stale_before")
+    ENVELOPE = ("environment", "generated_at", "product", "stream")
+
+    #: Cold SELECTs of ``parts=names`` on this fixture, unscoped and
+    #: with ``product=``: the pass view behind ``stale_before`` (the
+    #: stream's environments, one count per environment, the declared
+    #: counts, the activity buckets: 3 + 2 here) and one statement per
+    #: catalogue (products, environments, assignees, assignment streams
+    #: and, since one exists here, their identities: 5). ``product=``
+    #: resolves its environments: one more. perf-seed/1 measures 14 and
+    #: 15 (WP-44 item 1): seven environments, no assignments.
+    COLD_SELECTS = 10
+    COLD_SELECTS_PRODUCT = 11
+
+    #: The Storage reads of the headline, trend and queues: none may
+    #: run for this part (``products`` included: its counts are the
+    #: per-environment pass).
+    HEADLINE_READS = (
+        "summary_rollup", "muted_cells", "assigned_cells", "mute_epoch",
+        "assigned_open_count", "queue_counts", "status_queue",
+        "status_queue_count", "daily_result_counts",
+        "daily_assigned_failures", "top_failing_scripts",
+        "latest_run_time", "latest_run_time_by_environment", "scripts",
+        "environment_products_map", "dashboard",
+    )
+
+    def _estate(self) -> int:
+        """TestSummary's estate in two products, a build of Atlas, and
+        one assignment from the build and one from mainline, so every
+        name is non-trivial. Returns the build's stream id."""
+        self.seed()
+        for environment, product in (("linux-sim", "Atlas"),
+                                     ("env2", "Beacon")):
+            self.call(
+                "PUT", "/api/environments/{}/product".format(environment),
+                body={"product": product, "username": "amy"})
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T05:00:03.000000"),
+        ])
+        build_id = self.call(
+            "GET", "/api/streams", query={"product": ["Atlas"]}
+        )["streams"][0]["id"]
+        self.call(
+            "PUT",
+            test_path("linux-sim", "suite/alpha.py", "test_still_fail",
+                      "/assignee"),
+            body={"username": "alice", "assigned_by": "bob",
+                  "stream_id": build_id})
+        self.call(
+            "PUT", test_path("env2", "smoke.py", "test_first", "/assignee"),
+            body={"username": "bob", "assigned_by": "bob"})
+        return build_id
+
+    def _scopes(self, build_id: int) -> List[Dict[str, List[str]]]:
+        """No product, a product, mainline and a build, and the other
+        scope parameters the summary honours."""
+        build = str(build_id)
+        return [
+            {},
+            {"product": ["Atlas"]},
+            {"product": ["Beacon"]},
+            {"product": ["Nobody"]},
+            {"stream": [build]},
+            {"stream": [build], "product": ["Atlas"]},
+            {"environment": ["env2"]},
+            {"assignee": ["alice"], "days": ["7"]},
+        ]
+
+    def _names(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
+        return self.call(
+            "GET", "/api/summary", query=dict(query, parts=["names"]))
+
+    def test_the_shape(self) -> None:
+        build_id = self._estate()
+        for query in self._scopes(build_id):
+            data = self._names(query)
+            self.assertEqual(
+                sorted(data),
+                sorted(self.NAMES + self.ENVELOPE + ("flaky_marks",)),
+                query)
+            self.assertIs(data["flaky_marks"], False, query)
+            for entry in data["products"]:
+                self.assertEqual(sorted(entry), ["product"])
+
+    def test_flaky_marks_says_whether_any_mark_exists(self) -> None:
+        """WP-44 item 6: estate-wide, whatever the scope, and read from
+        the products statement it rides (no statement of its own)."""
+        build_id = self._estate()
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+        tests = [{"environment": "env2", "script": "smoke.py",
+                  "test_name": "test_first"}]
+        self.call("POST", "/api/flaky/bulk", body={
+            "username": "dev1", "reason": "why", "cadence": 3,
+            "tests": tests})
+        for query in self._scopes(build_id):
+            self.assertIs(self._names(query)["flaky_marks"], True, query)
+        self.call("POST", "/api/flaky/unmark",
+                  body={"username": "dev1", "tests": tests})
+        self.assertIs(self._names({})["flaky_marks"], False)
+        # The same products, in the same order, either way.
+        self.assertEqual(
+            self._names({})["products"],
+            [{"product": "Atlas"}, {"product": "Beacon"}])
+
+    def test_each_name_equals_the_full_payload_in_every_scope(self) -> None:
+        build_id = self._estate()
+        for query in self._scopes(build_id):
+            names = self._names(query)
+            full = self.call("GET", "/api/summary", query=query)
+            for key in self.NAMES + self.ENVELOPE:
+                if key == "products":
+                    self.assertEqual(
+                        names[key],
+                        [{"product": entry["product"]}
+                         for entry in full[key]], query)
+                else:
+                    self.assertEqual(names[key], full[key], (key, query))
+        # The fixture makes every name say something.
+        names = self._names({"product": ["Atlas"]})
+        self.assertEqual(
+            names["products"], [{"product": "Atlas"}, {"product": "Beacon"}])
+        self.assertEqual(names["environments"], ["linux-sim"])
+        self.assertEqual(names["assignees"], ["alice", "bob"])
+        self.assertEqual(
+            [stream["id"] for stream in names["assignment_streams"]],
+            [build_id])
+        build = self._names({"stream": [str(build_id)]})
+        self.assertEqual(build["stream"], build_id)
+        self.assertEqual(build["environments"], ["linux-sim"])
+
+    def test_with_no_product_declared_products_is_empty(self) -> None:
+        self.seed()
+        names = self._names({})
+        self.assertEqual(names["products"], [])
+        self.assertEqual(
+            names["products"], self.call("GET", "/api/summary")["products"])
+        self.assertEqual(names["environments"], ["env2", "linux-sim"])
+
+    def test_an_unknown_part_is_a_400_listing_every_part(self) -> None:
+        self.seed()
+        error = self.call(
+            "GET", "/api/summary", query={"parts": ["everything"]},
+            expect=400)["error"]
+        for part in ("headline", "queue", "assigned_trend", "names"):
+            self.assertIn(part, error)
+
+    def test_the_scope_errors_are_the_full_payloads(self) -> None:
+        self.seed()
+        for query, status in (({"stream": ["x"]}, 400),
+                              ({"stream": ["999"]}, 404),
+                              ({"days": ["0"]}, 400)):
+            self.call("GET", "/api/summary", query=query, expect=status)
+            self.call("GET", "/api/summary",
+                      query=dict(query, parts=["names"]), expect=status)
+
+    def test_no_headline_trend_or_queue_read_runs(self) -> None:
+        """By Storage method, so it holds on both backends."""
+        build_id = self._estate()
+        called = []  # type: List[str]
+
+        def refuse(name: str) -> Any:
+            def refused(*args: Any, **kwargs: Any) -> Any:
+                called.append(name)
+                raise AssertionError(name)
+            return refused
+
+        for name in self.HEADLINE_READS:
+            setattr(self.storage, name, refuse(name))
+        try:
+            for query in self._scopes(build_id):
+                self.storage._invalidate_summary_cache()
+                self.storage._invalidate_trend_cache()
+                self._names(query)
+        finally:
+            for name in self.HEADLINE_READS:
+                delattr(self.storage, name)
+        self.assertEqual(called, [])
+
+    # -- the cost (sqlite3's trace callback: excluded on MariaDB) -----
+
+    def _selects(self, query: Dict[str, List[str]]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self._names(query)
+        finally:
+            conn.set_trace_callback(None)
+        return [s for s in seen if s.strip().upper().startswith("SELECT")]
+
+    def _cold_selects(self, query: Dict[str, List[str]]) -> List[str]:
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        return self._selects(query)
+
+    def test_the_cold_count_is_pinned_and_warm_runs_no_more(self) -> None:
+        self._estate()
+        for query, pinned in (({}, self.COLD_SELECTS),
+                              ({"product": ["Atlas"]},
+                               self.COLD_SELECTS_PRODUCT)):
+            cold = self._cold_selects(query)
+            self.assertEqual(len(cold), pinned, cold)
+            warm = self._selects(query)
+            self.assertLessEqual(len(warm), len(cold), warm)
+            for statement in cold:
+                # Neither runs nor the rollup's GROUP BY over latest_runs.
+                flat = " ".join(statement.split()).upper()
+                self.assertNotIn(" RUNS ", flat + " ")
+                self.assertNotIn("PREV_RESULT", flat)
+
+
+class FlakyApiTest(ApiCase):
+    """WP-44: the flaky mark over HTTP — ``POST /api/flaky/bulk``,
+    ``POST /api/flaky/unmark``, their shapes and 400s, and the test
+    detail's ``flaky`` and ``flaky_history``.
+
+    TestSummary's estate: test_still_fail ran PASS on the 23rd, then
+    FAIL on the 24th, 25th and 26th; test_new_fail PASS then FAIL;
+    test_fixed FAIL then PASS. A build ran test_still_fail once, a
+    FAIL, on the 26th.
+    """
+
+    seed = TestSummary.seed
+
+    STILL = ("linux-sim", "suite/alpha.py", "test_still_fail")
+    NEW = ("linux-sim", "suite/alpha.py", "test_new_fail")
+    FIXED = ("linux-sim", "suite/alpha.py", "test_fixed")
+    FLAKY_KEYS = {"cadence", "marked_by", "marked_at", "reason", "state",
+                  "streak", "runs"}
+    HISTORY_KEYS = {"id", "action", "cadence", "reason", "actor",
+                    "acted_at"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.seed()
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T05:00:03.000000"),
+        ])
+        self.build = self.storage.list_streams("")[0].stream_id
+        created = datetime.datetime(2026, 7, 1)
+        for name in ("alice", "bob", "carol"):
+            self.storage.ensure_user(name, created)
+        self.storage.set_user_active("carol", False, "bob", created)
+
+    @staticmethod
+    def entry(key: Any, **extra: Any) -> Dict[str, Any]:
+        item = {
+            "environment": key[0], "script": key[1], "test_name": key[2],
+        }  # type: Dict[str, Any]
+        item.update(extra)
+        return item
+
+    def mark(self, keys: List[Any], expect: int = 200,
+             **overrides: Any) -> Dict[str, Any]:
+        body = {
+            "username": "alice", "reason": "race in teardown",
+            "cadence": 3, "tests": [self.entry(k) for k in keys],
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return self.call("POST", "/api/flaky/bulk", body=body,
+                         expect=expect)
+
+    def unmark(self, keys: List[Any], expect: int = 200,
+               **overrides: Any) -> Dict[str, Any]:
+        body = {
+            "username": "bob", "tests": [self.entry(k) for k in keys],
+        }  # type: Dict[str, Any]
+        body.update(overrides)
+        return self.call("POST", "/api/flaky/unmark", body=body,
+                         expect=expect)
+
+    def detail(self, key: Any, stream: Optional[int] = None
+               ) -> Dict[str, Any]:
+        query = {} if stream is None else {"stream": [str(stream)]}
+        return self.call("GET", test_path(*key), query=query)
+
+    # -- the shapes ---------------------------------------------------
+
+    def test_the_acts_answer_in_their_shapes(self) -> None:
+        self.assertEqual(
+            self.mark([self.STILL, self.NEW,
+                       ("linux-sim", "suite/alpha.py", "nope")]),
+            {"marked": 2, "changed": 0, "unchanged": 0, "unknown": 1})
+        self.assertEqual(
+            self.mark([self.STILL, self.NEW], cadence=5, reason=None,
+                      username="bob"),
+            {"marked": 0, "changed": 2, "unchanged": 0, "unknown": 0})
+        again = {"username": "bob", "cadence": 5,
+                 "tests": [self.entry(self.STILL)]}
+        self.assertEqual(
+            self.call("POST", "/api/flaky/bulk", body=again),
+            {"marked": 0, "changed": 0, "unchanged": 1, "unknown": 0})
+        self.assertEqual(self.unmark([self.STILL, self.FIXED]),
+                         {"unmarked": 1})
+
+    def test_the_detail_carries_the_mark_its_state_and_history(
+        self,
+    ) -> None:
+        data = self.detail(self.STILL)
+        self.assertIsNone(data["flaky"])
+        self.assertEqual(data["flaky_history"], [])
+        self.mark([self.STILL], cadence=4, username="alice")
+        self.mark([self.STILL], cadence=3, reason=None, username="bob")
+        data = self.detail(self.STILL)
+        self.assertEqual(set(data["flaky"]), self.FLAKY_KEYS)
+        # F F F (P): at 3 every one of the newest three failed.
+        self.assertEqual(
+            data["flaky"],
+            {"cadence": 3, "marked_by": "alice",
+             "marked_at": format_iso(NOW), "reason": "race in teardown",
+             "state": "failing", "streak": 3, "runs": 3})
+        history = data["flaky_history"]
+        for act in history:
+            self.assertEqual(set(act), self.HISTORY_KEYS)
+        self.assertEqual(
+            [(a["action"], a["cadence"], a["reason"], a["actor"])
+             for a in history],
+            [("cadence", 3, None, "bob"),
+             ("mark", 4, "race in teardown", "alice")])
+        self.assertGreater(history[0]["id"], history[1]["id"])
+        # The reason is a comment, posted from nowhere in particular.
+        comments = self.call("GET", test_path(*self.STILL, "/comments"))
+        self.assertEqual(
+            [(c["author"], c["text"]) for c in comments["comments"]],
+            [("alice", "race in teardown")])
+
+    def test_the_state_is_the_streams_own(self) -> None:
+        self.mark([self.STILL], cadence=4)
+        self.mark([self.NEW, self.FIXED], cadence=2)
+        # Mainline F F F P at 4: flaking, three in a row.
+        self.assertEqual(
+            {k: self.detail(self.STILL)["flaky"][k]
+             for k in ("state", "streak", "runs")},
+            {"state": "flaking", "streak": 3, "runs": None})
+        # The build ran it once, a FAIL: fewer runs than the cadence,
+        # every one failed, so over it there (verdict 8).
+        on_build = self.detail(self.STILL, stream=self.build)["flaky"]
+        self.assertEqual(
+            (on_build["state"], on_build["streak"], on_build["runs"]),
+            ("failing", 1, 1))
+        self.assertEqual(on_build["cadence"], 4)
+        new = self.detail(self.NEW)["flaky"]
+        self.assertEqual((new["state"], new["streak"], new["runs"]),
+                         ("flaking", 1, None))
+        fixed = self.detail(self.FIXED)["flaky"]
+        self.assertEqual((fixed["state"], fixed["streak"], fixed["runs"]),
+                         ("passing", 0, None))
+
+    def test_a_mark_made_from_a_build_tags_its_comment(self) -> None:
+        self.mark([self.STILL], tests=[
+            self.entry(self.STILL, stream_id=self.build)])
+        comments = self.call("GET", test_path(*self.STILL, "/comments"))
+        self.assertEqual(
+            [c["stream_id"] for c in comments["comments"]], [self.build])
+
+    # -- the 400s -----------------------------------------------------
+
+    def test_bulk_refuses_a_bad_body(self) -> None:
+        cases = [
+            ({"username": None}, "username"),
+            ({"username": ""}, "username"),
+            ({"cadence": None}, "cadence"),
+            ({"cadence": 1}, "cadence"),
+            ({"cadence": 11}, "cadence"),
+            ({"cadence": "3"}, "cadence"),
+            ({"cadence": True}, "cadence"),
+            ({"cadence": 2.5}, "cadence"),
+            ({"reason": ""}, "reason"),
+            ({"reason": 7}, "reason"),
+            ({"reason": "x" * 10001}, "reason"),
+            ({"tests": []}, "tests"),
+            ({"tests": "all"}, "tests"),
+            ({"tests": [{"environment": "linux-sim"}]}, "tests[0]"),
+            ({"marked_by": "bob"}, "marked_by"),
+            ({"assignee": "bob"}, "assignee"),
+            ({"username": "nobody"}, "username"),
+            ({"username": "carol"}, "username"),
+        ]
+        for overrides, field in cases:
+            body = {
+                "username": "alice", "reason": "why", "cadence": 3,
+                "tests": [self.entry(self.STILL)],
+            }  # type: Dict[str, Any]
+            body.update(overrides)
+            if body["username"] is None:
+                del body["username"]
+            if body["cadence"] is None:
+                del body["cadence"]
+            error = self.call("POST", "/api/flaky/bulk", body=body,
+                              expect=400)["error"]
+            self.assertTrue(error.startswith(field), (overrides, error))
+        missing = {"username": "alice", "cadence": 3, "reason": "why"}
+        self.assertTrue(self.call(
+            "POST", "/api/flaky/bulk", body=missing,
+            expect=400)["error"].startswith("tests"))
+        self.call("POST", "/api/flaky/bulk", body=b"{not json",
+                  expect=400)
+        # Nothing was written by any of them.
+        self.assertIsNone(self.detail(self.STILL)["flaky"])
+
+    def test_a_fresh_mark_without_a_reason_is_a_400_naming_it(self) -> None:
+        self.mark([self.STILL])
+        error = self.mark([self.STILL, self.NEW], cadence=5, reason=None,
+                          expect=400)["error"]
+        self.assertTrue(error.startswith("reason: is required"), error)
+        self.assertIn("1 of these tests is not yet marked", error)
+        self.assertEqual(self.detail(self.STILL)["flaky"]["cadence"], 3)
+        self.assertIsNone(self.detail(self.NEW)["flaky"])
+
+    def _comment_count(self, key: Any) -> int:
+        return len(self.call(
+            "GET", test_path(*key, "/comments"))["comments"])
+
+    def test_a_pure_cadence_change_takes_any_blank_reason(self) -> None:
+        """The UI sends the note box as it stands: absent, null, empty
+        and whitespace-only are all "no reason", which a cadence change
+        may have. No comment, and the history records a null reason."""
+        self.mark([self.STILL, self.NEW], cadence=3)
+        comments = self._comment_count(self.STILL)
+        blanks = [{"reason": None}, {"reason": ""}, {"reason": "   "},
+                  {"reason": "\n\t"}, {}]
+        for cadence, blank in zip(range(4, 9), blanks):
+            body = {
+                "username": "bob", "cadence": cadence,
+                "tests": [self.entry(self.STILL), self.entry(self.NEW)],
+            }  # type: Dict[str, Any]
+            body.update(blank)
+            self.assertEqual(
+                self.call("POST", "/api/flaky/bulk", body=body),
+                {"marked": 0, "changed": 2, "unchanged": 0, "unknown": 0},
+                blank)
+            data = self.detail(self.STILL)
+            self.assertEqual(data["flaky"]["cadence"], cadence)
+            self.assertEqual(data["flaky"]["reason"], "race in teardown")
+            self.assertEqual(data["flaky"]["marked_by"], "alice")
+            latest = data["flaky_history"][0]
+            self.assertEqual(
+                (latest["action"], latest["cadence"], latest["reason"],
+                 latest["actor"]), ("cadence", cadence, None, "bob"), blank)
+        self.assertEqual(self._comment_count(self.STILL), comments)
+        # A real reason on a cadence change is posted and recorded.
+        self.mark([self.STILL], cadence=2, reason="worse", username="bob")
+        data = self.detail(self.STILL)
+        self.assertEqual(data["flaky_history"][0]["reason"], "worse")
+        self.assertEqual(data["flaky"]["reason"], "worse")
+        self.assertEqual(self._comment_count(self.STILL), comments + 1)
+
+    def test_a_mixed_request_with_a_blank_reason_writes_nothing(
+        self,
+    ) -> None:
+        """One test marked, one not, and a blank reason: a 400 naming
+        the reason for the whole request, all or nothing. The marked
+        test's cadence does not move either."""
+        self.mark([self.STILL], cadence=3)
+        history = len(self.detail(self.STILL)["flaky_history"])
+        comments = self._comment_count(self.STILL)
+        for blank in ({"reason": None}, {"reason": ""}, {"reason": "  "},
+                      {}):
+            body = {
+                "username": "bob", "cadence": 6,
+                "tests": [self.entry(self.STILL), self.entry(self.NEW)],
+            }  # type: Dict[str, Any]
+            body.update(blank)
+            error = self.call("POST", "/api/flaky/bulk", body=body,
+                              expect=400)["error"]
+            self.assertTrue(error.startswith("reason: is required"), error)
+            self.assertIn("1 of these tests is not yet marked", error)
+        still = self.detail(self.STILL)
+        self.assertEqual(still["flaky"]["cadence"], 3)
+        self.assertEqual(len(still["flaky_history"]), history)
+        self.assertEqual(self._comment_count(self.STILL), comments)
+        self.assertIsNone(self.detail(self.NEW)["flaky"])
+
+    def test_an_unknown_stream_is_a_404(self) -> None:
+        self.mark([self.STILL], expect=404,
+                  tests=[self.entry(self.STILL, stream_id=999)])
+
+    def test_unmark_refuses_a_bad_body(self) -> None:
+        self.mark([self.STILL])
+        for overrides, field in (({"username": ""}, "username"),
+                                 ({"username": "nobody"}, "username"),
+                                 ({"username": "carol"}, "username"),
+                                 ({"tests": []}, "tests"),
+                                 ({"tests": None}, "tests")):
+            error = self.unmark([self.STILL], expect=400,
+                                **overrides)["error"]
+            self.assertTrue(error.startswith(field), (overrides, error))
+        self.call("POST", "/api/flaky/unmark",
+                  body={"username": "bob"}, expect=400)
+        self.assertEqual(self.detail(self.STILL)["flaky"]["cadence"], 3)
+
+    def test_only_post_is_allowed(self) -> None:
+        self.assert_405("GET", "/api/flaky/bulk", "POST")
+        self.assert_405("GET", "/api/flaky/unmark", "POST")
+
+
+class NoMarksAddsNothingTest(ApiCase):
+    """WP-44: with the flaky tables present and EMPTY, the cold
+    statements of every read the mark touches are the base's, and none
+    of them reads the mark's tables beyond the "any mark" bit, bar the
+    test detail's one read of its acts.
+
+    Item 3's form, measured at 152820e: identical lists for every read
+    except the detail, whose mute-history statement became
+    :meth:`Storage.test_acts`. Item 6 widens it (design §2 B.7) to the
+    names part, ``assigned_trend`` and the My actions queue, and lets
+    each read carry the bit on a statement it already ran, in exactly
+    one of the four forms below (:data:`CARRIERS`); nothing else may
+    name a flaky table, and no statement joins one. Against the base
+    (67d73ca), cold, by the same trace on this fixture, the lists were
+    compared byte for byte once the carriers are taken out: identical
+    for every read, the queue part's and ``/api/dashboard``'s in another
+    order (their count and their products statement now run first, so
+    the rows know whether to join the marks).
+    """
+
+    #: Cold SELECTs per read at the base commit, on this fixture.
+    #:
+    #: Item 8 widens the reads (design §2 B.7) to browse with Failing
+    #: (``result=FAIL``, which now leaves flaking rows out), with Failing
+    #: and Flaking (today's FAIL), with Flaking alone (no statement but
+    #: the bit's carrier: an empty page), Open Actions' Failing mode (it
+    #: sends both values) and the 90-day ``assigned_trend``. Their base
+    #: counts were taken at fc35019 by the same trace on this fixture,
+    #: ``result=FAIL`` standing for the two that send FLAKING (which the
+    #: base refused): the statement lists are identical, the count of
+    #: /api/dashboard now running beside its rows rather than after the
+    #: streaks.
+    #:
+    #: Item 14 widens the reads to ``queue=flaking``, which the base did
+    #: not serve: its pin is the queue prefix every kind pays and the mute
+    #: epoch's statement carrying the bit, two fewer than New failures
+    #: (no count, no rows), and every statement it runs is one the New
+    #: failures queue runs (test_the_flaking_queue_runs_nothing_new).
+    BASE_COLD_SELECTS = {
+        "headline": 22, "full": 29, "browse": 3, "open_actions": 13,
+        "watch": 12, "detail": 5, "detail_build": 9, "names": 9,
+        "assigned_trend": 2,
+        "queue_new_failures": 9, "queue_still_failing": 9,
+        "queue_muted": 9, "queue_fixed": 8, "queue_unexpected_passes": 8,
+        "queue_not_run": 8, "queue_assigned": 8, "queue_mine": 11,
+        "queue_flaking": 7,
+        "browse_fail": 3, "browse_fail_flaking": 3, "browse_flaking": 1,
+        "open_actions_failing": 13, "assigned_trend_90": 2,
+    }
+    DETAIL = "/api/tests/linux-sim/suite%2Falpha.py/test_still_fail"
+
+    #: How the bit rides a statement already run (item 6): a MIN column
+    #: on the mute epoch's read and on the queue part's count, one
+    #: UNION ALL row on /api/dashboard's environment-products read, and
+    #: one on the names part's products read (with the column it needs
+    #: and ORDER BY 1, mapped back to the base's text).
+    CARRIERS = (
+        (", (SELECT MIN(environment) FROM test_flaky_marks)", ""),
+        (" UNION ALL SELECT NULL, MIN(environment) FROM test_flaky_marks "
+         "ORDER BY 1", " ORDER BY product"),
+        (" UNION ALL SELECT NULL, MIN(environment) FROM test_flaky_marks",
+         ""),
+        ("SELECT DISTINCT product, NULL FROM", "SELECT DISTINCT product FROM"),
+        # Item 8: /api/dashboard's carries the marked environments, one
+        # row each (none with no mark), in place of the MIN.
+        (" UNION ALL SELECT DISTINCT NULL, environment FROM "
+         "test_flaky_marks", ""),
+    )
+
+    def setUp(self) -> None:
+        super().setUp()
+        TestSummary.seed(self)  # type: ignore
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T06:00:00.000000"),
+        ])
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_new_fail", "/assignee"),
+                  body={"username": "alice", "assigned_by": "bob"})
+        self.call("POST", "/api/mutes/bulk", body={
+            "username": "bob", "reason": "infra", "hours": 24,
+            "assignee": "carol",
+            "tests": [{"environment": "linux-sim",
+                       "script": "suite/alpha.py",
+                       "test_name": "test_still_fail"}]})
+        self.build = self.storage.list_streams("")[0].stream_id
+
+    def _reads(self) -> List[Any]:
+        reads = [
+            ("headline", "/api/summary", {"parts": ["headline"]}),
+            ("full", "/api/summary", {}),
+            ("browse", "/api/dashboard", {"limit": ["250"]}),
+            ("open_actions", "/api/dashboard",
+             {"open": ["1"], "with_comment": ["1"], "with_streak": ["1"],
+              "limit": ["100"]}),
+            ("watch", "/api/watch", {"c": ["e:linux-sim", "p:Atlas"]}),
+            ("detail", self.DETAIL, {}),
+            ("detail_build", self.DETAIL, {"stream": [str(self.build)]}),
+            ("names", "/api/summary", {"parts": ["names"]}),
+            ("assigned_trend", "/api/summary",
+             {"parts": ["assigned_trend"]}),
+            ("browse_fail", "/api/dashboard",
+             {"result": ["FAIL"], "limit": ["250"]}),
+            ("browse_fail_flaking", "/api/dashboard",
+             {"result": ["FAIL", "FLAKING"], "limit": ["250"]}),
+            ("browse_flaking", "/api/dashboard",
+             {"result": ["FLAKING"], "limit": ["250"]}),
+            ("open_actions_failing", "/api/dashboard",
+             {"open": ["1"], "result": ["FAIL", "FLAKING"],
+              "with_comment": ["1"], "with_streak": ["1"],
+              "limit": ["100"]}),
+            ("assigned_trend_90", "/api/summary",
+             {"parts": ["assigned_trend"], "days": ["90"]}),
+        ]  # type: List[Any]
+        for kind in QUEUE_KINDS:
+            reads.append(("queue_" + kind, "/api/summary",
+                          {"parts": ["queue"], "queue": [kind]}))
+        reads.append(("queue_mine", "/api/summary",
+                      {"parts": ["queue"], "queue": ["mine"],
+                       "assignee": ["alice"]}))
+        reads.append(("queue_flaking", "/api/summary",
+                      {"parts": ["queue"], "queue": ["flaking"]}))
+        return reads
+
+    def _cold_selects(self, path: str, query: Dict[str, List[str]]
+                      ) -> List[str]:
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", path, query=query)
+        finally:
+            conn.set_trace_callback(None)
+        return [" ".join(s.split()) for s in seen
+                if s.strip().upper().startswith("SELECT")]
+
+    def _bare(self, statement: str) -> str:
+        """*statement* with the bit's carrier taken out."""
+        for carried, base in self.CARRIERS:
+            statement = statement.replace(carried, base)
+        return statement
+
+    def test_every_read_costs_what_it_did_and_reads_no_mark(self) -> None:
+        self.assertEqual(sorted(name for name, _p, _q in self._reads()),
+                         sorted(self.BASE_COLD_SELECTS))
+        for name, path, query in self._reads():
+            cold = self._cold_selects(path, query)
+            self.assertEqual(len(cold), self.BASE_COLD_SELECTS[name],
+                             (name, cold))
+            carrying = [s for s in cold if self._bare(s) != s]
+            touching = [s for s in cold
+                        if "flaky" in self._bare(s).lower()]
+            if not name.startswith("detail"):
+                # The bit rides a statement the read already ran, and
+                # nothing else names a flaky table.
+                self.assertTrue(carrying, name)
+                self.assertEqual(touching, [], name)
+                continue
+            self.assertEqual(carrying, [], name)
+            # The detail: its one acts read, the mute history first and
+            # the mark's two tables only as UNION ALL members of it.
+            self.assertEqual(len(touching), 1, (name, touching))
+            members = touching[0].split(" UNION ALL ")
+            self.assertEqual(len(members), 3, touching)
+            self.assertIn("FROM mute_history WHERE", members[0])
+            self.assertNotIn("flaky", members[0].lower())
+            self.assertIn("FROM flaky_mark_history WHERE", members[1])
+            self.assertIn("FROM test_flaky_marks WHERE", members[2])
+            self.assertEqual(cold[-1], touching[0], name)
+
+    def test_no_statement_joins_or_counts_the_marks(self) -> None:
+        """The count-join guard, widened to the bit: no statement joins
+        a flaky table, and a count names one only as the bit's MIN."""
+        for name, path, query in self._reads():
+            for statement in self._cold_selects(path, query):
+                upper = statement.upper()
+                self.assertNotIn("JOIN TEST_FLAKY_MARKS", upper, name)
+                self.assertNotIn("JOIN FLAKY_MARK_HISTORY", upper, name)
+                if "COUNT(" in upper:
+                    self.assertNotIn(
+                        "FLAKY", self._bare(statement).upper(), name)
+
+    def test_the_flaking_queue_runs_nothing_new(self) -> None:
+        """Item 14: with no mark, ``queue=flaking`` runs no statement the
+        New failures queue does not, the bit's carrier included, and
+        nothing warm but the prefix both pay."""
+        query = {"parts": ["queue"], "queue": ["flaking"]}
+        flaking = self._cold_selects("/api/summary", query)
+        new = self._cold_selects("/api/summary", {
+            "parts": ["queue"], "queue": ["new_failures"]})
+        self.assertEqual([s for s in flaking if s not in new], [], flaking)
+        self.assertEqual(len(flaking), len(new) - 2, (flaking, new))
+        self.assertEqual(
+            self.call("GET", "/api/summary", query=query)["queue"],
+            {"total": 0, "tests": []})
+
+    def test_the_detail_of_a_marked_test_costs_the_same(self) -> None:
+        """The detail's cache guard: a mark adds no statement, whatever
+        its state, while the 90-day window holds N runs or a non-FAIL
+        among them; only a window shorter than N, every run a FAIL,
+        reads one Q2 (here the build's single FAIL at cadence 3)."""
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+        base = self.BASE_COLD_SELECTS["detail"]
+        for cadence, state in ((3, "failing"), (4, "flaking")):
+            self.call("POST", "/api/flaky/bulk", body={
+                "username": "dev1", "reason": "why", "cadence": cadence,
+                "tests": [{"environment": "linux-sim",
+                           "script": "suite/alpha.py",
+                           "test_name": "test_still_fail"}]})
+            self.assertEqual(
+                self.call("GET", self.DETAIL)["flaky"]["state"], state)
+            self.assertEqual(len(self._cold_selects(self.DETAIL, {})),
+                             base)
+        build = {"stream": [str(self.build)]}
+        cold = self._cold_selects(self.DETAIL, build)
+        self.assertEqual(len(cold),
+                         self.BASE_COLD_SELECTS["detail_build"] + 1, cold)
+        self.assertIn("FROM runs", cold[-1])
+        self.assertIn("ORDER BY start_time DESC LIMIT 4", cold[-1])
+        self.assertEqual(
+            self.call("GET", self.DETAIL, query=build)["flaky"]["state"],
+            "failing")
+
+
+class FlakyBoardApiTest(ApiCase):
+    """WP-44 item 6: the board acts on the mark, through the API.
+
+    TestSummary's estate, linux-sim declared as Atlas, two more tests on
+    ``suite/alpha.py`` and five marks at cadence 3:
+
+    - test_new_fail (P F): flaking, would be new;
+    - test_flaky2 (P F F): flaking, would be still failing;
+    - test_still_fail (P F F F): over its cadence on this run, New;
+    - test_tol (F P F P): a pass after a tolerated failure, not fixed;
+    - env2/test_first (F): its first run failed, New as any test.
+
+    test_fixed (F P) is unmarked and fixed.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        TestSummary.seed(self)  # type: ignore
+        self.import_runs([
+            record(test_name=name, result=result,
+                   start_time="2026-07-{0:02d}T02:00:00.000000".format(day),
+                   end_time="2026-07-{0:02d}T03:00:00.000000".format(day))
+            for name, results in (
+                ("test_flaky2", ("PASS", "FAIL", "FAIL")),
+                ("test_tol", ("FAIL", "PASS", "FAIL", "PASS")))
+            for day, result in zip(range(27 - len(results), 27), results)
+        ])
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+
+    #: The marks are made before the estate's last night: a test goes
+    #: over its cadence on a run, so a run older than the mark is never
+    #: the night it went over (PromotionTest).
+    MARKED_AT = datetime.datetime(2026, 7, 20)
+
+    def _mark(self) -> None:
+        tests = [
+            ("linux-sim", "suite/alpha.py", name, None)
+            for name in ("test_new_fail", "test_flaky2", "test_still_fail",
+                         "test_tol")
+        ] + [("env2", "smoke.py", "test_first", None)]
+        self.storage.mark_flaky(
+            tests, 3, "known race", "dev1", self.MARKED_AT)
+
+    def _selects(self, path: str, query: Dict[str, List[str]]
+                 ) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", path, query=query)
+        finally:
+            conn.set_trace_callback(None)
+        return [" ".join(s.split()) for s in seen
+                if s.strip().upper().startswith("SELECT")]
+
+    def _cold(self, path: str, query: Dict[str, List[str]]) -> List[str]:
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        return self._selects(path, query)
+
+    # -- what the board says -------------------------------------------
+
+    def test_the_headline_sets_the_flaking_tests_aside(self) -> None:
+        self._mark()
+        data = self.call("GET", "/api/summary", query={"parts": ["headline"]})
+        status = data["status"]
+        self.assertEqual(
+            {key: status[key] for key in (
+                "new_failures", "still_failing", "fixed", "flaking",
+                "flaking_new_failures", "flaking_still_failing",
+                "flaky_total")},
+            {"new_failures": 2, "still_failing": 0, "fixed": 1,
+             "flaking": 2, "flaking_new_failures": 1,
+             "flaking_still_failing": 1, "flaky_total": 5})
+        # Still failures: the pass rate's inputs do not move.
+        self.assertEqual(status["results"]["FAIL"], 4)
+        linux = [row for row in data["by_environment"]
+                 if row["environment"] == "linux-sim"][0]
+        self.assertEqual(
+            (linux["failed"], linux["flaking"], linux["new_failures"],
+             linux["muted"], linux["assigned"]), (1, 2, 1, 0, 0))
+        alpha = [row for row in data["top_failing_scripts"]
+                 if row["script"] == "suite/alpha.py"][0]
+        self.assertEqual((alpha["failing"], alpha["flaking"]), (1, 2))
+        self.assertEqual(
+            data["products"],
+            [{"product": "Atlas", "failing": 1, "new_failures": 1,
+              "fixed": 1, "unexpected_passes": 1, "muted": 0,
+              "flaking": 2}])
+        self.assertEqual(
+            data["queue_totals"]["new_failures"], status["new_failures"])
+        self.assertEqual(
+            data["queue_totals"]["still_failing"], status["still_failing"])
+        self.assertEqual(data["queue_totals"]["fixed"], status["fixed"])
+
+    def test_with_no_mark_todays_numbers_exactly(self) -> None:
+        query = {"parts": ["headline"]}
+        before = self.call("GET", "/api/summary", query=query)
+        self._mark()
+        self.call("POST", "/api/flaky/unmark", body={
+            "username": "dev1",
+            "tests": [{"environment": e, "script": s, "test_name": t}
+                      for e, s, t in (
+                          ("linux-sim", "suite/alpha.py", "test_new_fail"),
+                          ("linux-sim", "suite/alpha.py", "test_flaky2"),
+                          ("linux-sim", "suite/alpha.py", "test_still_fail"),
+                          ("linux-sim", "suite/alpha.py", "test_tol"),
+                          ("env2", "smoke.py", "test_first"))]})
+        after = self.call("GET", "/api/summary", query=query)
+        self.assertEqual(after, before)
+        self.assertEqual(before["status"]["flaking"], 0)
+        self.assertEqual(before["status"]["new_failures"], 2)
+
+    def test_the_queues_act_on_the_mark(self) -> None:
+        self._mark()
+
+        def queue(kind: str) -> Dict[str, Any]:
+            return self.call("GET", "/api/summary", query={
+                "parts": ["queue"], "queue": [kind]})["queue"]
+
+        full = self.call("GET", "/api/summary")["queues"]
+        for kind, names in (
+                ("new_failures", ["test_first", "test_still_fail"]),
+                ("still_failing", []),
+                ("fixed", ["test_fixed"])):
+            for payload in (queue(kind), full[kind]):
+                self.assertEqual(
+                    sorted(e["test_name"] for e in payload["tests"]), names,
+                    kind)
+                self.assertEqual(payload["total"], len(names), kind)
+        promoted = [e for e in full["new_failures"]["tests"]
+                    if e["test_name"] == "test_still_fail"][0]
+        # FLAKING -> FAIL (flaky): no new field, the pair says it.
+        self.assertEqual(promoted["prev_result"], "FAIL")
+        self.assertEqual(
+            promoted["flaky"],
+            {"cadence": 3, "marked_by": "dev1",
+             "marked_at": "2026-07-20T00:00:00.000000",
+             "reason": "known race", "state": "failing", "streak": 3,
+             "runs": 3})
+        first = [e for e in full["new_failures"]["tests"]
+                 if e["test_name"] == "test_first"][0]
+        self.assertEqual((first["flaky"]["state"], first["flaky"]["runs"]),
+                         ("failing", 1))
+
+    def test_rows_carry_the_mark_and_its_state(self) -> None:
+        self._mark()
+        for query in ({"limit": ["250"]},
+                      {"open": ["1"], "with_comment": ["1"],
+                       "with_streak": ["1"], "limit": ["100"]}):
+            rows = {row["test_name"]: row for row in self.call(
+                "GET", "/api/dashboard", query=query)["tests"]}
+            states = {name: (None if row["flaky"] is None
+                             else (row["flaky"]["state"],
+                                   row["flaky"]["streak"],
+                                   row["flaky"]["runs"]))
+                      for name, row in rows.items()}
+            expected = {
+                "test_new_fail": ("flaking", 1, None),
+                "test_flaky2": ("flaking", 2, None),
+                "test_still_fail": ("failing", 3, 3),
+                "test_tol": ("passing", 0, None),
+                "test_first": ("failing", 1, 1),
+                "test_fixed": None, "test_note": None,
+            }
+            for name, state in expected.items():
+                if name in states:
+                    self.assertEqual(states[name], state, (name, query))
+            # The wire result stays FAIL, on every listed row whose mark
+            # is flaking or over its cadence.
+            for name, row in rows.items():
+                if row["flaky"] is not None and row["flaky"]["state"] in (
+                        "flaking", "failing"):
+                    self.assertEqual(row["result"], "FAIL", (name, query))
+            if "open" in query:
+                # WP-44 item 8: Open Actions leaves its unassigned
+                # flaking tests out (OpenActionsSetAsideTest).
+                self.assertNotIn("test_flaky2", rows)
+                self.assertNotIn("test_new_fail", rows)
+                self.assertEqual(rows["test_still_fail"]["result"], "FAIL")
+                continue
+            self.assertEqual(rows["test_flaky2"]["result"], "FAIL")
+
+    def test_watch_cards_set_the_flaking_tests_aside(self) -> None:
+        self._mark()
+        cards = {card["spec"]: card for card in self.call(
+            "GET", "/api/watch",
+            query={"c": ["e:linux-sim", "p:Atlas", "e:env2"]})["cards"]}
+        for spec in ("e:linux-sim", "p:Atlas"):
+            card = cards[spec]
+            self.assertEqual(
+                (card["failing"], card["new_failures"], card["fixed"],
+                 card["flaking"], card["unassigned_failing"]),
+                (1, 1, 1, 2, 1), spec)
+        env2 = cards["e:env2"]
+        self.assertEqual((env2["failing"], env2["flaking"],
+                          env2["unassigned_failing"]), (1, 0, 1))
+
+    def test_names_says_a_mark_exists(self) -> None:
+        self.assertIs(self.call("GET", "/api/summary", query={
+            "parts": ["names"]})["flaky_marks"], False)
+        self._mark()
+        self.assertIs(self.call("GET", "/api/summary", query={
+            "parts": ["names"]})["flaky_marks"], True)
+
+    # -- the cache guards (sqlite3's trace: excluded on MariaDB) --------
+
+    def test_the_headline_pays_q1_qc_and_one_q2_cold_and_nothing_warm(
+            self) -> None:
+        """Design §2 B.7: headline base + 2 + one Q2 per 100 tests
+        (here 3: two FAIL-after-FAIL tests and one fix candidate);
+        warm, the base's warm."""
+        query = {"parts": ["headline"]}
+        base_cold = len(self._cold("/api/summary", query))
+        base_warm = len(self._selects("/api/summary", query))
+        self._mark()
+        cold = self._cold("/api/summary", query)
+        self.assertEqual(len(cold), base_cold + 2 + 1, cold)
+        self.assertEqual(len([s for s in cold if "FROM runs WHERE" in s]), 1)
+        self.assertEqual(len(self._selects("/api/summary", query)),
+                         base_warm)
+
+    def test_browse_pays_one_q2_for_its_page_and_its_count_nothing(
+            self) -> None:
+        query = {"limit": ["250"]}
+        base = self._cold("/api/dashboard", query)
+        self._mark()
+        cold = self._cold("/api/dashboard", query)
+        self.assertEqual(len(cold), len(base) + 1, cold)
+        self.assertFalse([s for s in cold
+                          if "CROSS JOIN test_flaky_marks" in s])
+        counts = [s for s in cold if s.startswith("SELECT COUNT(*)")]
+        self.assertEqual(counts, [s for s in base
+                                  if s.startswith("SELECT COUNT(*)")])
+        # The runs read is memoized: a second cold page needs none.
+        self.storage._invalidate_summary_cache()
+        self.assertEqual(len(self._selects("/api/dashboard", query)),
+                         len(base))
+
+    @staticmethod
+    def _flaky_reads(statements: List[str]) -> Tuple[int, int, int]:
+        """(Q1, Qc, Q2 statements) among *statements*."""
+        return (
+            len([s for s in statements
+                 if "CROSS JOIN test_flaky_marks" in s]),
+            len([s for s in statements
+                 if "FROM test_flaky_marks AS fm CROSS JOIN" in s]),
+            len([s for s in statements if "FROM runs WHERE" in s
+                 and "ORDER BY start_time DESC LIMIT" in s]))
+
+    def test_the_queue_part_costs(self) -> None:
+        """New failures and Still failing: Q1 and one Q2; Fixed: Qc, its
+        Q2 and the mute epoch its memo is keyed on; every other queue
+        nothing. A queue the mark shortens runs fewer streak reads than
+        the base, so the total is bounded, not equal."""
+        added = {"new_failures": (1, 0, 1), "still_failing": (1, 0, 1),
+                 "fixed": (0, 1, 1)}
+        base = {}  # type: Dict[str, int]
+        for kind in QUEUE_KINDS:
+            base[kind] = len(self._cold("/api/summary", {
+                "parts": ["queue"], "queue": [kind]}))
+        self._mark()
+        for kind in QUEUE_KINDS:
+            query = {"parts": ["queue"], "queue": [kind]}
+            cold = self._cold("/api/summary", query)
+            reads = added.get(kind, (0, 0, 0))
+            self.assertEqual(self._flaky_reads(cold), reads, (kind, cold))
+            self.assertLessEqual(
+                len(cold), base[kind] + sum(reads)
+                + (1 if kind == "fixed" else 0), (kind, cold))
+            self.assertLessEqual(len(self._selects("/api/summary", query)),
+                                 base[kind], kind)
+
+    def test_the_full_payload_and_watch_pay_once(self) -> None:
+        base_full = len(self._cold("/api/summary", {}))
+        watch = {"c": ["e:linux-sim", "p:Atlas"]}
+        base_watch = len(self._cold("/api/watch", watch))
+        self._mark()
+        full = self._cold("/api/summary", {})
+        self.assertEqual(self._flaky_reads(full), (1, 1, 1), full)
+        self.assertLessEqual(len(full), base_full + 3)
+        cold_watch = self._cold("/api/watch", watch)
+        self.assertEqual(self._flaky_reads(cold_watch), (1, 1, 1))
+        self.assertEqual(len(cold_watch), base_watch + 3)
+
+    # -- WP-44 item 8: the lists and filters ----------------------------
+
+    def _names_of(self, query: Dict[str, List[str]]) -> Tuple[List[str], int]:
+        data = self.call("GET", "/api/dashboard", query=query)
+        return [row["test_name"] for row in data["tests"]], data["total"]
+
+    def test_open_actions_leaves_out_the_unassigned_flaking(self) -> None:
+        """X here is test_new_fail and test_flaky2. Assigned, test_flaky2
+        is listed again, reading FLAKING; the rows, the total and bulk
+        assign agree on the set."""
+        query = {"open": ["1"], "limit": ["100"]}
+        today, today_total = self._names_of(query)
+        self._mark()
+        names, total = self._names_of(query)
+        self.assertEqual(
+            names, [n for n in today
+                    if n not in ("test_new_fail", "test_flaky2")])
+        self.assertEqual((total, today_total - total), (len(names), 2))
+        failing = {"open": ["1"], "result": ["FAIL", "FLAKING"],
+                   "limit": ["100"]}
+        self.assertEqual(sorted(self._names_of(failing)[0]),
+                         ["test_first", "test_still_fail"])
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_flaky2", "/assignee"),
+                  body={"username": "dev1", "assigned_by": "dev1"})
+        rows = {row["test_name"]: row for row in self.call(
+            "GET", "/api/dashboard", query=query)["tests"]}
+        self.assertEqual(rows["test_flaky2"]["flaky"]["state"], "flaking")
+        self.assertIsNone(rows["test_flaky2"]["mute"])
+        self.assertNotIn("test_new_fail", rows)
+        unassigned = {"open": ["1"], "unassigned": ["1"]}
+        expected = self._names_of(unassigned)
+        updated = self.call(
+            "POST", "/api/assignments/bulk", query=unassigned,
+            body={"username": "dev1", "assigned_by": "dev1"})["updated"]
+        self.assertEqual(updated, expected[1])
+        self.assertEqual(self._names_of(unassigned), ([], 0))
+        # test_new_fail, the one X left, is still nobody's.
+        self.assertIsNone(self.storage.current_assignee(
+            "linux-sim", "suite/alpha.py", "test_new_fail"))
+
+    def test_the_result_filter_has_flaking(self) -> None:
+        self._mark()
+        flaking, total = self._names_of({"result": ["FLAKING"]})
+        self.assertEqual((sorted(flaking), total),
+                         (["test_flaky2", "test_new_fail"], 2))
+        fail, total = self._names_of({"result": ["FAIL"]})
+        self.assertEqual((sorted(fail), total),
+                         (["test_first", "test_still_fail"], 2))
+        both, total = self._names_of({"result": ["FAIL", "FLAKING"]})
+        self.assertEqual(sorted(both), sorted(flaking + fail))
+        self.assertEqual(total, 4)
+        # Repeatable, and every other value composes: FLAKING with UP.
+        with_up, total = self._names_of(
+            {"result": ["FLAKING", "UNEXPECTED_PASS"]})
+        self.assertEqual(sorted(with_up),
+                         ["test_flaky2", "test_new_fail", "test_note"])
+        # Sorting stays on the wire value.
+        rows = self.call("GET", "/api/dashboard", query={
+            "result": ["FLAKING"], "sort": ["result"]})["tests"]
+        self.assertEqual({row["result"] for row in rows}, {"FAIL"})
+        # Bulk assign acts on the same set.
+        updated = self.call(
+            "POST", "/api/assignments/bulk", query={"result": ["FLAKING"]},
+            body={"username": "dev1", "assigned_by": "dev1"})["updated"]
+        self.assertEqual(updated, 2)
+        self.assertEqual(
+            sorted(self._names_of({"assignee": ["dev1"]})[0]),
+            ["test_flaky2", "test_new_fail"])
+
+    def test_flaking_with_no_mark_is_an_empty_page(self) -> None:
+        self.assertEqual(self._names_of({"result": ["FLAKING"]}), ([], 0))
+        fail = self._names_of({"result": ["FAIL"]})
+        self.assertEqual(self._names_of({"result": ["FAIL", "FLAKING"]}),
+                         fail)
+
+    def test_an_unknown_result_names_flaking_among_the_values(self) -> None:
+        body = self.call("GET", "/api/dashboard",
+                         query={"result": ["FLAKY"]}, expect=400)
+        self.assertIn("FLAKING", body["error"])
+        self.assertIn("'FLAKY'", body["error"])
+
+    def test_the_trend_carries_fail_flaking(self) -> None:
+        """Each night as it stood then, under today's marks: test_still_
+        fail's FAILs of the 24th and 25th were tolerated and the 26th's
+        went over; test_tol's of the 23rd was its first run (over),
+        the 25th's tolerated; test_flaky2's two and test_new_fail's one
+        tolerated. Assigned now, test_flaky2's leave FAIL_ASSIGNED."""
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_flaky2", "/assignee"),
+                  body={"username": "dev1", "assigned_by": "dev1"})
+        query = {"parts": ["assigned_trend"], "days": ["7"]}
+        before = {n["date"]: n for n in self.call(
+            "GET", "/api/summary", query=query)["trend"]["nights"]}
+        self.assertEqual(
+            [before[d]["FAIL_FLAKING"] for d in sorted(before)], [0] * 7)
+        self._mark()
+        after = {n["date"]: n for n in self.call(
+            "GET", "/api/summary", query=query)["trend"]["nights"]}
+        self.assertEqual(
+            {d: after[d]["FAIL_FLAKING"] for d in sorted(after)
+             if after[d]["FAIL_FLAKING"]},
+            {"2026-07-24": 1, "2026-07-25": 3, "2026-07-26": 2})
+        for day in ("2026-07-25", "2026-07-26"):
+            self.assertEqual(after[day]["FAIL_ASSIGNED"],
+                             before[day]["FAIL_ASSIGNED"] - 1, day)
+        full = {n["date"]: n for n in self.call(
+            "GET", "/api/summary", query={"days": ["7"]})["trend"]["nights"]}
+        for day, night in after.items():
+            self.assertLessEqual(
+                night["FAIL_ASSIGNED"] + night["FAIL_MUTED"]
+                + night["FAIL_FLAKING"], full[day]["FAIL"], day)
+            self.assertGreaterEqual(night["FAIL_ASSIGNED"], 0)
+        assert_no_trend_split(self, self.call(
+            "GET", "/api/summary", query={"parts": ["headline"]}))
+
+    def _flaking(self, **query: List[str]) -> Dict[str, Any]:
+        return self.call("GET", "/api/summary", query=dict(
+            query, parts=["queue"], queue=["flaking"]))
+
+    def test_the_flaking_queue(self) -> None:
+        """WP-44 item 14 (design §14): ``queue=flaking`` is the queue part
+        as for any other kind: the tests flaking now (test_flaky2 and
+        test_new_fail; test_still_fail is over its cadence and New,
+        test_first failing, test_tol passing), nearest to its cadence
+        first, ``total`` the headline's ``status.flaking``. A virtual
+        kind: in no ``queue_totals`` and not in the unsliced payload;
+        ``assignee`` is ignored."""
+        self._mark()
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_flaky2", "/assignee"),
+                  body={"username": "dev1", "assigned_by": "dev1"})
+        data = self._flaking()
+        new = self.call("GET", "/api/summary", query={
+            "parts": ["queue"], "queue": ["new_failures"]})
+        self.assertEqual(sorted(data), sorted(new))
+        self.assertEqual((data["kind"], data["queue_cap"], data["stream"]),
+                         ("flaking", 500, MAINLINE_STREAM_ID))
+        self.assertEqual(sorted(data["queue"]), sorted(new["queue"]))
+        tests = data["queue"]["tests"]
+        self.assertEqual([row["test_name"] for row in tests],
+                         ["test_flaky2", "test_new_fail"])
+        self.assertEqual(data["queue"]["total"], 2)
+        self.assertEqual(sorted(tests[0]), sorted(new["queue"]["tests"][0]))
+        self.assertEqual(tests[0]["flaky"], {
+            "cadence": 3, "marked_by": "dev1",
+            "marked_at": "2026-07-20T00:00:00.000000",
+            "reason": "known race", "state": "flaking", "streak": 2,
+            "runs": None})
+        self.assertEqual(tests[1]["flaky"]["streak"], 1)
+        self.assertEqual(
+            [(row["result"], row["prev_result"], row["failing_since"],
+              row["last_pass_time"], row["mute"]) for row in tests],
+            [("FAIL", "FAIL", None, None, None),
+             ("FAIL", "PASS", None, None, None)])
+        self.assertEqual((tests[0]["assignee"], tests[1]["assignee"]),
+                         ("dev1", None))
+        headline = self.call("GET", "/api/summary",
+                             query={"parts": ["headline"]})
+        self.assertEqual(headline["status"]["flaking"], 2)
+        self.assertNotIn("flaking", headline["queue_totals"])
+        self.assertNotIn("flaking", self.call("GET", "/api/summary")["queues"])
+        # assignee is ignored; a product narrows, an unknown one empties;
+        # env2 holds only a failing mark.
+        self.assertEqual(self._flaking(assignee=["nobody"])["queue"],
+                         data["queue"])
+        self.assertEqual(self._flaking(product=["Atlas"])["queue"],
+                         data["queue"])
+        self.assertEqual(self._flaking(product=["Nowhere"])["queue"],
+                         {"total": 0, "tests": []})
+        self.assertEqual(self._flaking(environment=["env2"])["queue"],
+                         {"total": 0, "tests": []})
+        # Muted: out of the rows and of total.
+        self.storage.mute_tests(
+            [("linux-sim", "suite/alpha.py", "test_new_fail",
+              MAINLINE_STREAM_ID)],
+            "infra", 24, "dev1", "dev1", datetime.datetime(2026, 7, 26, 11))
+        self.assertEqual(
+            [row["test_name"] for row in self._flaking()["queue"]["tests"]],
+            ["test_flaky2"])
+
+    def test_the_flaking_queue_with_no_mark_is_empty(self) -> None:
+        self.assertEqual(self._flaking()["queue"], {"total": 0, "tests": []})
+        body = self.call("GET", "/api/summary", query={
+            "parts": ["queue"], "queue": ["flaky"]}, expect=400)
+        self.assertIn("flaking", body["error"])
+        self.assertIn("'flaky'", body["error"])
+
+    def test_get_api_flaky_is_no_longer_served(self) -> None:
+        """WP-44 item 14: the Flaky tab's own read is gone: an unknown
+        path, as any other, with or without a mark. The acts stay."""
+        for marked in (False, True):
+            if marked:
+                self._mark()
+            for method in ("GET", "POST"):
+                self.assertEqual(
+                    self.call(method, "/api/flaky", expect=404),
+                    {"error": "not found"}, (marked, method))
+            self.assertEqual(
+                self.call("GET", "/api/flaky", query={
+                    "limit": ["100"], "offset": ["0"]}, expect=404),
+                {"error": "not found"})
+        self.assert_405("GET", "/api/flaky/bulk", "POST")
+        self.assert_405("GET", "/api/flaky/unmark", "POST")
+
+    def test_the_open_assignment_figures_do_not_move(self) -> None:
+        """OpenAssignmentFiguresUnchangedTest's API half: the full
+        payload's assigned_open, queue_totals.assigned and .mine and the
+        assigned and My actions queues, byte for byte with and without
+        the marks, bar the rows' ``flaky``."""
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_flaky2", "/assignee"),
+                  body={"username": "dev1", "assigned_by": "dev1"})
+
+        def figures() -> Dict[str, Any]:
+            data = self.call("GET", "/api/summary",
+                             query={"assignee": ["dev1"]})
+            queues = {}  # type: Dict[str, Any]
+            for kind in ("assigned", "mine"):
+                payload = data["queues"][kind]
+                queues[kind] = {
+                    "total": payload["total"],
+                    "tests": [{key: value for key, value in row.items()
+                               if key != "flaky"}
+                              for row in payload["tests"]]}
+            return {
+                "assigned_open": data["status"]["assigned_open"],
+                "assigned": data["queue_totals"]["assigned"],
+                "mine": data["queue_totals"]["mine"],
+                "queues": queues,
+            }
+
+        # Marked first, then unmarked: a fresh mark's reason is posted as
+        # a comment (decision 10), which the rows carry either way.
+        self._mark()
+        marked = figures()
+        self.call("POST", "/api/flaky/unmark", body={
+            "username": "dev1",
+            "tests": [{"environment": "linux-sim",
+                       "script": "suite/alpha.py", "test_name": name}
+                      for name in ("test_new_fail", "test_flaky2",
+                                   "test_still_fail", "test_tol")]
+            + [{"environment": "env2", "script": "smoke.py",
+                "test_name": "test_first"}]})
+        self.assertEqual(figures(), marked)
+        self.assertEqual(marked["queues"]["mine"]["total"], 1)
+        self.assertEqual(
+            [row["test_name"] for row in marked["queues"]["mine"]["tests"]],
+            ["test_flaky2"])
+
+    # -- item 8's cache guards (sqlite3's trace: excluded on MariaDB) ---
+
+    @staticmethod
+    def _reads_of(statements: List[str]) -> List[str]:
+        """*statements* without the per-row streak reads Open Actions
+        makes (``with_streak``), which follow the rows it lists."""
+        return [s for s in statements
+                if not s.startswith(("SELECT start_time FROM runs",
+                                     "SELECT MIN(start_time) FROM runs",
+                                     "SELECT environment, script, "
+                                     "test_name, result, start_time "
+                                     "FROM runs"))]
+
+    def test_the_filtered_reads_cost(self) -> None:
+        """Design §2 B.7: Open Actions and browse with Failing or
+        Flaking, cold, are the base's statements plus Q1 and one Q2 per
+        100 tests (here one). The environments Q1's memo is kept for are
+        those that hold a mark, read on the statement that already
+        carries the "any mark" bit, so neither the stream's environment
+        list nor any other statement is read for them. Warm after the
+        headline, the base's. Open Actions answers its rows and total by
+        keys on SQLite: the same two statements as the base's rows and
+        count. Failing and Flaking together is today's FAIL and reads no
+        mark beyond the rows' own."""
+        reads = {
+            "open": {"open": ["1"], "with_comment": ["1"],
+                     "with_streak": ["1"], "limit": ["100"]},
+            "fail": {"result": ["FAIL"], "limit": ["250"]},
+            "flaking": {"result": ["FLAKING"], "limit": ["250"]},
+            "both": {"result": ["FAIL", "FLAKING"], "limit": ["250"]},
+        }
+        base = {name: self._reads_of(self._cold("/api/dashboard", query))
+                for name, query in reads.items()}
+        self.assertEqual(len(base["flaking"]), 1)
+        self._mark()
+        for name, query in reads.items():
+            cold = self._reads_of(self._cold("/api/dashboard", query))
+            q1, _qc, q2 = self._flaky_reads(cold)
+            names = [s for s in cold
+                     if s.startswith("SELECT DISTINCT environment FROM")]
+            if name == "both":
+                # The rows' own runs read for the page (item 6), no Q1.
+                self.assertEqual((q1, q2, len(names)), (0, 1, 0), cold)
+                self.assertEqual(len(cold), len(base[name]) + 1, cold)
+                continue
+            self.assertEqual((q1, q2, len(names)), (1, 1, 0), (name, cold))
+            expected = len(base["fail"] if name == "flaking"
+                           else base[name])
+            self.assertEqual(len(cold), expected + 2, (name, cold))
+            if name == "open":
+                self.assertTrue(
+                    [s for s in cold if s.startswith(
+                        "SELECT lr.environment, lr.script, lr.test_name, "
+                        "lr.result FROM latest_runs")], cold)
+                self.assertFalse(
+                    [s for s in cold if s.startswith("SELECT COUNT(*)")])
+        self.call("GET", "/api/summary", query={"parts": ["headline"]})
+        for name, query in reads.items():
+            warm = self._reads_of(self._selects("/api/dashboard", query))
+            expected = len(base["fail"] if name == "flaking"
+                           else base[name])
+            self.assertEqual(len(warm), expected, (name, warm))
+
+    def test_no_count_joins_the_marks_with_marks(self) -> None:
+        """The count-join guard with marks present: every COUNT(*) of the
+        filtered reads joins no flaky table; the F term reads ``lr``
+        only. (Open Actions with an X to leave out counts by keys on
+        SQLite: test_the_filtered_reads_cost.)"""
+        self._mark()
+        for query in ({"result": ["FAIL"]}, {"result": ["FLAKING"]},
+                      {"result": ["FAIL", "PASS"]},
+                      {"result": ["FLAKING", "PASS"]},
+                      {"open": ["1"], "result": ["FAIL"],
+                       "assignee": ["dev1"]}):
+            counts = [s for s in self._cold("/api/dashboard", query)
+                      if s.upper().startswith("SELECT COUNT(")]
+            self.assertTrue(counts, query)
+            for statement in counts:
+                self.assertNotIn("TEST_FLAKY_MARKS", statement.upper())
+                self.assertNotIn("FLAKY_MARK_HISTORY", statement.upper())
+                self.assertNotIn("JOIN TEST_MUTES", statement.upper())
+
+    def test_the_trend_part_costs(self) -> None:
+        """The trend part: one more statement cold (the marks and their
+        runs in the window) and one Q2 for the tests whose first run in
+        the window failed; nothing warm. (Item 14 removes the tab's half
+        of this guard with its endpoint: test_the_flaking_queue_costs.)"""
+        query = {"parts": ["assigned_trend"]}
+        base = self._cold("/api/summary", query)
+        self._mark()
+        cold = self._cold("/api/summary", query)
+        self.assertEqual(len(cold), len(base) + 2, cold)
+        self.assertEqual(len([s for s in cold
+                              if "CROSS JOIN runs AS r ON r.environment = "
+                              "fm.environment" in s]), 1, cold)
+        self.assertEqual(self._selects("/api/summary", query), [])
+
+    @staticmethod
+    def _rows_by_key(statements: List[str]) -> List[str]:
+        """The Flaking queue's rows statements among *statements*, in
+        either spelling of ``Storage._rows_by_key`` (WP-44 item 16: on
+        SQLite the keys drive the read; which spelling a backend uses is
+        FlakyPlanTest's to pin, the count is this test's)."""
+        return [s for s in statements
+                if "JOIN runs AS r ON r.id = lr.run_id" in s
+                and ("lr.test_name) IN (VALUES (" in s
+                     or ") AS k CROSS JOIN latest_runs AS lr ON " in s)]
+
+    def test_the_flaking_queue_costs(self) -> None:
+        """Item 14 (design §14), in the design pass's terms. P is the
+        prefix every queue fetch pays whatever its kind (the products
+        map, the pass view's reads): the statements of a cold
+        ``queue=flaking`` with no mark, bar the bit.
+
+        - No mark: P+1, the mute epoch's statement carrying the bit,
+          which every failing queue kind reads; no statement the New
+          failures queue does not run.
+        - Cold with marks: P+4 here (the bit, Q1, one Q2 at N+1, the
+          rows by key; the marked environments come from the pass view's
+          environment list, so no DISTINCT), at most the design's P+5;
+          no count statement beyond P's, no runs read but Q2.
+        - After the headline: P+1, the rows statement alone.
+        - Warm: P."""
+        query = {"parts": ["queue"], "queue": ["flaking"]}
+        nothing = self._cold("/api/summary", query)
+        bit = [s for s in nothing if "test_flaky_marks" in s]
+        self.assertEqual(len(bit), 1, nothing)
+        self.assertIn("FROM test_mutes WHERE stream_id = ", bit[0])
+        prefix = [s for s in nothing if s not in bit]
+        new = self._cold("/api/summary", {
+            "parts": ["queue"], "queue": ["new_failures"]})
+        self.assertEqual([s for s in nothing if s not in new], [], new)
+        self.assertEqual(len(new), len(prefix) + 3, new)
+        warm_prefix = self._selects("/api/summary", query)
+        self.assertEqual(len(warm_prefix), 3, warm_prefix)
+        self._mark()
+        cold = self._cold("/api/summary", query)
+        self.assertEqual(cold[:len(prefix)], prefix, cold)
+        self.assertEqual(len(cold), len(prefix) + 4, cold)
+        self.assertEqual(self._flaky_reads(cold), (1, 0, 1), cold)
+        self.assertEqual(len(self._rows_by_key(cold)), 1, cold)
+        self.assertEqual(
+            [s for s in cold if s.upper().startswith("SELECT COUNT(")],
+            [s for s in prefix if s.upper().startswith("SELECT COUNT(")])
+        self.assertEqual(len([s for s in cold if "FROM runs" in s]), 1, cold)
+        self.assertEqual(self._selects("/api/summary", query), warm_prefix)
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        self.call("GET", "/api/summary", query={"parts": ["headline"]})
+        after = self._selects("/api/summary", query)
+        self.assertEqual(len(after), len(warm_prefix) + 1, after)
+        self.assertEqual(self._rows_by_key(after), [after[-1]], after)
+
+
+class FlakingQueueAgreesWithHeadlineTest(ApiCase):
+    """WP-44 item 14 (design §14; item 11's FlakyTabAgreesWithHeadlineTest
+    reworked onto the queue): ``queue=flaking``'s ``total`` is the
+    headline's ``status.flaking`` in every scope the tab can be opened in
+    (mainline, a build with its floor, one environment, one product), and
+    the queue lists exactly those tests. The browse filter's
+    ``result=FLAKING`` count is the same set (design §2 B.1's F). A row
+    has exactly the keys a Still failing row has, so the page's shared
+    renderer and the Review panel need nothing new.
+
+    Every marked state is present, on mainline and on the build alike:
+    flaking (new, still, assigned), flaking under a live mute, flaking
+    and retired, promoted tonight, failing past its cadence, passing
+    after a tolerated failure, plus an unmarked failure. Cadence 3; each
+    history oldest first, the last night the 26th."""
+
+    MARKED_AT = datetime.datetime(2026, 7, 15)
+    ALPHA = ("linux-sim", "suite/alpha.py")
+    SMOKE = ("env2", "smoke.py")
+    HISTORIES = (
+        (ALPHA, "t_flaking", ("PASS", "FAIL"), True),
+        (ALPHA, "t_flaking_still", ("PASS", "FAIL", "FAIL"), True),
+        (ALPHA, "t_flaking_assigned", ("PASS", "FAIL"), True),
+        (ALPHA, "t_flaking_muted", ("PASS", "FAIL"), True),
+        (ALPHA, "t_flaking_retired", ("PASS", "FAIL"), True),
+        (ALPHA, "t_promoted", ("PASS", "FAIL", "FAIL", "FAIL"), True),
+        (ALPHA, "t_over", ("FAIL",) * 5, True),
+        (ALPHA, "t_passing", ("FAIL", "PASS", "FAIL", "PASS"), True),
+        (ALPHA, "t_unmarked", ("PASS", "FAIL"), False),
+        (SMOKE, "t_env2_flaking", ("UNEXPECTED_PASS", "FAIL"), True),
+        (SMOKE, "t_env2_over", ("FAIL",) * 4, True),
+    )
+    #: The tests flaking now in each scope, in the queue's order: one
+    #: FAIL from the cadence first, then environment, script, test name.
+    FLAKING_ALPHA = ["t_flaking_still", "t_flaking", "t_flaking_assigned"]
+    FLAKING_ALL = ["t_flaking_still", "t_env2_flaking", "t_flaking",
+                   "t_flaking_assigned"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        records = []  # type: List[Dict[str, Any]]
+        # Mainline at 02:00 and the build at 04:00, the same results.
+        for build, hour in ((None, 2), ("rc1", 4)):
+            for (environment, script), name, results, _marked in (
+                    self.HISTORIES):
+                for day, result in zip(range(27 - len(results), 27),
+                                       results):
+                    start = datetime.datetime(2026, 7, day, hour)
+                    overrides = {
+                        "environment": environment, "script": script,
+                        "test_name": name, "result": result,
+                        "start_time": format_iso(start),
+                        "end_time": format_iso(
+                            start + datetime.timedelta(minutes=5)),
+                    }  # type: Dict[str, Any]
+                    if build is not None:
+                        overrides["build"] = build
+                    records.append(record(**overrides))
+        self.import_runs(records)
+        self.build = [s.stream_id for s in self.storage.list_streams("")
+                      if s.stream_id != MAINLINE_STREAM_ID][0]
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+        self.storage.mark_flaky(
+            [scope + (name, None)
+             for scope, name, _results, marked in self.HISTORIES if marked],
+            3, "known race", "dev1", self.MARKED_AT)
+        self.storage.set_assignee(
+            "linux-sim", "suite/alpha.py", "t_flaking_assigned", "dev1",
+            "dev1", self.MARKED_AT)
+        self.storage.mute_tests(
+            [self.ALPHA + ("t_flaking_muted", stream)
+             for stream in (MAINLINE_STREAM_ID, self.build)],
+            "infra", 24, "dev1", "dev1", NOW - datetime.timedelta(hours=1))
+        self.storage.set_retired(
+            "linux-sim", "suite/alpha.py", "t_flaking_retired", True,
+            "dev1", "gone", self.MARKED_AT)
+
+    def _scopes(self) -> List[Tuple[str, Dict[str, List[str]], List[str]]]:
+        build = [str(self.build)]
+        return [
+            ("mainline", {}, self.FLAKING_ALL),
+            ("build", {"stream": build}, self.FLAKING_ALL),
+            ("environment", {"environment": ["linux-sim"]},
+             self.FLAKING_ALPHA),
+            ("product", {"product": ["Atlas"]}, self.FLAKING_ALPHA),
+            ("build environment", {"stream": build,
+                                   "environment": ["env2"]},
+             ["t_env2_flaking"]),
+            ("build product", {"stream": build, "product": ["Atlas"]},
+             self.FLAKING_ALPHA),
+        ]
+
+    def _queue(self, kind: str, scope: Dict[str, List[str]]
+               ) -> Dict[str, Any]:
+        return self.call("GET", "/api/summary", query=dict(
+            scope, parts=["queue"], queue=[kind]))["queue"]
+
+    def test_total_is_the_headlines_flaking_in_every_scope(self) -> None:
+        for name, scope, expected in self._scopes():
+            for warm in (False, True):
+                if not warm:
+                    self.storage._invalidate_summary_cache()
+                    self.storage._invalidate_trend_cache()
+                queue = self._queue("flaking", scope)
+                headline = self.call("GET", "/api/summary", query=dict(
+                    scope, parts=["headline"]))
+                self.assertEqual(queue["total"],
+                                 headline["status"]["flaking"], name)
+                self.assertEqual(queue["total"], len(expected), name)
+                # The set, and the order: nearest to the cadence first.
+                self.assertEqual([row["test_name"] for row in queue["tests"]],
+                                 expected, name)
+                for row in queue["tests"]:
+                    self.assertEqual(
+                        (row["flaky"]["state"], row["mute"], row["result"]),
+                        ("flaking", None, "FAIL"), (name, row))
+
+    def test_the_rows_are_total_up_to_the_cap(self) -> None:
+        """With no race, ``len(tests) == min(total, queue_cap)`` in every
+        scope, cold and after the headline."""
+        for name, scope, _expected in self._scopes():
+            for after_headline in (False, True):
+                self.storage._invalidate_summary_cache()
+                self.storage._invalidate_trend_cache()
+                if after_headline:
+                    self.call("GET", "/api/summary", query=dict(
+                        scope, parts=["headline"]))
+                data = self.call("GET", "/api/summary", query=dict(
+                    scope, parts=["queue"], queue=["flaking"]))
+                self.assertEqual(
+                    len(data["queue"]["tests"]),
+                    min(data["queue"]["total"], data["queue_cap"]),
+                    (name, after_headline))
+
+    def test_the_browse_filters_flaking_count_is_the_same_set(self) -> None:
+        for name, scope, expected in self._scopes():
+            browse = self.call("GET", "/api/dashboard", query=dict(
+                scope, result=["FLAKING"], limit=["250"]))
+            queue = self._queue("flaking", scope)
+            self.assertEqual(browse["total"], queue["total"], name)
+            self.assertEqual(
+                sorted(row["test_name"] for row in browse["tests"]),
+                sorted(row["test_name"] for row in queue["tests"]), name)
+
+    def test_a_row_has_exactly_the_keys_of_a_still_failing_row(
+            self) -> None:
+        """t_over and t_env2_over are failing past their cadence: Still
+        failing rows, beside the flaking ones, in every scope. Key for
+        key, the row and every object nested in it (``flaky``,
+        ``latest_comment``, ``mute``), each present on both sides: a
+        comment on every test, and a mute that lapsed two days ago on
+        t_over, t_env2_over, t_flaking and t_env2_flaking (a lapsed mute
+        is on the row and sets nothing aside), on both streams. No
+        nested object differs between the two kinds."""
+        lapsed = NOW - datetime.timedelta(hours=48)
+        for scope, name, _results, _marked in self.HISTORIES:
+            self.storage.add_comment(scope[0], scope[1], name, "dev1",
+                                     "looked at it", lapsed)
+        self.storage.mute_tests(
+            [scope + (name, stream)
+             for scope, name in ((self.ALPHA, "t_over"),
+                                 (self.SMOKE, "t_env2_over"),
+                                 (self.ALPHA, "t_flaking"),
+                                 (self.SMOKE, "t_env2_flaking"))
+             for stream in (MAINLINE_STREAM_ID, self.build)],
+            "infra", 1, "dev1", "dev1", lapsed)
+        nested = set()  # type: Set[str]
+        for name, scope, _expected in self._scopes():
+            still = self._queue("still_failing", scope)["tests"]
+            flaking = self._queue("flaking", scope)["tests"]
+            self.assertTrue(still, name)
+            self.assertTrue(flaking, name)
+            for row in flaking:
+                for other in still:
+                    self.assertEqual(sorted(row), sorted(other), name)
+                    for key in row:
+                        if not (isinstance(row[key], dict)
+                                or isinstance(other[key], dict)):
+                            continue
+                        if row[key] is None or other[key] is None:
+                            # A test with no comment or no mute on it;
+                            # the pairs that have both are compared.
+                            continue
+                        self.assertIsInstance(row[key], dict, (name, key))
+                        self.assertIsInstance(other[key], dict, (name, key))
+                        self.assertEqual(sorted(row[key]),
+                                         sorted(other[key]), (name, key))
+                        nested.add(key)
+        self.assertEqual(nested, {"flaky", "latest_comment", "mute"})
+
+    def test_the_streak_is_the_fails_in_a_row_at_the_latest_run(
+            self) -> None:
+        histories = {name: results
+                     for _scope, name, results, _marked in self.HISTORIES}
+        for name, scope, _expected in self._scopes():
+            for row in self._queue("flaking", scope)["tests"]:
+                results = histories[row["test_name"]]
+                streak = len(results) - len(
+                    "".join("F" if r == "FAIL" else "." for r in results
+                            ).rstrip("F"))
+                self.assertEqual(row["flaky"]["streak"], streak,
+                                 (name, row["test_name"]))
+                self.assertTrue(
+                    1 <= row["flaky"]["streak"] < row["flaky"]["cadence"],
+                    (name, row["flaky"]))
+
+    def test_disjoint_from_the_failing_and_fixed_queues(self) -> None:
+        """No flaking test is in New failures, Still failing or Fixed; the
+        muted flaking test is in Muted alone of the five."""
+        for name, scope, _expected in self._scopes():
+            queues = {kind: set(row["test_name"]
+                                for row in self._queue(kind, scope)["tests"])
+                      for kind in ("new_failures", "still_failing", "fixed",
+                                   "muted", "flaking")}
+            for kind in ("new_failures", "still_failing", "fixed", "muted"):
+                self.assertEqual(queues[kind] & queues["flaking"], set(),
+                                 (name, kind))
+            if scope.get("environment") == ["env2"]:
+                continue
+            self.assertEqual(
+                [kind for kind in sorted(queues)
+                 if "t_flaking_muted" in queues[kind]], ["muted"], name)

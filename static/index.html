@@ -136,7 +136,7 @@
                suite's page for its individual executions. -->
           <h3>Failing runs per day</h3>
           <div id="trend-chart"></div>
-          <p id="trend-split-caption" class="chart-caption" hidden>Assigned and muted are as they stand now: a day's columns recolour as tests are taken.</p>
+          <p id="trend-split-caption" class="chart-caption" hidden>Assigned and muted are as they stand now: a day's columns recolour as tests are taken.<span id="trend-mark-caption" hidden></span></p>
           <details>
             <summary>Data table</summary>
             <table class="data-table small" id="trend-table">
@@ -147,6 +147,7 @@
                   <th class="num trend-split-col" hidden>Unassigned</th>
                   <th class="num trend-split-col" hidden>Assigned</th>
                   <th class="num trend-split-col" hidden>Muted</th>
+                  <th class="num trend-mark-col" hidden>Flaking</th>
                   <th class="num">Unexpected pass</th>
                   <th class="num">Runs</th>
                 </tr>
@@ -187,6 +188,9 @@
         <div>
           <strong>All clear.</strong>
           <span class="muted">No new failures, nothing still failing, no stale annotations.</span>
+          <!-- What the claim leaves out: the failing tests that are muted
+               or flaking, filled by app.js; hidden when there are none. -->
+          <div id="all-clear-aside" class="muted" hidden></div>
         </div>
       </div>
       <div class="table-wrap">

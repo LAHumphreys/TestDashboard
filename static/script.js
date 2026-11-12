@@ -20,11 +20,13 @@ import {
   clearNode,
   el,
   fetchJson,
+  flakyTag,
   formatDuration,
   formatTime,
   renderUserWidget,
   resultChip,
   resultClass,
+  rowResult,
   showError,
 } from "./api.js";
 import { stackedColumnChart } from "./charts.js";
@@ -212,7 +214,10 @@ function renderTests(rows, append) {
   }
   for (const row of rows) {
     const tr = document.createElement("tr");
-    const marker = resultClass(row.result);
+    // One displayed result for the edge and the chip (WP-44). The
+    // execution breakdown above stays raw: a run is what happened.
+    const shown = rowResult(row);
+    const marker = resultClass(shown);
     if (marker) {
       tr.className = marker;
     }
@@ -234,7 +239,11 @@ function renderTests(rows, append) {
     tr.appendChild(cell);
 
     const resultCell = el("td");
-    resultCell.appendChild(resultChip(row.result));
+    resultCell.appendChild(resultChip(shown));
+    const tag = flakyTag(row);
+    if (tag) {
+      resultCell.appendChild(tag);
+    }
     tr.appendChild(resultCell);
     tr.appendChild(el("td", "", formatTime(row.start_time)));
     tr.appendChild(el("td", "", row.assignee || "—"));

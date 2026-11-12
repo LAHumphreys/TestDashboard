@@ -315,6 +315,23 @@ export function unmuteUrl() {
   );
 }
 
+/* Flaky marks (WP-44), the mute pair's twins: a mark covers its test on
+ * every stream, and the stream a selection was made on travels per
+ * test, inside the body, to tag the reason's comment. */
+export function bulkFlakyUrl() {
+  return apiUrl(
+    "api/flaky/bulk", null,
+    { product: null, stream: null, baseline: null, environment: null },
+  );
+}
+
+export function unmarkFlakyUrl() {
+  return apiUrl(
+    "api/flaky/unmark", null,
+    { product: null, stream: null, baseline: null, environment: null },
+  );
+}
+
 /** The current page, scoped to a different stream (null = mainline).
  * Resets `baseline` (a stream's own comparison choice belongs to THAT
  * stream) per the hierarchy rule; leaves `product`/`environment` alone,
