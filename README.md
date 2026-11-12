@@ -460,7 +460,7 @@ waiting for its slowest piece (this is what the home screen does):
 - `parts=queue&queue=<kind>` — one queue's rows:
   `{"generated_at", "environment", "stale_before", "queue_cap",
   "kind", "queue": {"total": n, "tests": [QueueEntry, ...]}}`.
-  `kind` is a queue name below or `mine`.
+  `kind` is a queue name below, `mine` or `flaking`.
 - `parts=names` — the catalogue only: `environments`, `assignees`,
   `products` (names), `assignment_streams`, `stale_before` and `flaky_marks`
   (whether any flaky mark exists). Open Actions' first paint asks for this
@@ -534,6 +534,12 @@ Definitions (matching the analytics semantics above):
   not a client-side filter of `assigned`, which would hide a user's own tests
   behind other people's once the estate has more open items than the cap.
   Without an `assignee` parameter it is `{"total": 0, "tests": []}`.
+- `flaking` is the tests flaking now (see [Flaky marks](#flaky-marks-wp-44--apiflaky)):
+  marked, failing within their cadence, with no live mute. It is not a key of
+  `queue_totals` or of `queues` in the full payload; its count is
+  `status.flaking`, which its `total` equals. Its entries are QueueEntries
+  like any other queue's, each with `flaky` set, ordered nearest to counting
+  as a failure first (`cadence - streak` ascending).
 - `trend.nights` is zero-filled: every UTC calendar day in the window appears
   even when nothing ran. Its cost tracks the *width of the window*, not the
   size of the history behind it.
@@ -880,10 +886,11 @@ newest first (`action` is `mute`, `extend` or `unmute`).
 
 A person can **mark** a test as flaky, with a **cadence** of 2 to 10: "fail if
 the N most recent runs fail". While a marked test is failing and its last N
-runs have not all failed it is **flaking**: it is set aside from the failing
-figures and from triage, shown in its own muted colour as FLAKING, and named
-beside the failing figure it was taken off ("12 failing · 4 flaking"), never
-subtracted silently. Flaking is not a pass; the pass rate counts the failure
+runs have not all failed it is **flaking**: it is taken off the failing
+figures and out of New failures and Still failing, listed in Home's Flaking
+tab with its streak against its cadence, shown in its own muted colour as
+FLAKING, and named beside the failing figure it was taken off ("12 failing ·
+4 flaking"), never subtracted silently. Flaking is not a pass; the pass rate counts the failure
 as it always did. The night its Nth failure in a row arrives it is a new
 failure again and is listed in New failures; after that it is Still failing.
 A mark or a cadence change never makes a test new; only a run that started
@@ -917,17 +924,19 @@ Response `{"marked": n, "changed": n, "unchanged": n, "unknown": n}`.
 `{"unmarked": n}`. The assignment stays. Every act (mark, cadence change,
 unmark) is recorded in the mark's history.
 
-`GET /api/flaky?stream=<id>&environment=&product=&limit=100&offset=0` — the
-Flaky tab's list, fetched on the tab's first click and by no first paint:
-`{generated_at, stream, total, retired, marks: [...]}`. Each entry:
-`environment, script, test_name, cadence, marked_by, marked_at, reason,
-retired, result, state, muted, assignee, recent_failures, recent_runs` (the
-failures in its last 20 runs on the stream). Ordered failing first, then
-flaking, then passing, newest mark first, retired last; paged by the server,
-`limit` 1..100. A mark on a test with no run on the stream is not listed or
-counted. A retired test's mark is listed, flagged, and counted apart: `total`
-is the marks that are not retired, `retired` the ones that are, and `offset`
-pages over `total + retired`.
+`GET /api/summary?parts=queue&queue=flaking` (with `stream`, `environment`
+and `product` as for any queue) — Home's Flaking tab: the tests flaking now,
+as a triage queue like New failures and Still failing. The response is the
+queue part's, and each entry is a QueueEntry key for key, so the page draws
+it with the same Output column and Review panel. An entry's `flaky.streak`
+against its `flaky.cadence` says how close it is to counting as a failure,
+and the entries arrive nearest first. `total` is the headline's
+`status.flaking` for the same scope; the entries are capped at `queue_cap`.
+`failing_since` and `last_pass_time` are null on these entries. The tab
+asks for it when it is opened and no first paint does. There is no
+`GET /api/flaky`: no request lists every mark. A marked test that is
+passing, or failing past its cadence, is known as marked by the `flaky` on
+its row wherever that row is listed.
 
 Elsewhere:
 

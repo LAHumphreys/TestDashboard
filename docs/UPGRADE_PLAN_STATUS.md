@@ -5101,3 +5101,65 @@ write's callback, for every driver, with a guard and a 300 KB round trip
 (`ShimAnswerTest`). The two Python 3.8 legs fail at the interpreter's
 setup, before any test: the hosted runner image no longer offers 3.8.
 Left for the owner; not this build's.
+
+## WP-44: the owner's first look overturns the Flaky tab; items 11 to 15, the Flaking tab as a triage queue (2026-11-12)
+
+The owner tried the build on a local server and overturned the tab twice
+in one morning. First: triage's new tab should hold only the tests in a
+flaking state, every other marked test sorting by its state (design §13).
+Then, when the walkthrough of that rework reported that the tab had no
+Output column and no Review panel: it must have the same review options
+as the other tabs, and each row its streak (§14). §14 records how the
+first design came about. The rule adopted is in `CLAUDE.md` and the UI
+agent's definition
+(`fec3d34`): every triage tab is a queue like its neighbours, and a
+triage design is compared with New failures and Still failing column by
+column and act by act, every difference put to the owner by name.
+
+Built as two commits. `b6f0162` (items 11 and 14, backend): the tab's
+rows are `GET /api/summary?parts=queue&queue=flaking`, a virtual kind
+whose set is the entries `status.flaking` counts and whose rows are
+queue rows key for key, nearest to their cadence first; `GET /api/flaky`
+and its read are removed. `6da4512` (items 12 and 15, UI): the tab is
+"Flaking", drawn by the shared queue loop with Output and Review, with a
+Streak column ("2 in a row, failing at 3") where Still failing has
+"Failing since" and "Last pass"; its bespoke renderer and pager are
+removed; `QueueTabReviewTest` fails the build if any triage tab's row
+lacks the Review button. Items 11 and 12 (the old endpoint narrowed, the
+bespoke tab relabelled) were verified and reviewed and never committed
+alone; they are carried in those two commits and superseded there.
+
+Measured (14p; perf-seed/1, SQLite, in-process, alternated, 65
+assignments; the old endpoint, then the queue): on the click after the
+headline 1.0 to 0.7 ms at 50 marks and 5.7 to 2.0 at 1,000; cold 3.0 to
+5.9 and 9.3 to 8.1. The cold cost at 50 marks is the prefix every queue
+request pays (11 statements cold on mainline, 3 after the headline) and
+the old endpoint did not; the queue itself adds four statements cold and
+one after the headline, against Still failing's eight and five, and runs
+in about half of Still failing's time. A local MariaDB 12.3: 1.9 to 2.3
+ms and 11.5 to 5.4 after the headline; 7.1 to 23.0 and 17.8 to 27.7
+cold. The other queue kinds and the six Known slow rows read the same
+with equal statement counts, against the tree before the day's work too.
+The rows read is by key; its plan on 12.3 is a range on the full primary
+key, the 600-key case included. **10.3 has not run it: CI decides
+whether a fallback spelling of the keys is needed, and it is not built.**
+
+Found on the way and fixed: a guard lost with a deleted test (the two
+writers of the marked-environments memo must store the same value); a
+sort key carried from another tab reordering a tab that has no such
+column, for every tab; a one-state line that called flaking tests
+"failing". Found and left, older than this work: every build-scoped
+summary part reads its stream twice, and two of the prefix's reads are
+not memoized (eight prefix statements after the headline on a build
+against three on mainline); the DOM shim's `querySelectorAll` matches one
+class only. For the owner: a Flaking row shows no time where New
+failures has "Failed at" (the row carries it; not built); "failed N of
+its last 20 runs" went with the old tab.
+
+A correction to this run's own first commit: it recorded the handover's
+suite counts as nine too high. They were right. Nine Tcl feeder tests
+exist only where `tclsh` is on PATH, and without it nothing is reported
+as skipped: the count is simply nine lower. Final counts in the main
+checkout, with it: 3055 OK (skipped 1) on SQLite and 4229 OK (skipped
+91) with the MariaDB variants on a local 12.3. No browser has rendered
+the tab.

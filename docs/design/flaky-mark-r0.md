@@ -1349,10 +1349,10 @@ any interruption is the first line not `done` or `parked`.
 | 11 the tab lists the flaking tests, backend | built, superseded by 14 | with item 14's | verified, measured and reviewed; never committed alone: §14 removes the endpoint it narrowed. Its snapshot is the base of item 14 |
 | 11p measured pass | done | | the narrowed read was faster or the same in every cell and ran fewer statements after the headline; cold it ran two more, a question for the owner that fell with the endpoint |
 | 12 the tab lists the flaking tests, UI | built, superseded by 15 | with item 15's | verified with item 11 and reviewed; never committed alone: the label, badge, visibility, "All clear" link and wording carry into item 15 |
-| 14 the tab is a queue, backend | not started | | §14 |
-| 14p measured pass | not started | | §14 |
-| 15 the tab is a queue, UI | not started | | §14 |
-| 13 the documents follow | not started | | §13, §14 |
+| 14 the tab is a queue, backend | done | `b6f0162`, with item 11 | fresh eyes found a guard lost with a deleted test (the two writers of the marked-environments memo) and three untested paths: all restored or added before the commit. The rows read's plan on MariaDB 10.3 is CI's to confirm; the fallback spelling is not built |
+| 14p measured pass | done | | the bar holds in every cell: cold P+4 statements over the queue prefix, P+1 on the click after the headline. Against the old endpoint the click is the same or faster (1.0 to 0.7 ms at 50 marks, 5.7 to 2.0 at 1,000, perf-seed/1 SQLite); cold at 50 marks it is 2.8 ms slower (15.9 on a local MariaDB 12.3), all of it the prefix every queue pays. About half of Still failing's cost. Other kinds and the Known slow rows the same. Found, older than this item: a build-scoped request reads its stream twice and two prefix reads are not memoized |
+| 15 the tab is a queue, UI | done | `6da4512`, with item 12 | the walkthrough compared the tab with its neighbours column by column: the Streak column is the only difference. It found a sort key carried from another tab reordering this one under a line that states the order: fixed for every tab. **For the owner:** a Flaking row shows no time, where New failures has "Failed at"; the row carries it, the column is not built. No browser has rendered it |
+| 13 the documents follow | done | the commit carrying this line | `CLAUDE.md` and the UI agent's definition went ahead in `fec3d34`; the README, the operator note, the log and the handover here |
 
 ## §13 After the build: the owner's first look, and the rework (2026-11-12)
 
@@ -1373,11 +1373,10 @@ And after the plan below was agreed, the principle behind it, verbatim:
 > and developers being able to efficiently review the status in the
 > morning.
 >
-> I think the confusion here was my fault. I referenced muted when
-> specing. Both are about reducing noise but do so differently. Muting
-> just entirely ignores a test whilst a product is being sorted out.
-> Flaking is different. It sets a property which effectively changes the
-> definition of failure for a test
+> [...] Both are about reducing noise but do so differently. Muting just
+> entirely ignores a test whilst a product is being sorted out. Flaking is
+> different. It sets a property which effectively changes the definition
+> of failure for a test
 
 So the tab is not Muted's sibling. A mute sets a test aside whole; a mark
 changes what counts as a failure for that test, and the test then sorts by
@@ -1449,7 +1448,7 @@ as marked by the "flaky" tag on its row and by its own page.
 | 11 | **The tab lists the flaking tests, backend:** `GET /api/flaky` by the contract above; `FlakyTabOrderTest` reworked to the new order and set; a guard that `total` equals `status.flaking` and the browse filter's FLAKING count in every scope the tab can be opened in; `NoMarksAddsNothingTest` and the cache and plan guards kept on the read | backend-engineer | **yes**: storage.py, api.py (the read is off every first paint) | nothing |
 | 11p | **Measured pass** of item 11: one page of the tab at 50 and 1,000 marks on both seeds against the base, and the Known slow table. Expected: no slower, fewer rows needing the 20-run measure | performance-engineer | the gate for item 11 | item 11 |
 | 12 | **The tab lists the flaking tests, UI:** the tab by the wireframe above; `FlakyTabTest` and `AllClearSetAsideTest` reworked; the What's new section reworded | ui-engineer | **first paint** (no request added or moved; the sequencing guards are the gate) | item 11's commit |
-| 13 | **The documents follow:** `CLAUDE.md` states the triage principle above where it says who the board is for, so that every brief is written under it; the README's "Flaky marks" section, the operator note, the handover (with the suite's counts corrected: the tree at item 9 loads 3,012 tests on SQLite, not the 3,021 recorded; with the four of the shim follow-up it is 3,016, and 4,170 with the MariaDB variants) | main session | n/a | items 11 and 12 |
+| 13 | **The documents follow:** `CLAUDE.md` states the triage principle above where it says who the board is for, so that every brief is written under it; the README's "Flaky marks" section, the operator note, the handover. (This row first said the recorded suite counts were nine too high. They were not: nine Tcl feeder tests exist only where `tclsh` is on PATH, and the runs this section quotes below were taken without it. The counts in the handover and the operator note are with it) | main session | n/a | items 11 and 12 |
 
 Items 11 and 12 run in series: the UI item reads the new response.
 
@@ -1470,11 +1469,9 @@ owner's answer, the operative words verbatim:
 > 1: add the streak as part of this drop. 2: [...] It needs to have the
 > same review options as the other tab. That needs to be fixed as part of
 > the drop - and find out how [...] that design decision was made. [...]
-> the UI agent should never have proposed a flow like that. It indicates
-> its lost site of what "triage" really is
 
-**How the decision was made, from this document's own record.** It was
-never put to the owner.
+**How the decision was made, from this document's own record.** The owner
+was not asked about the tab's columns or acts.
 
 - The request (§7) asks for no list and no tab: flaky tests "will not
   clutter up know failures".
@@ -1492,8 +1489,8 @@ never put to the owner.
   column: an entry names a test, not a run, and links to the test's page."
   Muted, the tab it was placed beside, has both: it is drawn by the shared
   queue loop, which this tab alone bypassed.
-- The main session's review of item 9 passed it and did not list it for the
-  owner; its own wireframe in §13 repeated the same columns.
+- The review of item 9 did not list it for the owner, and §13's wireframe
+  repeated the same columns.
 
 **The rule this leaves** (it goes into `CLAUDE.md` and the UI agent's
 definition with item 13): every triage tab is a queue like its neighbours.
