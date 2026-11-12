@@ -967,6 +967,18 @@ export function flakySentence(flaky, muteLive) {
   return flakyMarkWords(cadence) + "; no run here yet";
 }
 
+/**
+ * "2 in a row, failing at 3": a flaking test's streak against its
+ * cadence, the Flaking tab's Streak cell (design §14), whose title is
+ * flakySentence(). The streak in cadenceWords()' own phrase, then the
+ * cadence as the sentence puts it ("counts as failing at 3 in a row"):
+ * "failing" is the state the test reaches there, where "fails" would
+ * read as one more run failing.
+ */
+export function flakyStreakWords(flaky) {
+  return cadenceWords(flaky.streak) + ", failing at " + flaky.cadence;
+}
+
 /** "by alice · 12 days ago · race in teardown": who made a mark, how
  * long ago, and why. The small print beside its sentence. */
 export function flakyDetail(flaky, nowMs) {
@@ -1000,28 +1012,20 @@ export function flakyTag(entry) {
   return tag;
 }
 
-/** "6 of its last 20 runs": how often a marked test has really failed,
- * the Flaky tab's measure (decision 4). "0 of its last 20 runs" is a
- * mark that may no longer be needed. */
-export function failedOfRuns(failures, runs) {
-  return runs === 1 ? failures + " of its only run"
-    : failures + " of its last " + runs + " runs";
-}
+/* The Flaking tab's words (WP-44, design §13 and §14): the tests flaking
+ * now. Its queue kind, the `queue=` its rows are asked for by (spelled
+ * here, as every flaky word is); its label; the line above its table,
+ * after the FLAKING chip, which says the one state and the server's
+ * order; its empty state. */
+export const FLAKING_QUEUE = "flaking";
+export const FLAKING_TAB_LABEL = "Flaking";
+export const FLAKING_TAB_NOTE = "Every test here failed its latest run, "
+  + "but fewer times in a row than its cadence. Nearest to its cadence "
+  + "first.";
+export const FLAKING_TAB_EMPTY = "Nothing is flaking.";
 
-/* The Flaky tab's words (WP-44, design §3 U8). */
-export const FLAKY_TAB_EMPTY = "No test is marked flaky here.";
-export const FLAKY_TAB_ORDER =
-  "Failing first, then flaking, then passing; newest mark first.";
-
-/** "4 flaking now": the tests reading FLAKING in scope, before the link
- * that lists them in All tests. */
-export function flakingNowWords(count) {
-  return count.toLocaleString() + " flaking now";
-}
-
-/** The title of every link that opens All tests on FLAKING alone. */
-export const FLAKING_LINK_TITLE =
-  "List the tests flaking now in All tests";
+/** The title of "All clear"'s "4 flaking", which opens the Flaking tab. */
+export const FLAKING_LINK_TITLE = "Open the Flaking tab";
 
 /** Open Actions' footer line where a mark exists (WP-44, §3 U9): what
  * the page leaves out, said under its count. */

@@ -27,8 +27,7 @@
  * paint). Each
  * section paints as its data lands, so the page is readable as soon as
  * the headline answers; the other queue tabs fetch their rows when first
- * opened, the Flaky tab (WP-44) from its own GET /api/flaky, which no
- * first paint asks for. While refreshing, previous
+ * opened. While refreshing, previous
  * renders are held at reduced opacity (no skeletons, no layout jumps).
  * All data reaches the DOM via textContent only.
  */
@@ -41,16 +40,14 @@ import {
   FLAKING_BAR,
   FLAKING_FILTER,
   FLAKING_LINK_TITLE,
+  FLAKING_QUEUE,
+  FLAKING_TAB_EMPTY,
+  FLAKING_TAB_LABEL,
+  FLAKING_TAB_NOTE,
   FLAKING_TREND_CAPTION,
-  FLAKY_TAB_EMPTY,
-  FLAKY_TAB_ORDER,
-  cadenceWords,
-  displayResult,
   failToggleTitle,
-  failedOfRuns,
-  flakingNowWords,
-  flakyDetail,
   flakySentence,
+  flakyStreakWords,
   mutedTag,
   muteDetail,
   failingWithSetAside,
@@ -334,50 +331,13 @@ function queueUrl(kind) {
     apiScope());
 }
 
-/** The Flaky tab's queue id (WP-44). Its rows are not a summary part. */
-const FLAKY_TAB = "flaky";
-
-/** Marks per page of the Flaky tab: the server's page, and its cap. */
-const FLAKY_PAGE = 100;
-
-/** URL for one page of the Flaky tab, in the page's scope. */
-function flakyUrl(offset) {
-  return apiUrl("api/flaky", { limit: FLAKY_PAGE, offset: offset },
-    apiScope());
-}
-
 /**
- * One page of the Flaky tab as a queue payload, so the tab is cached,
- * badged and refreshed like any queue. Each mark keeps the server's
- * fields and gains `flaky`, the mark as a row carries it, which is what
- * the selection bar reads to offer Set cadence. `total` counts the marks
- * that are not retired (the badge's set); the retired ones come last in
- * the same list, so the pager runs to `total + retired`.
- */
-async function fetchFlakyPage(offset) {
-  const page = await fetchJson(flakyUrl(offset));
-  return {
-    generated_at: page.generated_at,
-    stale_before: null,
-    queue: {
-      tests: page.marks.map((mark) => Object.assign({}, mark, {
-        flaky: { cadence: mark.cadence, marked_by: mark.marked_by,
-          marked_at: mark.marked_at, reason: mark.reason,
-          state: mark.state },
-      })),
-      total: page.total,
-      retired: page.retired,
-    },
-  };
-}
-
-/**
- * One tab's rows: a summary part, or for the Flaky tab its own request.
- * Called by loadQueue() and the coalescer for the ACTIVE tab only, so
- * /api/flaky is asked for once the tab has been opened and never before.
+ * One tab's rows, the Flaking tab's included (WP-44, design §14): its
+ * queue part. Called by loadQueue() and the coalescer for the ACTIVE tab
+ * only, so a tab's rows are asked for once it has been opened.
  */
 function rowsRequest(kind) {
-  return kind === FLAKY_TAB ? fetchFlakyPage(0) : fetchJson(queueUrl(kind));
+  return fetchJson(queueUrl(kind));
 }
 
 /** URL for one page of the test list under the current filters. */
@@ -517,43 +477,6 @@ async function loadQueue(kind, seq) {
     if (seq === state.requestSeq) {
       showError(err.message);
     }
-  }
-}
-
-/**
- * The Flaky tab's "Show more": the next page after the marks on screen,
- * appended below them in the server's order (decision 16), the rows
- * already ticked left ticked. A refresh started meanwhile wins.
- */
-async function loadFlakyMore() {
-  const seq = state.requestSeq;
-  const queue = state.queues[FLAKY_TAB];
-  const more = document.getElementById("queue-more");
-  if (!queue || more.disabled) {
-    return;
-  }
-  // One page at a time: a second click before the first lands would ask
-  // for the same offset again and list its marks twice.
-  more.disabled = true;
-  try {
-    const payload = await fetchFlakyPage(queue.tests.length);
-    if (seq !== state.requestSeq || state.queues[FLAKY_TAB] !== queue) {
-      return;
-    }
-    const added = tagStream(payload.queue.tests);
-    queue.tests = queue.tests.concat(added);
-    queue.total = payload.queue.total;
-    queue.retired = payload.queue.retired;
-    if (state.activeQueue === FLAKY_TAB) {
-      appendFlakyRows(added);
-      renderQueueTabs();
-    }
-  } catch (err) {
-    if (seq === state.requestSeq) {
-      showError(err.message);
-    }
-  } finally {
-    more.disabled = false;
   }
 }
 
@@ -1220,9 +1143,10 @@ const QUEUE_TABS = [
   { id: "new_failures", label: "New failures" },
   { id: "still_failing", label: "Still failing" },
   { id: "muted", label: "Muted" },
-  // WP-44 (design §3 U8): every flaky mark in scope; the tab exists only
-  // where there is one (decision 5). See flakyTabShown().
-  { id: FLAKY_TAB, label: "Flaky" },
+  // WP-44 (design §13, §14): the tests flaking now, marked and failing
+  // within their cadence, a queue like its neighbours; the tab exists
+  // only where there is one. See flakyTabShown().
+  { id: FLAKING_QUEUE, label: FLAKING_TAB_LABEL },
   { id: "fixed", label: "Fixed" },
   { id: "unexpected_passes", label: "Stale annotations" },
   { id: "not_run", label: "Not run" },
@@ -1233,7 +1157,7 @@ const QUEUE_EMPTY_TEXT = {
   new_failures: "No new failures — nothing broke that was passing before.",
   still_failing: "Nothing is stuck failing.",
   muted: "Nothing is muted.",
-  [FLAKY_TAB]: FLAKY_TAB_EMPTY,
+  [FLAKING_QUEUE]: FLAKING_TAB_EMPTY,
   fixed: "No tests have gone from failing to passing.",
   unexpected_passes:
     "No stale annotations — every known failure still fails.",
@@ -1256,21 +1180,27 @@ function queueCount(queueId) {
   if (queue) {
     return queue.total;
   }
-  if (queueId === FLAKY_TAB) {
-    // The tab's badge is every mark in scope (WP-44): the headline's
-    // flaky_total, the set /api/flaky's `total` counts.
-    return state.summary ? state.summary.status.flaky_total || 0 : 0;
+  if (queueId === FLAKING_QUEUE) {
+    // The tab's badge is the tests flaking now (WP-44, design §14): the
+    // headline's `status.flaking`, the set its queue's `total` counts. A
+    // virtual kind, as "mine" is, so not in `queue_totals`.
+    return flakingNow();
   }
   const totals = state.summary && state.summary.queue_totals;
   return totals ? (totals[queueId] || 0) : 0;
 }
 
-/** Whether the Flaky tab is drawn: where the scope has a mark (decision
- * 5), and while it is the open tab, so an act that removes the last mark
- * leaves the reader on its empty state rather than on no tab at all. */
+/** The tests flaking now in scope, by the headline; 0 before it lands. */
+function flakingNow() {
+  return state.summary ? state.summary.status.flaking || 0 : 0;
+}
+
+/** Whether the Flaking tab is drawn: where a test in scope is flaking now
+ * (design §13), and while it is the open tab, so the act that clears the
+ * last one leaves the reader on its empty state rather than on no tab at
+ * all. */
 function flakyTabShown() {
-  return state.activeQueue === FLAKY_TAB
-    || (Boolean(state.summary) && flakyScope());
+  return state.activeQueue === FLAKING_QUEUE || flakingNow() > 0;
 }
 
 /** True once SOMETHING can say how big `queueId` is. Before that a
@@ -1319,14 +1249,6 @@ async function refreshQueueCounts() {
     renderQueueTabs();
     renderStatus();
     renderEnvUpdated();
-    // The Flaky tab is paged: the coalescer has just replaced its rows
-    // with page one, so the tab is redrawn from that page (its rows, its
-    // pager and its "N flaking now" line), or the table would show pages
-    // the state no longer holds and the next "Show more" would list them
-    // twice. Its row's control has already saved, so nothing is lost.
-    if (state.activeQueue === FLAKY_TAB) {
-      renderQueueTable();
-    }
   } catch (err) {
     showError(err.message);
   }
@@ -1336,7 +1258,7 @@ function renderQueueTabs() {
   const tabs = document.getElementById("queue-tabs");
   clearNode(tabs);
   for (const tab of QUEUE_TABS) {
-    if (tab.id === FLAKY_TAB && !flakyTabShown()) {
+    if (tab.id === FLAKING_QUEUE && !flakyTabShown()) {
       continue;
     }
     const count = queueCount(tab.id);
@@ -1378,9 +1300,8 @@ function renderQueueTabs() {
  * U6): the failing tests the claim leaves out, so a glance at a clear
  * board still says what is being tolerated. Muted is the two failing
  * tiles' muted figures; flaking is `status.flaking`. Both zero (or no
- * headline yet), no line. "3 muted" opens the Muted tab; "4 flaking"
- * opens All tests on FLAKING alone: the tests flaking now, where
- * the Flaky tab lists every mark.
+ * headline yet), no line. Each part opens the tab that lists it: "3
+ * muted" the Muted tab, "4 flaking" the Flaking tab (design §13).
  */
 function renderAllClearAside() {
   const aside = document.getElementById("all-clear-aside");
@@ -1398,38 +1319,14 @@ function renderAllClearAside() {
     if (index > 0) {
       aside.appendChild(document.createTextNode(" · "));
     }
-    if (part.key === "muted") {
-      const link = el("button", "link-btn", part.text);
-      link.type = "button";
-      link.title = "Open the Muted tab";
-      link.addEventListener("click", () => openQueue("muted"));
-      aside.appendChild(link);
-    } else {
-      aside.appendChild(flakingLink(part.text));
-    }
+    const muted = part.key === "muted";
+    const link = el("button", "link-btn", part.text);
+    link.type = "button";
+    link.title = muted ? "Open the Muted tab" : FLAKING_LINK_TITLE;
+    link.addEventListener("click",
+      () => openQueue(muted ? "muted" : FLAKING_QUEUE));
+    aside.appendChild(link);
   });
-}
-
-/** A link-styled button that opens All tests on FLAKING alone: "All
- * clear"'s "4 flaking" and the Flaky tab's "List them in All tests". */
-function flakingLink(text) {
-  const link = el("button", "link-btn", text);
-  link.type = "button";
-  link.title = FLAKING_LINK_TITLE;
-  link.addEventListener("click", openFlakingInBrowse);
-  return link;
-}
-
-/** All tests on FLAKING alone (WP-44, design §3 U6): the other result
- * toggles and "Not run recently" cleared, scrolled to, as "retired"
- * does. The other filters are the reader's and stay. */
-function openFlakingInBrowse() {
-  state.activeResults = new Set([FLAKING_FILTER]);
-  state.staleOnly = false;
-  syncResultToggles();
-  syncStaleToggle();
-  refilterBrowse();
-  scrollTo("browse-section");
 }
 
 /** Column sets per queue: header + cell builder. */
@@ -1447,6 +1344,9 @@ const QUEUE_INVARIANT_RESULT = {
     result: "UNEXPECTED_PASS",
     text: "Every test here passed while annotated as a known failure.",
   },
+  // WP-44 (design §13, §14): every row is a test flaking now, and the
+  // rows come in the server's order, said here once with the state.
+  [FLAKING_QUEUE]: { result: FLAKING_FILTER, text: FLAKING_TAB_NOTE },
 };
 
 /*
@@ -1534,6 +1434,28 @@ function queueColumns(queueId) {
       if (nights >= 1) {
         cell.appendChild(el("span", "row-sub",
           nights + (nights === 1 ? " night" : " nights")));
+      }
+      return cell;
+    },
+  };
+  // How close a flaking test is to counting as failing (WP-44, design
+  // §14): the Flaking tab's answer to what Failing since and Last pass
+  // say on Still failing, its streak against its cadence. It sorts by
+  // the runs left before the test counts as failing, the server's order,
+  // and its title is the sentence the Review panel's Flaky group says.
+  // Read defensively, as the panel reads it: a row with no `flaky` (an
+  // older server, a race) draws an empty cell and sorts last (null).
+  const streakCol = {
+    header: "Streak",
+    sortKey: "runs_left",
+    sortValue: (entry) => (entry.flaky
+      ? entry.flaky.cadence - entry.flaky.streak : null),
+    cell: (entry) => {
+      const cell = el("td");
+      if (entry.flaky) {
+        cell.textContent = flakyStreakWords(entry.flaky);
+        cell.title = flakySentence(entry.flaky,
+          Boolean(entry.mute && entry.mute.live));
       }
       return cell;
     },
@@ -1652,10 +1574,10 @@ function queueColumns(queueId) {
         commentCol,
         { header: "Assignee",
           cell: (entry) => el("td", "", entry.assignee || "—") }];
-    case FLAKY_TAB:
-      // The assignee cell every queue has: an assignment means the same
-      // in any state (design §3 U8).
-      return [testCol].concat(flakyColumns(), [assigneeCol]);
+    case FLAKING_QUEUE:
+      // Still failing's row with the streak where its two times stand
+      // (design §14): the one difference.
+      return [testCol, streakCol, commentCol, assigneeCol];
     case "unexpected_passes":
       return [testCol,
         { header: "Known-failure reason",
@@ -1678,110 +1600,6 @@ function queueColumns(queueId) {
       return [testCol, resultCol, failingSinceCol, commentCol,
         assigneeCol];
   }
-}
-
-/*
- * The Flaky tab's own columns (WP-44, design §3 U8), between the test
- * and the assignee. No sortKey anywhere: the list is paged by the server
- * in an order it states above the table (decision 16), and sorting one
- * page here would order that page, not the list. Every string from the
- * server (the reason, the owner) goes in through textContent.
- */
-function flakyColumns() {
-  return [
-    { header: "State",
-      cell: (entry, shown) => {
-        const cell = el("td");
-        cell.appendChild(resultChip(shown));
-        if (entry.muted) {
-          const tag = el("span", "mute-tag", "muted");
-          tag.title = flakySentence(entry.flaky, true);
-          cell.appendChild(tag);
-        }
-        if (entry.retired) {
-          cell.appendChild(el("span", "retired-tag", "retired"));
-        }
-        return cell;
-      } },
-    { header: "Mark",
-      cell: (entry) => {
-        const cell = el("td", "wrap comment-cell");
-        cell.appendChild(el("span", "comment-text", entry.reason));
-        cell.appendChild(el("span", "row-sub", flakyDetail(
-          { marked_by: entry.marked_by, marked_at: entry.marked_at },
-          Date.parse(serverClock() + "Z"))));
-        return cell;
-      } },
-    { header: "Cadence",
-      cell: (entry) => el("td", "", cadenceWords(entry.cadence)) },
-    { header: "Failed",
-      cell: (entry) => el("td", "",
-        failedOfRuns(entry.recent_failures, entry.recent_runs)) },
-  ];
-}
-
-/**
- * The Flaky tab's table: one row per mark, in the server's order. The
- * chip and the row edge take ONE value, displayResult() of the mark's
- * result, state and live mute, as every other row's does. No Output
- * column: an entry names a test, not a run.
- */
-function renderFlakyTable(entries) {
-  const headRow = document.getElementById("queue-head-row");
-  headRow.appendChild(queueSelectionMount.headerCell());
-  for (const column of queueColumns(FLAKY_TAB)) {
-    headRow.appendChild(el("th", "", column.header));
-  }
-  appendFlakyRows(entries);
-  renderFlakyNote();
-  document.getElementById("queue-table").hidden = false;
-  document.getElementById("queue-empty").hidden = true;
-  document.getElementById("queue-cap-note").hidden = true;
-}
-
-/** Rows of the Flaky tab below those on screen, and the pager after
- * them: "Show more" runs to `total + retired`, the retired marks being
- * the last of the same list. */
-function appendFlakyRows(entries) {
-  const body = document.getElementById("queue-body");
-  const columns = queueColumns(FLAKY_TAB);
-  for (const entry of entries) {
-    const tr = document.createElement("tr");
-    const shown = displayResult(entry.result, entry.state, entry.muted);
-    const marker = resultClass(shown);
-    if (marker) {
-      tr.className = marker;
-    }
-    tr.appendChild(queueSelectionMount.rowCell(entry));
-    for (const column of columns) {
-      tr.appendChild(column.cell(entry, shown));
-    }
-    body.appendChild(tr);
-  }
-  const queue = state.queues[FLAKY_TAB];
-  const listed = queue.total + queue.retired;
-  const more = document.getElementById("queue-more");
-  more.hidden = queue.tests.length >= listed;
-  more.textContent = "Show "
-    + Math.min(FLAKY_PAGE, listed - queue.tests.length).toLocaleString()
-    + " more";
-}
-
-/** Above the Flaky tab: the order it is in, then "N flaking now · List
- * them in All tests" where a test reads FLAKING (`status.flaking`). */
-function renderFlakyNote() {
-  const note = document.getElementById("queue-flaky-note");
-  clearNode(note);
-  note.appendChild(el("span", "", FLAKY_TAB_ORDER));
-  const flaking = state.summary ? state.summary.status.flaking || 0 : 0;
-  if (flaking > 0) {
-    const line = el("span");
-    line.appendChild(document.createTextNode(
-      flakingNowWords(flaking) + " · "));
-    line.appendChild(flakingLink("List them in All tests"));
-    note.appendChild(line);
-  }
-  note.hidden = false;
 }
 
 /* ---- inline review ----
@@ -1830,9 +1648,6 @@ function renderQueueTable() {
   // here, unlike the browse table) -- so every render is a fresh view,
   // and the selection made on the PREVIOUS render is cleared every time.
   queueSelectionMount.reset();
-  // The Flaky tab's note and pager: shown by renderFlakyTable() only.
-  document.getElementById("queue-flaky-note").hidden = true;
-  document.getElementById("queue-more").hidden = true;
 
   const invariant = QUEUE_INVARIANT_RESULT[queueId];
   resultNote.hidden = !invariant;
@@ -1855,8 +1670,7 @@ function renderQueueTable() {
     // a skeleton — refreshes keep the previous table dimmed, so this
     // shows only the first time a queue is opened.
     table.hidden = true;
-    emptyNote.textContent = queueId === FLAKY_TAB ? "Loading…"
-      : "Loading queue…";
+    emptyNote.textContent = "Loading queue…";
     emptyNote.hidden = false;
     capNote.hidden = true;
     resultNote.hidden = true;
@@ -1870,11 +1684,6 @@ function renderQueueTable() {
     resultNote.hidden = true;
     return;
   }
-  if (queueId === FLAKY_TAB) {
-    renderFlakyTable(allEntries);
-    return;
-  }
-
   const columns = queueColumns(queueId);
   // These queues are CAPPED slices of a larger set, so sorting them in
   // the browser is only honest while nothing has been cut off. Past the
@@ -1883,9 +1692,26 @@ function renderQueueTable() {
   // actions on server-side sorting. The controls are switched off with
   // a reason rather than quietly reordering a truncated list.
   const capped = queueCount(queueId) > allEntries.length;
-  const entries = capped
-    ? allEntries
-    : sortRows(allEntries, state.queueSortKey || "", state.queueSortDesc);
+  // The sort key is the reader's last header click, kept across tabs. It
+  // applies only where it names one of THIS tab's columns, which then
+  // shows its arrow; a key from another tab's column (every queue row
+  // carries `start_time`, `failing_since`, ..., so it would reorder them
+  // with no arrow on any header) leaves the rows in the server's order,
+  // the order the line above the table states.
+  const sortColumn = state.queueSortKey ? columns.find(
+    (column) => column.sortKey === state.queueSortKey) : null;
+  // A column whose order is not one field of the row names a `sortValue`
+  // (the Flaking tab's Streak: the runs left before its cadence); its
+  // rows are sorted by sortRows() on that value, read once per row.
+  const sortValue = sortColumn ? sortColumn.sortValue : null;
+  let entries = allEntries;
+  if (!capped && sortValue) {
+    entries = sortRows(
+      allEntries.map((entry) => ({ entry: entry, value: sortValue(entry) })),
+      "value", state.queueSortDesc).map((pair) => pair.entry);
+  } else if (!capped && sortColumn) {
+    entries = sortRows(allEntries, sortColumn.sortKey, state.queueSortDesc);
+  }
 
   headRow.appendChild(queueSelectionMount.headerCell());
   for (const column of columns) {
@@ -2336,9 +2162,6 @@ function wireMainlineControls() {
     });
   document.getElementById("show-more").addEventListener("click", () => {
     loadBrowse(true);
-  });
-  document.getElementById("queue-more").addEventListener("click", () => {
-    loadFlakyMore();
   });
 
   for (const btn of

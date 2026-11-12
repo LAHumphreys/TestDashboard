@@ -6537,11 +6537,13 @@ def _driver_endings(source: str) -> List[str]:
 
 
 def _shim(
-    fixture: Dict[str, Any], source: str = _SHIM_DRIVER
+    fixture: Dict[str, Any], source: str = _SHIM_DRIVER,
+    root: str = REPO_DIR
 ) -> Dict[str, Any]:
     """Run the shim driver *source* (the home page's by default) over
-    *fixture*; its JSON answer, typed at the boundary by the caller's
-    assertions. The driver answers through _DRIVER_PRELUDE's
+    *fixture*, against the static files under *root* (the repository's,
+    or a planted copy); its JSON answer, typed at the boundary by the
+    caller's assertions. The driver answers through _DRIVER_PRELUDE's
     driverAnswer(), so an answer of any size arrives whole."""
     with tempfile.TemporaryDirectory() as scratch:
         driver = os.path.join(scratch, "driver.mjs")
@@ -6551,7 +6553,7 @@ def _shim(
         with io.open(data, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(fixture))
         done = subprocess.run(
-            [str(NODE), driver, REPO_DIR, data], stdout=subprocess.PIPE,
+            [str(NODE), driver, root, data], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
     if done.returncode != 0:
         raise AssertionError("shim driver failed: " + done.stderr[-2000:])
@@ -7283,8 +7285,10 @@ _FLAKY_HELPERS = (
     "flakyCadenceSelect", "stabilityWord",
     "rowResult", "previousShown", "setAsideSuffix", "setAsideBracket",
     "failingWithSetAside", "setAsideWords", "newFailuresSub", "failingSplit",
-    # The Flaky tab's and the browse filter's.
-    "failedOfRuns", "failToggleTitle", "flakingNowWords",
+    # The Flaking tab's and the browse filter's. (WP-44 item 15:
+    # failedOfRuns() went with the tab's "Failed" column, and the Streak
+    # column's flakyStreakWords() takes its place.)
+    "flakyStreakWords", "failToggleTitle",
 )
 
 
@@ -8174,10 +8178,6 @@ globalThis.fetch = (url) => {
         || { tests: [], total: 0 } };
   } else if (u.pathname.endsWith("api/dashboard")) {
     body = fixture.dashboard;
-  } else if (u.pathname.endsWith("api/flaky")) {
-    // The Flaky tab (WP-44), drawn where the scope has a mark.
-    body = { generated_at: fixture.headline.generated_at, stream: 1,
-      total: 0, retired: 0, marks: [] };
   } else if (u.pathname.endsWith("api/users")) {
     body = { users: [] };
   }
@@ -8310,6 +8310,9 @@ def _state_fixture(marks: str, clear: bool = False, tick: Any = None,
         "new_failures": [rows["over"], rows["plain"]],
         "still_failing": [rows["over"], dict(rows["plain"], prev_result="FAIL")],
         "muted": [rows["muted"]],
+        # The Flaking tab's queue (WP-44 item 15), asked for only where
+        # the tab is drawn: never with no mark, so the base digests hold.
+        "flaking": [rows["flaking"]],
         "fixed": [rows["passing"]],
         "unexpected_passes": [rows["up"]],
         "not_run": [rows["flaking"]],
@@ -8412,11 +8415,10 @@ def _ghost_offenders(source: str) -> List[str]:
 
 
 class AllClearSetAsideTest(unittest.TestCase):
-    """WP-44 item 7 (design §3 U6): "All clear" names what it leaves
+    """WP-44 item 7 (design §3 U6, §13): "All clear" names what it leaves
     out, "Set aside: 3 muted · 4 flaking", so a clear board still says
-    what is tolerated.
-    "3 muted" opens the Muted tab; "4 flaking" opens All tests on the
-    FLAKING filter alone."""
+    what is tolerated. Each part opens the tab that lists it: "3 muted"
+    the Muted tab, "4 flaking" the Flaking tab."""
 
     def test_the_line_ships_hidden_inside_the_banner(self) -> None:
         html = read("index.html")
@@ -8434,20 +8436,37 @@ class AllClearSetAsideTest(unittest.TestCase):
                                r" \|\| 0\) \+ \(status\.muted_still_failing"
                                r" \|\| 0\),\s*status\.flaking\)")
         self.assertIn("aside.hidden = words.length === 0;", body)
-        self.assertIn('if (part.key === "muted") {', body)
-        self.assertIn('openQueue("muted")', body)
-        # Widened for the FLAKING filter: the flaking part is the link into the
-        # browse filter, its words through textContent, never markup.
-        self.assertIn("aside.appendChild(flakingLink(part.text));", body)
+        self.assertIn('const muted = part.key === "muted";', body)
+        # Each part a link-styled button opening its tab (design §13: the
+        # flaking part opens the Flaking tab, no longer the browse
+        # filter), its words through textContent, never markup.
+        self.assertIn('el("button", "link-btn", part.text)', body)
+        self.assertIn('link.title = muted ? "Open the Muted tab" : '
+                      'FLAKING_LINK_TITLE;', body)
+        self.assertIn('openQueue(muted ? "muted" : FLAKING_QUEUE)', body)
         self.assertNotIn("innerHTML", body)
-        link = _function_body(app, "function flakingLink(")
-        self.assertIn('el("button", "link-btn", text)', link)
-        self.assertIn('link.addEventListener("click", openFlakingInBrowse)',
-                      link)
-        self.assertNotIn("innerHTML", link)
+        for gone in ("function flakingLink(", "openFlakingInBrowse"):
+            self.assertNotIn(gone, app)
         api = _strip_comments(read("api.js"))
+        self.assertIn('export const FLAKING_LINK_TITLE = "Open the Flaking '
+                      'tab";', api)
         words = _function_body(api, "export function setAsideWords(")
         self.assertIn("setAsideParts(muted, flaking)", words)
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_flaking_part_opens_the_flaking_tab(self) -> None:
+        """"6 flaking" opens the Flaking tab and asks for its queue, and
+        nothing else: the browse filters are left as they were. The
+        scripts chart's bar still opens All tests (FlakingFilterTest)."""
+        load, opened = _lists_walk("flaky", [["asideLink", "6 flaking"]],
+                                   clear=True)
+        self.assertEqual(opened["asked"], [_FLAKING_QUEUE_ASK])
+        self.assertEqual([tab[0] for tab in opened["tabs"]
+                          if tab[2] == "true"], ["Flaking"])
+        self.assertEqual([t[2] for t in opened["toggles"]],
+                         [t[2] for t in load["toggles"]])
+        self.assertEqual(opened["head"], _FLAKING_HEAD)
 
 
 class PromotionTransitionTest(unittest.TestCase):
@@ -8623,6 +8642,9 @@ class FlakyStateDomTest(unittest.TestCase):
         self.assertEqual(rows("Stale annotations"), [
             ["result-unexpected-pass", [["flaky-tag", "flaky", "Marked "
              "flaky: counts as failing once its last 3 runs have failed"]]]])
+        # The Flaking tab (item 15): every row reads FLAKING, said once
+        # above the table, so the row has its edge and no chip or pill.
+        self.assertEqual(rows("Flaking"), [["result-flaking", []]])
         # A live mute: raw before and now, the pill.
         self.assertEqual(rows("Muted"), [["result-fail", [
             ["chip chip-ghost result-fail", "FAIL"],
@@ -8667,16 +8689,15 @@ class FlakyStateDomTest(unittest.TestCase):
         aside = self._walk("flaky", True)["aside"]
         self.assertFalse(aside["hidden"])
         self.assertEqual(aside["text"], "Set aside: 9 muted · 6 flaking")
-        # Widened for the FLAKING filter: "6 flaking" is a link (FlakingFilterTest
-        # walks where it goes); "9 muted" still opens the Muted tab.
+        # Each part is a link to the tab that lists it: "9 muted" the
+        # Muted tab, "6 flaking" the Flaking tab (design §13).
         self.assertEqual(aside["parts"], [
             "#:Set aside: ", "BUTTON:9 muted", "#: · ", "BUTTON:6 flaking"])
         self.assertEqual(aside["opened"], ["Muted"])
         flaking_only = self._walk("flaky", True, 0)["aside"]
         self.assertEqual(flaking_only["parts"],
                          ["#:Set aside: ", "BUTTON:6 flaking"])
-        # It opens no queue tab: the one open is still New failures.
-        self.assertEqual(flaking_only["opened"], ["New failures"])
+        self.assertEqual(flaking_only["opened"], ["Flaking"])
 
     def test_the_bars_gain_a_flaking_segment_and_key(self) -> None:
         regions = self._walk("flaky")["regions"]
@@ -8814,10 +8835,23 @@ window.setTimeout = setTimeout;
 window.clearTimeout = clearTimeout;
 window.localStorage.setItem("testboard.username", "dev1");
 Element.prototype.focus = function () {};
+// The shim keeps the queue's header row (#queue-head-row) apart from its
+// table, so attachSorting() would find no header buttons there; its one
+// query is pointed at that row, so a header click sorts as in a browser.
+const ownQuery = Element.prototype.querySelectorAll;
+Element.prototype.querySelectorAll = function (selector) {
+  if (selector === "thead .sort-btn" && this === byId["queue-table"]) {
+    return byId["queue-head-row"].find((c) => c.className === "sort-btn");
+  }
+  return ownQuery.call(this, selector);
+};
 let asked = [];
 // An act (any request that is not a GET) moves the board on: from then
-// on the headline is `headlineAfter`, where the fixture gives one.
+// on the headline is `headlineAfter` and the queues are `queuesAfter`,
+// where the fixture gives them; every act is kept in `posts`.
 let headline = fixture.headline;
+let queues = fixture.queues;
+let posts = [];
 globalThis.fetch = (url, opts) => {
   const u = new URL(String(url), "http://127.0.0.1/");
   const path = u.pathname.replace(/^\//, "");
@@ -8825,9 +8859,10 @@ globalThis.fetch = (url, opts) => {
   if (path !== "api/users" && path !== "api/products") {
     asked.push(path + u.search);
   }
-  if (opts && opts.method && opts.method !== "GET"
-      && fixture.headlineAfter) {
-    headline = fixture.headlineAfter;
+  if (opts && opts.method && opts.method !== "GET") {
+    headline = fixture.headlineAfter || headline;
+    queues = fixture.queuesAfter || queues;
+    posts.push([path, opts.body ? JSON.parse(opts.body) : null]);
   }
   let body = {};
   if (part === "headline") {
@@ -8837,12 +8872,14 @@ globalThis.fetch = (url, opts) => {
     body = fixture.parts && fixture.parts.length
       ? fixture.parts.shift() : fixture.part;
   } else if (part === "queue") {
+    // `queueRow`, where given, is every queue's one row, whatever kind
+    // is asked for (QueueTabReviewTest).
     body = { generated_at: fixture.headline.generated_at,
       stale_before: fixture.headline.stale_before,
-      queue: fixture.queues[u.searchParams.get("queue")]
-        || { tests: [], total: 0 } };
-  } else if (path === "api/flaky") {
-    body = fixture.flaky[u.searchParams.get("offset") || "0"];
+      queue: fixture.queueRow ? { tests: [fixture.queueRow], total: 1 }
+        : queues[u.searchParams.get("queue")] || { tests: [], total: 0 } };
+  } else if (path.startsWith("api/runs/")) {
+    body = { output: "boom" };
   } else if (path === "api/dashboard") {
     body = fixture.dashboard;
   } else if (path === "api/users") {
@@ -8873,29 +8910,72 @@ const legend = (node) => {
 };
 const describe = (c) => c.className + ":" + c.textContent
   + (c.title ? ":" + c.title : "");
+// The queue's header after the selection column: a sortable one as
+// "sort:" and its key (the shim drops a button's own text once the
+// arrow span is appended to it, as a browser would not), the rest by
+// their text.
+const headCells = () => byId["queue-head-row"].children.slice(1).map((th) => {
+  const sort = th.children.find((c) => c.className === "sort-btn");
+  return sort ? "sort:" + sort.dataset.key : th.textContent;
+});
+// The queue's test rows, and the open Review panel's row if any.
+const testRows = () => byId["queue-body"].children.filter(
+  (tr) => tr.className !== "review-row");
+const panelRow = () => byId["queue-body"].children.find(
+  (tr) => tr.className === "review-row") || null;
+// What an open Review panel offers: its groups' labels, and the Flaky
+// group's line (the sentence, then the small print) and controls.
+const panelShape = () => {
+  const panel = panelRow();
+  if (!panel) {
+    return null;
+  }
+  const labels = panel.find((c) => c.className === "review-label");
+  const flaky = labels.find((c) => c.textContent === "Flaky");
+  return {
+    labels: labels.map((c) => c.textContent),
+    flaky: flaky ? flaky.parentNode.children.slice(1).map((c) => [c.tagName,
+      c.tagName === "SELECT" ? c.value
+        : c.tagName === "SPAN" ? c.children.map((x) => x.textContent)
+          : c.textContent]) : null,
+  };
+};
 const snap = () => {
-  const note = byId["queue-flaky-note"];
+  const note = byId["queue-result-note"];
   const firstNight = byId["trend-table-body"].children[0];
   const out = {
     asked,
+    posts,
     tabs: byId["queue-tabs"].children.map((t) => [tabLabel(t),
       t.children[1].textContent, t.attributes["aria-selected"]]),
     toggles: byId["result-toggles"].children.map((b) => [b.textContent,
       b.hidden, b.attributes["aria-pressed"], b.title || "", b.className]),
-    head: byId["queue-head-row"].children.slice(1).map((th) => th.textContent),
-    rows: byId["queue-body"].children.map((tr) => ({
+    head: headCells(),
+    rows: testRows().map((tr) => ({
       edge: tr.className,
       cells: tr.children.slice(1, 6).map((td) => td.textContent),
+      titles: tr.children.slice(1, 6).map((td) => td.title || ""),
       take: tr.find((c) => c.className === "take-btn").length,
-      marks: tr.find((c) => /^(chip|mute-tag|retired-tag|flaky-tag)/
+      review: tr.find((c) => c.className === "review-btn")
+        .map((c) => c.textContent),
+      marks: tr.find((c) => /^(chip|mute-tag|flaky-tag)/
         .test(String(c.className))).map(describe),
     })),
+    panel: panelShape(),
+    // The header showing a sort arrow, as "key:direction".
+    sorted: byId["queue-head-row"].children.slice(1).filter((th) =>
+      th.attributes["aria-sort"] && th.attributes["aria-sort"] !== "none")
+      .map((th) => th.children[0].dataset.key + ":"
+        + th.attributes["aria-sort"]),
     tableHidden: byId["queue-table"].hidden,
+    sortOff: byId["queue-table"].classList.contains("sort-disabled"),
     empty: [byId["queue-empty"].hidden, byId["queue-empty"].textContent],
-    resultNote: byId["queue-result-note"].hidden,
+    cap: [byId["queue-cap-note"].hidden, byId["queue-cap-note"].textContent],
+    // The one-state line above the table: hidden, its text, and every
+    // chip and control in it.
     note: [note.hidden, note.textContent,
-      note.find((c) => c.tagName === "BUTTON").map(describe)],
-    more: [byId["queue-more"].hidden, byId["queue-more"].textContent],
+      note.find((c) => c.tagName === "BUTTON"
+        || /^chip/.test(String(c.className))).map(describe)],
     trendLegend: legend(byId["trend-chart"]),
     trendDim: byId["trend-card"].classList.contains("is-loading"),
     events,
@@ -8909,6 +8989,7 @@ const snap = () => {
   };
   asked = [];
   events = [];
+  posts = [];
   return out;
 };
 await import(pathToFileURL(root + "/static/app.js").href);
@@ -8931,9 +9012,6 @@ for (const [action, arg, wait] of fixture.steps) {
   } else if (action === "asideLink") {
     await byId["all-clear-aside"].children.find(
       (c) => c.tagName === "BUTTON" && c.textContent === arg).click();
-  } else if (action === "noteLink") {
-    await byId["queue-flaky-note"].find((c) => c.tagName === "BUTTON")[0]
-      .click();
   } else if (action === "scriptBar") {
     await byId["scripts-chart"].children.filter(
       (c) => c.className === "bar-row")[arg].click();
@@ -8948,9 +9026,55 @@ for (const [action, arg, wait] of fixture.steps) {
       (c) => String(c.className).startsWith("assignee-select"))[0];
     select.value = arg;
     await select.dispatch("change");
+  } else if (action === "sort") {
+    // A click on the header whose sort key is arg.
+    await byId["queue-head-row"].find((c) => c.className === "sort-btn"
+      && c.dataset.key === arg)[0].click();
+  } else if (action === "review") {
+    // Open the Review panel of the arg-th row, by its Output column.
+    await testRows()[arg].find((c) => c.className === "review-btn")[0]
+      .click();
+  } else if (action === "panelUnmark") {
+    await panelRow().find((c) => c.tagName === "BUTTON"
+      && c.textContent === "Unmark")[0].click();
+  } else if (action === "barUnmark") {
+    const boxes = testRows().map((tr) => tr.children[0].children[0]);
+    for (const index of arg) {
+      boxes[index].checked = true;
+      await boxes[index].dispatch("change");
+    }
+    await bar().children.find(
+      (c) => c.className === "selection-unmark-btn").click();
+  } else if (action === "reviewEach") {
+    // Every tab drawn, in turn: its rows' Review buttons, and what one
+    // click on the first opens (QueueTabReviewTest).
+    const each = [];
+    const labels = byId["queue-tabs"].children.map(tabLabel);
+    for (const label of labels) {
+      await byId["queue-tabs"].children.find(
+        (t) => tabLabel(t) === label).click();
+      await settle(wait);
+      const rows = testRows();
+      const buttons = rows.map((tr) => tr.find(
+        (c) => c.className === "review-btn").length);
+      const review = rows.length && buttons[0]
+        ? rows[0].find((c) => c.className === "review-btn")[0] : null;
+      if (review) {
+        await review.click();
+        await settle(wait);
+      }
+      each.push({ tab: label, head: headCells(), buttons,
+        panel: panelShape() });
+      if (review) {
+        // Closed again: every tab's one row is the same test, and a panel
+        // left open would be reopened on the next tab's row by itself.
+        await review.click();
+      }
+    }
+    snaps.push({ each });
+    continue;
   } else if (action === "tick") {
-    const boxes = byId["queue-body"].children.map(
-      (tr) => tr.children[0].children[0]);
+    const boxes = testRows().map((tr) => tr.children[0].children[0]);
     for (const index of arg) {
       boxes[index].checked = true;
       await boxes[index].dispatch("change");
@@ -8974,37 +9098,39 @@ await driverAnswer(snaps);
 """
 
 
-def _mark(name: str, result: str, state: str, **extra: Any) -> Dict[str, Any]:
-    """One ``GET /api/flaky`` entry in the server's shape."""
-    mark = {
-        "environment": "env-a", "script": "s1.py", "test_name": name,
-        "cadence": 3, "marked_by": "dev2",
-        "marked_at": "2026-09-21T12:00:00", "reason": "races the DNS",
-        "retired": False, "result": result, "state": state, "muted": False,
-        "assignee": None, "recent_failures": 6, "recent_runs": 20,
-    }  # type: Dict[str, Any]
-    mark.update(extra)
-    return mark
+def _flaking_row(name: str, streak: int, cadence: int = 3,
+                 **extra: Any) -> Dict[str, Any]:
+    """One row of ``queue=flaking`` in the server's shape (design §14): a
+    queue row, key for key what ``still_failing`` returns, FAIL, no live
+    mute, its ``flaky`` never null: state "flaking", ``streak`` at least
+    1 and below ``cadence``."""
+    row = _state_row("plain", "flaky")
+    row.update({"test_name": name, "prev_result": "FAIL",
+                "flaky": dict(_flaky("flaking", streak), cadence=cadence)})
+    row.update(extra)
+    return row
 
 
-def _flaky_page(marks: List[Dict[str, Any]], total: int,
-                retired: int = 0) -> Dict[str, Any]:
-    return {"generated_at": "2026-10-03T12:00:00", "stream": 1,
-            "total": total, "retired": retired, "marks": marks}
-
-
-#: The Flaky tab's first page in the server's order (decision 16):
-#: failing, flaking (one assigned, one muted), passing, retired last.
-_FLAKY_MARKS = [
-    _mark("dns_timeout", "FAIL", "failing", recent_failures=9),
-    _mark("login_retry", "FAIL", "flaking", assignee="dev1", cadence=5,
-          marked_by="dev1", marked_at="2026-10-02T12:00:00",
-          reason="race in teardown"),
-    _mark("muted_one", "FAIL", "flaking", muted=True),
-    _mark("cache_warm", "PASS", "passing", recent_failures=0,
-          recent_runs=1),
-    _mark("gone_test", "PASS", "passing", retired=True),
+#: The Flaking tab's rows in the server's order, nearest to their cadence
+#: first (one run left, one run left, two), then environment, script and
+#: name; not alphabetical, so a page that re-sorted them would show it.
+_FLAKING_ROWS = [
+    _flaking_row("dns_timeout", 2),
+    _flaking_row("login_retry", 4, 5, environment="env-b", assignee="dev1",
+                 latest_comment={"text": "retry storm", "author": "dev1",
+                                 "created_at": "2026-10-02T09:00:00"}),
+    _flaking_row("cache_warm", 1),
 ]
+
+#: The Flaking tab's one request, as any queue's: its queue part.
+_FLAKING_QUEUE_ASK = "api/summary?parts=queue&queue=flaking&assignee=dev1"
+
+#: The Flaking tab's columns: Still failing's, the Streak where its two
+#: times stand (design §14), the Output column's Review last. Sortable
+#: ones by their key (the lists driver's headCells()): Test, Streak (by
+#: the runs left), Latest comment, Assignee, Output.
+_FLAKING_HEAD = ["sort:test_name", "sort:runs_left", "Latest comment",
+                 "sort:assignee", "Output"]
 
 
 def _trend_part(flaking: Any) -> Dict[str, Any]:
@@ -9019,22 +9145,27 @@ def _trend_part(flaking: Any) -> Dict[str, Any]:
 
 def _lists_walk(marks: str, steps: List[List[Any]], clear: bool = False,
                 url: str = "http://127.0.0.1/index.html",
-                flaky: Any = None, part: Any = "flaking",
+                rows: Any = None, total: Any = None, part: Any = "flaking",
                 flaking: Any = None, flaking_after: Any = None,
                 headline_delay: int = 0, delays: Any = None,
-                parts: Any = None) -> List[Dict[str, Any]]:
+                parts: Any = None, rows_after: Any = None,
+                queue_row: Any = None,
+                root: str = REPO_DIR) -> List[Dict[str, Any]]:
     """Home over the shim with the lists driver. *marks* as
-    ``_state_fixture`` ("flaky", "zero", "older"); *flaky* the
-    ``/api/flaky`` pages by offset (default one page of _FLAKY_MARKS);
-    *part* the trend part ("flaking": with FAIL_FLAKING, 1 a night;
-    "older": a server that sends none); *flaking* overrides
+    ``_state_fixture`` ("flaky", "zero", "older"); *rows* the Flaking
+    tab's queue (default _FLAKING_ROWS) and *total* its ``total``
+    (default its length), *rows_after* its rows once an act has been
+    sent; *queue_row*, where given, every queue's one row whatever kind
+    is asked for; *part* the trend part ("flaking": with FAIL_FLAKING, 1
+    a night; "older": a server that sends none); *flaking* overrides
     ``status.flaking``, and *flaking_after* is its value once an act has
     been sent; *headline_delay* (ms) holds every headline answer back,
     and the load's snapshot then carries ``early``, what was asked for
     halfway through that wait. *delays* holds the headline and the split
     back by request, in order (``{"headline": [0, 300]}``); *parts*
-    answers each split request in turn (None: no split to be had). A step
-    may carry a third element, the ms to wait before its snapshot."""
+    answers each split request in turn (None: no split to be had);
+    *root* is the tree whose static files are walked. A step may carry a
+    third element, the ms to wait before its snapshot."""
     fixture = _state_fixture(marks, clear)
     if flaking is not None:
         fixture["headline"]["status"]["flaking"] = flaking
@@ -9042,13 +9173,19 @@ def _lists_walk(marks: str, steps: List[List[Any]], clear: bool = False,
         after = json.loads(json.dumps(fixture["headline"]))
         after["status"]["flaking"] = flaking_after
         fixture["headlineAfter"] = after
+    flaking_rows = _FLAKING_ROWS if rows is None else rows
+    fixture["queues"]["flaking"] = {
+        "tests": flaking_rows,
+        "total": len(flaking_rows) if total is None else total}
+    if rows_after is not None:
+        fixture["queuesAfter"] = dict(fixture["queues"], flaking={
+            "tests": rows_after, "total": len(rows_after)})
     fixture["part"] = _trend_part(1 if part == "flaking" else None)
     fixture.update({
         "url": url, "steps": steps, "headlineDelay": headline_delay,
-        "delays": delays or {}, "parts": parts or [],
-        "flaky": flaky or {"0": _flaky_page(_FLAKY_MARKS, 4, 1)},
+        "delays": delays or {}, "parts": parts or [], "queueRow": queue_row,
     })
-    answer = _shim(fixture, _LISTS_HOME_DRIVER)  # type: Any
+    answer = _shim(fixture, _LISTS_HOME_DRIVER, root)  # type: Any
     return list(answer)
 
 
@@ -9064,12 +9201,14 @@ def _results_of(asked: List[str]) -> List[List[str]]:
             for entry in asked if entry.startswith("api/dashboard")]
 
 
-#: Functions of app.js that must never name the Flaky tab's request:
-#: the refresh, the coalescer and the first paint around them.
+#: Functions of app.js that must never name the Flaking tab's rows: the
+#: refresh, the coalescer and the first paint around them. They reach
+#: its queue only as the open tab's, through loadQueue(state.activeQueue)
+#: and the coalescer's rowsRequest(kind), as any tab's (WP-44 item 15).
 _NO_FLAKY_REQUEST_IN = ("async function refreshAll(",
                         "async function fetchSummary()",
                         "function renderHeadline()", "function init()")
-_FLAKY_REQUEST_TOKENS = ("api/flaky", "flakyUrl(", "fetchFlakyPage(")
+_FLAKY_REQUEST_TOKENS = ("api/flaky", "FLAKING_QUEUE")
 
 
 def _flaky_request_offenders(source: str) -> List[str]:
@@ -9080,250 +9219,334 @@ def _flaky_request_offenders(source: str) -> List[str]:
                    for token in _FLAKY_REQUEST_TOKENS)]
 
 
-class FlakyTabTest(unittest.TestCase):
-    """WP-44 (design §3 U8): the Flaky tab beside Muted lists
-    every mark in scope. Its data is ``GET /api/flaky``, asked for on the
-    tab's first click and by nothing else: never by the first paint,
-    ``refreshAll`` or the coalescer, which reach it only as the open
-    tab's rows once someone has opened it. Paged by the server, 100 a
-    page, "Show more" running to ``total + retired`` (the retired marks
-    are the end of the same list, and ``total`` leaves them out)."""
+#: What the Flaking tab drew before it was a queue (WP-44 items 9 and 12),
+#: gone with item 15: its own request and pager, its own table and
+#: columns, their wording and their rule.
+_FLAKING_TAB_GONE = (
+    "FLAKY_TAB", "FLAKY_PAGE", "flakyUrl", "fetchFlakyPage",
+    "loadFlakyMore", "renderFlakyTable", "appendFlakyRows", "flakyColumns",
+    "failedOfRuns", "queue-more", "Newest mark first", "recent_failures",
+    "recent_runs")
 
-    def test_the_request_is_named_only_where_the_tab_asks(self) -> None:
+
+class FlakyTabTest(unittest.TestCase):
+    """WP-44 (design §13 and §14): the Flaking tab lists the tests
+    flaking now, marked and failing within their cadence, and nothing
+    else, and is a queue like its neighbours: its rows are the queue part
+    ``queue=flaking``, asked for through queueUrl() and rowsRequest() on
+    the tab's first click and as the open tab's rows after that, never by
+    the first paint; drawn by renderQueueTable()'s shared loop with the
+    Output column's Review on every row; Still failing's columns with the
+    Streak where Failing since and Last pass stand. It is drawn only
+    where ``status.flaking`` is above zero, or while it is the open tab.
+    The one state is said once above the table, with the order."""
+
+    def test_the_rows_are_a_queue_part(self) -> None:
         code = _strip_comments(read("app.js"))
         self.assertEqual(_flaky_request_offenders(read("app.js")), [])
-        self.assertEqual(code.count('"api/flaky"'), 1)
-        self.assertIn('apiUrl("api/flaky", { limit: FLAKY_PAGE, offset: '
-                      'offset },', _function_body(code, "function flakyUrl("))
-        self.assertIn("const FLAKY_PAGE = 100;", code)
-        self.assertEqual(len(_call_arguments(code, "flakyUrl")), 1)
-        self.assertIn("fetchJson(flakyUrl(offset))",
-                      _function_body(code, "async function fetchFlakyPage("))
-        self.assertEqual(sorted(_call_arguments(code, "fetchFlakyPage")),
-                         ["0", "queue.tests.length"])
-        self.assertIn("kind === FLAKY_TAB ? fetchFlakyPage(0)",
-                      _function_body(code, "function rowsRequest("))
+        self.assertRegex(_function_body(code, "function rowsRequest("),
+                         r"^function rowsRequest\(kind\) \{\s+return "
+                         r"fetchJson\(queueUrl\(kind\)\);\s+\}$")
+        self.assertIn('export const FLAKING_QUEUE = "flaking";',
+                      _strip_comments(read("api.js")))
+        # Nothing asks for GET /api/flaky any more: the only addresses
+        # under it are the two acts' POSTs.
+        for name, source in scripts().items():
+            for literal in _STRING_LITERAL_RE.findall(
+                    _strip_comments(source)):
+                if "api/flaky" in literal:
+                    self.assertIn(literal[1:-1], ("api/flaky/bulk",
+                                                  "api/flaky/unmark"), name)
+        for name in list(scripts()) + ["index.html", "style.css"]:
+            text = read_text(name)
+            for gone in _FLAKING_TAB_GONE:
+                self.assertNotIn(gone, text, name + ": " + gone)
 
     def test_the_detector_can_fail(self) -> None:
-        """Planted: the tab's request in the refresh and the coalescer."""
+        """Planted: the tab's request in the refresh, the coalescer and
+        the first paint."""
         source = read("app.js")
         for signature, planted in (
                 ("async function refreshAll(",
-                 "  fetchJson(flakyUrl(0));\n"),
+                 "  fetchJson(queueUrl(FLAKING_QUEUE));\n"),
                 ("async function fetchSummary()",
                  '  fetchJson("api/flaky");\n'),
-                ("function renderHeadline()", "  fetchFlakyPage(0);\n")):
+                ("function renderHeadline()",
+                 "  loadQueue(FLAKING_QUEUE, state.requestSeq);\n")):
             at = source.index(signature)
             at = source.index("{", at) + 1
             with self.subTest(signature=signature):
                 self.assertEqual(_flaky_request_offenders(
                     source[:at] + "\n" + planted + source[at:]), [signature])
 
-    def test_the_tab_sits_beside_muted_and_shows_only_with_a_mark(
+    def test_the_tab_sits_beside_muted_and_shows_only_while_flaking(
             self) -> None:
         code = _strip_comments(read("app.js"))
         tabs = code[code.index("const QUEUE_TABS = ["):]
         tabs = tabs[:tabs.index("];")]
-        self.assertLess(tabs.index('{ id: "muted"'),
-                        tabs.index('{ id: FLAKY_TAB, label: "Flaky" }'))
-        self.assertLess(tabs.index('{ id: FLAKY_TAB'), tabs.index('{ id: "fixed"'))
-        self.assertIn("if (tab.id === FLAKY_TAB && !flakyTabShown()) {",
+        self.assertLess(
+            tabs.index('{ id: "muted"'),
+            tabs.index("{ id: FLAKING_QUEUE, label: FLAKING_TAB_LABEL }"))
+        self.assertLess(tabs.index("{ id: FLAKING_QUEUE"),
+                        tabs.index('{ id: "fixed"'))
+        self.assertIn('export const FLAKING_TAB_LABEL = "Flaking";',
+                      _strip_comments(read("api.js")))
+        self.assertIn("if (tab.id === FLAKING_QUEUE && !flakyTabShown()) {",
                       _function_body(code, "function renderQueueTabs()"))
-        self.assertIn("flakyScope()", _function_body(code,
-                                                     "function flakyTabShown()"))
-        self.assertIn("state.summary.status.flaky_total",
-                      _function_body(code, "function queueCount("))
+        # Drawn by the tests flaking now, not by any mark (design §13):
+        # `status.flaky_total` stays the FLAKING toggle's and the charts'.
+        shown = _function_body(code, "function flakyTabShown()")
+        self.assertIn(
+            "state.activeQueue === FLAKING_QUEUE || flakingNow() > 0", shown)
+        # The badge: `status.flaking` until the queue's own total lands
+        # (a virtual kind, not in `queue_totals`).
+        count = _function_body(code, "function queueCount(")
+        self.assertLess(count.index("return queue.total;"),
+                        count.index("return flakingNow();"))
+        self.assertIn("state.summary.status.flaking || 0",
+                      _function_body(code, "function flakingNow()"))
+        for body in (shown, count):
+            self.assertNotIn("flaky_total", body)
+            self.assertNotIn("flakyScope()", body)
 
-    def test_the_pager_runs_to_total_plus_retired(self) -> None:
-        body = _strip_comments(_function_body(read("app.js"),
-                                              "function appendFlakyRows("))
-        self.assertIn("const listed = queue.total + queue.retired;", body)
-        self.assertIn("more.hidden = queue.tests.length >= listed;", body)
-        more = _strip_comments(_function_body(
-            read("app.js"), "async function loadFlakyMore("))
-        self.assertIn("fetchFlakyPage(queue.tests.length)", more)
-        self.assertIn("queue.retired = payload.queue.retired;", more)
-
-    def test_the_rows_take_one_displayed_result_and_no_sorts(self) -> None:
+    def test_the_rows_are_drawn_by_the_shared_loop(self) -> None:
+        """No branch of the tab's own anywhere in the loop, the fetch or
+        the refresh: its row is built, edged and given Review as every
+        queue's is."""
         code = _strip_comments(read("app.js"))
-        rows = _function_body(code, "function appendFlakyRows(")
-        self.assertIn("const shown = displayResult(entry.result, entry.state,"
-                      " entry.muted);", rows)
-        self.assertIn("const marker = resultClass(shown);", rows)
-        self.assertIn("column.cell(entry, shown)", rows)
-        columns = _function_body(code, "function flakyColumns()")
-        self.assertIn("resultChip(shown)", columns)
-        self.assertNotIn("sortKey", columns)
-        self.assertNotIn("entry.result", columns)
-        self.assertNotIn("innerHTML", columns + rows)
-        self.assertIn("failedOfRuns(entry.recent_failures, "
-                      "entry.recent_runs)", columns)
-        self.assertIn("cadenceWords(entry.cadence)", columns)
-        self.assertNotIn("attachSorting",
-                         _function_body(code, "function renderFlakyTable("))
+        for signature in ("function renderQueueTable()",
+                          "async function loadQueue(",
+                          "async function refreshQueueCounts()",
+                          "function rowsRequest("):
+            self.assertNotIn("FLAKING_QUEUE", _function_body(code, signature),
+                             signature)
+        columns = _function_body(code, "function queueColumns(")
+        # Still failing's row, the Streak where its two times stand: the
+        # one difference (design §14).
+        self.assertRegex(columns, r"case FLAKING_QUEUE:\s+return \[testCol, "
+                                  r"streakCol, commentCol, assigneeCol\];")
+        self.assertRegex(columns, r'case "still_failing":\s+return \[testCol, '
+                                  r'failingSinceCol,\s+when\("Last pass", '
+                                  r'"last_pass_time"\),\s+commentCol,\s+'
+                                  r'assigneeCol\];')
+
+    def test_the_streak_column(self) -> None:
+        """Its words from api.js's helper beside flakySentence(), its
+        title that sentence, and its order the runs left before the test
+        counts as failing, as the server orders the rows."""
+        code = _strip_comments(read("app.js"))
+        columns = _function_body(code, "function queueColumns(")
+        streak = columns[columns.index("const streakCol = {"):]
+        streak = streak[:streak.index("\n  };") + 4]
+        self.assertIn('header: "Streak",', streak)
+        self.assertIn('sortKey: "runs_left",', streak)
+        # Read defensively, as the Review panel reads a mark: a row with
+        # no `flaky` draws an empty cell and sorts last (null).
+        self.assertRegex(streak, r"sortValue: \(entry\) => \(entry\.flaky\s+"
+                                 r"\? entry\.flaky\.cadence - "
+                                 r"entry\.flaky\.streak : null\),")
+        self.assertRegex(streak, r"if \(entry\.flaky\) \{\s+cell\.textContent"
+                                 r" = flakyStreakWords\(entry\.flaky\);\s+"
+                                 r"cell\.title = flakySentence\(entry\.flaky,")
+        self.assertNotIn("innerHTML", streak)
+        # The loop sorts on a column's sortValue where it names one, by
+        # the one shared sortRows(), and not past the cap.
+        render = _function_body(code, "function renderQueueTable()")
+        self.assertIn("const sortValue = sortColumn ? sortColumn.sortValue "
+                      ": null;", render)
+        self.assertIn("if (!capped && sortValue) {", render)
+        self.assertIn("value: sortValue(entry)", render)
+        # Only a key one of this tab's columns has sorts it (QueueSortTest).
+        self.assertIn("} else if (!capped && sortColumn) {", render)
+        self.assertNotIn("state.queueSortKey || \"\"", render)
+        api = _strip_comments(read("api.js"))
+        self.assertIn(
+            'return cadenceWords(flaky.streak) + ", failing at " '
+            '+ flaky.cadence;',
+            _function_body(api, "export function flakyStreakWords(flaky)"))
+        self.assertLess(api.index("export function flakySentence("),
+                        api.index("export function flakyStreakWords("))
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
                      "are optional dev tooling, the source guards still run")
-    def test_no_mark_no_tab_and_no_request(self) -> None:
-        for marks in ("zero", "older"):
-            with self.subTest(marks=marks):
-                load = _lists_walk(marks, [])[0]
-                self.assertNotIn("Flaky", [tab[0] for tab in load["tabs"]])
+    def test_the_streak_words_byte_for_byte(self) -> None:
+        """They agree with the sentence (its title) and the cadence's own
+        words: "N in a row" is cadenceWords(), "failing at" the sentence's
+        "counts as failing at"."""
+        answer = _api_calls([
+            ("flakyStreakWords", [_flaky("flaking", 1)]),
+            ("flakyStreakWords", [_flaky("flaking", 2)]),
+            ("flakyStreakWords",
+             [dict(_flaky("flaking", 9), cadence=10)]),
+            ("flakySentence", [_flaky("flaking", 2), False]),
+            ("cadenceWords", [3]),
+        ])
+        self.assertEqual(answer, [
+            "1 in a row, failing at 3", "2 in a row, failing at 3",
+            "9 in a row, failing at 10",
+            "Flaking: failed its last 2 runs; counts as failing at 3 in a row",
+            "3 in a row"])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_a_row_without_its_mark_still_draws(self) -> None:
+        """A row with ``flaky: null`` (an older server behind a reload, a
+        race) draws whole, with its Review, an empty Streak cell and no
+        title, and sorts last by Streak in either direction."""
+        bare = dict(_FLAKING_ROWS[0], test_name="no_mark", flaky=None)
+        opened, ascending, descending = _lists_walk(
+            "flaky", [["tab", "Flaking"], ["sort", "runs_left"],
+                      ["sort", "runs_left"]],
+            rows=[bare, _FLAKING_ROWS[0], _FLAKING_ROWS[2]])[1:]
+        self.assertEqual([row["cells"][0][:7] for row in opened["rows"]],
+                         ["no_mark", "dns_tim", "cache_w"])
+        self.assertEqual(opened["rows"][0]["cells"][1], "")
+        self.assertEqual(opened["rows"][0]["titles"][1], "")
+        self.assertEqual([row["review"] for row in opened["rows"]],
+                         [["Review"]] * 3)
+        self.assertEqual([row["cells"][0][:7] for row in ascending["rows"]],
+                         ["dns_tim", "cache_w", "no_mark"])
+        self.assertEqual([row["cells"][0][:7] for row in descending["rows"]],
+                         ["cache_w", "dns_tim", "no_mark"])
+
+    def test_the_one_state_is_said_once_above_the_table(self) -> None:
+        """By QUEUE_INVARIANT_RESULT, the mechanism Still failing and
+        Stale annotations use, its words from api.js; the old order line,
+        its element, its rule and its "N flaking now" link are gone."""
+        code = _strip_comments(read("app.js"))
+        self.assertIn("[FLAKING_QUEUE]: { result: FLAKING_FILTER, text: "
+                      "FLAKING_TAB_NOTE },", code)
+        api = _strip_comments(read("api.js"))
+        # Not "failing": a mark changes what counts as a failure, and a
+        # test on this tab is by that definition not failing.
+        self.assertIn('export const FLAKING_TAB_NOTE = "Every test here '
+                      'failed its latest run, "\n  + "but fewer times in a '
+                      'row than its cadence. Nearest to its cadence "\n'
+                      '  + "first.";', api.replace("\r\n", "\n"))
+        self.assertIn('export const FLAKING_TAB_EMPTY = "Nothing is '
+                      'flaking.";', api)
+        for name, text in (("app.js", code), ("api.js", api),
+                           ("index.html", read("index.html")),
+                           ("style.css", read_text("style.css"))):
+            for gone in ("queue-flaky-note", "flakingNowWords",
+                         "FLAKY_TAB_ORDER", "List them in All tests",
+                         "renderFlakyNote", "retired-tag"):
+                self.assertNotIn(gone, text, name + ": " + gone)
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_nothing_flaking_no_tab_and_no_request(self) -> None:
+        """No mark, or marks with none flaking now (``flaky_total`` 9,
+        ``flaking`` 0): no tab, and the tab's queue is never asked for."""
+        for marks, flaking in (("zero", None), ("older", None),
+                               ("flaky", 0)):
+            with self.subTest(marks=marks, flaking=flaking):
+                load = _lists_walk(marks, [], flaking=flaking)[0]
                 self.assertEqual([tab[0] for tab in load["tabs"]], [
                     "New failures", "Still failing", "Muted", "Fixed",
                     "Stale annotations", "Not run", "My actions"])
-                self.assertFalse(any(a.startswith("api/flaky")
+                self.assertFalse(any("queue=flaking" in a or
+                                     a.startswith("api/flaky")
                                      for a in load["asked"]))
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
                      "are optional dev tooling, the source guards still run")
     def test_the_first_click_asks_once_and_draws_the_rows(self) -> None:
         load, opened, again, reopened = _lists_walk("flaky", [
-            ["tab", "Flaky"], ["tab", "Muted"], ["tab", "Flaky"]])
+            ["tab", "Flaking"], ["tab", "Muted"], ["tab", "Flaking"]],
+            flaking=3)
+        # Before the tab's own answer, its badge is `status.flaking`.
         self.assertEqual([tab[:2] for tab in load["tabs"]][2:4],
-                         [["Muted", "6"], ["Flaky", "9"]])
-        self.assertFalse(any(a.startswith("api/flaky") for a in load["asked"]))
+                         [["Muted", "6"], ["Flaking", "3"]])
+        self.assertFalse(any("queue=flaking" in a for a in load["asked"]))
         # Home's load is still four data requests: three in the first
         # batch, then the trend's split once the headline is drawn.
         self.assertEqual(len(load["asked"]), 4)
         self.assertTrue(load["asked"][-1].startswith(
             "api/summary?parts=assigned_trend"))
-        self.assertEqual(opened["asked"], ["api/flaky?limit=100&offset=0"])
+        self.assertEqual(opened["asked"], [_FLAKING_QUEUE_ASK])
         self.assertEqual(again["asked"],
                          ["api/summary?parts=queue&queue=muted&assignee=dev1"])
         self.assertEqual(reopened["asked"], [])
-        # The badge is the tab's own total once it has landed.
-        self.assertEqual(opened["tabs"][3], ["Flaky", "4", "true"])
-        self.assertEqual(opened["head"], ["Test", "State", "Mark", "Cadence",
-                                          "Failed", "Assignee"])
+        # The badge is the tab's own total once it has landed: the rows.
+        self.assertEqual(opened["tabs"][3], ["Flaking", "3", "true"])
+        self.assertEqual(opened["head"], _FLAKING_HEAD)
         self.assertFalse(opened["tableHidden"])
-        self.assertTrue(opened["resultNote"])
-        rows = opened["rows"]
-        self.assertEqual([row["edge"] for row in rows], [
-            "result-fail", "result-flaking", "result-fail", "result-pass",
-            "result-pass"])
-        self.assertEqual(rows[0]["cells"], [
-            "dns_timeoutenv-a · s1.py", "FAIL",
-            "races the DNSby dev2 · 12 days ago", "3 in a row",
-            "9 of its last 20 runs"])
-        self.assertEqual(rows[1]["cells"][1:], [
-            "FLAKING", "race in teardownby dev1 · 1 day ago",
-            "5 in a row", "6 of its last 20 runs"])
-        self.assertEqual(rows[1]["marks"], ["chip result-flaking:FLAKING"])
-        # A live mute wins: FAIL, the pill, its title the mark's sentence.
-        self.assertEqual(rows[2]["marks"], [
-            "chip result-fail:FAIL", "mute-tag:muted:Marked flaky; the mute "
-            "comes first until it runs out"])
-        self.assertEqual(rows[3]["cells"][4], "0 of its only run")
-        self.assertEqual(rows[4]["marks"], ["chip result-pass:PASS",
-                                            "retired-tag:retired"])
-        # The assignee cell every queue has: Take where nobody has it.
-        self.assertEqual([row["take"] for row in rows], [1, 0, 1, 1, 1])
-        self.assertEqual(opened["note"][0:2], [
-            False, "Failing first, then flaking, then passing; newest mark "
-            "first.6 flaking now · List them in All tests"])
-        self.assertEqual(opened["note"][2], [
-            "link-btn:List them in All tests:List the tests flaking now in "
-            "All tests"])
-        self.assertEqual(opened["more"][0], True)
-        # Another tab hides the tab's note and pager.
-        self.assertTrue(again["note"][0])
-        self.assertTrue(again["more"][0])
-
-    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
-                     "are optional dev tooling, the source guards still run")
-    def test_the_link_line_only_above_zero(self) -> None:
-        opened = _lists_walk("flaky", [["tab", "Flaky"]], flaking=0)[1]
         self.assertEqual(opened["note"], [
-            False, "Failing first, then flaking, then passing; newest mark "
-            "first.", []])
+            False, "FLAKINGEvery test here failed its latest run, but fewer "
+            "times in a row than its cadence. Nearest to its cadence first.",
+            ["chip result-flaking:FLAKING"]])
+        rows = opened["rows"]
+        # In the server's order, nearest to its cadence first: the test,
+        # the streak, the latest comment.
+        self.assertEqual([row["cells"][:2] for row in rows], [
+            ["dns_timeoutenv-a · s1.py", "2 in a row, failing at 3"],
+            ["login_retryenv-b · s1.py", "4 in a row, failing at 5"],
+            ["cache_warmenv-a · s1.py", "1 in a row, failing at 3"]])
+        self.assertEqual([row["cells"][2][:18] for row in rows],
+                         ["—", "retry stormdev1 · ", "—"])
+        self.assertEqual([row["cells"][4] for row in rows], ["Review"] * 3)
+        self.assertEqual([row["titles"][1] for row in rows], [
+            "Flaking: failed its last 2 runs; counts as failing at "
+            "3 in a row",
+            "Flaking: failed its last 4 runs; counts as failing at "
+            "5 in a row",
+            "Flaking: failed its last run; counts as failing at 3 in a row"])
+        # The row's edge reads flaking; no chip, no pill in the row.
+        self.assertEqual([row["edge"] for row in rows], ["result-flaking"] * 3)
+        self.assertEqual([row["marks"] for row in rows], [[], [], []])
+        # The assignee cell every queue has, Take where nobody has it,
+        # and the Output column's Review on every row.
+        self.assertEqual([row["take"] for row in rows], [1, 0, 1])
+        self.assertEqual([row["review"] for row in rows], [["Review"]] * 3)
+        self.assertEqual(opened["cap"][0], True)
+        self.assertFalse(opened["sortOff"])
+        # Another tab draws its own line (Muted has none).
+        self.assertEqual(again["note"][:2], [True, ""])
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
                      "are optional dev tooling, the source guards still run")
-    def test_show_more_appends_until_total_plus_retired(self) -> None:
-        """The list pages over ``total + retired``: the retired marks are
-        the end of the same list, and ``total`` leaves them out. One
-        hundred marks, then the last two of 101 + 1, the retired one
-        last."""
-        first = [_mark("t%03d" % index, "FAIL", "flaking")
-                 for index in range(100)]
-        last = [_mark("t100", "PASS", "passing"),
-                _mark("t101", "PASS", "passing", retired=True)]
-        pages = {"0": _flaky_page(first, 101, 1),
-                 "100": _flaky_page(last, 101, 1)}
-        opened, more = _lists_walk("flaky", [
-            ["tab", "Flaky"], ["click", "queue-more"]], flaky=pages)[1:]
-        self.assertEqual(len(opened["rows"]), 100)
-        self.assertEqual(opened["more"], [False, "Show 2 more"])
-        self.assertEqual(more["asked"], ["api/flaky?limit=100&offset=100"])
-        self.assertEqual(len(more["rows"]), 102)
-        self.assertEqual(more["rows"][-1]["marks"],
-                         ["chip result-pass:PASS", "retired-tag:retired"])
-        self.assertEqual(more["more"][0], True)
-        # Run to `total` alone, the retired mark would never be listed.
-        self.assertLess(101, len(more["rows"]))
-
-    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
-                     "are optional dev tooling, the source guards still run")
-    def test_an_act_after_show_more_redraws_page_one(self) -> None:
-        """Two pages loaded, then an act from a row: Take (the summary
-        refresh) or the assignee select (the counts refresh). The
-        coalescer brings page one back, and the tab is redrawn from it:
-        the rows, the pager and the "N flaking now" line agree with the
-        state, and the next "Show more" asks for offset 100 and lists no
-        mark twice."""
-        pages = {
-            str(offset): _flaky_page(
-                [_mark("t%03d" % index, "FAIL", "flaking")
-                 for index in range(offset, min(offset + 100, 210))], 210)
-            for offset in (0, 100, 200)}
-        for act in (["take", None], ["assign", "dev1"]):
-            with self.subTest(act=act[0]):
-                opened, two, acted, again = _lists_walk(
-                    "flaky", [["tab", "Flaky"], ["click", "queue-more"], act,
-                              ["click", "queue-more"]],
-                    flaky=pages, flaking_after=5)[1:]
-                self.assertEqual(len(two["rows"]), 200)
-                self.assertEqual(two["more"], [False, "Show 10 more"])
-                self.assertIn("api/flaky?limit=100&offset=0", acted["asked"])
-                self.assertEqual(len(acted["rows"]), 100)
-                self.assertEqual(acted["more"], [False, "Show 100 more"])
-                self.assertIn("5 flaking now", acted["note"][1])
-                self.assertNotIn("6 flaking now", acted["note"][1])
-                self.assertEqual(again["asked"],
-                                 ["api/flaky?limit=100&offset=100"])
-                names = [row["cells"][0].split("env-a")[0]
-                         for row in again["rows"]]
-                self.assertEqual(len(names), 200)
-                self.assertEqual(len(set(names)), 200)
-                self.assertEqual(again["more"], [False, "Show 10 more"])
+    def test_the_cap_note_and_sort_as_on_every_tab(self) -> None:
+        """A queue capped below its total says so and switches its sorts
+        off with the reason, the Flaking tab's as every tab's; the badge
+        is the queue's ``total``."""
+        opened = _lists_walk("flaky", [["tab", "Flaking"]], flaking=600,
+                             total=600)[1]
+        self.assertEqual(len(opened["rows"]), 3)
+        self.assertEqual(opened["tabs"][3][:2], ["Flaking", "600"])
+        self.assertEqual(opened["cap"], [
+            False, "Showing the first 3 of 600 — filter by environment to "
+            "narrow the queue."])
+        self.assertTrue(opened["sortOff"])
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
                      "are optional dev tooling, the source guards still run")
     def test_the_states_loading_and_empty(self) -> None:
-        self.assertIn('queueId === FLAKY_TAB ? "Loading…"',
-                      _function_body(read("app.js"), "function renderQueueTable()"))
-        empty = _lists_walk("flaky", [["tab", "Flaky"]], flaky={
-            "0": _flaky_page([], 0)})[1]
+        # Loading reads as every queue's does: the tab is one of them.
+        render = _strip_comments(_function_body(
+            read("app.js"), "function renderQueueTable()"))
+        self.assertIn('emptyNote.textContent = "Loading queue…";', render)
+        self.assertNotIn('"Loading…"', render)
+        empty = _lists_walk("flaky", [["tab", "Flaking"]], rows=[])[1]
         self.assertTrue(empty["tableHidden"])
-        self.assertEqual(empty["empty"], [False, "No test is marked flaky here."])
+        self.assertEqual(empty["empty"], [False, "Nothing is flaking."])
         self.assertTrue(empty["note"][0])
-        self.assertTrue(empty["more"][0])
+        self.assertEqual(empty["tabs"][3], ["Flaking", "0", "true"])
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
                      "are optional dev tooling, the source guards still run")
-    def test_an_act_refetches_page_one_and_the_counts(self) -> None:
-        """Take (the coalescer) and a selection-bar act or Reload
-        (``refreshAll``, as Mute does on the Muted tab) each ask for page
-        one again with the headline; on another tab they do not."""
+    def test_an_act_refetches_the_queue_and_the_counts(self) -> None:
+        """Take (the coalescer) and Reload (``refreshAll``) each ask for
+        the open tab's queue again with the headline, as on any tab; on
+        another tab they do not."""
         opened, take, reload = _lists_walk("flaky", [
-            ["tab", "Flaky"], ["take", None], ["click", "reload-btn"]])[1:]
-        self.assertIn("api/flaky?limit=100&offset=0", take["asked"])
+            ["tab", "Flaking"], ["take", None], ["click", "reload-btn"]])[1:]
+        self.assertIn(_FLAKING_QUEUE_ASK, take["asked"])
         self.assertTrue(any("parts=headline" in a for a in take["asked"]))
-        self.assertIn("api/flaky?limit=100&offset=0", reload["asked"])
+        self.assertIn(_FLAKING_QUEUE_ASK, reload["asked"])
         self.assertTrue(any("parts=headline" in a for a in reload["asked"]))
         elsewhere = _lists_walk("flaky", [["click", "reload-btn"]])[1]
-        self.assertFalse(any(a.startswith("api/flaky")
+        self.assertFalse(any("queue=flaking" in a
                              for a in elsewhere["asked"]))
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
@@ -9331,8 +9554,191 @@ class FlakyTabTest(unittest.TestCase):
     def test_the_selection_bar_works_on_its_rows(self) -> None:
         """Every row is marked, so ticking any of them offers Set cadence
         and Unmark, as on any queue's rows."""
-        ticked = _lists_walk("flaky", [["tab", "Flaky"], ["tick", [0, 1]]])[2]
+        ticked = _lists_walk("flaky", [["tab", "Flaking"], ["tick", [0, 1]]])[2]
         self.assertEqual(ticked["ticked"], ["Set cadence", False])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_review_on_a_flaking_row_and_unmark_from_the_panel(self) -> None:
+        """Review on a Flaking row opens the panel Still failing's opens,
+        group for group: assign, comment, mute and the Flaky group with
+        the mark's sentence, owner, age and reason, Set cadence and
+        Unmark. Unmark from it posts the one test, and the reload that
+        follows brings the queue back without it, the badge with it."""
+        still = _lists_walk("flaky", [["tab", "Still failing"],
+                                      ["review", 0]])[2]
+        load, _, flaking, unmarked = _lists_walk(
+            "flaky", [["tab", "Flaking"], ["review", 0],
+                      ["panelUnmark", None]], flaking=3, flaking_after=2,
+            rows_after=_FLAKING_ROWS[1:])
+        self.assertEqual(load["tabs"][3][:2], ["Flaking", "3"])
+        self.assertEqual(flaking["panel"]["labels"], still["panel"]["labels"])
+        self.assertEqual(flaking["panel"]["labels"],
+                         ["Assign to", "Add a comment", "Mute", "Flaky"])
+        self.assertEqual(flaking["panel"]["flaky"], [
+            ["SPAN", ["Flaking: failed its last 2 runs; counts as failing "
+                      "at 3 in a row", "by dev1 · 12 days ago · race in "
+                      "teardown"]],
+            ["SELECT", "3"], ["BUTTON", "Set cadence"], ["BUTTON", "Unmark"]])
+        self.assertEqual([row["review"] for row in flaking["rows"]][0],
+                         ["Close"])
+        self.assertEqual(unmarked["posts"], [["api/flaky/unmark", {
+            "username": "dev1", "tests": [{
+                "environment": "env-a", "script": "s1.py",
+                "test_name": "dns_timeout"}]}]])
+        self.assertIn(_FLAKING_QUEUE_ASK, unmarked["asked"])
+        self.assertEqual([row["cells"][0] for row in unmarked["rows"]],
+                         ["login_retryenv-b · s1.py",
+                          "cache_warmenv-a · s1.py"])
+        self.assertEqual(unmarked["tabs"][3], ["Flaking", "2", "true"])
+        self.assertIsNone(unmarked["panel"])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_unmark_from_the_selection_bar(self) -> None:
+        """The bar's Unmark on a ticked Flaking row: the one test posted,
+        then the board reloaded, the row gone and the badge following."""
+        acted = _lists_walk("flaky", [["tab", "Flaking"],
+                                      ["barUnmark", [2]]],
+                            flaking=3, flaking_after=2,
+                            rows_after=_FLAKING_ROWS[:2])[2]
+        self.assertEqual(acted["posts"], [["api/flaky/unmark", {
+            "username": "dev1", "tests": [{
+                "environment": "env-a", "script": "s1.py",
+                "test_name": "cache_warm"}]}]])
+        self.assertIn(_FLAKING_QUEUE_ASK, acted["asked"])
+        self.assertEqual([row["cells"][0] for row in acted["rows"]],
+                         ["dns_timeoutenv-a · s1.py",
+                          "login_retryenv-b · s1.py"])
+        self.assertEqual(acted["tabs"][3], ["Flaking", "2", "true"])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_act_that_clears_the_last_row_leaves_the_empty_state(
+            self) -> None:
+        """Unmarking the last test flaking leaves the reader on the open
+        tab's empty state; leaving it, the tab is gone."""
+        cleared, left = _lists_walk(
+            "flaky", [["tab", "Flaking"], ["review", 0],
+                      ["panelUnmark", None], ["tab", "Muted"]],
+            rows=_FLAKING_ROWS[:1], flaking=1, flaking_after=0,
+            rows_after=[])[3:]
+        self.assertEqual(cleared["tabs"][3], ["Flaking", "0", "true"])
+        self.assertTrue(cleared["tableHidden"])
+        self.assertEqual(cleared["empty"], [False, "Nothing is flaking."])
+        self.assertNotIn("Flaking", [tab[0] for tab in left["tabs"]])
+
+
+#: Triage tabs allowed to draw a row without the Output column's Review,
+#: each with its reason. None: Triage is the morning touch point, and
+#: every tab in it is a queue with the run's output and the Review panel
+#: on every row (CLAUDE.md, "Triage is the morning touch point"; design
+#: flaky-mark-r0 §14). A tab added here needs the owner's word, named in
+#: the reason.
+_TABS_WITHOUT_REVIEW = {}  # type: Dict[str, str]
+
+
+def _tabs_without_review(each: List[Dict[str, Any]]) -> List[str]:
+    """The tabs of a ``reviewEach`` walk whose row has no Review button,
+    or whose Review opens no panel with the groups every tab's has."""
+    return [tab["tab"] for tab in each
+            if tab["buttons"] != [1] or tab["head"][-1:] != ["Output"]
+            or not tab["panel"]
+            or tab["panel"]["labels"][:2] != ["Assign to", "Add a comment"]
+            or "Flaky" not in tab["panel"]["labels"]]
+
+
+class QueueTabReviewTest(unittest.TestCase):
+    """WP-44 item 15: every Triage tab's row has the Output column's
+    Review, and it opens the panel. The Flaking tab was built without
+    them, as a table of its own beside the shared loop, and nothing
+    failed; this walks every tab in QUEUE_TABS, each given the same one
+    row, so a tab added later without them fails here unless it is named
+    in _TABS_WITHOUT_REVIEW with its reason."""
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_every_tabs_row_has_review_and_it_opens_the_panel(self) -> None:
+        each = _lists_walk("flaky", [["reviewEach", None]], flaking=1,
+                           queue_row=_FLAKING_ROWS[0])[1]["each"]
+        code = _strip_comments(read("app.js"))
+        tabs = code[code.index("const QUEUE_TABS = ["):]
+        tabs = tabs[:tabs.index("];")]
+        # Every tab of QUEUE_TABS was drawn and walked.
+        self.assertEqual(len(each), tabs.count("{ id: "))
+        self.assertEqual(len(each), 8)
+        self.assertEqual(
+            [label for label in _tabs_without_review(each)
+             if label not in _TABS_WITHOUT_REVIEW], [])
+        # The same row opens the same panel on every tab.
+        self.assertEqual(
+            {json.dumps(tab["panel"]) for tab in each
+             if tab["tab"] not in _TABS_WITHOUT_REVIEW},
+            {json.dumps(each[0]["panel"])})
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: a copy of the static tree whose Fixed tab draws its
+        rows without Review, as the Flaking tab once did."""
+        with tempfile.TemporaryDirectory() as scratch:
+            shutil.copytree(STATIC_DIR, os.path.join(scratch, "static"))
+            os.makedirs(os.path.join(scratch, "tools", "dev", "net"))
+            shutil.copy(
+                os.path.join(REPO_DIR, "tools", "dev", "net", "domshim.mjs"),
+                os.path.join(scratch, "tools", "dev", "net"))
+            app = os.path.join(scratch, "static", "app.js")
+            with io.open(app, encoding="utf-8") as handle:
+                source = handle.read()
+            planted = source.replace(
+                "    actionCell.appendChild(reviewBtn);\n",
+                '    if (queueId !== "fixed") {\n'
+                "      actionCell.appendChild(reviewBtn);\n    }\n", 1)
+            self.assertNotEqual(planted, source)
+            with io.open(app, "w", encoding="utf-8") as handle:
+                handle.write(planted)
+            each = _lists_walk("flaky", [["reviewEach", None]], flaking=1,
+                               queue_row=_FLAKING_ROWS[0],
+                               root=scratch)[1]["each"]
+        self.assertEqual(_tabs_without_review(each), ["Fixed"])
+
+
+class QueueSortTest(unittest.TestCase):
+    """The reader's sort key is kept across the Triage tabs, and applies
+    only where it names one of the open tab's own columns. Every queue row
+    carries ``start_time``, ``failing_since`` and the rest, so before this
+    a key from another tab's column reordered a tab's rows with no arrow
+    on any header, under a line stating the server's order ("Nearest to
+    its cadence first"); now such a key leaves the server's order."""
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_only_a_key_the_tab_has_sorts_it(self) -> None:
+        # Started at different times, so a sort on New failures' "Failed
+        # at" would put them in another order than the server's.
+        rows = [dict(row, start_time=at) for row, at in zip(
+            _FLAKING_ROWS, ("2026-10-03T03:00:00", "2026-10-03T01:00:00",
+                            "2026-10-03T02:00:00"))]
+        def names(snap: Dict[str, Any]) -> List[str]:
+            return [row["cells"][0].split("env-")[0] for row in snap["rows"]]
+
+        failed_at, flaking, by_assignee, muted, back = _lists_walk(
+            "flaky", [["sort", "start_time"], ["tab", "Flaking"],
+                      ["sort", "assignee"], ["tab", "Muted"],
+                      ["tab", "Flaking"]], rows=rows)[1:]
+        self.assertEqual(failed_at["sorted"], ["start_time:ascending"])
+        # Another tab's key: the server's order, and no arrow.
+        self.assertEqual(names(flaking),
+                         ["dns_timeout", "login_retry", "cache_warm"])
+        self.assertEqual(flaking["sorted"], [])
+        # A key this tab has sorts it, with its arrow (nobody's last).
+        self.assertEqual(names(by_assignee),
+                         ["login_retry", "dns_timeout", "cache_warm"])
+        self.assertEqual(by_assignee["sorted"], ["assignee:ascending"])
+        # And carries to another tab that has the column, and back.
+        self.assertEqual(muted["sorted"], ["assignee:ascending"])
+        self.assertEqual(back["sorted"], ["assignee:ascending"])
+        self.assertEqual(names(back), names(by_assignee))
 
 
 class FlakingFilterTest(unittest.TestCase):
@@ -9401,22 +9807,6 @@ class FlakingFilterTest(unittest.TestCase):
         self.assertEqual(_results_of(load["asked"]), [["FLAKING", "FAIL"]])
         self.assertIn("params.getAll(\"result\").length > 0", _function_body(
             _strip_comments(read("app.js")), "function urlAsksForBrowseFilters("))
-
-    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
-                     "are optional dev tooling, the source guards still run")
-    def test_the_links_set_flaking_alone(self) -> None:
-        """"All clear"'s "6 flaking" and the Flaky tab's link line set
-        FLAKING alone on the browse request, stale cleared; nothing else
-        is asked for."""
-        aside = _lists_walk("flaky", [["asideLink", "6 flaking"]],
-                            clear=True)[1]
-        self.assertEqual(_results_of(aside["asked"]), [["FLAKING"]])
-        self.assertEqual(len(aside["asked"]), 1)
-        self.assertEqual([t[2] for t in aside["toggles"]],
-                         ["false", "false", "true", "false", "false"])
-        tab = _lists_walk("flaky", [["tab", "Flaky"], ["noteLink", None]])[2]
-        self.assertEqual(_results_of(tab["asked"]), [["FLAKING"]])
-        self.assertEqual(len(tab["asked"]), 1)
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
                      "are optional dev tooling, the source guards still run")

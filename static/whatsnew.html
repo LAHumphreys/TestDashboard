@@ -73,9 +73,14 @@
         <li><strong>All tests gains a FLAKING filter</strong>, beside FAIL,
           once a test in view is marked; FAIL now leaves the flaking tests
           out, and the two together are every failing test.</li>
-        <li><strong>A Flaky tab beside Muted</strong> lists every mark: its
-          reason, owner and age, its cadence, and how often the test has
-          really failed (&ldquo;6 of its last 20 runs&rdquo;).</li>
+        <li><strong>A Flaking tab in Triage</strong> lists the tests
+          flaking now, nearest to their cadence first, each with its
+          streak (&ldquo;2 in a row, failing at 3&rdquo;). You review them
+          as on any other tab: the run&rsquo;s output, comments, assigning,
+          muting, and the mark&rsquo;s reason, <strong>Set
+          cadence</strong> and <strong>Unmark</strong> are under
+          <strong>Review</strong> on every row. The &ldquo;flaking&rdquo;
+          count under &ldquo;All clear&rdquo; opens it.</li>
       </ul>
     </section>
 
