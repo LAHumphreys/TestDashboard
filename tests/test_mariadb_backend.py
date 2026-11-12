@@ -337,10 +337,15 @@ EXCLUDED_TESTS = {
     "FlakyBoardApiTest.test_no_count_joins_the_marks_with_marks":
         "reads statements with sqlite3's set_trace_callback (WP-44 item "
         "8); the statement text is the same on both engines.",
-    "FlakyBoardApiTest.test_the_trend_part_and_the_tab_cost":
+    "FlakyBoardApiTest.test_the_trend_part_costs":
         "counts statements with sqlite3's set_trace_callback (WP-44 "
-        "item 8). The values are FlakyTrendTest's and FlakyTabOrderTest's, "
-        "which run here.",
+        "item 8). The values are FlakyTrendTest's, which runs here.",
+    "FlakyBoardApiTest.test_the_flaking_queue_costs":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 14). The values are FlakingQueueTest's and "
+        "FlakingQueueAgreesWithHeadlineTest's, and the rows read's plan "
+        "FlakyPlanTest's, which run here; that the rows are read in two "
+        "statements at the cap is FlakingQueueTest's, by its own spy.",
     "TestBulkSetAssignee.test_empty_input_issues_no_writes":
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssigneeForTriples."

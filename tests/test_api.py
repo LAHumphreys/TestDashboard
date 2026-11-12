@@ -25,7 +25,7 @@ import re
 import sqlite3
 import unittest
 import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from testboard import api
 from testboard.model import format_iso
@@ -8004,6 +8004,12 @@ class NoMarksAddsNothingTest(ApiCase):
     #: base refused): the statement lists are identical, the count of
     #: /api/dashboard now running beside its rows rather than after the
     #: streaks.
+    #:
+    #: Item 14 widens the reads to ``queue=flaking``, which the base did
+    #: not serve: its pin is the queue prefix every kind pays and the mute
+    #: epoch's statement carrying the bit, two fewer than New failures
+    #: (no count, no rows), and every statement it runs is one the New
+    #: failures queue runs (test_the_flaking_queue_runs_nothing_new).
     BASE_COLD_SELECTS = {
         "headline": 22, "full": 29, "browse": 3, "open_actions": 13,
         "watch": 12, "detail": 5, "detail_build": 9, "names": 9,
@@ -8011,6 +8017,7 @@ class NoMarksAddsNothingTest(ApiCase):
         "queue_new_failures": 9, "queue_still_failing": 9,
         "queue_muted": 9, "queue_fixed": 8, "queue_unexpected_passes": 8,
         "queue_not_run": 8, "queue_assigned": 8, "queue_mine": 11,
+        "queue_flaking": 7,
         "browse_fail": 3, "browse_fail_flaking": 3, "browse_flaking": 1,
         "open_actions_failing": 13, "assigned_trend_90": 2,
     }
@@ -8088,6 +8095,8 @@ class NoMarksAddsNothingTest(ApiCase):
         reads.append(("queue_mine", "/api/summary",
                       {"parts": ["queue"], "queue": ["mine"],
                        "assignee": ["alice"]}))
+        reads.append(("queue_flaking", "/api/summary",
+                      {"parts": ["queue"], "queue": ["flaking"]}))
         return reads
 
     def _cold_selects(self, path: str, query: Dict[str, List[str]]
@@ -8149,6 +8158,20 @@ class NoMarksAddsNothingTest(ApiCase):
                 if "COUNT(" in upper:
                     self.assertNotIn(
                         "FLAKY", self._bare(statement).upper(), name)
+
+    def test_the_flaking_queue_runs_nothing_new(self) -> None:
+        """Item 14: with no mark, ``queue=flaking`` runs no statement the
+        New failures queue does not, the bit's carrier included, and
+        nothing warm but the prefix both pay."""
+        query = {"parts": ["queue"], "queue": ["flaking"]}
+        flaking = self._cold_selects("/api/summary", query)
+        new = self._cold_selects("/api/summary", {
+            "parts": ["queue"], "queue": ["new_failures"]})
+        self.assertEqual([s for s in flaking if s not in new], [], flaking)
+        self.assertEqual(len(flaking), len(new) - 2, (flaking, new))
+        self.assertEqual(
+            self.call("GET", "/api/summary", query=query)["queue"],
+            {"total": 0, "tests": []})
 
     def test_the_detail_of_a_marked_test_costs_the_same(self) -> None:
         """The detail's cache guard: a mark adds no statement, whatever
@@ -8581,67 +8604,94 @@ class FlakyBoardApiTest(ApiCase):
         assert_no_trend_split(self, self.call(
             "GET", "/api/summary", query={"parts": ["headline"]}))
 
-    def test_the_flaky_tab(self) -> None:
+    def _flaking(self, **query: List[str]) -> Dict[str, Any]:
+        return self.call("GET", "/api/summary", query=dict(
+            query, parts=["queue"], queue=["flaking"]))
+
+    def test_the_flaking_queue(self) -> None:
+        """WP-44 item 14 (design §14): ``queue=flaking`` is the queue part
+        as for any other kind: the tests flaking now (test_flaky2 and
+        test_new_fail; test_still_fail is over its cadence and New,
+        test_first failing, test_tol passing), nearest to its cadence
+        first, ``total`` the headline's ``status.flaking``. A virtual
+        kind: in no ``queue_totals`` and not in the unsliced payload;
+        ``assignee`` is ignored."""
         self._mark()
         self.call("PUT", test_path("linux-sim", "suite/alpha.py",
                                    "test_flaky2", "/assignee"),
                   body={"username": "dev1", "assigned_by": "dev1"})
-        data = self.call("GET", "/api/flaky")
-        self.assertEqual(sorted(data),
-                         ["generated_at", "marks", "retired", "stream",
-                          "total"])
-        self.assertEqual((data["stream"], data["total"], data["retired"]),
-                         (MAINLINE_STREAM_ID, 5, 0))
-        self.assertEqual(
-            [(m["test_name"], m["state"]) for m in data["marks"]],
-            [("test_first", "failing"), ("test_still_fail", "failing"),
-             ("test_flaky2", "flaking"), ("test_new_fail", "flaking"),
-             ("test_tol", "passing")])
-        flaky2 = data["marks"][2]
-        self.assertEqual(flaky2, {
-            "environment": "linux-sim", "script": "suite/alpha.py",
-            "test_name": "test_flaky2", "cadence": 3, "marked_by": "dev1",
-            "marked_at": "2026-07-20T00:00:00.000000",
-            "reason": "known race", "retired": False, "result": "FAIL",
-            "state": "flaking", "muted": False, "assignee": "dev1",
-            "recent_failures": 2, "recent_runs": 3})
-        tol = data["marks"][4]
-        self.assertEqual((tol["result"], tol["recent_failures"],
-                          tol["recent_runs"]), ("PASS", 2, 4))
-        # Paged by the server; a product narrows, an unknown one empties.
-        page = self.call("GET", "/api/flaky",
-                         query={"limit": ["2"], "offset": ["2"]})
-        self.assertEqual([m["test_name"] for m in page["marks"]],
+        data = self._flaking()
+        new = self.call("GET", "/api/summary", query={
+            "parts": ["queue"], "queue": ["new_failures"]})
+        self.assertEqual(sorted(data), sorted(new))
+        self.assertEqual((data["kind"], data["queue_cap"], data["stream"]),
+                         ("flaking", 500, MAINLINE_STREAM_ID))
+        self.assertEqual(sorted(data["queue"]), sorted(new["queue"]))
+        tests = data["queue"]["tests"]
+        self.assertEqual([row["test_name"] for row in tests],
                          ["test_flaky2", "test_new_fail"])
-        self.assertEqual(page["total"], 5)
-        atlas = self.call("GET", "/api/flaky", query={"product": ["Atlas"]})
-        self.assertEqual(atlas["total"], 4)
-        self.assertEqual(self.call("GET", "/api/flaky", query={
-            "product": ["Nowhere"]})["marks"], [])
-        env2 = self.call("GET", "/api/flaky", query={
-            "environment": ["env2"]})
-        self.assertEqual([m["test_name"] for m in env2["marks"]],
-                         ["test_first"])
-        # Retired: listed last, flagged, counted apart.
-        self.storage.set_retired("linux-sim", "suite/alpha.py",
-                                 "test_still_fail", True, "dev1", "gone",
-                                 datetime.datetime(2026, 7, 26, 11))
-        data = self.call("GET", "/api/flaky")
-        self.assertEqual((data["total"], data["retired"]), (4, 1))
-        self.assertEqual(data["marks"][-1]["test_name"], "test_still_fail")
-        self.assertIs(data["marks"][-1]["retired"], True)
+        self.assertEqual(data["queue"]["total"], 2)
+        self.assertEqual(sorted(tests[0]), sorted(new["queue"]["tests"][0]))
+        self.assertEqual(tests[0]["flaky"], {
+            "cadence": 3, "marked_by": "dev1",
+            "marked_at": "2026-07-20T00:00:00.000000",
+            "reason": "known race", "state": "flaking", "streak": 2,
+            "runs": None})
+        self.assertEqual(tests[1]["flaky"]["streak"], 1)
+        self.assertEqual(
+            [(row["result"], row["prev_result"], row["failing_since"],
+              row["last_pass_time"], row["mute"]) for row in tests],
+            [("FAIL", "FAIL", None, None, None),
+             ("FAIL", "PASS", None, None, None)])
+        self.assertEqual((tests[0]["assignee"], tests[1]["assignee"]),
+                         ("dev1", None))
+        headline = self.call("GET", "/api/summary",
+                             query={"parts": ["headline"]})
+        self.assertEqual(headline["status"]["flaking"], 2)
+        self.assertNotIn("flaking", headline["queue_totals"])
+        self.assertNotIn("flaking", self.call("GET", "/api/summary")["queues"])
+        # assignee is ignored; a product narrows, an unknown one empties;
+        # env2 holds only a failing mark.
+        self.assertEqual(self._flaking(assignee=["nobody"])["queue"],
+                         data["queue"])
+        self.assertEqual(self._flaking(product=["Atlas"])["queue"],
+                         data["queue"])
+        self.assertEqual(self._flaking(product=["Nowhere"])["queue"],
+                         {"total": 0, "tests": []})
+        self.assertEqual(self._flaking(environment=["env2"])["queue"],
+                         {"total": 0, "tests": []})
+        # Muted: out of the rows and of total.
+        self.storage.mute_tests(
+            [("linux-sim", "suite/alpha.py", "test_new_fail",
+              MAINLINE_STREAM_ID)],
+            "infra", 24, "dev1", "dev1", datetime.datetime(2026, 7, 26, 11))
+        self.assertEqual(
+            [row["test_name"] for row in self._flaking()["queue"]["tests"]],
+            ["test_flaky2"])
 
-    def test_the_flaky_tabs_refusals(self) -> None:
-        for query, status in (
-                ({"limit": ["0"]}, 400), ({"limit": ["101"]}, 400),
-                ({"limit": ["x"]}, 400), ({"offset": ["-1"]}, 400),
-                ({"stream": ["x"]}, 400), ({"stream": ["999"]}, 404)):
-            self.call("GET", "/api/flaky", query=query, expect=status)
-        self.assert_405("POST", "/api/flaky", "GET")
-        # With no mark: an empty tab.
-        data = self.call("GET", "/api/flaky")
-        self.assertEqual((data["total"], data["retired"], data["marks"]),
-                         (0, 0, []))
+    def test_the_flaking_queue_with_no_mark_is_empty(self) -> None:
+        self.assertEqual(self._flaking()["queue"], {"total": 0, "tests": []})
+        body = self.call("GET", "/api/summary", query={
+            "parts": ["queue"], "queue": ["flaky"]}, expect=400)
+        self.assertIn("flaking", body["error"])
+        self.assertIn("'flaky'", body["error"])
+
+    def test_get_api_flaky_is_no_longer_served(self) -> None:
+        """WP-44 item 14: the Flaky tab's own read is gone: an unknown
+        path, as any other, with or without a mark. The acts stay."""
+        for marked in (False, True):
+            if marked:
+                self._mark()
+            for method in ("GET", "POST"):
+                self.assertEqual(
+                    self.call(method, "/api/flaky", expect=404),
+                    {"error": "not found"}, (marked, method))
+            self.assertEqual(
+                self.call("GET", "/api/flaky", query={
+                    "limit": ["100"], "offset": ["0"]}, expect=404),
+                {"error": "not found"})
+        self.assert_405("GET", "/api/flaky/bulk", "POST")
+        self.assert_405("GET", "/api/flaky/unmark", "POST")
 
     def test_the_open_assignment_figures_do_not_move(self) -> None:
         """OpenAssignmentFiguresUnchangedTest's API half: the full
@@ -8770,11 +8820,11 @@ class FlakyBoardApiTest(ApiCase):
                 self.assertNotIn("FLAKY_MARK_HISTORY", statement.upper())
                 self.assertNotIn("JOIN TEST_MUTES", statement.upper())
 
-    def test_the_trend_part_and_the_tab_cost(self) -> None:
+    def test_the_trend_part_costs(self) -> None:
         """The trend part: one more statement cold (the marks and their
         runs in the window) and one Q2 for the tests whose first run in
-        the window failed; nothing warm. The tab: the marks, one Q2 at
-        N+1 for its FAIL-after-FAIL tests and one at 20 for its page."""
+        the window failed; nothing warm. (Item 14 removes the tab's half
+        of this guard with its endpoint: test_the_flaking_queue_costs.)"""
         query = {"parts": ["assigned_trend"]}
         base = self._cold("/api/summary", query)
         self._mark()
@@ -8784,9 +8834,281 @@ class FlakyBoardApiTest(ApiCase):
                               if "CROSS JOIN runs AS r ON r.environment = "
                               "fm.environment" in s]), 1, cold)
         self.assertEqual(self._selects("/api/summary", query), [])
-        tab = self._cold("/api/flaky", {})
-        self.assertEqual(len(tab), 3, tab)
-        self.assertIn("FROM test_flaky_marks AS fm CROSS JOIN latest_runs",
-                      tab[0])
-        self.assertIn("LIMIT 4", tab[1])
-        self.assertIn("LIMIT 20", tab[2])
+
+    @staticmethod
+    def _rows_by_key(statements: List[str]) -> List[str]:
+        """The Flaking queue's rows statements among *statements*."""
+        return [s for s in statements
+                if "JOIN runs AS r ON r.id = lr.run_id" in s
+                and "lr.test_name) IN (VALUES (" in s]
+
+    def test_the_flaking_queue_costs(self) -> None:
+        """Item 14 (design §14), in the design pass's terms. P is the
+        prefix every queue fetch pays whatever its kind (the products
+        map, the pass view's reads): the statements of a cold
+        ``queue=flaking`` with no mark, bar the bit.
+
+        - No mark: P+1, the mute epoch's statement carrying the bit,
+          which every failing queue kind reads; no statement the New
+          failures queue does not run.
+        - Cold with marks: P+4 here (the bit, Q1, one Q2 at N+1, the
+          rows by key; the marked environments come from the pass view's
+          environment list, so no DISTINCT), at most the design's P+5;
+          no count statement beyond P's, no runs read but Q2.
+        - After the headline: P+1, the rows statement alone.
+        - Warm: P."""
+        query = {"parts": ["queue"], "queue": ["flaking"]}
+        nothing = self._cold("/api/summary", query)
+        bit = [s for s in nothing if "test_flaky_marks" in s]
+        self.assertEqual(len(bit), 1, nothing)
+        self.assertIn("FROM test_mutes WHERE stream_id = ", bit[0])
+        prefix = [s for s in nothing if s not in bit]
+        new = self._cold("/api/summary", {
+            "parts": ["queue"], "queue": ["new_failures"]})
+        self.assertEqual([s for s in nothing if s not in new], [], new)
+        self.assertEqual(len(new), len(prefix) + 3, new)
+        warm_prefix = self._selects("/api/summary", query)
+        self.assertEqual(len(warm_prefix), 3, warm_prefix)
+        self._mark()
+        cold = self._cold("/api/summary", query)
+        self.assertEqual(cold[:len(prefix)], prefix, cold)
+        self.assertEqual(len(cold), len(prefix) + 4, cold)
+        self.assertEqual(self._flaky_reads(cold), (1, 0, 1), cold)
+        self.assertEqual(len(self._rows_by_key(cold)), 1, cold)
+        self.assertEqual(
+            [s for s in cold if s.upper().startswith("SELECT COUNT(")],
+            [s for s in prefix if s.upper().startswith("SELECT COUNT(")])
+        self.assertEqual(len([s for s in cold if "FROM runs" in s]), 1, cold)
+        self.assertEqual(self._selects("/api/summary", query), warm_prefix)
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        self.call("GET", "/api/summary", query={"parts": ["headline"]})
+        after = self._selects("/api/summary", query)
+        self.assertEqual(len(after), len(warm_prefix) + 1, after)
+        self.assertEqual(self._rows_by_key(after), [after[-1]], after)
+
+
+class FlakingQueueAgreesWithHeadlineTest(ApiCase):
+    """WP-44 item 14 (design §14; item 11's FlakyTabAgreesWithHeadlineTest
+    reworked onto the queue): ``queue=flaking``'s ``total`` is the
+    headline's ``status.flaking`` in every scope the tab can be opened in
+    (mainline, a build with its floor, one environment, one product), and
+    the queue lists exactly those tests. The browse filter's
+    ``result=FLAKING`` count is the same set (design §2 B.1's F). A row
+    has exactly the keys a Still failing row has, so the page's shared
+    renderer and the Review panel need nothing new.
+
+    Every marked state is present, on mainline and on the build alike:
+    flaking (new, still, assigned), flaking under a live mute, flaking
+    and retired, promoted tonight, failing past its cadence, passing
+    after a tolerated failure, plus an unmarked failure. Cadence 3; each
+    history oldest first, the last night the 26th."""
+
+    MARKED_AT = datetime.datetime(2026, 7, 15)
+    ALPHA = ("linux-sim", "suite/alpha.py")
+    SMOKE = ("env2", "smoke.py")
+    HISTORIES = (
+        (ALPHA, "t_flaking", ("PASS", "FAIL"), True),
+        (ALPHA, "t_flaking_still", ("PASS", "FAIL", "FAIL"), True),
+        (ALPHA, "t_flaking_assigned", ("PASS", "FAIL"), True),
+        (ALPHA, "t_flaking_muted", ("PASS", "FAIL"), True),
+        (ALPHA, "t_flaking_retired", ("PASS", "FAIL"), True),
+        (ALPHA, "t_promoted", ("PASS", "FAIL", "FAIL", "FAIL"), True),
+        (ALPHA, "t_over", ("FAIL",) * 5, True),
+        (ALPHA, "t_passing", ("FAIL", "PASS", "FAIL", "PASS"), True),
+        (ALPHA, "t_unmarked", ("PASS", "FAIL"), False),
+        (SMOKE, "t_env2_flaking", ("UNEXPECTED_PASS", "FAIL"), True),
+        (SMOKE, "t_env2_over", ("FAIL",) * 4, True),
+    )
+    #: The tests flaking now in each scope, in the queue's order: one
+    #: FAIL from the cadence first, then environment, script, test name.
+    FLAKING_ALPHA = ["t_flaking_still", "t_flaking", "t_flaking_assigned"]
+    FLAKING_ALL = ["t_flaking_still", "t_env2_flaking", "t_flaking",
+                   "t_flaking_assigned"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        records = []  # type: List[Dict[str, Any]]
+        # Mainline at 02:00 and the build at 04:00, the same results.
+        for build, hour in ((None, 2), ("rc1", 4)):
+            for (environment, script), name, results, _marked in (
+                    self.HISTORIES):
+                for day, result in zip(range(27 - len(results), 27),
+                                       results):
+                    start = datetime.datetime(2026, 7, day, hour)
+                    overrides = {
+                        "environment": environment, "script": script,
+                        "test_name": name, "result": result,
+                        "start_time": format_iso(start),
+                        "end_time": format_iso(
+                            start + datetime.timedelta(minutes=5)),
+                    }  # type: Dict[str, Any]
+                    if build is not None:
+                        overrides["build"] = build
+                    records.append(record(**overrides))
+        self.import_runs(records)
+        self.build = [s.stream_id for s in self.storage.list_streams("")
+                      if s.stream_id != MAINLINE_STREAM_ID][0]
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+        self.storage.mark_flaky(
+            [scope + (name, None)
+             for scope, name, _results, marked in self.HISTORIES if marked],
+            3, "known race", "dev1", self.MARKED_AT)
+        self.storage.set_assignee(
+            "linux-sim", "suite/alpha.py", "t_flaking_assigned", "dev1",
+            "dev1", self.MARKED_AT)
+        self.storage.mute_tests(
+            [self.ALPHA + ("t_flaking_muted", stream)
+             for stream in (MAINLINE_STREAM_ID, self.build)],
+            "infra", 24, "dev1", "dev1", NOW - datetime.timedelta(hours=1))
+        self.storage.set_retired(
+            "linux-sim", "suite/alpha.py", "t_flaking_retired", True,
+            "dev1", "gone", self.MARKED_AT)
+
+    def _scopes(self) -> List[Tuple[str, Dict[str, List[str]], List[str]]]:
+        build = [str(self.build)]
+        return [
+            ("mainline", {}, self.FLAKING_ALL),
+            ("build", {"stream": build}, self.FLAKING_ALL),
+            ("environment", {"environment": ["linux-sim"]},
+             self.FLAKING_ALPHA),
+            ("product", {"product": ["Atlas"]}, self.FLAKING_ALPHA),
+            ("build environment", {"stream": build,
+                                   "environment": ["env2"]},
+             ["t_env2_flaking"]),
+            ("build product", {"stream": build, "product": ["Atlas"]},
+             self.FLAKING_ALPHA),
+        ]
+
+    def _queue(self, kind: str, scope: Dict[str, List[str]]
+               ) -> Dict[str, Any]:
+        return self.call("GET", "/api/summary", query=dict(
+            scope, parts=["queue"], queue=[kind]))["queue"]
+
+    def test_total_is_the_headlines_flaking_in_every_scope(self) -> None:
+        for name, scope, expected in self._scopes():
+            for warm in (False, True):
+                if not warm:
+                    self.storage._invalidate_summary_cache()
+                    self.storage._invalidate_trend_cache()
+                queue = self._queue("flaking", scope)
+                headline = self.call("GET", "/api/summary", query=dict(
+                    scope, parts=["headline"]))
+                self.assertEqual(queue["total"],
+                                 headline["status"]["flaking"], name)
+                self.assertEqual(queue["total"], len(expected), name)
+                # The set, and the order: nearest to the cadence first.
+                self.assertEqual([row["test_name"] for row in queue["tests"]],
+                                 expected, name)
+                for row in queue["tests"]:
+                    self.assertEqual(
+                        (row["flaky"]["state"], row["mute"], row["result"]),
+                        ("flaking", None, "FAIL"), (name, row))
+
+    def test_the_rows_are_total_up_to_the_cap(self) -> None:
+        """With no race, ``len(tests) == min(total, queue_cap)`` in every
+        scope, cold and after the headline."""
+        for name, scope, _expected in self._scopes():
+            for after_headline in (False, True):
+                self.storage._invalidate_summary_cache()
+                self.storage._invalidate_trend_cache()
+                if after_headline:
+                    self.call("GET", "/api/summary", query=dict(
+                        scope, parts=["headline"]))
+                data = self.call("GET", "/api/summary", query=dict(
+                    scope, parts=["queue"], queue=["flaking"]))
+                self.assertEqual(
+                    len(data["queue"]["tests"]),
+                    min(data["queue"]["total"], data["queue_cap"]),
+                    (name, after_headline))
+
+    def test_the_browse_filters_flaking_count_is_the_same_set(self) -> None:
+        for name, scope, expected in self._scopes():
+            browse = self.call("GET", "/api/dashboard", query=dict(
+                scope, result=["FLAKING"], limit=["250"]))
+            queue = self._queue("flaking", scope)
+            self.assertEqual(browse["total"], queue["total"], name)
+            self.assertEqual(
+                sorted(row["test_name"] for row in browse["tests"]),
+                sorted(row["test_name"] for row in queue["tests"]), name)
+
+    def test_a_row_has_exactly_the_keys_of_a_still_failing_row(
+            self) -> None:
+        """t_over and t_env2_over are failing past their cadence: Still
+        failing rows, beside the flaking ones, in every scope. Key for
+        key, the row and every object nested in it (``flaky``,
+        ``latest_comment``, ``mute``), each present on both sides: a
+        comment on every test, and a mute that lapsed two days ago on
+        t_over, t_env2_over, t_flaking and t_env2_flaking (a lapsed mute
+        is on the row and sets nothing aside), on both streams. No
+        nested object differs between the two kinds."""
+        lapsed = NOW - datetime.timedelta(hours=48)
+        for scope, name, _results, _marked in self.HISTORIES:
+            self.storage.add_comment(scope[0], scope[1], name, "dev1",
+                                     "looked at it", lapsed)
+        self.storage.mute_tests(
+            [scope + (name, stream)
+             for scope, name in ((self.ALPHA, "t_over"),
+                                 (self.SMOKE, "t_env2_over"),
+                                 (self.ALPHA, "t_flaking"),
+                                 (self.SMOKE, "t_env2_flaking"))
+             for stream in (MAINLINE_STREAM_ID, self.build)],
+            "infra", 1, "dev1", "dev1", lapsed)
+        nested = set()  # type: Set[str]
+        for name, scope, _expected in self._scopes():
+            still = self._queue("still_failing", scope)["tests"]
+            flaking = self._queue("flaking", scope)["tests"]
+            self.assertTrue(still, name)
+            self.assertTrue(flaking, name)
+            for row in flaking:
+                for other in still:
+                    self.assertEqual(sorted(row), sorted(other), name)
+                    for key in row:
+                        if not (isinstance(row[key], dict)
+                                or isinstance(other[key], dict)):
+                            continue
+                        if row[key] is None or other[key] is None:
+                            # A test with no comment or no mute on it;
+                            # the pairs that have both are compared.
+                            continue
+                        self.assertIsInstance(row[key], dict, (name, key))
+                        self.assertIsInstance(other[key], dict, (name, key))
+                        self.assertEqual(sorted(row[key]),
+                                         sorted(other[key]), (name, key))
+                        nested.add(key)
+        self.assertEqual(nested, {"flaky", "latest_comment", "mute"})
+
+    def test_the_streak_is_the_fails_in_a_row_at_the_latest_run(
+            self) -> None:
+        histories = {name: results
+                     for _scope, name, results, _marked in self.HISTORIES}
+        for name, scope, _expected in self._scopes():
+            for row in self._queue("flaking", scope)["tests"]:
+                results = histories[row["test_name"]]
+                streak = len(results) - len(
+                    "".join("F" if r == "FAIL" else "." for r in results
+                            ).rstrip("F"))
+                self.assertEqual(row["flaky"]["streak"], streak,
+                                 (name, row["test_name"]))
+                self.assertTrue(
+                    1 <= row["flaky"]["streak"] < row["flaky"]["cadence"],
+                    (name, row["flaky"]))
+
+    def test_disjoint_from_the_failing_and_fixed_queues(self) -> None:
+        """No flaking test is in New failures, Still failing or Fixed; the
+        muted flaking test is in Muted alone of the five."""
+        for name, scope, _expected in self._scopes():
+            queues = {kind: set(row["test_name"]
+                                for row in self._queue(kind, scope)["tests"])
+                      for kind in ("new_failures", "still_failing", "fixed",
+                                   "muted", "flaking")}
+            for kind in ("new_failures", "still_failing", "fixed", "muted"):
+                self.assertEqual(queues[kind] & queues["flaking"], set(),
+                                 (name, kind))
+            if scope.get("environment") == ["env2"]:
+                continue
+            self.assertEqual(
+                [kind for kind in sorted(queues)
+                 if "t_flaking_muted" in queues[kind]], ["muted"], name)

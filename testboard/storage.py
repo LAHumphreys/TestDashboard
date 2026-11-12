@@ -72,6 +72,7 @@ __all__ = [
     "describe_open_error",
     "DASHBOARD_SORTS",
     "QUEUE_KINDS",
+    "FLAKING_QUEUE",
     "COMPARE_CATEGORIES",
     "TestSummaryRow",
     "TestStatusRow",
@@ -986,12 +987,6 @@ MUTE_MAX_HOURS = 168
 FLAKY_CADENCE_MIN = 2
 FLAKY_CADENCE_MAX = 10
 
-#: WP-44 item 8 (decision 4): the Flaky tab's measure is how many of a
-#: marked test's last 20 runs on the stream failed, read by the bounded
-#: runs read (:meth:`Storage.cadence_runs`), never the recent-results
-#: read (design §6: 52 ms against about 6 for the same page).
-FLAKY_TAB_RECENT_RUNS = 20
-
 #: Prefix marking a migration step that runs Python instead of SQL.
 #:
 #: Migrations stay a list of STRINGS rather than a mix of strings and
@@ -1681,33 +1676,6 @@ class _SetAside(NamedTuple):
     states: Dict[Tuple[str, str, str], FlakyState]
 
 
-class FlakyTabEntry(NamedTuple):
-    """One mark on the Flaky tab (WP-44 item 8, design §1 "The Flaky
-    tab", §2 B.2): the mark, its test's latest result and state on the
-    stream, whether a live mute or a retirement covers it, the current
-    assignee, and how many of its last :data:`FLAKY_TAB_RECENT_RUNS` runs
-    on the stream failed (``recent_failures`` of ``recent_runs``)."""
-
-    mark: FlakyMark
-    retired: bool
-    result: Result
-    state: FlakyState
-    muted: bool
-    assignee: Optional[str]
-    recent_failures: int
-    recent_runs: int
-
-
-class FlakyTabPage(NamedTuple):
-    """One page of the Flaky tab (:meth:`Storage.flaky_tab`): ``total``
-    marks in scope whose test has a run on the stream, retired ones
-    apart (``retired``), and the page, in the tab's order."""
-
-    total: int
-    retired: int
-    entries: List[FlakyTabEntry]
-
-
 class DailyFlakingFailures(NamedTuple):
     """WP-44 item 8: of one UTC day's FAIL runs, how many were a marked
     test's tolerated failure as it stood that night, under today's marks
@@ -2234,6 +2202,16 @@ QUEUE_KINDS = (
     "not_run",
     "assigned",
 )
+
+#: WP-44 item 14 (design §14): the Flaking tab's queue, the tests flaking
+#: now (:meth:`Storage.flaky_view`'s ``flaking`` entries in scope). A
+#: VIRTUAL kind, as the API's ``mine`` is: :meth:`Storage.status_queue`
+#: and :meth:`Storage.status_queue_count_and_marks` take it, but it is not
+#: in :data:`QUEUE_KINDS`, so no ``queue_totals`` figure, no unsliced
+#: payload and no grouped count carries it. Its set is the view's, never
+#: a predicate over ``latest_runs``: there is no entry for it in
+#: ``_QUEUE_PREDICATES``.
+FLAKING_QUEUE = "flaking"
 
 #: WP-40: the row's own stream's current mute, reached by
 #: its primary key — one seek per row, on a table of human-rate size.
@@ -7169,7 +7147,15 @@ class Storage:
         :meth:`add_comment` and :meth:`set_retired` (which also posts
         one) both invalidate this alongside the runs/assignment/
         retirement writes every other cached method already needs.
+
+        WP-44 item 14: *kind* may also be :data:`FLAKING_QUEUE`, the
+        virtual kind read by :meth:`_flaking_queue` (its own order, no
+        predicate; *assignee* and *stale_before* do not apply to it).
         """
+        if kind == FLAKING_QUEUE:
+            return self._flaking_queue(
+                environment, limit, with_latest_comment, environments,
+                stream_id, now, marks, floor)
         envs_key = (
             None if environments is None else tuple(sorted(environments))
         )
@@ -7294,6 +7280,130 @@ class Storage:
                 ", ".join("(?, ?, ?)" for _ in promoted)))
         return term, [value for triple in promoted for value in triple]
 
+    def _flaking_queue(
+        self,
+        environment: Optional[str],
+        limit: Optional[int],
+        with_latest_comment: bool,
+        environments: Optional[Sequence[str]],
+        stream_id: int,
+        now: Optional[datetime.datetime],
+        marks: Optional[bool],
+        floor: Optional[datetime.datetime],
+    ) -> List[TestStatusRow]:
+        """The Flaking queue (WP-44 item 14, design §14): the tests
+        flaking now in scope on *stream_id* (marked, failing within their
+        cadence, under no live mute, not retired), each a queue row in
+        the shape every other kind returns, its ``flaky`` never None.
+
+        The set is :meth:`flaky_view`'s ``flaking`` entries, asked with
+        the Still failing queue's arguments so the two share its memo:
+        the number of rows before any cap is the headline's
+        ``status.flaking`` in the same scope, by construction. Ordered
+        nearest to counting as a failure first (``cadence - streak``
+        ascending), then environment, script, test name; the cadence
+        comes from Q1's memoized rows and the streak from the view's
+        states, so the keys are sorted and capped at *limit* BEFORE any
+        row is read. The capped keys alone are then fetched by the
+        partition's primary key (:meth:`_rows_by_key`: at most 250 a
+        statement, so two at the queue's cap), and each row's mark and
+        state come from the view's states, so no runs are read for them.
+
+        Never through :meth:`_queue_clause` or the other kinds'
+        over-fetch and drop, which read the stream's FAIL range rather
+        than the keys. With no mark anywhere, the "any mark" bit (*marks*
+        when the caller has it, else the mute epoch's memoized
+        statement) answers an empty queue and nothing else is read.
+
+        Memoized as every kind is, keyed on the mute epoch: no write
+        drops the memo when a mute lapses, and the epoch moves then, so
+        the next read has the test the mute held back. A row that is no
+        longer a flaking test's when read (an act or a push between the
+        view and this read) is left out, never shown with no mark.
+        """
+        at = now or model.utcnow()
+        marked = (
+            self.flaky_marks_exist(stream_id, at) if marks is None
+            else marks)
+        if not marked:
+            return []
+        epoch = self.mute_epoch(stream_id, at)
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        # The key has the other kinds' layout; no assignee and no cutoff
+        # apply to this kind.
+        key = (
+            "status_queue", FLAKING_QUEUE, environment, limit, None, None,
+            with_latest_comment, envs_key, stream_id, epoch, marked,
+        )
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        view = self.flaky_view(
+            stream_id, at, environment, environments, marks=False,
+            failing=True, floor=floor, marked=True)
+        result = []  # type: List[TestStatusRow]
+        flaking = [] if view is None else [
+            (count.environment, count.script, count.test_name)
+            for count in view.counted if count.role == FLAKY_ROLE_FLAKING]
+        if view is not None and flaking:
+            # Each flaking test's cadence, from the Q1 rows the view has
+            # just used or filled (memoized: no statement). A flaking
+            # triple missing here is skipped, silently, on purpose: the
+            # view's entries are built from these same Q1 entries, so it
+            # happens only when the view is served from its memo while a
+            # Q1 entry was dropped (time limit, size cap, another
+            # thread's invalidation) and re-read after another process
+            # changed that test; ``total`` then counts it until the view
+            # is next read, as the headline does.
+            failing = self._flaky_failing(stream_id)
+            wanted = set(flaking)
+            cadences = {}  # type: Dict[Tuple[str, str, str], int]
+            for name in sorted(set(triple[0] for triple in flaking)):
+                entry = failing.get(name)
+                if entry is None:
+                    continue
+                for q1_row in entry.rows:
+                    triple = (q1_row.environment, q1_row.script,
+                              q1_row.test_name)
+                    if triple in wanted:
+                        cadences[triple] = q1_row.cadence
+            states = view.states
+            keys = sorted(
+                (triple for triple in flaking if triple in cadences),
+                key=lambda triple: (
+                    cadences[triple] - states[triple].streak,
+                    triple[0], triple[1], triple[2]))
+            if limit is not None:
+                keys = keys[:limit]
+            columns = self._STATUS_COLUMNS
+            if with_latest_comment:
+                columns += ", " + _LATEST_COMMENT_COLUMNS
+            columns += ", lr.prev_result, " + self._FLAKY_COLUMNS
+            prev_index = len(_STATUS_COLUMN_NAMES) + (
+                _LATEST_COMMENT_COUNT if with_latest_comment else 0
+            )
+            fail = Result.FAIL.value
+            rows = [
+                row for row in self._rows_by_key(
+                    stream_id, keys, columns,
+                    self._LATEST_JOIN + " " + self._FLAKY_JOIN)
+                if row[4] == fail and row[prev_index + 1] is not None]
+            flakies = self._flaky_rows(
+                stream_id, rows, prev_index, floor, states)
+            result = [
+                TestStatusRow(*(_row_fields(
+                    row,
+                    _latest_comment_from(row) if with_latest_comment
+                    else None)
+                    + (None if row[prev_index] is None
+                       else Result(row[prev_index]), flaky)))
+                for row, flaky in zip(rows, flakies)
+            ]
+        self._store_summary(key, result, stream_id)
+        return result
+
     def status_queue_count(
         self,
         kind: str,
@@ -7332,7 +7442,20 @@ class Storage:
         they know whether to join the marks. No join is added to the
         count. With a mark, New failures, Still failing and Fixed move
         by :meth:`flaky_view`'s roles, as :meth:`queue_counts` does
-        (:meth:`_subtract_flaky`); the statement is the same."""
+        (:meth:`_subtract_flaky`); the statement is the same.
+
+        WP-44 item 14: :data:`FLAKING_QUEUE` runs no count statement. Its
+        bit is :meth:`flaky_marks_exist` (the mute epoch's memoized
+        statement) and its count the view's ``flaking`` entries in scope,
+        the headline's ``status.flaking``; *assignee* does not apply."""
+        if kind == FLAKING_QUEUE:
+            marked = self.flaky_marks_exist(stream_id, now)
+            view = self.flaky_view(
+                stream_id, now, environment, environments, marks=False,
+                failing=True, floor=floor, marked=marked)
+            return (0 if view is None else sum(
+                1 for entry in view.counted
+                if entry.role == FLAKY_ROLE_FLAKING)), marked
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
             stream_id, now,
@@ -10939,110 +11062,6 @@ class Storage:
                           candidate.test_name)
                 marked_entry.fixes[triple] = rules.flaky_fix_counts(
                     candidate.cadence, runs.get(triple, ()))
-
-    #: The Flaky tab's order of states (decision 16): failing first, then
-    #: flaking, then passing.
-    _FLAKY_TAB_RANK = {
-        FLAKY_FAILING: 0, FLAKY_FLAKING: 1, FLAKY_PASSING: 2,
-    }  # type: Dict[str, int]
-
-    def flaky_tab(
-        self,
-        stream_id: int,
-        now: Optional[datetime.datetime],
-        environment: Optional[str] = None,
-        environments: Optional[Sequence[str]] = None,
-        limit: int = 100,
-        offset: int = 0,
-        floor: Optional[datetime.datetime] = None,
-    ) -> FlakyTabPage:
-        """One page of the Flaky tab (WP-44 item 8, design §1 "The Flaky
-        tab", §2 B.2, decisions 4, 11 and 16): every mark in scope whose
-        test has a run on *stream_id*, in an order known without the
-        measure: failing first, then flaking, then passing, newest mark
-        first, retired last. A mark on a test with no run on the stream
-        is absent. A retired test's mark is listed and flagged and is in
-        no count: ``total`` is the others, ``retired`` apart from it.
-
-        One statement reads the marks in scope, driven from the marks
-        (``CROSS JOIN``), each reaching its test's ``latest_runs`` row,
-        mute, retirement and assignment by key: bounded by the marks,
-        never by the estate. Each state is decided as a row's is
-        (:meth:`_flaky_rows`: the latest pair, and Q2 at LIMIT N+1 only
-        for a FAIL after a FAIL at a cadence of 3 to 10, from the memo
-        or cache when a page has read it). The page's measure is the
-        bounded runs read at :data:`FLAKY_TAB_RECENT_RUNS`
-        (:meth:`cadence_runs`), one statement per 100 marks on the page;
-        *floor* bounds both reads on a build. Not memoized: the tab is
-        fetched on its first click, off every first paint.
-        """
-        at_iso = model.format_iso(now or model.utcnow())
-        allowed = None if environments is None else list(environments)
-        if allowed is not None and not allowed:
-            return FlakyTabPage(total=0, retired=0, entries=[])
-        sql = (
-            "SELECT lr.environment, lr.script, lr.test_name, "
-            "tr.retired_at, lr.result, lr.start_time, lr.prev_result, "
-            + self._FLAKY_COLUMNS + ", tm.expires_at, ca.assignee "
-            "FROM test_flaky_marks AS fm "
-            "CROSS JOIN latest_runs AS lr "
-            "  ON lr.stream_id = ? AND lr.environment = fm.environment "
-            " AND lr.script = fm.script AND lr.test_name = fm.test_name "
-            "LEFT JOIN test_retirements AS tr "
-            "  ON tr.environment = lr.environment "
-            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
-            + _MUTE_JOIN + " "
-            "LEFT JOIN current_assignments AS ca "
-            "  ON ca.environment = lr.environment "
-            " AND ca.script = lr.script AND ca.test_name = lr.test_name"
-        )
-        params = [stream_id]  # type: List[Any]
-        if environment is not None:
-            sql += " WHERE fm.environment = ?"
-            params.append(environment)
-        if allowed is not None:
-            sql += (" AND " if environment is not None else " WHERE ")
-            sql += "fm.environment IN ({0})".format(
-                ", ".join("?" for _ in allowed))
-            params.extend(allowed)
-        rows = self._conn().execute(sql, params).fetchall()
-        # Columns from 6: prev_result, then the mark's four (the layout
-        # _flaky_rows reads), then the mute's expiry and the assignee.
-        flakies = self._flaky_rows(stream_id, rows, 6, floor, None)
-        # Each listed mark with its state, which is never None here: a
-        # row's test has a run on the stream (the CROSS JOIN).
-        listed = []  # type: List[Tuple[Sequence[Any], FlakyRow, FlakyState]]
-        for row, flaky in zip(rows, flakies):
-            if flaky is not None and flaky.state is not None:
-                listed.append((row, flaky, flaky.state))
-        # Stable sorts, last key first: the triple, then newest mark,
-        # then the state, then retired last.
-        listed.sort(key=lambda item: (item[0][0], item[0][1], item[0][2]))
-        listed.sort(key=lambda item: item[1].mark.marked_at, reverse=True)
-        rank = self._FLAKY_TAB_RANK
-        listed.sort(key=lambda item: (
-            item[0][3] is not None, rank[item[2].state]))
-        retired = sum(1 for item in listed if item[0][3] is not None)
-        page = listed[offset:offset + limit]
-        recent = self._cadence_runs_iso(
-            stream_id,
-            [(row[0], row[1], row[2], str(row[5]), FLAKY_TAB_RECENT_RUNS)
-             for row, _flaky, _state in page],
-            floor)
-        entries = []  # type: List[FlakyTabEntry]
-        for row, flaky, state in page:
-            results = recent.get((row[0], row[1], row[2]), [])
-            entries.append(FlakyTabEntry(
-                mark=flaky.mark, retired=row[3] is not None,
-                result=Result(row[4]), state=state,
-                muted=_mute_live(
-                    None if row[11] is None else str(row[11]), at_iso),
-                assignee=row[12],
-                recent_failures=sum(
-                    1 for result in results if result is Result.FAIL),
-                recent_runs=len(results)))
-        return FlakyTabPage(
-            total=len(listed) - retired, retired=retired, entries=entries)
 
     def _subtract_flaky(
         self, counts: Dict[str, int], view: Optional[FlakyView],

@@ -126,6 +126,17 @@ export class Element {
   }
   async click() { await this.dispatch("click"); }
   scrollIntoView() { /* no layout here */ }
+  /** The element itself or its nearest ancestor matching *selector*, in
+   * the forms this shim reads: ".class", or a bare tag name. */
+  closest(selector) {
+    const byClass = selector.startsWith(".");
+    const wanted = byClass ? selector.slice(1) : selector.toUpperCase();
+    for (let node = this; node && node.classList; node = node.parentNode) {
+      if (byClass ? node.classList.contains(wanted)
+          : node.tagName === wanted) return node;
+    }
+    return null;
+  }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
   querySelectorAll(selector) {
     const wanted = selector.replace(/^\./, "");

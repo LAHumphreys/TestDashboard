@@ -56,6 +56,7 @@ from testboard.storage import (
     FLAKY_CADENCE_MAX,
     FLAKY_CADENCE_MIN,
     FLAKY_ROLE_FLAKING,
+    FLAKING_QUEUE,
     MAINLINE_STREAM_ID,
     QUEUE_KINDS,
     FlakyMark,
@@ -134,6 +135,9 @@ _TIMELINE_MAX_RUNS = 5000
 #: Queues whose entries report failing_since / last_pass_time. Only these
 #: pay for the per-row streak seeks; the others describe a test whose
 #: latest run is not a failure, or show the previous result instead.
+#: WP-44 item 14: not the Flaking queue either: its rows carry the two
+#: keys null, as New failures' do, and ``flaky.streak`` says how many
+#: runs in a row it has failed (two to three statements a call saved).
 _STREAK_QUEUES = ("still_failing",)
 
 #: Window used for the list-view stability signal ("broken since Tuesday"
@@ -1350,7 +1354,11 @@ def _summary_queue_json(
     open items, which resolves to the ``assigned`` predicate filtered to
     *assignee* in SQL (picking a user's tests out of an already-capped
     queue would hide their work behind other people's) and is empty
-    without an assignee.
+    without an assignee. Or ``"flaking"`` (WP-44 item 14,
+    :data:`testboard.storage.FLAKING_QUEUE`): the tests flaking now, in
+    storage's own order (nearest to counting as a failure first), its
+    total the headline's ``status.flaking`` from the view with no count
+    statement; *assignee* is ignored for it.
 
     Streak bounds cost three index seeks per row; computed for the
     queues that report ``failing_since``/``last_pass_time``
@@ -1389,6 +1397,8 @@ def _summary_queue_json(
             return {"total": 0, "tests": []}
         storage_kind = "assigned"
         queue_assignee = assignee
+    # The Flaking queue (WP-44 item 14) passes as itself, with no
+    # assignee: like `mine`, a virtual kind storage reads by its own path.
     with_streaks = kind in _STREAK_QUEUES or kind == "mine"
 
     total = None  # type: Optional[int]
@@ -1782,7 +1792,9 @@ def _handle_summary(
       (status, trend, rollups, filters, ``queue_totals`` for the tab
       badges);
     - ``parts=queue&queue=<kind>`` — one queue's rows. ``kind`` is a
-      :data:`testboard.storage.QUEUE_KINDS` entry or ``mine``;
+      :data:`testboard.storage.QUEUE_KINDS` entry, ``mine`` or
+      ``flaking`` (WP-44 item 14: the tests flaking now, the Flaking
+      tab's rows, ``total`` the headline's ``status.flaking``);
     - ``parts=assigned_trend`` (WP-43) — ``{"trend": {"days", "from",
       "to", "nights": [{"date", "FAIL_ASSIGNED", "FAIL_MUTED",
       "FAIL_FLAKING"}]}}`` (``FAIL_FLAKING``: WP-44 item 8) for
@@ -1916,7 +1928,9 @@ def _handle_summary(
 
     if part == "queue":
         kind = _query_single(request.query, "queue")
-        valid_kinds = QUEUE_KINDS + ("mine",)
+        # `mine` and `flaking` (WP-44 item 14) are virtual kinds: valid
+        # here, in no queue_totals figure and not in the unsliced payload.
+        valid_kinds = QUEUE_KINDS + ("mine", FLAKING_QUEUE)
         if kind not in valid_kinds:
             raise _HttpError(
                 400,
@@ -3124,81 +3138,6 @@ def _handle_flaky_unmark(
     except ValueError as exc:
         raise _storage_value_error(exc)
     return _json_response(200, {"unmarked": unmarked})
-
-
-#: The Flaky tab's page (design §1 "The Flaky tab"): 100 marks, and no
-#: more in one request, so the page's runs read is one statement.
-_FLAKY_TAB_PAGE = 100
-
-
-def _handle_flaky_list(
-    storage: Storage,
-    request: Request,
-    now: Callable[[], datetime.datetime],
-) -> Response:
-    """GET /api/flaky?stream=&environment=&product=&limit=100&offset=0 —
-    the Flaky tab (WP-44 item 8, design §1, §2 B.2), fetched on the
-    tab's first click and by no first paint.
-
-    Every mark in scope whose test has a run on the stream (absent
-    otherwise), paged by the server in the order of decision 16:
-    failing first, then flaking, then passing, newest mark first,
-    retired last. ``total`` counts the marks listed that are not retired
-    (the tab's badge is ``status.flaky_total``, the same set); a retired
-    test's mark is listed, flagged, and counted apart in ``retired``.
-    Each entry carries the mark, the test's latest ``result`` and
-    ``state`` on the stream, ``muted`` (a live mute on it now),
-    ``retired``, the current ``assignee`` and ``recent_failures`` of
-    ``recent_runs``: its last 20 runs on the stream.
-
-    ``stream`` is an id (absent: mainline; 400 not an integer, 404 no
-    such stream); ``product`` narrows to its environments (an unknown
-    one is an empty list, as everywhere); ``environment`` is exact.
-    ``limit`` 1..100 (default 100) and ``offset`` are 400 outside their
-    range. ``offset`` pages over ``total + retired`` entries: the retired
-    marks sit at the end of the same list, so a client pages until it
-    has ``total + retired``.
-    """
-    environment = _query_single(request.query, "environment")
-    product = _query_single(request.query, "product")
-    environments = _resolve_product_environments(storage, product)
-    stream_id, floor = _resolve_stream(storage, request)
-    limit = _parse_int_param(
-        request, "limit", _FLAKY_TAB_PAGE, 1, _FLAKY_TAB_PAGE)
-    offset = _parse_int_param(request, "offset", 0, 0, _MAX_OFFSET)
-    current = now()
-    page = storage.flaky_tab(
-        stream_id, current, environment=environment,
-        environments=environments, limit=limit, offset=offset, floor=floor)
-    marks = []  # type: List[Dict[str, Any]]
-    for entry in page.entries:
-        mark = entry.mark
-        marks.append({
-            "environment": mark.environment,
-            "script": mark.script,
-            "test_name": mark.test_name,
-            "cadence": mark.cadence,
-            "marked_by": mark.marked_by,
-            "marked_at": model.format_iso(mark.marked_at),
-            "reason": mark.reason,
-            "retired": entry.retired,
-            "result": entry.result.value,
-            "state": entry.state.state,
-            "muted": entry.muted,
-            "assignee": entry.assignee,
-            "recent_failures": entry.recent_failures,
-            "recent_runs": entry.recent_runs,
-        })
-    return _json_response(
-        200,
-        {
-            "generated_at": model.format_iso(current),
-            "stream": stream_id,
-            "total": page.total,
-            "retired": page.retired,
-            "marks": marks,
-        },
-    )
 
 
 def _handle_bulk_assignments_list(
@@ -5175,10 +5114,6 @@ def _route(
     if rest == ["flaky", "unmark"]:
         _check_method(request.method, ("POST",))
         return _handle_flaky_unmark(storage, request, now)
-
-    if rest == ["flaky"]:
-        _check_method(request.method, ("GET",))
-        return _handle_flaky_list(storage, request, now)
 
     if rest == ["mutes", "unmute"]:
         _check_method(request.method, ("POST",))
