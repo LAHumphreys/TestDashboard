@@ -8837,10 +8837,14 @@ class FlakyBoardApiTest(ApiCase):
 
     @staticmethod
     def _rows_by_key(statements: List[str]) -> List[str]:
-        """The Flaking queue's rows statements among *statements*."""
+        """The Flaking queue's rows statements among *statements*, in
+        either spelling of ``Storage._rows_by_key`` (WP-44 item 16: on
+        SQLite the keys drive the read; which spelling a backend uses is
+        FlakyPlanTest's to pin, the count is this test's)."""
         return [s for s in statements
                 if "JOIN runs AS r ON r.id = lr.run_id" in s
-                and "lr.test_name) IN (VALUES (" in s]
+                and ("lr.test_name) IN (VALUES (" in s
+                     or ") AS k CROSS JOIN latest_runs AS lr ON " in s)]
 
     def test_the_flaking_queue_costs(self) -> None:
         """Item 14 (design §14), in the design pass's terms. P is the

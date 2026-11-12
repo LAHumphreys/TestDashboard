@@ -11221,8 +11221,10 @@ class FlakyStatementsTest(FlakyEstateBase):
             self.assertEqual(state, oracle[(self.ENV, self.SCRIPT, name)])
 
     #: The Flaking queue's rows read (item 14): the capped keys by the
-    #: partition's primary key, nothing else of latest_runs.
-    QUEUE_ROWS_READ = "lr.test_name) IN (VALUES ("
+    #: partition's primary key, nothing else of latest_runs. SQLite's
+    #: spelling since item 16 (this class runs on SQLite only): the keys
+    #: drive the read.
+    QUEUE_ROWS_READ = ") AS k CROSS JOIN latest_runs AS lr ON "
 
     def _flaking_queue(self) -> Any:
         """The queue part's two calls for ``queue=flaking``: the count
@@ -11291,6 +11293,80 @@ class FlakyStatementsTest(FlakyEstateBase):
             del self.store._backend.max_bound_parameters  # type: ignore
         self.assertEqual(len(seen), 6, seen)
         self.assertEqual(chunked, whole)
+
+    def test_the_keys_driven_read_refuses_a_join_of_another_shape(
+            self) -> None:
+        """Item 16: SQLite's keys-driven read replaces the join's leading
+        ``FROM latest_runs AS lr`` with ``k CROSS JOIN latest_runs``, so
+        a join that starts otherwise is refused at once with a
+        ValueError, never spliced into a wrong statement. Both real
+        callers' joins (Open Actions' and the Flaking queue's, with and
+        without the marks) are accepted and run."""
+        key = (self.ENV, self.SCRIPT, "t_flaking_new")
+        columns = self.store._STATUS_COLUMNS
+        flaky = self.store._LATEST_JOIN + " " + self.store._FLAKY_JOIN
+        for join in (self.store._LATEST_JOIN, flaky):
+            sql, params = self.store._keys_driven_rows(
+                storage.MAINLINE_STREAM_ID, [key], columns, join)
+            rows = self.store._conn().execute(sql, params).fetchall()
+            self.assertEqual([tuple(row[:3]) for row in rows], [key])
+        for join in (
+                self.store._LATEST_COUNT_JOIN.replace(
+                    "FROM latest_runs AS lr ", "FROM latest_runs lr "),
+                "FROM runs AS r JOIN latest_runs AS lr "
+                "ON lr.run_id = r.id",
+                " " + self.store._LATEST_JOIN,
+                self.store._FLAKY_JOIN):
+            with self.assertRaises(ValueError) as caught:
+                self.store._keys_driven_rows(
+                    storage.MAINLINE_STREAM_ID, [key], columns, join)
+            self.assertIn("reads latest_runs AS lr first",
+                          str(caught.exception))
+
+    def test_the_keys_driven_read_stays_under_the_compound_limit(
+            self) -> None:
+        """Item 16: SQLite refuses a compound select of more than 500
+        arms (``SQLITE_MAX_COMPOUND_SELECT``, default 500), and the keys
+        drive the read as one arm a key. So no statement may carry more
+        than 250 arms whatever the ceiling on bound parameters: at the
+        default, planted high (a million, and None, MariaDB's "no
+        ceiling") and planted low (31: ten a statement). 1,001 keys, the
+        stream's real ones and made-up ones, give the same rows in the
+        same order at every ceiling; counted on the statements run."""
+        real = [tuple(row) for row in self.store._conn().execute(
+            "SELECT environment, script, test_name FROM latest_runs "
+            "WHERE stream_id = ? ORDER BY test_name DESC",
+            (storage.MAINLINE_STREAM_ID,)).fetchall()]
+        keys = real + [("env-none", "s.py", "missing{0:04d}".format(index))
+                       for index in range(1001 - len(real))]
+        self.assertEqual(len(keys), 1001)
+        unset = object()
+        answers = []  # type: List[Any]
+        for ceiling, most in ((unset, 250), (10 ** 6, 250), (None, 250),
+                              (31, 10)):
+            if ceiling is not unset:
+                self.store._backend.max_bound_parameters = (  # type: ignore
+                    ceiling)
+            try:
+                found = []  # type: List[Any]
+                seen = self._statements(lambda: found.extend(
+                    self.store._rows_by_key(
+                        storage.MAINLINE_STREAM_ID, keys,
+                        self.store._STATUS_COLUMNS,
+                        self.store._LATEST_JOIN)))
+            finally:
+                if ceiling is not unset:
+                    del self.store._backend.max_bound_parameters  # type: ignore
+            arms = [s.count(" UNION ALL ") + 1 for s in seen]
+            self.assertTrue(all(") AS k CROSS JOIN latest_runs AS lr ON "
+                                in s for s in seen), ceiling)
+            self.assertEqual(sum(arms), 1001, (ceiling, arms))
+            self.assertEqual(max(arms), most, (ceiling, arms))
+            self.assertLessEqual(max(arms), 250, (ceiling, arms))
+            answers.append([tuple(row[:3]) for row in found])
+        self.assertEqual(answers[0], real)
+        for answer in answers[1:]:
+            self.assertEqual(answer, answers[0])
 
     def test_with_no_mark_the_flaking_queue_reads_the_bit_alone(
             self) -> None:
@@ -11507,10 +11583,28 @@ class FlakyPlanTest(FlakyEstateBase):
         for line in lr:
             self.assertTrue(line.startswith("SEARCH"), (what, plan))
 
+    def _sqlite_fail_range(self, plan: List[Any], what: str) -> None:
+        """SQLite only: a statement whose row-value term is a filter
+        reaches ``lr`` by the stream's FAIL range, never by the term and
+        never by ``stream_id`` alone; the message names the version."""
+        note = ("{0} on SQLite {1}".format(what, sqlite3.sqlite_version),
+                plan)
+        lr = [line for line in plan if " LR " in line + " "]
+        self.assertEqual(len(lr), 1, note)
+        self.assertTrue(lr[0].startswith("SEARCH"), note)
+        self.assertIn("IDX_LATEST_RUNS_RESULT (STREAM_ID=? AND RESULT=?)",
+                      lr[0], note)
+
     def test_the_filter_terms_keep_the_fail_range(self) -> None:
         """Browse with Failing and with Flaking: the F term reads ``lr``
         alone and leaves the rows and the count on the stream's FAIL
-        range (design §3c), and the count joins no mark."""
+        range (design §3c), and the count joins no mark.
+
+        Item 16 widens it: :meth:`_lr_by_key_or_range` accepts any
+        SEARCH, which a read of the stream's whole partition is (CI's
+        SQLite 3.26 read the keyed rows so). On SQLite each statement
+        must now reach ``lr`` by ``idx_latest_runs_result`` on the
+        stream and FAIL; MariaDB's assertion is unchanged."""
         for flaking in (False, True):
             for marker in ("SELECT COUNT(*)", "LEFT JOIN test_flaky_marks"):
                 self.store._invalidate_summary_cache()
@@ -11523,14 +11617,46 @@ class FlakyPlanTest(FlakyEstateBase):
                               sql)
                 if marker == "SELECT COUNT(*)":
                     self.assertNotIn("TEST_FLAKY_MARKS", sql.upper())
-                self._lr_by_key_or_range(
-                    self._explain(sql, params), (flaking, marker))
+                plan = self._explain(sql, params)
+                self._lr_by_key_or_range(plan, (flaking, marker))
+                if not self._mariadb():
+                    self._sqlite_fail_range(
+                        plan, "the browse filter's term {0!r}".format(
+                            (flaking, marker)))
+
+    def test_the_promoted_term_keeps_the_fail_range(self) -> None:
+        """Item 16: the New failures queue's promoted term (P, a
+        row-value ``IN`` beside "previous result not FAIL") is a filter
+        on the stream's FAIL range, never the way into latest_runs. No
+        guard pinned ``lr`` for it; on SQLite it must be a SEARCH of
+        ``idx_latest_runs_result`` on the stream and FAIL, on MariaDB no
+        read of latest_runs whole."""
+        cutoff = self.NOW - datetime.timedelta(hours=36)
+        self.store._invalidate_summary_cache()
+        sql, params = self._statement(
+            lambda: self.store.status_queue(
+                "new_failures", stale_before=cutoff, now=self.NOW,
+                marks=True),
+            "LEFT JOIN test_flaky_marks AS fm")
+        self.assertIn("OR (lr.environment, lr.script, lr.test_name) IN (",
+                      sql)
+        plan = self._explain(sql, params)
+        self._lr_by_key_or_range(plan, "the promoted term")
+        if not self._mariadb():
+            self._sqlite_fail_range(plan, "the promoted term")
 
     def test_open_actions_terms_and_keys_read_no_partition_whole(
             self) -> None:
         """Open Actions: the bound X term (MariaDB's form) on the rows and
         the count, and the keys form's two statements (SQLite's), on
-        both engines: no read of latest_runs is a scan."""
+        both engines: no read of latest_runs is a scan.
+
+        Item 16 widens it: the keys form's page by key is
+        :meth:`Storage._rows_by_key`, the statement CI's SQLite 3.26 read
+        by ``stream_id`` alone (a SEARCH, so this guard passed it), and
+        it now carries the Flaking queue's full-key assertion on both
+        engines. The reads are found by ``latest_runs AS lr``, which the
+        keys-driven spelling joins rather than starts from."""
         for by_keys in (False, True):
             self.store._backend.set_aside_by_keys = by_keys  # type: ignore
             try:
@@ -11542,17 +11668,43 @@ class FlakyPlanTest(FlakyEstateBase):
             finally:
                 del self.store._backend.set_aside_by_keys  # type: ignore
             reads = [c for c in captured
-                     if "FROM latest_runs AS lr" in c[0]
+                     if "latest_runs AS lr" in c[0]
                      and "CROSS JOIN test_flaky_marks" not in c[0]]
             self.assertEqual(len(reads), 2, [c[0][:60] for c in reads])
+            by_key = [c for c in reads
+                      if ") AS k CROSS JOIN latest_runs AS lr" in c[0]
+                      or "WHERE lr.stream_id = ? AND (lr.environment, "
+                         "lr.script, lr.test_name) IN (" in c[0]]
+            self.assertEqual(len(by_key), 1 if by_keys else 0,
+                             [c[0][:60] for c in reads])
             for sql, params in reads:
                 if by_keys:
                     self.assertNotIn("ca.assignee IS NULL AND", sql)
                 else:
                     self.assertIn("ca.assignee IS NULL AND (lr.environment",
                                   sql)
-                self._lr_by_key_or_range(
-                    self._explain(sql, params), (by_keys, sql[:60]))
+                plan = self._explain(sql, params)
+                self._lr_by_key_or_range(plan, (by_keys, sql[:60]))
+                if (sql, params) in by_key:
+                    # A page of 66 keys on this fixture: a list, not one.
+                    self.assertGreater(len(params), 1 + 3 * 50, sql[:200])
+                    self._full_key_read(plan, "Open Actions' page by key")
+
+    def _full_key_read(self, plan: List[Any], what: str) -> None:
+        """A :meth:`Storage._rows_by_key` statement's plan reads
+        latest_runs by its whole primary key, on either engine."""
+        if self._mariadb():
+            full = self._full_key_len()
+            lr = [row for row in plan if row[2] == "lr"]
+            self.assertEqual(len(lr), 1, plan)
+            self.assertEqual(
+                (lr[0][5], str(lr[0][6])), ("PRIMARY", full),
+                "{0} reads latest_runs by {1} at key_len {2} ({3}), not by "
+                "the whole primary key (key_len {4}): {5}".format(
+                    what, lr[0][5], lr[0][6], lr[0][3], full, plan))
+            self.assertNotIn(lr[0][3], ("ALL", "index"), plan)
+            return
+        self._sqlite_full_key_read(plan, what)
 
     def _full_key_len(self) -> str:
         """MariaDB's ``key_len`` for latest_runs' whole primary key: the
@@ -11579,7 +11731,14 @@ class FlakyPlanTest(FlakyEstateBase):
         whole partition, would pass it. This guard requires the FULL key:
         on SQLite a SEARCH by all four columns of the partition's primary
         key; on MariaDB the primary key at its whole ``key_len`` (that of
-        a lookup by all four columns), never ALL, index or a prefix."""
+        a lookup by all four columns), never ALL, index or a prefix.
+
+        Item 16: CI's Python 3.6.8 jobs (SQLite 3.26) read the row-value
+        ``IN`` by ``stream_id`` alone, the whole partition, where 3.50
+        read it by the key. SQLite's statement is now driven from the
+        keys (``k CROSS JOIN lr``), and on SQLite this guard also
+        requires ``k`` scanned before the one ``lr`` line and no list or
+        OR plan anywhere, and names the SQLite version it ran on."""
         self.store._invalidate_summary_cache()
         captured = self._captured(lambda: self.store.status_queue(
             storage.FLAKING_QUEUE, limit=500, with_latest_comment=True,
@@ -11588,28 +11747,46 @@ class FlakyPlanTest(FlakyEstateBase):
         self.assertEqual(len(touching), 2, [c[0][:80] for c in captured])
         self.assertEqual(touching[0][0], self._q1()[0])
         sql, params = touching[1]
-        self.assertIn("WHERE lr.stream_id = ? AND (lr.environment, "
-                      "lr.script, lr.test_name) IN (", sql)
+        if self.store._backend.rows_by_key_from_keys:
+            self.assertIn(
+                "FROM (SELECT ? AS environment, ? AS script, ? AS test_name "
+                "UNION ALL SELECT ?, ?, ? ", sql)
+            self.assertIn(
+                ") AS k CROSS JOIN latest_runs AS lr ON lr.stream_id = ? "
+                "AND lr.environment = k.environment AND lr.script = k.script "
+                "AND lr.test_name = k.test_name ", sql)
+            self.assertNotIn(") IN (", sql)
+        else:
+            self.assertIn("WHERE lr.stream_id = ? AND (lr.environment, "
+                          "lr.script, lr.test_name) IN (", sql)
         self.assertEqual(len(params), 1 + 3 * 53, sql[:200])
-        plan = self._explain(sql, params)
-        if self._mariadb():
-            full = self._full_key_len()
-            lr = [row for row in plan if row[2] == "lr"]
-            self.assertEqual(len(lr), 1, plan)
-            self.assertEqual(
-                (lr[0][5], str(lr[0][6])), ("PRIMARY", full),
-                "the Flaking queue reads latest_runs by {0} at key_len "
-                "{1} ({2}), not by the whole primary key (key_len {3}): "
-                "{4}".format(lr[0][5], lr[0][6], lr[0][3], full, plan))
-            self.assertNotIn(lr[0][3], ("ALL", "index"), plan)
-            return
+        self._full_key_read(
+            self._explain(sql, params), "the Flaking queue's rows")
+
+    def _sqlite_full_key_read(self, plan: List[Any], what: str) -> None:
+        """SQLite's plan of a :meth:`Storage._rows_by_key` statement: the
+        keys ``k`` scanned first (``SCAN K`` on a current SQLite, ``SCAN
+        SUBQUERY n AS K`` on 3.26), then exactly one ``lr`` line, a
+        SEARCH (``SEARCH LR`` or ``SEARCH TABLE LATEST_RUNS AS LR``, by
+        version) by all four columns of the partition's primary key; no
+        list subquery and no multi-index OR anywhere. Every message names
+        the SQLite version the plan came from."""
+        version = "{0} on SQLite {1}".format(what, sqlite3.sqlite_version)
+        note = (version, plan)
         lr = [line for line in plan if " LR " in line + " "]
-        self.assertEqual(len(lr), 1, plan)
-        self.assertTrue(lr[0].startswith("SEARCH"), plan)
-        self.assertIn("SQLITE_AUTOINDEX_LATEST_RUNS_1", lr[0], plan)
+        self.assertEqual(len(lr), 1, note)
+        self.assertTrue(lr[0].startswith("SEARCH"), note)
+        self.assertIn("SQLITE_AUTOINDEX_LATEST_RUNS_1", lr[0], note)
         self.assertIn(
             "(STREAM_ID=? AND ENVIRONMENT=? AND SCRIPT=? AND TEST_NAME=?)",
-            lr[0], plan)
+            lr[0], note)
+        k = [index for index, line in enumerate(plan)
+             if line.startswith("SCAN") and " K " in line + " "]
+        self.assertEqual(len(k), 1, note)
+        self.assertLess(k[0], plan.index(lr[0]), note)
+        for line in plan:
+            self.assertNotIn("LIST SUBQUERY", line, note)
+            self.assertNotIn("MULTI-INDEX OR", line, note)
 
     def test_the_trend_reaches_runs_from_each_mark(self) -> None:
         """SQLite's plan only: the runs member reads each mark's range of
@@ -12299,8 +12476,13 @@ class FlakingQueueTest(FlakyListsBase):
                          [item[1:] for item in expected[:500]])
         reads = [s for s in seen if "JOIN runs AS r ON r.id = lr.run_id" in s]
         self.assertEqual(len(reads), 2, [s[:80] for s in seen])
+        # Each by key, in the backend's spelling (item 16: on SQLite the
+        # keys drive the read; FlakyPlanTest pins each spelling's plan).
+        spelling = (") AS k CROSS JOIN latest_runs AS lr ON "
+                    if self.store._backend.rows_by_key_from_keys
+                    else "lr.test_name) IN (")
         for statement in reads:
-            self.assertIn("lr.test_name) IN (", statement)
+            self.assertIn(spelling, statement)
         # The whole set when uncapped; the count unchanged.
         self.assertEqual(len(self._queue()), 653)
         self.assertEqual(self._total(), 653)

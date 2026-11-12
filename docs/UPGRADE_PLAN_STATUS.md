@@ -5163,3 +5163,39 @@ as skipped: the count is simply nine lower. Final counts in the main
 checkout, with it: 3055 OK (skipped 1) on SQLite and 4229 OK (skipped
 91) with the MariaDB variants on a local 12.3. No browser has rendered
 the tab.
+
+## WP-44 item 16: CI's 3.6.8 jobs catch the keyed read on an old SQLite; fixed (2026-11-12)
+
+The rework's first push went red on all six Python 3.6.8 jobs for one
+test, item 14's plan guard for the Flaking queue's rows. The SQLite of
+that target (3.26) cannot drive an index from a row-value `IN` over a
+list of rows, so `_rows_by_key` read every `latest_runs` row of the
+stream to find 53. The answer was right; the cost was the stream. Every
+interpreter on the development machine carries a newer SQLite that plans
+the form by the key, so no local run could show it. **The MariaDB
+variant of the same guard passed on both 10.3 jobs: production's stream
+reads those rows by the full key**, which was the question left open for
+CI, and MariaDB's statement is unchanged.
+
+The fault was older than the queue: Open Actions' page by keys on SQLite
+has used `_rows_by_key` since item 8, and its guard was green on 3.6.8
+only because it accepted any index search, the stream-wide one included.
+
+On SQLite the read is now driven from the keys (a compound select of the
+keys, `CROSS JOIN latest_runs` on the four key columns), which SQLite
+documents as fixing the loop order whatever the version or the
+statistics; 250 keys a statement as before. Rejected in the design pass:
+an OR of key terms, a cost-based choice that can lose to the read being
+escaped. The implementer built SQLite 3.26 from the public amalgamation
+in a scratch directory: the tree before fails the guard as CI did, the
+fixed tree passes. Measured (16p, perf-seed/1, SQLite 3.50): no change
+in any cell of the queue or of Open Actions' rows, statements equal,
+Known slow rows the same; forcing the old plan costs 4.3 to 5.7 ms more
+on every call of either read, on a queue call of 1.2 to 3.3 ms after the
+headline. The guards now require the full key for both keyed reads on
+both backends and name the SQLite version; two guards that accepted any
+index search name their index. Noted: the code's SQLite floor is 3.15
+(row values in two filter terms) and is stated nowhere. Main checkout,
+`tclsh` on PATH: 3056 OK (skipped 1) and 4231 OK (skipped 91) on the
+fix, then two more tests of the keys-driven read added by the review
+(`tests.test_storage`: 709 OK). CI on the push is the proof on 3.6.8.

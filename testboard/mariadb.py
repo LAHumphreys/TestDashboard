@@ -193,6 +193,11 @@ class MariaDBBackend(object):
     limited_union_member = _LIMITED_UNION_MEMBER
     row_value_list = _ROW_VALUE_LIST
 
+    #: WP-44 item 16: ``Storage._rows_by_key`` keeps the row-value
+    #: ``IN`` here, which 10.3 and 12.3 read by the whole primary key;
+    #: SQLite drives the read from the keys instead.
+    rows_by_key_from_keys = False
+
     #: WP-44 item 8: Open Actions' unassigned flaking tests are bound as
     #: a gated row-value term on the rows and their count here; the keys
     #: form brought nothing on this engine (design §3b).

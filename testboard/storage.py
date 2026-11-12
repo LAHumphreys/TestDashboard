@@ -2570,6 +2570,19 @@ class _SqliteBackend(object):
     #: values only as a VALUES clause; MariaDB takes the tuples bare.
     row_value_list = "VALUES {0}"
 
+    #: WP-44 item 16: :meth:`Storage._rows_by_key` drives its read FROM
+    #: the keys here: a compound select of the bound triples, ``CROSS
+    #: JOIN``-ed to ``latest_runs`` on all four columns of its primary
+    #: key. The row-value ``IN (VALUES ...)`` it replaces read the
+    #: stream's whole partition on SQLite 3.26 (RHEL 8's, the 3.6.8
+    #: target's), which cannot drive an index from a list of row values;
+    #: a current SQLite happens to. SQLite documents that the left side
+    #: of a CROSS JOIN is always the outer loop, and a compound select
+    #: whose arms have no FROM is never flattened, so the plan is one
+    #: full-key probe per key on every version. MariaDB reads the
+    #: row-value form by the key and keeps it.
+    rows_by_key_from_keys = True
+
     #: WP-44 item 8 (design §3b, §3c): Open Actions leaves out its
     #: unassigned flaking tests by the KEYS form on this engine (the
     #: matched keys in order, the set dropped in Python, the page fetched
@@ -4372,24 +4385,76 @@ class Storage:
         """The rows of *keys* on *stream_id*, in *keys*' order: the keys
         form's page, by the partition's primary key, at most 250 keys a
         statement (fewer under a lower ceiling) and ordered in Python,
-        since the keys already carry the sort."""
+        since the keys already carry the sort. *join* is one of the
+        ``FROM latest_runs AS lr ...`` joins.
+
+        Spelled by the backend (WP-44 item 16): where it drives the read
+        from the keys (SQLite), :meth:`_keys_driven_rows`; elsewhere a
+        row-value ``IN`` on the stream's partition. Both bind three
+        parameters a key and one for the stream."""
         if not keys:
             return []
         per = 250
         ceiling = self._backend.max_bound_parameters
         if ceiling is not None:
             per = max(1, min(per, (ceiling - 1) // 3))
+        from_keys = self._backend.rows_by_key_from_keys
         found = {}  # type: Dict[Tuple[str, str, str], Sequence[Any]]
         conn = self._conn()
         for start in range(0, len(keys), per):
             chunk = keys[start:start + per]
-            term, term_params = self._row_value_in(chunk)
-            sql = "SELECT {0} {1} WHERE lr.stream_id = ? AND {2}".format(
-                columns, join, term)
-            for row in conn.execute(
-                    sql, [stream_id] + term_params).fetchall():
+            if from_keys:
+                sql, params = self._keys_driven_rows(
+                    stream_id, chunk, columns, join)
+            else:
+                term, term_params = self._row_value_in(chunk)
+                sql = "SELECT {0} {1} WHERE lr.stream_id = ? AND {2}".format(
+                    columns, join, term)
+                params = [stream_id] + term_params
+            for row in conn.execute(sql, params).fetchall():
                 found[(row[0], row[1], row[2])] = row
         return [found[key] for key in keys if key in found]
+
+    #: The head every join :meth:`_rows_by_key` is given starts with.
+    _ROWS_BY_KEY_FROM = "FROM latest_runs AS lr "
+
+    def _keys_driven_rows(
+        self,
+        stream_id: int,
+        chunk: Sequence[Tuple[str, str, str]],
+        columns: str,
+        join: str,
+    ) -> Tuple[str, List[Any]]:
+        """One statement of :meth:`_rows_by_key` driven from its keys:
+        *join*'s leading ``latest_runs`` becomes ``k CROSS JOIN
+        latest_runs`` on all four columns of its primary key, where ``k``
+        is the chunk's triples as a compound select, each arm a constant
+        row; the rest of *join* follows unchanged. The left side of a
+        CROSS JOIN is always SQLite's outer loop, so each key is one
+        probe of the partition's primary key on every version (3.26
+        read the stream's whole partition for the row-value ``IN`` this
+        replaces). The arms are bound in triple order, so the probes
+        walk the index forwards; the caller restores its own order. At
+        most 250 arms, inside SQLite's default limit of 500 on a
+        compound select."""
+        if not join.startswith(self._ROWS_BY_KEY_FROM):
+            raise ValueError(
+                "_rows_by_key reads latest_runs AS lr first: {0!r}".format(
+                    join[:60]))
+        ordered = sorted(chunk)
+        arms = " UNION ALL ".join(
+            ["SELECT ? AS environment, ? AS script, ? AS test_name"]
+            + ["SELECT ?, ?, ?"] * (len(ordered) - 1))
+        sql = (
+            "SELECT {0} FROM ({1}) AS k "
+            "CROSS JOIN latest_runs AS lr "
+            "ON lr.stream_id = ? AND lr.environment = k.environment "
+            "AND lr.script = k.script AND lr.test_name = k.test_name "
+            "{2}").format(
+                columns, arms, join[len(self._ROWS_BY_KEY_FROM):])
+        params = [value for triple in ordered for value in triple]
+        params.append(stream_id)
+        return sql, params
 
     def _flaky_rows(
         self,
