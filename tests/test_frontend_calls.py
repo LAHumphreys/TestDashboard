@@ -8211,7 +8211,8 @@ class FlakyMarkDomTest(unittest.TestCase):
         self.assertEqual(first["banner"], [
             "Marked flaky, 3 in a row",
             "by dev1 · 12 days ago · race in teardown",
-            "Flaking: failed its last run; counts as failing at 3 in a row",
+            "Flaking: failed its last run; counts as failing after 3 in a "
+            "row",
             "Set cadence", "Unmark"])
         # Marked: the mark's banner in the mark's edge, no offer anywhere.
         self.assertFalse(first["offer"])
@@ -9638,9 +9639,16 @@ class FlakyTabTest(unittest.TestCase):
         self.assertNotIn("state.queueSortKey || \"\"", render)
         api = _strip_comments(read("api.js"))
         self.assertIn(
-            'return cadenceWords(flaky.streak) + ", failing at " '
+            'return cadenceWords(flaky.streak) + ", failing after " '
             '+ flaky.cadence;',
             _function_body(api, "export function flakyStreakWords(flaky)"))
+        # The sentence beside it (its title) says the cadence the same
+        # way, "after", as the select's "fail after…" does; held here
+        # too so a run without node still sees it.
+        self.assertIn(
+            'return "Flaking: " + failed + "; counts as failing after "\n'
+            '      + cadenceWords(cadence);',
+            _function_body(api, "export function flakySentence("))
         self.assertLess(api.index("export function flakySentence("),
                         api.index("export function flakyStreakWords("))
 
@@ -9648,8 +9656,9 @@ class FlakyTabTest(unittest.TestCase):
                      "are optional dev tooling, the source guards still run")
     def test_the_streak_words_byte_for_byte(self) -> None:
         """They agree with the sentence (its title) and the cadence's own
-        words: "N in a row" is cadenceWords(), "failing at" the sentence's
-        "counts as failing at"."""
+        words: "N in a row" is cadenceWords(), "failing after" the
+        sentence's "counts as failing after", as the select's "fail
+        after…" says it."""
         answer = _api_calls([
             ("flakyStreakWords", [_flaky("flaking", 1)]),
             ("flakyStreakWords", [_flaky("flaking", 2)]),
@@ -9659,9 +9668,10 @@ class FlakyTabTest(unittest.TestCase):
             ("cadenceWords", [3]),
         ])
         self.assertEqual(answer, [
-            "1 in a row, failing at 3", "2 in a row, failing at 3",
-            "9 in a row, failing at 10",
-            "Flaking: failed its last 2 runs; counts as failing at 3 in a row",
+            "1 in a row, failing after 3", "2 in a row, failing after 3",
+            "9 in a row, failing after 10",
+            "Flaking: failed its last 2 runs; counts as failing after 3 in "
+            "a row",
             "3 in a row"])
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
@@ -9757,18 +9767,19 @@ class FlakyTabTest(unittest.TestCase):
         # In the server's order, nearest to its cadence first: the test,
         # the streak, the latest comment.
         self.assertEqual([row["cells"][:2] for row in rows], [
-            ["dns_timeoutenv-a · s1.py", "2 in a row, failing at 3"],
-            ["login_retryenv-b · s1.py", "4 in a row, failing at 5"],
-            ["cache_warmenv-a · s1.py", "1 in a row, failing at 3"]])
+            ["dns_timeoutenv-a · s1.py", "2 in a row, failing after 3"],
+            ["login_retryenv-b · s1.py", "4 in a row, failing after 5"],
+            ["cache_warmenv-a · s1.py", "1 in a row, failing after 3"]])
         self.assertEqual([row["cells"][2][:18] for row in rows],
                          ["—", "retry stormdev1 · ", "—"])
         self.assertEqual([row["cells"][4] for row in rows], ["Review"] * 3)
         self.assertEqual([row["titles"][1] for row in rows], [
-            "Flaking: failed its last 2 runs; counts as failing at "
+            "Flaking: failed its last 2 runs; counts as failing after "
             "3 in a row",
-            "Flaking: failed its last 4 runs; counts as failing at "
+            "Flaking: failed its last 4 runs; counts as failing after "
             "5 in a row",
-            "Flaking: failed its last run; counts as failing at 3 in a row"])
+            "Flaking: failed its last run; counts as failing after 3 in "
+            "a row"])
         # The row's edge reads flaking; no chip, no pill in the row.
         self.assertEqual([row["edge"] for row in rows], ["result-flaking"] * 3)
         self.assertEqual([row["marks"] for row in rows], [[], [], []])
@@ -9854,7 +9865,7 @@ class FlakyTabTest(unittest.TestCase):
                          ["Assign to", "Add a comment", "Mute", "Flaky"])
         self.assertEqual(flaking["panel"]["flaky"], [
             ["SPAN", ["Flaking: failed its last 2 runs; counts as failing "
-                      "at 3 in a row", "by dev1 · 12 days ago · race in "
+                      "after 3 in a row", "by dev1 · 12 days ago · race in "
                       "teardown"]],
             ["SELECT", "3"], ["BUTTON", "Set cadence"], ["BUTTON", "Unmark"]])
         self.assertEqual([row["review"] for row in flaking["rows"]][0],

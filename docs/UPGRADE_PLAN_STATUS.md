@@ -5261,3 +5261,35 @@ trigger paths. Counts in the main checkout, `tclsh` and `node` on PATH:
 3067 OK (skipped 1) on SQLite and 4242 OK (skipped 91) with the MariaDB
 variants on a local 12.3, one more than before on each, the new guard.
 No browser has rendered it.
+
+## WP-44 item 19: the sentence and the Streak cell say "after", as the select does (2026-11-12)
+
+CI on `3d287b5` passed all twelve jobs. The owner, shown the difference
+item 18 left ("at" in the text beside a select that says "after"),
+decided it: "Change them to match: "after"".
+
+The mark's flaking sentence now reads "counts as failing after 3 in a
+row" (the Review panel's line, a test page's banner, the title of the
+"flaky" tag on list rows and of the Streak cell) and the Flaking tab's
+Streak cell "2 in a row, failing after 3". What's new quotes the cell's
+new text; the design doc's sketches and the operator note follow. A
+sweep of `static/` found no other place that words the cadence with
+"at"; the wordings that never did are unchanged ("counts as failing once
+its last 3 runs have failed", "3 in a row", "fail past their cadence").
+
+The statement is true as written: a marked test is failing when its
+newest N results are all failures, so at a cadence of 3 the third
+failure in a row is the one that counts, and the flaking sentence is
+only shown below it.
+
+Every guard that held either string holds the new one, none loosened:
+the source check of the Streak words, the byte-for-byte test, the walks
+of the Flaking tab, the Review panel and the test page's banner. The
+sentence is now also held from the source, so a run without `node`
+checks it. Nothing can newly wrap: the Streak cell does not wrap, and
+the sentence is shorter than the failing one drawn in the same place.
+
+No performance pass: two strings built in the browser, off the trigger
+paths. Counts in the main checkout, `tclsh` and `node` on PATH: 3067 OK
+(skipped 1) on SQLite and 4242 OK (skipped 91) with the MariaDB variants
+on a local 12.3, unchanged. No browser has rendered it.

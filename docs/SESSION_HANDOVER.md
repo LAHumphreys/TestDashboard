@@ -14,7 +14,8 @@ committed on the same branch. Three more items followed the same day: CI
 caught the tab's keyed read scanning a whole stream on the old SQLite of
 the 3.6.8 target (fixed, and green there), the owner could not find
 "Mark as flaky" on a test's own page (it is in the header now), and the
-cadence select's placeholder was reworded to "fail after…". The design
+cadence is worded as "after" throughout: the select opens on "fail
+after…" and the sentence and the Streak cell beside it follow. The design
 doc's §13 and §14 have the verdicts, how the first design came about, and
 the plan that was run; its §12 strip has every item.
 
@@ -32,8 +33,10 @@ the plan that was run; its §12 strip has every item.
   the first build (to `0406e68`); items 11 to 15 are the rework of the
   triage tab (`b6f0162` backend, `6da4512` UI); item 16 is the keyed read
   on an old SQLite (`77f12d2`); item 17 the test page's header offer
-  (`4b96426`); item 18 the cadence select's placeholder (the branch's
-  last commit); the documents between them. **Migration 12 runs** (create-only: `test_flaky_marks`,
+  (`4b96426`); item 18 the cadence select's placeholder (`3d287b5`);
+  item 19 the sentence and the Streak cell saying "after" as the select
+  does (the branch's last commit); the documents between them.
+  **Migration 12 runs** (create-only: `test_flaky_marks`,
   `flaky_mark_history`, one index); the upgrade tool's ledger has the step.
   **Production stays at 11 until the drop.** The server's Python changed, so
   the restart is required.
@@ -56,12 +59,13 @@ the plan that was run; its §12 strip has every item.
 - **A mark is made from** the selection bar, the Review panel, or the
   header of the test's own page, where an unmarked test shows "Flaky" and a
   "Mark as flaky" button beside the Mute offer, whatever its result.
-- **CI is green on `65ec790`, all twelve jobs**: the six Python 3.6.8 jobs
+- **CI is green on `3d287b5`, all twelve jobs**: the six Python 3.6.8 jobs
   (the old SQLite) and both MariaDB 10.3 jobs, with the plan guards of the
   Flaking queue's rows and of Open Actions' page by keys. Item 6h (a
-  dialect hook) is not needed. What followed that commit is item 18: one
-  string in `static/api.js`, one guard, and documents; **CI on that last
-  push had not finished when this was written.**
+  dialect hook) is not needed. What followed that commit is item 19: two
+  strings in `static/api.js`, the What's new line that quotes one, their
+  guards, and documents; **CI on that last push had not finished when
+  this was written.**
 - **`_rows_by_key` is written differently on each backend, on purpose**:
   MariaDB uses a row-value `IN`; SQLite is driven from the keys with a
   `CROSS JOIN`, because SQLite 3.26 cannot use an index for the row-value
@@ -101,10 +105,10 @@ the plan that was run; its §12 strip has every item.
 ## Next session's plan
 
 1. **Read CI on PR #21 at the branch's head** (`gh pr checks 21`). It was
-   green on `65ec790`; the commit after it changes one string in a static
-   file, adds its guard, and documents.
+   green on `3d287b5`; the commit after it changes two strings in a static
+   file, the What's new line that quotes one, their guards, and documents.
 2. **The owner looks at the Flaking tab and a test's page in a browser**
-   and decides the things under "Needs a person" items 1, 2, 3 and 22. Anything
+   and decides the things under "Needs a person" items 1, 2 and 3. Anything
    overturned is a rework on the same branch before the merge.
 3. **Ship it** when the owner says so (`/drop`): set the real date in the
    operator note and in What's new together; **rewrite PR #21's body**, which
@@ -138,9 +142,9 @@ the plan that was run; its §12 strip has every item.
 | | |
 |---|---|
 | `origin/master` | `6cba071` — the drop of 2026-10-13 (PR #20) on top of the drop of 2026-10-12 (PR #19); deployment of neither reported |
-| `wp-44-flaky-mark` | **WP-44, the drop of 2026-11-11**, PR #21: the design arc, items 1 to 10, then the rework (the plan commits, `fec3d34` the triage rule in `CLAUDE.md` and the UI agent's definition, `b6f0162` backend, `6da4512` UI, `77f12d2` the keyed read on an old SQLite, `4b96426` the test page's offer, the cadence select's placeholder, the documents). Squash-merge, delete |
+| `wp-44-flaky-mark` | **WP-44, the drop of 2026-11-11**, PR #21: the design arc, items 1 to 10, then the rework (the plan commits, `fec3d34` the triage rule in `CLAUDE.md` and the UI agent's definition, `b6f0162` backend, `6da4512` UI, `77f12d2` the keyed read on an old SQLite, `4b96426` the test page's offer, `3d287b5` the cadence select's placeholder, the sentence and Streak cell that follow it, the documents). Squash-merge, delete |
 | `design-flaky-mark` | the arc's frozen doc, local only, already the base of the branch above; **delete after the merge** |
-| `wp44-11-wt`, `wp44-12-wt`, `wp44-14-base`, `wp44-14-wt`, `wp44-15-wt`, `wp44-16-wt`, `wp44-17-wt`, `wp44-18-wt` and nine `worktree-agent-*` of 2026-11-12 | the rework's snapshot branches and agent worktrees under `.claude/worktrees/`; remove the worktrees, then the branches, after the merge. **The backend agent's worktree of item 16 holds an unmerged memory note** (`.claude/agent-memory/backend-engineer/old-sqlite-326-repro.md`, how to build SQLite 3.26 in the Linux subsystem): copy it out first if it is wanted |
+| `wp44-11-wt`, `wp44-12-wt`, `wp44-14-base`, `wp44-14-wt`, `wp44-15-wt`, `wp44-16-wt`, `wp44-17-wt`, `wp44-18-wt`, `wp44-19-wt` and ten `worktree-agent-*` of 2026-11-12 | the rework's snapshot branches and agent worktrees under `.claude/worktrees/`; remove the worktrees, then the branches, after the merge. **The backend agent's worktree of item 16 holds an unmerged memory note** (`.claude/agent-memory/backend-engineer/old-sqlite-326-repro.md`, how to build SQLite 3.26 in the Linux subsystem): copy it out first if it is wanted |
 | `wp44-*-wt` (items 1 to 9), `wp44-5-base`, `wp44-6-head`, `wp44-8-head`, `wp44-10-head`, `wp44-pre-reword`, older `worktree-agent-*` | the first build's snapshot and scratch branches, most with a worktree under `.claude/worktrees/` (about forty worktrees in all, several locked); remove the worktrees, then the branches, after the merge |
 | `wp-43-charts-assigned-split`, `design-charts-assigned-split`, `wp43-backend-wt`, `wp43-seed-wt`, `wp43-ui-wt` | merged as PR #20; the three `wp43-*` worktrees and all five branches are still here: remove |
 | `admin-2026-10-09-handover` | PR #17, a handover rewrite superseded four times; **close without merging** |
@@ -157,7 +161,7 @@ A local `master` exists since 2026-10-03; keep it a mirror of
 | Plan | Spec | Branch | Status |
 |---|---|---|---|
 | WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8, status strip §9 (frozen 2026-10-13) | `wp-43-charts-assigned-split` | **merged as PR #20**; deployment not reported; one owner decision still open in its §7 (item 7 below) |
-| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11); the triage tab's contract is §14, which replaces §3 U8 and §13's | `wp-44-flaky-mark`, PR #21 | **built, every item done (1 to 10, then 11 to 18); not merged, not deployed.** The status strip is the doc's §12. Item 6h is not needed. CI green on `65ec790`, 3.6.8 and MariaDB 10.3 included. Its item 3 claimed migration 12 and moved the parked WP-15 to 13 |
+| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11); the triage tab's contract is §14, which replaces §3 U8 and §13's | `wp-44-flaky-mark`, PR #21 | **built, every item done (1 to 10, then 11 to 19); not merged, not deployed.** The status strip is the doc's §12. Item 6h is not needed. CI green on `3d287b5`, 3.6.8 and MariaDB 10.3 included. Its item 3 claimed migration 12 and moved the parked WP-15 to 13 |
 
 ## Needs a person, not a commit
 
@@ -271,14 +275,6 @@ A local `master` exists since 2026-10-03; keep it a mirror of
     across. Either the briefs say so from the start or the ledgers move.
 21. **The agents' memory notes from WP-44 are not merged** (backend, UI,
     performance): the owner decides what is kept.
-22. **WP-44, the cadence select says "after" and the text beside it says
-    "at".** The select opens on "fail after…" (the owner's wording); the
-    mark's sentence reads "counts as failing at 3 in a row" and the Flaking
-    tab's Streak cell "2 in a row, failing at 3", which What's new quotes.
-    All mean the third failure in a row; "after 3" can also be read as the
-    fourth. Named to the owner, not changed: the sentence and the cell
-    follow the select, or stay.
-
 ## Known slow, measured, not changed
 
 **Production-scale SQLite (perf-seed/1, `tools/dev/perf/`), cold,

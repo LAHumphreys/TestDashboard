@@ -532,7 +532,7 @@ nothing is flaking. Every row over its cadence, the promotion night
 included (U6), takes one form of title:
 
 ```
-flaking    Flaking: failed its last 2 runs; counts as failing at 3 in a row
+flaking    Flaking: failed its last 2 runs; counts as failing after 3 in a row
            ("failed its last run" when streak is 1)
 runs = N   Failing: its last 3 runs all failed; marked flaky, 3 in a row
 runs < N   Failing: every run here has failed (2 of 2);
@@ -552,7 +552,7 @@ every ticked row is marked.
 
 ```
 Flaky  [why is this test flaky? (required)    ] [fail after…▾] [Mark as flaky]
-Flaky  Flaking: failed its last run; counts as failing at 3 in a row
+Flaky  Flaking: failed its last run; counts as failing after 3 in a row
        dev1 · 12 days ago · race in teardown  [3 in a row▾] Set cadence
        Unmark
 ```
@@ -568,7 +568,7 @@ what happened; flaking is a judgement on the test now; decision 9). With
 ```
 login_retry                  [FLAKING] 2026-11-10 02:14 · 41.2 s
 Marked flaky · 3 in a row    dev1 · 12 days ago · race in teardown
-  Flaking: failed its last run; counts as failing at 3 in a row
+  Flaking: failed its last run; counts as failing after 3 in a row
   [3 in a row▾] [Set cadence] [Unmark]
 FLAKINESS   unmarked: [Mark as flaky]   marked: Marked flaky, 3 in a row
 Flaky mark history ▸   Action | By | When (UTC) | Cadence | Reason
@@ -1356,7 +1356,8 @@ any interruption is the first line not `done` or `parked`.
 | 16 the keyed read on an old SQLite | done | `77f12d2` | not in §14's plan: CI's Python 3.6.8 jobs failed item 14's plan guard on SQLite 3.26, which cannot drive an index from a row-value `IN` over a list and read the whole stream. MariaDB 10.3 passed the same guard. On SQLite the read is now driven from the keys (`CROSS JOIN`); the same fault in Open Actions' page by keys, there since item 8 behind a guard that accepted any index search, is fixed by the same change. Proven on a scratch build of 3.26; CI's 3.6.8 jobs are the proof on the target |
 | 16p measured pass | done | | no change on a current SQLite in any cell, statements equal, the Known slow rows the same; the old plan forced on the development machine costs 4.3 to 5.7 ms more on every call of either read |
 | 17 the test page offers the mark in its header | done | `4b96426` | not in §14's plan: the owner, trying the build, had to ask where "Mark as flaky" was on a test's page. It was in the Flakiness card (§7's question 15); every other act on that page is in the header. It is there now, beside the Mute offer, for a test whatever its result; the card keeps a link that opens the header's one form. The walkthrough compared it with the Mute offer and changed its label ("Not marked flaky" to "Flaky") and made the offer quiet: no background, a muted label. CI's 3.6.8 jobs passed item 16 before this was committed. No browser has rendered it |
-| 18 the cadence select opens on "fail after…" | done | the commit carrying this line | not in §14's plan: the owner, trying the build, asked for the select's placeholder to read "fail after…" where it read "at…". One string in the one builder all three surfaces use (the selection bar, the Review panel, a test's page), and a guard that holds it and the Mute select's "for…". The select is no wider: a closed select takes the width of its widest option, "10 in a row". The walkthrough named one thing to the owner: the sentence and the Streak cell beside the select still say "failing at 3", and "after 3" can be read as the fourth failure where "at 3" cannot; left as it is until the owner says. CI was green on all twelve jobs at `65ec790` before this |
+| 18 the cadence select opens on "fail after…" | done | `3d287b5` | not in §14's plan: the owner, trying the build, asked for the select's placeholder to read "fail after…" where it read "at…". One string in the one builder all three surfaces use (the selection bar, the Review panel, a test's page), and a guard that holds it and the Mute select's "for…". The select is no wider: a closed select takes the width of its widest option, "10 in a row". The walkthrough named one thing to the owner: the sentence and the Streak cell beside the select still said "at" for the cadence, and "after 3" can be read as the fourth failure where "at 3" cannot; left for the owner, who decided it in item 19. CI was green on all twelve jobs at `65ec790` before this |
+| 19 the sentence and the Streak cell say "after" | done | the commit carrying this line | the owner, shown item 18's difference: "Change them to match: "after"". The mark's flaking sentence reads "counts as failing after 3 in a row" and the Streak cell "2 in a row, failing after 3"; What's new quotes the cell's new text. A sweep of `static/` found no other place that says the cadence with "at". Every guard that held either string holds the new one, and the sentence is now also held from the source, so a run without `node` sees it. Nothing can newly wrap: the Streak cell does not wrap and the sentence is shorter than the failing one drawn in the same place. The sketches in §3 follow. CI was green on all twelve jobs at `3d287b5` before this |
 
 ## §13 After the build: the owner's first look, and the rework (2026-11-12)
 

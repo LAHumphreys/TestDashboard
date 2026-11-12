@@ -946,7 +946,7 @@ export function flakySentence(flaky, muteLive) {
   if (flaky.state === "flaking") {
     const failed = flaky.streak > 1
       ? "failed its last " + flaky.streak + " runs" : "failed its last run";
-    return "Flaking: " + failed + "; counts as failing at "
+    return "Flaking: " + failed + "; counts as failing after "
       + cadenceWords(cadence);
   }
   if (flaky.state === "failing") {
@@ -968,15 +968,15 @@ export function flakySentence(flaky, muteLive) {
 }
 
 /**
- * "2 in a row, failing at 3": a flaking test's streak against its
+ * "2 in a row, failing after 3": a flaking test's streak against its
  * cadence, the Flaking tab's Streak cell (design §14), whose title is
  * flakySentence(). The streak in cadenceWords()' own phrase, then the
- * cadence as the sentence puts it ("counts as failing at 3 in a row"):
- * "failing" is the state the test reaches there, where "fails" would
- * read as one more run failing.
+ * cadence as the sentence and the select put it ("counts as failing
+ * after 3 in a row", "fail after…"): "failing" is the state the test
+ * reaches there, where "fails" would read as one more run failing.
  */
 export function flakyStreakWords(flaky) {
-  return cadenceWords(flaky.streak) + ", failing at " + flaky.cadence;
+  return cadenceWords(flaky.streak) + ", failing after " + flaky.cadence;
 }
 
 /** "by alice · 12 days ago · race in teardown": who made a mark, how
