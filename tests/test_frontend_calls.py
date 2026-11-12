@@ -128,6 +128,52 @@ class CoverageTest(unittest.TestCase):
             self.assertGreater(len(scripts()[name]), 1000, name)
 
 
+#: Files under static/ still spelling a NUL as the byte itself rather
+#: than as the escape "\u0000" (the same string at run time). Each is
+#: named so that this list can only shrink: respelling one fails
+#: NoNulByteTest until its name is removed here. (actions.js is outside
+#: WP-44 item 17's scope; CoverageTest's NUL read relies on it.)
+_NUL_BYTE_FILES = ("actions.js",)
+
+
+def _nul_byte_files(directory: str) -> List[str]:
+    """The files under *directory*, recursively and by path relative to
+    it, that contain a NUL byte."""
+    found = []  # type: List[str]
+    for parent, _dirs, names in os.walk(directory):
+        for name in names:
+            path = os.path.join(parent, name)
+            with io.open(path, "rb") as handle:
+                if b"\x00" in handle.read():
+                    found.append(
+                        os.path.relpath(path, directory).replace(os.sep, "/"))
+    return sorted(found)
+
+
+class NoNulByteTest(unittest.TestCase):
+    """WP-44 item 17: test.js held a literal NUL inside a string, which
+    made search tools call it binary and the editing tools refuse it. A
+    NUL in a string is spelled as its escape; no file under static/
+    holds the byte, bar the ones named in _NUL_BYTE_FILES."""
+
+    def test_no_static_file_holds_a_nul_byte(self) -> None:
+        self.assertEqual(_nul_byte_files(STATIC_DIR),
+                         sorted(_NUL_BYTE_FILES))
+
+    def test_the_sentinel_is_spelled_as_its_escape(self) -> None:
+        self.assertIn('const NEW_USER_SENTINEL = "\\u0000new-user";',
+                      read("test.js"))
+
+    def test_the_detector_can_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            os.mkdir(os.path.join(scratch, "sub"))
+            for name, data in (("clean.js", b'const a = "\\u0000x";\n'),
+                               ("sub/key.js", b'const a = "\x00x";\n')):
+                with io.open(os.path.join(scratch, name), "wb") as handle:
+                    handle.write(data)
+            self.assertEqual(_nul_byte_files(scratch), ["sub/key.js"])
+
+
 class UrlsModuleTest(unittest.TestCase):
     """urls.js (WP-24, docs/SCOPED_URLS_PLAN.md): the one module that
     builds every scoped URL, both navigation hrefs and /api/... fetch
@@ -5861,8 +5907,11 @@ class RootAbsoluteApiUrlTest(unittest.TestCase):
     #: files) precisely because a first-pass grep skipped them without
     #: comment. ``scripts()``/``read()`` decode bytes explicitly and
     #: are immune, but this asserts the scan actually reached them
-    #: rather than trusting that silently.
-    _NUL_FILES = ("actions.js", "test.js")
+    #: rather than trusting that silently. (WP-44 item 17: test.js now
+    #: spells its NUL as the escape and left this list; the list is the
+    #: one NoNulByteTest holds equal to every NUL-bearing file under
+    #: static/, so the scan is asserted to reach all of them.)
+    _NUL_FILES = _NUL_BYTE_FILES
 
     def test_the_nul_byte_files_are_still_in_scope(self) -> None:
         found = scripts()
@@ -7417,6 +7466,20 @@ def _owner_tokens(body: str) -> List[str]:
     return [token for token in _FLAKY_OWNER_TOKENS if token in body]
 
 
+def _offer_tints(body: str) -> List[str]:
+    """The declarations in a CSS rule *body* that would tint the test
+    page's flaky offer like the mark (WP-44 item 17): any background
+    other than ``none``, or anything in the flaking colour."""
+    found = []  # type: List[str]
+    for declaration in body.split(";"):
+        name, _colon, value = declaration.partition(":")
+        name, value = name.strip(), value.strip()
+        if ((name.startswith("background") and value != "none")
+                or "flaking" in value):
+            found.append(name + ": " + value)
+    return found
+
+
 class FlakyMarkControlsTest(unittest.TestCase):
     """WP-44 item 5: mark, change the cadence and unmark from the
     selection bar, the Review panel and the test page, each built like
@@ -7530,6 +7593,74 @@ class FlakyMarkControlsTest(unittest.TestCase):
         self.assertEqual(re.findall(r"<th>([^<]+)</th>", history),
                          ["Action", "By", "When (UTC)", "Cadence", "Reason"])
 
+    def test_one_form_in_the_header_and_a_link_in_the_card(self) -> None:
+        """WP-44 item 17: every act on the test sits in the header. The
+        offer is drawn in the mark's slot for any unmarked test, whatever
+        its result; the form is drawn there and nowhere else; the card's
+        link opens it and draws none of its own."""
+        code = _strip_comments(read("test.js"))
+        banner = _function_body(code, "function renderFlakyBanner(")
+        for needle in ('classList.toggle("is-offer", !flaky)',
+                       'el("span", "kf-label", "Flaky")', '"Mark as flaky"',
+                       'addEventListener("click", openFlakyForm)',
+                       "open.title = MARK_FLAKY_TITLE"):
+            self.assertIn(needle, banner)
+        # A mark is made while the test passes too: nothing but the mark
+        # gates the offer, neither the result nor a mute.
+        offer = banner[:banner.index("return;")]
+        self.assertIn("if (!flaky) {", offer)
+        for needle in ("latest", "FAIL", "failing", "if (muteLive"):
+            self.assertNotIn(needle, offer)
+        form = _function_body(code, "function openFlakyForm(")
+        self.assertIn('document.getElementById("flaky-banner")', form)
+        self.assertIn("renderFlakyBanner(null)", form)
+        # The submit explains the act as the opener does, as Mute's act
+        # button carries its own: one constant, used twice.
+        self.assertIn("mark.title = MARK_FLAKY_TITLE", form)
+        self.assertEqual(code.count("MARK_FLAKY_TITLE"), 3)
+        card = _function_body(code, "function renderFlakyCard(")
+        for needle in ('el("button", "linkish", "Mark as flaky")',
+                       "openFlakyForm()",
+                       'getElementById("flaky-banner").scrollIntoView('):
+            self.assertIn(needle, card)
+        for needle in ("createElement(", "flakyCadenceSelect(",
+                       "bulkFlakyUrl(", "postAct("):
+            self.assertNotIn(needle, card)
+        # One form on the page: one reason box, one mark request with a
+        # reason.
+        self.assertEqual(code.count("FLAKY_REASON_PLACEHOLDER;"), 1)
+        self.assertEqual(code.count("reason: text, cadence: chosen"), 1)
+        # The offer is quieter than the mark: no tint, a neutral edge and
+        # a muted label, and no rule naming the offer may tint it again.
+        css = re.sub(r"/\*.*?\*/", "", read_text("style.css"), flags=re.S)
+        rules = {}  # type: Dict[str, str]
+        for match in re.finditer(r"([^{}]+)\{([^}]*)\}", css):
+            for selector in match.group(1).split(","):
+                if "is-offer" in selector:
+                    rules[selector.strip()] = match.group(2)
+        self.assertEqual(sorted(rules), [
+            ".known-failure.is-flaky.is-offer",
+            ".known-failure.is-flaky.is-offer .kf-label"])
+        slot = rules[".known-failure.is-flaky.is-offer"]
+        self.assertIn("border-left-color: var(--grid)", slot)
+        self.assertIn("background: none", slot)
+        self.assertEqual(_offer_tints(slot), [])
+        self.assertEqual(
+            rules[".known-failure.is-flaky.is-offer .kf-label"].strip(),
+            "color: var(--muted);")
+        # The mark's banner keeps the annotation's tint.
+        self.assertIn("background: #fdf8ec",
+                      re.search(r"\n\.known-failure\s*\{([^}]*)\}",
+                                css).group(1))
+
+    def test_a_tinted_offer_would_be_caught(self) -> None:
+        for planted in ("background: #fdf8ec;", "background-color: #fff;",
+                        "border-left-color: var(--c-flaking-strong);",
+                        "background: none; background: #fdf8ec;"):
+            self.assertTrue(_offer_tints(planted), planted)
+        self.assertEqual(_offer_tints(
+            "border-left-color: var(--grid);\n  background: none;"), [])
+
     def test_the_header_reads_the_mark_and_history_stays_raw(self) -> None:
         """Decision 9: a run is what happened, so run history and the
         compare strip show the wire result; the header shows what the
@@ -7635,7 +7766,14 @@ const byId = installDom(fixture.ids, fixture.url);
 window.setTimeout = setTimeout;
 window.clearTimeout = clearTimeout;
 window.localStorage.setItem("testboard.username", "dev1");
-Element.prototype.focus = function () {};
+// What took the focus last and what was scrolled to, by class or id.
+let focused = null;
+const scrolled = [];
+Element.prototype.focus = function () { focused = this.className; };
+Element.prototype.scrollIntoView = function () {
+  scrolled.push(Object.keys(byId).find((id) => byId[id] === this)
+    || this.className);
+};
 const asked = [];
 let acted = false;
 globalThis.fetch = (url, opts) => {
@@ -7694,7 +7832,9 @@ if (fixture.surface === "test") {
       chip: chip ? [chip.className, chip.textContent] : null,
       tag: tag ? [tag.textContent, tag.title] : null,
       banner: byId["flaky-banner"].hidden ? null : words(byId["flaky-banner"]),
+      offer: byId["flaky-banner"].classList.contains("is-offer"),
       card: words(byId["flaky-mark"]),
+      cardTags: byId["flaky-mark"].children.map((c) => c.tagName),
       signal: byId["flakiness"].children[0].textContent,
       historyHidden: byId["flaky-history-section"].hidden,
       history: byId["flaky-history-body"].children.map((tr) => words(tr)),
@@ -7705,16 +7845,45 @@ if (fixture.surface === "test") {
   out.first = page();
   out.firstAsked = asked.map((a) => a.method + " " + a.path);
   const before = asked.length;
+  const banner = byId["flaky-banner"];
+  const form = () => banner.children.map((c) => c.tagName);
+  const reasonBox = () => banner.children.find((c) => c.tagName === "INPUT");
+  const fill = () => {
+    reasonBox().value = "race in teardown";
+    banner.children.find((c) => c.tagName === "SELECT").value = "3";
+  };
   if (fixture.act === "mark") {
-    const box = byId["flaky-mark"];
-    await button(box, "Mark as flaky").click();
-    out.form = box.children.map((c) => c.tagName);
-    await button(box, "Mark as flaky").click();
+    // The header's offer opens the form in the same slot.
+    await button(banner, "Mark as flaky").click();
+    out.form = form();
+    out.formWords = words(banner);
+    out.focused = focused;
+    out.cardWhileOpen = byId["flaky-mark"].children.map((c) => c.tagName);
+    await button(banner, "Mark as flaky").click();
     out.emptyError = errorShown();
     out.emptyPosts = posts().length;
-    box.children.find((c) => c.tagName === "INPUT").value = "race in teardown";
-    box.children.find((c) => c.tagName === "SELECT").value = "3";
-    await button(box, "Mark as flaky").click();
+    fill();
+    await button(banner, "Mark as flaky").click();
+  } else if (fixture.act === "card") {
+    // The card's link: the header's form, focused and scrolled to; again
+    // while open, what was typed stays; Cancel, the offer; then mark.
+    const link = button(byId["flaky-mark"], "Mark as flaky");
+    out.linkClass = link.className;
+    await link.click();
+    out.form = form();
+    out.focused = focused;
+    out.scrolled = scrolled.slice();
+    out.cardWhileOpen = byId["flaky-mark"].children.map((c) => c.tagName);
+    reasonBox().value = "race";
+    focused = null;
+    await link.click();
+    out.again = [form(), reasonBox().value, focused];
+    await button(banner, "Cancel").click();
+    out.cancelled = [words(banner), banner.classList.contains("is-offer")];
+    await link.click();
+    out.fresh = reasonBox().value;
+    fill();
+    await button(banner, "Mark as flaky").click();
   } else if (fixture.act === "cadence") {
     const banner = byId["flaky-banner"];
     const select = banner.children.find((c) => c.tagName === "SELECT");
@@ -7969,17 +8138,22 @@ class FlakyMarkDomTest(unittest.TestCase):
     def test_an_unmarked_test_page_is_todays_page_with_the_offer(
             self) -> None:
         """No ``flaky`` field (an older server) and a null one draw the
-        same: the raw chip, no pill, no banner, no history, the card's
-        button, and the same requests."""
+        same: the raw chip, no pill, no history, the offer in the
+        header's slot (WP-44 item 17, widened from "no banner": the
+        slot now offers the mark, in the offer's edge, not the mark's),
+        the card's link, and the same requests."""
         older = self._page(_test_detail("FAIL"))
         newer = self._page(_test_detail("FAIL", None))
         for answer in (older, newer):
             first = answer["first"]
             self.assertEqual(first["chip"], ["chip result-fail", "FAIL"])
             self.assertIsNone(first["tag"])
-            self.assertIsNone(first["banner"])
+            self.assertEqual(first["banner"],
+                             ["Flaky", "Mark as flaky"])
+            self.assertTrue(first["offer"])
             self.assertTrue(first["historyHidden"])
             self.assertEqual(first["card"], ["Mark as flaky"])
+            self.assertEqual(first["cardTags"], ["BUTTON"])
             self.assertEqual(first["signal"], "flips often")
             self.assertEqual(answer["posts"], [])
         self.assertEqual(older["firstAsked"], newer["firstAsked"])
@@ -7989,6 +8163,26 @@ class FlakyMarkDomTest(unittest.TestCase):
             "GET api/tests/env-a/s1.py/t1/history",
             "GET api/tests/env-a/s1.py/t1/streams",
             "GET api/users"])
+
+    def test_the_offer_shows_whatever_the_result_and_beside_a_mute(
+            self) -> None:
+        """WP-44 item 17: a mark is a standing property of the test, so
+        the header offers it for a passing test as for a failing one,
+        and beside a live mute (the card offered it there too); the
+        requests are the failing page's, so nothing is fetched for it."""
+        failing = self._page(_test_detail("FAIL", None))
+        for name, detail in (
+                ("passing", _test_detail("PASS", None)),
+                ("muted", _test_detail("FAIL", None, _LIVE_MUTE))):
+            with self.subTest(name):
+                answer = self._page(detail)
+                first = answer["first"]
+                self.assertEqual(first["banner"],
+                                 ["Flaky", "Mark as flaky"])
+                self.assertTrue(first["offer"])
+                self.assertEqual(first["card"], ["Mark as flaky"])
+                self.assertEqual(sorted(set(answer["firstAsked"])),
+                                 sorted(set(failing["firstAsked"])))
 
     def test_a_flaking_test_reads_FLAKING_with_banner_card_and_history(
             self) -> None:
@@ -8001,6 +8195,8 @@ class FlakyMarkDomTest(unittest.TestCase):
             "by dev1 · 12 days ago · race in teardown",
             "Flaking: failed its last run; counts as failing at 3 in a row",
             "Set cadence", "Unmark"])
+        # Marked: the mark's banner in the mark's edge, no offer anywhere.
+        self.assertFalse(first["offer"])
         self.assertEqual(first["card"], ["Marked flaky, 3 in a row"])
         self.assertFalse(first["historyHidden"])
         self.assertEqual(first["history"], [[
@@ -8037,10 +8233,19 @@ class FlakyMarkDomTest(unittest.TestCase):
                 self.assertEqual(first["tag"], ["flaky", sentence])
                 self.assertEqual(first["banner"][2], sentence)
 
-    def test_marking_from_the_card_asks_for_the_reason_first(self) -> None:
+    def test_marking_from_the_header_asks_for_the_reason_first(self) -> None:
+        """WP-44 item 17 (widened from the card's form, which moved): the
+        header's offer opens the one form in its slot, the label kept as
+        the Mute offer keeps its own; the act, its refusals, the request
+        and the refresh are the card's form's, unchanged."""
         answer = self._page(_test_detail("FAIL", None), "mark",
                             _test_detail("FAIL", _flaky("flaking", 1)))
-        self.assertEqual(answer["form"], ["INPUT", "SELECT", "BUTTON", "BUTTON"])
+        self.assertEqual(answer["form"],
+                         ["SPAN", "INPUT", "SELECT", "BUTTON", "BUTTON"])
+        self.assertEqual(answer["formWords"],
+                         ["Flaky", "", "Mark as flaky", "Cancel"])
+        self.assertEqual(answer["focused"], "flaky-reason-input")
+        self.assertEqual(answer["cardWhileOpen"], ["BUTTON"])
         self.assertEqual(answer["emptyPosts"], 0)
         self.assertTrue(answer["emptyError"].startswith("Say why"))
         self.assertEqual(answer["posts"], [["api/flaky/bulk", {
@@ -8051,7 +8256,57 @@ class FlakyMarkDomTest(unittest.TestCase):
             "POST api/flaky/bulk", "GET api/tests/env-a/s1.py/t1"])
         self.assertEqual(answer["after"]["chip"],
                          ["chip result-flaking", "FLAKING"])
+        self.assertEqual(answer["after"]["banner"][0],
+                         "Marked flaky, 3 in a row")
+        self.assertFalse(answer["after"]["offer"])
         self.assertEqual(answer["after"]["card"], ["Marked flaky, 3 in a row"])
+
+    def test_a_passing_test_and_a_build_page_mark_from_the_header(
+            self) -> None:
+        """The act is the same whatever the result; on a page opened for
+        a build the request carries the page's stream, as the card's
+        form always sent it (the mark itself covers every stream)."""
+        passing = self._page(_test_detail("PASS", None), "mark",
+                             _test_detail("PASS", _flaky("passing", 0)))
+        self.assertEqual(passing["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [_ONE_TEST]}]])
+        self.assertFalse(passing["after"]["offer"])
+        build = self._page(
+            _test_detail("FAIL", None), "mark",
+            _test_detail("FAIL", _flaky("flaking", 1)),
+            url="http://127.0.0.1/test.html?environment=env-a"
+                "&script=s1.py&test_name=t1&stream=4")
+        self.assertTrue(build["first"]["offer"])
+        self.assertEqual(build["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [dict(_ONE_TEST, stream_id=4)]}]])
+        self.assertEqual(build["later"][0], "POST api/flaky/bulk")
+
+    def test_the_cards_link_opens_the_header_form(self) -> None:
+        """WP-44 item 17: the Flakiness card keeps an entry point, a
+        link-styled button, that opens the header's form, puts the focus
+        in its reason box and scrolls the slot into view; it draws no
+        form of its own, and a second click keeps what was typed."""
+        answer = self._page(_test_detail("FAIL", None), "card",
+                            _test_detail("FAIL", _flaky("flaking", 1)))
+        self.assertEqual(answer["linkClass"], "linkish")
+        self.assertEqual(answer["form"],
+                         ["SPAN", "INPUT", "SELECT", "BUTTON", "BUTTON"])
+        self.assertEqual(answer["focused"], "flaky-reason-input")
+        self.assertEqual(answer["scrolled"], ["flaky-banner"])
+        self.assertEqual(answer["cardWhileOpen"], ["BUTTON"])
+        self.assertEqual(answer["again"], [
+            ["SPAN", "INPUT", "SELECT", "BUTTON", "BUTTON"], "race",
+            "flaky-reason-input"])
+        self.assertEqual(answer["cancelled"],
+                         [["Flaky", "Mark as flaky"], True])
+        self.assertEqual(answer["fresh"], "")
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["after"]["card"], ["Marked flaky, 3 in a row"])
+        self.assertFalse(answer["after"]["offer"])
 
     def test_the_banner_changes_the_cadence_and_unmarks(self) -> None:
         marked = _test_detail("FAIL", _flaky("flaking", 1))
@@ -8066,7 +8321,11 @@ class FlakyMarkDomTest(unittest.TestCase):
         answer = self._page(marked, "unmark", _test_detail("FAIL", None))
         self.assertEqual(answer["posts"], [["api/flaky/unmark", {
             "username": "dev1", "tests": [_ONE_TEST]}]])
-        self.assertIsNone(answer["after"]["banner"])
+        # Widened for WP-44 item 17 (was: no banner): after Unmark the
+        # slot offers the mark again.
+        self.assertEqual(answer["after"]["banner"],
+                         ["Flaky", "Mark as flaky"])
+        self.assertTrue(answer["after"]["offer"])
         self.assertEqual(answer["after"]["chip"], ["chip result-fail", "FAIL"])
         self.assertEqual(answer["after"]["card"], ["Mark as flaky"])
 

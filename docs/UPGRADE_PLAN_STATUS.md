@@ -5199,3 +5199,36 @@ index search name their index. Noted: the code's SQLite floor is 3.15
 `tclsh` on PATH: 3056 OK (skipped 1) and 4231 OK (skipped 91) on the
 fix, then two more tests of the keys-driven read added by the review
 (`tests.test_storage`: 709 OK). CI on the push is the proof on 3.6.8.
+
+## WP-44: CI green on the keyed read; item 17, the test page offers the mark in its header (2026-11-12)
+
+CI on `77f12d2` passed all twelve jobs: the six Python 3.6.8 jobs that
+had failed on the old SQLite, and both MariaDB 10.3 jobs with the plan
+guards of the Flaking queue and of Open Actions' page by keys. The
+question left for CI is answered on both backends.
+
+Item 17 came from the owner trying the build: "Mark as flaky" on a
+test's own page was inside the Flakiness card of the Analytics section
+(the design's answer to its question 15, beside the computed signal),
+and the owner had to ask where it was. Every other act on that page is
+in the header. The offer is now there, in the slot the mark's banner
+uses, beside the Mute offer: "Flaky" and a "Mark as flaky" button that
+opens the form in place, for a test whatever its latest result. The
+card keeps a link that opens the header's one form. The walkthrough
+compared the offer with the Mute offer act by act and changed two
+things: the label, which was "Not marked flaky" and read as a status on
+a passing test's page, and the offer's look, which kept the mark's
+cream background and amber label; it now has no background, a neutral
+edge and a muted label, with a guard against the tint returning. No
+request is added to the page's load.
+
+`static/test.js` held a literal NUL character in a sentinel string,
+which made git store it as binary and tools refuse to edit it. It is
+respelt as the escape `\u0000`, the same string at run time;
+`NoNulByteTest` scans `static/` and holds its exceptions equal to what
+it finds. One is left, named there: `static/actions.js`, the same kind
+of literal in its "unassigned" sentinel.
+
+Final counts in the main checkout, `tclsh` and `node` on PATH: 3066 OK
+(skipped 1) on SQLite and 4241 OK (skipped 91) with the MariaDB variants
+on a local 12.3. No browser has rendered the page.

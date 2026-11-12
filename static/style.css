@@ -1006,13 +1006,23 @@ button.bar-row:focus-visible {
   border-left-color: var(--c-flaking-strong);
 }
 
+/* The same slot offering a mark on an unmarked test, quieter than the
+ * mark: no tint, a neutral edge and a muted label, so an unmarked
+ * passing test's page carries no caution-coloured box. */
+.known-failure.is-flaky.is-offer {
+  border-left-color: var(--grid);
+  background: none;
+}
+
+.known-failure.is-flaky.is-offer .kf-label { color: var(--muted); }
+
 .flaky-sentence {
   flex: 1 0 100%;
   font-size: 13px;
 }
 
-/* The Flakiness card's mark: the mark in words, or the button that
- * opens the form to make one, which wraps inside the card. */
+/* The Flakiness card's mark: the mark in words, or the link that opens
+ * the form in the header's slot. */
 .flaky-mark {
   display: flex;
   flex-wrap: wrap;
