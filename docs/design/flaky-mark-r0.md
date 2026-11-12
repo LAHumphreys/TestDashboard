@@ -1346,10 +1346,13 @@ any interruption is the first line not `done` or `parked`.
 | 8p measured pass | done | | two passes. Found `parts=assigned_trend` on Home's first paint (+11% at 50 marks, +86% at 1,000 on SQLite): item 9 sends it after the headline, and Home is then the base's. Every list and filter row inside the bar on the final tree. **For the owner:** the trend part at 90 days with 1,000 marks is +909 to +1,047 ms against the design's 366; a covering runs index is priced, not taken |
 | 9 lists and filters, UI | done | the commit carrying this line | Open Actions' Failing mode sends `open=1` with FAIL and FLAKING (fewer rows with marks; the same rows with none), for the owner to confirm; fresh eyes found a page appended twice after an assignment on a paged tab, fixed; no browser has rendered it |
 | 10 the drop | documents done, pushed for CI | the commit carrying this line | README, operator note (date provisional) and handover written; the merge, the deploy and the after-deploy bookkeeping wait for the owner, with the decisions the handover lists |
-| 11 the tab lists the flaking tests, backend | not started | | §13 |
-| 11p measured pass | not started | | §13 |
-| 12 the tab lists the flaking tests, UI | not started | | §13 |
-| 13 the documents follow | not started | | §13 |
+| 11 the tab lists the flaking tests, backend | built, superseded by 14 | with item 14's | verified, measured and reviewed; never committed alone: §14 removes the endpoint it narrowed. Its snapshot is the base of item 14 |
+| 11p measured pass | done | | the narrowed read was faster or the same in every cell and ran fewer statements after the headline; cold it ran two more, a question for the owner that fell with the endpoint |
+| 12 the tab lists the flaking tests, UI | built, superseded by 15 | with item 15's | verified with item 11 and reviewed; never committed alone: the label, badge, visibility, "All clear" link and wording carry into item 15 |
+| 14 the tab is a queue, backend | not started | | §14 |
+| 14p measured pass | not started | | §14 |
+| 15 the tab is a queue, UI | not started | | §14 |
+| 13 the documents follow | not started | | §13, §14 |
 
 ## §13 After the build: the owner's first look, and the rework (2026-11-12)
 
@@ -1455,3 +1458,98 @@ above and what it gives up: "Go". The run is unattended (`/overnight`),
 from a suite green on both backends in the main checkout at `0406e68`
 (3,016 OK on SQLite; 4,170 OK with the MariaDB variants on a local 12.3).
 The strip in §12 carries items 11 to 13.
+
+## §14 The tab is a queue like its neighbours (2026-11-12)
+
+Items 11 and 12 were built, verified and reviewed. The main session's
+walkthrough of item 12 then reported two things to the owner as open: a row
+does not say how close it is to counting as a failure, and the tab has no
+Output column and no Review panel, unlike every other triage tab. The
+owner's answer, the operative words verbatim:
+
+> 1: add the streak as part of this drop. 2: [...] It needs to have the
+> same review options as the other tab. That needs to be fixed as part of
+> the drop - and find out how [...] that design decision was made. [...]
+> the UI agent should never have proposed a flow like that. It indicates
+> its lost site of what "triage" really is
+
+**How the decision was made, from this document's own record.** It was
+never put to the owner.
+
+- The request (§7) asks for no list and no tab: flaky tests "will not
+  clutter up know failures".
+- The main session introduced a list in the recommended answer to §7's
+  question 2 ("a Flaky list shows every mark with its owner, age and how
+  often it has actually failed") and recommended its place in question 12
+  ("A Home tab beside Muted"). The owner chose the recommended label both
+  times. A list kept so that marks can be found was thereby put in Triage.
+- Four things about the tab were put to the owner: where it lives, the
+  20-run measure (decision 4), that it shows only where a mark exists
+  (decision 5) and its order (decision 16). Nothing about its columns, the
+  run's output or the review acts, in any round.
+- The absence of Output and Review first appears at the build, in item 9's
+  code and commit message, stated as a fact: "There is no Output or Review
+  column: an entry names a test, not a run, and links to the test's page."
+  Muted, the tab it was placed beside, has both: it is drawn by the shared
+  queue loop, which this tab alone bypassed.
+- The main session's review of item 9 passed it and did not list it for the
+  owner; its own wireframe in §13 repeated the same columns.
+
+**The rule this leaves** (it goes into `CLAUDE.md` and the UI agent's
+definition with item 13): every triage tab is a queue like its neighbours.
+A new triage surface is compared with New failures and Still failing column
+by column and act by act before it is built, and every difference is put to
+the owner as a named decision. An implementer who finds a neighbour's
+review control missing from a design reports it and does not build around
+it.
+
+**The contract, replacing §13's:**
+
+```
+GET /api/summary?parts=queue&queue=flaking[&stream=&environment=&product=]
+  -> the queue part as for any other kind:
+     {..., queue: {kind: "flaking", tests: [<queue row>...], total}, queue_cap}
+```
+
+- The set is the tests flaking now, the entries the headline's
+  `status.flaking` counts; `total` equals it by construction.
+- A row is a queue row, key for key what `still_failing` returns, so the
+  page's shared loop and the Review panel need nothing new. Its `flaky` is
+  never null: `state` "flaking", `streak` at least 1 and below `cadence`.
+- Order: nearest to counting as a failure first (`cadence - streak`
+  ascending), then environment, script, test name. Capped as every queue.
+- A virtual kind, as `mine` is: not in `queue_totals`, not in the unsliced
+  payload.
+- `GET /api/flaky` is removed with everything only it used. The two POST
+  acts stay.
+
+**The row, against its neighbour.** Every difference is named here:
+
+| Still failing | Flaking |
+|---|---|
+| Test | Test |
+| Failing since, Last pass | **Streak**: the runs failed in a row against the cadence, in one phrase |
+| Latest comment | Latest comment |
+| Assignee | Assignee |
+| Output, with Review | Output, with Review |
+
+- Label, badge (`status.flaking`), visibility, the one-state line above the
+  table, the empty state and "All clear"'s link are item 12's.
+- **Given up, put to the owner in chat when this was planned:** "Failed N
+  of its last 20 runs" (decision 4). It was agreed for the list of every
+  mark, where it showed a stale one; on a tab of tests flaking now the
+  streak answers the morning's question, and the figure costs a statement a
+  page. The mark's reason and owner move from a column to the Review
+  panel's Flaky group, where they already are. The pager goes: the tab is
+  capped as its neighbours are.
+
+**The plan.** Same package, same branch.
+
+| # | Item | Layer | Trigger paths | Gated on |
+|---|---|---|---|---|
+| 14 | **The tab is a queue, backend:** `queue=flaking` by the contract above; `GET /api/flaky`, `flaky_tab` and their types removed; guards: `total` against `status.flaking` and the browse filter in every scope, a row's keys against `still_failing`'s, the streak, the order, the cap, disjointness from the other kinds; the no-marks, cache and plan guards on the new read | backend-engineer | **yes**: storage.py, api.py | item 11's snapshot |
+| 14p | **Measured pass** of item 14: the queue cold and after the headline at 50 and 1,000 marks on both seeds, statements per call counted in full, the other queue kinds and the Known slow table against the base | performance-engineer | the gate for item 14 | item 14 |
+| 15 | **The tab is a queue, UI:** fetched and drawn as a queue by the shared loop, with Output and Review; the Streak column; the bespoke tab code and the pager removed; a guard that every triage tab's row has the Review control; What's new | ui-engineer | **first paint** (no request added or moved; the guards are the gate) | item 14's snapshot |
+
+The backend commit carries items 11 and 14, the UI commit items 12 and 15.
+Item 13 follows both.
