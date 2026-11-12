@@ -1346,3 +1346,93 @@ any interruption is the first line not `done` or `parked`.
 | 8p measured pass | done | | two passes. Found `parts=assigned_trend` on Home's first paint (+11% at 50 marks, +86% at 1,000 on SQLite): item 9 sends it after the headline, and Home is then the base's. Every list and filter row inside the bar on the final tree. **For the owner:** the trend part at 90 days with 1,000 marks is +909 to +1,047 ms against the design's 366; a covering runs index is priced, not taken |
 | 9 lists and filters, UI | done | the commit carrying this line | Open Actions' Failing mode sends `open=1` with FAIL and FLAKING (fewer rows with marks; the same rows with none), for the owner to confirm; fresh eyes found a page appended twice after an assignment on a paged tab, fixed; no browser has rendered it |
 | 10 the drop | documents done, pushed for CI | the commit carrying this line | README, operator note (date provisional) and handover written; the merge, the deploy and the after-deploy bookkeeping wait for the owner, with the decisions the handover lists |
+| 11 the tab lists the flaking tests, backend | not started | | §13 |
+| 11p measured pass | not started | | §13 |
+| 12 the tab lists the flaking tests, UI | not started | | §13 |
+| 13 the documents follow | not started | | §13 |
+
+## §13 After the build: the owner's first look, and the rework (2026-11-12)
+
+The owner tried the build on a local server. The verdict, in chat,
+captured verbatim:
+
+> OK - the "flaky" section on home isn't what I wanted. In triage the new
+> section shoudl contain only tests in a Flaking state. Other tests should
+> sort normally based on their state. A flaky test that becomes "failing"
+> should show up under new / persistent failures. A flaky tests that pass
+> is fien and doesn't need triage
+
+**What this overturns:** §3 U8 and decision 16. The tab was built as the
+list of every mark in scope, in any state. It becomes the list of the tests
+flaking now and nothing else.
+
+**What already holds, read from a running server on the 50-mark fixture
+before anything was changed** (perf-seed/1 shifted to today, 65
+assignments, 50 marks): of 50 marks, 34 are failing past their cadence, and
+those sit where their state puts them (8 in New failures, 21 in Still
+failing, 3 in Muted, 2 retired); 3 are passing and sit in no triage tab
+except one in Fixed, by decision 3; 13 are flaking, 2 of them muted and
+listed under Muted, and the other 11 (`status.flaking`) are in no tab at
+all. So the queues need no change. The one thing to change is the tab.
+
+**The contract, replacing §2 B.2's `/api/flaky` line:**
+
+```
+GET /api/flaky?stream=&environment=&product=&limit=100&offset=0 -> {
+  generated_at, stream, total, marks: [{<triple>, cadence, marked_by,
+  marked_at, reason, result, state, muted, assignee, recent_failures,
+  recent_runs}]}
+```
+
+- It lists **the tests flaking now**: marked, failing within their cadence,
+  with no live mute and not retired. That is the set `status.flaking`
+  counts in the same scope, and `total` is that count: the two agree by a
+  guard, as the browse filter's FLAKING count does.
+- Every entry reads `state: "flaking"`, `muted: false`. The entry's
+  `retired` field and the top-level `retired` count go; `offset` pages over
+  `total`.
+- Order: newest mark first, then environment, script, test name. No state
+  rank is left to sort by.
+- Nothing else in §1 changes. `status.flaky_total` stays: it is what shows
+  the FLAKING toggle and the charts' key.
+
+**The UI, replacing §3 U8:**
+
+```
+New failures 3 · Still failing 11 · Muted 2 · Flaking 7 · Fixed 4 · …
+Flaking: failing within its cadence. Newest mark first.
+☐ Test         Mark                     Cadence  Failed   Assignee
+☐ login_retry  race in teardown · dev1  3 in a…  6 of 20  dev1
+```
+
+- **Label** "Flaking". **Badge** `status.flaking`; the tab exists only
+  above zero, and while it is the open tab.
+- **Columns**: the State column goes, every row being in the one state,
+  said once above the table as the other one-state tabs do.
+- **The link line goes** ("N flaking now · List them in All tests"): the
+  tab is that list. "All clear"'s "N flaking" opens the tab, as "N muted"
+  opens Muted.
+- **Empty**: "Nothing is flaking."
+- Rows, chips, edges, tags, the FLAKING toggle on All tests, the tiles, the
+  charts and Open Actions are untouched.
+
+**What is given up, for the owner to know:** no page lists every mark any
+more. A marked test that is passing, or failing past its cadence, is known
+as marked by the "flaky" tag on its row and by its own page.
+
+**The plan.** Same package, same branch, three commits after item 10.
+
+| # | Item | Layer | Trigger paths | Gated on |
+|---|---|---|---|---|
+| 11 | **The tab lists the flaking tests, backend:** `GET /api/flaky` by the contract above; `FlakyTabOrderTest` reworked to the new order and set; a guard that `total` equals `status.flaking` and the browse filter's FLAKING count in every scope the tab can be opened in; `NoMarksAddsNothingTest` and the cache and plan guards kept on the read | backend-engineer | **yes**: storage.py, api.py (the read is off every first paint) | nothing |
+| 11p | **Measured pass** of item 11: one page of the tab at 50 and 1,000 marks on both seeds against the base, and the Known slow table. Expected: no slower, fewer rows needing the 20-run measure | performance-engineer | the gate for item 11 | item 11 |
+| 12 | **The tab lists the flaking tests, UI:** the tab by the wireframe above; `FlakyTabTest` and `AllClearSetAsideTest` reworked; the What's new section reworded | ui-engineer | **first paint** (no request added or moved; the sequencing guards are the gate) | item 11's commit |
+| 13 | **The documents follow:** the README's "Flaky marks" section, the operator note, the handover (with the suite's counts corrected: the tree at item 9 loads 3,012 tests on SQLite, not the 3,021 recorded; with the four of the shim follow-up it is 3,016, and 4,170 with the MariaDB variants) | main session | n/a | items 11 and 12 |
+
+Items 11 and 12 run in series: the UI item reads the new response.
+
+The owner's go, 2026-11-12, at the kickoff question, which named the plan
+above and what it gives up: "Go". The run is unattended (`/overnight`),
+from a suite green on both backends in the main checkout at `0406e68`
+(3,016 OK on SQLite; 4,170 OK with the MariaDB variants on a local 12.3).
+The strip in §12 carries items 11 to 13.
