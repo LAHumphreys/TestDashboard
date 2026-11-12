@@ -10,8 +10,12 @@ overturned the tab it had added to Home's Triage twice in one morning:
 first to hold only the tests flaking now, then to be a queue like its
 neighbours, with the run's output, the Review panel and a streak on every
 row. Both are built, verified on both backends, measured, reviewed and
-committed on the same branch. The design doc's §13 and §14 have the
-verdicts, how the first design came about, and the plan that was run.
+committed on the same branch. Two more items followed the same day: CI
+caught the tab's keyed read scanning a whole stream on the old SQLite of
+the 3.6.8 target (fixed, and green there), and the owner could not find
+"Mark as flaky" on a test's own page (it is in the header now). The design
+doc's §13 and §14 have the verdicts, how the first design came about, and
+the plan that was run; its §12 strip has every item.
 
 ## Where things stand
 
@@ -25,8 +29,9 @@ verdicts, how the first design came about, and the plan that was run.
 - **Built, not merged, not deployed: WP-44, the drop of 2026-11-11**
   (provisional date), branch `wp-44-flaky-mark`, PR #21. Items 1 to 10 are
   the first build (to `0406e68`); items 11 to 15 are the rework of the
-  triage tab (`b6f0162` backend, `6da4512` UI), with the documents after
-  them. **Migration 12 runs** (create-only: `test_flaky_marks`,
+  triage tab (`b6f0162` backend, `6da4512` UI); item 16 is the keyed read
+  on an old SQLite (`77f12d2`); item 17 the test page's header offer
+  (`4b96426`); the documents after them. **Migration 12 runs** (create-only: `test_flaky_marks`,
   `flaky_mark_history`, one index); the upgrade tool's ledger has the step.
   **Production stays at 11 until the drop.** The server's Python changed, so
   the restart is required.
@@ -46,12 +51,19 @@ verdicts, how the first design came about, and the plan that was run.
   There is no `GET /api/flaky` and no page that lists every mark.
   `QueueTabReviewTest` fails the build if any triage tab's row lacks the
   Review button.
-- **CI is green on the first build's head** (`0406e68`), both MariaDB 10.3
-  legs included: the plan's conditional item 6h (a dialect hook) is not
-  needed, and the two Python 3.8 legs pass again after their runner was
-  pinned. **CI has not yet run the rework when this was written.** One
-  thing there is only CI's to answer: the Flaking tab's rows are read by
-  key, and that read's plan guard has run only on a local MariaDB 12.3.
+- **A mark is made from** the selection bar, the Review panel, or the
+  header of the test's own page, where an unmarked test shows "Flaky" and a
+  "Mark as flaky" button beside the Mute offer, whatever its result.
+- **CI is green on `77f12d2`, all twelve jobs**: the six Python 3.6.8 jobs
+  (the old SQLite) and both MariaDB 10.3 jobs, with the plan guards of the
+  Flaking queue's rows and of Open Actions' page by keys. Item 6h (a
+  dialect hook) is not needed. What followed that commit is the test
+  page's offer (static files and their guards) and documents; **CI on
+  that last push had not finished when this was written.**
+- **`_rows_by_key` is written differently on each backend, on purpose**:
+  MariaDB uses a row-value `IN`; SQLite is driven from the keys with a
+  `CROSS JOIN`, because SQLite 3.26 cannot use an index for the row-value
+  form. The backend flag is `rows_by_key_from_keys`.
 - **Not reported back from the 2026-10-01 deploy — ask, do not assume:**
   what the upgrade tool's dry run said (`SERVER: may keep running`
   expected); whether the start-up output named the orphaned build; how long
@@ -86,15 +98,12 @@ verdicts, how the first design came about, and the plan that was run.
 
 ## Next session's plan
 
-1. **Read CI on PR #21 at the rework's head.** Green on both 10.3 legs: the
-   rows-by-key read is confirmed on production's stream. A plan guard red
-   there (`FlakyPlanTest.test_the_flaking_queue_reads_its_rows_by_the_full_key`):
-   brief `backend-engineer` for the fallback, the keys spelt on MariaDB as
-   an OR of primary-key triples behind the backend's dialect (the log's
-   entry of 2026-11-12 and the item 14 commit have the shape).
-2. **The owner looks at the Flaking tab in a browser** and decides the two
-   things under "Needs a person" items 1 and 2. Anything overturned is a
-   rework on the same branch before the merge.
+1. **Read CI on PR #21 at the branch's head** (`gh pr checks 21`). It was
+   green on `77f12d2`; the commits after it change static files, their
+   guards and documents.
+2. **The owner looks at the Flaking tab and a test's page in a browser**
+   and decides the things under "Needs a person" items 1, 2 and 3. Anything
+   overturned is a rework on the same branch before the merge.
 3. **Ship it** when the owner says so (`/drop`): set the real date in the
    operator note and in What's new together; **rewrite PR #21's body**, which
    still describes the first build's tab and is the squash-commit message;
@@ -127,9 +136,9 @@ verdicts, how the first design came about, and the plan that was run.
 | | |
 |---|---|
 | `origin/master` | `6cba071` — the drop of 2026-10-13 (PR #20) on top of the drop of 2026-10-12 (PR #19); deployment of neither reported |
-| `wp-44-flaky-mark` | **WP-44, the drop of 2026-11-11**, PR #21: the design arc, items 1 to 10, then the rework (the plan commits, `fec3d34` the triage rule in `CLAUDE.md` and the UI agent's definition, `b6f0162` backend, `6da4512` UI, the documents). Squash-merge, delete |
+| `wp-44-flaky-mark` | **WP-44, the drop of 2026-11-11**, PR #21: the design arc, items 1 to 10, then the rework (the plan commits, `fec3d34` the triage rule in `CLAUDE.md` and the UI agent's definition, `b6f0162` backend, `6da4512` UI, `77f12d2` the keyed read on an old SQLite, `4b96426` the test page's offer, the documents). Squash-merge, delete |
 | `design-flaky-mark` | the arc's frozen doc, local only, already the base of the branch above; **delete after the merge** |
-| `wp44-11-wt`, `wp44-12-wt`, `wp44-14-base`, `wp44-14-wt`, `wp44-15-wt` and six `worktree-agent-*` of 2026-11-12 | the rework's snapshot branches and agent worktrees under `.claude/worktrees/`; remove the worktrees, then the branches, after the merge |
+| `wp44-11-wt`, `wp44-12-wt`, `wp44-14-base`, `wp44-14-wt`, `wp44-15-wt`, `wp44-16-wt`, `wp44-17-wt` and eight `worktree-agent-*` of 2026-11-12 | the rework's snapshot branches and agent worktrees under `.claude/worktrees/`; remove the worktrees, then the branches, after the merge. **The backend agent's worktree of item 16 holds an unmerged memory note** (`.claude/agent-memory/backend-engineer/old-sqlite-326-repro.md`, how to build SQLite 3.26 in the Linux subsystem): copy it out first if it is wanted |
 | `wp44-*-wt` (items 1 to 9), `wp44-5-base`, `wp44-6-head`, `wp44-8-head`, `wp44-10-head`, `wp44-pre-reword`, older `worktree-agent-*` | the first build's snapshot and scratch branches, most with a worktree under `.claude/worktrees/` (about forty worktrees in all, several locked); remove the worktrees, then the branches, after the merge |
 | `wp-43-charts-assigned-split`, `design-charts-assigned-split`, `wp43-backend-wt`, `wp43-seed-wt`, `wp43-ui-wt` | merged as PR #20; the three `wp43-*` worktrees and all five branches are still here: remove |
 | `admin-2026-10-09-handover` | PR #17, a handover rewrite superseded four times; **close without merging** |
@@ -145,8 +154,8 @@ A local `master` exists since 2026-10-03; keep it a mirror of
 
 | Plan | Spec | Branch | Status |
 |---|---|---|---|
-| WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8, status strip §9 (frozen 2026-10-13) | `wp-43-charts-assigned-split` | **merged as PR #20**; deployment not reported; one owner decision still open in its §7 (item 5 below) |
-| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11); the triage tab's contract is §14, which replaces §3 U8 and §13's | `wp-44-flaky-mark`, PR #21 | **built, every item done (1 to 10, then 11 to 15); not merged, not deployed.** The status strip is the doc's §12. Item 6h is not needed (CI, first build). Open on CI: the rows-by-key plan on 10.3. Its item 3 claimed migration 12 and moved the parked WP-15 to 13 |
+| WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8, status strip §9 (frozen 2026-10-13) | `wp-43-charts-assigned-split` | **merged as PR #20**; deployment not reported; one owner decision still open in its §7 (item 7 below) |
+| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11); the triage tab's contract is §14, which replaces §3 U8 and §13's | `wp-44-flaky-mark`, PR #21 | **built, every item done (1 to 10, then 11 to 17); not merged, not deployed.** The status strip is the doc's §12. Item 6h is not needed. CI green on `77f12d2`, 3.6.8 and MariaDB 10.3 included. Its item 3 claimed migration 12 and moved the parked WP-15 to 13 |
 
 ## Needs a person, not a commit
 
@@ -161,14 +170,25 @@ A local `master` exists since 2026-10-03; keep it a mirror of
    that passes, or fails past its cadence, is known as marked by the "flaky"
    tag on its row and by its own page. Confirm, or ask for a "marked" filter
    on All tests.
-3. **WP-44, the headline's cost is over the bar the design set**, where
+3. **WP-44, every unmarked test's page now carries the offer in its
+   header**, passing tests included: one quiet line ("Flaky", a button), no
+   background. Shown always so that a flaky test that happens to be passing
+   can be marked. Confirm, or ask for it only on failing tests.
+4. **Two small things found on the way, each its own change.**
+   `static/actions.js` holds a literal NUL character in its "unassigned"
+   sentinel, as `test.js` did: respell it as `\u0000` and rework
+   `CoverageTest.test_files_containing_a_nul_byte_are_still_read` to plant
+   its own file (`ui-engineer`). And **the code's floor on SQLite is 3.15**
+   (row values in two filter terms) and is stated nowhere: say so in the
+   README, or decide it should be lower.
+5. **WP-44, the headline's cost is over the bar the design set**, where
    marks exist and only cold: SQLite +6.2 ms (22% of base) at 50 marks and
    +11.4 (41%) at 1,000 against a bar of 18% and 34%; a local MariaDB 12.3
    +17.0 (18%) and +35.8 (38%) against 16% and 34%. Accepted in the build
    for the owner to confirm. Priced and not taken: a covering runs index,
    dropping the "Newly fixed" rule, dropping the cadence-2 read (the log's
    item 6 entry has each).
-4. **WP-44, the per-day chart's split.** Two things. (a) The measured pass
+6. **WP-44, the per-day chart's split.** Two things. (a) The measured pass
    found its request on Home's first paint, which the design had not
    expected; with marks it cost the page 11% at 50 marks and 86% at 1,000.
    It is now sent after the headline has drawn, **for every load, marks or
@@ -177,11 +197,11 @@ A local `master` exists since 2026-10-03; keep it a mirror of
    marks: on the 90-night seed, 90 days at 1,000 marks, +909 to +1,047 ms
    against the 366 the design had recorded; 14 days at 50 marks, about
    +8.5 ms. Off first paint, so it delays the chart and nothing else.
-5. **The trend part's cost is one decision with two causes** (WP-43: 1.5 s
+7. **The trend part's cost is one decision with two causes** (WP-43: 1.5 s
    on SQLite and 2 to 3 s on MariaDB at 90 days with 1,000 assignments;
-   WP-44: item 4b). Accept, a covering index on `runs` (for marks: 968 ms
+   WP-44: item 6b). Accept, a covering index on `runs` (for marks: 968 ms
    to 399, 23% more database, about 12% on a push), or a cap.
-6. **WP-44, behaviour to confirm:** Open Actions' Failing mode leaves out
+8. **WP-44, behaviour to confirm:** Open Actions' Failing mode leaves out
    the unassigned flaking tests (the design's intent; fewer rows than
    before where marks exist); the Flaking tab is hidden where nothing is
    flaking, and a carried sort applies to a tab only if the tab has that
@@ -192,60 +212,62 @@ A local `master` exists since 2026-10-03; keep it a mirror of
    `products` in `parts=names` is names only; Open Actions no longer warms
    Home's headline, so Home opened straight after it pays its own; What's
    new is dated 2026-11-11 and the drop sets the real date.
-7. **WP-44, known and left:** if a Reload's headline fails while the
+9. **WP-44, known and left:** if a Reload's headline fails while the
    chart's split is on screen, the chart keeps its old bars under the error
    banner until the next Reload; Open Actions' cold rows read runs for 46
    tests on the seed (none warm); above SQLite's parameter ceiling the
    filter with Passing chosen costs +42 to +55 ms; a cold open of the
    Flaking tab pays the queue prefix (2.8 ms on SQLite, 16 on a local
-   MariaDB) that the headline has normally paid already; one MariaDB
+   MariaDB) that the headline has normally paid already; on a test's page,
+   another act while the mark's form is open (assign, mute) redraws the
+   slot and discards a half-typed reason, as the Mute offer does; one MariaDB
    reading (Home as a page with no marks, +9.6 ms in one order, -10.3 in
    the other, equal statements) is unexplained and wants a quiet machine.
-8. **No browser has rendered WP-44**: the mauve, the Flaky group in the
+10. **No browser has rendered WP-44**: the mauve, the Flaky group in the
    selection bar, the Flaking tab and its Review panel, the chart's fourth
    part. Nor WP-43's blue. The owner's look at a local server on
    2026-11-12 is what overturned the tab; what they saw after the rework is
    not recorded here.
-9. **Found during WP-44, older than it, not touched:** every bulk endpoint
+11. **Found during WP-44, older than it, not touched:** every bulk endpoint
    resolves each entry's stream with two statements (about 110 ms per 100
    entries on MariaDB); Mute group can be armed again while its request is
    in flight; the test page's refresh after an act swallows its error; the
    DOM shim's `querySelectorAll` matches one class only and a button loses
    its label once a child is appended (walks read sortable headers by key).
-10. **The performance harness's gaps** (`performance-engineer`, a change of
+12. **The performance harness's gaps** (`performance-engineer`, a change of
     its own): `ab.py` has no per-side request lists, no warm or
     after-the-headline mode, no MariaDB backend, no way to compare two
     trees that serve a read at different addresses, and no pre-marks base
     at N > 0; the WP-44 passes did these in scratch drivers.
-11. **WP-43, left as built:** the trend's fallback is all-or-nothing; a row
+13. **WP-43, left as built:** the trend's fallback is all-or-nothing; a row
     with every count zero still draws a zero-width red fill and a 2 px gap;
     the full unsliced payload does not carry the trend keys.
-12. **Should there be a switch that turns the build delete off**, or
+14. **Should there be a switch that turns the build delete off**, or
     anything in front of it beyond a typed name? The users' habits will say.
-13. **Build comments — the workshop the owner offered:** mainline lists show
+15. **Build comments — the workshop the owner offered:** mainline lists show
     a test's newest comment of any origin, unlabelled; deleting a build
     clears the tag on its comments; nothing carries from one build to the
     next of the same branch.
-14. Carried from 2026-08-11, still open: re-retire the tests the un-retire
+16. Carried from 2026-08-11, still open: re-retire the tests the un-retire
     bug released (search comments for "Automatically un-retired");
     `tools/diagnose_db.py --compare-local` on prod; `max_allowed_packet`
     persistence with the daemon owners; import output-size cap; the
     morning decision list's UI judgement calls; first Tcl 8.5 site is
     still an experiment.
-15. Carried from WP-31: a build whose last run is more than 36 hours old
+17. Carried from WP-31: a build whose last run is more than 36 hours old
     shows "Reported 0 of N" on its own tiles. **Do not loosen the clamp**.
-16. **The sanity net's seed is dated August** and fails five clock-dependent
+18. **The sanity net's seed is dated August** and fails five clock-dependent
     checks; re-dating it is a brief for `backend-engineer` when the net is
     next needed for a drop.
-17. **The `ui-engineer` agent type is still not registered** in a session;
+19. **The `ui-engineer` agent type is still not registered** in a session;
     every UI item since WP-42 ran as a general-purpose Opus agent told to
     read the definition as its instructions. Check the agent list at the
     start of the next session.
-18. **Agents in an isolated worktree cannot write the ledger** in the main
+20. **Agents in an isolated worktree cannot write the ledger** in the main
     checkout's `.claude/work/`; in the rework each kept its notes in the
     session's scratch directory and the main session copied the decisions
     across. Either the briefs say so from the start or the ledgers move.
-19. **The agents' memory notes from WP-44 are not merged** (backend, UI,
+21. **The agents' memory notes from WP-44 are not merged** (backend, UI,
     performance): the owner decides what is kept.
 
 ## Known slow, measured, not changed
@@ -274,11 +296,11 @@ swings 2× to 5× between runs, so only paired deltas within one run compare.
 memoized until the next push or act: 23 ms at 14 days and 101 ms at 90 days
 with 65 assignments on the 90-night seed; 317 ms and 1,553 ms at 1,000
 assignments; with marks, about +8.5 ms at 50 and up to +1,047 ms at 90 days
-with 1,000 (items 4 and 5 above). **With WP-44 Open Actions as a page is 25
+with 1,000 (items 6 and 7 above). **With WP-44 Open Actions as a page is 25
 to 48% faster on SQLite** (it fetches the names part, not the full
 summary) and 10% faster to level on MariaDB; its rows row above is
 unchanged with no marks. Where marks exist the headline costs 18 to 41%
-more cold (item 3 above). **The Flaking tab's rows** (`queue=flaking`,
+more cold (item 5 above). **The Flaking tab's rows** (`queue=flaking`,
 measured 2026-11-12 on a day the machine read about five times faster than
 the table above, so compare only within this sentence): on the click after
 the headline 0.7 ms at 50 marks and 2.0 at 1,000 on SQLite, 2.3 and 5.4 on
@@ -294,10 +316,17 @@ There is still no browser here; every drop's operator note says so.
   skipped, the count is simply nine lower. On this machine the Bash tool
   has it and PowerShell does not: append the Git installation's
   `clangarm64\bin` to PATH for the run. The counts below are with it.
+- **No interpreter on this machine carries an old SQLite** (3.50 on
+  Windows, 3.45 in the Linux subsystem), so a plan that only an old SQLite
+  gets wrong shows first in CI's 3.6.8 jobs (3.26). Item 16's implementer
+  reproduced one locally in about ten minutes: SQLite 3.26 built from the
+  public amalgamation in a scratch directory inside the subsystem and
+  loaded for one python3 process, nothing installed on the host. A plan
+  guard's failure message now names the SQLite version it ran on.
 - `tools/dev/net/run_net.py` — the six-class sanity net; boots the repo it
   lives in on a copy of the database on a free port, needs `node` on PATH
   for the DOM walks (optional; the API checks run without it). **It fails
-  five checks** on every tree since its August seed went stale (item 16
+  five checks** on every tree since its August seed went stale (item 18
   above).
 - `tools/dev/perf/` — the performance engineer's harness: `seed.py` builds
   the production-scale seed in ~75 s, and with `--history-nights 90` the
@@ -349,7 +378,7 @@ git fetch origin --prune
 git log --oneline -4 origin/master   # 6cba071 on top = the drop of 2026-10-13; 49e596d below is what production last reported running
 gh pr list --state open              # expect #9, #17 (close it) and #21 (WP-44)
 gh pr checks 21                      # the two MariaDB 10.3 legs decide the rows-by-key plan guard
-python -m unittest discover          # on wp-44-flaky-mark, tclsh and node on PATH: expect 3055 OK (skipped 1), SQLite; 4229 OK (skipped 91) with MariaDB
+python -m unittest discover          # on wp-44-flaky-mark, tclsh and node on PATH: expect 3066 OK (skipped 1), SQLite; 4241 OK (skipped 91) with MariaDB
 python tools/dev/install_hooks.py    # once per clone: the publication gate's hooks
 ```
 
