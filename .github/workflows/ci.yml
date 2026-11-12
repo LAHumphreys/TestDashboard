@@ -32,7 +32,12 @@ on:
 jobs:
   modern:
     name: Python ${{ matrix.python-version }} (ubuntu)
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: setup-python has no Python 3.8 build for
+    # Ubuntu 26.04, so once ubuntu-latest moved there the 3.8 leg failed
+    # at the interpreter's setup, before any test. 24.04 is the newest
+    # image that still offers 3.8 (and it offers 3.14 too). Move the pin
+    # only together with the 3.8 legs' interpreter.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -161,7 +166,10 @@ jobs:
     # The Python version here is incidental -- feeder.tcl does not care.
     # 3.6 compatibility is gated statically in every job by
     # tests/test_python36_compat.py and executed by the ubi8 leg.
-    runs-on: ubuntu-latest
+    #
+    # Pinned to 24.04 for the same reason as the `modern` job: no Python
+    # 3.8 build exists for Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
