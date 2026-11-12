@@ -6501,9 +6501,39 @@ if (fixture.bars) {
     tableRow: firstRow ? firstRow.children.map((td) => td.textContent) : null,
   });
 }
-console.log(JSON.stringify(out));
-process.exit(0);
+await driverAnswer(out);
 """
+
+#: Prepended by _shim() to every driver: the one way a driver answers.
+#: Its JSON goes out on one line, ASCII only (the reader decodes stdout
+#: in the locale's encoding, and the board's words carry "·" and "…"),
+#: and the process ends only from the write's callback, once the whole
+#: line has been handed to the pipe. On POSIX a pipe write is
+#: asynchronous past the pipe's buffer: a process.exit() straight after
+#: console.log() ends node with all but the first 64 KB of a large answer
+#: unwritten. The promise it returns never settles, so ``await
+#: driverAnswer(x)`` also stops a driver that answers early.
+_DRIVER_PRELUDE = r"""
+globalThis.driverAnswer = (value) => {
+  const line = JSON.stringify(value).replace(/[\u007f-￿]/g,
+    (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  process.stdout.write(line + "\n", () => process.exit(0));
+  return new Promise(() => {});
+};
+"""
+
+
+def _driver_endings(source: str) -> List[str]:
+    """The ways *source*, a shim driver, could end node before its answer
+    is out: any process.exit() or console.log() of its own (the prelude
+    holds the one exit, in the write's callback), or no awaited
+    driverAnswer() at all."""
+    found = [token for token in ("process.exit(", "console.log(",
+                                 "process.stdout.write(")
+             if token in source]
+    if "await driverAnswer(" not in source:
+        found.append("no await driverAnswer(")
+    return found
 
 
 def _shim(
@@ -6511,12 +6541,13 @@ def _shim(
 ) -> Dict[str, Any]:
     """Run the shim driver *source* (the home page's by default) over
     *fixture*; its JSON answer, typed at the boundary by the caller's
-    assertions."""
+    assertions. The driver answers through _DRIVER_PRELUDE's
+    driverAnswer(), so an answer of any size arrives whole."""
     with tempfile.TemporaryDirectory() as scratch:
         driver = os.path.join(scratch, "driver.mjs")
         data = os.path.join(scratch, "fixture.json")
         with io.open(driver, "w", encoding="utf-8") as handle:
-            handle.write(source)
+            handle.write(_DRIVER_PRELUDE + source)
         with io.open(data, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(fixture))
         done = subprocess.run(
@@ -6526,6 +6557,69 @@ def _shim(
         raise AssertionError("shim driver failed: " + done.stderr[-2000:])
     answer = json.loads(done.stdout.strip().split("\n")[-1])  # type: Dict[str, Any]
     return answer
+
+
+#: A driver whose answer is as large as its fixture says, with one
+#: non-ASCII character at the end. argv: repo root, fixture path.
+_BIG_ANSWER_DRIVER = r"""
+import { readFileSync } from "node:fs";
+const fixture = JSON.parse(readFileSync(process.argv[3], "utf-8"));
+await driverAnswer({ size: fixture.size,
+  big: "x".repeat(fixture.size) + "·" });
+"""
+
+
+def _drivers() -> Dict[str, str]:
+    """Every shim driver in this module, by name."""
+    return {name: value for name, value in sorted(globals().items())
+            if name.endswith("_DRIVER") and isinstance(value, str)}
+
+
+class ShimAnswerTest(unittest.TestCase):
+    """A shim driver's answer arrives whole, whatever its size. On POSIX
+    node writes to a pipe asynchronously past the pipe's 64 KB buffer, so
+    a driver that ended with ``console.log(...); process.exit(0)`` handed
+    the reader its first 65,536 characters and nothing more. Every driver
+    now answers through _DRIVER_PRELUDE's driverAnswer(), which exits only
+    from the write's callback."""
+
+    def test_every_driver_answers_through_the_prelude(self) -> None:
+        drivers = _drivers()
+        self.assertGreaterEqual(len(drivers), 8, sorted(drivers))
+        self.assertEqual(
+            {name: found for name, found in
+             ((name, _driver_endings(source))
+              for name, source in drivers.items()) if found}, {})
+
+    def test_the_prelude_ends_node_only_once_the_line_is_written(
+            self) -> None:
+        self.assertEqual(_DRIVER_PRELUDE.count("process.exit("), 1)
+        self.assertIn('process.stdout.write(line + "\\n", () => '
+                      'process.exit(0));', _DRIVER_PRELUDE)
+        self.assertNotIn("console.log(", _DRIVER_PRELUDE)
+        self.assertIn("return new Promise(() => {});", _DRIVER_PRELUDE)
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: the ending that cut answers at 64 KB, an exit of its
+        own anywhere, and a driver that never answers."""
+        for planted in (
+                "console.log(JSON.stringify(out));\nprocess.exit(0);\n",
+                "await driverAnswer(out);\nprocess.exit(0);\n",
+                'process.stdout.write(JSON.stringify(out));\n'
+                'await driverAnswer(out);\n',
+                "const out = {};\n"):
+            with self.subTest(planted=planted):
+                self.assertNotEqual(_driver_endings(planted), [])
+        self.assertEqual(_driver_endings("await driverAnswer(out);\n"), [])
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_a_300_kb_answer_arrives_whole(self) -> None:
+        size = 300 * 1024
+        answer = _shim({"size": size}, _BIG_ANSWER_DRIVER)
+        self.assertEqual(answer["size"], size)
+        self.assertEqual(len(answer["big"]), size + 1)
+        self.assertEqual(answer["big"][-2:], "x·")
 
 
 #: The class lists and widths ``barRows`` drew at the base commit
@@ -7051,8 +7145,7 @@ Object.assign(out, {
   laterRows: byId["actions-body"].children.length,
   laterEnvOptions: byId["filter-environment"].children.map((o) => o.value),
 });
-console.log(JSON.stringify(out));
-process.exit(0);
+await driverAnswer(out);
 """
 
 
@@ -7707,8 +7800,7 @@ if (fixture.surface === "test") {
     await settle();
     out.afterRelease = [bar.hidden, changed];
     out.posts = posts();
-    console.log(JSON.stringify(out));
-    process.exit(0);
+    await driverAnswer(out);
   }
   await tick();
   out.ticked = seen();
@@ -7789,11 +7881,7 @@ if (fixture.surface === "test") {
   out.reloads = reloads;
 }
 out.posts = posts();
-// ASCII only: the reader decodes stdout in the locale's encoding, and
-// the board's words carry "·" and "…".
-console.log(JSON.stringify(out).replace(/[\u007f-￿]/g,
-  (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")));
-process.exit(0);
+await driverAnswer(out);
 """
 
 _ONE_TEST = {"environment": "env-a", "script": "s1.py",
@@ -8148,10 +8236,7 @@ for (const set of fixture.tick || []) {
     await boxes[index].dispatch("change");
   }
 }
-// ASCII only, as the flaky walks: the board's words carry "·" and "…".
-console.log(JSON.stringify(out).replace(/[\u007f-￿]/g,
-  (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")));
-process.exit(0);
+await driverAnswer(out);
 """
 
 #: The regions of Home the state walk serializes.
@@ -8426,9 +8511,7 @@ const out = fixture.calls.map(([name, args]) => {
   const value = api[name](...args);
   return value === undefined ? "undefined" : value;
 });
-console.log(JSON.stringify(out).replace(/[\u007f-￿]/g,
-  (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")));
-process.exit(0);
+await driverAnswer(out);
 """
 
 
@@ -8887,9 +8970,7 @@ for (const [action, arg, wait] of fixture.steps) {
   await settle(wait);
   snaps.push(snap());
 }
-console.log(JSON.stringify(snaps).replace(/[\u007f-￿]/g,
-  (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")));
-process.exit(0);
+await driverAnswer(snaps);
 """
 
 
@@ -9564,8 +9645,7 @@ const firstTr = byId["actions-body"].children[0];
 out.firstRow = firstTr ? [firstTr.className].concat(firstTr.find(
   (c) => String(c.className).startsWith("chip")).map(
   (c) => c.className + ":" + c.textContent)) : null;
-console.log(JSON.stringify(out));
-process.exit(0);
+await driverAnswer(out);
 """
 
 

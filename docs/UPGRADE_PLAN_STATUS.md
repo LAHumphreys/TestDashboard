@@ -5088,3 +5088,16 @@ is merged or deployed: both are the owner's, with the decisions the
 handover lists (the headline over its bar, the trend part's cost with many
 marks, the chart's split after the headline, Open Actions' Failing mode).
 Item 6h (a dialect hook) exists only if a plan guard fails on those legs.
+
+## WP-44: the first CI run; 10.3 passes the plan guards, item 6h not needed; a test-harness fault fixed (2026-11-12)
+
+The build's first push ran CI. Both MariaDB 10.3 legs ran all 4,175 tests
+and every plan guard of WP-44 passed there: item 6h is not needed. One
+test failed on every Linux leg and passed on Windows: the DOM shim's
+drivers ended with a log and an exit, and on Linux the exit cut any
+answer longer than a pipe's 64 KB buffer; the Flaky tab's paging walk was
+the first to pass it. The shim now writes the answer and exits from the
+write's callback, for every driver, with a guard and a 300 KB round trip
+(`ShimAnswerTest`). The two Python 3.8 legs fail at the interpreter's
+setup, before any test: the hosted runner image no longer offers 3.8.
+Left for the owner; not this build's.
