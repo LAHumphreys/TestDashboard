@@ -543,7 +543,7 @@ live mute  Marked flaky; the mute comes first until it runs out
 
 ### U3 The selection bar
 
-Unchanged (decision 13): `Flaky [at…▾] Mark as flaky · Unmark` after
+Unchanged (decision 13): `Flaky [fail after…▾] Mark as flaky · Unmark` after
 Mute, about 400 px wider (estimate), the note box as the reason, the
 person marking as owner (decision 12). **Set cadence** replaces Mark when
 every ticked row is marked.
@@ -551,7 +551,7 @@ every ticked row is marked.
 ### U4 The Review panel
 
 ```
-Flaky  [why is this test flaky? (required)    ] [at…▾] [Mark as flaky]
+Flaky  [why is this test flaky? (required)    ] [fail after…▾] [Mark as flaky]
 Flaky  Flaking: failed its last run; counts as failing at 3 in a row
        dev1 · 12 days ago · race in teardown  [3 in a row▾] Set cadence
        Unmark
@@ -1355,7 +1355,8 @@ any interruption is the first line not `done` or `parked`.
 | 13 the documents follow | done | `c705f28` | `CLAUDE.md` and the UI agent's definition went ahead in `fec3d34`; the README, the operator note, the log and the handover in `c705f28` |
 | 16 the keyed read on an old SQLite | done | `77f12d2` | not in §14's plan: CI's Python 3.6.8 jobs failed item 14's plan guard on SQLite 3.26, which cannot drive an index from a row-value `IN` over a list and read the whole stream. MariaDB 10.3 passed the same guard. On SQLite the read is now driven from the keys (`CROSS JOIN`); the same fault in Open Actions' page by keys, there since item 8 behind a guard that accepted any index search, is fixed by the same change. Proven on a scratch build of 3.26; CI's 3.6.8 jobs are the proof on the target |
 | 16p measured pass | done | | no change on a current SQLite in any cell, statements equal, the Known slow rows the same; the old plan forced on the development machine costs 4.3 to 5.7 ms more on every call of either read |
-| 17 the test page offers the mark in its header | done | the commit carrying this line | not in §14's plan: the owner, trying the build, had to ask where "Mark as flaky" was on a test's page. It was in the Flakiness card (§7's question 15); every other act on that page is in the header. It is there now, beside the Mute offer, for a test whatever its result; the card keeps a link that opens the header's one form. The walkthrough compared it with the Mute offer and changed its label ("Not marked flaky" to "Flaky") and made the offer quiet: no background, a muted label. CI's 3.6.8 jobs passed item 16 before this was committed. No browser has rendered it |
+| 17 the test page offers the mark in its header | done | `4b96426` | not in §14's plan: the owner, trying the build, had to ask where "Mark as flaky" was on a test's page. It was in the Flakiness card (§7's question 15); every other act on that page is in the header. It is there now, beside the Mute offer, for a test whatever its result; the card keeps a link that opens the header's one form. The walkthrough compared it with the Mute offer and changed its label ("Not marked flaky" to "Flaky") and made the offer quiet: no background, a muted label. CI's 3.6.8 jobs passed item 16 before this was committed. No browser has rendered it |
+| 18 the cadence select opens on "fail after…" | done | the commit carrying this line | not in §14's plan: the owner, trying the build, asked for the select's placeholder to read "fail after…" where it read "at…". One string in the one builder all three surfaces use (the selection bar, the Review panel, a test's page), and a guard that holds it and the Mute select's "for…". The select is no wider: a closed select takes the width of its widest option, "10 in a row". The walkthrough named one thing to the owner: the sentence and the Streak cell beside the select still say "failing at 3", and "after 3" can be read as the fourth failure where "at 3" cannot; left as it is until the owner says. CI was green on all twelve jobs at `65ec790` before this |
 
 ## §13 After the build: the owner's first look, and the rework (2026-11-12)
 

@@ -5232,3 +5232,32 @@ of literal in its "unassigned" sentinel.
 Final counts in the main checkout, `tclsh` and `node` on PATH: 3066 OK
 (skipped 1) on SQLite and 4241 OK (skipped 91) with the MariaDB variants
 on a local 12.3. No browser has rendered the page.
+
+## WP-44: CI green at the branch head; item 18, the cadence select opens on "fail after…" (2026-11-12)
+
+CI on `65ec790` passed all twelve jobs, so the test page's offer and its
+guards are green on Python 3.6.8, 3.8, 3.14 and both MariaDB 10.3 jobs.
+
+Item 18 came from the owner trying the build: the cadence select's
+placeholder read "at…" and should read "fail after…". It is one string in
+`flakyCadenceSelect()`, the builder the selection bar, the Review panel
+and a test's page all use, so the three change together. A new guard,
+`FlakyMarkControlsTest.test_the_placeholders_say_what_is_chosen`, holds
+that text and the Mute select's "for…" (neither was held before), each as
+one ellipsis character on an option of value "" drawn before the choices.
+The select is no wider: a closed select takes the width of its widest
+option, and "10 in a row" is wider than the new placeholder in the fonts
+measured; no rule in `static/` changes how a select is sized.
+
+The walkthrough named one thing to the owner and changed nothing for it:
+the sentence beside the select ("counts as failing at 3 in a row") and
+the Flaking tab's Streak cell ("2 in a row, failing at 3") say "at" where
+the select now says "after". Both mean the third failure in a row; "after
+3" can also be read as the fourth. Whether those follow the select or
+stay is the owner's.
+
+No performance pass: one string in a select built on demand, off the
+trigger paths. Counts in the main checkout, `tclsh` and `node` on PATH:
+3067 OK (skipped 1) on SQLite and 4242 OK (skipped 91) with the MariaDB
+variants on a local 12.3, one more than before on each, the new guard.
+No browser has rendered it.

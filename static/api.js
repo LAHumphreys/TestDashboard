@@ -1054,8 +1054,8 @@ export function cadenceChanged(select, flaky) {
 }
 
 /**
- * A <select> of the cadences behind a placeholder option "at…" (value
- * ""), the flaky twin of muteDurationSelect(). `defaultValue` is the
+ * A <select> of the cadences behind a placeholder option "fail after…"
+ * (value ""), the flaky twin of muteDurationSelect(). `defaultValue` is the
  * cadence to start on: a marked test's own, so changing it is one
  * choice; a fresh mark starts on the placeholder, which keeps its
  * button disabled until a cadence is chosen. Read the choice with
@@ -1065,7 +1065,7 @@ export function flakyCadenceSelect(className, defaultValue) {
   const select = el("select", className);
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = "at…";
+  placeholder.textContent = "fail after…";
   select.appendChild(placeholder);
   for (const cadence of FLAKY_CADENCES) {
     const option = document.createElement("option");

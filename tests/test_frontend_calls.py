@@ -7506,6 +7506,24 @@ class FlakyMarkControlsTest(unittest.TestCase):
             '"Clear selection"')]
         self.assertEqual(order, sorted(order))
 
+    def test_the_placeholders_say_what_is_chosen(self) -> None:
+        """WP-44 item 18: the cadence select opens on "fail after…", so
+        it reads "fail after… / 3 in a row"; its twin, the mute duration,
+        opens on "for…". Each is one ellipsis character, on an option of
+        value "" drawn before the choices; the bar, the Review panel and
+        the test page all build theirs from these two."""
+        api = _strip_comments(read("api.js"))
+        for signature, words in (
+                ("export function flakyCadenceSelect(", "fail after…"),
+                ("export function muteDurationSelect(", "for…")):
+            body = _function_body(api, signature)
+            self.assertIn('placeholder.value = "";', body, signature)
+            self.assertIn('placeholder.textContent = "' + words + '";',
+                          body, signature)
+            self.assertLess(body.index("select.appendChild(placeholder)"),
+                            body.index("for (const "), signature)
+        self.assertNotIn('"at…"', api)
+
     def test_the_bar_asks_for_the_reason_before_the_server_does(
             self) -> None:
         code = _strip_comments(read("selection.js"))
