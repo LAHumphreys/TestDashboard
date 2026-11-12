@@ -1362,6 +1362,25 @@ captured verbatim:
 > should show up under new / persistent failures. A flaky tests that pass
 > is fien and doesn't need triage
 
+And after the plan below was agreed, the principle behind it, verbatim:
+
+> As an important point of future reference "triage" should never be a
+> dump for "being able to search". It's the morning touch point for the
+> board. The success of the board is dependent on triage having no noise
+> and developers being able to efficiently review the status in the
+> morning.
+>
+> I think the confusion here was my fault. I referenced muted when
+> specing. Both are about reducing noise but do so differently. Muting
+> just entirely ignores a test whilst a product is being sorted out.
+> Flaking is different. It sets a property which effectively changes the
+> definition of failure for a test
+
+So the tab is not Muted's sibling. A mute sets a test aside whole; a mark
+changes what counts as a failure for that test, and the test then sorts by
+its state as any test does. Triage holds what a developer must look at
+that morning and nothing kept there only so that it can be found.
+
 **What this overturns:** §3 U8 and decision 16. The tab was built as the
 list of every mark in scope, in any state. It becomes the list of the tests
 flaking now and nothing else.
@@ -1427,7 +1446,7 @@ as marked by the "flaky" tag on its row and by its own page.
 | 11 | **The tab lists the flaking tests, backend:** `GET /api/flaky` by the contract above; `FlakyTabOrderTest` reworked to the new order and set; a guard that `total` equals `status.flaking` and the browse filter's FLAKING count in every scope the tab can be opened in; `NoMarksAddsNothingTest` and the cache and plan guards kept on the read | backend-engineer | **yes**: storage.py, api.py (the read is off every first paint) | nothing |
 | 11p | **Measured pass** of item 11: one page of the tab at 50 and 1,000 marks on both seeds against the base, and the Known slow table. Expected: no slower, fewer rows needing the 20-run measure | performance-engineer | the gate for item 11 | item 11 |
 | 12 | **The tab lists the flaking tests, UI:** the tab by the wireframe above; `FlakyTabTest` and `AllClearSetAsideTest` reworked; the What's new section reworded | ui-engineer | **first paint** (no request added or moved; the sequencing guards are the gate) | item 11's commit |
-| 13 | **The documents follow:** the README's "Flaky marks" section, the operator note, the handover (with the suite's counts corrected: the tree at item 9 loads 3,012 tests on SQLite, not the 3,021 recorded; with the four of the shim follow-up it is 3,016, and 4,170 with the MariaDB variants) | main session | n/a | items 11 and 12 |
+| 13 | **The documents follow:** `CLAUDE.md` states the triage principle above where it says who the board is for, so that every brief is written under it; the README's "Flaky marks" section, the operator note, the handover (with the suite's counts corrected: the tree at item 9 loads 3,012 tests on SQLite, not the 3,021 recorded; with the four of the shim follow-up it is 3,016, and 4,170 with the MariaDB variants) | main session | n/a | items 11 and 12 |
 
 Items 11 and 12 run in series: the UI item reads the new response.
 
