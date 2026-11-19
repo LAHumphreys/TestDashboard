@@ -12839,3 +12839,354 @@ class FlakyTrendTest(FlakyListsBase):
                          [False, False])
         self.assertEqual(analytics.flaking_that_night(
             3, [P, F, F, F], first=2), [True, False])
+
+
+class _NotRunMutedFixture(StorageTestBase):
+    """WP-44 item 20's estate (no tests of its own).
+
+    Mainline, ``linux-sim``: q_fail (FAIL, quiet, muted a day), q_pass
+    (PASS, quiet, muted two hours), q_marked (FAIL, quiet, muted a day,
+    marked flaky: the mute wins), q_plain (PASS, quiet, unmuted), r_fail
+    (FAIL, recent, muted a day: leaves nothing), r_pass (PASS, recent),
+    q_retired (quiet, muted, retired: nowhere). ``win-sim``: w_quiet
+    (PASS, quiet, muted a day), w_plain (FAIL, quiet, unmuted). Build
+    ``b1``: b_quiet (quiet, muted a day on the build), b_plain (quiet),
+    b_recent (recent) and q_fail (quiet; its mainline mute is not the
+    build's).
+    """
+
+    OLD = BASE
+    RECENT = BASE + datetime.timedelta(days=1)
+    CUTOFF = BASE + datetime.timedelta(hours=12)
+    NOW = BASE + datetime.timedelta(days=1, hours=10)
+    #: Past q_pass's two-hour mute, inside the others' day.
+    LATER = NOW + datetime.timedelta(hours=3)
+    #: Past every mute.
+    AFTER = NOW + datetime.timedelta(hours=25)
+    ENV = "linux-sim"
+    SCRIPT = "suite.py"
+
+    def setUp(self) -> None:
+        super().setUp()
+        fail, ok = Result.FAIL, Result.PASS
+        records = [
+            make_record(test_name=name, result=result, start=start)
+            for name, result, start in (
+                ("q_fail", fail, self.OLD), ("q_pass", ok, self.OLD),
+                ("q_marked", fail, self.OLD), ("q_plain", ok, self.OLD),
+                ("r_fail", fail, self.RECENT), ("r_pass", ok, self.RECENT),
+                ("q_retired", ok, self.OLD))
+        ] + [
+            make_record(environment="win-sim", test_name=name,
+                        result=result, start=self.OLD)
+            for name, result in (("w_quiet", ok), ("w_plain", fail))
+        ] + [
+            make_record(test_name=name, result=ok, start=start, build="b1")
+            for name, start in (
+                ("b_quiet", self.OLD), ("b_plain", self.OLD),
+                ("b_recent", self.RECENT),
+                # A run is unique by (triple, start): its own start.
+                ("q_fail", self.OLD + datetime.timedelta(hours=1)))
+        ]
+        self.store.upsert_runs(records)
+        self.build = self.store.list_streams("")[0].stream_id
+        main = storage.MAINLINE_STREAM_ID
+        self.store.mute_tests(
+            [(self.ENV, self.SCRIPT, name, main)
+             for name in ("q_fail", "q_marked", "r_fail", "q_retired")]
+            + [("win-sim", self.SCRIPT, "w_quiet", main),
+               (self.ENV, self.SCRIPT, "b_quiet", self.build)],
+            "infra", 24, "carol", "bob", self.NOW)
+        self.store.mute_tests(
+            [(self.ENV, self.SCRIPT, "q_pass", main)],
+            "infra", 2, "carol", "bob", self.NOW)
+        self.store.set_retired(
+            self.ENV, self.SCRIPT, "q_retired", True, "bob", "gone",
+            CREATED)
+        self.store.ensure_user("dev1", CREATED)
+        self.store.mark_flaky(
+            [(self.ENV, self.SCRIPT, "q_marked", None)], 3, "race", "dev1",
+            CREATED)
+
+    def _headline(self, now: datetime.datetime, **scope: Any
+                  ) -> analytics.EstateSummary:
+        stream_id = scope.pop("stream_id", storage.MAINLINE_STREAM_ID)
+        environment = scope.pop("environment", None)
+        environments = scope.pop("environments", None)
+        return analytics.summarize_rollup(
+            self.store.summary_rollup(
+                self.CUTOFF, environment, environments=environments,
+                stream_id=stream_id),
+            muted=self.store.muted_cells(
+                now, self.CUTOFF, environment, environments=environments,
+                stream_id=stream_id))
+
+    def _figures(self, now: datetime.datetime, **scope: Any
+                 ) -> Dict[str, Any]:
+        """Every Not run figure and list in *scope* at *now*."""
+        status = self._headline(now, **dict(scope)).status
+        page, total = self.store.dashboard_page(
+            stale_before=self.CUTOFF, now=now, **scope)
+        rows = self.store.status_queue(
+            "not_run", stale_before=self.CUTOFF, now=now, **scope)
+        return {
+            "not_run": status.not_run,
+            "muted_not_run": status.muted_not_run,
+            "sum": status.not_run + status.muted_not_run,
+            "gap": status.total_tests - status.ran_recently,
+            "queue_counts": self.store.queue_counts(
+                stale_before=self.CUTOFF, now=now, **scope)["not_run"],
+            "count": self.store.status_queue_count(
+                "not_run", stale_before=self.CUTOFF, now=now, **scope),
+            "rows": sorted(row.test_name for row in rows),
+            "browse": sorted(row.test_name for row in page),
+            "browse_total": total,
+            "browse_count": self.store.dashboard_count(
+                stale_before=self.CUTOFF, now=now, **scope),
+        }
+
+    def _expect(self, names: Sequence[str], muted: int) -> Dict[str, Any]:
+        return {
+            "not_run": len(names), "muted_not_run": muted,
+            "sum": len(names) + muted, "gap": len(names) + muted,
+            "queue_counts": len(names), "count": len(names),
+            "rows": sorted(names), "browse": sorted(names),
+            "browse_total": len(names), "browse_count": len(names),
+        }
+
+
+class NotRunMutedTest(_NotRunMutedFixture):
+    """WP-44 item 20: a test under a live mute that has not run since the
+    cutoff leaves every Not run figure and list, and the headline says
+    how many it left out (``muted_not_run``). On both backends."""
+
+    def test_every_figure_leaves_the_quiet_muted_tests_out(self) -> None:
+        self.assertEqual(self._figures(self.NOW),
+                         self._expect(["q_plain", "w_plain"], 4))
+
+    def test_scoped_by_environment_and_by_product(self) -> None:
+        self.assertEqual(self._figures(self.NOW, environment="win-sim"),
+                         self._expect(["w_plain"], 1))
+        self.assertEqual(self._figures(self.NOW, environments=[self.ENV]),
+                         self._expect(["q_plain"], 3))
+        self.assertEqual(
+            self._figures(self.NOW, environments=[self.ENV, "win-sim"]),
+            self._expect(["q_plain", "w_plain"], 4))
+        self.assertEqual(self._figures(self.NOW, environments=[]),
+                         self._expect([], 0))
+
+    def test_a_build_reads_its_own_mutes(self) -> None:
+        """q_fail is muted on mainline, not on the build: the build
+        lists it as not run and leaves b_quiet out."""
+        self.assertEqual(self._figures(self.NOW, stream_id=self.build),
+                         self._expect(["b_plain", "q_fail"], 1))
+
+    def test_each_environment_carries_its_own_figure(self) -> None:
+        by_env = {
+            rollup.environment: (rollup.not_run, rollup.muted_not_run,
+                                 rollup.total_tests)
+            for rollup in self._headline(self.NOW).by_environment}
+        self.assertEqual(by_env, {self.ENV: (1, 3, 6), "win-sim": (1, 1, 2)})
+
+    def test_the_sum_holds_and_a_recent_mute_leaves_nothing(self) -> None:
+        """r_fail is muted and ran recently: it is not in muted_not_run,
+        and ran_recently, total_tests, results and muted_total keep every
+        muted test."""
+        status = self._headline(self.NOW).status
+        self.assertEqual(
+            (status.total_tests, status.ran_recently, status.not_run,
+             status.muted_not_run, status.muted_total),
+            (8, 2, 2, 4, 5))
+        self.assertEqual(status.results[Result.FAIL], 4)
+        self.assertEqual(
+            sorted(row.test_name for row in self.store.status_queue(
+                "muted", now=self.NOW)),
+            ["q_fail", "q_marked", "q_pass", "r_fail", "w_quiet"])
+
+    def test_an_expiry_puts_them_back_with_no_write(self) -> None:
+        """Every figure is read at NOW first (memos filled), then at a
+        later clock with no write in between: q_pass's two hours are up
+        at LATER, every mute's day at AFTER."""
+        self.assertEqual(self._figures(self.NOW),
+                         self._expect(["q_plain", "w_plain"], 4))
+        self.assertEqual(self._figures(self.LATER),
+                         self._expect(["q_pass", "q_plain", "w_plain"], 3))
+        self.assertEqual(
+            self._figures(self.AFTER),
+            self._expect(["q_fail", "q_marked", "q_pass", "q_plain",
+                          "w_plain", "w_quiet"], 0))
+        self.assertEqual(
+            self._figures(self.AFTER, stream_id=self.build),
+            self._expect(["b_plain", "b_quiet", "q_fail"], 0))
+
+    def test_the_cached_queue_counts_follow_the_expiry(self) -> None:
+        first = self.store.queue_counts(stale_before=self.CUTOFF, now=self.NOW)
+        key = ("queue_counts", None, None, self.CUTOFF, None,
+               storage.MAINLINE_STREAM_ID)
+        self.assertIsNotNone(self.store._cached_summary(key))
+        later = self.store.queue_counts(
+            stale_before=self.CUTOFF, now=self.LATER)
+        self.assertEqual((first["not_run"], later["not_run"]), (2, 3))
+        self.assertEqual(first["muted"], 5)
+        self.assertEqual(later["muted"], 4)
+
+    def test_an_assignee_count_joins_the_mutes(self) -> None:
+        """The muted cells carry no owner: with an assignee the count
+        binds the term itself. carol owns every mute; q_plain is given
+        her too."""
+        self.store.set_assignee(
+            self.ENV, self.SCRIPT, "q_plain", "carol", "bob", CREATED)
+        for now, expected in ((self.NOW, 1), (self.LATER, 2),
+                              (self.AFTER, 5)):
+            self.assertEqual(
+                self.store.status_queue_count(
+                    "not_run", assignee="carol", stale_before=self.CUTOFF,
+                    now=now),
+                expected, now)
+            self.assertEqual(
+                len(self.store.status_queue(
+                    "not_run", assignee="carol", stale_before=self.CUTOFF,
+                    now=now)),
+                expected, now)
+
+    def test_the_muted_filter_with_stale(self) -> None:
+        """muted=false says the same thing; muted=true and stale match
+        nothing, by the owner's rule, not special-cased."""
+        self.assertEqual(
+            sorted(row.test_name for row in self.store.dashboard(
+                stale_before=self.CUTOFF, muted=False, now=self.NOW)),
+            ["q_plain", "w_plain"])
+        self.assertEqual(self.store.dashboard(
+            stale_before=self.CUTOFF, muted=True, now=self.NOW), [])
+        self.assertEqual(self.store.dashboard_count(
+            stale_before=self.CUTOFF, muted=True, now=self.NOW), 0)
+
+    def test_a_bulk_assign_over_stale_acts_on_the_listed_set(self) -> None:
+        updated = self.store.bulk_set_assignee(
+            "dave", "bob", CREATED, stale_before=self.CUTOFF, now=self.NOW)
+        self.assertEqual(updated, 2)
+        owners = {
+            name: self.store.current_assignee(env, self.SCRIPT, name)
+            for env, name in ((self.ENV, "q_plain"), ("win-sim", "w_plain"),
+                              (self.ENV, "q_fail"), ("win-sim", "w_quiet"))}
+        self.assertEqual(owners, {"q_plain": "dave", "w_plain": "dave",
+                                  "q_fail": "carol", "w_quiet": "carol"})
+
+
+class NotRunMutedStatementsTest(_NotRunMutedFixture):
+    """WP-44 item 20's cost: the statements, by sqlite3's trace. With no
+    live mute no read binds the term and no count joins the mutes; the
+    Not run count and the stale browse each read the mute epoch (one
+    indexed MIN, memoized: the headline has read it). With one, no Not
+    run count statement joins the mutes (it subtracts the cells), the
+    rows bind the term on the join they already carry, and the stale
+    browse's count joins the mutes because its WHERE reads them."""
+
+    def _statements(self, call: Callable[[], Any]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            call()
+        finally:
+            conn.set_trace_callback(None)
+        return [" ".join(s.split()) for s in seen
+                if s.strip().upper().startswith("SELECT")]
+
+    def _reads(self, now: datetime.datetime) -> Dict[str, List[str]]:
+        """Each read's statements, cold."""
+        def cold(call: Callable[[], Any]) -> List[str]:
+            self.store._invalidate_summary_cache()
+            return self._statements(call)
+        return {
+            "count": cold(lambda: self.store.status_queue_count(
+                "not_run", stale_before=self.CUTOFF, now=now)),
+            "rows": cold(lambda: self.store.status_queue(
+                "not_run", stale_before=self.CUTOFF, now=now, limit=500)),
+            "browse": cold(lambda: self.store.dashboard_page(
+                stale_before=self.CUTOFF, now=now, limit=250)),
+            "browse_unfiltered": cold(lambda: self.store.dashboard_page(
+                now=now, limit=250)),
+        }
+
+    def test_no_live_mute_runs_the_statements_it_did(self) -> None:
+        """At AFTER no mute is live: no statement binds the mute term,
+        no count joins test_mutes, and each read is its base statements
+        plus, cold, the epoch's one MIN where the base did not already
+        read it (the count, the stale browse). With the epoch in hand,
+        as after the headline, each is exactly its base."""
+        reads = self._reads(self.AFTER)
+        for name, statements in reads.items():
+            for statement in statements:
+                self.assertNotIn("tm.expires_at IS NULL", statement, name)
+                if "COUNT(" in statement.upper():
+                    self.assertNotIn("test_mutes", statement, name)
+        epoch = "SELECT MIN(expires_at)"
+        for name, cold in (("count", 2), ("rows", 2), ("browse", 3),
+                           ("browse_unfiltered", 2)):
+            self.assertEqual(len(reads[name]), cold, (name, reads[name]))
+        self.assertTrue(reads["count"][0].startswith(epoch), reads["count"])
+        # The unfiltered browse never reads the epoch.
+        for statement in reads["browse_unfiltered"]:
+            self.assertFalse(statement.startswith(epoch), statement)
+        # Epoch in hand: the count is its one statement, the stale browse
+        # its rows and count, as at the base.
+        main = storage.MAINLINE_STREAM_ID
+        for name, call, base in (
+                ("count", lambda: self.store.status_queue_count(
+                    "not_run", stale_before=self.CUTOFF, now=self.AFTER), 1),
+                ("browse", lambda: self.store.dashboard_page(
+                    stale_before=self.CUTOFF, now=self.AFTER, limit=250),
+                 2)):
+            self.store._invalidate_summary_cache()
+            self.store.mute_epoch(main, self.AFTER)
+            warm = self._statements(call)
+            self.assertEqual(len(warm), base, (name, warm))
+
+    def test_with_a_live_mute_no_count_joins_the_mutes(self) -> None:
+        reads = self._reads(self.NOW)
+        counts = [s for s in reads["count"]
+                  if "COUNT(*), (SELECT MIN(environment)" in s]
+        self.assertEqual(len(counts), 1, reads["count"])
+        self.assertNotIn("test_mutes", counts[0])
+        # The epoch, the stream's environment names and the muted cells
+        # (bounded by the mutes; the headline and the queue part's prefix
+        # have read the first two), then the count.
+        self.assertEqual(len(reads["count"]), 4, reads["count"])
+        rows = [s for s in reads["rows"] if "ORDER BY" in s]
+        self.assertEqual(len(rows), 1, reads["rows"])
+        self.assertIn("lr.start_time < ? AND (tm.expires_at IS NULL OR "
+                      "tm.expires_at <= ?)", rows[0].replace(
+                          "'" + model.format_iso(self.CUTOFF) + "'", "?")
+                      .replace("'" + model.format_iso(self.NOW) + "'", "?"))
+        # The stale filter's count joins the mutes because its WHERE
+        # reads them; the page's rows already carry the join.
+        browse_counts = [s for s in reads["browse"] if "COUNT(" in s]
+        self.assertEqual(len(browse_counts), 1, reads["browse"])
+        self.assertIn("LEFT JOIN test_mutes AS tm", browse_counts[0])
+        self.assertIn("tm.expires_at IS NULL", browse_counts[0])
+        # The unfiltered browse is untouched.
+        for statement in reads["browse_unfiltered"]:
+            self.assertNotIn("tm.expires_at IS NULL", statement)
+            if "COUNT(" in statement:
+                self.assertNotIn("test_mutes", statement)
+
+    def test_a_repeat_is_a_hit_and_an_expiry_recomputes(self) -> None:
+        def rows(now: datetime.datetime) -> List[str]:
+            return sorted(row.test_name for row in self.store.status_queue(
+                "not_run", stale_before=self.CUTOFF, now=now))
+        def counts(now: datetime.datetime) -> int:
+            return self.store.queue_counts(
+                stale_before=self.CUTOFF, now=now)["not_run"]
+        self.assertEqual(rows(self.NOW), ["q_plain", "w_plain"])
+        self.assertEqual(counts(self.NOW), 2)
+        self.assertEqual(self._statements(lambda: rows(self.NOW)), [])
+        self.assertEqual(self._statements(lambda: counts(self.NOW)), [])
+        # Past q_pass's expiry, with no write: the epoch moves, so the
+        # rows' key and the cells' key are new and both are re-read.
+        expired = self._statements(lambda: rows(self.LATER))
+        self.assertTrue(expired)
+        self.assertEqual(rows(self.LATER), ["q_pass", "q_plain", "w_plain"])
+        self.assertEqual(counts(self.LATER), 3)
+        self.assertEqual(self._statements(lambda: rows(self.LATER)), [])
+        self.assertEqual(self._statements(lambda: counts(self.LATER)), [])

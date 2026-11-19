@@ -74,6 +74,11 @@ EXCLUDED_CLASSES = {
         "FlakyAgreesWithAnalyticsTest, PromotionTest and FixedRuleTest, "
         "with 101 marked tests in one environment (decision 22), and "
         "their plans by FlakyPlanTest.",
+    "NotRunMutedStatementsTest":
+        "counts and reads statements with sqlite3's set_trace_callback "
+        "(WP-44 item 20): the instrument is SQLite's. The values those "
+        "reads return, the expiry with no write included, are "
+        "NotRunMutedTest's and NotRunMutedApiTest's, which run here.",
     "TestEnvironmentListingCost":
         "counts sqlite page reads to pin a query-shape regression; "
         "the instrument is engine-specific even though the shape "

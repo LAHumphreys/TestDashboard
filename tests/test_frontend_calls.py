@@ -43,7 +43,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.parse
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 STATIC_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
@@ -9095,6 +9095,127 @@ class FlakyStateDomTest(unittest.TestCase):
                          {"swatchClass": "swatch-flaking", "label": "flaking",
                           "value": "0"})
         self.assertEqual(keyed["words"], unkeyed["words"])
+
+
+def _not_run_fixture(muted: Optional[int]) -> Dict[str, Any]:
+    """The Home walk's fixture with an empty Not run queue and
+    ``status.muted_not_run`` of *muted* (WP-44 item 20), the same figure
+    on env-a's ``by_environment`` entry; ``None`` is a server from before
+    the field, which sends it nowhere."""
+    fixture = _state_fixture("zero")
+    fixture["queues"]["not_run"] = {"tests": [], "total": 0}
+    if muted is not None:
+        fixture["headline"]["status"]["muted_not_run"] = muted
+        for entry, count in zip(fixture["headline"]["by_environment"],
+                                (muted, 0, 0)):
+            entry["muted_not_run"] = count
+    return fixture
+
+
+class MutedNotRunTest(unittest.TestCase):
+    """WP-44 item 20: a test under a live mute that has stopped running
+    leaves the Not run tile, tab and filter (the server's half), and the
+    page says how many were set aside: the tile's sub-line ends "+5
+    muted" through withSetAside(), as the failing tiles' do, and the
+    tab's empty line names them rather than claiming every test reported
+    in. A payload without ``muted_not_run``, or with it 0, draws exactly
+    what the page drew before."""
+
+    _walks = {}  # type: Dict[Optional[int], Dict[str, Any]]
+
+    def _walk(self, muted: Optional[int]) -> Dict[str, Any]:
+        if muted not in self._walks:
+            self._walks[muted] = _shim(_not_run_fixture(muted),
+                                       _HOME_STATE_DRIVER)
+        return self._walks[muted]
+
+    def test_the_tile_goes_through_the_set_aside_helper(self) -> None:
+        status = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        self.assertRegex(status, r'withSetAside\("no run " \+ windowPhrase'
+                                 r'\(summary\),\s*status\.muted_not_run, 0\)')
+
+    def test_the_empty_line_comes_from_one_helper(self) -> None:
+        app = _strip_comments(read("app.js"))
+        table = _function_body(app, "function renderQueueTable()")
+        self.assertIn("emptyNote.textContent = queueEmptyText(queueId);",
+                      table)
+        self.assertNotIn("QUEUE_EMPTY_TEXT[", table)
+        body = _function_body(app, "function queueEmptyText(queueId)")
+        self.assertIn('queueId === "not_run"', body)
+        self.assertIn("setAsideWords(status.muted_not_run, 0)", body)
+        self.assertIn("return QUEUE_EMPTY_TEXT[queueId];", body)
+        self.assertIn('"No unmuted test has gone silent"', body)
+
+    def test_all_clear_names_muted_quiet_tests_only_if_it_counts_them(
+            self) -> None:
+        """"All clear" is a claim about New failures, Still failing and
+        Stale annotations. Were Not run ever among its conditions, a
+        board cleared by muting quiet tests would have to say so: its
+        aside's muted figure would then carry ``muted_not_run``."""
+        app = _strip_comments(read("app.js"))
+        tabs = _function_body(app, "function renderQueueTabs()")
+        conditions = re.search(r"const known = \[([^\]]*)\]", tabs)
+        self.assertIsNotNone(conditions)
+        aside = _function_body(app, "function renderAllClearAside()")
+        if '"not_run"' in conditions.group(1):
+            self.assertIn("status.muted_not_run", aside)
+        else:
+            self.assertNotIn("muted_not_run", aside)
+
+    def test_the_detector_reads_the_conditions(self) -> None:
+        planted = 'const known = ["new_failures", "not_run"]\n'
+        found = re.search(r"const known = \[([^\]]*)\]", planted)
+        self.assertIsNotNone(found)
+        self.assertIn('"not_run"', found.group(1))
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_the_tile_and_the_empty_line_over_the_shim(self) -> None:
+        def drawn(answer: Dict[str, Any]) -> Tuple[str, Any]:
+            tiles = answer["regions"]["stat-tiles"][7]
+            subs = {_dom_text(tile[7][0]): _dom_text(tile[7][2])
+                    for tile in tiles}
+            empty = answer["queues"]["Not run"][3]
+            return subs["Not run"], [empty[2], _dom_text(empty)]
+
+        before_sub, before_empty = drawn(self._walk(None))
+        self.assertTrue(before_sub.startswith("no run since "))
+        self.assertNotIn("muted", before_sub)
+        self.assertEqual(before_empty, [
+            "", "Every test reported in — nothing has gone silent."])
+        self.assertEqual(drawn(self._walk(0)), (before_sub, before_empty))
+        sub, empty = drawn(self._walk(5))
+        self.assertEqual(sub, before_sub + " · +5 muted")
+        self.assertEqual(empty, [
+            "", "No unmuted test has gone silent · 5 muted"])
+        self.assertEqual(drawn(self._walk(1))[1][1],
+                         "No unmuted test has gone silent · 1 muted")
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_nothing_else_changes(self) -> None:
+        """The same requests, and every region and tab but the Not run
+        tile and the Not run tab's empty line drawn as without the field:
+        the per-environment figure is in the payload but no surface draws
+        a per-environment not-run count."""
+        before, after = self._walk(None), self._walk(5)
+        self.assertEqual(after["asked"], before["asked"])
+        self.assertEqual(after["aside"], before["aside"])
+        for region in _HOME_REGIONS:
+            if region != "stat-tiles":
+                self.assertEqual(after["regions"][region],
+                                 before["regions"][region], region)
+        tiles = [tile for tile in after["regions"]["stat-tiles"][7]
+                 if _dom_text(tile[7][0]) != "Not run"]
+        self.assertEqual(tiles, [
+            tile for tile in before["regions"]["stat-tiles"][7]
+            if _dom_text(tile[7][0]) != "Not run"])
+        for label, drawn in after["queues"].items():
+            if label != "Not run":
+                self.assertEqual(drawn, before["queues"][label], label)
+        self.assertEqual(after["queues"]["Not run"][:3],
+                         before["queues"]["Not run"][:3])
 
 
 #: Home over the shim, driven by a list of steps (WP-44): every

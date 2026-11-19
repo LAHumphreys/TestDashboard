@@ -897,7 +897,11 @@ function renderStatus() {
     label: "Not run",
     value: status.not_run.toLocaleString(),
     accent: status.not_run > 0 ? "accent-warn" : "accent-zero",
-    sub: "no run " + windowPhrase(summary),
+    // A test under a live mute that has gone quiet is left out of this
+    // figure (WP-44 item 20) and named beside it, as a muted failure is
+    // beside the failing ones. Not run has no flaking part.
+    sub: withSetAside("no run " + windowPhrase(summary),
+      status.muted_not_run, 0),
     onClick: () => openQueue("not_run"),
   }));
 }
@@ -1164,6 +1168,21 @@ const QUEUE_EMPTY_TEXT = {
   not_run: "Every test reported in — nothing has gone silent.",
   mine: "Nothing is assigned to you.",
 };
+
+/** A queue tab's empty line. Not run leaves out the tests under a live
+ * mute that have gone quiet (WP-44 item 20), so while the headline says
+ * there are some, "every test reported in" would be untrue: the line
+ * names them instead, in the words "All clear" sets aside with. */
+function queueEmptyText(queueId) {
+  const status = state.summary ? state.summary.status : null;
+  const words = queueId === "not_run" && status
+    ? setAsideWords(status.muted_not_run, 0) : [];
+  if (!words.length) {
+    return QUEUE_EMPTY_TEXT[queueId];
+  }
+  return ["No unmuted test has gone silent"]
+    .concat(words.map((part) => part.text)).join(" · ");
+}
 
 function queueEntries(queueId) {
   // Every queue — "mine" included — arrives filtered, ordered and capped
@@ -1678,7 +1697,7 @@ function renderQueueTable() {
   }
   if (allEntries.length === 0) {
     table.hidden = true;
-    emptyNote.textContent = QUEUE_EMPTY_TEXT[queueId];
+    emptyNote.textContent = queueEmptyText(queueId);
     emptyNote.hidden = false;
     capNote.hidden = true;
     resultNote.hidden = true;

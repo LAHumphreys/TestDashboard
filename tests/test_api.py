@@ -7454,6 +7454,203 @@ class SummaryAssignedSplitTest(ApiCase):
         self.assertEqual(self._selects(query), [])
 
 
+class NotRunMutedApiTest(ApiCase):
+    """WP-44 item 20, the JSON contract: a test under a live mute whose
+    latest run is before ``stale_before`` leaves ``status.not_run``,
+    ``by_environment[].not_run``, ``queue_totals.not_run``, the Not run
+    queue and the browse read with ``stale=1`` (and so a bulk assign over
+    it), and ``muted_not_run`` says how many it left out.
+
+    TestSummary's estate (test_stale is quiet and unmuted) plus three
+    quiet tests, all muted for a day at NOW: test_quiet_fail and
+    test_quiet_pass on linux-sim (declared as Atlas), test_quiet_env2 on
+    env2; test_new_fail is muted too but ran recently. Build b1 runs
+    test_b_quiet (muted on the build) and test_b_plain on days of their
+    own, and four tests on the 26th.
+    """
+
+    LATER = NOW + datetime.timedelta(hours=25)
+
+    def setUp(self) -> None:
+        super().setUp()
+        TestSummary.seed(self)  # type: ignore
+
+        def at(day: int, hour: int = 2) -> str:
+            return "2026-07-{:02d}T{:02d}:00:00.000000".format(day, hour)
+
+        # Each quiet run on a day of its own, a few of an environment's
+        # tests: no block of them counts as a pass, so the cutoff stays
+        # TestSummary's (the 25th, 00:00) on mainline and on the build.
+        self.import_runs([
+            record(test_name="test_quiet_fail", result="FAIL",
+                   start_time=at(15), end_time=at(15, 3)),
+            record(test_name="test_quiet_pass", result="PASS",
+                   start_time=at(17), end_time=at(17, 3)),
+            record(environment="env2", script="smoke.py",
+                   test_name="test_quiet_env2", result="PASS",
+                   start_time=at(18), end_time=at(18, 3)),
+        ] + [
+            record(environment="env2", script="smoke.py", test_name=name,
+                   result="PASS", start_time=at(26), end_time=at(26, 3))
+            for name in ("test_env2_a", "test_env2_b")
+        ] + [
+            record(test_name=name, result="PASS", build="b1",
+                   start_time=at(day, 4), end_time=at(day, 5))
+            for name, day in (("test_b_quiet", 15), ("test_b_plain", 17),
+                              ("test_new_fail", 26), ("test_fixed", 26),
+                              ("test_note", 26), ("test_still_fail", 26))
+        ])
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.build = self.storage.list_streams("")[0].stream_id
+
+        def entry(name: str, environment: str = "linux-sim",
+                  script: str = "suite/alpha.py",
+                  stream_id: int = MAINLINE_STREAM_ID) -> Dict[str, Any]:
+            return {"environment": environment, "script": script,
+                    "test_name": name, "stream_id": stream_id}
+
+        self.call("POST", "/api/mutes/bulk", body={
+            "username": "bob", "reason": "infra", "hours": 24,
+            "assignee": "carol",
+            "tests": [entry("test_quiet_fail"), entry("test_quiet_pass"),
+                      entry("test_new_fail"),
+                      entry("test_quiet_env2", "env2", "smoke.py"),
+                      entry("test_b_quiet", stream_id=self.build)]})
+
+    def _get(self, path: str, query: Dict[str, List[str]],
+             at: datetime.datetime = NOW) -> Dict[str, Any]:
+        response = api.handle_api(
+            self.storage,
+            api.Request(method="GET", path=path, query=query, body=b""),
+            now=lambda: at)
+        self.assertEqual(response.status, 200)
+        return json.loads(response.body.decode("utf-8"))
+
+    def _figures(self, query: Dict[str, List[str]],
+                 at: datetime.datetime = NOW) -> Dict[str, Any]:
+        """Every Not run figure and list in one scope, by the API."""
+        head = self._get("/api/summary", dict(query, parts=["headline"]), at)
+        queue = self._get("/api/summary", dict(
+            query, parts=["queue"], queue=["not_run"]), at)["queue"]
+        full = self._get("/api/summary", dict(query), at)
+        browse = self._get("/api/dashboard", dict(
+            query, stale=["1"], limit=["250"]), at)
+        status = head["status"]
+        self.assertEqual(
+            status["not_run"] + status["muted_not_run"],
+            status["total_tests"] - status["ran_recently"], status)
+        for rollup in head["by_environment"]:
+            self.assertIn("muted_not_run", rollup)
+        return {
+            "not_run": status["not_run"],
+            "muted_not_run": status["muted_not_run"],
+            "by_environment": {
+                rollup["environment"]: (rollup["not_run"],
+                                        rollup["muted_not_run"])
+                for rollup in head["by_environment"]},
+            "queue_totals": head["queue_totals"]["not_run"],
+            "queue_total": queue["total"],
+            "queue": sorted(test["test_name"] for test in queue["tests"]),
+            "full_total": full["queues"]["not_run"]["total"],
+            "full_queue": sorted(
+                test["test_name"] for test in full["queues"]["not_run"][
+                    "tests"]),
+            "browse_total": browse["total"],
+            "browse": sorted(test["test_name"] for test in browse["tests"]),
+        }
+
+    @staticmethod
+    def _expect(names: List[str], muted: int,
+                by_environment: Dict[str, Tuple[int, int]]
+                ) -> Dict[str, Any]:
+        return {
+            "not_run": len(names), "muted_not_run": muted,
+            "by_environment": by_environment,
+            "queue_totals": len(names), "queue_total": len(names),
+            "queue": sorted(names), "full_total": len(names),
+            "full_queue": sorted(names), "browse_total": len(names),
+            "browse": sorted(names),
+        }
+
+    def test_mainline(self) -> None:
+        self.assertEqual(self._figures({}), self._expect(
+            ["test_stale"], 3,
+            {"env2": (0, 1), "linux-sim": (1, 2)}))
+
+    def test_scoped_by_product_and_by_environment(self) -> None:
+        self.assertEqual(self._figures({"product": ["Atlas"]}), self._expect(
+            ["test_stale"], 2, {"linux-sim": (1, 2)}))
+        self.assertEqual(self._figures({"environment": ["env2"]}),
+                         self._expect([], 1, {"env2": (0, 1)}))
+
+    def test_a_build_reads_its_own_mutes(self) -> None:
+        figures = self._figures({"stream": [str(self.build)]})
+        self.assertEqual(figures["muted_not_run"], 1)
+        self.assertNotIn("test_b_quiet", figures["queue"])
+        self.assertIn("test_b_plain", figures["queue"])
+        self.assertEqual(figures["queue"], figures["full_queue"])
+        self.assertEqual(
+            figures["queue_totals"],
+            figures["not_run"])
+        self.assertEqual(figures["queue_total"], len(figures["queue"]))
+
+    def test_the_unchanged_figures(self) -> None:
+        """total_tests, ran_recently, results, muted_total and the Muted
+        queue keep every muted test; the failing figures are WP-40's."""
+        status = self._get("/api/summary", {"parts": ["headline"]})["status"]
+        self.assertEqual(
+            (status["total_tests"], status["ran_recently"],
+             status["results"]["FAIL"], status["muted_total"]),
+            (11, 7, 4, 4))
+        muted = self._get("/api/summary", {
+            "parts": ["queue"], "queue": ["muted"]})["queue"]
+        self.assertEqual(
+            sorted(test["test_name"] for test in muted["tests"]),
+            ["test_new_fail", "test_quiet_env2", "test_quiet_fail",
+             "test_quiet_pass"])
+
+    def test_an_expiry_puts_them_back_with_no_write(self) -> None:
+        self._figures({})
+        later = self._figures({}, self.LATER)
+        self.assertEqual(later["muted_not_run"], 0)
+        for name in ("test_stale", "test_quiet_fail", "test_quiet_pass",
+                     "test_quiet_env2"):
+            for figure in ("queue", "full_queue", "browse"):
+                self.assertIn(name, later[figure], (name, figure))
+        self.assertEqual(later["queue_totals"], later["not_run"])
+        self.assertEqual(later["browse_total"], later["not_run"])
+
+    def test_a_bulk_assign_over_stale_acts_on_the_listed_set(self) -> None:
+        updated = self.call(
+            "POST", "/api/assignments/bulk", query={"stale": ["1"]},
+            body={"username": "dave", "assigned_by": "bob"})["updated"]
+        self.assertEqual(updated, 1)
+        owners = {
+            name: self.storage.current_assignee(environment, script, name)
+            for environment, script, name in (
+                ("linux-sim", "suite/alpha.py", "test_stale"),
+                ("linux-sim", "suite/alpha.py", "test_quiet_fail"),
+                ("env2", "smoke.py", "test_quiet_env2"))}
+        self.assertEqual(owners, {"test_stale": "dave",
+                                  "test_quiet_fail": "carol",
+                                  "test_quiet_env2": "carol"})
+
+    def test_with_no_mute_the_figure_is_zero_and_present(self) -> None:
+        self.call("POST", "/api/mutes/unmute", body={
+            "username": "bob",
+            "tests": [{"environment": e, "script": s, "test_name": n,
+                       "stream_id": MAINLINE_STREAM_ID}
+                      for e, s, n in (
+                          ("linux-sim", "suite/alpha.py", "test_quiet_fail"),
+                          ("linux-sim", "suite/alpha.py", "test_quiet_pass"),
+                          ("linux-sim", "suite/alpha.py", "test_new_fail"),
+                          ("env2", "smoke.py", "test_quiet_env2"))]})
+        self.assertEqual(self._figures({}), self._expect(
+            ["test_quiet_env2", "test_quiet_fail", "test_quiet_pass",
+             "test_stale"], 0, {"env2": (1, 0), "linux-sim": (3, 0)}))
+
+
 class NamesPartTest(ApiCase):
     """WP-44: ``parts=names``, the catalogue the Open Actions page reads
     from the summary on its first paint, without the headline, trend
@@ -8010,13 +8207,22 @@ class NoMarksAddsNothingTest(ApiCase):
     #: epoch's statement carrying the bit, two fewer than New failures
     #: (no count, no rows), and every statement it runs is one the New
     #: failures queue runs (test_the_flaking_queue_runs_nothing_new).
+    #:
+    #: WP-44 item 20 moves ``queue_not_run`` from 8 to 10 on this fixture,
+    #: which holds a live mute: the Not run queue now reads mutes, so it
+    #: pays the mute epoch's MIN, as the three queues that already read
+    #: them do (9 each), and its count, kept byte-identical with no mute
+    #: join, has the muted cells read (bounded by the mutes) taken off
+    #: it. Both are memo hits after the headline; with no live mute it is
+    #: the epoch alone, and after a headline nothing
+    #: (tests/test_storage.py's NotRunMutedStatementsTest pins both).
     BASE_COLD_SELECTS = {
         "headline": 22, "full": 29, "browse": 3, "open_actions": 13,
         "watch": 12, "detail": 5, "detail_build": 9, "names": 9,
         "assigned_trend": 2,
         "queue_new_failures": 9, "queue_still_failing": 9,
         "queue_muted": 9, "queue_fixed": 8, "queue_unexpected_passes": 8,
-        "queue_not_run": 8, "queue_assigned": 8, "queue_mine": 11,
+        "queue_not_run": 10, "queue_assigned": 8, "queue_mine": 11,
         "queue_flaking": 7,
         "browse_fail": 3, "browse_fail_flaking": 3, "browse_flaking": 1,
         "open_actions_failing": 13, "assigned_trend_90": 2,

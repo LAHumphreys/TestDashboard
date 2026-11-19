@@ -882,6 +882,15 @@ expires_at, muted_by, extensions, live, stream_id}`); test detail
 carries the stream's current `mute` and the `mute_history` across streams,
 newest first (`action` is `mute`, `extend` or `unmute`).
 
+A live mute also sets aside a test that has stopped running: it is left out
+of `status.not_run`, `by_environment[].not_run`, `queue_totals.not_run`, the
+`not_run` queue's rows and `GET /api/dashboard?stale=1` (and so out of a bulk
+assignment over that filter), and counted in `status.muted_not_run` and
+`by_environment[].muted_not_run` instead, so `not_run + muted_not_run` is
+always `total_tests - ran_recently`. It is still in the `muted` queue and in
+`total_tests`, and is back in every `not_run` figure the moment the mute
+expires. `stale=1` with `muted=true` therefore matches nothing.
+
 ### Flaky marks (WP-44) — `/api/flaky/*`
 
 A person can **mark** a test as flaky, with a **cadence** of 2 to 10: "fail if

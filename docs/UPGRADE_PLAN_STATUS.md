@@ -5293,3 +5293,75 @@ No performance pass: two strings built in the browser, off the trigger
 paths. Counts in the main checkout, `tclsh` and `node` on PATH: 3067 OK
 (skipped 1) on SQLite and 4242 OK (skipped 91) with the MariaDB variants
 on a local 12.3, unchanged. No browser has rendered it.
+
+## WP-44: three answers from the owner before the drop (2026-11-19)
+
+CI at the branch head (`45c957a`, item 19) passed all twelve jobs. The
+owner, asked the open decisions of the handover on the day the drop was
+retargeted to 2026-11-19, answered three of them:
+
+- **The offer in a test page's header stays on every unmarked test's
+  page**, passing tests included, as item 17 built it. Closed.
+- **The headline's cost where marks exist is accepted for now** (cold
+  only: SQLite +22% at 50 marks and +41% at 1,000 against a bar of 18%
+  and 34%; a local MariaDB 12.3 +18% and +38% against 16% and 34%). "For
+  now" is the owner's: the priced alternatives in the item 6 entry stand
+  untaken, not rejected. The question put to the owner named the
+  headline only; the per-day chart's split and the trend part's cost
+  were not asked and are still open.
+- **The drop of 2026-10-13 is deployed.** It was cut on top of the drop
+  of 2026-10-12, so the drop of WP-44 carries WP-44 alone: migration 12
+  and a restart.
+
+Not answered and still open: a time column on a Flaking row; whether
+any page should list every mark. No code changed.
+
+## WP-44 item 20: a muted test that has stopped running leaves Not run (2026-11-19)
+
+The owner asked, before the drop, that muting a test that has stopped
+running take it off the Not run numbers, and of three scopes offered
+chose the widest: gone everywhere but the Muted tab. Two briefs against
+one payload contract, backend and UI, each in its own worktree; the
+commit message has the contract, the design and every number.
+
+What is true now: a test under a live mute whose latest run is older
+than the stale cutoff is out of `status.not_run`, the per-environment
+figure, the Not run queue's total and rows, and the browse read with
+`stale=1`; `status.muted_not_run` and its per-environment twin count
+it; the tile says "+N muted" and the tab's empty line names them. It is
+back at the mute's expiry with no write.
+
+The performance design pass changed the shape before anything was
+written: the brief would have added the mutes join to two count
+statements, which WP-40 had measured at +15 to +31 ms and left out on
+purpose. As built the counts are byte-identical and the muted cells are
+subtracted; the price is two small statements where the Not run tab is
+fetched before a headline. `NoMarksAddsNothingTest`'s cold count for
+that part moved from 8 to 10 and the owner accepted it, adding that
+features will cost performance and that a drop centred on performance
+may be wanted after this one. The measured pass: SQLite the same
+everywhere; a local MariaDB 12.3 +0.5 to +1.6 ms cold on that one part.
+
+Review: fresh eyes found a comment naming a test class that does not
+exist (fixed by the implementer) and nothing else; no existing
+expectation changed but the one above. The walkthrough, on a play
+server over a shifted copy of perf-seed/1 with 42 quiet tests on
+mainline and 12 on a build, found no defect: the tile, the badge, the
+rows and the filter agreed in every scope tried and moved together
+when a quiet test was muted and unmuted through the API. The expiry was
+not run live (a mute lasts at least an hour); it rests on the
+fixed-clock tests.
+
+Named to the owner, not built, all older than this item: the Review
+panel and a test's page offer Mute only for a failing test, so a quiet
+test whose last result is a pass can be muted from the selection bar
+only; the mute's wording speaks of failures throughout; the Muted tab
+shows such a row as "PASS→PASS" with nothing saying it is quiet, and it
+is now the only list the test is in; the empty lines of New failures
+and Still failing do not name their muted tests as Not run's now does;
+a build's `stale=1` browse uses mainline's cutoff; the Time page's
+count of excluded quiet tests still includes muted ones.
+
+Counts in the main checkout, `tclsh` and `node` on PATH:
+3093 OK (skipped 1) on SQLite and 4285 OK (skipped 91) with the MariaDB
+variants on a local 12.3. No browser has rendered it.

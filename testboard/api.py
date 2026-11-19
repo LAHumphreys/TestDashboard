@@ -2176,6 +2176,12 @@ def _handle_summary(
                 "flaking_new_failures": status.flaking_new_failures,
                 "flaking_still_failing": status.flaking_still_failing,
                 "flaky_total": status.flaky_total,
+                # WP-44 item 20: ``not_run`` above EXCLUDES the tests
+                # under a live mute that have not run since
+                # ``stale_before``; this is how many it left out, never
+                # a silent subtraction. ``not_run + muted_not_run ==
+                # total_tests - ran_recently``.
+                "muted_not_run": status.muted_not_run,
             },
             "trend": {
                 "days": days,
@@ -2197,6 +2203,8 @@ def _handle_summary(
                     # WP-44: beside "failed", "muted" and "assigned",
                     # inside none of them.
                     "flaking": rollup.flaking,
+                    # WP-44 item 20: taken off "not_run", reported here.
+                    "muted_not_run": rollup.muted_not_run,
                 }
                 for rollup in estate.by_environment
             ],

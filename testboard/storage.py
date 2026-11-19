@@ -3791,6 +3791,18 @@ class Storage:
             clauses.append(_MUTE_LIVE if muted else _NOT_MUTE_LIVE)
             params.append(model.format_iso(now or model.utcnow()))
 
+        # WP-44 item 20: "not run recently" leaves out the tests under a
+        # live mute, as the Not run queue does. The epoch is read only
+        # when that filter is on (memoized; None, the common case, adds
+        # no term and so no join); `muted=False` already says it, and
+        # with `muted=True` the two together match nothing, by the
+        # owner's rule. The statements join `tm` for it by
+        # :meth:`_reads_mutes`.
+        if (stale_before is not None and muted is not False
+                and self.mute_epoch(stream_id, now) is not None):
+            clauses.append(_NOT_MUTE_LIVE)
+            params.append(model.format_iso(now or model.utcnow()))
+
         if assignment_origin == "build":
             clauses.append("(ca.stream_id IS NOT NULL AND ca.stream_id != ?)")
             params.append(MAINLINE_STREAM_ID)
@@ -3803,6 +3815,14 @@ class Storage:
                 "got {!r}".format(assignment_origin)
             )
         return clauses, params
+
+    @staticmethod
+    def _reads_mutes(clauses: Sequence[str]) -> bool:
+        """Whether :meth:`_dashboard_filters`' *clauses* read ``tm``: the
+        *muted* filter or the stale filter's live-mute term (WP-44 item
+        20). A count or keys statement appends :data:`_MUTE_JOIN` then
+        and only then; see :attr:`_LATEST_COUNT_JOIN`."""
+        return _MUTE_LIVE in clauses or _NOT_MUTE_LIVE in clauses
 
     @staticmethod
     def _order_by(sort: str, descending: bool) -> str:
@@ -4054,7 +4074,7 @@ class Storage:
         total = None  # type: Optional[int]
         if aside is not None and self._set_aside_by_keys(aside, len(params)):
             keys = self._matched_keys(
-                clauses, params, sort, descending, muted, aside)
+                clauses, params, sort, descending, aside)
             page = (keys[offset:] if limit is None
                     else keys[offset:offset + limit])
             rows = self._rows_by_key(stream_id, page, columns, join)
@@ -4078,7 +4098,7 @@ class Storage:
                 row_params.append(offset)
             rows = self._conn().execute(sql, row_params).fetchall()
             if counted:
-                total = self._count_matched(clauses, params, muted)
+                total = self._count_matched(clauses, params)
 
         if not with_flaky:
             if not with_latest_comment:
@@ -4107,14 +4127,14 @@ class Storage:
 
     def _count_matched(
         self, clauses: Sequence[str], params: Sequence[Any],
-        muted: Optional[bool],
     ) -> int:
         """The dashboard's ``COUNT(*)`` over *clauses*: the count join
-        (``ca`` and ``tr``) and the mute join only when the *muted*
-        filter reads it, never the marks' (the count-join rule)."""
+        (``ca`` and ``tr``) and the mute join only when a clause reads
+        it (:meth:`_reads_mutes`), never the marks' (the count-join
+        rule)."""
         sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
-        if muted is not None:
-            # The only filter that reads `tm`; see _LATEST_COUNT_JOIN.
+        if self._reads_mutes(clauses):
+            # The only filters that read `tm`; see _LATEST_COUNT_JOIN.
             sql += " " + _MUTE_JOIN
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
@@ -4353,16 +4373,15 @@ class Storage:
         params: Sequence[Any],
         sort: str,
         descending: bool,
-        muted: Optional[bool],
         aside: _SetAside,
     ) -> List[Tuple[str, str, str]]:
         """The keys form's one statement: every key the filters match, in
         the sort's order, over the count's join (the mute join only when
-        the *muted* filter reads it; every sort reads ``lr`` or ``ca``),
-        with *aside* dropped in Python."""
+        a clause reads it, :meth:`_reads_mutes`; every sort reads ``lr``
+        or ``ca``), with *aside* dropped in Python."""
         sql = ("SELECT lr.environment, lr.script, lr.test_name, lr.result "
                + self._LATEST_COUNT_JOIN)
-        if muted is not None:
+        if self._reads_mutes(clauses):
             sql += " " + _MUTE_JOIN
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
@@ -4596,11 +4615,11 @@ class Storage:
         if aside is not None:
             if self._set_aside_by_keys(aside, len(params)):
                 return len(self._matched_keys(
-                    clauses, params, "environment", False, muted, aside))
+                    clauses, params, "environment", False, aside))
             terms, term_params = self._set_aside_terms(aside)
             clauses = clauses + terms
             params = params + term_params
-        return self._count_matched(clauses, params, muted)
+        return self._count_matched(clauses, params)
 
     def environments(
         self, environments: Optional[Sequence[str]] = None,
@@ -7080,8 +7099,16 @@ class Storage:
         stream_id: int = MAINLINE_STREAM_ID,
         now: Optional[datetime.datetime] = None,
         also_new: Optional[Tuple[str, List[Any]]] = None,
+        quiet_mutes: bool = False,
     ) -> Tuple[str, List[Any]]:
         """Build the WHERE clause for one triage queue.
+
+        *quiet_mutes* (WP-44 item 20, ``not_run`` only) leaves out the
+        tests under a live mute: :data:`_NOT_MUTE_LIVE`, *now* bound
+        after the cutoff. The caller passes it only when the stream's
+        mute epoch is not None, so with no live mute the statement is
+        exactly what it was, and only where ``tm`` is joined (the rows
+        always; a count only when it appends :data:`_MUTE_JOIN`).
 
         *also_new* (WP-44 item 6, ``new_failures`` only) is one more way
         into the New failures queue beside "previous result not FAIL",
@@ -7123,6 +7150,10 @@ class Storage:
                     also_new[0], _NOT_MUTE_LIVE))
             params.extend([Result.FAIL.value, Result.FAIL.value])
             params.extend(also_new[1])
+        if quiet_mutes:
+            if kind != "not_run":
+                raise ValueError("quiet_mutes is the Not run queue's")
+            predicate = predicate + " AND " + _NOT_MUTE_LIVE
         sql = " WHERE lr.stream_id = ? AND {} AND {}".format(
             predicate, Storage._NOT_RETIRED
         )
@@ -7132,7 +7163,7 @@ class Storage:
                     "queue {!r} needs stale_before".format(kind)
                 )
             params.append(model.format_iso(stale_before))
-        if kind in _NOW_QUEUES:
+        if kind in _NOW_QUEUES or quiet_mutes:
             params.append(model.format_iso(now or model.utcnow()))
         if environment is not None:
             sql += " AND lr.environment = ?"
@@ -7227,9 +7258,14 @@ class Storage:
         marked = (
             self.flaky_marks_exist(stream_id, now) if marks is None
             else marks)
+        # WP-44 item 20: the Not run queue reads the epoch too. A live
+        # mute leaves a quiet test out of it, so its key carries the
+        # epoch (an expiry puts the test back with no write) and its
+        # statement binds the term only when the epoch is not None.
         epoch = (
             self.mute_epoch(stream_id, now)
-            if kind in _NOW_QUEUES or (marked and kind == "fixed")
+            if kind in _NOW_QUEUES or kind == "not_run"
+            or (marked and kind == "fixed")
             else None
         )
         key = (
@@ -7271,6 +7307,7 @@ class Storage:
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
             stream_id, now, also_new,
+            quiet_mutes=kind == "not_run" and epoch is not None,
         )
         ceiling = self._backend.max_bound_parameters
         if (also_new is not None and ceiling is not None
@@ -7521,19 +7558,38 @@ class Storage:
             return (0 if view is None else sum(
                 1 for entry in view.counted
                 if entry.role == FLAKY_ROLE_FLAKING)), marked
+        # WP-44 item 20: the Not run count leaves out the quiet tests
+        # under a live mute. The statement stays the one it was, with no
+        # mute join (a count carries no join its WHERE does not read),
+        # and the muted cells that did not run since the cutoff come off
+        # it: the cells the headline has read, on the same cutoff and
+        # scope (none, and no statement, with no live mute). They carry
+        # no owner, so an *assignee* (no API caller passes one for this
+        # kind) joins the mutes and binds the term instead.
+        quiet_cells = []  # type: List[RollupCount]
+        quiet_join = False
+        if kind == "not_run" and stale_before is not None:
+            if assignee is None:
+                quiet_cells = [
+                    cell for cell in self.muted_cells(
+                        now, stale_before, environment, environments,
+                        stream_id)
+                    if not cell.recent]
+            else:
+                quiet_join = self.mute_epoch(stream_id, now) is not None
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
-            stream_id, now,
+            stream_id, now, quiet_mutes=quiet_join,
         )
         sql = (
             "SELECT COUNT(*), (SELECT MIN(environment) "
             "FROM test_flaky_marks) " + self._LATEST_COUNT_JOIN)
-        if kind in _NOW_QUEUES:
-            # These three predicates read `tm`; see _LATEST_COUNT_JOIN.
+        if kind in _NOW_QUEUES or quiet_join:
+            # These predicates read `tm`; see _LATEST_COUNT_JOIN.
             sql += " " + _MUTE_JOIN
         sql += where
         row = self._conn().execute(sql, params).fetchone()
-        count = int(row[0])
+        count = int(row[0]) - sum(cell.count for cell in quiet_cells)
         marked = row[1] is not None
         if (marked and assignee is None
                 and kind in ("new_failures", "still_failing", "fixed")):
@@ -7567,8 +7623,10 @@ class Storage:
         WP-40: the memoized counts are the base figures; the live
         mutes (:meth:`muted_cells`, read fresh — tiny,
         time-dependent) are subtracted from ``new_failures``/
-        ``still_failing`` (FAIL cells only) and ALL summed into ``muted`` on every
-        call, so expiry is exact without touching the memo.
+        ``still_failing`` (FAIL cells only), from ``not_run`` (the cells
+        that did not run recently, WP-44 item 20) and ALL summed into
+        ``muted`` on every call, so expiry is exact without touching the
+        memo.
 
         WP-23 perf pass: ``/api/summary``'s full payload used to call
         :meth:`status_queue_count` once per :data:`QUEUE_KINDS` entry for
@@ -10153,10 +10211,15 @@ class Storage:
         """:meth:`queue_counts`' last step, on a COPY of the memoized
         dict: the live mutes on FAILING tests come off ``new_failures``/
         ``still_failing``, and EVERY live mute — failing or passing —
-        becomes ``muted``, so the tab's badge is its row count."""
+        becomes ``muted``, so the tab's badge is its row count. WP-44
+        item 20: a live mute that has not run since *stale_before* (any
+        result) comes off ``not_run``; the cells' ``recent`` is read on
+        that same cutoff, so this is the queue's own predicate."""
         counts["muted"] = 0
         for cell in self.muted_cells(
                 now, stale_before, environment, environments, stream_id):
+            if not cell.recent:
+                counts["not_run"] -= cell.count
             if cell.result is Result.FAIL:
                 if cell.prev_result is Result.FAIL:
                     counts["still_failing"] -= cell.count
@@ -11447,8 +11510,8 @@ class Storage:
             "ca.environment IS NOT NULL, lr.result "
             + self._LATEST_COUNT_JOIN
         )
-        if muted is not None:
-            # The only filter that reads `tm`; see _LATEST_COUNT_JOIN.
+        if self._reads_mutes(clauses):
+            # The only filters that read `tm`; see _LATEST_COUNT_JOIN.
             sql += " " + _MUTE_JOIN
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)

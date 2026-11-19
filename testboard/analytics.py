@@ -639,6 +639,14 @@ class SummaryStatus(NamedTuple):
     #: WP-44: every un-retired mark in scope whose test has run on the
     #: stream, whatever its state: the Flaky tab's badge.
     flaky_total: int
+    #: WP-44 item 20: tests under a live mute whose latest run started
+    #: before the cutoff. EXCLUDED from ``not_run`` above and reported
+    #: here beside it, never a silent subtraction: ``not_run +
+    #: muted_not_run == total_tests - ran_recently``. A mute sets a test
+    #: aside whole, so a quiet one is no longer a Not run test either;
+    #: it is still listed on the Muted tab and counted in
+    #: ``muted_total``.
+    muted_not_run: int
 
 
 class EnvironmentRollup(NamedTuple):
@@ -660,6 +668,9 @@ class EnvironmentRollup(NamedTuple):
     #: WP-44: the flaking failures, beside ``failed`` and ``muted`` and
     #: inside neither (nor inside ``assigned``).
     flaking: int
+    #: WP-44 item 20 — see SummaryStatus.muted_not_run; ``not_run``
+    #: excludes these.
+    muted_not_run: int
 
 
 class ProductRollup(NamedTuple):
@@ -1173,7 +1184,13 @@ def summarize_rollup(
     count), and a muted test that is passing is subtracted from
     nothing. A test still counts
     in ``total_tests`` and ``ran_recently``: it exists and it ran; it
-    is its failure that has been muted.
+    is its failure that has been muted. WP-44 item 20: a muted cell
+    that did NOT run recently (any result) leaves ``not_run`` and its
+    environment's ``not_run`` and is reported as ``muted_not_run``
+    beside them; ``total_tests`` and ``ran_recently`` are unchanged,
+    so ``not_run + muted_not_run == total_tests - ran_recently``. The
+    cells carry ``recent`` on the same cutoff as *counts*, which is how
+    every caller reads them.
 
     *assigned* (WP-43) is :meth:`Storage.assigned_cells` for the same
     stream and scope: the FAIL, un-retired tests with a current
@@ -1210,9 +1227,10 @@ def summarize_rollup(
     muted_new = 0
     muted_still = 0
     muted_total = 0
+    muted_not_run = 0
 
     # Per environment: [total, failed, new_failures, unexpected, not_run,
-    # muted, assigned, flaking]
+    # muted, assigned, flaking, muted_not_run]
     env_totals = collections.OrderedDict()  # type: Dict[str, List[int]]
 
     for cell in counts:
@@ -1240,7 +1258,7 @@ def summarize_rollup(
             fixed += cell.count
 
         if cell.environment not in env_totals:
-            env_totals[cell.environment] = [0, 0, 0, 0, 0, 0, 0, 0]
+            env_totals[cell.environment] = [0, 0, 0, 0, 0, 0, 0, 0, 0]
         bucket = env_totals[cell.environment]
         bucket[0] += cell.count
         if is_fail:
@@ -1256,8 +1274,16 @@ def summarize_rollup(
     # stream, same scope, retired excluded), so subtracting the FAIL
     # ones per (environment, prev_result, recent) is exact. A muted
     # test that is not failing is only counted, never subtracted.
+    # WP-44 item 20: whatever its result, a muted cell that did not run
+    # recently leaves not_run (bucket[4]) and is bucket[8].
     for cell in muted:
         muted_total += cell.count
+        if not cell.recent:
+            muted_not_run += cell.count
+            if cell.environment in env_totals:
+                bucket = env_totals[cell.environment]
+                bucket[4] -= cell.count
+                bucket[8] += cell.count
         if cell.result is not Result.FAIL:
             continue
         if cell.prev_result is Result.FAIL:
@@ -1310,7 +1336,7 @@ def summarize_rollup(
     status = SummaryStatus(
         total_tests=total,
         ran_recently=ran_recently,
-        not_run=total - ran_recently,
+        not_run=total - ran_recently - muted_not_run,
         retired=retired,
         results=results,
         recent_results=recent_results,
@@ -1326,6 +1352,7 @@ def summarize_rollup(
         flaking_new_failures=flaking_new,
         flaking_still_failing=flaking_still,
         flaky_total=flaky_total,
+        muted_not_run=muted_not_run,
     )
     by_environment = [
         EnvironmentRollup(
@@ -1338,6 +1365,7 @@ def summarize_rollup(
             muted=bucket[5],
             assigned=bucket[6],
             flaking=bucket[7],
+            muted_not_run=bucket[8],
         )
         for environment, bucket in sorted(env_totals.items())
     ]
