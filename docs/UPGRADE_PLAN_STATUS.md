@@ -5400,3 +5400,23 @@ questions follow them. A fresh-eyes pass over the assembled doc found
 fourteen places where the sections, the decisions and §0 disagreed or
 used a term a reader of the short path could not know; all are fixed.
 Nothing is built.
+
+## A default flaky cadence for an environment: the owner's verdicts on round 0 (2026-11-19)
+
+The owner went through all twenty-three decisions and the open questions
+of `docs/design/flaky-default-r0.md` in chat, each put as a question with
+its options; the answers are in the doc's "Round 1 review" section, word
+for word. Twenty-two decisions stand as recommended: the headline's price
+is accepted in the performance pass's cheaper shape, the streak kept at
+push time waits for a later drop centred on performance, and a default
+may be 2 to 10. A typical night sits nearer 50 failing tests than 500.
+
+Decision 3 is reversed. Round 0 recommended that the per-day chart count
+hand-marked tests only, because judging past nights by a default reads
+every run of the environment over the window (+298 to +317 ms at 14 days,
+on SQLite). The owner's verdict is that the chart must agree with every
+other surface, that it may draw that much later, and that it must not
+hold up the rest of the page; while it loads it shows its loading state
+and draws once. The drop moves out for it. The figure has not been taken
+on MariaDB or at a longer window; round 1 measures both. Round 1 rewrites
+§2 B.5, §3 U7 and §3a's section on the trend, and decision 3 with them.

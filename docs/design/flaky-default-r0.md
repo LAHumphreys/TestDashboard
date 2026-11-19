@@ -1,8 +1,12 @@
 # A default flaky cadence for an environment — design, round 0
 
-**Status: ROUND 0, for the owner's review (2026-11-19). §0 is agreed.
-Twenty-three decisions in §4 wait for a verdict, four of them on cost or
-on §0 itself, and five questions are open in §5. Nothing is built.**
+**Status: ROUND 1, dispositions in writing (2026-11-19). The owner's
+verdicts are in "Round 1 review" at the foot of this file: twenty-two
+decisions accepted as recommended, decision 3 reversed (the per-day chart
+must apply a default), and §5's four questions answered (the fifth needs
+no answer). §2 B.5, §3 U7 and
+§3a's "The trend" are being rewritten for decision 3; until that lands,
+§4 and those sections read as round 0 left them. Nothing is built.**
 It builds on `flaky-mark-r0.md` (WP-44, frozen) and uses its terms: a
 **mark**, the **cadence** N, **flaking**, **over its cadence**, a
 **triple**. A **default** is new here: an environment's standing cadence
@@ -883,3 +887,65 @@ migration 13.
    page, a build's headline, Open Actions' Failing mode on MariaDB at 50
    and 200; and the plans on MariaDB 10.3 and SQLite 3.26, which are
    CI's and the measured pass's to show.
+
+## Round 1 review (2026-11-19, in chat, captured verbatim)
+
+The owner went through §4 and §5 in chat, one decision at a time, each put
+with its recommended position and the alternatives as options. The owner's
+choice is quoted as the option's label; anything the owner typed is quoted
+whole.
+
+**§4, the four that need the owner.**
+
+1. The headline's price: **"Accept (Recommended)"**.
+2. The streak kept at push time: **"Later drop (Recommended)"** (not in
+   this drop; a candidate for the performance-centred drop after it).
+3. The per-day chart, offered as "Marks only (Recommended)", "Chart must
+   agree" or "Discuss". The owner typed: "Chart must agree. It can render
+   late (+300ms) but it must not hold up the rest of the page. Drop can
+   mvoe out […]". Asked then what the chart area
+   shows while the figures that apply the default are loading: **"Wait,
+   draw once (Recommended)"** (the usual loading state, then one drawing
+   with the right figures; nothing is shown that then changes).
+4. The values a default may take: **"2 to 10 (Recommended)"**.
+
+**§4, how it is built.** 5: **"Accept (Recommended)"**. 6: **"Accept
+(Recommended)"**. 7 (a reason to set, change and remove): **"Accept
+(Recommended)"**. 8 (the newest twenty changes shown): **"Accept
+(Recommended)"**. 9 (a removal can make New failures): **"Accept
+(Recommended)"**. 10: **"Accept (Recommended)"**. 11: **"Accept
+(Recommended)"**. 12 (the reason repeated on each failing row): **"Accept
+(Recommended)"**. 13: **"Accept (Recommended)"**.
+
+**§4, what the developer sees.** 14: **"Admin, after Metrics
+(Recommended)"**. 15: **"Accept (Recommended)"**. 16: **"No link
+(Recommended)"**. 17: **"No filter (Recommended)"**. 18: **"Accept
+(Recommended)"**. 19: **"No pill (Recommended)"**. 20: **"Accept
+(Recommended)"**. 21 ("Mark as flaky" and a "Change the default" link):
+**"Accept (Recommended)"**. 22: **"Accept (Recommended)"**. 23: **"Accept
+(Recommended)"**.
+
+**§5.** 1 (200 rows flaking by default in the Flaking tab): **"As drawn
+(Recommended)"**. 2 (a sub-line under Streak): **"No (Recommended)"**. 3
+(older What's new sections): **"Leave as history (Recommended)"**. 4
+(where in "50 to 500" a typical night sits): **"Nearer 50"**. 5 was not
+put: it lists what the build's measured pass has to cover.
+
+**Read as.** All are decisions; none is a style instruction, and no
+question came back. Twenty-two decisions stand as round 0 recommended
+them. Decision 3 is reversed, and it changes the design:
+
+- §0's "every surface that shows flaking agrees about a test flaking by
+  default" stands with no exception. The per-day chart applies an
+  environment's default to the nights it draws.
+- The cost the owner accepted is the read round 0 measured and rejected:
+  about +300 ms at a 14-day window, taken on SQLite. It has not been
+  measured on MariaDB, nor at a longer window; round 1 measures both
+  before the figure is called accepted there.
+- That read is not on any page's first paint and holds nothing else up.
+  Where the chart's scope has a default, the chart shows its loading
+  state and draws once.
+- The drop that carries WP-44 moves out for it.
+
+Round 1 rewrites §2 B.5, §3 U7 and §3a's "The trend" to that, and §4's
+decision 3 with them.
