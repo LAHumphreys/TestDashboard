@@ -161,7 +161,8 @@ A local `master` exists since 2026-10-03; keep it a mirror of
 | Plan | Spec | Branch | Status |
 |---|---|---|---|
 | WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8, status strip §9 (frozen 2026-10-13) | `wp-43-charts-assigned-split` | **merged as PR #20**; deployment not reported; one owner decision still open in its §7 (item 7 below) |
-| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11); the triage tab's contract is §14, which replaces §3 U8 and §13's | `wp-44-flaky-mark`, PR #21 | **built, every item done (1 to 10, then 11 to 19); not merged, not deployed.** The status strip is the doc's §12. Item 6h is not needed. CI green on `3d287b5`, 3.6.8 and MariaDB 10.3 included. Its item 3 claimed migration 12 and moved the parked WP-15 to 13 |
+| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11); the triage tab's contract is §14, which replaces §3 U8 and §13's | `wp-44-flaky-mark`, PR #21 | **built, every item done (1 to 10, then 11 to 19); not merged, not deployed.** The status strip is the doc's §12. Item 6h is not needed. CI green on `3d287b5`, 3.6.8 and MariaDB 10.3 included. Its item 3 claimed migration 12 and moved the parked WP-15 to 13. Item 20 (a muted test that has stopped running leaves Not run) was added and committed on 2026-11-19 as `6217c3e` |
+| A default flaky cadence for an environment, with the Admin page (ships in WP-44's drop) | `docs/design/flaky-default-r0.md` §6, status strip in §6 (frozen 2026-11-19 after round 1) | `wp-44-flaky-mark`, PR #21 | **building: items 21 to 27, unattended through `/overnight` from 2026-11-19**, aiming at a drop dated 2026-11-20. Item 22 claims migration 13 and moves the parked WP-15 to 14. Each commit is pushed for CI. The owner's click-through on a play server precedes the drop |
 
 ## Needs a person, not a commit
 

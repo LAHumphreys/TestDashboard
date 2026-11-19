@@ -5420,3 +5420,32 @@ hold up the rest of the page; while it loads it shows its loading state
 and draws once. The drop moves out for it. The figure has not been taken
 on MariaDB or at a longer window; round 1 measures both. Round 1 rewrites
 §2 B.5, §3 U7 and §3a's section on the trend, and decision 3 with them.
+
+## A default flaky cadence for an environment: round 1 closed, the design frozen (2026-11-19)
+
+Round 1 rewrote the three places decision 3's reversal touched, each by
+its owning agent: §2 B.5 (the rule for a past night, judged by today's
+default as marks are), §3 U7a (the chart waits for its late part and draws
+once) and §3a's section on the trend. The performance pass replaced round
+0's figure, which had been taken on a seed with seven nights, with one
+taken on 90 nights, two runs a night, on both backends. The backend
+section's first shape, every window run of the environment's tests read
+into Python, cost +1,010 ms on SQLite and +2,224 on a local MariaDB 12.3
+at 50 failing tests a night and is withdrawn. The pass's shape drives one
+statement per environment with a default from the window's failed runs
+and judges each in the engine: +62 to +64 ; +67 to +70 ms at 50 failing a
+night and +238 ; +716 to +735 at 500, at the 14-day window, on the chart's
+late part only. No first-paint request gains a statement. MariaDB 10.3 is
+not measured; the build's pass takes it by hand.
+
+The figure at 500 on MariaDB is above the +300 the owner first accepted,
+so it went back to the owner with three more decisions: the measured cost
+is accepted; the chart waits and draws once on every scope; a late part
+that fails draws the totals and says so; a past night is judged by today's
+default. They are §4's decisions 24 to 27, and the answers are in the
+doc's "Round 1 review", word for word. No decision is open.
+
+The sizing pass is the doc's §6: seven items, 21 to 27, on the branch that
+carries WP-44, with a status strip. The owner chose an unattended run
+through `/overnight`, with each commit pushed for CI, aiming at a drop
+dated 2026-11-20. The handover registers the build.
