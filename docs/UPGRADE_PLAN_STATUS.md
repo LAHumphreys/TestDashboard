@@ -5577,3 +5577,17 @@ that the chart counts a default's tolerated failures is true of the
 build only with item 24. Both are checked at the build's last walk.
 For the owner's click-through: the loading line under the card's dim,
 the card's height between line and chart, the amber line.
+
+## The default flaky cadence: the owner on item 22's three open points (2026-11-19)
+
+Three things from item 22 were put to the owner while the build ran: a
+`PUT` with no `cadence` key is a 400, so leaving the field out can never
+remove a default; a default's reason is at most 500 characters, with a
+new 400; and `mark_flaky` and `unmark_flaky` have, older than this
+build, the two-writers gap on MariaDB that item 22 closed for defaults,
+left as it is. The owner's answer, word for word: "Those 3 items to
+confirm seem fine to me".
+
+Read as: the first two are confirmed as built and need nothing more.
+The third is accepted as left for this drop; it stays on the handover's
+list as a known gap in the mark's write path, not as a question.
