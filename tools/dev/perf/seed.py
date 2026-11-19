@@ -1192,8 +1192,11 @@ def _mainline_tests(conn: sqlite3.Connection, environment: str
 def _later(column: str) -> str:
     """SQL for *column* (an ISO timestamp) moved to the second server's
     hour: whole seconds through ``strftime``, which carries a day over,
-    then the original fraction."""
-    return ("strftime('%Y-%m-%dT%H:%M:%S', {0}, '+{1} hours') "
+    then the original fraction. Only the whole seconds go in: with a
+    modifier, some SQLite versions (3.45) round the time to the
+    millisecond, so a fraction of .9995 or more came out a second late."""
+    return ("strftime('%Y-%m-%dT%H:%M:%S', SUBSTR({0}, 1, 19), "
+            "'+{1} hours') "
             "|| SUBSTR({0}, 20)".format(column, SECOND_SERVER_HOURS))
 
 
