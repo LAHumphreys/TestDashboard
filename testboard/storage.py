@@ -972,6 +972,55 @@ MIGRATIONS = [
             "ON flaky_mark_history (environment, script, test_name, id)",
         ],
     ),
+    (
+        13,
+        [
+            # An environment's default flaky cadence (design
+            # flaky-default-r0 §2 B.2): a standing cadence N (2..10) for
+            # every test in the environment that has no mark of its own.
+            # Keyed by the environment's NAME: a renamed environment
+            # starts with none, and a dropped one takes its default and
+            # history with it (_ENVIRONMENT_TABLES).
+            #
+            # `environment_flaky_defaults` is the current default, one row
+            # per environment: `set_by`/`set_at` are the last act's, and
+            # `cadence_at` moves only when the cadence does (a set or a
+            # cadence change, never a reason edit), so a later reader can
+            # tell which runs predate the cadence. `flaky_default_history`
+            # is one row per act (set / cadence / reason / clear); a
+            # reason is required for every act, a removal included.
+            #
+            # Creates only; touches no existing table, so on MariaDB
+            # (tools/upgrade_mariadb_schema.py's ledger, step 12->13,
+            # alters=()) the server may keep running through it. Not a
+            # column on environment_expectations or environment_products:
+            # their rows live only while their declaration does, and a
+            # column would be an ALTER.
+            """
+            CREATE TABLE environment_flaky_defaults (
+                environment TEXT NOT NULL PRIMARY KEY,
+                cadence INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                set_by TEXT NOT NULL REFERENCES users(username),
+                set_at TEXT NOT NULL,
+                cadence_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE flaky_default_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                environment TEXT NOT NULL,
+                action TEXT NOT NULL,
+                cadence INTEGER,
+                reason TEXT NOT NULL,
+                actor TEXT NOT NULL REFERENCES users(username),
+                acted_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX idx_flaky_default_history_env "
+            "ON flaky_default_history (environment, id)",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: WP-40: the longest a mute can run, in HOURS (seven days), on any
@@ -986,6 +1035,55 @@ MUTE_MAX_HOURS = 168
 #: applies it.
 FLAKY_CADENCE_MIN = 2
 FLAKY_CADENCE_MAX = 10
+
+#: How many of an environment's default acts ``GET /api/environments``
+#: carries, newest first (design flaky-default-r0 §2 B.3, decision 8).
+FLAKY_DEFAULT_HISTORY_SHOWN = 20
+
+#: The actions a ``flaky_default_history`` row can record, and the one
+#: answer of :meth:`Storage.set_flaky_default` that records nothing.
+FLAKY_DEFAULT_SET = "set"
+FLAKY_DEFAULT_CADENCE = "cadence"
+FLAKY_DEFAULT_REASON = "reason"
+FLAKY_DEFAULT_CLEAR = "clear"
+FLAKY_DEFAULT_UNCHANGED = "unchanged"
+
+#: The longest reason a default may carry, in characters after trimming.
+#: A default's reason is repeated on every failing row of its
+#: environment that it judges, so it is a sentence, not a comment.
+FLAKY_DEFAULT_REASON_MAX = 500
+
+#: How many times :meth:`Storage.set_flaky_default` starts again when
+#: another writer moved the row under it. Two writers need two; a third
+#: is for three at once.
+_FLAKY_DEFAULT_ATTEMPTS = 3
+
+
+class FlakyDefaultRefused(ValueError):
+    """A default act refused for something the caller sent or named (the
+    API's 400). Any other error out of :meth:`Storage.set_flaky_default`
+    is the server's own."""
+
+
+def flaky_default_reason(raw: Any) -> str:
+    """The rule for a default's reason, in one place (decision 7): it is
+    required to set, change and remove a default, a string, and at most
+    :data:`FLAKY_DEFAULT_REASON_MAX` characters once trimmed. Returns it
+    trimmed; refuses with :class:`FlakyDefaultRefused`. The API applies
+    it before anything is read, and storage again for its other
+    callers."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raise FlakyDefaultRefused(
+            "reason: required, to set, change or remove a default")
+    if not isinstance(raw, str):
+        raise FlakyDefaultRefused(
+            "reason: must be a string, got {0}".format(type(raw).__name__))
+    reason = raw.strip()
+    if len(reason) > FLAKY_DEFAULT_REASON_MAX:
+        raise FlakyDefaultRefused(
+            "reason: at most {0} characters, got {1}".format(
+                FLAKY_DEFAULT_REASON_MAX, len(reason)))
+    return reason
 
 #: Prefix marking a migration step that runs Python instead of SQL.
 #:
@@ -1516,6 +1614,47 @@ class FlakyMarkResult(NamedTuple):
     #: Requested tests with no ``latest_runs`` row on any stream —
     #: skipped, never a hard failure (a stale page).
     unknown: int
+
+
+class FlakyDefault(NamedTuple):
+    """An environment's default flaky cadence (migration 13): the
+    cadence every test in it that has no mark of its own is judged at."""
+
+    environment: str
+    #: N, 2..10, as a mark's.
+    cadence: int
+    reason: str
+    #: Who made the last act on it, and when.
+    set_by: str
+    set_at: datetime.datetime
+    #: When the cadence last moved (a set or a cadence change; a reason
+    #: edit leaves it).
+    cadence_at: datetime.datetime
+
+
+class FlakyDefaultAct(NamedTuple):
+    """One row of ``flaky_default_history``: who did what, when, in the
+    mark history's fields."""
+
+    id: int
+    environment: str
+    #: ``set``, ``cadence``, ``reason`` or ``clear``.
+    action: str
+    #: The cadence the act left; None for ``clear``.
+    cadence: Optional[int]
+    reason: str
+    actor: str
+    acted_at: datetime.datetime
+
+
+class FlakyDefaultChange(NamedTuple):
+    """What :meth:`Storage.set_flaky_default` did."""
+
+    #: One of the act's ``action`` values, or ``unchanged`` (nothing
+    #: written).
+    action: str
+    #: The default as it stands after the act; None when there is none.
+    flaky_default: Optional[FlakyDefault]
 
 
 class TestActs(NamedTuple):
@@ -2178,6 +2317,10 @@ _ENVIRONMENT_TABLES = (
     # with it (decision 11); retiring a test or deleting a build does not.
     "test_flaky_marks",
     "flaky_mark_history",
+    # Migration 13: so does its default flaky cadence and every act on
+    # it (decision 13 of flaky-default-r0); a renamed one starts with none.
+    "environment_flaky_defaults",
+    "flaky_default_history",
     "environment_expectations",
     "environment_products",
     "activity_hours",
@@ -2541,6 +2684,13 @@ class _SqliteBackend(object):
     #: Raised on a unique-key race; ensure_user/create_user catch it.
     integrity_error = sqlite3.IntegrityError
 
+    @staticmethod
+    def restartable(exc: BaseException) -> bool:
+        """Never here: ``BEGIN IMMEDIATE`` serialises the writers, so no
+        transaction is asked to start again (MariaDB's counterpart says
+        which of its errors are)."""
+        return False
+
     #: SQLite owns its schema: MIGRATIONS run at startup. The MariaDB
     #: backend never runs DDL — its schema is created by the migration
     #: tooling (docs/MARIADB_MIGRATION.md §D) and only VERIFIED here.
@@ -2563,6 +2713,11 @@ class _SqliteBackend(object):
     #: inside a subquery and rejects a parenthesised member; MariaDB
     #: takes the member in parentheses, which it reads cheaper.
     limited_union_member = "SELECT * FROM ({0}) AS q{1}"
+
+    #: Appended to a read that must lock the row it finds until the
+    #: transaction ends (:meth:`Storage.set_flaky_default`). Nothing here:
+    #: ``BEGIN IMMEDIATE`` already holds the whole database for writing.
+    locking_read = ""
 
     #: The right-hand side of a row-value ``IN`` over a bound list
     #: (WP-44 item 6: the New failures queue's promoted tests), formatted
@@ -10345,24 +10500,27 @@ class Storage:
     @staticmethod
     def _require_active_user(
         conn: sqlite3.Connection, username: str,
+        act: str = "mark a test as flaky or change or remove a mark",
     ) -> None:
         """Inside the caller's transaction: refuse a flaky act by anyone
         but a known, active user (decision 12). Unlike a comment or an
         assignment, a mark never creates its actor: the person marking
         is the mark's owner, so the name must already be a person here.
-        ``ValueError`` names the ``username`` field for the API's 400."""
+        ``ValueError`` names the ``username`` field for the API's 400.
+        *act* is what the refusal says the user cannot do: an
+        environment's default (migration 13) is refused in its own
+        words, by the same rule."""
         row = conn.execute(
             "SELECT deactivated_at FROM users WHERE username = ?",
             (username,)).fetchone()
         if row is None:
             raise ValueError(
                 "username: {0} is not a known user; only a known, "
-                "active user can mark a test as flaky or change or "
-                "remove a mark".format(username))
+                "active user can {1}".format(username, act))
         if row[0] is not None:
             raise ValueError(
-                "username: {0} has been deactivated and cannot mark a "
-                "test as flaky or change or remove a mark".format(username))
+                "username: {0} has been deactivated and cannot "
+                "{1}".format(username, act))
 
     def mark_flaky(
         self,
@@ -10581,6 +10739,263 @@ class Storage:
         if existing:
             self._invalidate_summary_cache()
         return len(existing)
+
+    # ------------------------------------------------------------------
+    # An environment's default flaky cadence (migration 13)
+    # ------------------------------------------------------------------
+
+    def set_flaky_default(
+        self,
+        environment: str,
+        cadence: Optional[int],
+        reason: str,
+        actor: str,
+        when: datetime.datetime,
+    ) -> FlakyDefaultChange:
+        """Set, change or remove *environment*'s default flaky cadence,
+        in one transaction with its history row (design flaky-default-r0
+        §2 B.3; decisions 7 and 8).
+
+        *cadence* 2..10 sets the default, or changes it; None removes it.
+        *reason* is required for all three (:func:`flaky_default_reason`
+        states the rule). *actor* must be a known, active user, as for a
+        mark; a default never creates its user. Every refusal meant for
+        the caller is a :class:`FlakyDefaultRefused`. The action is
+        ``set`` (there was none), ``cadence`` (the cadence moved; the
+        reason given replaces the old), ``reason`` (same cadence, another
+        reason), ``clear``, or ``unchanged`` (the same cadence and reason
+        again, or a removal where there is none), which writes nothing.
+        ``cadence_at`` moves on ``set`` and ``cadence`` only.
+
+        Two writers at once. The act is judged against the row as it is
+        stored when the write happens, never against an earlier read.
+        On MariaDB, where ``BEGIN IMMEDIATE`` is a plain ``START
+        TRANSACTION`` and a read takes no lock, a row that exists is
+        read again under a lock (the backend's ``locking_read``), and a
+        first set that loses the race to another first set (the primary
+        key refuses the second INSERT) starts again and is judged
+        against the row that won. So does an act whose locking read the
+        server refuses because the row changed after this transaction's
+        snapshot (``innodb_snapshot_isolation``, on by default from
+        11.6; the backend's ``restartable``). On SQLite ``BEGIN IMMEDIATE`` already
+        serialises the writers. So each writer's answer is true of what
+        it found, and the history holds exactly one row per act that
+        changed something. No lock is taken on a row that does not
+        exist: two such locks (InnoDB gap locks) followed by two INSERTs
+        would deadlock.
+
+        Whether *environment* exists is the caller's question (the API's
+        404, as the expected count's). An act drops every memo, as a
+        mark's does: whatever later reads the default is recomputed. It
+        posts no comment and adds nothing to the push path.
+        """
+        if cadence is not None and (
+                not isinstance(cadence, int) or isinstance(cadence, bool)
+                or cadence < FLAKY_CADENCE_MIN
+                or cadence > FLAKY_CADENCE_MAX):
+            raise FlakyDefaultRefused(
+                "cadence: must be a whole number from {0} to {1} or null, "
+                "got {2!r}".format(FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX,
+                                   cadence))
+        reason = flaky_default_reason(reason)
+        when_iso = model.format_iso(when)
+        conn = self._conn()
+        outcome = None  # type: Optional[Tuple[str, Optional[FlakyDefault]]]
+        for _attempt in range(_FLAKY_DEFAULT_ATTEMPTS):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                try:
+                    self._require_active_user(
+                        conn, actor,
+                        act="set, change or remove a flaky default")
+                except ValueError as exc:
+                    raise FlakyDefaultRefused(str(exc))
+                try:
+                    outcome = self._flaky_default_act(
+                        conn, environment, cadence, reason, actor, when_iso)
+                except Exception as exc:
+                    if not self._backend.restartable(exc):
+                        raise
+                    outcome = None
+                if outcome is not None:
+                    conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            if outcome is not None:
+                break
+            # Another writer moved the row between the read and the
+            # write: start again, against what it left.
+            conn.execute("ROLLBACK")
+        if outcome is None:
+            raise RuntimeError(
+                "the default of {0} kept changing under this act; nothing "
+                "was written".format(environment))
+        action, current = outcome
+        if action == FLAKY_DEFAULT_UNCHANGED:
+            return FlakyDefaultChange(action=action, flaky_default=current)
+        self._invalidate_summary_cache()
+        after = None  # type: Optional[FlakyDefault]
+        if cadence is not None:
+            after = FlakyDefault(
+                environment=environment, cadence=cadence, reason=reason,
+                set_by=actor, set_at=model.parse_iso(when_iso),
+                cadence_at=(
+                    current.cadence_at
+                    if action == FLAKY_DEFAULT_REASON and current is not None
+                    else model.parse_iso(when_iso)))
+        return FlakyDefaultChange(action=action, flaky_default=after)
+
+    def _read_flaky_default(
+        self, conn: sqlite3.Connection, environment: str, lock: bool,
+    ) -> Optional[FlakyDefault]:
+        """*environment*'s stored default, read under a row lock when
+        *lock* (MariaDB's ``FOR UPDATE``; nothing on SQLite, whose
+        ``BEGIN IMMEDIATE`` already holds the database)."""
+        row = conn.execute(
+            "SELECT cadence, reason, set_by, set_at, cadence_at "
+            "FROM environment_flaky_defaults WHERE environment = ?"
+            + (self._backend.locking_read if lock else ""),
+            (environment,)).fetchone()
+        if row is None:
+            return None
+        return FlakyDefault(
+            environment=environment, cadence=int(row[0]), reason=row[1],
+            set_by=row[2], set_at=model.parse_iso(row[3]),
+            cadence_at=model.parse_iso(row[4]))
+
+    def _flaky_default_act(
+        self, conn: sqlite3.Connection, environment: str,
+        cadence: Optional[int], reason: str, actor: str, when_iso: str,
+    ) -> Optional[Tuple[str, Optional[FlakyDefault]]]:
+        """Inside the caller's transaction: judge the act against the
+        stored row and write it, returning ``(action, the row it was
+        judged against)``; None when another writer moved the row in
+        between and the act must start again (see
+        :meth:`set_flaky_default`)."""
+        current = self._read_flaky_default(conn, environment, lock=False)
+        if current is not None:
+            # The row exists: lock it and judge against what is stored
+            # now, which a writer that got there first may have moved.
+            current = self._read_flaky_default(conn, environment, lock=True)
+            if current is None:
+                return None
+        if cadence is None:
+            action = (FLAKY_DEFAULT_UNCHANGED if current is None
+                      else FLAKY_DEFAULT_CLEAR)
+        elif current is None:
+            action = FLAKY_DEFAULT_SET
+        elif current.cadence != cadence:
+            action = FLAKY_DEFAULT_CADENCE
+        elif current.reason != reason:
+            action = FLAKY_DEFAULT_REASON
+        else:
+            action = FLAKY_DEFAULT_UNCHANGED
+        if action == FLAKY_DEFAULT_SET:
+            try:
+                conn.execute(
+                    "INSERT INTO environment_flaky_defaults (environment, "
+                    "cadence, reason, set_by, set_at, cadence_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (environment, cadence, reason, actor, when_iso,
+                     when_iso))
+            except self._backend.integrity_error:
+                # Another first set committed since the read. Only the
+                # primary key can fire here: every column is bound non-
+                # null, and set_by's user was validated in this same
+                # transaction (MariaDB carries no foreign keys, runbook B.6).
+                return None
+        elif action == FLAKY_DEFAULT_CADENCE:
+            conn.execute(
+                "UPDATE environment_flaky_defaults SET cadence = ?, "
+                "reason = ?, set_by = ?, set_at = ?, cadence_at = ? "
+                "WHERE environment = ?",
+                (cadence, reason, actor, when_iso, when_iso, environment))
+        elif action == FLAKY_DEFAULT_REASON:
+            conn.execute(
+                "UPDATE environment_flaky_defaults SET reason = ?, "
+                "set_by = ?, set_at = ? WHERE environment = ?",
+                (reason, actor, when_iso, environment))
+        elif action == FLAKY_DEFAULT_CLEAR:
+            conn.execute(
+                "DELETE FROM environment_flaky_defaults "
+                "WHERE environment = ?", (environment,))
+        if action != FLAKY_DEFAULT_UNCHANGED:
+            conn.execute(
+                "INSERT INTO flaky_default_history (environment, "
+                "action, cadence, reason, actor, acted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (environment, action, cadence, reason, actor, when_iso))
+        return action, current
+
+    def flaky_defaults_with_history(
+        self, environments: Sequence[str],
+    ) -> Tuple[Dict[str, FlakyDefault], Dict[str, List[FlakyDefaultAct]]]:
+        """Every environment's default flaky cadence, and the newest
+        :data:`FLAKY_DEFAULT_HISTORY_SHOWN` acts on each of
+        *environments*, newest first, in ONE statement (design
+        flaky-default-r0 §2 B.3: ``GET /api/environments``' one more).
+
+        The defaults are a member reading ``environment_flaky_defaults``
+        whole (a row per environment with a default, at most the
+        estate's environments); each environment's history is a member
+        of its own, an ``idx_flaky_default_history_env`` range read
+        backwards and stopped at the limit, so the cost is bounded by
+        the environments times the limit and never by how long the
+        history has grown. Members are spelled by the backend
+        (``limited_union_member``), as :meth:`cadence_runs`' are. Past
+        :data:`_RECENT_CHUNK` environments, one statement more per
+        hundred. An environment named twice is read once.
+
+        Read by the Admin page's one request; no first-paint read calls
+        it, and nothing here judges a default.
+        """
+        order = []  # type: List[str]
+        for environment in environments:
+            if environment not in order:
+                order.append(environment)
+        defaults = {}  # type: Dict[str, FlakyDefault]
+        history = {}  # type: Dict[str, List[FlakyDefaultAct]]
+        if not order:
+            return defaults, history
+        current = (
+            "SELECT 0 AS kind, environment, NULL AS id, NULL AS action, "
+            "cadence, reason, set_by AS actor, set_at AS acted_at, "
+            "cadence_at FROM environment_flaky_defaults")
+        member = (
+            "SELECT 1 AS kind, environment, id, action, cadence, reason, "
+            "actor, acted_at, NULL AS cadence_at FROM flaky_default_history "
+            "WHERE environment = ? ORDER BY id DESC LIMIT {0}".format(
+                FLAKY_DEFAULT_HISTORY_SHOWN))
+        spelling = self._backend.limited_union_member
+        conn = self._conn()
+        rows = []  # type: List[Any]
+        for start in range(0, len(order), _RECENT_CHUNK):
+            chunk = order[start:start + _RECENT_CHUNK]
+            members = [spelling.format(member, index)
+                       for index in range(len(chunk))]
+            if start == 0:
+                members.insert(0, spelling.format(current, "c"))
+            rows.extend(conn.execute(
+                " UNION ALL ".join(members), tuple(chunk)).fetchall())
+        for row in rows:
+            environment = row[1]
+            if int(row[0]) == 0:
+                defaults[environment] = FlakyDefault(
+                    environment=environment, cadence=int(row[4]),
+                    reason=row[5], set_by=row[6],
+                    set_at=model.parse_iso(row[7]),
+                    cadence_at=model.parse_iso(row[8]))
+            else:
+                history.setdefault(environment, []).append(FlakyDefaultAct(
+                    id=int(row[2]), environment=environment, action=row[3],
+                    cadence=None if row[4] is None else int(row[4]),
+                    reason=row[5], actor=row[6],
+                    acted_at=model.parse_iso(row[7])))
+        for acts in history.values():
+            # A UNION ALL promises no order across or within members.
+            acts.sort(key=lambda act: act.id, reverse=True)
+        return defaults, history
 
     def test_acts(
         self, environment: str, script: str, test_name: str,

@@ -59,6 +59,10 @@ from testboard.storage import (
     FLAKING_QUEUE,
     MAINLINE_STREAM_ID,
     QUEUE_KINDS,
+    FlakyDefault,
+    FlakyDefaultAct,
+    FlakyDefaultRefused,
+    flaky_default_reason,
     FlakyMark,
     Mute,
     Comment,
@@ -3813,6 +3817,14 @@ def _handle_environments_list(
 
     Costs one hour-bucketed query over a fortnight (a few hundred rows),
     the same one ``/api/summary`` already runs.
+
+    Each environment also carries ``flaky_default`` (null, or
+    ``{cadence, set_by, set_at, reason}``) and ``flaky_default_history``
+    (the newest twenty acts, newest first, in the mark history's fields:
+    ``id``, ``action``, ``cadence``, ``reason``, ``actor``,
+    ``acted_at``): one statement more, bounded by the environments times
+    twenty (design flaky-default-r0 §2 B.3). Shown and recorded only;
+    nothing here judges a default.
     """
     view = _pass_view(storage, now())
     shown = analytics.complete_passes(
@@ -3830,11 +3842,17 @@ def _handle_environments_list(
     # same shape as declared_rows above) and read on every load of this
     # page regardless of whether products are in use.
     products = storage.environment_products_map()
+    known = storage.known_environments()
+    # Migration 13: each environment's default flaky cadence and the
+    # newest changes to it, in one statement (design flaky-default-r0
+    # §2 B.3), so the Admin page's History needs no request of its own.
+    defaults, default_history = storage.flaky_defaults_with_history(known)
 
     items = []  # type: List[Dict[str, Any]]
-    for environment in storage.known_environments():
+    for environment in known:
         found = by_env.get(environment, [])
         row = declared_rows.get(environment)
+        flaky_default = defaults.get(environment)
         items.append({
             "environment": environment,
             "product": products.get(environment, ""),
@@ -3848,6 +3866,11 @@ def _handle_environments_list(
             "passes_total": len(found),
             "passes_covered": len([e for e in found if e.covered]),
             "latest_pass": _pass_json(found[-1]) if found else None,
+            "flaky_default": (None if flaky_default is None
+                              else _flaky_default_json(flaky_default)),
+            "flaky_default_history": [
+                _flaky_default_act_json(act)
+                for act in default_history.get(environment, [])],
         })
 
     return _json_response(
@@ -3937,6 +3960,117 @@ def _handle_environment_expectation(
             "updated_at": model.format_iso(record.updated_at),
             "updated_by": record.updated_by,
             "cleared": False,
+        },
+    )
+
+
+def _flaky_default_json(flaky_default: FlakyDefault) -> Dict[str, Any]:
+    """An environment's default flaky cadence (migration 13), as
+    ``GET /api/environments`` and the PUT's answer carry it."""
+    return {
+        "cadence": flaky_default.cadence,
+        "set_by": flaky_default.set_by,
+        "set_at": model.format_iso(flaky_default.set_at),
+        "reason": flaky_default.reason,
+    }
+
+
+def _flaky_default_act_json(act: FlakyDefaultAct) -> Dict[str, Any]:
+    """One act on a default, in the mark history's fields."""
+    return {
+        "id": act.id,
+        "action": act.action,
+        "cadence": act.cadence,
+        "reason": act.reason,
+        "actor": act.actor,
+        "acted_at": model.format_iso(act.acted_at),
+    }
+
+
+def _parse_flaky_default_cadence(obj: Dict[str, Any]) -> Optional[int]:
+    """``cadence`` of a default: a whole number 2..10, or null to remove
+    it. Absent is refused rather than read as null, so that a client
+    that forgot the field cannot remove a default by omission."""
+    if "cadence" not in obj:
+        raise _HttpError(
+            400,
+            "cadence: required field is missing (a whole number from {} "
+            "to {}, or null to remove the default)".format(
+                FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX))
+    value = obj["cadence"]
+    if value is None:
+        return None
+    if (not isinstance(value, int) or isinstance(value, bool)
+            or value < FLAKY_CADENCE_MIN or value > FLAKY_CADENCE_MAX):
+        raise _HttpError(
+            400,
+            "cadence: must be a whole number from {} to {} or null, got "
+            "{}".format(FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX,
+                        json.dumps(value)))
+    return value
+
+
+def _parse_flaky_default_reason(obj: Dict[str, Any]) -> str:
+    """``reason``: :func:`storage.flaky_default_reason` is the rule
+    (required to set, change and remove a default, a string, at most
+    500 characters once trimmed); its refusal is the 400. Applied here
+    so that a refused body is answered before anything is read."""
+    try:
+        return flaky_default_reason(obj.get("reason"))
+    except FlakyDefaultRefused as exc:
+        raise _HttpError(400, str(exc))
+
+
+def _handle_environment_flaky_default(
+    storage: Storage,
+    request: Request,
+    environment: str,
+    now: Callable[[], datetime.datetime],
+) -> Response:
+    """PUT /api/environments/{environment}/flaky-default — set, change or
+    remove an environment's default flaky cadence (design
+    flaky-default-r0 §1a, §2 B.3).
+
+    Body: ``{"username", "cadence", "reason"}``. ``cadence`` 2..10 sets
+    or changes the default; ``null`` removes it. ``reason`` is required
+    for all three (decision 7), at most 500 characters once trimmed
+    (it is repeated on the rows the default judges). ``username`` is a
+    known, active user,
+    validated as the flaky mark's is (a default never creates its
+    user). An environment that has never reported a run and carries no
+    declaration is a 404, as the expected count's is. Every set, change
+    and removal is a history row (decision 8); the same cadence and
+    reason again, or a removal where there is none, writes nothing.
+
+    Response: ``{"environment", "action": "set"|"cadence"|"reason"|
+    "clear"|"unchanged", "flaky_default": {cadence, set_by, set_at,
+    reason} | null}``. Recorded and shown only in this build: nothing
+    judges a default yet.
+    """
+    obj = _parse_json_object(request.body)
+    username = _validate_username(obj, "username")
+    cadence = _parse_flaky_default_cadence(obj)
+    reason = _parse_flaky_default_reason(obj)
+
+    if not storage.environment_exists(environment):
+        raise _HttpError(
+            404, "unknown environment: {}".format(environment)
+        )
+    try:
+        change = storage.set_flaky_default(
+            environment, cadence, reason, username, now())
+    except FlakyDefaultRefused as exc:
+        # Only a refusal meant for the caller (here, the user check):
+        # any other error is the server's, and a 500 as elsewhere.
+        raise _HttpError(400, str(exc))
+    return _json_response(
+        200,
+        {
+            "environment": environment,
+            "action": change.action,
+            "flaky_default": (
+                None if change.flaky_default is None
+                else _flaky_default_json(change.flaky_default)),
         },
     )
 
@@ -5174,6 +5308,13 @@ def _route(
             and rest[2] == "product"):
         _check_method(request.method, ("PUT",))
         return _handle_environment_product(
+            storage, request, rest[1], now
+        )
+
+    if (len(rest) == 3 and rest[0] == "environments"
+            and rest[2] == "flaky-default"):
+        _check_method(request.method, ("PUT",))
+        return _handle_environment_flaky_default(
             storage, request, rest[1], now
         )
 

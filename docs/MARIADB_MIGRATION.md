@@ -578,7 +578,7 @@ breaks you will not know which change did it.
 
 | SQLite | MariaDB | Note |
 |---|---|---|
-| `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT AUTO_INCREMENT PRIMARY KEY` | `BIGINT`, not `INT`: ids are consumed by re-imports (§B.5), so they run ahead of the row count. Six sites: `runs`, `comments`, `assignments`, `streams` (migration 9), `mute_history` (migration 11) and `flaky_mark_history` (migration 12); `tests/test_sql_portability.py::InventoryTest` pins the count. |
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT AUTO_INCREMENT PRIMARY KEY` | `BIGINT`, not `INT`: ids are consumed by re-imports (§B.5), so they run ahead of the row count. Seven sites: `runs`, `comments`, `assignments`, `streams` (migration 9), `mute_history` (migration 11), `flaky_mark_history` (migration 12) and `flaky_default_history` (migration 13); `tests/test_sql_portability.py::InventoryTest` pins the count. |
 | `TEXT` (identity) | `VARCHAR(n)` per §B.1 | Bounded, or it cannot be indexed. |
 | `TEXT` (`result`) | `VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin` | Values are `PASS`, `FAIL`, `FAILED_AS_EXPECTED`, `UNEXPECTED_PASS`. Do **not** use a MariaDB `ENUM` — the Python `Result` enum is the authority and an ENUM would give you two definitions that can drift. |
 | `TEXT` (`source_link`) | `VARCHAR(1024)` | Not indexed. The audit checks nothing exceeds it. |
@@ -1260,7 +1260,7 @@ code keeps serving through the upgrade (that is how the 2026-08-11 run
 went) and refuses only at its next start. What decides it is the
 ledger's own declaration of which existing tables a step rewrites:
 
-- **A step that only creates tables** (migrations 11 and 12) touches
+- **A step that only creates tables** (migrations 11, 12 and 13) touches
   nothing the running server reads or writes. Run it with the server
   up; the only gap is the restart into the new code, which every drop
   has. A push landing during the step is just a push.
@@ -1432,11 +1432,24 @@ serving through the step (G.3).
 | 9 → 10 | WP-23 | `stream_id` in the keys of `activity_hours`, `script_hours` | `activity_hours`, `script_hours` (stop the server) |
 | 10 → 11 | WP-40 | `test_mutes`, `mute_history`, two indexes | nothing |
 | 11 → 12 | WP-44 | `test_flaky_marks` (keyed by the triple, no stream), `flaky_mark_history`, `idx_flaky_mark_history_triple` | nothing |
+| 12 → 13 | WP-44 | `environment_flaky_defaults` (keyed by the environment's name), `flaky_default_history`, `idx_flaky_default_history_env` | nothing |
 
 Step 11 → 12 is the flaky mark's: two new tables, no backfill, nothing
 existing touched; the tables start empty. Rollback is the G.2 dump,
 or, with the old code redeployed, dropping the two tables and setting
 `schema_version` back to 11 (every mark and its history goes with them).
+
+Step 12 → 13 is an environment's default flaky cadence: the current
+default, one row per environment that has one, and every act on it
+(set, cadence, reason, clear). Two new tables and one index, no
+backfill, nothing existing touched; the tables start empty, so the
+server keeps serving through it and the only gap is the restart into
+the new code. Rollback is the G.2 dump, or, with the old code
+redeployed, `DROP TABLE flaky_default_history`, `DROP TABLE
+environment_flaky_defaults` and setting `schema_version` back to 12
+(every default and its history goes with them; marks are untouched).
+`tools/drop_environment.py` deletes an environment's rows from both
+tables with the rest of it, and its dry run counts them.
 
 ---
 

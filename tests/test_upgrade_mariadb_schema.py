@@ -172,6 +172,42 @@ class LedgerTest(unittest.TestCase):
             "ON flaky_mark_history (environment, script, test_name, id)",
             statements)
 
+    def test_the_flaky_default_step_creates_only(self) -> None:
+        """Migration 13 (an environment's default flaky cadence): step 12
+        to 13 creates the default's two tables and their index and
+        rewrites nothing, so the dry run says the server may keep
+        running; its CREATE TABLEs are the exporter's, whitespace aside,
+        and the new tables are in TABLE_ORDER (what the exporter loads
+        and the dual-backend suite truncates)."""
+        step = [s for s in upgrade.LEDGER if s.from_version == 12][0]
+        self.assertEqual(step.package, "WP-44")
+        self.assertEqual(step.alters, ())
+        self.assertEqual(upgrade.rewritten_tables([step]), [])
+        self.assertEqual(
+            sorted(probe.table for probe in step.probes),
+            ["environment_flaky_defaults", "flaky_default_history"])
+        self.assertTrue(all(probe.column is None for probe in step.probes))
+        sizes = exporter.Sizes(64, 255, 255)
+        statements = step.statements(sizes, "2026-01-01T00:00:00.000000")
+        oracle = " ".join(exporter.ddl(sizes).split())
+        creates = [s for s in statements if s.startswith("CREATE TABLE")]
+        self.assertEqual(len(creates), 2)
+        for statement in creates:
+            flat = " ".join(statement.split())
+            self.assertIn(flat, oracle.replace(";", ""), statement)
+        self.assertEqual(len(statements), 3, statements)
+        self.assertIn(
+            "CREATE INDEX idx_flaky_default_history_env ON "
+            "flaky_default_history (environment, id)",
+            " ".join(exporter.INDEXES.split()))
+        self.assertIn(
+            "CREATE INDEX idx_flaky_default_history_env "
+            "ON flaky_default_history (environment, id)",
+            statements)
+        for table in ("environment_flaky_defaults", "flaky_default_history"):
+            self.assertIn(table, exporter.TABLE_ORDER)
+        self.assertEqual(upgrade.TARGET_VERSION, 13)
+
     def test_row_count_tables_are_the_altered_ones_runs_first(
             self) -> None:
         self.assertEqual(upgrade._ROW_COUNT_TABLES[0], "runs")

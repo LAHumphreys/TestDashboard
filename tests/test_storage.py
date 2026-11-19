@@ -4650,6 +4650,12 @@ class EnvironmentDeleteTest(StorageTestBase):
                 environment, "suite.py", "b", "alice", "alice", CREATED)
             self.store.set_environment_expectation(
                 environment, 2, "alice", CREATED)
+            # Migration 13: a default flaky cadence, set then changed, so
+            # the default and two history rows belong to each.
+            self.store.set_flaky_default(
+                environment, 2, "two servers", "alice", CREATED)
+            self.store.set_flaky_default(
+                environment, 3, "three servers", "alice", CREATED)
         self.store.set_retired(
             "UNKNOWN", "suite.py", "a", True, "alice", "bogus env", CREATED)
 
@@ -4704,6 +4710,37 @@ class EnvironmentDeleteTest(StorageTestBase):
         self.assertEqual(self.store.environments(), ["linux-sim"])
         self.assertEqual(
             len(self.store.list_environment_expectations()), 1)
+        defaults, history = self.store.flaky_defaults_with_history(
+            ["linux-sim", "UNKNOWN"])
+        self.assertEqual(sorted(defaults), ["linux-sim"])
+        self.assertEqual(defaults["linux-sim"].cadence, 3)
+        self.assertEqual(sorted(history), ["linux-sim"])
+        self.assertEqual(len(history["linux-sim"]), 2)
+
+    def test_the_default_and_its_history_are_counted_and_deleted(
+        self,
+    ) -> None:
+        """Decision 13: a deleted environment takes its default flaky
+        cadence and every act on it; the dry run counts both."""
+        self._seed()
+        counted = self.store.count_environment_rows("UNKNOWN")
+        self.assertEqual(counted["environment_flaky_defaults"], 1)
+        self.assertEqual(counted["flaky_default_history"], 2)
+        deleted = self.store.delete_environment("UNKNOWN")
+        self.assertEqual(deleted["environment_flaky_defaults"], 1)
+        self.assertEqual(deleted["flaky_default_history"], 2)
+
+    def test_a_renamed_environment_starts_with_no_default(self) -> None:
+        """Decision 13: a default belongs to the name. The new name has
+        none; the old one keeps its own until it is dropped."""
+        self._seed()
+        self.store.upsert_runs([make_record(environment="linux-sim-2",
+                                            test_name="a")])
+        defaults, history = self.store.flaky_defaults_with_history(
+            ["linux-sim-2", "linux-sim"])
+        self.assertNotIn("linux-sim-2", defaults)
+        self.assertNotIn("linux-sim-2", history)
+        self.assertIn("linux-sim", defaults)
 
     def test_no_derived_row_is_left_pointing_at_a_deleted_run(self) -> None:
         """The failure that would actually break the dashboard."""
@@ -10144,6 +10181,495 @@ class FlakyActStatementsTest(StorageTestBase):
             "SELECT COUNT(*) FROM flaky_mark_history WHERE action = ? "
             "AND reason IS NULL", ("cadence",)).fetchone()
         self.assertEqual(int(changes[0]), 305)
+
+
+class FlakyDefaultWriteTest(StorageTestBase):
+    """An environment's default flaky cadence (migration 13; design
+    flaky-default-r0 §2 B.2, B.3, decisions 7, 8 and 13): set, change,
+    reason edit and removal, each one transaction with its history row;
+    a reason for every act; a known, active user, never created; 2 to
+    10 or none; the same again writes nothing; an act drops the memos,
+    and posts no comment."""
+
+    NOW = datetime.datetime(2026, 7, 2, 12, 0, 0)
+    LATER = NOW + datetime.timedelta(hours=1)
+    ENV = "linux-sim"
+    REASON = "two servers; investigate failures on both"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(test_name="t1", result=Result.FAIL),
+            make_record(environment="win-sim", test_name="w1"),
+        ])
+        for name in ("alice", "bob", "carol"):
+            self.store.ensure_user(name, CREATED)
+        self.store.set_user_active("carol", False, "bob", CREATED)
+
+    def _set(self, cadence: Optional[int], reason: Any = REASON,
+             by: str = "alice", when: Optional[datetime.datetime] = None,
+             env: Optional[str] = None) -> "storage.FlakyDefaultChange":
+        return self.store.set_flaky_default(
+            env or self.ENV, cadence, reason, by, when or self.NOW)
+
+    def _read(self, env: Optional[str] = None) -> Tuple[
+            Optional["storage.FlakyDefault"],
+            List[Tuple[str, Optional[int], str, str, datetime.datetime]]]:
+        name = env or self.ENV
+        defaults, history = self.store.flaky_defaults_with_history([name])
+        return defaults.get(name), [
+            (a.action, a.cadence, a.reason, a.actor, a.acted_at)
+            for a in history.get(name, [])]
+
+    def _count(self, table: str) -> int:
+        return int(self.store._conn().execute(
+            "SELECT COUNT(*) FROM {0}".format(table)).fetchone()[0])
+
+    def _written(self) -> Tuple[int, int, int, int]:
+        return (self._count("environment_flaky_defaults"),
+                self._count("flaky_default_history"),
+                self._count("comments"), self._count("users"))
+
+    def test_a_set_is_kept_and_recorded(self) -> None:
+        change = self._set(2)
+        expected = storage.FlakyDefault(
+            environment=self.ENV, cadence=2, reason=self.REASON,
+            set_by="alice", set_at=self.NOW, cadence_at=self.NOW)
+        self.assertEqual(change, storage.FlakyDefaultChange(
+            action="set", flaky_default=expected))
+        current, acts = self._read()
+        self.assertEqual(current, expected)
+        self.assertEqual(acts, [("set", 2, self.REASON, "alice", self.NOW)])
+
+    def test_a_cadence_change_moves_the_cadence_and_takes_the_reason(
+        self,
+    ) -> None:
+        self._set(2)
+        change = self._set(3, reason="a third server", by="bob",
+                           when=self.LATER)
+        expected = storage.FlakyDefault(
+            environment=self.ENV, cadence=3, reason="a third server",
+            set_by="bob", set_at=self.LATER, cadence_at=self.LATER)
+        self.assertEqual(change.action, "cadence")
+        self.assertEqual(change.flaky_default, expected)
+        current, acts = self._read()
+        self.assertEqual(current, expected)
+        self.assertEqual(acts, [
+            ("cadence", 3, "a third server", "bob", self.LATER),
+            ("set", 2, self.REASON, "alice", self.NOW)])
+
+    def test_a_reason_edit_leaves_when_the_cadence_last_moved(self) -> None:
+        """``cadence_at`` moves on set and cadence only, so a reason edit
+        makes no promotion night (B.2)."""
+        self._set(2)
+        change = self._set(2, reason="reworded", by="bob", when=self.LATER)
+        self.assertEqual(change.action, "reason")
+        current, acts = self._read()
+        self.assertEqual(current, storage.FlakyDefault(
+            environment=self.ENV, cadence=2, reason="reworded",
+            set_by="bob", set_at=self.LATER, cadence_at=self.NOW))
+        self.assertEqual(change.flaky_default, current)
+        self.assertEqual(acts[0], ("reason", 2, "reworded", "bob",
+                                   self.LATER))
+
+    def test_the_same_again_writes_nothing(self) -> None:
+        self._set(2)
+        before = self._written()
+        for reason in (self.REASON, "  " + self.REASON + "\n"):
+            change = self._set(2, reason=reason, by="bob", when=self.LATER)
+            self.assertEqual(change.action, "unchanged")
+            self.assertEqual(change.flaky_default, self._read()[0])
+            self.assertEqual(change.flaky_default.set_by, "alice")
+        self.assertEqual(self._written(), before)
+
+    def test_a_removal_is_recorded_with_its_reason(self) -> None:
+        self._set(2)
+        change = self._set(None, reason="trial over", by="bob",
+                           when=self.LATER)
+        self.assertEqual(change, storage.FlakyDefaultChange(
+            action="clear", flaky_default=None))
+        current, acts = self._read()
+        self.assertIsNone(current)
+        self.assertEqual(acts[0], ("clear", None, "trial over", "bob",
+                                   self.LATER))
+        self.assertEqual(self._count("environment_flaky_defaults"), 0)
+
+    def test_removing_what_is_not_there_writes_nothing(self) -> None:
+        before = self._written()
+        change = self._set(None, reason="tidying up")
+        self.assertEqual(change, storage.FlakyDefaultChange(
+            action="unchanged", flaky_default=None))
+        self.assertEqual(self._written(), before)
+
+    def test_every_act_needs_a_reason_and_writes_nothing_without(
+        self,
+    ) -> None:
+        """Decision 7: to set, to change and to remove."""
+        for cadence, prepare in ((2, None), (3, 2), (None, 2)):
+            if prepare is not None and self._read()[0] is None:
+                self._set(prepare)
+            before = self._written()
+            for reason, message in (
+                    (None, "reason: required, to set, change or remove a "
+                           "default"),
+                    ("", "reason: required, to set, change or remove a "
+                         "default"),
+                    ("   ", "reason: required, to set, change or remove a "
+                            "default"),
+                    (7, "reason: must be a string, got int"),
+                    ("x" * 501, "reason: at most 500 characters, got 501")):
+                with self.assertRaises(storage.FlakyDefaultRefused) as caught:
+                    self._set(cadence, reason=reason)
+                self.assertEqual(str(caught.exception), message)
+            self.assertEqual(self._written(), before)
+
+    def test_the_reason_rule_is_one_function(self) -> None:
+        """The API applies :func:`storage.flaky_default_reason` before
+        anything is read and storage applies it again, so the copy the
+        API makes unreachable is the same rule, not a second one."""
+        self.assertEqual(storage.flaky_default_reason("  " + "x" * 500 + " "),
+                         "x" * 500)
+        with self.assertRaises(storage.FlakyDefaultRefused) as caught:
+            storage.flaky_default_reason("y" * 501)
+        self.assertEqual(str(caught.exception),
+                         "reason: at most 500 characters, got 501")
+        self.assertEqual(storage.FLAKY_DEFAULT_REASON_MAX, 500)
+        self.assertEqual(self._set(2, reason=" " + "z" * 500).action, "set")
+        self.assertEqual(self._read()[0].reason, "z" * 500)
+
+    def test_the_cadence_is_two_to_ten_or_none(self) -> None:
+        for bad in (0, 1, 11, -2, True, 2.0, "2"):
+            with self.assertRaises(ValueError) as caught:
+                self._set(bad)  # type: ignore
+            self.assertTrue(str(caught.exception).startswith(
+                "cadence: must be a whole number from 2 to 10 or null"),
+                caught.exception)
+        self.assertEqual(self._written()[:2], (0, 0))
+        self.assertEqual(self._set(10).action, "set")
+        self.assertEqual(self._set(2).action, "cadence")
+
+    def test_only_a_known_active_user_acts_and_none_is_created(
+        self,
+    ) -> None:
+        self._set(2)
+        before = self._written()
+        cases = (
+            ("dave", "username: dave is not a known user; only a known, "
+                     "active user can set, change or remove a flaky "
+                     "default"),
+            ("carol", "username: carol has been deactivated and cannot "
+                      "set, change or remove a flaky default"),
+        )
+        for user, message in cases:
+            for cadence in (3, None):
+                with self.assertRaises(ValueError) as caught:
+                    self._set(cadence, by=user)
+                self.assertEqual(str(caught.exception), message)
+        self.assertEqual(self._written(), before)
+        self.assertEqual(self._read()[0].cadence, 2)
+
+    def test_a_marks_refusal_is_worded_as_it_was(self) -> None:
+        """The shared user check kept the mark's words."""
+        with self.assertRaises(ValueError) as caught:
+            self.store.mark_flaky([(self.ENV, "suite.py", "t1", None)], 3,
+                                  "why", "dave", self.NOW)
+        self.assertEqual(
+            str(caught.exception),
+            "username: dave is not a known user; only a known, active user "
+            "can mark a test as flaky or change or remove a mark")
+
+    def test_an_act_drops_the_memos_and_nothing_else_does(self) -> None:
+        """B.4: a default act drops every memo, so whatever later reads
+        the default is recomputed; an unchanged act drops nothing."""
+        probe = ("probe", 1)
+        for cadence, action in ((2, "set"), (2, "unchanged"),
+                                (3, "cadence"), (None, "clear"),
+                                (None, "unchanged")):
+            self.store._store_summary(probe, "memo")
+            self.assertEqual(self._set(cadence).action, action)
+            if action == "unchanged":
+                self.assertEqual(self.store._cached_summary(probe), "memo")
+            else:
+                self.assertIsNone(self.store._cached_summary(probe), action)
+
+    def test_defaults_are_per_environment_and_post_no_comment(self) -> None:
+        self._set(2)
+        self._set(4, env="win-sim", by="bob")
+        self._set(None, reason="done here")
+        self.assertIsNone(self._read()[0])
+        self.assertEqual(self._read("win-sim")[0].cadence, 4)
+        self.assertEqual([a[0] for a in self._read("win-sim")[1]], ["set"])
+        self.assertEqual(self._count("comments"), 0)
+
+
+class _AfterFirstRead(object):
+    """A connection that runs *hook* once, right after the first
+    statement starting with *marker* has executed: where one writer has
+    read the stored row and has not yet written."""
+
+    def __init__(self, conn: Any, marker: str,
+                 hook: Callable[[], None]) -> None:
+        self._conn = conn
+        self._marker = marker
+        self._hook = hook
+        self._fired = False
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        cursor = self._conn.execute(sql, params)
+        if not self._fired and sql.startswith(self._marker):
+            self._fired = True
+            self._hook()
+        return cursor
+
+    def executemany(self, sql: str, seq_of_params: Any) -> Any:
+        return self._conn.executemany(sql, seq_of_params)
+
+
+class FlakyDefaultRaceTest(StorageTestBase):
+    """Two writers on one environment's default at once. Writer A
+    reads the stored row; before it writes, writer B
+    runs a whole act on its own connection. On MariaDB nothing stops B
+    (A's read took no lock), so B commits first and A must judge
+    against B's row: a first set that loses the race starts again
+    rather than failing on the primary key, and a change re-reads the
+    row under a lock rather than writing a second history row against
+    a stale one. On SQLite ``BEGIN IMMEDIATE`` makes B wait for A, so A
+    commits first. Either way each answer is true of what its writer
+    found, the stored row is the later writer's, and the history holds
+    one row per act that changed something."""
+
+    ENV = "linux-sim"
+    NOW = datetime.datetime(2026, 7, 2, 12, 0, 0)
+    LATER = NOW + datetime.timedelta(minutes=1)
+    READ = "SELECT cadence, reason, set_by"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([make_record(test_name="t1")])
+        for name in ("alice", "bob"):
+            self.store.ensure_user(name, CREATED)
+        self.sqlite = isinstance(self.store._backend, storage._SqliteBackend)
+
+    @staticmethod
+    def _judge(state: Optional[Tuple[int, str]], cadence: Optional[int],
+               reason: str) -> Tuple[str, Optional[Tuple[int, str]]]:
+        """The act's answer against *state*, and the state it leaves."""
+        if cadence is None:
+            return ("unchanged", None) if state is None else ("clear", None)
+        if state is None:
+            return "set", (cadence, reason)
+        if state[0] != cadence:
+            return "cadence", (cadence, reason)
+        if state[1] != reason:
+            return "reason", (cadence, reason)
+        return "unchanged", state
+
+    def _race(self, initial: Optional[Tuple[int, str]],
+              a: Tuple[Optional[int], str],
+              b: Tuple[Optional[int], str]) -> None:
+        if initial is not None:
+            self.store.set_flaky_default(
+                self.ENV, initial[0], initial[1], "alice", CREATED)
+        acts_before = len(self.store.flaky_defaults_with_history(
+            [self.ENV])[1].get(self.ENV, []))
+        answers = {}  # type: Dict[str, Any]
+        failures = []  # type: List[BaseException]
+        during = []  # type: List[bool]
+
+        def run_b() -> None:
+            try:
+                answers["b"] = self.store.set_flaky_default(
+                    self.ENV, b[0], b[1], "bob", self.LATER)
+            except BaseException as exc:  # reported by the test thread
+                failures.append(exc)
+
+        writer_b = threading.Thread(target=run_b)
+
+        def hook() -> None:
+            writer_b.start()
+            # SQLite: B waits on A's BEGIN IMMEDIATE, so give up soon.
+            writer_b.join(0.3 if self.sqlite else 10.0)
+            during.append(not writer_b.is_alive())
+
+        a_thread = threading.get_ident()
+        original = self.store._conn
+        wrapped = []  # type: List[Any]
+
+        def conn_for_a() -> Any:
+            conn = original()
+            if threading.get_ident() != a_thread:
+                return conn
+            if not wrapped:
+                wrapped.append(_AfterFirstRead(conn, self.READ, hook))
+            return wrapped[0]
+
+        self.store._conn = conn_for_a  # type: ignore
+        try:
+            answers["a"] = self.store.set_flaky_default(
+                self.ENV, a[0], a[1], "alice", self.NOW)
+        finally:
+            del self.store._conn
+            writer_b.join(15.0)
+        self.assertEqual(failures, [])
+        # The interleaving happened as forced: B finished inside A's
+        # transaction on MariaDB, and waited for it on SQLite.
+        self.assertEqual(during, [not self.sqlite])
+        order = ("a", "b") if self.sqlite else ("b", "a")
+        state = initial
+        expected = {}  # type: Dict[str, str]
+        for who in order:
+            cadence, reason = a if who == "a" else b
+            expected[who], state = self._judge(state, cadence, reason)
+        self.assertEqual({who: answers[who].action for who in answers},
+                         expected)
+        current, history = self.store.flaky_defaults_with_history(
+            [self.ENV])
+        stored = current.get(self.ENV)
+        self.assertEqual(
+            None if stored is None else (stored.cadence, stored.reason),
+            state)
+        changed = [who for who in order if expected[who] != "unchanged"]
+        acts = history.get(self.ENV, [])
+        self.assertEqual(len(acts) - acts_before, len(changed), acts)
+        # Newest first by id, which is commit order: on MariaDB B (acting
+        # LATER) commits first, so acted_at order is not commit order.
+        self.assertEqual(
+            [act.actor for act in acts[:len(changed)]],
+            ["alice" if who == "a" else "bob" for who in reversed(changed)])
+
+    def test_two_first_sets_of_the_same_default(self) -> None:
+        self._race(None, (2, "two servers"), (2, "two servers"))
+
+    def test_two_first_sets_of_different_defaults(self) -> None:
+        self._race(None, (2, "two servers"), (3, "three servers"))
+
+    def test_two_changes_to_the_same_cadence(self) -> None:
+        self._race((2, "two servers"), (3, "three"), (3, "three"))
+
+    def test_a_removal_against_a_reason_edit(self) -> None:
+        self._race((2, "two servers"), (None, "trial over"),
+                   (2, "reworded"))
+
+    def test_a_change_against_a_removal(self) -> None:
+        self._race((2, "two servers"), (4, "four"), (None, "trial over"))
+
+
+class FlakyDefaultHistoryReadTest(StorageTestBase):
+    """``flaky_defaults_with_history``: the default of every environment
+    and the newest twenty acts on each named one, newest first, in ONE
+    statement whatever the history's length, one more per hundred
+    environments past the first hundred (design flaky-default-r0 §2 B.3,
+    decision 8). Counted on both backends: SQLite's trace; MariaDB's own
+    ``Questions``."""
+
+    NOW = datetime.datetime(2026, 7, 2, 12, 0, 0)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.upsert_runs([
+            make_record(environment=env, test_name="t")
+            for env in ("linux-sim", "win-sim", "mac-sim")])
+        self.store.ensure_user("alice", CREATED)
+        # 25 acts on linux-sim, ending on cadence 3; 3 on win-sim.
+        for index in range(25):
+            self.store.set_flaky_default(
+                "linux-sim", 2 + index % 2, "r{0}".format(index), "alice",
+                self.NOW + datetime.timedelta(minutes=index))
+        for index in range(3):
+            self.store.set_flaky_default(
+                "win-sim", 5, "w{0}".format(index), "alice",
+                self.NOW + datetime.timedelta(minutes=index))
+
+    def _statements(self, call: Callable[[], Any]) -> int:
+        conn = self.store._conn()
+        if isinstance(self.store._backend, storage._SqliteBackend):
+            seen = []  # type: List[str]
+            trace_sql_into(conn, seen)
+            try:
+                call()
+            finally:
+                conn.set_trace_callback(None)
+            return len(seen)
+
+        def questions() -> int:
+            row = conn.execute(
+                "SHOW SESSION STATUS LIKE 'Questions'").fetchone()
+            return int(row[1])
+
+        before = questions()
+        call()
+        # The second SHOW counts itself.
+        return questions() - before - 1
+
+    def test_the_newest_twenty_newest_first_per_environment(self) -> None:
+        defaults, history = self.store.flaky_defaults_with_history(
+            ["linux-sim", "win-sim", "mac-sim"])
+        self.assertEqual(sorted(defaults), ["linux-sim", "win-sim"])
+        self.assertEqual(defaults["linux-sim"].cadence, 2)
+        self.assertEqual(defaults["linux-sim"].reason, "r24")
+        self.assertEqual(defaults["win-sim"].reason, "w2")
+        linux = history["linux-sim"]
+        self.assertEqual(len(linux), storage.FLAKY_DEFAULT_HISTORY_SHOWN)
+        self.assertEqual([a.reason for a in linux],
+                         ["r{0}".format(i) for i in range(24, 4, -1)])
+        self.assertEqual([a.id for a in linux],
+                         sorted((a.id for a in linux), reverse=True))
+        self.assertEqual(linux[-1].action, "cadence")
+        self.assertEqual([a.action for a in history["win-sim"]],
+                         ["reason", "reason", "set"])
+        self.assertNotIn("mac-sim", history)
+
+    def test_one_statement_however_long_the_history(self) -> None:
+        envs = ["linux-sim", "win-sim", "mac-sim"]
+        self.assertEqual(self._statements(
+            lambda: self.store.flaky_defaults_with_history(envs)), 1)
+        for index in range(40):
+            self.store.set_flaky_default(
+                "mac-sim", 2 + index % 2, "m{0}".format(index), "alice",
+                self.NOW + datetime.timedelta(minutes=index))
+        self.assertEqual(self._statements(
+            lambda: self.store.flaky_defaults_with_history(envs)), 1)
+        self.assertEqual(len(self.store.flaky_defaults_with_history(
+            envs)[1]["mac-sim"]), storage.FLAKY_DEFAULT_HISTORY_SHOWN)
+
+    def test_one_more_statement_per_hundred_environments(self) -> None:
+        names = ["linux-sim", "win-sim"] + [
+            "env-{0:03d}".format(i) for i in range(148)]
+        found = []  # type: List[Any]
+        self.assertEqual(self._statements(
+            lambda: found.append(self.store.flaky_defaults_with_history(
+                names + names[:5]))), 2)
+        defaults, history = found[0]
+        self.assertEqual(sorted(defaults), ["linux-sim", "win-sim"])
+        self.assertEqual(len(history["linux-sim"]), 20)
+        self.assertEqual(len(history["win-sim"]), 3)
+
+    def test_no_environment_no_statement(self) -> None:
+        self.assertEqual(self._statements(
+            lambda: self.store.flaky_defaults_with_history([])), 0)
+
+    def test_each_history_member_is_a_range_of_its_index(self) -> None:
+        """SQLite's plan: every environment's member reads
+        ``idx_flaky_default_history_env`` backwards from its key, with
+        no sort, so twenty rows are read and no more."""
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            self.store.flaky_defaults_with_history(
+                ["linux-sim", "win-sim", "mac-sim"])
+        finally:
+            conn.set_trace_callback(None)
+        (statement,) = seen
+        # The trace may carry the values in place of the placeholders.
+        params = (("linux-sim", "win-sim", "mac-sim")
+                  if "?" in statement else ())  # type: Tuple[str, ...]
+        plan = " | ".join(str(row[-1]) for row in conn.execute(
+            "EXPLAIN QUERY PLAN " + statement, params).fetchall())
+        self.assertEqual(
+            plan.count("USING INDEX idx_flaky_default_history_env "
+                       "(environment=?)"), 3, plan)
+        self.assertNotIn("TEMP B-TREE", plan, plan)
 
 
 class FlakyCadenceTest(StorageTestBase):

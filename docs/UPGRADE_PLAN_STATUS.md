@@ -5515,3 +5515,42 @@ Counts in the main checkout, with item 21 in the tree: 3141 OK (skipped
 1) on SQLite and 4333 OK (skipped 91) with the MariaDB variants on a
 local 12.3, taken before the walk's two fixes; with them the frontend
 guards read 636 OK. No browser has rendered it.
+
+## The default flaky cadence, item 22: kept and recorded, migration 13 (2026-11-19)
+
+An environment's default cadence is stored, changed, removed and read
+back, with every act in a history table, on both backends. Nothing judges
+it yet. **Migration 13 runs**, create-only (two tables, one index); on
+MariaDB it is the upgrade tool's ledger step 12 to 13 and runbook §G
+lists it; the registry gives 13 to this work and moves the parked
+in-run-progress work to 14. The commit message has the contract, the
+decisions and every number.
+
+The measured pass (`performance-engineer`, perf-seed/1, SQLite, cold,
+three arms alternated): twenty-four reads run the same statements by
+count and text and return the same bytes on the base, on this tree, and
+on this tree with a default set; `GET /api/environments` gains its one
+statement (13 to 14 on the seed) and reads "same" at 19 ms; every Known
+slow row reads "same"; the history read stays flat with 50,000 rows
+planted on SQLite and on a local MariaDB 12.3. MariaDB 10.3 is CI's.
+
+Review, twice. The first pass found the contract and the DDL right and
+one real gap: on MariaDB two simultaneous writers could end in a 500 or
+record an act against a stale row. The fix (a locked re-read, three
+attempts) was reviewed again by fresh eyes and found sound; its tests
+force five interleavings with a statement hook. Also from review: only a
+refusal is a 400; the perf log labels the route.
+
+Decided where the design was silent, and put to the owner: a request
+with no `cadence` key is a 400; a default's reason is at most 500
+characters (a new 400), because item 23 repeats it on every failing row
+and the accepted payload cost assumed a sentence. Found and not changed,
+older than this item: `mark_flaky` and `unmark_flaky` have the same
+two-writers gap on MariaDB.
+
+CI on the push of items 21 and 25 was red on its three Ubuntu jobs: item
+21's doubled runs came out a second late where SQLite 3.45 rounds a
+time with a modifier to the millisecond. Fixed in `seed.py` by the
+performance engineer (only whole seconds go through `strftime`), the
+test unchanged; the built fixtures were checked pair by pair and are
+exact. The Python 3.6.8 and MariaDB 10.3 jobs were green throughout.

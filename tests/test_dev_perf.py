@@ -85,7 +85,8 @@ class SeedTest(_SeededCase):
     PINNED = ({
         "activity_hours": 63, "assignments": 0, "comments": 2,
         "current_assignments": 0, "environment_expectations": 0,
-        "environment_products": 7, "flaky_mark_history": 0,
+        "environment_flaky_defaults": 0, "environment_products": 7,
+        "flaky_default_history": 0, "flaky_mark_history": 0,
         "latest_runs": 974, "mute_history": 0,
         "run_outputs": 2790, "runs": 2790, "schema_version": 1,
         "script_hours": 182, "streams": 5, "test_flaky_marks": 0,
@@ -1226,11 +1227,22 @@ class FlakyDefaultStepTest(unittest.TestCase):
         self.assertEqual(seed.flaky_defaults(copy), {})
         conn = sqlite3.connect(copy)
         try:
-            conn.execute("CREATE TABLE environment_flaky_defaults ("
-                         "environment TEXT NOT NULL PRIMARY KEY, cadence "
-                         "INTEGER NOT NULL)")
-            conn.execute("INSERT INTO environment_flaky_defaults VALUES "
-                         "(?, 3)", (seed.ESTATE[0][1],))
+            if conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'environment_flaky_defaults'").fetchone()[0]:
+                # A tree at migration 13 built the seed: its own table.
+                conn.execute(
+                    "INSERT INTO environment_flaky_defaults (environment, "
+                    "cadence, reason, set_by, set_at, cadence_at) VALUES "
+                    "(?, 3, 'held', 'amy', '2026-09-01T00:00:00', "
+                    "'2026-09-01T00:00:00')", (seed.ESTATE[0][1],))
+            else:
+                # An older tree: a stand-in with the two columns read.
+                conn.execute("CREATE TABLE environment_flaky_defaults ("
+                             "environment TEXT NOT NULL PRIMARY KEY, cadence "
+                             "INTEGER NOT NULL)")
+                conn.execute("INSERT INTO environment_flaky_defaults VALUES "
+                             "(?, 3)", (seed.ESTATE[0][1],))
             conn.commit()
         finally:
             conn.close()

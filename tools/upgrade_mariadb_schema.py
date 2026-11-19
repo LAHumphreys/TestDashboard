@@ -384,6 +384,48 @@ def step_11_to_12(sizes: exporter.Sizes) -> List[str]:
     ]
 
 
+def step_12_to_13(sizes: exporter.Sizes) -> List[str]:
+    """environment_flaky_defaults + flaky_default_history - migration 13.
+
+    Mirrors storage.py's entry 13 (an environment's default flaky
+    cadence): two new tables and one index, no backfill, nothing
+    existing touched, so the server may keep serving through it.
+    Column-for-column identical to ``exporter.ddl()`` (the oracle
+    ``verify`` diffs against), kept literal for the same reason as
+    step_7_to_8. Keyed by the environment's name alone; ``reason`` is
+    TEXT and required on every act, a removal included; ``action``
+    shares ``result``'s ascii_bin, as the other history tables' do.
+    """
+    env = "VARCHAR({0})".format(sizes.environment)
+    stamp = "VARCHAR(26) CHARACTER SET ascii COLLATE ascii_bin"
+    return [
+        "CREATE TABLE environment_flaky_defaults (\n"
+        "  environment {env} NOT NULL,\n"
+        "  cadence     INT NOT NULL,\n"
+        "  reason      TEXT NOT NULL,\n"
+        "  set_by      VARCHAR(100) NOT NULL,\n"
+        "  set_at      {stamp} NOT NULL,\n"
+        "  cadence_at  {stamp} NOT NULL,\n"
+        "  PRIMARY KEY (environment)\n"
+        ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC".format(env=env, stamp=stamp),
+
+        "CREATE TABLE flaky_default_history (\n"
+        "  id          BIGINT NOT NULL AUTO_INCREMENT,\n"
+        "  environment {env} NOT NULL,\n"
+        "  action      VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin "
+        "NOT NULL,\n"
+        "  cadence     INT NULL,\n"
+        "  reason      TEXT NOT NULL,\n"
+        "  actor       VARCHAR(100) NOT NULL,\n"
+        "  acted_at    {stamp} NOT NULL,\n"
+        "  PRIMARY KEY (id)\n"
+        ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC".format(env=env, stamp=stamp),
+
+        "CREATE INDEX idx_flaky_default_history_env "
+        "ON flaky_default_history (environment, id)",
+    ]
+
+
 #: Every MariaDB migration since the cutover, in order. One entry per
 #: ``storage.MIGRATIONS`` entry above CUTOVER_VERSION — a gap fails
 #: ``LedgerTest`` and stops the tool at start-up (see ledger_gaps).
@@ -436,6 +478,17 @@ LEDGER = (
                       "test_flaky_marks", None),
                 Probe("flaky_mark_history table",
                       "flaky_mark_history", None)),
+        alters=(),
+    ),
+    Step(
+        from_version=12, package="WP-44",
+        summary="environment_flaky_defaults and flaky_default_history "
+                "tables",
+        statements=lambda sizes, now_iso: step_12_to_13(sizes),
+        probes=(Probe("environment_flaky_defaults table",
+                      "environment_flaky_defaults", None),
+                Probe("flaky_default_history table",
+                      "flaky_default_history", None)),
         alters=(),
     ),
 )  # type: Tuple[Step, ...]

@@ -38,6 +38,13 @@ afterwards, so its entry goes too and the Build picker stops listing it
 (the ``streams`` line of the report counts those). A build that also
 ran elsewhere keeps its other environments' results.
 
+The environment's human records go with it too: its comments,
+assignments, mutes, flaky marks, its default flaky cadence and the
+history of each (the ``environment_flaky_defaults`` and
+``flaky_default_history`` lines). A default belongs to the name, so an
+environment renamed by its feeder starts with none; dropping the old
+name is what removes the old default.
+
 On SQLite, space is not returned to the file system until a
 ``VACUUM``; pass ``--vacuum`` to do that here, in a maintenance window
 (it rewrites the whole file and takes an exclusive lock). On MariaDB

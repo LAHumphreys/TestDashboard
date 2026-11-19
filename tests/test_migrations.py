@@ -463,13 +463,16 @@ class Migration12Test(TempDirTest):
 
         storage = Storage(path)
         self.addCleanup(storage.close)
-        self.assertEqual(version_of(path), 12)
+        # Widened for migration 13: the open now steps 11 to 13, so what
+        # it adds is migration 12's objects and exactly 13's beside them.
+        self.assertEqual(version_of(path), 13)
         after = schema_of(path)
         added = {(kind, name) for kind, name, _sql in after} - {
             (kind, name) for kind, name, _sql in before}
-        self.assertEqual(added, self.ADDED)
+        self.assertEqual(added, self.ADDED | Migration13Test.ADDED)
         self.assertEqual(
-            [row for row in after if (row[0], row[1]) not in self.ADDED],
+            [row for row in after if (row[0], row[1]) not in
+             self.ADDED | Migration13Test.ADDED],
             before)
         self.assertEqual(
             self._columns(path, "test_flaky_marks"),
@@ -495,6 +498,104 @@ class Migration12Test(TempDirTest):
                 0)
         finally:
             conn.close()
+
+
+class Migration13Test(TempDirTest):
+    """Migration 13 (design flaky-default-r0 §2 B.2, decision 6) creates
+    an environment's default flaky cadence and its history, with their
+    one index, and touches nothing else: a version-12 database holding a
+    mute and a flaky mark opens at 13 with every existing object and row
+    unchanged. MariaDB's half is step
+    12 to 13 of the upgrade-tool ledger (``LedgerTest`` and the upgrade
+    tests)."""
+
+    ADDED = {
+        ("table", "environment_flaky_defaults"),
+        ("table", "flaky_default_history"),
+        ("index", "idx_flaky_default_history_env"),
+        ("index", "sqlite_autoindex_environment_flaky_defaults_1"),
+    }
+
+    def _columns(self, path: str, table: str) -> List[Tuple[str, str, int]]:
+        conn = sqlite3.connect(path)
+        try:
+            return [(row[1], row[2], row[3]) for row in conn.execute(
+                "PRAGMA table_info({0})".format(table))]
+        finally:
+            conn.close()
+
+    def test_twelve_to_thirteen_creates_only(self) -> None:
+        path = self.path("v12.db")
+        build_at(path, 12)
+        conn = sqlite3.connect(path)
+        conn.execute("INSERT INTO users (username, created_at) "
+                     "VALUES ('someone', '2026-10-01T00:00:00.000000')")
+        conn.execute(
+            "INSERT INTO test_mutes (stream_id, environment, script, "
+            "test_name, reason, muted_at, expires_at, muted_by) VALUES "
+            "(1, 'prod', 's.py', 't', 'infra', "
+            "'2026-10-01T00:00:00.000000', '2026-10-02T00:00:00.000000', "
+            "'someone')")
+        conn.execute(
+            "INSERT INTO test_flaky_marks (environment, script, test_name, "
+            "cadence, reason, marked_by, marked_at) VALUES "
+            "('prod', 's.py', 't', 3, 'races', 'someone', "
+            "'2026-10-01T00:00:00.000000')")
+        conn.commit()
+        conn.close()
+        before = schema_of(path)
+
+        storage = Storage(path)
+        self.addCleanup(storage.close)
+        self.assertEqual(version_of(path), 13)
+        after = schema_of(path)
+        added = {(kind, name) for kind, name, _sql in after} - {
+            (kind, name) for kind, name, _sql in before}
+        self.assertEqual(added, self.ADDED)
+        self.assertEqual(
+            [row for row in after if (row[0], row[1]) not in self.ADDED],
+            before)
+        self.assertEqual(
+            self._columns(path, "environment_flaky_defaults"),
+            [("environment", "TEXT", 1), ("cadence", "INTEGER", 1),
+             ("reason", "TEXT", 1), ("set_by", "TEXT", 1),
+             ("set_at", "TEXT", 1), ("cadence_at", "TEXT", 1)])
+        self.assertEqual(
+            self._columns(path, "flaky_default_history"),
+            [("id", "INTEGER", 0), ("environment", "TEXT", 1),
+             ("action", "TEXT", 1), ("cadence", "INTEGER", 0),
+             ("reason", "TEXT", 1), ("actor", "TEXT", 1),
+             ("acted_at", "TEXT", 1)])
+        conn = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT reason FROM test_mutes").fetchall(),
+                [("infra",)])
+            self.assertEqual(
+                conn.execute(
+                    "SELECT cadence, reason FROM test_flaky_marks"
+                ).fetchall(), [(3, "races")])
+            for table in ("environment_flaky_defaults",
+                          "flaky_default_history"):
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM {0}".format(table)
+                    ).fetchone()[0], 0, table)
+        finally:
+            conn.close()
+
+    def test_the_history_index_leads_with_the_environment(self) -> None:
+        """The Admin page's read is a backwards range of it per
+        environment, stopped at twenty."""
+        path = self.path("v13.db")
+        build_at(path, 13)
+        conn = sqlite3.connect(path)
+        try:
+            columns = [row[2] for row in conn.execute(
+                "PRAGMA index_info(idx_flaky_default_history_env)")]
+        finally:
+            conn.close()
+        self.assertEqual(columns, ["environment", "id"])
 
 
 class PlantedRegressionTest(unittest.TestCase):

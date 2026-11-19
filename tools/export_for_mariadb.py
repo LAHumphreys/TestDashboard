@@ -56,6 +56,8 @@ TABLE_ORDER = (
     "mute_history",
     "test_flaky_marks",
     "flaky_mark_history",
+    "environment_flaky_defaults",
+    "flaky_default_history",
     "environment_expectations",
     "environment_products",
     "activity_hours",
@@ -288,6 +290,27 @@ CREATE TABLE flaky_mark_history (
   PRIMARY KEY (id)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
 
+CREATE TABLE environment_flaky_defaults (
+  environment {env} NOT NULL,
+  cadence     INT NOT NULL,
+  reason      TEXT NOT NULL,
+  set_by      {user} NOT NULL,
+  set_at      {stamp} NOT NULL,
+  cadence_at  {stamp} NOT NULL,
+  PRIMARY KEY (environment)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE flaky_default_history (
+  id          BIGINT NOT NULL AUTO_INCREMENT,
+  environment {env} NOT NULL,
+  action      VARCHAR(20) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  cadence     INT NULL,
+  reason      TEXT NOT NULL,
+  actor       {user} NOT NULL,
+  acted_at    {stamp} NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+
 CREATE TABLE environment_expectations (
   environment    {env} NOT NULL,
   expected_tests INT NOT NULL,
@@ -360,6 +383,8 @@ CREATE INDEX idx_mute_history_triple
   ON mute_history (environment, script, test_name, id);
 CREATE INDEX idx_flaky_mark_history_triple
   ON flaky_mark_history (environment, script, test_name, id);
+CREATE INDEX idx_flaky_default_history_env
+  ON flaky_default_history (environment, id);
 """
 
 

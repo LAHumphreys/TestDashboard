@@ -8406,6 +8406,359 @@ class NoMarksAddsNothingTest(ApiCase):
             self.call("GET", self.DETAIL, query=build)["flaky"]["state"],
             "failing")
 
+    def test_a_default_is_read_by_no_first_paint_read(self) -> None:
+        """Design flaky-default-r0 item 22: an environment's default is
+        kept and shown, and nothing judges it yet. With a default of 2
+        (and its history) on linux-sim, every read above runs exactly
+        the statements it ran without one, cold, byte for byte, and none
+        of them names the default's tables. Item 23 is where this
+        changes, by design."""
+        before = {name: self._cold_selects(path, query)
+                  for name, path, query in self._reads()}
+        self.call("PUT", "/api/environments/linux-sim/flaky-default",
+                  body={"username": "bob", "cadence": 3, "reason": "r1"})
+        self.call("PUT", "/api/environments/linux-sim/flaky-default",
+                  body={"username": "bob", "cadence": 2, "reason": "r2"})
+        for name, path, query in self._reads():
+            cold = self._cold_selects(path, query)
+            self.assertEqual(cold, before[name], name)
+            self.assertEqual(len(cold), self.BASE_COLD_SELECTS[name], name)
+            for statement in cold:
+                self.assertNotIn("flaky_default", statement, name)
+                self.assertNotIn("environment_flaky_defaults", statement,
+                                 name)
+
+
+class DefaultJudgesNothingYetTest(ApiCase):
+    """Design flaky-default-r0 item 22, on both backends: a default is
+    kept and shown and judges nothing yet. With a default of 2 on
+    linux-sim (whose tests fail after a pass, fail after a fail, and are
+    fixed), every first-paint read answers byte for byte as it did
+    without one; no payload carries ``status.flaky_defaults`` or a
+    ``flaky.source``, which are item 23's. ``NoMarksAddsNothingTest``'s
+    reads, its fixture and its statement guard (SQLite) pin the cost."""
+
+    DETAIL = NoMarksAddsNothingTest.DETAIL
+
+    def setUp(self) -> None:
+        super().setUp()
+        TestSummary.seed(self)  # type: ignore
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T06:00:00.000000"),
+        ])
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_new_fail", "/assignee"),
+                  body={"username": "alice", "assigned_by": "bob"})
+        self.build = self.storage.list_streams("")[0].stream_id
+
+    def _answers(self) -> Dict[str, Any]:
+        answers = {}  # type: Dict[str, Any]
+        for name, path, query in NoMarksAddsNothingTest._reads(
+                self):  # type: ignore
+            self.storage._invalidate_summary_cache()
+            self.storage._invalidate_trend_cache()
+            answers[name] = self.call("GET", path, query=query)
+        return answers
+
+    def _keys(self, value: Any, into: Set[str]) -> None:
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                into.add(key)
+                self._keys(inner, into)
+        elif isinstance(value, list):
+            for inner in value:
+                self._keys(inner, into)
+
+    def test_every_answer_is_the_same_with_a_default(self) -> None:
+        before = self._answers()
+        for cadence in (3, 2):
+            self.call("PUT", "/api/environments/linux-sim/flaky-default",
+                      body={"username": "bob", "cadence": cadence,
+                            "reason": "two servers"})
+        after = self._answers()
+        for name in sorted(before):
+            self.assertEqual(after[name], before[name], name)
+            keys = set()  # type: Set[str]
+            self._keys(after[name], keys)
+            self.assertNotIn("flaky_defaults", keys, name)
+            self.assertNotIn("source", keys, name)
+
+
+class FlakyDefaultApiTest(ApiCase):
+    """``PUT /api/environments/{environment}/flaky-default`` (design
+    flaky-default-r0 §1a, §2 B.3; decisions 7, 8 and 13): set, change,
+    reason edit and removal, with every error B.3 lists, and nothing
+    written by a refusal."""
+
+    PATH = "/api/environments/linux-sim/flaky-default"
+    REASON = "two servers; investigate failures on both"
+    SET_AT = "2026-07-26T12:00:00.000000"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(), record(environment="win-sim")])
+        for name in ("amy", "ben", "dee"):
+            self.storage.ensure_user(name, NOW)
+        self.storage.set_user_active("dee", False, "amy", NOW)
+
+    def _put(self, body: Dict[str, Any], expect: int = 200,
+             path: Optional[str] = None) -> Dict[str, Any]:
+        return self.call("PUT", path or self.PATH, body=body, expect=expect)
+
+    def _listed(self, environment: str = "linux-sim") -> Dict[str, Any]:
+        data = self.call("GET", "/api/environments")
+        (item,) = [e for e in data["environments"]
+                   if e["environment"] == environment]
+        return item
+
+    def test_set_change_reason_and_clear(self) -> None:
+        shown = {"cadence": 2, "set_by": "amy", "set_at": self.SET_AT,
+                 "reason": self.REASON}
+        self.assertEqual(
+            self._put({"username": "amy", "cadence": 2,
+                       "reason": self.REASON}),
+            {"environment": "linux-sim", "action": "set",
+             "flaky_default": shown})
+        self.assertEqual(
+            self._put({"username": "ben", "cadence": 3,
+                       "reason": "a third server"}),
+            {"environment": "linux-sim", "action": "cadence",
+             "flaky_default": {"cadence": 3, "set_by": "ben",
+                               "set_at": self.SET_AT,
+                               "reason": "a third server"}})
+        self.assertEqual(
+            self._put({"username": "amy", "cadence": 3,
+                       "reason": "reworded"})["action"], "reason")
+        same = self._put({"username": "ben", "cadence": 3,
+                          "reason": "reworded"})
+        self.assertEqual(same["action"], "unchanged")
+        self.assertEqual(same["flaky_default"]["set_by"], "amy")
+        self.assertEqual(
+            self._put({"username": "ben", "cadence": None,
+                       "reason": "trial over"}),
+            {"environment": "linux-sim", "action": "clear",
+             "flaky_default": None})
+        self.assertEqual(
+            self._put({"username": "ben", "cadence": None,
+                       "reason": "trial over"}),
+            {"environment": "linux-sim", "action": "unchanged",
+             "flaky_default": None})
+        item = self._listed()
+        self.assertIsNone(item["flaky_default"])
+        self.assertEqual(
+            [(a["action"], a["cadence"], a["reason"], a["actor"])
+             for a in item["flaky_default_history"]],
+            [("clear", None, "trial over", "ben"),
+             ("reason", 3, "reworded", "amy"),
+             ("cadence", 3, "a third server", "ben"),
+             ("set", 2, self.REASON, "amy")])
+
+    def test_an_unknown_environment_is_a_404(self) -> None:
+        data = self._put(
+            {"username": "amy", "cadence": 2, "reason": self.REASON},
+            expect=404,
+            path="/api/environments/atlas-lab-zulu/flaky-default")
+        self.assertEqual(data["error"],
+                         "unknown environment: atlas-lab-zulu")
+
+    def test_the_cadence_is_two_to_ten_or_null(self) -> None:
+        for bad, shown in ((11, "11"), (1, "1"), (0, "0"), ("2", '"2"'),
+                           (True, "true"), (2.5, "2.5"), ([2], "[2]")):
+            data = self._put({"username": "amy", "cadence": bad,
+                              "reason": self.REASON}, expect=400)
+            self.assertEqual(
+                data["error"],
+                "cadence: must be a whole number from 2 to 10 or null, "
+                "got " + shown)
+        data = self._put({"username": "amy", "reason": self.REASON},
+                         expect=400)
+        self.assertTrue(data["error"].startswith(
+            "cadence: required field is missing"), data)
+        for good in (2, 10):
+            self.assertIn(self._put({"username": "amy", "cadence": good,
+                                     "reason": self.REASON})["action"],
+                          ("set", "cadence"))
+
+    def test_a_reason_is_required_to_set_change_and_remove(self) -> None:
+        """Decision 7."""
+        message = "reason: required, to set, change or remove a default"
+        for cadence in (2, 3, None):
+            if cadence == 3:
+                self._put({"username": "amy", "cadence": 2,
+                           "reason": self.REASON})
+            for body in ({}, {"reason": None}, {"reason": ""},
+                         {"reason": "  \n"}):
+                body.update({"username": "amy", "cadence": cadence})
+                self.assertEqual(self._put(body, expect=400)["error"],
+                                 message)
+        self.assertEqual(
+            self._put({"username": "amy", "cadence": 3, "reason": 7},
+                      expect=400)["error"],
+            "reason: must be a string, got int")
+        item = self._listed()
+        self.assertEqual(item["flaky_default"]["cadence"], 2)
+        self.assertEqual(len(item["flaky_default_history"]), 1)
+
+    def test_a_reason_is_at_most_500_characters_once_trimmed(self) -> None:
+        """A default's reason is repeated on the rows it judges, so it is
+        a sentence: 500 after trimming is taken, 501 is the 400."""
+        data = self._put({"username": "amy", "cadence": 2,
+                          "reason": "x" * 501}, expect=400)
+        self.assertEqual(data["error"],
+                         "reason: at most 500 characters, got 501")
+        self.assertIsNone(self._listed()["flaky_default"])
+        data = self._put({"username": "amy", "cadence": 2,
+                          "reason": "  " + "y" * 500 + "\n"})
+        self.assertEqual(data["action"], "set")
+        self.assertEqual(data["flaky_default"]["reason"], "y" * 500)
+
+    def test_only_a_refusal_is_a_400(self) -> None:
+        """Any other error out of storage, a ValueError included, is the
+        server's: a 500, as everywhere else."""
+        def broken(*_args: Any, **_kwargs: Any) -> Any:
+            raise ValueError("time data '2026-13-01' does not match format")
+
+        self.storage.set_flaky_default = broken  # type: ignore
+        data = self._put({"username": "amy", "cadence": 2,
+                          "reason": self.REASON}, expect=500)
+        self.assertIn("internal server error", data["error"])
+
+    def test_the_user_is_validated_as_the_marks_is(self) -> None:
+        cases = (
+            ("carol", "username: carol is not a known user; only a known, "
+                      "active user can set, change or remove a flaky "
+                      "default"),
+            ("dee", "username: dee has been deactivated and cannot set, "
+                    "change or remove a flaky default"),
+        )
+        for user, message in cases:
+            data = self._put({"username": user, "cadence": 2,
+                              "reason": self.REASON}, expect=400)
+            self.assertEqual(data["error"], message)
+        self.assertEqual(
+            self._put({"cadence": 2, "reason": self.REASON},
+                      expect=400)["error"],
+            "username: required field is missing")
+        self.assertNotIn("carol", [u["username"] for u in self.call(
+            "GET", "/api/users")["users"]])
+        item = self._listed()
+        self.assertIsNone(item["flaky_default"])
+        self.assertEqual(item["flaky_default_history"], [])
+
+    def test_only_put(self) -> None:
+        self.assert_405("GET", self.PATH, "PUT")
+        self.assert_405("POST", self.PATH, "PUT",
+                        body={"username": "amy", "cadence": 2,
+                              "reason": self.REASON})
+
+    def test_a_default_belongs_to_its_environment(self) -> None:
+        self._put({"username": "amy", "cadence": 2, "reason": self.REASON})
+        self.assertIsNone(self._listed("win-sim")["flaky_default"])
+        self.assertEqual(self._listed("win-sim")["flaky_default_history"],
+                         [])
+
+
+class EnvironmentsListFlakyDefaultTest(ApiCase):
+    """``GET /api/environments`` carries each environment's
+    ``flaky_default`` and ``flaky_default_history`` (design
+    flaky-default-r0 §2 B.3): the key names of B.3's example payloads,
+    the newest twenty newest first, and nothing else of the listing
+    moved."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(), record(environment="win-sim")])
+        self.storage.ensure_user("amy", NOW)
+
+    def test_no_default_reads_null_and_an_empty_history(self) -> None:
+        data = self.call("GET", "/api/environments")
+        for item in data["environments"]:
+            self.assertIsNone(item["flaky_default"])
+            self.assertEqual(item["flaky_default_history"], [])
+
+    def test_the_payload_keys_are_b3s(self) -> None:
+        self.storage.set_flaky_default(
+            "linux-sim", 2, "two servers", "amy", NOW)
+        data = self.call("GET", "/api/environments")
+        (item,) = [e for e in data["environments"]
+                   if e["environment"] == "linux-sim"]
+        self.assertEqual(item["flaky_default"], {
+            "cadence": 2, "set_by": "amy",
+            "set_at": "2026-07-26T12:00:00.000000",
+            "reason": "two servers"})
+        (act,) = item["flaky_default_history"]
+        self.assertEqual(sorted(act), ["acted_at", "action", "actor",
+                                       "cadence", "id", "reason"])
+        self.assertEqual(
+            (act["action"], act["cadence"], act["reason"], act["actor"],
+             act["acted_at"]),
+            ("set", 2, "two servers", "amy", "2026-07-26T12:00:00.000000"))
+        self.assertIsInstance(act["id"], int)
+        # The listing's existing keys are all still there.
+        for key in ("environment", "product", "tests_seen",
+                    "expected_tests", "effective_expected", "updated_at",
+                    "updated_by", "passes_total", "passes_covered",
+                    "latest_pass"):
+            self.assertIn(key, item)
+
+    def test_the_newest_twenty_newest_first(self) -> None:
+        for index in range(23):
+            self.storage.set_flaky_default(
+                "linux-sim", 2 + index % 3, "r{0}".format(index), "amy",
+                NOW + datetime.timedelta(minutes=index))
+        data = self.call("GET", "/api/environments")
+        (item,) = [e for e in data["environments"]
+                   if e["environment"] == "linux-sim"]
+        history = item["flaky_default_history"]
+        self.assertEqual(len(history), 20)
+        self.assertEqual([a["reason"] for a in history],
+                         ["r{0}".format(i) for i in range(22, 2, -1)])
+        self.assertEqual(item["flaky_default"]["reason"], "r22")
+
+
+class EnvironmentsListStatementsTest(ApiCase):
+    """The cache guard of ``GET /api/environments`` (design
+    flaky-default-r0 §2 B.3: one statement more): counted by SQLite's
+    trace, the same however long a history has grown."""
+
+    #: SELECTs of the listing at the base commit (5e80e20) on this
+    #: fixture, by the same trace; the default and its history are the
+    #: one more.
+    BASE_SELECTS = 8
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.import_runs([record(), record(environment="win-sim")])
+        self.storage.ensure_user("amy", NOW)
+
+    def _selects(self) -> List[str]:
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        seen = []  # type: List[str]
+        conn = self.storage._conn()
+        _trace_sql_into(conn, seen)
+        try:
+            self.call("GET", "/api/environments")
+        finally:
+            conn.set_trace_callback(None)
+        return [" ".join(s.split()) for s in seen
+                if s.strip().upper().startswith("SELECT")]
+
+    def test_one_statement_more_than_the_base(self) -> None:
+        empty = self._selects()
+        self.assertEqual(len(empty), self.BASE_SELECTS + 1, empty)
+        reading = [s for s in empty if "flaky_default" in s]
+        self.assertEqual(len(reading), 1, reading)
+        for index in range(30):
+            self.storage.set_flaky_default(
+                "linux-sim", 2 + index % 2, "r{0}".format(index), "amy",
+                NOW + datetime.timedelta(minutes=index))
+        self.assertEqual(len(self._selects()), self.BASE_SELECTS + 1)
+
 
 class FlakyBoardApiTest(ApiCase):
     """WP-44 item 6: the board acts on the mark, through the API.

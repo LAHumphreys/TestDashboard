@@ -79,6 +79,14 @@ EXCLUDED_CLASSES = {
         "(WP-44 item 20): the instrument is SQLite's. The values those "
         "reads return, the expiry with no write included, are "
         "NotRunMutedTest's and NotRunMutedApiTest's, which run here.",
+    "EnvironmentsListStatementsTest":
+        "counts GET /api/environments' statements with sqlite3's "
+        "set_trace_callback (migration 13, the default flaky cadence). "
+        "That the one statement it adds runs once on MariaDB, however "
+        "long the history, is FlakyDefaultHistoryReadTest's "
+        "test_one_statement_however_long_the_history, which counts the "
+        "server's own Questions here; the payload is "
+        "EnvironmentsListFlakyDefaultTest's, which runs here.",
     "TestEnvironmentListingCost":
         "counts sqlite page reads to pin a query-shape regression; "
         "the instrument is engine-specific even though the shape "
@@ -306,6 +314,14 @@ EXCLUDED_TESTS = {
         "That both a full statement and a second one execute on MariaDB "
         "is test_q2_over_more_than_one_statement, which runs here "
         "(decision 22).",
+    "FlakyDefaultHistoryReadTest"
+    ".test_each_history_member_is_a_range_of_its_index":
+        "reads the statement with sqlite3's set_trace_callback and "
+        "asserts SQLite's EXPLAIN QUERY PLAN (migration 13). The same "
+        "members are parenthesised on MariaDB, as Q2's are; that they "
+        "return the newest twenty there is "
+        "test_the_newest_twenty_newest_first_per_environment, which "
+        "runs here.",
     "FlakyCadenceTest.test_the_marks_reads_are_driven_by_their_keys":
         "reads statements with sqlite3's set_trace_callback and asserts "
         "SQLite's EXPLAIN QUERY PLAN (WP-44). Q2's plan guard, "

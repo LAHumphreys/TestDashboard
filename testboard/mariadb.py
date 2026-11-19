@@ -55,6 +55,10 @@ PING_IDLE_SECONDS = 60.0
 #: Rides in init_command so a driver-level reconnect re-applies it.
 _INIT_COMMAND = "SET SESSION innodb_lock_wait_timeout=10"
 
+#: Server errors after which the whole transaction may simply be run
+#: again (``MariaDBBackend.restartable``): ER_CHECKREAD, ER_LOCK_DEADLOCK.
+_RESTARTABLE_ERRNOS = (1020, 1213)
+
 #: MariaDB spells "no limit" as the largest possible row count; -1 is
 #: a syntax error there (the SQLite spelling lives in _SqliteBackend).
 _LIMIT_ALL_OFFSET = " LIMIT 18446744073709551615 OFFSET ?"
@@ -191,6 +195,11 @@ class MariaDBBackend(object):
     like_test_name = _LIKE_TEST_NAME
     limit_all_offset = _LIMIT_ALL_OFFSET
     limited_union_member = _LIMITED_UNION_MEMBER
+
+    #: A read that locks the row it finds until the transaction ends
+    #: (``Storage.set_flaky_default``): ``START TRANSACTION`` takes no
+    #: lock, so a plain read can be stale by the time the write lands.
+    locking_read = " FOR UPDATE"
     row_value_list = _ROW_VALUE_LIST
 
     #: WP-44 item 16: ``Storage._rows_by_key`` keeps the row-value
@@ -214,6 +223,16 @@ class MariaDBBackend(object):
         self.integrity_error = driver.IntegrityError
         self._driver_module = driver
         self._sql_cache = {}  # type: Dict[str, str]
+
+    def restartable(self, exc: BaseException) -> bool:
+        """True for the two errors InnoDB answers with "try restarting
+        transaction" (``Storage.set_flaky_default`` starts again on
+        them): 1020, a locking read of a row another transaction changed
+        since this one's snapshot (``innodb_snapshot_isolation``, on by
+        default since 11.6; 10.3 reads the new row instead), and 1213,
+        a deadlock this transaction was chosen to lose."""
+        return (isinstance(exc, self._driver_module.OperationalError)
+                and bool(exc.args) and exc.args[0] in _RESTARTABLE_ERRNOS)
 
     # ------------------------------------------------------------------
     # Connections

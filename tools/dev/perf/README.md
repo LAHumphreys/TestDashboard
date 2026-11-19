@@ -406,8 +406,8 @@ compares it with the tables below.**
 
 ### The default: the one step after item 22
 
-The fixtures hold no default: migration 13 and its endpoint arrive with
-item 22. Once they exist, the default is set through the tree's own
+The fixtures hold no default: they are at migration 12, and migration 13
+and its endpoint came with item 22. The default is set through the tree's own
 `PUT /api/environments/{environment}/flaky-default` (the design's §1a
 contract), in-process, as amy, dated an hour before the environment's
 first run (`default_clock()`: no run precedes `cadence_at`, so every
