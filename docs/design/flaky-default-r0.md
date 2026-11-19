@@ -1159,7 +1159,7 @@ API section, the pull request's body, the handover.
 Status strip, ticked by the run as each item is committed; a parked item
 says why:
 
-- [ ] 21 the fixture for both bars
+- [x] 21 the fixture for both bars
 - [ ] 22 the default kept and recorded (migration 13)
 - [ ] 23 the default judged
 - [ ] 24 the per-day chart's late part

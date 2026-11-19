@@ -3,7 +3,7 @@
     python tools/dev/perf/ab.py --base SHA --head SHA --db <scratch>/perf.db
     python tools/dev/perf/ab.py --base SHA --head-tree <worktree> --db ...
         [--pages NAME=URL ...] [--calls 24] [--methods m1,m2] [--json OUT]
-        [--assign 65|1000] [--marks 0|50|1000]
+        [--assign 65|1000] [--marks 0|50|1000] [--flaky-default 2|3]
         [--page-mode open-actions home] [--workers 2]
 
 Both trees' ``testboard`` packages are loaded into ONE process, each
@@ -29,6 +29,12 @@ states, whatever N is.
 assignments fixture when both are given): N flaky marks written through
 each tree's own ``Storage.mark_flaky``, with their companions, and the
 fixture's census printed. N > 0 needs both trees at migration 12.
+
+``--flaky-default C`` then sets the largest environment's flaky default
+to C through each tree's own ``PUT /api/environments/{E}/flaky-default``
+(both trees at WP-44 item 22, migration 13, or later) and prints the
+default's census. The failing fixture it is measured on is built
+beforehand by ``seed.py --onto ... --default-failing N``.
 
 ``--page-mode PAGE ...`` times a page's first paint: its requests
 (``FIRST_PAINT``) sent together to ``--workers`` long-lived threads in
@@ -808,6 +814,8 @@ class Result(NamedTuple):
     marks: Optional[Tuple[int, int, int, int]]
     census: List[str]
     page_rows: List[PageRow]
+    flaky_default: Optional[int]
+    default_census: List[str]
 
 
 def _apply_marks(seed: types.ModuleType, trees: Tuple[Tree, Tree],
@@ -837,13 +845,43 @@ def _apply_marks(seed: types.ModuleType, trees: Tuple[Tree, Tree],
     return done[0], seed.census_lines(census[1])
 
 
+def _apply_default(seed: types.ModuleType, trees: Tuple[Tree, Tree],
+                   stores: Sequence[object], copies: Tuple[str, str],
+                   activator: Activator, scope: Scope, cadence: int
+                   ) -> List[str]:
+    """The flaky default on both copies, each through its own tree's
+    ``PUT /api/environments/{E}/flaky-default``, dated before every run
+    of E (``seed.default_clock``). Both sides must hold the same default
+    and the same fixture rows; returns the default's census."""
+    for side in (0, 1):
+        activator.use(trees[side])
+        seed.put_flaky_default(  # type: ignore
+            trees[side].modules["testboard.api"], stores[side],
+            scope.environment, cadence,
+            seed.default_clock(copies[side], scope.environment))
+    held = [seed.flaky_defaults(copy).get(scope.environment)
+            for copy in copies]
+    if held != [cadence, cadence]:
+        raise ValueError("the flaky default was not written on both sides: "
+                         "{} / {}".format(held[0], held[1]))
+    digests = [seed.fixture_digest(copy) for copy in copies]
+    if digests[0] != digests[1]:
+        raise ValueError("the flaky default's rows differ between the trees "
+                         "(fixture_digest {} / {}): the two sides would not "
+                         "measure the same estate".format(
+                             digests[0][:12], digests[1][:12]))
+    return seed.default_lines(seed.default_census(
+        copies[1], scope.environment, cadence, scope.now))
+
+
 def run(base_tree: str, head_tree: str, db: str, scratch: str,
         labels: Tuple[str, str], pages: Sequence[Tuple[str, str]] = (),
         calls: int = 24, methods: Sequence[str] = (),
         known: bool = True,
         log: Optional[Callable[[str], None]] = None,
         assign: int = 0, marks: Optional[int] = None,
-        page_modes: Sequence[str] = (), workers: int = 2) -> Result:
+        page_modes: Sequence[str] = (), workers: int = 2,
+        flaky_default: Optional[int] = None) -> Result:
     """Measure every row on both trees; see the module docstring."""
     check_db(db)
     for name in page_modes:
@@ -852,9 +890,13 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                 name, ", ".join(sorted(FIRST_PAINT))))
     if marks is not None and marks < 0:
         raise ValueError("--marks N needs N >= 0")
-    if (assign or marks is not None) and not (pages or page_modes):
-        raise ValueError("--assign and --marks apply to the --pages rows "
-                         "and --page-mode pages; name at least one")
+    if flaky_default is not None and not 2 <= flaky_default <= 10:
+        raise ValueError("--flaky-default C takes 2 to 10")
+    fixtured = assign or marks is not None or flaky_default is not None
+    if fixtured and not (pages or page_modes):
+        raise ValueError("--assign, --marks and --flaky-default apply to the "
+                         "--pages rows and --page-mode pages; name at least "
+                         "one")
     trees = (load_tree(labels[0], base_tree), load_tree(labels[1], head_tree))
     copies = (os.path.join(scratch, "a.db"), os.path.join(scratch, "b.db"))
     for copy in copies:
@@ -882,7 +924,7 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                     "older tree".format(labels[side], exc))
         pair = (stores[0], stores[1])
         tracers = (_Tracer(), _Tracer())
-        page_state = "fixture" if assign or marks is not None else "plain"
+        page_state = "fixture" if fixtured else "plain"
         wanted = [(name, url, state) for name, url, state in KNOWN_SLOW
                   if known] + [(name, url, page_state) for name, url in pages]
         rows = []  # type: List[Row]
@@ -890,6 +932,7 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
         fixture = (0, 0)
         marked = None  # type: Optional[Tuple[int, int, int, int]]
         census = []  # type: List[str]
+        defaulted = []  # type: List[str]
         for state in ("plain", "assign65", "fixture"):
             todo = [w for w in wanted if w[2] == state]
             paged = list(page_modes) if state == page_state else []
@@ -915,6 +958,10 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
                 if marks is not None:
                     marked, census = _apply_marks(
                         seed, trees, stores, copies, activator, scope, marks)
+                if flaky_default is not None:
+                    defaulted = _apply_default(
+                        seed, trees, stores, copies, activator, scope,
+                        flaky_default)
             for name, url, _state in todo:
                 row = alternate(trees, pair, activator, name,
                                 fill(url, scope), scope.now, calls,
@@ -970,7 +1017,8 @@ def run(base_tree: str, head_tree: str, db: str, scratch: str,
     return Result(labels=labels, db=os.path.abspath(db), scope=scope,
                   calls=calls, rows=rows, methods=per_method,
                   fixture=fixture, marks=marked, census=census,
-                  page_rows=page_rows)
+                  page_rows=page_rows, flaky_default=flaky_default,
+                  default_census=defaulted)
 
 
 def report(result: Result) -> List[str]:
@@ -997,6 +1045,13 @@ def report(result: Result) -> List[str]:
                 result.marks[0], result.scope.environment, result.marks[1],
                 result.marks[2], result.marks[3]))
         lines.extend(result.census)
+    if result.flaky_default is not None:
+        lines.append(
+            "--pages rows measured with a flaky default of {} in {}, set "
+            "through each tree's own endpoint before every run. Census (the "
+            "harness's own reading of the rule):".format(
+                result.flaky_default, result.scope.environment))
+        lines.extend(result.default_census)
     lines.append("{:36s} {:>9s} {:>9s} {:>8s} {:>18s} {:>9s}  {}".format(
         "request", "A ms", "B ms", "B-A ms", "95% band of B-A", "stmts A/B",
         "verdict"))
@@ -1101,6 +1156,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "1000 marks; after --assign when both are "
                              "given); N > 0 needs both trees at migration "
                              "12")
+    parser.add_argument("--flaky-default", type=int, default=None,
+                        metavar="C",
+                        help="measure the --pages rows and --page-mode "
+                             "pages with the largest environment's flaky "
+                             "default at C (2 to 10), set through each "
+                             "tree's own endpoint after the other fixtures; "
+                             "both trees at WP-44 item 22 or later")
     parser.add_argument("--page-mode", nargs="*", default=[],
                         metavar="PAGE",
                         help="also time a page's first paint on long-lived "
@@ -1116,11 +1178,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         check_db(args.db)
         pages = _parse_pages(args.pages)
-        if (args.assign or args.marks is not None) and not (
-                pages or args.page_mode):
-            raise ValueError("--assign and --marks apply to the --pages "
-                             "rows and --page-mode pages; name at least "
-                             "one")
+        if (args.assign or args.marks is not None
+                or args.flaky_default is not None) and not (
+                    pages or args.page_mode):
+            raise ValueError("--assign, --marks and --flaky-default apply to "
+                             "the --pages rows and --page-mode pages; name "
+                             "at least one")
         trees = []  # type: List[Tuple[str, str]]
         for index, (sha, tree) in enumerate(((args.base, args.base_tree),
                                              (args.head, args.head_tree))):
@@ -1136,7 +1199,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                      known=not args.no_known,
                      log=lambda text: print(text, file=sys.stderr),
                      assign=args.assign, marks=args.marks,
-                     page_modes=args.page_mode, workers=args.workers)
+                     page_modes=args.page_mode, workers=args.workers,
+                     flaky_default=args.flaky_default)
     except ValueError as exc:
         print("ab.py: {}".format(exc), file=sys.stderr)
         return 2
@@ -1155,6 +1219,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "marks": (list(result.marks) if result.marks is not None
                           else None),
                 "census": result.census,
+                "flaky_default": result.flaky_default,
+                "default_census": result.default_census,
                 "rows": [row._asdict() for row in result.rows],
                 "pages": [page._asdict() for page in result.page_rows],
             }, handle, indent=1)

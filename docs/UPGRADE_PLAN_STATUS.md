@@ -5449,3 +5449,33 @@ The sizing pass is the doc's §6: seven items, 21 to 27, on the branch that
 carries WP-44, with a status strip. The owner chose an unattended run
 through `/overnight`, with each commit pushed for CI, aiming at a drop
 dated 2026-11-20. The handover registers the build.
+
+## The default flaky cadence, build started; item 21, the fixtures for both bars (2026-11-19)
+
+The owner's go at the kickoff of `/overnight flaky-default-r0`: unattended,
+each commit pushed for CI. Kickoff counts in the main checkout at
+`5e80e20`: 3093 OK (skipped 1) on SQLite and 4285 OK (skipped 91) with the
+MariaDB variants. Items 21, 22 and 25 started together, each in its own
+worktree.
+
+Item 21 (`performance-engineer`) turns the hand-built databases of the
+design's two measured bars into a recipe in `tools/dev/perf/`:
+`seed.py --onto COPY --default-failing N --failing-mix latest|nightly
+[--two-servers]`, a check that compares every derived table with `runs`
+after each rewrite and fails the build on a difference, `--census` for
+the counts a pass checks before it measures, the default set through the
+tree's own endpoint (`--flaky-default`, which waits for item 22), and
+`mariadb_load.py` for the MariaDB copy. The README has the recipe, the
+census tables and both bars with their source. The commit message has
+the census of the four fixtures built; nightly-50 reproduces the figures
+round 1 measured on (1,038 failed runs over 204 tests in the newest 14
+nights).
+
+Review: fresh eyes found every acceptance line met and no product code
+touched. Two things went back and were fixed: tracked text that pointed
+at untracked build scripts, and a restore of `max_allowed_packet` that
+could hide a load's own failure.
+
+Counts in the main checkout, with item 25's files beside it in the tree
+(the two share no file): 3141 OK (skipped 1) on SQLite and 4333 OK
+(skipped 91) with the MariaDB variants on a local 12.3.

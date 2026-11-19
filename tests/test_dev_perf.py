@@ -7,7 +7,11 @@ those failure modes, run on a small seed (``--scale 0.03``) in a temp
 directory, never inside the checkout.
 """
 
+import contextlib
+import datetime
 import importlib.util
+import io
+import json
 import os
 import shutil
 import sqlite3
@@ -16,7 +20,7 @@ import tempfile
 import types
 import typing
 import unittest
-from typing import Dict, List, Set, Tuple
+from typing import Callable, Dict, List, Set, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PERF_DIR = os.path.join(REPO_ROOT, "tools", "dev", "perf")
@@ -33,6 +37,7 @@ def _load(name: str) -> types.ModuleType:
 
 seed = _load("seed")
 ab = _load("ab")
+mariadb_load = _load("mariadb_load")
 
 #: Appended to a COPY of storage.py: every Browse page now sleeps 25 ms.
 _PLANT = '''
@@ -779,6 +784,611 @@ class MarksFixtureTest(unittest.TestCase):
         self.assertEqual(getattr(result, "marks"), (0, 1, 1, 2))
 
 
+#: Appended to a COPY of api.py: a stand-in for WP-44 item 22's
+#: ``PUT /api/environments/{environment}/flaky-default``, writing the two
+#: tables of the design's §2 B.2 through the storage's own connection.
+#: ``{reason}`` is the reason it stores (the request's, or a planted one).
+_DEFAULT_ENDPOINT = '''
+
+import json as _planted_json
+from urllib.parse import unquote as _planted_unquote
+
+_planted_default_handle = handle_api
+
+
+def handle_api(storage, request, *args, **kwargs):
+    parts = request.path.split("/")
+    if request.method == "PUT" and parts[-1] == "flaky-default":
+        body = _planted_json.loads(request.body.decode("utf-8"))
+        reason = {reason}
+        when = kwargs["now"]().isoformat()
+        environment = _planted_unquote(parts[3])
+        conn = storage._conn()
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS environment_flaky_defaults ("
+            "environment TEXT NOT NULL PRIMARY KEY, cadence INTEGER NOT "
+            "NULL, reason TEXT NOT NULL, set_by TEXT NOT NULL, set_at TEXT "
+            "NOT NULL, cadence_at TEXT NOT NULL)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS flaky_default_history (id INTEGER "
+            "PRIMARY KEY AUTOINCREMENT, environment TEXT NOT NULL, action "
+            "TEXT NOT NULL, cadence INTEGER, reason TEXT NOT NULL, actor "
+            "TEXT NOT NULL, acted_at TEXT NOT NULL)")
+        conn.execute(
+            "INSERT OR REPLACE INTO environment_flaky_defaults "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (environment, body["cadence"], reason, body["username"], when,
+             when))
+        conn.execute(
+            "INSERT INTO flaky_default_history (environment, action, "
+            "cadence, reason, actor, acted_at) VALUES (?, 'set', ?, ?, ?, ?)",
+            (environment, body["cadence"], reason, body["username"], when))
+        conn.commit()
+        return Response(200, [("Content-Type",
+                               "application/json; charset=utf-8")], b"{{}}")
+    return _planted_default_handle(storage, request, *args, **kwargs)
+'''
+
+#: Appended to a COPY of api.py: a tree from before item 22, as far as
+#: the harness can tell (the endpoint answers 404), whatever the tree is.
+_NO_DEFAULT_ENDPOINT = '''
+
+_planted_no_default_handle = handle_api
+
+
+def handle_api(storage, request, *args, **kwargs):
+    if request.path.endswith("/flaky-default"):
+        return Response(404, [("Content-Type",
+                               "application/json; charset=utf-8")],
+                        b'{"error": "planted: no such route"}')
+    return _planted_no_default_handle(storage, request, *args, **kwargs)
+'''
+
+
+def _api_planted_copy(scratch: str, name: str, plant: str) -> str:
+    """A copy of the package with *plant* appended to its api.py."""
+    tree = _planted_copy(scratch, name, "")
+    with open(os.path.join(tree, "testboard", "api.py"), "a",
+              encoding="utf-8") as handle:
+        handle.write(plant)
+    return tree
+
+
+class FailingFixtureTest(unittest.TestCase):
+    """The failing fixture the flaky default's two bars were measured on
+    (docs/design/flaky-default-r0.md §3a), at a tiny size: the nightly
+    mix over every night, with and without the second server, the latest
+    mix, the derived tables rebuilt and the check that proves it, and the
+    refusals."""
+
+    #: Seventeen nights of the largest environment (240 tests at 0.03):
+    #: more than the per-day chart's fourteen.
+    SEED = {"scale": 0.03, "nights": 3, "history_nights": 17}
+    FAILING = 20
+
+    scratch = ""
+    db = ""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.scratch = tempfile.mkdtemp(prefix="testboard-dev-perf-failing-")
+        cls.db = os.path.join(cls.scratch, "seed.db")
+        seed.build(cls.db, None, **cls.SEED)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.scratch, ignore_errors=True)
+
+    def _copy(self, name: str) -> str:
+        copy = os.path.join(self.scratch, name)
+        ab.copy_db(self.db, copy)
+        return copy
+
+    def _rows(self, path: str, sql: str, *params: object
+              ) -> List[Tuple[object, ...]]:
+        conn = sqlite3.connect(path)
+        try:
+            return [tuple(row) for row in conn.execute(sql, params)]
+        finally:
+            conn.close()
+
+    def _environment_runs(self, path: str) -> List[Tuple[object, ...]]:
+        return self._rows(
+            path, "SELECT script, test_name, start_time, end_time, result, "
+            "id FROM runs WHERE environment = ? AND stream_id = 1 "
+            "ORDER BY script, test_name, start_time", seed.ESTATE[0][1])
+
+    def test_the_nightly_mix_gives_the_bars_nights(self) -> None:
+        """At 8,000 tests the draw holds the fourteen nights the per-day
+        chart's bar quotes (§3a, "The trend, round 1": 1,038 FAIL runs
+        over 204 tests at 50, 9,286 over 1,790 at 500)."""
+        import hashlib
+        self.assertEqual(seed.mix_hash(7, 3), int(
+            hashlib.md5(b"(7, 3)").hexdigest()[:8], 16))
+        for count, runs, tests in ((50, 1038, 204), (500, 9286, 1790)):
+            failed = 0
+            failing = set()  # type: Set[int]
+            for index in range(8000):
+                for night in range(90 - seed.TREND_NIGHTS, 90):
+                    pair = seed.nightly_pair(index, night, count, 8000)
+                    if "FAIL" in pair:
+                        failed += pair.count("FAIL")
+                        failing.add(index)
+            self.assertEqual((failed, len(failing)), (runs, tests), count)
+
+    def test_two_servers_run_every_test_twice_a_night(self) -> None:
+        copy = self._copy("two-servers.db")
+        before = self._rows(copy, "SELECT * FROM runs WHERE environment <> ? "
+                            "OR stream_id <> 1 ORDER BY id",
+                            seed.ESTATE[0][1])
+        done = seed.apply_onto_all(copy, 0, None, None, self.FAILING,
+                                   "nightly", True)
+        runs = self._environment_runs(copy)
+        nights = sorted(set(str(row[2])[:10] for row in runs))
+        tests = sorted(set((row[0], row[1]) for row in runs))
+        self.assertEqual(len(nights), self.SEED["history_nights"])
+        self.assertEqual(len(runs), 2 * len(nights) * len(tests))
+        self.assertEqual(done.failing.doubled, len(runs) // 2)
+        parse = seed.datetime.datetime.strptime
+        for at in range(0, len(runs), 2):
+            first, second = runs[at], runs[at + 1]
+            self.assertEqual(first[:2], second[:2])
+            started = [parse(str(row[2]), "%Y-%m-%dT%H:%M:%S.%f")
+                       for row in (first, second)]
+            ended = [parse(str(row[3]), "%Y-%m-%dT%H:%M:%S.%f")
+                     for row in (first, second)]
+            self.assertEqual(started[1] - started[0],
+                             seed.datetime.timedelta(hours=3))
+            self.assertEqual(ended[1] - started[1], ended[0] - started[0])
+            pair = seed.nightly_pair(
+                tests.index((first[0], first[1])),
+                nights.index(str(first[2])[:10]), self.FAILING, len(tests))
+            self.assertEqual((first[4], second[4]), pair)
+        # Every second run carries the first's output, and nothing else
+        # in the estate moved.
+        self.assertEqual(self._rows(
+            copy, "SELECT COUNT(*) FROM runs AS r JOIN runs AS n "
+            "ON n.environment = r.environment AND n.script = r.script "
+            "AND n.test_name = r.test_name AND n.stream_id = r.stream_id "
+            "AND n.id > r.id AND SUBSTR(n.start_time, 1, 10) = "
+            "SUBSTR(r.start_time, 1, 10) JOIN run_outputs AS a "
+            "ON a.run_id = r.id JOIN run_outputs AS b ON b.run_id = n.id "
+            "WHERE r.environment = ? AND a.output <> b.output",
+            seed.ESTATE[0][1]), [(0,)])
+        self.assertEqual(self._rows(
+            copy, "SELECT * FROM runs WHERE environment <> ? OR "
+            "stream_id <> 1 ORDER BY id", seed.ESTATE[0][1]), before)
+        self.assertEqual(seed.check_derived(copy), [])
+        census = seed.failing_census(copy, seed.ESTATE[0][1])
+        self.assertEqual(census.runs, len(runs))
+        self.assertEqual(census.estate_runs, census.outputs)
+        self.assertEqual(census.window_since, nights[-seed.TREND_NIGHTS])
+
+    def test_one_server_rewrites_and_adds_nothing(self) -> None:
+        copy = self._copy("one-server.db")
+        count = len(self._environment_runs(copy))
+        seed.apply_onto_all(copy, 0, None, None, self.FAILING, "nightly",
+                            False)
+        runs = self._environment_runs(copy)
+        self.assertEqual(len(runs), count)
+        nights = sorted(set(str(row[2])[:10] for row in runs))
+        tests = sorted(set((row[0], row[1]) for row in runs))
+        for row in runs:
+            self.assertEqual(row[4], seed.nightly_pair(
+                tests.index((row[0], row[1])),
+                nights.index(str(row[2])[:10]), self.FAILING,
+                len(tests))[0])
+        self.assertEqual(seed.check_derived(copy), [])
+
+    def test_the_latest_mix_is_the_plan(self) -> None:
+        """The latest mix: N failing now, half after a pass; the newest
+        three runs of each planted test are the plan's, and the census's
+        reading at cadence 2 follows from it (one in seven of the FAIL
+        after a FAIL promoted, one in five candidates a real fix)."""
+        copy = self._copy("latest.db")
+        environment = seed.ESTATE[0][1]
+        conn = sqlite3.connect(copy)
+        try:
+            plan = seed.latest_plan(seed._mainline_tests(conn, environment),
+                                    self.FAILING)
+        finally:
+            conn.close()
+        seed.apply_onto_all(copy, 0, None, None, self.FAILING, "latest")
+        for (script, test_name), results in plan.items():
+            newest = [row[0] for row in self._rows(
+                copy, "SELECT result FROM runs WHERE environment = ? AND "
+                "script = ? AND test_name = ? AND stream_id = 1 "
+                "ORDER BY start_time DESC LIMIT 3", environment, script,
+                test_name)]
+            for got, want in zip(newest, results):
+                if want is not None:
+                    self.assertEqual(got, want)
+        census = seed.failing_census(copy, environment)
+        half, candidates = self.FAILING // 2, (3 * self.FAILING) // 10
+        self.assertEqual((census.latest_fail, census.fail_after_fail,
+                          census.fail_first, census.candidates),
+                         (self.FAILING, half, 0, candidates))
+        main = seed.default_census(copy, environment, 2,
+                                   seed.seed_clock(copy))[0]
+        self.assertEqual(main.stream, "mainline")
+        promoted = len([j for j in range(half) if j % 7 == 0])
+        fixes = len([j for j in range(candidates) if j % 5 == 0])
+        self.assertEqual(
+            (main.flaking, main.failing, main.promoted, main.candidates,
+             main.real_fixes, main.tests),
+            (half, half, promoted, candidates, fixes,
+             census.tests))
+        self.assertEqual(seed.check_derived(copy), [])
+
+    def test_the_check_finds_what_a_rewrite_leaves_stale(self) -> None:
+        """A rewrite of runs that skips the rebuild leaves the rollups and
+        latest_runs describing runs that are gone, and every read of them
+        invalid. The check reads every derived row against runs and finds
+        each."""
+        environment = seed.ESTATE[0][1]
+        stale = self._copy("stale.db")
+        conn = sqlite3.connect(stale)
+        try:
+            seed.apply_failing(conn, environment, self.FAILING, "nightly",
+                               True)
+            conn.commit()
+        finally:
+            conn.close()
+        found = " ".join(seed.check_derived(stale))
+        for table in ("activity_hours", "script_hours", "latest_runs"):
+            self.assertIn(table, found)
+        for name, sql in (
+                ("activity_hours",
+                 "UPDATE activity_hours SET count = count + 1 WHERE rowid = "
+                 "(SELECT MIN(rowid) FROM activity_hours)"),
+                ("latest_runs",
+                 "UPDATE latest_runs SET prev_result = 'SKIP' WHERE rowid = "
+                 "(SELECT MIN(rowid) FROM latest_runs)"),
+                ("run_outputs",
+                 "DELETE FROM run_outputs WHERE run_id = "
+                 "(SELECT MAX(run_id) FROM run_outputs)")):
+            copy = self._copy("planted-{}.db".format(name))
+            seed.apply_onto_all(copy, 0, None, None, self.FAILING, "nightly",
+                                True)
+            self.assertEqual(seed.check_derived(copy), [], name)
+            conn = sqlite3.connect(copy)
+            try:
+                conn.execute(sql)
+                conn.commit()
+            finally:
+                conn.close()
+            problems = seed.check_derived(copy)
+            self.assertEqual(len(problems), 1, (name, problems))
+            self.assertIn(name, problems[0])
+
+    def test_same_seed_same_fixture(self) -> None:
+        prints = []  # type: List[object]
+        for name in ("same-a.db", "same-b.db"):
+            copy = self._copy(name)
+            seed.apply_onto_all(copy, 10, None, None, self.FAILING,
+                                "nightly", True)
+            prints.append(seed.fingerprint(copy))
+        self.assertEqual(prints[0], prints[1])
+
+    def test_refusals(self) -> None:
+        environment = seed.ESTATE[0][1]
+        cases = (({"failing": self.FAILING, "mix": "latest",
+                   "two_servers": True}, "nightly mix"),
+                 ({"failing": self.FAILING, "marks": 10}, "separate"),
+                 ({"failing": 100000}, "fewer than"),
+                 ({"failing": self.FAILING, "mix": "weekly"}, "one of"),
+                 ({"flaky_default": 1}, "2 to 10"))
+        for kwargs, text in cases:
+            copy = self._copy("refused.db")
+            with self.assertRaises(ValueError) as caught:
+                seed.apply_onto_all(copy, 0, None, **kwargs)
+            self.assertIn(text, str(caught.exception), kwargs)
+        twice = self._copy("twice.db")
+        seed.apply_onto_all(twice, 0, None, None, self.FAILING, "nightly",
+                            True)
+        with self.assertRaises(ValueError) as caught:
+            seed.apply_onto_all(twice, 0, None, None, self.FAILING,
+                                "nightly", True)
+        self.assertIn("twice a night", str(caught.exception))
+        self.assertEqual(seed.check_derived(twice), [])
+        with self.assertRaises(ValueError):
+            seed.apply_onto_all(
+                os.path.join(REPO_ROOT, "testboard.db"), 0, None, None,
+                self.FAILING)
+        self.assertEqual(seed.failing_census(twice, environment).runs,
+                         2 * len(self._environment_runs(self.db)))
+
+    def test_the_cli_writes_it_and_prints_the_census(self) -> None:
+        copy = self._copy("cli.db")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = seed.main(["--onto", copy, "--assignments", "10",
+                              "--default-failing", str(self.FAILING),
+                              "--two-servers", "--tree", REPO_ROOT])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("derived tables: valid", out.getvalue())
+        self.assertIn("2.0 a test a night", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = seed.main(["--census", copy, "--cadence", "3"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("as if one were at cadence 3", out.getvalue())
+        self.assertIn("default  3", out.getvalue())
+        conn = sqlite3.connect(copy)
+        try:
+            conn.execute("DELETE FROM activity_hours WHERE rowid = "
+                         "(SELECT MIN(rowid) FROM activity_hours)")
+            conn.commit()
+        finally:
+            conn.close()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(seed.main(["--census", copy]), 1)
+        self.assertIn("INVALID", out.getvalue())
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(seed.main(["--onto", copy, "--two-servers"]), 2)
+            self.assertEqual(seed.main(["--out", os.path.join(
+                self.scratch, "x.db"), "--default-failing", "5"]), 2)
+
+
+class FlakyDefaultStepTest(unittest.TestCase):
+    """The one step that sets a default once WP-44 item 22 is in: through
+    the tree's own endpoint, dated before every run, its census, and the
+    runner applying it to both sides or refusing."""
+
+    scratch = ""
+    db = ""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.scratch = tempfile.mkdtemp(prefix="testboard-dev-perf-default-")
+        cls.db = os.path.join(cls.scratch, "seed.db")
+        seed.build(cls.db, None, scale=0.03, nights=3)
+        seed.apply_onto_all(cls.db, 0, None, None, 20, "latest")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.scratch, ignore_errors=True)
+
+    class _Api(object):
+        """The two names put_flaky_default asks of a tree's api module."""
+
+        def __init__(self, status: int) -> None:
+            self.status = status
+            self.seen = []  # type: List[Tuple[object, datetime.datetime]]
+            from testboard import api
+            self.Request = api.Request
+            self.Response = api.Response
+
+        def handle_api(self, store: object, request: object,
+                       now: Callable[[], datetime.datetime]) -> object:
+            self.seen.append((request, now()))
+            return self.Response(self.status, [], b'{"error": "planted"}')
+
+    def test_the_request_is_the_contract(self) -> None:
+        when = datetime.datetime(2026, 9, 1, 3)
+        api = self._Api(200)
+        seed.put_flaky_default(api, object(), "atlas-lab-alpha", 3, when)
+        request, now = api.seen[0]
+        self.assertEqual(now, when)
+        self.assertEqual(getattr(request, "method"), "PUT")
+        self.assertEqual(getattr(request, "path"),
+                         "/api/environments/atlas-lab-alpha/flaky-default")
+        body = json.loads(getattr(request, "body").decode("utf-8"))
+        self.assertEqual(body, {"username": "amy", "cadence": 3,
+                                "reason": seed.DEFAULT_REASON})
+        with self.assertRaises(ValueError) as caught:
+            seed.put_flaky_default(self._Api(404), object(),
+                                   "atlas-lab-alpha", 3, when)
+        self.assertIn("item 22", str(caught.exception))
+        self.assertIn("planted", str(caught.exception))
+
+    def test_dated_before_every_run(self) -> None:
+        environment = seed.ESTATE[0][1]
+        when = seed.default_clock(self.db, environment)
+        conn = sqlite3.connect(self.db)
+        try:
+            first = conn.execute(
+                "SELECT MIN(start_time) FROM runs WHERE environment = ?",
+                (environment,)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertLess(when.isoformat(), first)
+        self.assertLess(first, (when + datetime.timedelta(hours=2))
+                        .isoformat())
+
+    def test_a_marked_test_is_left_to_its_mark(self) -> None:
+        copy = os.path.join(self.scratch, "marked.db")
+        ab.copy_db(self.db, copy)
+        environment = seed.ESTATE[0][1]
+        before = seed.default_census(copy, environment, 2,
+                                     seed.seed_clock(copy))[0]
+        conn = sqlite3.connect(copy)
+        try:
+            conn.execute(
+                "INSERT INTO test_flaky_marks SELECT environment, script, "
+                "test_name, 5, 'marked', 'amy', '2026-09-01T00:00:00' FROM "
+                "latest_runs WHERE stream_id = 1 AND environment = ? AND "
+                "result = 'FAIL' AND prev_result <> 'FAIL' LIMIT 1",
+                (environment,))
+            conn.commit()
+        finally:
+            conn.close()
+        after = seed.default_census(copy, environment, 2,
+                                    seed.seed_clock(copy))[0]
+        self.assertEqual((after.marked, after.tests, after.flaking),
+                         (1, before.tests - 1, before.flaking - 1))
+
+    def test_the_census_reads_the_default_held(self) -> None:
+        copy = os.path.join(self.scratch, "held.db")
+        ab.copy_db(self.db, copy)
+        self.assertEqual(seed.flaky_defaults(copy), {})
+        conn = sqlite3.connect(copy)
+        try:
+            conn.execute("CREATE TABLE environment_flaky_defaults ("
+                         "environment TEXT NOT NULL PRIMARY KEY, cadence "
+                         "INTEGER NOT NULL)")
+            conn.execute("INSERT INTO environment_flaky_defaults VALUES "
+                         "(?, 3)", (seed.ESTATE[0][1],))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(seed.flaky_defaults(copy), {seed.ESTATE[0][1]: 3})
+        lines = seed.census_report(copy, 2)
+        self.assertIn("the default held at cadence 3", "\n".join(lines))
+
+    def _run(self, base: str, head: str, **kwargs: object) -> object:
+        return ab.run(base, head, self.db,
+                      tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                      pages=[("browse", "/api/dashboard?limit=50&offset=0")],
+                      calls=2, known=False, **kwargs)
+
+    def test_the_runner_sets_it_on_both_sides(self) -> None:
+        tree = _api_planted_copy(self.scratch, "with-default",
+                                 _DEFAULT_ENDPOINT.format(
+                                     reason='body["reason"]'))
+        result = self._run(tree, tree, flaky_default=2, assign=10)
+        self.assertEqual(getattr(result, "flaky_default"), 2)
+        census = getattr(result, "default_census")
+        self.assertTrue(census and "default  2" in census[0], census)
+        report = "\n".join(ab.report(result))
+        self.assertIn("flaky default of 2", report)
+        # The seed itself is never written.
+        self.assertEqual(seed.flaky_defaults(self.db), {})
+
+    def test_the_runner_refuses_a_tree_without_it(self) -> None:
+        with_it = _api_planted_copy(self.scratch, "has-default",
+                                    _DEFAULT_ENDPOINT.format(
+                                        reason='body["reason"]'))
+        without = _api_planted_copy(self.scratch, "no-default",
+                                    _NO_DEFAULT_ENDPOINT)
+        with self.assertRaises(ValueError) as caught:
+            self._run(without, with_it, flaky_default=2)
+        self.assertIn("item 22", str(caught.exception))
+        other = _api_planted_copy(self.scratch, "other-default-reason",
+                                  _DEFAULT_ENDPOINT.format(
+                                      reason='"another reason"'))
+        with self.assertRaises(ValueError) as caught:
+            self._run(with_it, other, flaky_default=2)
+        self.assertIn("rows differ", str(caught.exception))
+        for kwargs, text in (({"flaky_default": 1}, "2 to 10"),):
+            with self.assertRaises(ValueError) as caught:
+                self._run(with_it, with_it, **kwargs)
+            self.assertIn(text, str(caught.exception))
+        with self.assertRaises(ValueError) as caught:
+            ab.run(with_it, with_it, self.db,
+                   tempfile.mkdtemp(dir=self.scratch), ("A", "B"),
+                   calls=2, known=True, flaky_default=2)
+        self.assertIn("--pages", str(caught.exception))
+
+
+class MariaDBLoadTest(unittest.TestCase):
+    """The MariaDB recipe's loader, without a server: what it refuses
+    before touching anything, what it measures from the fixture, and that
+    it reaches the server only through the migration tool."""
+
+    def setUp(self) -> None:
+        self.scratch = tempfile.mkdtemp(prefix="testboard-dev-perf-mdb-")
+        self.db = os.path.join(self.scratch, "fixture.db")
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("CREATE TABLE run_outputs (run_id INTEGER PRIMARY "
+                         "KEY, output BLOB NOT NULL)")
+            conn.execute("INSERT INTO run_outputs VALUES (1, ?), (2, ?)",
+                         (b"x" * 40, b"y" * 181))
+            conn.commit()
+        finally:
+            conn.close()
+        self.cnf = os.path.join(self.scratch, "sacrificial.cnf")
+        with open(self.cnf, "w") as handle:
+            handle.write("[client]\nuser = u\npassword = p\n"
+                         "database = scratch\n")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def test_the_plan_measures_the_largest_output(self) -> None:
+        plan = mariadb_load.plan_load(self.cnf, self.db, REPO_ROOT, True)
+        self.assertEqual(plan.max_blob_bytes, 181)
+        self.assertEqual(plan.tool, os.path.join(
+            REPO_ROOT, "tools", "migrate_to_mariadb.py"))
+
+    def test_it_refuses_before_touching_anything(self) -> None:
+        for args, text in (
+                ((self.cnf, self.db, REPO_ROOT, False), "--recreate"),
+                ((self.cnf, os.path.join(REPO_ROOT, "testboard.db"),
+                  REPO_ROOT, True), "repo-root"),
+                ((self.cnf, self.db + ".missing", REPO_ROOT, True),
+                 "no fixture"),
+                ((self.cnf + ".missing", self.db, REPO_ROOT, True),
+                 "no option file"),
+                ((self.cnf, self.db, self.scratch, True), "not a checkout")):
+            with self.assertRaises(ValueError) as caught:
+                mariadb_load.plan_load(*args)
+            self.assertIn(text, str(caught.exception))
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(mariadb_load.main(
+                ["--config", self.cnf, "--db", self.db]), 2)
+        self.assertIn("--recreate", errors.getvalue())
+
+    class _Server(object):
+        """A server whose restoring SET can be made to fail."""
+
+        def __init__(self, restore_fails: bool) -> None:
+            self.restore_fails = restore_fails
+            self.statements = []  # type: List[str]
+
+        def run(self, sql: str) -> None:
+            self.statements.append(sql)
+            if self.restore_fails and sql.endswith("= 16"):
+                raise RuntimeError("planted: restore refused")
+
+        def rows(self, sql: str) -> List[Tuple[object, ...]]:
+            return [(16,)]
+
+    def test_the_packet_is_put_back_without_masking_the_load(self) -> None:
+        def broken_load() -> None:
+            raise RuntimeError("planted: load failed")
+
+        said = []  # type: List[str]
+        server = self._Server(restore_fails=False)
+        with self.assertRaises(RuntimeError) as caught:
+            mariadb_load.with_packet(server, 16, broken_load, said.append)
+        self.assertIn("load failed", str(caught.exception))
+        self.assertEqual(server.statements, [
+            "SET GLOBAL max_allowed_packet = {}".format(
+                mariadb_load.PACKET_BYTES),
+            "SET GLOBAL max_allowed_packet = 16"])
+        # A failed restore is reported, and the load's failure is still
+        # the one raised.
+        said = []
+        with self.assertRaises(RuntimeError) as caught:
+            mariadb_load.with_packet(self._Server(restore_fails=True), 16,
+                                     broken_load, said.append)
+        self.assertIn("load failed", str(caught.exception))
+        self.assertIn("could NOT put", said[-1])
+        # With the load fine, a failed restore is the error.
+        with self.assertRaises(RuntimeError) as caught:
+            mariadb_load.with_packet(self._Server(restore_fails=True), 16,
+                                     lambda: None, said.append)
+        self.assertIn("restore refused", str(caught.exception))
+
+    def test_it_installs_nothing_and_shells_out_to_nothing(self) -> None:
+        """The driver stays behind the migration tool (on the driver's
+        allowlist), and the only program it starts is this interpreter."""
+        import re
+        with io.open(os.path.join(PERF_DIR, "mariadb_load.py"),
+                     encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIsNone(re.search(r"\bpymysql\b", source))
+        calls = re.findall(r"subprocess\.(\w+)\(\s*\[\s*([\w.]+)", source)
+        self.assertTrue(calls)
+        self.assertEqual(set(program for _call, program in calls),
+                         {"sys.executable"})
+
+
 class PageModeTest(_SeededCase):
     """The page mode: a page's first-paint requests on long-lived
     workers, cold, with what the page waits for; a planted slow request
@@ -969,7 +1579,7 @@ class AnnotationsTest(unittest.TestCase):
 
     def test_every_function_annotation_evaluates(self) -> None:
         checked = 0
-        for module in (seed, ab):
+        for module in (seed, ab, mariadb_load):
             for value in list(vars(module).values()):
                 targets = [value]
                 if isinstance(value, type) and value.__module__ == \
