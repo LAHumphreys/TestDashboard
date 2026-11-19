@@ -1044,6 +1044,69 @@ export const FLAKY_UNMARK_TITLE = "Remove the flaky mark; a failure "
 export const FLAKY_REASON_PLACEHOLDER = "Why is this test flaky? (required)";
 export const FLAKY_REASON_LABEL = "Reason for marking the test flaky";
 
+/* An environment's flaky default (flaky-default design §3 U2): the
+ * Admin page's words for the setting, its editor and its history. A
+ * default is the environment's standing cadence for every test in it
+ * that has no mark of its own. */
+
+/** The Environments section's added sentence: what a default does, and
+ * the one place on the board (with What's new) that says it reads the
+ * most recent runs rather than one night's (decision 23). */
+export const FLAKY_DEFAULT_NOTE = "A flaky default makes every test in an "
+  + "environment that has no mark of its own count as failing only once "
+  + "its last N runs have failed. It reads the most recent runs, not one "
+  + "night's.";
+
+/** What a choice in the default's editor does, under its controls: a
+ * cadence to set, or null for a removal. */
+export function flakyDefaultEffect(cadence) {
+  return cadence
+    ? "Every test here with no mark of its own " + cadenceSentence(cadence)
+      + "."
+    : "Every test here with no mark of its own then counts as failing on "
+      + "its first failure.";
+}
+
+/** "set by amy · 3 days ago · two servers": who set the default in
+ * force, how long ago and why; the line under its cadence. */
+export function flakyDefaultSetBy(flakyDefault, nowMs) {
+  const parts = [
+    "set by " + flakyDefault.set_by,
+    ageText(flakyDefault.set_at, nowMs === undefined ? Date.now() : nowMs),
+  ];
+  if (flakyDefault.reason) {
+    parts.push(flakyDefault.reason);
+  }
+  return parts.join(" · ");
+}
+
+/** "removed by ben · 9 days ago · trial over": one recorded change of a
+ * default, in the mark history's fields (`action`, `cadence`, `actor`,
+ * `acted_at`, `reason`). The cell's line after a removal, and each line
+ * of its History. */
+export function flakyDefaultChange(change, nowMs) {
+  let what;
+  if (change.action === "set") {
+    what = "set to " + cadenceWords(change.cadence);
+  } else if (change.action === "cadence") {
+    what = "changed to " + cadenceWords(change.cadence);
+  } else if (change.action === "reason") {
+    what = "reason changed";
+  } else if (change.action === "clear") {
+    what = "removed";
+  } else {
+    what = String(change.action);
+  }
+  const parts = [
+    what + " by " + change.actor,
+    ageText(change.acted_at, nowMs === undefined ? Date.now() : nowMs),
+  ];
+  if (change.reason) {
+    parts.push(change.reason);
+  }
+  return parts.join(" · ");
+}
+
 /**
  * Whether one marked test's "Set cadence" has anything to send: a
  * cadence chosen, and not the mark's own. The panel and the test page

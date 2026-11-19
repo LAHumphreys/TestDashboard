@@ -1163,7 +1163,7 @@ says why:
 - [ ] 22 the default kept and recorded (migration 13)
 - [ ] 23 the default judged
 - [ ] 24 the per-day chart's late part
-- [ ] 25 the Admin page
+- [x] 25 the Admin page
 - [ ] 26 a row flaking by default
 - [ ] 27 the per-day chart waits and draws once
 

@@ -1032,7 +1032,8 @@ button.bar-row:focus-visible {
 }
 
 .mute-reason-input,
-.flaky-reason-input {
+.flaky-reason-input,
+.env-default-reason {
   flex: 1 1 220px;
   min-width: 160px;
 }
@@ -1040,7 +1041,8 @@ button.bar-row:focus-visible {
 .review-duration-select,
 .selection-duration-select,
 .review-cadence-select,
-.selection-cadence-select {
+.selection-cadence-select,
+.env-cadence-select {
   font: inherit;
   padding: 4px 6px;
 }
@@ -1403,20 +1405,7 @@ button.bar-row:focus-visible {
   font-size: 12px;
 }
 
-/* ---------- Manage people (open actions) ---------- */
-
-#people-section {
-  margin-top: 28px;
-}
-
-#people-heading {
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
+/* ---------- Admin: People, and the notes of both sections ---------- */
 
 .people-note {
   max-width: 62ch;
@@ -1564,6 +1553,52 @@ button.bar-row:focus-visible {
    draws the eye to a row that is worth reading, and never carries the
    meaning on its own. */
 .env-none-counted { color: var(--c-fail); font-weight: 600; }
+
+/* The flaky default (flaky-default design §3 U2): the table's last
+   column, its History folded under it, and the editing row the table's
+   width beneath an environment's. The cell and the editing row wrap:
+   `.data-table td` is nowrap, and a free-text reason would otherwise
+   stretch the table as wide as it is long. */
+.data-table td.env-default-cell {
+  min-width: 14em;
+  max-width: 28em;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.data-table tr.env-default-editor td { white-space: normal; }
+
+.env-default-history summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.env-default-history ul {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.env-default-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.env-default-label { font-weight: 600; }
+
+.env-default-effect { margin: 6px 0 0; font-size: 13px; }
+
+/* The row `admin.html?environment=<env>` names: outlined each time the
+   table is drawn, so the reader who followed a link finds it. */
+#envs-table tr.env-row-target {
+  outline: 2px solid var(--accent-link);
+  outline-offset: -2px;
+}
 
 
 /* ---------- What's new ---------- */

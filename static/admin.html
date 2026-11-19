@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>testboard — admin</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%232e7d32'/%3E%3Cpath%20d='M4%208.5l3%203%205-6'%20stroke='%23fff'%20stroke-width='2'%20fill='none'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <!-- WP-38: every module this page will import, named up
+       front so the browser fetches them all at once instead
+       of discovering each level as the one before it parses.
+       Kept equal to the import graph by
+       tests/test_frontend_calls.py::ModulePreloadTest. -->
+  <link rel="modulepreload" href="admin.js">
+  <link rel="modulepreload" href="nav.js">
+  <link rel="modulepreload" href="api.js">
+  <link rel="modulepreload" href="urls.js">
+</head>
+<body class="home">
+  <header class="site-header">
+    <a class="brand" href="index.html">testboard</a>
+    <nav class="site-nav">
+      <a href="index.html">Dashboard</a>
+      <a href="actions.html">Open actions</a>
+      <a href="time.html">Time</a>
+      <a href="timeline.html">Timeline</a>
+      <a href="watch.html">Watch</a>
+      <a href="metrics.html">Metrics</a>
+      <a href="admin.html" aria-current="page">Admin</a>
+      <a id="nav-whatsnew" href="whatsnew.html">What's new</a>
+    </nav>
+    <div id="user-widget" class="user-widget"></div>
+  </header>
+
+  <!-- The board's rarely changed settings, one page for both sections
+       (flaky-default design §3 U1). Both are open: they were folded on
+       Open Actions only to spare a triage visit their reads, and that
+       reason stayed there. No product filter: a few dozen rows, each
+       with an editable Product cell a filter would hide on change. -->
+  <main class="wide">
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+    <h1>Admin</h1>
+    <p class="muted">
+      Settings for the whole board, rarely changed. Every change is
+      recorded against your name.
+    </p>
+
+    <!-- The expected test count is the denominator of the coverage test
+         that decides whether a night's activity counted as a pass of the
+         suite — and therefore when a quiet test is called missing.
+         Inferring it from history gives a high-water mark, and too high a
+         number fails silently, so it is declarable here and echoed back
+         against what actually happened. The flaky default is the last
+         column, shown only where the server sends it. -->
+    <section id="envs-section" aria-labelledby="envs-heading">
+      <div class="section-head">
+        <h2 id="envs-heading" class="eyebrow">Environments</h2>
+      </div>
+      <p class="muted people-note">
+        How many tests each environment is supposed to run. testboard
+        decides whether a test has gone quiet by looking at whether the
+        suite has been round since — and a night only counts as a full
+        pass if it ran at least half of the environment. Left blank,
+        that “half” is measured against every test ever seen in the
+        environment, which only grows. Set the real number here if the
+        passes below are not counting.
+        <span id="envs-flaky-note" hidden></span>
+      </p>
+      <p id="envs-cutoff" class="muted"></p>
+      <!-- Upgrade-day bulk assign (WP-23 addendum): before any product
+           is declared, every environment is implicitly product "" —
+           this turns "declare N environments one at a time" into one
+           action. Hidden whenever nothing is unmapped: zero visible
+           change on an estate that has already been fully declared, or
+           that has never used products at all. Deliberately NOT a
+           standing default applied automatically on import — see
+           docs/STREAMS_PLAN.md §2 for why. -->
+      <div id="envs-bulk-assign" class="envs-bulk-assign" hidden>
+        <label class="toolbar-field">
+          Assign <span id="envs-bulk-count">0</span> unmapped
+          environment(s) to
+          <input id="envs-bulk-product" type="text"
+                 placeholder="product name"
+                 aria-label="Product to bulk-assign unmapped environments to">
+        </label>
+        <button id="envs-bulk-btn" type="button">Assign</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="envs-table">
+          <thead>
+            <tr>
+              <th>Environment</th>
+              <!-- Which product this environment belongs to (WP-20),
+                   editable in place. -->
+              <th>Product</th>
+              <th>Tests seen</th>
+              <th>Expected</th>
+              <th>Recent passes</th>
+              <th>Latest pass</th>
+              <th></th>
+              <th id="envs-flaky-head" hidden>Flaky default</th>
+            </tr>
+          </thead>
+          <tbody id="envs-body"></tbody>
+        </table>
+      </div>
+      <p id="envs-loading" class="muted">Loading…</p>
+      <p id="envs-empty" class="empty-state" hidden>
+        No environments have reported yet.
+      </p>
+      <p id="envs-failed" class="empty-state" hidden></p>
+    </section>
+
+    <section id="people-section" aria-labelledby="people-heading">
+      <div class="section-head">
+        <h2 id="people-heading" class="eyebrow">People</h2>
+      </div>
+      <p class="muted people-note">
+        Deactivating someone removes them from every assignee dropdown.
+        Their comments and past assignments are kept exactly as they are.
+        Reassign anything they still own first — testboard will refuse
+        otherwise, because work assigned to a name nobody can select
+        never resurfaces.
+      </p>
+      <div class="table-wrap">
+        <table class="data-table" id="people-table">
+          <thead>
+            <tr>
+              <th>Person</th>
+              <th>Status</th>
+              <th>Since</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="people-body"></tbody>
+        </table>
+      </div>
+      <p id="people-loading" class="muted">Loading…</p>
+      <p id="people-empty" class="empty-state" hidden>No people yet.</p>
+      <p id="people-failed" class="empty-state" hidden></p>
+    </section>
+  </main>
+
+  <script type="module" src="admin.js"></script>
+  <script type="module" src="nav.js"></script>
+</body>
+</html>

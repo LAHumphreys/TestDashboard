@@ -25,6 +25,7 @@
       <a href="timeline.html">Timeline</a>
       <a href="watch.html">Watch</a>
       <a href="metrics.html">Metrics</a>
+      <a href="admin.html">Admin</a>
       <a id="nav-whatsnew" href="whatsnew.html" aria-current="page">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
@@ -87,6 +88,19 @@
           recently&rdquo; filter in All tests leave it out, as the failing
           figures leave out a muted failure, and the tile says how many
           (&ldquo;+2 muted&rdquo;). The Muted tab still lists it.</li>
+        <li><strong>Admin</strong>: Manage people and Environment
+          expectations have moved from the foot of Open Actions to their
+          own page, Admin, in the navigation bar, as People and
+          Environments.</li>
+        <li><strong>A flaky default for an environment</strong>, set on
+          Admin in the environment&rsquo;s row with a reason (&ldquo;fail
+          after 2 in a row&rdquo;, 2 to 10): a test there with no mark of
+          its own counts as failing only once its last N runs have failed.
+          It reads the most recent runs, not one night&rsquo;s: one
+          failure on each of two nights counts, and the test may then show
+          under Fixed. <strong>Change</strong> and <strong>Remove</strong>
+          take a reason too, and every change is kept under the
+          row&rsquo;s <strong>History</strong>.</li>
       </ul>
     </section>
 

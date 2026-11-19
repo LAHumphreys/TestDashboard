@@ -5479,3 +5479,39 @@ could hide a load's own failure.
 Counts in the main checkout, with item 25's files beside it in the tree
 (the two share no file): 3141 OK (skipped 1) on SQLite and 4333 OK
 (skipped 91) with the MariaDB variants on a local 12.3.
+
+## The default flaky cadence, item 25: the Admin page (2026-11-19)
+
+Manage people and Environment expectations leave the foot of Open
+Actions for a new page, Admin, in every page's navigation after Metrics;
+the environments table gains the Flaky default column with its editing
+row, Remove and History. Built by the UI implementer against item 22's
+contract while the endpoint was being written; the commit message has
+the page, the request counts and the tests.
+
+Open Actions loses its two lazy reads and 14.5 KB of script; its first
+paint is unchanged. Admin's first paint is three requests in parallel.
+No other page's first paint changes.
+
+Review took three passes. Fresh eyes found nothing. The main session's
+read of the diff sent back six layout and polish defects that no test
+caught (a long reason stretching the table, an unstyled select, a fixed
+reason box, a tooltip naming the wrong setter, a numbered history, focus
+on the wrong control), all fixed and now pinned. The walk waited for
+item 22's endpoint: on a play server holding items 21, 22 and 25, the
+real page was driven on the DOM shim through set, change, a reason-only
+edit, remove and set again, and through the refusals for an unknown and
+a deactivated user. No defect in the page or the contract; two more
+polish points fixed (an unbroken token did not wrap; several editors
+could be open at once and a save discarded the others' text).
+
+Put to the owner, not blocking: after a reason-only edit the cell reads
+"set by" whoever reworded it, because the default's `set_by` is its last
+act's, as designed; the History shows who set the cadence. What's new
+says a test under a default "counts as failing only once its last N runs
+have failed", which is true of the build once item 23 is in it.
+
+Counts in the main checkout, with item 21 in the tree: 3141 OK (skipped
+1) on SQLite and 4333 OK (skipped 91) with the MariaDB variants on a
+local 12.3, taken before the walk's two fixes; with them the frontend
+guards read 636 OK. No browser has rendered it.

@@ -348,7 +348,7 @@ class UserListTest(unittest.TestCase):
         - the administrative roster, which asks for
           ``include_inactive=1`` and is a genuinely different result set
           — every user rather than the assignable ones — fetched once,
-          lazily, when a fold-out section is opened.
+          by the Admin page's People section.
 
         What is still banned is the thing that caused the outage: a
         second place fetching the *assignable* list, which is what every
@@ -374,7 +374,7 @@ class UserListTest(unittest.TestCase):
             len(offenders.get("api.js", [])), 1,
             "api.js must fetch the assignable /api/users exactly once")
 
-    def test_the_admin_roster_is_fetched_at_most_once_and_lazily(
+    def test_the_admin_roster_is_fetched_once_by_the_admin_page(
         self
     ) -> None:
         """The exemption above must stay narrow.
@@ -382,6 +382,13 @@ class UserListTest(unittest.TestCase):
         One place, asking explicitly for the full roster. If a second
         appears, or if it stops being explicit, the exemption has
         started covering something it was not written for.
+
+        MOVED with the People section (flaky-default design §3 U1, U9):
+        the roster was fetched lazily on Open Actions, when its fold-out
+        was opened, because that page is opened every morning to triage
+        and almost never to manage people. On the Admin page managing
+        people is the page's job, so the read is part of its first paint
+        and the one place it may live is admin.js's loadPeople().
         """
         sites = []  # type: List[str]
         for name, source in scripts().items():
@@ -389,16 +396,15 @@ class UserListTest(unittest.TestCase):
                 line = source.split("\n")[number - 1]
                 if "include_inactive" in line:
                     sites.append("%s:%d" % (name, number))
-        self.assertLessEqual(
+        self.assertEqual(
             len(sites), 1,
-            "more than one place fetches the full user roster: "
+            "exactly one place fetches the full user roster: "
             + repr(sites))
-        if sites:
-            body = _function_body(read("actions.js"), "async function loadPeople()")
-            self.assertIn(
-                "include_inactive", body,
-                "the roster fetch must live in loadPeople(), which runs "
-                "only when the Manage people section is opened")
+        self.assertTrue(sites[0].startswith("admin.js:"), sites)
+        body = _function_body(read("admin.js"), "async function loadPeople()")
+        self.assertIn(
+            '"api/users?include_inactive=1"', body,
+            "the roster fetch must live in admin.js's loadPeople()")
 
     def test_the_promise_is_cached_not_the_result(self) -> None:
         """Caching the resolved value is the bug; it looks identical."""
@@ -2412,11 +2418,12 @@ class MetricsPageTest(unittest.TestCase):
     end owns is that the page asks once and then leaves the server
     alone."""
 
-    #: Every page with the site's nav bar.
+    #: Every page with the site's nav bar. (Widened for the Admin page,
+    #: flaky-default design §3 U9.)
     _PAGES = (
-        "actions.html", "index.html", "metrics.html", "script.html",
-        "test.html", "time.html", "timeline.html", "watch.html",
-        "whatsnew.html",
+        "actions.html", "admin.html", "index.html", "metrics.html",
+        "script.html", "test.html", "time.html", "timeline.html",
+        "watch.html", "whatsnew.html",
     )
 
     def test_there_is_no_timer_on_the_page(self) -> None:
@@ -4088,26 +4095,28 @@ class ProductColumnTest(unittest.TestCase):
 class BulkAssignUnmappedTest(unittest.TestCase):
     """The upgrade-day bulk "assign every unmapped environment to
     product X" action (WP-23 addendum, docs/STREAMS_PLAN.md §2) —
-    static/actions.html + static/actions.js. Explicit, one-time,
-    never a standing default (see the decision recorded in
-    docs/STREAMS_PLAN.md §2)."""
+    static/admin.html + static/admin.js, moved there from Open Actions
+    with the Environments section (flaky-default design §3 U1, U9).
+    Explicit, one-time, never a standing default (see the decision
+    recorded in docs/STREAMS_PLAN.md §2)."""
 
     def test_the_control_ships_hidden_in_the_markup(self) -> None:
-        html = read_text("actions.html")
+        html = read_text("admin.html")
         mount_at = html.index('id="envs-bulk-assign"')
         self.assertIn("hidden", html[mount_at:mount_at + 60])
 
-    def test_the_control_lives_inside_the_envs_details_section(
+    def test_the_control_lives_inside_the_envs_section(
         self
     ) -> None:
-        """Loaded lazily with the rest of the environment-expectations
-        section, not a separate always-fetched control."""
-        html = read_text("actions.html")
-        details_at = html.index('id="envs-details"')
+        """Drawn from the Environments section's own read, not a
+        separate control with a fetch of its own."""
+        html = read_text("admin.html")
+        section_at = html.index('id="envs-section"')
         bulk_at = html.index('id="envs-bulk-assign"')
         table_at = html.index('id="envs-table"')
-        self.assertLess(details_at, bulk_at)
+        self.assertLess(section_at, bulk_at)
         self.assertLess(bulk_at, table_at)
+        self.assertLess(table_at, html.index('id="people-section"'))
 
     def test_load_envs_refreshes_the_bulk_control_from_the_same_fetch(
         self
@@ -4115,19 +4124,19 @@ class BulkAssignUnmappedTest(unittest.TestCase):
         """No second request for the unmapped list — it is
         data.environments, already in memory from the one fetch
         loadEnvs() already makes."""
-        body = _function_body(read("actions.js"), "async function loadEnvs(")
+        body = _function_body(read("admin.js"), "async function loadEnvs(")
         self.assertIn("updateBulkAssignControl(data.environments)", body)
 
     def test_the_control_filters_by_unmapped_product(self) -> None:
         body = _function_body(
-            read("actions.js"), "function updateBulkAssignControl(")
+            read("admin.js"), "function updateBulkAssignControl(")
         self.assertIn("!item.product", body)
 
     def test_the_control_hides_when_nothing_is_unmapped(self) -> None:
         """Zero visible change: an estate with every environment already
         declared (or none using products at all) never shows this."""
         body = _function_body(
-            read("actions.js"), "function updateBulkAssignControl(")
+            read("admin.js"), "function updateBulkAssignControl(")
         self.assertIn("unmappedEnvs.length === 0", body)
 
     def test_bulk_assign_reuses_the_existing_per_environment_endpoint(
@@ -4137,7 +4146,7 @@ class BulkAssignUnmappedTest(unittest.TestCase):
         the SAME PUT saveEnvProduct already issues, once per unmapped
         environment."""
         body = _function_body(
-            read("actions.js"), "async function bulkAssignUnmapped(")
+            read("admin.js"), "async function bulkAssignUnmapped(")
         self.assertIn('"api/environments/"', body)
         self.assertIn('"/product"', body)
         self.assertIn("for (const item of unmappedEnvs)", body)
@@ -4149,7 +4158,7 @@ class BulkAssignUnmappedTest(unittest.TestCase):
         actually holds now. loadEnvs() belongs in a finally, not only
         the success path."""
         body = _function_body(
-            read("actions.js"), "async function bulkAssignUnmapped(")
+            read("admin.js"), "async function bulkAssignUnmapped(")
         finally_at = body.index("} finally {")
         self.assertIn("await loadEnvs()", body[finally_at:])
 
@@ -4158,12 +4167,12 @@ class BulkAssignUnmappedTest(unittest.TestCase):
         the same idiom review.js's retirement reason box uses — not a
         browser confirm() dialog."""
         body = _function_body(
-            read("actions.js"), "async function bulkAssignUnmapped(")
+            read("admin.js"), "async function bulkAssignUnmapped(")
         self.assertIn("if (!product)", body)
 
     def test_bulk_assign_requires_a_username(self) -> None:
         body = _function_body(
-            read("actions.js"), "async function bulkAssignUnmapped(")
+            read("admin.js"), "async function bulkAssignUnmapped(")
         self.assertIn("requireUsername()", body)
 
     def test_no_confirm_dialog_is_introduced(self) -> None:
@@ -4171,7 +4180,8 @@ class BulkAssignUnmappedTest(unittest.TestCase):
         window.confirm() anywhere, so this feature must not be the
         first — the required-input gate above is the established
         substitute."""
-        self.assertNotIn("confirm(", _strip_comments(read("actions.js")))
+        for name in ("admin.js", "actions.js"):
+            self.assertNotIn("confirm(", _strip_comments(read(name)), name)
 
 
 class OpenActionsBulkAssignmentsTest(unittest.TestCase):
@@ -7338,6 +7348,8 @@ _FLAKY_HELPERS = (
     # failedOfRuns() went with the tab's "Failed" column, and the Streak
     # column's flakyStreakWords() takes its place.)
     "flakyStreakWords", "failToggleTitle",
+    # The Admin page's flaky default (flaky-default design §3 U2).
+    "flakyDefaultEffect", "flakyDefaultSetBy", "flakyDefaultChange",
 )
 
 
@@ -10475,6 +10487,782 @@ class OpenActionsFlakingDomTest(unittest.TestCase):
         self.assertFalse(answer["note"][0])
         self.assertTrue(answer["note"][1].startswith("Unassigned tests that "
                                                      "are flaking"))
+
+
+#: The settings that moved from Open Actions to the Admin page
+#: (flaky-default design §3 U1): their sections, their reads and the
+#: functions that drew them. None may come back to Open Actions.
+_SETTINGS_TOKENS = (
+    'id="people-section"', 'id="envs-section"', "Manage people",
+    "Environment expectations", '"api/environments"', "include_inactive",
+    "loadPeople", "loadEnvs", "buildPersonRow", "buildEnvRow", "saveEnv",
+    "buildProductCell", "bulkAssignUnmapped", "updateBulkAssignControl",
+)
+
+
+def _settings_tokens(html: str, js: str) -> List[str]:
+    """The settings tokens Open Actions' markup *html* and code *js*
+    hold (comments stripped)."""
+    text = re.sub(r"<!--.*?-->", " ", html, flags=re.S) + _strip_comments(js)
+    return [token for token in _SETTINGS_TOKENS if token in text]
+
+
+def _admin_init_problems(source: str) -> List[str]:
+    """What is wrong with admin.js's init(): both reads must start
+    there, Environments first, with nothing awaited between them."""
+    body = _strip_comments(_function_body(source, "function init()"))
+    found = []  # type: List[str]
+    for call in ("loadEnvs();", "loadPeople();"):
+        if body.count(call) != 1:
+            found.append("init() must call " + call + " once")
+    if "await" in body:
+        found.append("init() awaits")
+    if not found and body.index("loadEnvs();") > body.index("loadPeople();"):
+        found.append("People is read before Environments")
+    return found
+
+
+def _nav(name: str) -> str:
+    html = read(name)
+    nav = html[html.index('<nav class="site-nav">'):]
+    return nav[:nav.index("</nav>")]
+
+
+class AdminPageTest(unittest.TestCase):
+    """The Admin page (flaky-default design §3 U1; decisions 14 to 17):
+    Manage people and Environment expectations, lifted off Open Actions
+    onto a page of their own, reached from every page's navigation."""
+
+    def test_every_page_links_to_it_after_metrics_before_whats_new(
+            self) -> None:
+        pages = sorted(name for name in os.listdir(STATIC_DIR)
+                       if name.endswith(".html"))
+        self.assertEqual(pages, sorted(MetricsPageTest._PAGES))
+        for name in pages:
+            nav = _nav(name)
+            self.assertEqual(nav.count('href="admin.html"'), 1, name)
+            self.assertIn(">Admin</a>", nav, name)
+            self.assertLess(nav.index('href="metrics.html"'),
+                            nav.index('href="admin.html"'), name)
+            self.assertLess(nav.index('href="admin.html"'),
+                            nav.index('href="whatsnew.html"'), name)
+
+    def test_the_link_is_current_on_its_own_page_only(self) -> None:
+        for name in MetricsPageTest._PAGES:
+            html = read(name)
+            at = html.index('href="admin.html"')
+            tag = html[html.rindex("<a", 0, at):html.index(">", at)]
+            self.assertEqual(
+                "aria-current" in tag, name == "admin.html", name)
+
+    def test_the_page_is_not_a_scoped_nav_target(self) -> None:
+        """Decision 17: no product filter, so no scope carried onto it,
+        and no switcher on it."""
+        code = _strip_comments(read("urls.js"))
+        block = code[code.index("NAV_SCOPE_PAGES = ["):]
+        self.assertNotIn("admin", block[:block.index("];")])
+        self.assertNotIn("product-switcher", read("admin.html"))
+        self.assertNotIn("products.js", read("admin.html"))
+
+    def test_open_actions_links_to_it_only_from_the_navigation(
+            self) -> None:
+        """Decision 16: What's new says where the sections went."""
+        html = read("actions.html")
+        self.assertEqual(html.count("admin.html"), 1)
+        self.assertNotIn("admin.html", _strip_comments(read("actions.js")))
+
+    def test_both_reads_start_together_environments_first(self) -> None:
+        self.assertEqual(_admin_init_problems(read("admin.js")), [])
+        code = _strip_comments(read("admin.js"))
+        self.assertIn('fetchJson("api/environments")', _function_body(
+            code, "async function loadEnvs()"))
+        self.assertEqual(len(fetch_sites(code, "api/environments\"")), 1)
+        html = read("admin.html")
+        self.assertLess(html.index('id="envs-section"'),
+                        html.index('id="people-section"'))
+
+    def test_both_sections_are_open(self) -> None:
+        """Decision 15: they were folded only to spare a triage visit
+        their reads."""
+        self.assertNotIn("<details", read("admin.html"))
+
+    def test_each_section_says_its_own_states(self) -> None:
+        """Loading, empty and a failed read, in each section; a failed
+        read never in the page's banner, which is for failed writes."""
+        html = read("admin.html")
+        code = _strip_comments(read("admin.js"))
+        for section, load in (("envs", "async function loadEnvs()"),
+                              ("people", "async function loadPeople()")):
+            for state in ("loading", "empty", "failed"):
+                self.assertIn('id="' + section + "-" + state + '"', html)
+            body = _function_body(code, load)
+            catch = body[body.index("} catch (err) {"):]
+            self.assertIn('sayFailed("' + section + '-failed"', catch)
+            self.assertNotIn("showError", catch)
+            self.assertIn(
+                'getElementById("' + section + '-loading").hidden = true',
+                body[body.index("} finally {"):])
+
+    def test_user_strings_reach_the_page_as_text(self) -> None:
+        code = _strip_comments(read("admin.js"))
+        self.assertNotIn("innerHTML", code)
+        self.assertNotIn("insertAdjacentHTML", code)
+
+    def test_open_actions_holds_neither_section_nor_read(self) -> None:
+        self.assertEqual(
+            _settings_tokens(read("actions.html"), read("actions.js")), [])
+        # And the Admin page does hold them, or the scan proves nothing.
+        self.assertEqual(
+            _settings_tokens(read("admin.html"), read("admin.js")),
+            [token for token in _SETTINGS_TOKENS
+             if token not in ("Manage people", "Environment expectations")])
+
+    def test_the_detectors_can_fail(self) -> None:
+        """Planted: a read back on Open Actions, a section back in its
+        markup, and init() awaiting one read or reading People first."""
+        self.assertEqual(_settings_tokens(
+            "", 'const data = await fetchJson("api/environments");'),
+            ['"api/environments"'])
+        self.assertEqual(_settings_tokens(
+            '<section id="people-section"><details>', ""),
+            ['id="people-section"'])
+        source = read("admin.js")
+        for old, new in (("  loadEnvs();\n", "  await loadEnvs();\n"),
+                         ("  loadEnvs();\n  loadPeople();\n",
+                          "  loadPeople();\n  loadEnvs();\n"),
+                         ("  loadPeople();\n", "")):
+            planted = source.replace(old, new, 1)
+            self.assertNotEqual(planted, source, old)
+            self.assertNotEqual(_admin_init_problems(planted), [], old)
+
+
+#: The Admin walk: the real admin.js over the shim. Every request is
+#: held until both reads have been asked for (so the walk proves neither
+#: waits for the other), then answered from the fixture; the steps then
+#: act on the Flaky default column and the page is read back. argv: repo
+#: root, fixture path.
+_ADMIN_SHIM_DRIVER = r"""
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [root, fixturePath] = process.argv.slice(2);
+const fixture = JSON.parse(readFileSync(fixturePath, "utf-8"));
+const { installDom, Element } = await import(
+  pathToFileURL(root + "/tools/dev/net/domshim.mjs").href);
+const byId = installDom(fixture.ids, fixture.url);
+// The shim parses no HTML, so what the markup ships hidden is hidden
+// here as the page would find it.
+for (const id of fixture.hidden) {
+  byId[id].hidden = true;
+}
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+window.localStorage.setItem("testboard.username", "amy");
+// The shim has no focus(); this one only notes which element took it.
+let focused = null;
+Element.prototype.focus = function () { focused = this; };
+const asked = [];
+const puts = [];
+const held = [];
+let holding = true;
+globalThis.fetch = (url, opts) => {
+  const u = new URL(String(url), "http://127.0.0.1/");
+  const path = u.pathname.replace(/^\//, "") + u.search;
+  const method = (opts && opts.method) || "GET";
+  asked.push(method === "GET" ? path : method + " " + path);
+  let answer = [200, {}];
+  if (method === "PUT") {
+    puts.push(JSON.parse(opts.body));
+    answer = fixture.putAnswers.shift() || [200, {}];
+  } else if (path === "api/environments") {
+    answer = fixture.envs;
+  } else if (path === "api/users?include_inactive=1") {
+    answer = fixture.users;
+  }
+  const response = { ok: answer[0] < 400, status: answer[0],
+    text: async () => JSON.stringify(answer[1]) };
+  if (holding) {
+    return new Promise((resolve) => held.push(() => resolve(response)));
+  }
+  return Promise.resolve(response);
+};
+const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
+const shown = (id) => (byId[id].hidden ? null : byId[id].textContent);
+const states = (section) => [!byId[section + "-loading"].hidden,
+  !byId[section + "-empty"].hidden, shown(section + "-failed")];
+const rows = () => byId["envs-body"].children;
+const editorRow = () => rows().find(
+  (tr) => tr.className === "env-default-editor");
+const flakyCell = (tr) => {
+  const cell = tr.children.find((td) => td.className === "env-default-cell");
+  if (!cell) {
+    return null;
+  }
+  const head = cell.children[0];
+  const history = cell.children.find(
+    (c) => c.className === "env-default-history");
+  return {
+    head: head.textContent,
+    buttons: head.find((c) => c.tagName === "BUTTON")
+      .map((b) => b.textContent),
+    subs: cell.children.filter((c) => c.className === "row-sub")
+      .map((c) => c.textContent),
+    history: history ? [history.children[0].textContent].concat(
+      history.children[1].children.map((li) => li.textContent)) : null,
+  };
+};
+const editorState = (tr) => {
+  const pick = (test) => tr.find(test)[0] || null;
+  const select = pick((c) => c.tagName === "SELECT");
+  const input = pick((c) => c.tagName === "INPUT");
+  const effect = pick((c) => String(c.className).includes("default-effect"));
+  return {
+    label: pick((c) => c.className === "env-default-label").textContent,
+    select: select ? select.value : null,
+    reason: input.value,
+    placeholder: input.placeholder,
+    buttons: tr.find((c) => c.tagName === "BUTTON")
+      .map((b) => [b.textContent, b.disabled]),
+    effect: effect.hidden ? null : effect.textContent,
+    colSpan: tr.children[0].colSpan,
+    focused: focused && tr.find((c) => c === focused).length
+      ? focused.tagName : null,
+  };
+};
+const snapshot = () => ({
+  head: !byId["envs-flaky-head"].hidden,
+  note: shown("envs-flaky-note"),
+  rows: rows().map((tr) => (tr.className === "env-default-editor"
+    ? { editor: editorState(tr) }
+    : { env: tr.children[0].textContent, cells: tr.children.length,
+        target: tr.classList.contains("env-row-target"),
+        flaky: flakyCell(tr), title: tr.title || null,
+        titles: tr.children.map((td) => td.title || null),
+        historyList: tr.find(
+          (c) => c.tagName === "UL" || c.tagName === "OL")
+          .map((c) => c.tagName) })),
+  envs: states("envs"),
+  people: byId["people-body"].children.map(
+    (tr) => tr.children.map((td) => td.textContent)),
+  peopleStates: states("people"),
+  banner: shown("error-banner"),
+});
+await import(pathToFileURL(root + "/static/admin.js").href);
+await settle();
+const out = { asked: asked.slice(), loading: snapshot() };
+holding = false;
+for (const release of held) {
+  release();
+}
+await settle();
+out.drawn = snapshot();
+for (const [kind, first, second] of fixture.steps) {
+  if (kind === "open") {
+    const tr = rows().find((row) => row.className !== "env-default-editor"
+      && row.children[0].textContent === first);
+    await tr.find((c) => c.tagName === "BUTTON"
+      && c.textContent === second)[0].click();
+  } else if (kind === "choose") {
+    const select = editorRow().find((c) => c.tagName === "SELECT")[0];
+    select.value = first;
+    await select.dispatch("change");
+  } else if (kind === "type") {
+    const input = editorRow().find((c) => c.tagName === "INPUT")[0];
+    input.value = first;
+    await input.dispatch("input");
+  } else if (kind === "press") {
+    await editorRow().find((c) => c.tagName === "BUTTON"
+      && c.textContent === first)[0].click();
+    await settle();
+  } else if (kind === "snap") {
+    out[first] = snapshot();
+  }
+}
+out.after = asked.slice(out.asked.length);
+out.puts = puts;
+await driverAnswer(out);
+"""
+
+
+def _admin_ids() -> List[str]:
+    return re.findall(r'id="([^"]+)"', read("admin.html"))
+
+
+def _hidden_ids(html: str) -> List[str]:
+    """The ids of the elements *html* ships with the ``hidden``
+    attribute."""
+    found = []  # type: List[str]
+    for tag in re.findall(r"<[a-z][^>]*>", html):
+        name = re.search(r'\sid="([^"]+)"', tag)
+        if name and re.search(r"\shidden(?=[\s>/])", tag):
+            found.append(name.group(1))
+    return found
+
+
+def _admin_env(name: str, flaky_default: Any = "absent",
+               history: Optional[List[Dict[str, Any]]] = None
+               ) -> Dict[str, Any]:
+    """One ``GET /api/environments`` row in the server's shape; with
+    *flaky_default* other than "absent", in the shape of the design's
+    §2 B.3 (``flaky_default`` and ``flaky_default_history``)."""
+    item = {
+        "environment": name, "product": "Atlas", "tests_seen": 4000,
+        "expected_tests": None, "effective_expected": 4000,
+        "updated_at": None, "updated_by": None, "passes_total": 7,
+        "passes_covered": 7,
+        "latest_pass": {"started": "2026-11-18T00:00:00.000000",
+                        "ended": "2026-11-18T02:00:00.000000",
+                        "runs": 3990, "covered": True},
+    }  # type: Dict[str, Any]
+    if flaky_default != "absent":
+        item["flaky_default"] = flaky_default
+        item["flaky_default_history"] = history or []
+    return item
+
+
+def _change(change_id: int, action: str, cadence: Optional[int],
+            reason: str, actor: str, days: float) -> Dict[str, Any]:
+    """One ``flaky_default_history`` entry, in the mark history's
+    fields."""
+    return {"id": change_id, "action": action, "cadence": cadence,
+            "reason": reason, "actor": actor,
+            "acted_at": _iso_days_ago(days)}
+
+
+#: The three cells U2 draws: no default ever; a default in force, changed
+#: once; and one removed.
+_ADMIN_ENVS_WITH_DEFAULTS = [
+    _admin_env("env-a", None),
+    _admin_env("env-b", {"cadence": 2, "set_by": "amy",
+                         "set_at": _iso_days_ago(3.2),
+                         "reason": "two servers; investigate both"},
+               [_change(2, "cadence", 2, "two servers; investigate both",
+                        "amy", 3.2),
+                _change(1, "set", 3, "first try", "ben", 10.2)]),
+    _admin_env("env-c", None,
+               [_change(4, "clear", None, "trial over", "ben", 9.2),
+                _change(3, "set", 2, "trial", "ben", 12.2)]),
+]
+
+
+def _admin_envs(environments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"cutoff": "2026-11-17T00:00:00.000000",
+            "cutoff_from_passes": True, "recent_hours": 36,
+            "coverage": 0.5, "lookback_days": 14,
+            "environments": environments}
+
+
+_ADMIN_USERS = {"users": [
+    {"username": "amy", "created_at": "2026-11-10T00:00:00.000000",
+     "active": True, "deactivated_at": None, "deactivated_by": None},
+    {"username": "dana", "created_at": "2026-11-10T00:00:00.000000",
+     "active": False, "deactivated_at": "2026-10-02T09:00:00.000000",
+     "deactivated_by": "ben"},
+]}
+
+
+def _admin_walk(steps: Optional[List[List[Any]]] = None,
+                environments: Optional[List[Dict[str, Any]]] = None,
+                envs_status: int = 200, users_status: int = 200,
+                put_answers: Optional[List[List[Any]]] = None,
+                url: str = "http://127.0.0.1/admin.html",
+                root: str = REPO_DIR) -> Dict[str, Any]:
+    envs = (_admin_envs(_ADMIN_ENVS_WITH_DEFAULTS if environments is None
+                        else environments) if envs_status < 400
+            else {"error": "environments unavailable"})
+    users = (_ADMIN_USERS if users_status < 400
+             else {"error": "users unavailable"})
+    answer = _shim({
+        "ids": _admin_ids(), "hidden": _hidden_ids(read("admin.html")),
+        "url": url, "steps": steps or [],
+        "envs": [envs_status, envs], "users": [users_status, users],
+        "putAnswers": put_answers or [],
+    }, _ADMIN_SHIM_DRIVER, root)  # type: Dict[str, Any]
+    return answer
+
+
+def _planted_admin(scratch: str, old: str, new: str) -> str:
+    """A copy of the static tree under *scratch* whose admin.js has *old*
+    replaced by *new*; the root to walk it from."""
+    shutil.copytree(STATIC_DIR, os.path.join(scratch, "static"))
+    os.makedirs(os.path.join(scratch, "tools", "dev", "net"))
+    shutil.copy(os.path.join(REPO_DIR, "tools", "dev", "net", "domshim.mjs"),
+                os.path.join(scratch, "tools", "dev", "net"))
+    path = os.path.join(scratch, "static", "admin.js")
+    source = read("admin.js")
+    planted = source.replace(old, new, 1)
+    if planted == source:
+        raise AssertionError("the plant did not take: " + old)
+    with io.open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(planted)
+    return scratch
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class AdminPageDomTest(unittest.TestCase):
+    """The Admin page over the shim: its first paint, each section's
+    states, and the `?environment=` outline (§3 U1)."""
+
+    def test_both_reads_are_asked_for_before_either_answers(self) -> None:
+        answer = _admin_walk()
+        self.assertEqual(answer["asked"],
+                         ["api/environments", "api/users?include_inactive=1"])
+        self.assertEqual(answer["loading"]["envs"], [True, False, None])
+        self.assertEqual(answer["loading"]["peopleStates"],
+                         [True, False, None])
+        self.assertEqual(answer["loading"]["rows"], [])
+        self.assertEqual(answer["after"], [])
+
+    def test_each_section_draws_on_its_own_answer(self) -> None:
+        drawn = _admin_walk()["drawn"]
+        self.assertEqual([row["env"] for row in drawn["rows"]],
+                         ["env-a", "env-b", "env-c"])
+        self.assertEqual(drawn["envs"], [False, False, None])
+        self.assertEqual(drawn["people"], [
+            ["amy", "Active", "—", "Deactivate"],
+            ["dana", "Deactivated", "2026-10-02 09:00:00 by ben",
+             "Reactivate"]])
+        self.assertEqual(drawn["peopleStates"], [False, False, None])
+        self.assertIsNone(drawn["banner"])
+
+    def test_a_failed_read_is_said_in_its_section_only(self) -> None:
+        drawn = _admin_walk(envs_status=500)["drawn"]
+        self.assertEqual(drawn["rows"], [])
+        self.assertEqual(drawn["envs"][:2], [False, False])
+        self.assertEqual(
+            drawn["envs"][2], "Could not load the environments: "
+            "environments unavailable. Reload the page to try again.")
+        self.assertIsNone(drawn["banner"])
+        self.assertEqual(len(drawn["people"]), 2, "People still draws")
+        drawn = _admin_walk(users_status=500)["drawn"]
+        self.assertEqual(drawn["peopleStates"][2],
+                         "Could not load the people: users unavailable. "
+                         "Reload the page to try again.")
+        self.assertEqual(len(drawn["rows"]), 3, "Environments still draws")
+        self.assertIsNone(drawn["banner"])
+
+    def test_nothing_reported_yet_says_so(self) -> None:
+        drawn = _admin_walk(environments=[])["drawn"]
+        self.assertEqual(drawn["envs"], [False, True, None])
+        self.assertFalse(drawn["head"])
+        self.assertIn("No environments have reported yet.",
+                      " ".join(read("admin.html").split()))
+
+    def test_the_named_environment_is_outlined_and_never_filtered(
+            self) -> None:
+        drawn = _admin_walk(
+            url="http://127.0.0.1/admin.html?environment=env-b"
+                "#envs-section")["drawn"]
+        self.assertEqual([[row["env"], row["target"]] for row in drawn["rows"]],
+                         [["env-a", False], ["env-b", True],
+                          ["env-c", False]])
+        drawn = _admin_walk()["drawn"]
+        self.assertEqual([row["target"] for row in drawn["rows"]],
+                         [False, False, False])
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class FlakyDefaultSettingTest(unittest.TestCase):
+    """The Flaky default column on the Admin page (§3 U2; decisions 7,
+    8, 18, 23), on fixtures in the contract's shape (§2 B.3): its three
+    cells, its editing row, and the PUT it sends."""
+
+    def test_no_key_no_column(self) -> None:
+        """An older server sends no ``flaky_default``: no column, no
+        sentence, and the rows as Open Actions drew them."""
+        drawn = _admin_walk(environments=[_admin_env("env-a"),
+                                          _admin_env("env-b")])["drawn"]
+        self.assertFalse(drawn["head"])
+        self.assertIsNone(drawn["note"])
+        self.assertEqual([[row["cells"], row["flaky"]] for row in
+                          drawn["rows"]], [[7, None], [7, None]])
+
+    def test_the_three_cells_and_the_paragraphs_sentence(self) -> None:
+        drawn = _admin_walk()["drawn"]
+        self.assertTrue(drawn["head"])
+        self.assertEqual(drawn["note"], (
+            "A flaky default makes every test in an environment that has "
+            "no mark of its own count as failing only once its last N runs "
+            "have failed. It reads the most recent runs, not one night's."))
+        cells = {row["env"]: row["flaky"] for row in drawn["rows"]}
+        self.assertEqual([row["cells"] for row in drawn["rows"]], [8, 8, 8])
+        self.assertEqual(cells["env-a"], {
+            "head": "none Set", "buttons": ["Set"], "subs": [],
+            "history": None})
+        self.assertEqual(cells["env-b"], {
+            "head": "2 in a row Change · Remove",
+            "buttons": ["Change", "Remove"],
+            "subs": ["set by amy · 3 days ago · two servers; investigate "
+                     "both"],
+            "history": [
+                "History (2)",
+                "changed to 2 in a row by amy · 3 days ago · two servers; "
+                "investigate both",
+                "set to 3 in a row by ben · 10 days ago · first try"]})
+        self.assertEqual(cells["env-c"], {
+            "head": "none Set", "buttons": ["Set"],
+            "subs": ["removed by ben · 9 days ago · trial over"],
+            "history": ["History (2)",
+                        "removed by ben · 9 days ago · trial over",
+                        "set to 2 in a row by ben · 12 days ago · trial"]})
+
+    def _set_walk(self, root: str = REPO_DIR) -> Dict[str, Any]:
+        return _admin_walk([
+            ["open", "env-a", "Set"], ["snap", "opened"],
+            ["choose", "2"], ["snap", "chosen"],
+            ["type", "two servers"], ["snap", "typed"],
+            ["type", "   "], ["snap", "blanked"],
+            ["press", "Save"], ["snap", "pressedEmpty"],
+            ["type", "two servers"], ["press", "Save"], ["snap", "saved"],
+        ], root=root)
+
+    def test_save_waits_for_a_cadence_and_a_reason(self) -> None:
+        answer = self._set_walk()
+        editor = answer["opened"]["rows"][1]["editor"]
+        self.assertEqual(editor["label"], "Flaky default for env-a")
+        self.assertEqual(editor["select"], "")
+        self.assertEqual(editor["placeholder"], "Why this default? (required)")
+        self.assertEqual(editor["buttons"], [["Save", True],
+                                             ["Cancel", False]])
+        self.assertIsNone(editor["effect"])
+        self.assertEqual(editor["colSpan"], 8)
+        chosen = answer["chosen"]["rows"][1]["editor"]
+        self.assertEqual(chosen["buttons"][0], ["Save", True])
+        self.assertEqual(chosen["effect"], (
+            "Every test here with no mark of its own counts as failing "
+            "once its last 2 runs have failed."))
+        self.assertEqual(answer["typed"]["rows"][1]["editor"]["buttons"][0],
+                         ["Save", False])
+        self.assertEqual(
+            answer["blanked"]["rows"][1]["editor"]["buttons"][0],
+            ["Save", True])
+        # Pressed while disabled (the shim does not stop a click), it
+        # sends nothing.
+        self.assertEqual(answer["pressedEmpty"]["rows"][1]["editor"]["reason"],
+                         "   ")
+
+    def test_save_sends_the_signed_in_user_and_redraws(self) -> None:
+        answer = self._set_walk()
+        self.assertEqual(answer["puts"], [
+            {"username": "amy", "cadence": 2, "reason": "two servers"}])
+        self.assertEqual(answer["after"], [
+            "PUT api/environments/env-a/flaky-default", "api/environments"])
+        self.assertEqual([row.get("env") for row in answer["saved"]["rows"]],
+                         ["env-a", "env-b", "env-c"], "the editor is gone")
+
+    def test_change_starts_on_the_cadence_in_force_with_no_reason(
+            self) -> None:
+        answer = _admin_walk([["open", "env-b", "Change"],
+                              ["snap", "opened"]])
+        editor = answer["opened"]["rows"][2]["editor"]
+        self.assertEqual(editor["select"], "2")
+        self.assertEqual(editor["reason"], "")
+        self.assertEqual(editor["buttons"][0], ["Save", True])
+
+    def test_remove_waits_for_a_reason_and_sends_no_cadence(self) -> None:
+        answer = _admin_walk([
+            ["open", "env-b", "Remove"], ["snap", "opened"],
+            ["type", "trial over"], ["snap", "typed"],
+            ["press", "Remove"]])
+        editor = answer["opened"]["rows"][2]["editor"]
+        self.assertEqual(editor["label"],
+                         "Remove the flaky default for env-b")
+        self.assertIsNone(editor["select"])
+        self.assertEqual(editor["placeholder"], "Why remove it? (required)")
+        self.assertEqual(editor["buttons"], [["Remove", True],
+                                             ["Cancel", False]])
+        self.assertEqual(editor["effect"], (
+            "Every test here with no mark of its own then counts as "
+            "failing on its first failure."))
+        self.assertEqual(answer["typed"]["rows"][2]["editor"]["buttons"][0],
+                         ["Remove", False])
+        self.assertEqual(answer["puts"], [
+            {"username": "amy", "cadence": None, "reason": "trial over"}])
+
+    def test_a_failed_write_goes_to_the_banner_and_keeps_what_was_typed(
+            self) -> None:
+        answer = _admin_walk([
+            ["open", "env-a", "Set"], ["choose", "3"],
+            ["type", "nightly pair"], ["press", "Save"], ["snap", "failed"]],
+            put_answers=[[404, {"error": "unknown environment: env-a"}]])
+        failed = answer["failed"]
+        self.assertEqual(failed["banner"], "unknown environment: env-a")
+        editor = failed["rows"][1]["editor"]
+        self.assertEqual([editor["select"], editor["reason"]],
+                         ["3", "nightly pair"])
+        self.assertEqual(editor["buttons"], [["Save", False],
+                                             ["Cancel", False]])
+        self.assertEqual(failed["envs"], [False, False, None])
+        self.assertEqual(answer["after"],
+                         ["PUT api/environments/env-a/flaky-default"])
+
+    def test_cancel_closes_the_row_and_a_second_open_replaces_it(
+            self) -> None:
+        answer = _admin_walk([
+            ["open", "env-b", "Change"], ["open", "env-b", "Remove"],
+            ["snap", "twice"], ["press", "Cancel"], ["snap", "cancelled"]])
+        self.assertEqual(
+            [row.get("env") or row["editor"]["label"]
+             for row in answer["twice"]["rows"]],
+            ["env-a", "env-b", "Remove the flaky default for env-b", "env-c"])
+        self.assertEqual([row.get("env") for row in
+                          answer["cancelled"]["rows"]],
+                         ["env-a", "env-b", "env-c"])
+        self.assertEqual(answer["puts"], [])
+
+    _TWO_ROWS = [["open", "env-a", "Set"], ["type", "half typed"],
+                 ["open", "env-b", "Change"], ["snap", "second"]]
+
+    def test_one_editor_is_open_at_a_time(self) -> None:
+        """A save redraws the table: an editor left open on another row
+        would lose what was typed there without a word."""
+        rows = _admin_walk(self._TWO_ROWS)["second"]["rows"]
+        self.assertEqual(
+            [row.get("env") or row["editor"]["label"] for row in rows],
+            ["env-a", "env-b", "Flaky default for env-b", "env-c"])
+
+    def test_the_one_editor_detector_can_fail(self) -> None:
+        """Planted: only an editor under the same row is closed."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = _planted_admin(
+                scratch, '  for (const open of tr.parentNode.querySelectorAll('
+                '".env-default-editor")) {\n    open.remove();\n  }\n',
+                '  const next = tr.nextSibling;\n'
+                '  if (next && next.classList.contains("env-default-editor"))'
+                ' {\n    next.remove();\n  }\n')
+            rows = _admin_walk(self._TWO_ROWS, root=root)["second"]["rows"]
+        self.assertEqual(sum(1 for row in rows if "editor" in row), 2)
+
+    def test_the_detectors_can_fail(self) -> None:
+        """Planted: Save armed without a reason; a column drawn for a
+        server that sends no key."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = _planted_admin(
+                scratch, "    send.disabled = inFlight || !reason.value.trim()\n"
+                "      || (!removing && !chosen);\n",
+                "    send.disabled = inFlight;\n")
+            chosen = self._set_walk(root)["chosen"]["rows"][1]["editor"]
+        self.assertEqual(chosen["buttons"][0], ["Save", False])
+        with tempfile.TemporaryDirectory() as scratch:
+            root = _planted_admin(
+                scratch, 'const withDefaults = data.environments.some(\n'
+                '      (item) => "flaky_default" in item);\n',
+                "const withDefaults = true;\n")
+            drawn = _admin_walk(environments=[_admin_env("env-a")],
+                                root=root)["drawn"]
+        self.assertTrue(drawn["head"])
+        self.assertEqual(drawn["rows"][0]["cells"], 8)
+
+    def test_history_is_an_unnumbered_list(self) -> None:
+        """Newest first, so a number would call the latest change 1."""
+        rows = _admin_walk()["drawn"]["rows"]
+        self.assertEqual([row["historyList"] for row in rows],
+                         [[], ["UL"], ["UL"]])
+
+    def test_the_expected_counts_setter_is_on_its_own_cells(self) -> None:
+        """On the row, the expected count's "Set by" showed over the
+        flaky default's "set by", perhaps another name."""
+        environments = [dict(_ADMIN_ENVS_WITH_DEFAULTS[1],
+                             expected_tests=3900, updated_by="ben",
+                             updated_at="2026-11-01T09:00:00.000000")]
+        row = _admin_walk(environments=environments)["drawn"]["rows"][0]
+        title = "Set by ben on 2026-11-01 09:00:00"
+        self.assertIsNone(row["title"])
+        self.assertEqual(row["titles"],
+                         [None, None, None, title, None, None, title, None])
+
+    def test_focus_goes_to_the_first_thing_to_choose(self) -> None:
+        """Set: the cadence. Change (cadence already chosen) and Remove:
+        the reason."""
+        for env, label, at, focused in (("env-a", "Set", 1, "SELECT"),
+                                        ("env-b", "Change", 2, "INPUT"),
+                                        ("env-b", "Remove", 2, "INPUT")):
+            with self.subTest(label=label):
+                answer = _admin_walk([["open", env, label],
+                                      ["snap", "opened"]])
+                self.assertEqual(
+                    answer["opened"]["rows"][at]["editor"]["focused"],
+                    focused)
+
+    def test_the_title_detector_can_fail(self) -> None:
+        """Planted: the setter's title back on the row."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = _planted_admin(
+                scratch, "    expected.title = actions.title = ",
+                "    tr.title = ")
+            row = _admin_walk(environments=[dict(
+                _ADMIN_ENVS_WITH_DEFAULTS[1], updated_by="ben",
+                updated_at="2026-11-01T09:00:00.000000")],
+                root=root)["drawn"]["rows"][0]
+        self.assertEqual(row["title"], "Set by ben on 2026-11-01 09:00:00")
+
+
+def _css_rule_bodies(css: str) -> Dict[str, List[str]]:
+    """Every selector in *css* (comments stripped, selector groups split)
+    with the bodies of the rules naming it, whitespace collapsed."""
+    found = {}  # type: Dict[str, List[str]]
+    for match in re.finditer(r"([^{}]+)\{([^}]*)\}",
+                             re.sub(r"/\*.*?\*/", "", css, flags=re.S)):
+        for selector in match.group(1).split(","):
+            found.setdefault(" ".join(selector.split()), []).append(
+                " ".join(match.group(2).split()))
+    return found
+
+
+def _admin_css_problems(css: str) -> List[str]:
+    """What the Flaky default's styling lacks (review of item 25): the
+    cell and the editing row wrap (``.data-table td`` is nowrap), the
+    cadence select and the reason box share their neighbours' rules, and
+    History is an unnumbered list."""
+    rules = _css_rule_bodies(css)
+    found = []  # type: List[str]
+    cell = " ".join(rules.get(".data-table td.env-default-cell", []))
+    if "white-space: normal" not in cell or "max-width: 28em" not in cell:
+        found.append("the cell does not wrap at 28em")
+    if "overflow-wrap: anywhere" not in cell:
+        found.append("a reason with no spaces does not wrap")
+    if "white-space: normal" not in " ".join(
+            rules.get(".data-table tr.env-default-editor td", [])):
+        found.append("the editing row does not wrap")
+    if rules.get(".env-cadence-select") != rules.get(".review-cadence-select"):
+        found.append("the cadence select is not styled as the mark's")
+    if rules.get(".env-default-reason") != rules.get(".flaky-reason-input"):
+        found.append("the reason box is not sized as the mark's")
+    history = " ".join(rules.get(".env-default-history ul", []))
+    if ("list-style: none" not in history
+            or ".env-default-history ol" in rules):
+        found.append("History is not an unnumbered list")
+    return found
+
+
+class AdminStylingTest(unittest.TestCase):
+    """The Flaky default column's layout (review of item 25): a long
+    reason wraps instead of stretching the table, and the editor's
+    controls look like the mark's."""
+
+    def test_the_column_wraps_and_its_controls_match_the_marks(
+            self) -> None:
+        self.assertEqual(_admin_css_problems(read_text("style.css")), [])
+
+    def test_the_detector_can_fail(self) -> None:
+        css = read_text("style.css")
+        for old, new in (
+                ("  max-width: 28em;\n", ""),
+                ("  max-width: 28em;\n  white-space: normal;\n"
+                 "  overflow-wrap: anywhere;\n",
+                 "  max-width: 28em;\n  white-space: normal;\n"),
+                (".data-table tr.env-default-editor td { white-space: normal; }",
+                 ""),
+                (".selection-cadence-select,\n.env-cadence-select {",
+                 ".selection-cadence-select {"),
+                (".env-default-effect {",
+                 ".env-default-reason { min-width: 18em; }\n"
+                 ".env-default-effect {"),
+                (".env-default-history ul {", ".env-default-history ol {")):
+            planted = css.replace(old, new, 1)
+            self.assertNotEqual(planted, css, old)
+            self.assertNotEqual(_admin_css_problems(planted), [], old)
 
 
 if __name__ == "__main__":
