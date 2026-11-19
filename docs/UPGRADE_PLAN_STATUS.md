@@ -5365,3 +5365,38 @@ count of excluded quiet tests still includes muted ones.
 Counts in the main checkout, `tclsh` and `node` on PATH:
 3093 OK (skipped 1) on SQLite and 4285 OK (skipped 91) with the MariaDB
 variants on a local 12.3. No browser has rendered it.
+
+## A default flaky cadence for an environment: design round 0 (2026-11-19)
+
+The owner signed off item 20 by clicking through it on a play server, and
+CI passed all twelve jobs on `6217c3e`. The second request of the day
+then opened a design arc: an environment carries a default cadence, so
+that a product whose suite runs on two servers into one environment
+counts a failure only when both fail. The doc is
+`docs/design/flaky-default-r0.md`; its §1 has the owner's seven answers
+and the amendment that moves Open Actions' two settings sections to a
+new Admin page, each in the owner's words.
+
+Round 0 was written by the owning agents against §0 and a provisional
+contract, backend and UI in parallel, the UI's four asks of the contract
+passed to the backend author while it wrote, and all four accepted. The
+performance design pass then measured the backend's shape and found its
+estimates low by about half: they were sums of statements timed alone
+and warm, and inside a cold call the read of each failing test's recent
+runs costs nearly twice as much. As written the headline costs +37 to
++42 ms on SQLite and +50 to +58 on a local MariaDB 12.3 at 500 failing
+tests; the pass's cheaper shape, which fetches the one extra run a
+default of 2 needs on statements that already run and reads no
+promotion on list paths, costs +29 to +31 and +19 to +33. It also found
+that the design's condition for "flaking by default" dropped a test
+failing on its first run from the FAIL filter. The cheaper shape and
+the correction are the doc's recommended design.
+
+For the owner, in §4: the headline's price; a streak kept at push time,
+offered for a later drop centred on performance and not built now; the
+per-day chart counting marked tests only; and a default of 3 or more
+costing about twice a default of 2. Nineteen more decisions and five
+questions follow them. A fresh-eyes pass over the assembled doc found
+fourteen places where the sections, the decisions and §0 disagreed or
+used a term a reader of the short path could not know; all are fixed.
+Nothing is built.
