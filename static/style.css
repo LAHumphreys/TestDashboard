@@ -562,6 +562,25 @@ button.tile:focus-visible {
   height: auto;
 }
 
+/* The trend's loading line on a first load (flaky default design §3
+   U7a), as tall as the chart that replaces it: the legend row (about
+   26px) and the plot, whose viewBox is 560 by 190, so 33.93% of the
+   width (a padding percentage is of the width). Less the line's own
+   14px top padding and its line of text, about 20px. */
+.trend-loading {
+  margin: 0;
+  padding-bottom: calc(33.93% - 8px);
+}
+
+/* A caption reporting a degraded chart (the trend's "Not split" line,
+   whose Failed disagrees with the tiles): the non-result amber
+   .tl-partial uses for a partial run, so it reads as a warning, not a
+   failure, and is not as quiet as the everyday caption. */
+.chart-caption-degraded {
+  color: #8a6d00;
+  font-weight: 600;
+}
+
 .chart-legend {
   display: flex;
   gap: 14px;

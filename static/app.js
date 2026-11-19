@@ -22,9 +22,9 @@
  * /api/summary?parts=queue for the active triage tab's rows, and one
  * page of /api/dashboard; then, once the headline has been drawn,
  * /api/summary?parts=assigned_trend (the trend's assigned/muted/flaking
- * split, WP-43: only the trend card waits for it, showing the headline's
- * totals meanwhile on a first load; the part is never on the first
- * paint). Each
+ * split, WP-43: only the trend card waits for it, and draws once, when it
+ * lands, showing a loading line meanwhile on a first load; the part is
+ * never on the first paint). Each
  * section paints as its data lands, so the page is readable as soon as
  * the headline answers; the other queue tabs fetch their rows when first
  * opened. While refreshing, previous
@@ -44,7 +44,6 @@ import {
   FLAKING_TAB_EMPTY,
   FLAKING_TAB_LABEL,
   FLAKING_TAB_NOTE,
-  FLAKING_TREND_CAPTION,
   failToggleTitle,
   flakySentence,
   flakyStreakWords,
@@ -75,6 +74,8 @@ import {
   resultClass,
   showError,
   testApiPath,
+  trendFlakingCaption,
+  trendNotSplitLine,
 } from "./api.js";
 import {
   barRows,
@@ -145,8 +146,11 @@ const state = {
   summary: null,          // last headline payload (no queue rows)
   // WP-43: the last parts=assigned_trend payload, or null when it could
   // not be had (failed, timed out, an older server's 400): the trend then
-  // draws today's two series from the headline alone.
+  // draws the headline's two series and says it is not split.
   trendSplit: null,
+  // Whether the trend card holds a chart: false until its first
+  // renderTrend(), and the card shows its loading line meanwhile.
+  trendDrawn: false,
   // The refresh generation (requestSeq) whose headline has been drawn:
   // a split is asked for only for that generation, never ahead of it.
   headlineDrawn: 0,
@@ -305,8 +309,11 @@ function fetchAssignedTrend() {
  *   the newest split asked for (`state.splitSends`), so neither an older
  *   scope's split nor an older burst's, landing last, is ever drawn.
  *
- * A failure or a timeout draws the headline's totals and lifts the card's
- * dim: a split never blocks or blanks anything else.
+ * This is the only place the trend is drawn (flaky default design §3
+ * U7a): once per answer, split, so a first load never shows a chart that
+ * then changes. A failure or a timeout draws the headline's totals with
+ * the "Not split" line and lifts the card's dim: a split never blocks or
+ * blanks anything else.
  */
 async function loadTrendSplit(seq) {
   if (seq !== state.requestSeq || state.headlineDrawn !== seq) {
@@ -364,13 +371,14 @@ function browseUrl(offset) {
  * arrival rather than waiting for the slowest. The trend's split is a
  * fourth, sent once the headline has been drawn (loadTrendSplit()): it
  * reads the runs of every night in the window, and with flaky marks a
- * per-night read besides, so it is never on the first paint. On a first
- * load the trend card draws the headline's totals and gains the split
- * when it lands; on a later one it keeps the chart it has, dimmed, until
- * the new split lands. The tiles, the bars and the tab badges paint on the headline
- * alone (WP-43). The tiles, charts and
- * tab counts are a fraction of the old monolithic payload, so the page
- * is readable at once even when a queue takes its time. A section that
+ * per-night read besides, so it is never on the first paint. The trend
+ * card waits for it and draws once (flaky default design §3 U7a): on a
+ * first load it shows its loading line until the split lands; on a
+ * later one it keeps the chart it has, dimmed, until the new split
+ * lands. Nothing else waits for it. The tiles, the bars and the tab
+ * badges paint on the headline alone (WP-43). The tiles, charts and tab
+ * counts are a fraction of the old monolithic payload, so the page is
+ * readable at once even when a queue takes its time. A section that
  * fails shows the error without blanking the ones that succeeded.
  *
  * Every block checks the sequence number before touching state: a
@@ -383,13 +391,11 @@ async function refreshAll() {
   setLoading(true);
   state.queues = {};  // the filters may have changed; refetch per tab
   // A split belongs to the scope it was asked in, so this generation's
-  // starts empty. Where one was on screen, the card keeps that chart (the
-  // previous headline with its own split) dimmed until the new split
-  // lands, rather than stepping down to two series and back; only a
-  // first load, or one after a split that could not be had, draws the
-  // headline's totals first.
-  const hadSplit = state.trendSplit !== null;
+  // starts empty. The card keeps the chart it has, dimmed, or shows its
+  // loading line where it has none yet, until the new split lands, and
+  // is drawn then, once: never from the headline's totals first.
   state.trendSplit = null;
+  showTrendLoading(true);
   // The trend card carries its own dim until its split has settled; the
   // page-wide one below waits for the headline, the queue and the browse
   // page only, as it always did (WP-43).
@@ -408,17 +414,17 @@ async function refreshAll() {
       document.getElementById("loading-state").hidden = true;
       // The split is asked for only now that the headline has been
       // drawn: the part reads every night's runs, and it is never on the
-      // first paint. Until it lands the card shows the headline's totals
-      // if it had no split to keep (see hadSplit above).
+      // first paint. The trend card is drawn when it lands, not before.
       state.headlineDrawn = seq;
-      if (!hadSplit) {
-        renderTrend();
-      }
       loadTrendSplit(seq);
     } catch (err) {
       if (seq === state.requestSeq) {
         showError(err.message);
         trendCard.classList.remove("is-loading");
+        // No split will be asked for: where no chart is on screen the
+        // card shows its heading only, as the bar cards do with nothing
+        // to draw, never a loading line with nothing loading.
+        showTrendLoading(false);
       }
     }
   })();
@@ -596,8 +602,8 @@ function renderHeadline() {
   renderToolbar();
   renderStatus();
   renderEnvUpdated();
-  // The bars only: the trend is drawn by refreshAll() (the headline's
-  // totals, where no split is on screen) and by loadTrendSplit().
+  // The bars only: the trend is drawn by loadTrendSplit() alone, once
+  // its split has answered.
   renderBars();
   renderQueues();
   // The FLAKING toggle shows once the headline says the scope has a mark.
@@ -980,21 +986,53 @@ function trendFlaking(split) {
       (night) => typeof night.FAIL_FLAKING === "number");
 }
 
-/** 1. Failing runs per day (stacked columns) + its table twin. */
+/**
+ * The trend card's loading line, the one place it is made (flaky default
+ * design §3 U7a): `shown` puts it in the chart's place, at the chart's
+ * height, so the card does not grow when the chart is drawn; otherwise
+ * the place is emptied. Only while no chart has been drawn: once one
+ * has, a refresh keeps it on screen, dimmed, instead.
+ */
+function showTrendLoading(shown) {
+  if (state.trendDrawn) {
+    return;
+  }
+  const chart = document.getElementById("trend-chart");
+  clearNode(chart);
+  if (shown) {
+    chart.appendChild(el("p", "empty-state trend-loading", "Loading…"));
+  }
+}
+
+/**
+ * 1. Failing runs per day (stacked columns) + its table twin, drawn by
+ * loadTrendSplit() alone, once its split has answered. Without a split
+ * (failed, rejected, timed out, or a night it does not carry) it draws
+ * the headline's totals and says so under the plot, in the caption's
+ * place (flaky default design §4 decision 26): never a chart that looks
+ * split and is not.
+ */
 function renderTrend() {
   const headlineNights = state.summary.trend.nights;
+  const status = state.summary.status;
   const flaking = trendFlaking(state.trendSplit);
   const merged = splitNights(headlineNights, state.trendSplit, flaking);
   const isSplit = merged !== null;
   const nights = isSplit ? merged : headlineNights;
   const splitSeries = flaking ? TREND_FLAKING_SERIES : TREND_SPLIT_SERIES;
-  stackedColumnChart(
-    document.getElementById("trend-chart"), nights,
+  const chart = document.getElementById("trend-chart");
+  stackedColumnChart(chart, nights,
     isSplit ? splitSeries : TREND_SERIES, { unit: "day" });
+  state.trendDrawn = true;
+  if (!isSplit) {
+    chart.appendChild(el("p", "chart-caption chart-caption-degraded",
+      trendNotSplitLine(flakyScope())));
+  }
   document.getElementById("trend-split-caption").hidden = !isSplit;
   const flakingCaption = document.getElementById("trend-mark-caption");
   flakingCaption.hidden = !(isSplit && flaking);
-  flakingCaption.textContent = isSplit && flaking ? FLAKING_TREND_CAPTION : "";
+  flakingCaption.textContent = isSplit && flaking
+    ? trendFlakingCaption(status.flaky_total, status.flaky_defaults) : "";
   for (const th of document.querySelectorAll(
     "#trend-table th.trend-split-col")) {
     th.hidden = !isSplit;

@@ -5554,3 +5554,26 @@ time with a modifier to the millisecond. Fixed in `seed.py` by the
 performance engineer (only whole seconds go through `strftime`), the
 test unchanged; the built fixtures were checked pair by pair and are
 exact. The Python 3.6.8 and MariaDB 10.3 jobs were green throughout.
+
+## The default flaky cadence, item 27: the per-day chart waits and draws once (2026-11-19)
+
+"Failing runs per day" no longer draws from the headline's totals and
+then again when its late part lands. It shows the loading line, then one
+drawing, on every scope; nothing else on the page waits; a part that
+cannot be loaded draws the totals with a "Not split" line. The caption's
+Flaking sentence is built from the scope's marks and defaults. Home's
+first batch is still three requests, pinned. The commit message has the
+states, the tests and the one assertion reversed by design.
+
+Review: fresh eyes traced the card's paths and found a first load whose
+headline fails left "Loading…" for good; the main session's walk found
+the wording as designed and asked for the "Not split" line to stand out
+from the everyday caption (it takes the Timeline's amber). Both fixed,
+with two walks the tests lacked, and the fix read again by fresh eyes.
+
+Open until items 23, 24 and 26 are in the tree: nothing with a default
+in scope has been walked on a live server, and What's new's sentence
+that the chart counts a default's tolerated failures is true of the
+build only with item 24. Both are checked at the build's last walk.
+For the owner's click-through: the loading line under the card's dim,
+the card's height between line and chart, the amber line.

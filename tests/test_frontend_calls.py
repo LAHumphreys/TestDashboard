@@ -6362,6 +6362,22 @@ def _trend_before_headline(source: str) -> List[str]:
     return found
 
 
+def _trend_drawn_outside_split(source: str) -> List[str]:
+    """Where *source* (app.js) draws the trend other than once in
+    loadTrendSplit(), its split's answer (flaky default design §3 U7a):
+    a renderTrend() call anywhere else, or no call there at all."""
+    code = _strip_comments(source)
+    load = _function_body(code, "async function loadTrendSplit(")
+    inside = len(_call_arguments(load, "renderTrend"))
+    found = []  # type: List[str]
+    if inside != 1:
+        found.append("{} calls in loadTrendSplit()".format(inside))
+    outside = len(_call_arguments(code, "renderTrend")) - inside
+    if outside:
+        found.append("{} calls elsewhere".format(outside))
+    return found
+
+
 class AssignedTrendFetchTest(unittest.TestCase):
     """WP-43 §1, decisions 8 and 13: the trend's split is its own part.
     Since WP-44 the part also reads every night's flaking runs, so it is
@@ -6369,9 +6385,11 @@ class AssignedTrendFetchTest(unittest.TestCase):
     headline, the active queue, the browse page), and the split is sent
     once the headline has been drawn, by one function on every path (the
     first load, every refreshAll(), and the coalescer once per burst).
-    Only the trend card waits for it, drawing the headline's totals until
-    it lands. A split back in the first batch would still work, only
-    making the first paint pay for it, which is why it is pinned."""
+    Only the trend card waits for it, and since the flaky default design
+    (§3 U7a) it is drawn once, when the split lands: a loading line on a
+    first load, the previous chart dimmed on a later one. A split back in
+    the first batch would still work, only making the first paint pay for
+    it, which is why it is pinned."""
 
     def _app(self) -> str:
         return _strip_comments(read("app.js"))
@@ -6434,25 +6452,33 @@ class AssignedTrendFetchTest(unittest.TestCase):
                       coalescer)
 
     def test_the_first_paint_does_not_wait_for_it(self) -> None:
-        """The headline draws the trend's totals itself (renderTrend()
-        in refreshAll() after renderHeadline()), never a split."""
+        """The stricter pin (flaky default design §3 U7a, decision 25):
+        the trend is drawn once, by loadTrendSplit() alone, when its
+        split has answered. The headline draws everything else and asks
+        for the split after it has drawn; it never draws the trend's
+        totals first, so a first load never shows a chart that then
+        changes. The 10 s timeout stays."""
         app = self._app()
         headline = _function_body(app, "function renderHeadline()")
         self.assertIn("renderBars()", headline)
-        self.assertNotIn("renderTrend()", headline)
         self.assertNotIn("renderCharts()", headline)
+        self.assertEqual(_trend_drawn_outside_split(read("app.js")), [])
         refresh = _function_body(app, "async function refreshAll(")
         part = refresh[refresh.index("const headlinePart = "):
                        refresh.index("const queuePart = ")]
         order = [part.index(token) for token in (
-            "renderHeadline();", "renderTrend();", "loadTrendSplit(seq);")]
+            "renderHeadline();", "state.headlineDrawn = seq;",
+            "loadTrendSplit(seq);")]
         self.assertEqual(order, sorted(order))
-        self.assertNotIn("renderTrend()", _function_body(
-            app, "async function refreshSummary()"))
+        self.assertNotIn("hadSplit", app)
+        self.assertIn("const ASSIGNED_TREND_TIMEOUT_MS = 10000;", app)
 
     def test_the_detector_can_fail(self) -> None:
         """Planted: the split back in the first batch, beside the
-        headline, or before the headline has been drawn."""
+        headline, or before the headline has been drawn; and the trend
+        drawn anywhere but loadTrendSplit(): the headline's totals first
+        on a first load (the drawing the design rules out), in
+        renderHeadline() or after a Take."""
         source = read("app.js")
         at = source.index("  const headlinePart = (async () => {")
         for planted in ("  const trendPart = fetchAssignedTrend();\n",
@@ -6465,6 +6491,15 @@ class AssignedTrendFetchTest(unittest.TestCase):
             "      loadTrendSplit(seq);\n      renderHeadline();\n", 1)
         self.assertNotEqual(early, source)
         self.assertNotEqual(_trend_before_headline(early), [])
+        for anchor in ("      state.headlineDrawn = seq;\n",
+                       "  renderBars();\n  renderQueues();\n",
+                       "    renderBars();\n    renderQueues();\n"):
+            with self.subTest(drawn_after=anchor):
+                indent = anchor[:len(anchor) - len(anchor.lstrip())]
+                planted = source.replace(
+                    anchor, anchor + indent + "renderTrend();\n", 1)
+                self.assertNotEqual(planted, source)
+                self.assertNotEqual(_trend_drawn_outside_split(planted), [])
 
     def test_it_never_rejects_and_never_hangs(self) -> None:
         body = _function_body(self._app(), "function fetchAssignedTrend()")
@@ -6542,6 +6577,11 @@ if (fixture.bars) {
     }
     return found;
   };
+  // The trend's lines of text in the chart's place: its loading line, or
+  // the "Not split" line under the plot, as [class, text].
+  const trendLines = (node) => node.children
+    .filter((c) => /^(empty-state|chart-caption)/.test(String(c.className)))
+    .map((c) => [c.className, c.textContent]);
   const firstRow = byId["trend-table-body"].children[0];
   Object.assign(out, {
     asked,
@@ -6558,6 +6598,7 @@ if (fixture.bars) {
       .map((c) => c.attributes["aria-label"] || null),
     captionHidden: byId["trend-split-caption"].hidden,
     tableRow: firstRow ? firstRow.children.map((td) => td.textContent) : null,
+    trendLines: trendLines(byId["trend-chart"]),
   });
 }
 await driverAnswer(out);
@@ -6790,6 +6831,22 @@ def _part() -> Dict[str, Any]:
                           for day in (1, 2, 3)]}}
 
 
+#: The trend card on a first load until its part answers (flaky default
+#: design §3 U7a), as the drivers' ``trendLines`` give it: [class, text].
+_TREND_LOADING_LINE = ["empty-state trend-loading", "Loading…"]
+
+#: The line under the plot when the part failed, was rejected or timed
+#: out (design decision 26): with no mark in scope, and with one.
+_NOT_SPLIT_LINE = [
+    "chart-caption chart-caption-degraded",
+    "Not split: the assigned and muted runs could not be "
+    "loaded, so Failed counts every failed run. Reload to try again."]
+_NOT_SPLIT_FLAKING_LINE = [
+    "chart-caption chart-caption-degraded",
+    "Not split: the assigned, muted and flaking runs could "
+    "not be loaded, so Failed counts every failed run. Reload to try again."]
+
+
 @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
                  "are optional dev tooling, the source guards still run")
 class AssignedSplitDomTest(unittest.TestCase):
@@ -6834,12 +6891,16 @@ class AssignedSplitDomTest(unittest.TestCase):
 
     def test_an_older_server_draws_todays_charts(self) -> None:
         """No ``assigned`` and a 400 for the part: two series, the
-        four-column table, no blue, no bar legend, the WP-40 bars."""
+        four-column table, no blue, no bar legend, the WP-40 bars. The
+        rejected part is said under the plot (flaky default design
+        decision 26), naming no flaking: the scope has no mark."""
         answer = _shim({"ids": _index_ids(),
                         "headline": _headline(False), "part": None})
         self.assertEqual(answer["trendLegend"], ["Failed", "Unexpected pass"])
         self.assertEqual(answer["tableRow"], ["Oct 1", "9", "2", "62"])
         self.assertTrue(answer["captionHidden"])
+        self.assertEqual(answer["trendLines"], [_NOT_SPLIT_LINE])
+        self.assertEqual(answer["dimmed"], [])
         self.assertFalse(answer["envAssigned"])
         self.assertIsNone(answer["envLegend"])
         self.assertIsNone(answer["scriptsLegend"])
@@ -6856,6 +6917,7 @@ class AssignedSplitDomTest(unittest.TestCase):
         self.assertEqual(answer["tableRow"],
                          ["Oct 1", "9", "4", "3", "2", "2", "62"])
         self.assertFalse(answer["captionHidden"])
+        self.assertEqual(answer["trendLines"], [])
         self.assertEqual(answer["envLegend"], ["Unassigned", "Assigned", "Muted"])
         self.assertEqual(answer["scriptsLegend"],
                          ["Unassigned", "Assigned", "Muted"])
@@ -6868,9 +6930,15 @@ class AssignedSplitDomTest(unittest.TestCase):
              "bar-fill bar-assigned bar-fill-open", "bar-fill bar-muted"])
 
     def test_a_failed_part_costs_the_trend_its_split_only(self) -> None:
+        """The headline's totals, undimmed, and the "Not split" line in
+        the caption's place (flaky default design decision 26)."""
         answer = _shim({"ids": _index_ids(),
                         "headline": _headline(True), "part": None})
         self.assertEqual(answer["trendLegend"], ["Failed", "Unexpected pass"])
+        self.assertEqual(answer["tableRow"], ["Oct 1", "9", "2", "62"])
+        self.assertTrue(answer["captionHidden"])
+        self.assertEqual(answer["trendLines"], [_NOT_SPLIT_LINE])
+        self.assertEqual(answer["dimmed"], [])
         self.assertEqual(answer["envLegend"], ["Unassigned", "Assigned", "Muted"])
 
     def test_a_hung_part_holds_up_nothing_but_the_trend(self) -> None:
@@ -6878,7 +6946,9 @@ class AssignedSplitDomTest(unittest.TestCase):
         part is never on the first paint, so it is asked for after the
         three requests of the first batch, once the headline has been
         drawn; while it hangs the tiles and both bar charts paint, and
-        the trend shows the headline's totals and keeps its dim."""
+        the trend card shows its loading line, dimmed, and no chart: it
+        is drawn once, when its part answers (flaky default design §3
+        U7a), never from the headline's totals first."""
         answer = _shim({"ids": _index_ids(),
                         "headline": _headline(True), "part": "hang"})
         asked = answer["asked"]
@@ -6889,7 +6959,9 @@ class AssignedSplitDomTest(unittest.TestCase):
         self.assertEqual(asked.count("assigned_trend"), 1)
         self.assertTrue(answer["tilesPainted"])
         self.assertEqual(answer["envLegend"], ["Unassigned", "Assigned", "Muted"])
-        self.assertEqual(answer["trendLegend"], ["Failed", "Unexpected pass"])
+        self.assertIsNone(answer["trendLegend"])
+        self.assertEqual(answer["trendLines"], [_TREND_LOADING_LINE])
+        self.assertIsNone(answer["tableRow"])
         # Only the trend card is still dimmed; every section has lifted.
         self.assertEqual(answer["dimmed"], ["trend-card"])
 
@@ -7350,6 +7422,9 @@ _FLAKY_HELPERS = (
     "flakyStreakWords", "failToggleTitle",
     # The Admin page's flaky default (flaky-default design §3 U2).
     "flakyDefaultEffect", "flakyDefaultSetBy", "flakyDefaultChange",
+    # The per-day chart's caption and its "Not split" line (flaky-default
+    # design §3 U7a).
+    "trendFlakingCaption", "trendNotSplitLine",
 )
 
 
@@ -9296,8 +9371,17 @@ globalThis.fetch = (url, opts) => {
   } else if (path === "api/users") {
     body = { users: [] };
   }
-  const answer = { ok: true, status: 200,
-    text: async () => JSON.stringify(body) };
+  // A split answered "refused" is a 400 (a server that rejects the
+  // part); one answered "unreachable" is a fetch that rejects.
+  // `headlineFails`, where given, says per headline asked, in order,
+  // whether it answers a 500.
+  const failed = part === "headline" && Boolean(
+    fixture.headlineFails && fixture.headlineFails.shift());
+  const refused = part === "assigned_trend" && body === "refused";
+  const answer = { ok: !refused && !failed,
+    status: failed ? 500 : refused ? 400 : 200,
+    text: async () => JSON.stringify(failed ? { error: "headline: boom" }
+      : refused ? { error: "parts: unknown" } : body) };
   // `headlineDelay` holds every headline's answer back, so what is asked
   // for before it has been drawn can be seen; `delays` gives the
   // headline and the split one hold each, in the order they are asked.
@@ -9305,12 +9389,27 @@ globalThis.fetch = (url, opts) => {
   const held = queued && queued.length ? queued.shift()
     : (part === "headline" ? fixture.headlineDelay || 0 : 0);
   events.push("ask:" + (part || path));
-  return new Promise((resolve) => setTimeout(() => {
+  return new Promise((resolve, reject) => setTimeout(() => {
     events.push("land:" + (part || path));
-    resolve(answer);
+    if (part === "assigned_trend" && body === "unreachable") {
+      reject(new TypeError("Failed to fetch"));
+    } else {
+      resolve(answer);
+    }
   }, held));
 };
 let events = [];
+// Each drawing of the trend: stackedColumnChart() puts its legend in
+// first, so a legend put into the chart's place is one drawing.
+let trendDraws = 0;
+const trendChart = byId["trend-chart"];
+const trendAppend = trendChart.appendChild.bind(trendChart);
+trendChart.appendChild = (node) => {
+  if (node && node.className === "chart-legend") {
+    trendDraws += 1;
+  }
+  return trendAppend(node);
+};
 const delay = fixture.headlineDelay || 0;
 const settle = (wait) => new Promise((resolve) => setTimeout(
   resolve, wait === undefined || wait === null ? 50 + delay : wait));
@@ -9389,6 +9488,13 @@ const snap = () => {
         || /^chip/.test(String(c.className))).map(describe)],
     trendLegend: legend(byId["trend-chart"]),
     trendDim: byId["trend-card"].classList.contains("is-loading"),
+    // The trend's lines of text in the chart's place, as [class, text]:
+    // its loading line, or the "Not split" line under the plot.
+    trendLines: byId["trend-chart"].children.filter((c) =>
+      /^(empty-state|chart-caption)/.test(String(c.className)))
+      .map((c) => [c.className, c.textContent]),
+    // How many times the trend has been drawn since the last snapshot.
+    trendDraws,
     events,
     trendRow: firstNight ? firstNight.children.map((td) => td.textContent)
       : null,
@@ -9401,6 +9507,7 @@ const snap = () => {
   asked = [];
   events = [];
   posts = [];
+  trendDraws = 0;
   return out;
 };
 await import(pathToFileURL(root + "/static/app.js").href);
@@ -9560,7 +9667,8 @@ def _lists_walk(marks: str, steps: List[List[Any]], clear: bool = False,
                 flaking: Any = None, flaking_after: Any = None,
                 headline_delay: int = 0, delays: Any = None,
                 parts: Any = None, rows_after: Any = None,
-                queue_row: Any = None,
+                queue_row: Any = None, defaults: Any = None,
+                headline_fails: Any = None,
                 root: str = REPO_DIR) -> List[Dict[str, Any]]:
     """Home over the shim with the lists driver. *marks* as
     ``_state_fixture`` ("flaky", "zero", "older"); *rows* the Flaking
@@ -9574,10 +9682,17 @@ def _lists_walk(marks: str, steps: List[List[Any]], clear: bool = False,
     and the load's snapshot then carries ``early``, what was asked for
     halfway through that wait. *delays* holds the headline and the split
     back by request, in order (``{"headline": [0, 300]}``); *parts*
-    answers each split request in turn (None: no split to be had);
-    *root* is the tree whose static files are walked. A step may carry a
-    third element, the ms to wait before its snapshot."""
+    answers each split request in turn (None: no split to be had;
+    "refused": a 400; "unreachable": a fetch that rejects); *defaults*,
+    where given, is the headline's ``status.flaky_defaults`` (absent
+    otherwise, as from a server before the flaky default);
+    *headline_fails* says per headline asked, in order, whether it
+    answers a 500; *root* is the tree whose static files are walked. A
+    step may carry a third element, the ms to wait before its
+    snapshot."""
     fixture = _state_fixture(marks, clear)
+    if defaults is not None:
+        fixture["headline"]["status"]["flaky_defaults"] = defaults
     if flaking is not None:
         fixture["headline"]["status"]["flaking"] = flaking
     if flaking_after is not None:
@@ -9595,6 +9710,7 @@ def _lists_walk(marks: str, steps: List[List[Any]], clear: bool = False,
     fixture.update({
         "url": url, "steps": steps, "headlineDelay": headline_delay,
         "delays": delays or {}, "parts": parts or [], "queueRow": queue_row,
+        "headlineFails": headline_fails or [],
     })
     answer = _shim(fixture, _LISTS_HOME_DRIVER, root)  # type: Any
     return list(answer)
@@ -10246,7 +10362,14 @@ class FlakingTrendTest(unittest.TestCase):
     """WP-44 (design §3 U7, decisions 2 and 5): the per-day chart's
     fourth series, FAIL_FLAKING from ``parts=assigned_trend``, after the
     grey, with key, tooltip row, table column and caption only where the
-    scope has a mark; an older part without the field draws today's."""
+    scope has a mark; an older part without the field draws today's.
+    The flaky default (its design §3 U7a): the caption is
+    trendFlakingCaption(), from the headline's ``flaky_total`` and
+    ``flaky_defaults`` (read as 0 where a server sends no such key), in
+    four cases: marks, default(s), both, neither. Which scopes draw the
+    series is flakyScope()'s, widened to a default by item 26 alone."""
+
+    _MARKS = " Flaking: the day's tolerated failures, by today's marks."
 
     def test_drawn_where_the_scope_has_a_mark(self) -> None:
         load = _lists_walk("flaky", [])[0]
@@ -10255,9 +10378,48 @@ class FlakingTrendTest(unittest.TestCase):
         # Failed 9 = 3 unassigned + 3 assigned + 2 muted + 1 flaking.
         self.assertEqual(load["trendRow"],
                          ["Oct 1", "9", "3", "3", "2", "1", "2", "62"])
-        self.assertEqual(load["caption"], [
-            False, False,
-            " Flaking: the tests flaking that night, by today's marks."])
+        self.assertEqual(load["caption"], [False, False, self._MARKS])
+
+    def test_the_caption_names_the_defaults_in_scope(self) -> None:
+        """Marks and a default in scope, read from the headline's
+        ``status.flaky_defaults`` through the caption helper's
+        arguments, not through a second scope predicate."""
+        for defaults, said in (
+                (0, self._MARKS),
+                (1, " Flaking: the day's tolerated failures, by today's "
+                    "marks and environment default."),
+                (2, " Flaking: the day's tolerated failures, by today's "
+                    "marks and environment defaults.")):
+            with self.subTest(defaults=defaults):
+                load = _lists_walk("flaky", [], defaults=defaults)[0]
+                self.assertEqual(load["trendLegend"][3], "Flaking")
+                self.assertEqual(load["caption"], [False, False, said])
+
+    def test_the_four_captions(self) -> None:
+        """Marks only, default(s) only, both, neither; a server that
+        sends no ``flaky_defaults`` (the second argument absent or
+        null) reads as no default."""
+        lead = " Flaking: the day's tolerated failures, by today's "
+        cases = [
+            ([9, 0], lead + "marks."),
+            ([0, 1], lead + "environment default."),
+            ([0, 3], lead + "environment defaults."),
+            ([9, 1], lead + "marks and environment default."),
+            ([9, 2], lead + "marks and environment defaults."),
+            ([0, 0], ""),
+            ([9], lead + "marks."),
+            ([9, None], lead + "marks."),
+            ([0], ""),
+        ]  # type: List[Tuple[List[Any], str]]
+        said = _api_calls([("trendFlakingCaption", args)
+                           for args, _ in cases])
+        self.assertEqual(said, [expected for _, expected in cases])
+
+    def test_the_not_split_line_names_flaking_where_drawn(self) -> None:
+        said = _api_calls([("trendNotSplitLine", [False]),
+                           ("trendNotSplitLine", [True])])
+        self.assertEqual(said, [_NOT_SPLIT_LINE[1],
+                                _NOT_SPLIT_FLAKING_LINE[1]])
 
     def test_no_mark_or_an_older_part_draws_todays_chart(self) -> None:
         for marks, part in (("zero", "flaking"), ("older", "flaking"),
@@ -10293,9 +10455,12 @@ class TrendSplitAfterHeadlineDomTest(unittest.TestCase):
     _DELAY = 200
 
     def test_the_first_batch_is_three_and_the_split_follows(self) -> None:
-        for marks in ("zero", "flaky"):
-            with self.subTest(marks=marks):
-                load = _lists_walk(marks, [],
+        """No mark, a mark, and a default in scope (flaky default design
+        §3 U7a): the same three first, the same one split after."""
+        for marks, defaults in (("zero", None), ("flaky", None),
+                                ("zero", 1)):
+            with self.subTest(marks=marks, defaults=defaults):
+                load = _lists_walk(marks, [], defaults=defaults,
                                    headline_delay=self._DELAY)[0]
                 self.assertEqual(sorted(_parts(load["early"])),
                                  ["api/dashboard", "headline", "queue"])
@@ -10328,9 +10493,11 @@ class TrendSplitAfterHeadlineDomTest(unittest.TestCase):
     def test_a_reload_keeps_its_chart_until_the_new_split(self) -> None:
         """Where a split is on screen, a reload does not redraw the chart
         between its headline and its split: the previous chart stays,
-        dimmed, and the new split replaces it. A first load draws the
-        headline's totals meanwhile; so does a load after a split that
-        could not be had, which ends with the totals drawn, undimmed."""
+        dimmed, and the new split replaces it. A first load shows the
+        loading line meanwhile, dimmed, and no chart (flaky default
+        design §3 U7a); a split that could not be had ends with the
+        totals drawn, undimmed, and the "Not split" line, and a reload
+        after it keeps those totals, dimmed, until its split lands."""
         load, mid, landed = _lists_walk(
             "flaky", [["click", "reload-btn", 120], ["wait", None, 400]],
             delays={"assigned_trend": [0, 300]})
@@ -10347,9 +10514,12 @@ class TrendSplitAfterHeadlineDomTest(unittest.TestCase):
             "flaky", [["wait", None, 400]],
             delays={"assigned_trend": [300]})
         self.assertEqual((first["trendLegend"], first["trendDim"]),
-                         (self._TOTALS, True))
+                         (None, True))
+        self.assertEqual(first["trendLines"], [_TREND_LOADING_LINE])
+        self.assertIsNone(first["trendRow"])
         self.assertEqual((after["trendLegend"], after["trendDim"]),
                          (self._SPLIT, False))
+        self.assertEqual(after["trendLines"], [])
         load, failed, mid, landed = _lists_walk(
             "flaky", [["click", "reload-btn"], ["click", "reload-btn", 120],
                       ["wait", None, 400]],
@@ -10358,9 +10528,11 @@ class TrendSplitAfterHeadlineDomTest(unittest.TestCase):
         self.assertEqual((failed["trendLegend"], failed["trendDim"]),
                          (self._TOTALS, False))
         self.assertEqual(failed["caption"][0], True)
+        self.assertEqual(failed["trendLines"], [_NOT_SPLIT_FLAKING_LINE])
         self.assertEqual((mid["trendLegend"], mid["trendDim"]),
                          (self._TOTALS, True))
         self.assertEqual(landed["trendLegend"], self._SPLIT)
+        self.assertEqual(landed["trendLines"], [])
 
     def test_an_act_before_a_reloads_headline_asks_once_after_it(
             self) -> None:
@@ -10401,6 +10573,143 @@ class TrendSplitAfterHeadlineDomTest(unittest.TestCase):
         self.assertEqual(second["trendRow"],
                          ["Oct 1", "9", "4", "2", "2", "1", "2", "62"])
         self.assertFalse(second["trendDim"])
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class TrendDrawsOnceDomTest(unittest.TestCase):
+    """The flaky default design (§3 U7a, decisions 25 and 26): the
+    per-day chart waits for its part and is drawn once, on every scope:
+    once per load, per reload, per new scope and per Take, never the
+    headline's totals first and the split after. A part that fails or
+    is rejected draws the headline's totals, undimmed, with the "Not
+    split" line in the caption's place, naming flaking only where the
+    scope draws it; the next reload draws the split, once, without it."""
+
+    _SPLIT = ["Unassigned", "Assigned", "Muted", "Unexpected pass"]
+    _FLAKING = ["Unassigned", "Assigned", "Muted", "Flaking",
+                "Unexpected pass"]
+    _TOTALS = ["Failed", "Unexpected pass"]
+
+    #: (marks, flaky_defaults, the split's legend): no mark, a mark, a
+    #: default only (flakyScope() is item 26's to widen), and a server
+    #: from before WP-44's fields.
+    _FIXTURES = (("zero", None, _SPLIT), ("flaky", None, _FLAKING),
+                 ("flaky", 2, _FLAKING), ("zero", 1, _SPLIT),
+                 ("older", None, _SPLIT))
+
+    def test_one_drawing_per_load_and_refresh(self) -> None:
+        for marks, defaults, legend in self._FIXTURES:
+            with self.subTest(marks=marks, defaults=defaults):
+                snaps = _lists_walk(
+                    marks, [["click", "reload-btn"], ["env", None],
+                            ["take", None]],
+                    defaults=defaults, headline_delay=100)
+                for name, snap in zip(("load", "reload", "environment",
+                                       "take"), snaps):
+                    with self.subTest(refresh=name):
+                        self.assertEqual(snap["trendDraws"], 1)
+                        self.assertEqual(
+                            (snap["trendLegend"], snap["trendDim"],
+                             snap["trendLines"]), (legend, False, []))
+
+    def test_a_failed_or_rejected_part_draws_the_totals_and_says_so(
+            self) -> None:
+        for marks, line in (("zero", _NOT_SPLIT_LINE),
+                            ("flaky", _NOT_SPLIT_FLAKING_LINE)):
+            for answer in ("unreachable", "refused"):
+                with self.subTest(marks=marks, part=answer):
+                    load, reload = _lists_walk(
+                        marks, [["click", "reload-btn"]], parts=[answer])
+                    self.assertEqual(load["trendDraws"], 1)
+                    self.assertEqual(
+                        (load["trendLegend"], load["trendDim"],
+                         load["trendLines"]), (self._TOTALS, False, [line]))
+                    self.assertEqual(load["trendRow"],
+                                     ["Oct 1", "9", "2", "62"])
+                    # The split's caption and Flaking sentence stay hidden.
+                    self.assertEqual(load["caption"], [True, True, ""])
+                    # Reloaded, the split is drawn once and the line goes.
+                    self.assertEqual(reload["trendDraws"], 1)
+                    self.assertEqual(reload["trendLines"], [])
+                    self.assertEqual(reload["trendLegend"][:3],
+                                     self._SPLIT[:3])
+
+    _HEADLINE_FAILS_STEPS = [["click", "reload-btn", 120],
+                             ["wait", None, 400]]
+
+    def _headline_fails_walk(self, root: str = REPO_DIR
+                             ) -> List[Dict[str, Any]]:
+        """A first load whose headline fails, then a good reload whose
+        part is held back 300 ms: after the failure, mid-reload, landed."""
+        return _lists_walk("flaky", self._HEADLINE_FAILS_STEPS,
+                           headline_fails=[True],
+                           delays={"assigned_trend": [300]}, root=root)
+
+    def test_a_failed_first_headline_leaves_no_loading_line(self) -> None:
+        """No split is asked for, so nothing is loading: the card shows
+        its heading only, undimmed. A good reload puts the loading line
+        back, dimmed, until its part lands and is drawn, once."""
+        failed, mid, landed = self._headline_fails_walk()
+        self.assertNotIn("ask:assigned_trend", failed["events"])
+        self.assertEqual((failed["trendLegend"], failed["trendDim"],
+                          failed["trendLines"], failed["trendDraws"]),
+                         (None, False, [], 0))
+        self.assertIn("ask:assigned_trend", mid["events"])
+        self.assertEqual((mid["trendLegend"], mid["trendDim"],
+                          mid["trendLines"], mid["trendDraws"]),
+                         (None, True, [_TREND_LOADING_LINE], 0))
+        self.assertEqual((landed["trendLegend"], landed["trendDim"],
+                          landed["trendLines"], landed["trendDraws"]),
+                         (self._FLAKING, False, [], 1))
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: a copy of the static tree whose failed headline leaves
+        the loading line in place, as the first build of this item did."""
+        with tempfile.TemporaryDirectory() as scratch:
+            shutil.copytree(STATIC_DIR, os.path.join(scratch, "static"))
+            os.makedirs(os.path.join(scratch, "tools", "dev", "net"))
+            shutil.copy(
+                os.path.join(REPO_DIR, "tools", "dev", "net", "domshim.mjs"),
+                os.path.join(scratch, "tools", "dev", "net"))
+            source = read("app.js")
+            planted = source.replace("        showTrendLoading(false);\n",
+                                     "", 1)
+            self.assertNotEqual(planted, source)
+            with io.open(os.path.join(scratch, "static", "app.js"), "w",
+                         encoding="utf-8", newline="\n") as handle:
+                handle.write(planted)
+            failed = self._headline_fails_walk(root=scratch)[0]
+        self.assertEqual(failed["trendLines"], [_TREND_LOADING_LINE])
+
+    def test_a_take_before_the_first_part_draws_the_newest_once(
+            self) -> None:
+        """A Take while the first load's part is still out: the Take's
+        part (Assigned 2) is drawn, once; the first load's (Assigned 1),
+        landing after it, is never drawn."""
+        def part(assigned: int) -> Dict[str, Any]:
+            answer = _trend_part(1)
+            for night in answer["trend"]["nights"]:
+                night["FAIL_ASSIGNED"] = assigned
+            return answer
+
+        load, take, later = _lists_walk(
+            "flaky", [["take", None, 150], ["wait", None, 700]],
+            parts=[part(1), part(2)],
+            delays={"assigned_trend": [600, 0]})
+        self.assertEqual((load["trendLegend"], load["trendDim"],
+                          load["trendLines"], load["trendDraws"]),
+                         (None, True, [_TREND_LOADING_LINE], 0))
+        self.assertEqual(take["trendDraws"], 1)
+        # The Take's own part only: the first load's is still out.
+        self.assertEqual(take["events"].count("land:assigned_trend"), 1)
+        # Failed 9 = 4 unassigned + 2 assigned + 2 muted + 1 flaking.
+        self.assertEqual(take["trendRow"],
+                         ["Oct 1", "9", "4", "2", "2", "1", "2", "62"])
+        self.assertFalse(take["trendDim"])
+        self.assertIn("land:assigned_trend", later["events"])
+        self.assertEqual(later["trendDraws"], 0)
+        self.assertEqual(later["trendRow"], take["trendRow"])
 
 
 #: Open Actions over the shim (WP-44): the rows request of each

@@ -728,9 +728,39 @@ export const FLAKING_BAR = {
 };
 
 /** What the per-day chart's flaking series counts, said under the plot
- * after the assigned/muted caption, where the series is drawn. */
-export const FLAKING_TREND_CAPTION =
-  " Flaking: the tests flaking that night, by today's marks.";
+ * after the assigned/muted caption, where the series is drawn (flaky
+ * default design §3 U7a): failed runs a day, tolerated by the marks
+ * (`marks`, the headline's `status.flaky_total`) and the environment
+ * defaults (`defaults`, its `status.flaky_defaults`, read as 0 where an
+ * older server sends no such key) in scope, both judged as they stand
+ * today. Neither in scope: no series, so no sentence. */
+export function trendFlakingCaption(marks, defaults) {
+  const defaulted = defaults || 0;
+  const judges = [];
+  if (marks > 0) {
+    judges.push("marks");
+  }
+  if (defaulted > 0) {
+    judges.push(defaulted === 1 ? "environment default"
+      : "environment defaults");
+  }
+  return judges.length
+    ? " Flaking: the day's tolerated failures, by today's "
+      + judges.join(" and ") + "."
+    : "";
+}
+
+/** Said under the per-day chart, in its caption's place, when its split
+ * could not be had (failed, rejected or timed out): the chart then draws
+ * the headline's totals, and Failed counts what the split would have set
+ * apart (design §4 decision 26). `flaking` names that part only where the
+ * scope draws one. */
+export function trendNotSplitLine(flaking) {
+  return "Not split: the "
+    + (flaking ? "assigned, muted and flaking" : "assigned and muted")
+    + " runs could not be loaded, so Failed counts every failed run. "
+    + "Reload to try again.";
+}
 
 /** A failing figure split (WP-43, WP-44): of the `failing` tests (muted
  * and flaking ones already out of it), the `assigned` ones someone has
