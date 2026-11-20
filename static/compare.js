@@ -32,6 +32,7 @@
 "use strict";
 
 import {
+  ageText,
   assigneeSelect,
   clearNode,
   el,
@@ -119,33 +120,6 @@ export function streamLabel(meta) {
  * time, not UTC. */
 function parseUtc(iso) {
   return new Date(iso + "Z");
-}
-
-/**
- * "3 days ago" / "1 hour ago" / "just now", from a real timestamp and
- * the caller's own `nowMs` — always derived from the two actual values
- * involved, never from a fixed window constant. This is the same
- * discipline WindowWordingTest pins for every other page's recency
- * wording (docs/STREAMS_PLAN.md §3.5: "let the UI phrase it from data").
- */
-export function ageText(iso, nowMs) {
-  if (!iso) {
-    return "never";
-  }
-  const ms = nowMs - parseUtc(iso).getTime();
-  if (ms < 90 * 1000) {
-    return "just now";
-  }
-  const minutes = Math.floor(ms / 60000);
-  if (minutes < 60) {
-    return minutes + (minutes === 1 ? " minute ago" : " minutes ago");
-  }
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return hours + (hours === 1 ? " hour ago" : " hours ago");
-  }
-  const days = Math.floor(hours / 24);
-  return days + (days === 1 ? " day ago" : " days ago");
 }
 
 /**

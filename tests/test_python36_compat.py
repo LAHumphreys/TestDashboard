@@ -288,6 +288,32 @@ def future_annotations(tree: ast.AST) -> List[int]:
     return found
 
 
+def namedtuple_defaults(tree: ast.AST) -> List[Tuple[int, str]]:
+    """Fields given a default in a ``typing.NamedTuple`` class body.
+
+    Class-syntax defaults arrived in 3.6.1; on 3.6.0 the class body's
+    assignment is silently a class attribute and the field is required,
+    so every construction that leaves it out raises TypeError there. The
+    floor here is 3.6.0 (``TYPING_36``), so a field is passed at every
+    construction instead. A class counts as a NamedTuple when a base is
+    the name ``NamedTuple`` or the attribute ``typing.NamedTuple``.
+    """
+    found = []  # type: List[Tuple[int, str]]
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if not any(dotted_name(base) in ("NamedTuple", "typing.NamedTuple")
+                   for base in node.bases):
+            continue
+        for statement in node.body:
+            if (isinstance(statement, ast.AnnAssign)
+                    and statement.value is not None
+                    and isinstance(statement.target, ast.Name)):
+                found.append((statement.lineno,
+                              node.name + "." + statement.target.id))
+    return found
+
+
 def parses_as_python36(source: str, path: str) -> Optional[str]:
     """None if the 3.6 grammar accepts the source, else the error.
 
@@ -384,6 +410,15 @@ class SourceCompatibilityTest(unittest.TestCase):
             for lineno in future_annotations(tree):
                 bad.append("%s:%d" % (relative(path), lineno))
         self.assertEqual(bad, [], "`from __future__ import annotations`")
+
+    def test_no_namedtuple_field_defaults(self) -> None:
+        """A NamedTuple field default needs 3.6.1; the floor is 3.6.0."""
+        bad = []  # type: List[str]
+        for path, tree in sorted(self.trees.items()):
+            for lineno, name in namedtuple_defaults(tree):
+                bad.append("%s:%d %s -- pass it at every construction"
+                           % (relative(path), lineno, name))
+        self.assertEqual(bad, [], "NamedTuple field defaults need 3.6.1+")
 
     def test_typing_names_all_exist_in_python_36(self) -> None:
         """Protocol/Literal/TypedDict/OrderedDict are all too new."""
@@ -827,7 +862,23 @@ class PlantedRegressionTest(unittest.TestCase):
             "future": len(future_annotations(tree)),
             "typing": len([name for _line, name in typing_imports(tree)
                            if name not in TYPING_36]),
+            "namedtuple_defaults": len(namedtuple_defaults(tree)),
         }
+
+    def test_detects_a_namedtuple_field_default(self) -> None:
+        nl = chr(10)
+        for source in (
+                "class Row(NamedTuple):" + nl + "    a: int" + nl
+                + "    b: int = 0" + nl,
+                "class Row(typing.NamedTuple):" + nl
+                + "    b: Optional[str] = None" + nl):
+            self.assertEqual(
+                self.detectors(source)["namedtuple_defaults"], 1, source)
+        # Not a NamedTuple, or a field with no default: nothing.
+        for source in ("class Box(object):" + nl + "    b: int = 0" + nl,
+                       "class Row(NamedTuple):" + nl + "    a: int" + nl):
+            self.assertEqual(
+                self.detectors(source)["namedtuple_defaults"], 0, source)
 
     def test_detects_builtin_generic_in_an_annotation(self) -> None:
         counts = self.detectors("def f(x: list[str]) -> dict[str, int]: ...")

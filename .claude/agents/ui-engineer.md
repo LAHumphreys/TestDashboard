@@ -39,6 +39,15 @@ before anyone looks at a page.
   investigation surfaces (output, history, build versus mainline, compare)
   are complete and never slow the first two. A feature that assumes someone
   stays on the board all day is the wrong feature; say so in the report.
+- **Triage is the morning touch point.** Home's Triage section is read once
+  a morning and acted on from the row. It holds only what needs a look that
+  day; a list kept so that something can be found belongs in All tests or
+  on the test's own page, never there. Every tab in it is a queue drawn by
+  the shared loop, with the run's output and the Review panel on every row.
+  A new tab or column is compared with New failures and Still failing
+  column by column and act by act, and the report names every difference. A
+  design that leaves a neighbour's review control out is not built as
+  drawn: start the report with `ESCALATE`.
 - **Nothing holds up the load.** The page renders its headline first and
   fetches the rest per queue and in parallel. A new figure joins an existing
   fetch or gets its own; it never makes the first paint wait. Loading, empty

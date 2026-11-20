@@ -28,12 +28,12 @@ with production incidents and are recorded in `docs/UPGRADE_PLAN_STATUS.md`:
 - **`output` can be large**: it lives in its own table (`run_outputs`), zlib-compressed, and is read by exactly one endpoint (`GET /api/runs/{id}`). Never join it into a list query — keeping it out of `runs` is what keeps metadata reads dense.
 - **The server serves from a fixed worker pool, never a thread per request.** Storage keeps connections in `threading.local()`, so a thread per request means a connection per request means an empty SQLite page cache on every request — measured: 20 requests, 20 connections, and no `cache_size` setting can help a cache that is discarded before it is used twice. The pool size *is* the connection count and is what a `--cache-mb` budget is divided by; `tests/test_server_pool.py` fails if the mixin comes back.
 - SQLite: WAL mode + busy timeout at connect (threaded server), versioned migration
-  table (`schema_version`). **`MIGRATIONS` holds eleven entries and entry 1 describes a
+  table (`schema_version`). **`MIGRATIONS` holds twelve entries and entry 1 describes a
   database that exists in production — never edit it.** Every schema change is a new
   appended entry whose version is claimed from the registry in `docs/UPGRADE_PLAN.md`
-  §1 *in the same commit*; version 11 is WP-40's, and 12 is claimed by WP-15
-  (renumbered six times now, as WP-17, WP-18, WP-20, WP-21, WP-23 and WP-40 each
-  shipped first — the parked WIP branch must renumber before merging). **The app never runs DDL on MariaDB**: there, the
+  §1 *in the same commit*; version 12 is WP-44's, and 13 is claimed by WP-15
+  (renumbered seven times now, as WP-17, WP-18, WP-20, WP-21, WP-23, WP-40 and
+  WP-44 each shipped first — the parked WIP branch must renumber before merging). **The app never runs DDL on MariaDB**: there, the
   schema is moved by `tools/upgrade_mariadb_schema.py` (WP-27; a ledger since
   WP-40 — every migration above 7 needs a step there and a table in the exporter's
   `ddl()`, in the same commit; `LedgerTest` fails the suite otherwise, no server

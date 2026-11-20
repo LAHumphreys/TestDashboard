@@ -15,16 +15,17 @@
 "use strict";
 
 import {
+  ageText,
   clearError,
   clearNode,
   el,
   fetchJson,
   fetchProducts,
   formatTime,
-  mutedSuffix,
+  setAsideBracket,
   showError,
 } from "./api.js";
-import { CATEGORY_LABELS, CATEGORY_ORDER, ageText } from "./compare.js";
+import { CATEGORY_LABELS, CATEGORY_ORDER } from "./compare.js";
 import { pageUrl } from "./urls.js";
 
 /** localStorage key holding this browser's default Watchlist query. */
@@ -166,19 +167,20 @@ function cardLink(card) {
  * call site omits it and gets the exact unlinked stat this page has
  * always rendered.
  */
-function buildStat(label, value, muted) {
-  // The optional third argument is the count of muted failures (WP-40)
-  // left out of `value`: drawn "(+3 muted)" beside it, so a number that
-  // had failures taken out of it says so wherever it is shown. (The
-  // earlier third argument, an href, died with its one caller when the
-  // 2026-08-10 redesign moved the unassigned-failing count into the
-  // hero (buildHero above).)
+function buildStat(label, value, muted, flaking) {
+  // The optional third and fourth arguments are the counts of muted
+  // (WP-40) and flaking (WP-44) failures left out of `value`: drawn
+  // "(+3 muted, +4 flaking)" beside it, the bracket failingWithSetAside()
+  // ends with, so a number that had failures taken out of it says so
+  // wherever it is shown. It is its own lighter span, so the figure keeps
+  // its weight. (The earlier third argument, an href, died with its one
+  // caller when the 2026-08-10 redesign moved the unassigned-failing
+  // count into the hero (buildHero above).)
   const stat = el("div", "watch-stat");
   const valueEl = el("span", "watch-stat-value", String(value));
-  const mutedText = mutedSuffix(muted || 0);
-  if (mutedText) {
-    valueEl.appendChild(
-      el("span", "watch-stat-muted", " (" + mutedText + ")"));
+  const aside = setAsideBracket(muted, flaking);
+  if (aside) {
+    valueEl.appendChild(el("span", "watch-stat-muted", aside));
   }
   stat.appendChild(valueEl);
   stat.appendChild(el("span", "watch-stat-label", label));
@@ -364,10 +366,12 @@ function buildOkCard(card, index, total) {
   div.appendChild(buildHero(card, nowMs));
 
   const verdict = el("div", "watch-card-verdict");
-  // Muted failures (WP-40) are not in "Failing"; named beside it as
-  // "(+3 muted)" so the subtraction is never silent. Absent on a server
-  // that does not send it, in which case nothing is drawn.
-  verdict.appendChild(buildStat("Failing", card.failing, card.muted));
+  // Muted failures (WP-40) and flaking ones (WP-44) are not in "Failing";
+  // named beside it as "(+3 muted, +4 flaking)" so the subtraction is
+  // never silent. Absent on a server that does not send them, in which
+  // case nothing is drawn. A stream card is unchanged (decision 9).
+  verdict.appendChild(buildStat("Failing", card.failing, card.muted,
+    card.flaking));
   verdict.appendChild(buildStat("New failures", card.new_failures));
   verdict.appendChild(buildStat("Fixed", card.fixed));
   div.appendChild(verdict);

@@ -715,6 +715,34 @@ class TestDropEnvironmentCLI(unittest.TestCase):
         self.assertEqual(store.list_streams(""), [])
         self.assertEqual(store.prune_empty_streams(), [])
 
+    def test_the_flaky_default_is_counted_then_goes_with_it(self) -> None:
+        """Decision 13 of flaky-default-r0: the dry run counts the
+        environment's default flaky cadence and its history, and the
+        delete takes both; another environment's default stays."""
+        store = Storage(self.db)
+        store.ensure_user("alice", NOW)
+        for environment in ("UNKNOWN", "linux-sim"):
+            store.set_flaky_default(environment, 2, "two servers", "alice",
+                                    NOW)
+        store.set_flaky_default("UNKNOWN", None, "trial over", "alice", NOW)
+        store.set_flaky_default("UNKNOWN", 4, "back again", "alice", NOW)
+        store.close()
+        rc, out = self.run_cli(
+            ["--db", self.db, "-e", "UNKNOWN", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertRegex(out, r"environment_flaky_defaults\s+1\b")
+        self.assertRegex(out, r"flaky_default_history\s+3\b")
+        rc, out = self.run_cli(
+            ["--db", self.db, "-e", "UNKNOWN", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertRegex(out, r"flaky_default_history\s+3\b")
+        store = Storage(self.db)
+        self.addCleanup(store.close)
+        defaults, history = store.flaky_defaults_with_history(
+            ["UNKNOWN", "linux-sim"])
+        self.assertEqual(sorted(defaults), ["linux-sim"])
+        self.assertEqual(sorted(history), ["linux-sim"])
+
     def test_an_unknown_name_is_reported_not_deleted(self) -> None:
         """Says what IS there, because the usual cause is a typo."""
         out = io.StringIO()
@@ -813,6 +841,14 @@ if backends.MARIADB_AVAILABLE:
                     output="out", source_link="",
                     known_failure_reason=None, build="dodgy"))
                 store.upsert_runs(records)
+                # Migration 13: UNKNOWN carries a default flaky cadence
+                # with two acts on it, which the dry run counts and the
+                # delete takes (decision 13 of flaky-default-r0).
+                store.ensure_user("alice", NOW)
+                store.set_flaky_default(
+                    "UNKNOWN", 2, "two servers", "alice", NOW)
+                store.set_flaky_default(
+                    "UNKNOWN", 3, "three servers", "alice", NOW)
             finally:
                 store.close()
 
@@ -848,6 +884,8 @@ if backends.MARIADB_AVAILABLE:
             self.assertEqual(rc, 0, out)
             self.assertIn("Dry run", out)
             self.assertRegex(out, r"streams\s+1\b")
+            self.assertRegex(out, r"environment_flaky_defaults\s+1\b")
+            self.assertRegex(out, r"flaky_default_history\s+2\b")
             self.assert_mariadb_output(out)
             self.assertEqual(self.environments(), ["UNKNOWN", "linux-sim"])
 
@@ -863,3 +901,5 @@ if backends.MARIADB_AVAILABLE:
             self.addCleanup(store.close)
             self.assertEqual(store.list_streams(""), [])
             self.assertEqual(store.prune_empty_streams(), [])
+            self.assertEqual(
+                store.flaky_defaults_with_history(["UNKNOWN"]), ({}, {}))

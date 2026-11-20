@@ -90,6 +90,7 @@ _ROUTE_ACTIONS = frozenset([
     "environments",
     "executions",
     "expectation",
+    "flaky-default",
     "history",
     "product",
     "reset",

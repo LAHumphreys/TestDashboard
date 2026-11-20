@@ -367,7 +367,7 @@ Query parameters (all optional):
 |---|---|
 | `environment` | exact match |
 | `script` | exact match |
-| `result` | repeatable; invalid value → 400 |
+| `result` | repeatable; invalid value → 400. `FLAKING` matches the rows that read FLAKING (a `FAIL` of a test with a mark, or under its environment's default, that is under its cadence, with no live mute); `FAIL` matches every other `FAIL` row, a muted flaking one included. Once a stream has a flaky mark or an environment default, `result=FAIL` alone leaves its flaking rows out: give both (`result=FAIL&result=FLAKING`) for every failing row. Sorting stays on the wire value. See "Flaky marks" |
 | `q` | case-insensitive (ASCII) substring match on test name; `%`, `_` and `\` are literal |
 | `stale` | `1`/`true` — only tests whose latest run is older than the 36 h recency window ("not run") |
 | `retired` | `1`/`true` — include tests retired as no longer in the suite (hidden by default) |
@@ -460,7 +460,17 @@ waiting for its slowest piece (this is what the home screen does):
 - `parts=queue&queue=<kind>` — one queue's rows:
   `{"generated_at", "environment", "stale_before", "queue_cap",
   "kind", "queue": {"total": n, "tests": [QueueEntry, ...]}}`.
-  `kind` is a queue name below or `mine`.
+  `kind` is a queue name below, `mine` or `flaking`.
+- `parts=names` — the catalogue only: `environments`, `assignees`,
+  `products` (names), `assignment_streams`, `stale_before` and `flaky_marks`
+  (whether any flaky mark exists). Open Actions' first paint asks for this
+  and never for the full payload.
+- `parts=assigned_trend` — the per-night split of the failing tests by who
+  owns them now: `{"trend": {"days", "from", "to", "nights": [{"date",
+  "FAIL_ASSIGNED", "FAIL_MUTED", "FAIL_FLAKING"}]}}`, with the headline's
+  parameters and validation. The three are disjoint; `FAIL_FLAKING` is each
+  night as it stood then under today's marks, and 0 where there is no mark.
+  It is the only carrier of these keys.
 - No `parts` — the full payload, headline plus every queue, as before the
   split (plus `queue_totals`). `tests/test_api.py::SummaryPartsTest` pins the
   parts to the whole, so the two cannot drift.
@@ -524,6 +534,12 @@ Definitions (matching the analytics semantics above):
   not a client-side filter of `assigned`, which would hide a user's own tests
   behind other people's once the estate has more open items than the cap.
   Without an `assignee` parameter it is `{"total": 0, "tests": []}`.
+- `flaking` is the tests flaking now (see [Flaky marks](#flaky-marks-wp-44--apiflaky)):
+  marked, failing within their cadence, with no live mute. It is not a key of
+  `queue_totals` or of `queues` in the full payload; its count is
+  `status.flaking`, which its `total` equals. Its entries are QueueEntries
+  like any other queue's, each with `flaky` set, ordered nearest to counting
+  as a failure first (`cadence - streak` ascending).
 - `trend.nights` is zero-filled: every UTC calendar day in the window appears
   even when nothing ran. Its cost tracks the *width of the window*, not the
   size of the history behind it.
@@ -866,6 +882,151 @@ expires_at, muted_by, extensions, live, stream_id}`); test detail
 carries the stream's current `mute` and the `mute_history` across streams,
 newest first (`action` is `mute`, `extend` or `unmute`).
 
+A live mute also sets aside a test that has stopped running: it is left out
+of `status.not_run`, `by_environment[].not_run`, `queue_totals.not_run`, the
+`not_run` queue's rows and `GET /api/dashboard?stale=1` (and so out of a bulk
+assignment over that filter), and counted in `status.muted_not_run` and
+`by_environment[].muted_not_run` instead, so `not_run + muted_not_run` is
+always `total_tests - ran_recently`. It is still in the `muted` queue and in
+`total_tests`, and is back in every `not_run` figure the moment the mute
+expires. `stale=1` with `muted=true` therefore matches nothing.
+
+### Flaky marks (WP-44) — `/api/flaky/*`
+
+A person can **mark** a test as flaky, with a **cadence** of 2 to 10: "fail if
+the N most recent runs fail". While a marked test (or one under its environment's default, below) is
+failing and its last N runs have not all failed it is **flaking**: it is taken off the failing
+figures and out of New failures and Still failing, listed in Home's Flaking
+tab with its streak against its cadence, shown in its own muted colour as
+FLAKING, and named beside the failing figure it was taken off ("12 failing ·
+4 flaking"), never subtracted silently. Flaking is not a pass; the pass rate counts the failure
+as it always did. The night its Nth failure in a row arrives it is a new
+failure again and is listed in New failures; after that it is Still failing.
+A mark or a cadence change never makes a test new; only a run that started
+after it can. The wire result of a flaking test stays `FAIL`; only the
+displayed word changes.
+
+A mark is of the test in one environment: `(environment, script, test_name)`,
+the same key an assignment uses. It has no stream; the state is worked out per
+stream, from that stream's own runs. A live mute wins over a mark: the row
+reads its raw result and is counted as muted. A marked test that passes after
+a tolerated failure is in no "Newly fixed" figure; a pass after it had gone
+over its cadence is. The mark's owner is the person who made it; nobody else
+can be named. Unassigned flaking tests are left out of Open Actions; assigned
+ones stay and read FLAKING.
+
+`POST /api/flaky/bulk` — body `{"username", "reason", "cadence", "tests":
+[...]}` (`tests` as in `POST /api/comments/bulk`; a missing `stream_id` is
+mainline). `cadence` must be a whole number 2..10 (anything else, `null`,
+strings and booleans included, is a `400`). A test with no mark is marked, and
+`reason` is required for it; a test that is already marked has its cadence
+changed (the owner and reason are kept), and the same cadence again is
+`unchanged` and writes nothing. A request that mixes fresh marks with a blank
+reason is a `400` and writes nothing. The reason is posted as a comment on
+each freshly marked test, tagged with the stream the request names. An unknown
+or deactivated `username` is a `400`; a mark never creates its user. Naming
+`marked_by` or `assignee` in the body is a `400`. Each act is one transaction:
+the mark, its history row and its comment commit together or not at all.
+Response `{"marked": n, "changed": n, "unchanged": n, "unknown": n}`.
+
+`POST /api/flaky/unmark` — body `{"username", "tests": [...]}`. Response
+`{"unmarked": n}`. The assignment stays. Every act (mark, cadence change,
+unmark) is recorded in the mark's history.
+
+`GET /api/summary?parts=queue&queue=flaking` (with `stream`, `environment`
+and `product` as for any queue) — Home's Flaking tab: the tests flaking now,
+as a triage queue like New failures and Still failing. The response is the
+queue part's, and each entry is a QueueEntry key for key, so the page draws
+it with the same Output column and Review panel. An entry's `flaky.streak`
+against its `flaky.cadence` says how close it is to counting as a failure,
+and the entries arrive nearest first. `total` is the headline's
+`status.flaking` for the same scope; the entries are capped at `queue_cap`.
+`failing_since` and `last_pass_time` are null on these entries. The tab
+asks for it when it is opened and no first paint does. There is no
+`GET /api/flaky`: no request lists every mark. A marked test that is
+passing, or failing past its cadence, is known as marked by the `flaky` on
+its row wherever that row is listed.
+
+Elsewhere:
+
+- Every row of `GET /api/dashboard`, of every `/api/summary` queue and of
+  Open Actions carries `flaky`: `null`, or `{source, cadence, marked_by,
+  marked_at, reason, state, streak, runs}`. `source` is `"mark"`, or `"default"`
+  for a test judged by its environment's default, whose `cadence`, `marked_by`,
+  `marked_at` and `reason` are then the default's (its last act's user and
+  time); a test with no mark carries a default's `flaky` only while its latest
+  result is `FAIL`, and `null` otherwise. `state` is `passing`, `flaking` or
+  `failing`; `streak` is the consecutive failures ending at the latest run,
+  capped at the cadence; `runs` is how many runs the stream has of the test,
+  capped at the cadence, given only when the state is `failing`. Comparison
+  rows carry nothing. Test detail carries the same `flaky` for the stream and
+  `flaky_history`, newest first (`action` is `mark`, `cadence` or `unmark`).
+- `/api/summary` `status` gains `flaking` (the marked tests, and those under an
+  environment's default, that are failing under their cadence: the number
+  taken off the failing figures),
+  `flaking_new_failures`, `flaking_still_failing` and `flaky_total` (every
+  mark in scope; defaults are not counted in it) and `flaky_defaults` (how many
+  environments in scope have a default and a run on the stream); `by_environment[]`, `products[]` and
+  `top_failing_scripts[]` gain `flaking`; `/api/watch` environment and
+  product cards gain `flaking`. A test is counted once: muted, else flaking,
+  else assigned, else unassigned.
+- `GET /api/dashboard?open=1` (Open Actions' rows) leaves out the flaking
+  tests nobody is assigned to, in the rows, in `total` and in a bulk
+  assignment from the same filters. An assigned test is listed whatever its
+  state.
+- `result=FLAKING` on `GET /api/dashboard`, `parts=names` and `FAIL_FLAKING`
+  in `parts=assigned_trend` are described with those requests above.
+
+With no marks on a stream every read runs the statements it ran before, and
+the push path is the same with or without marks. A payload without these
+fields draws the same page as before.
+
+### A default flaky cadence for an environment — `PUT /api/environments/{environment}/flaky-default`
+
+An environment can carry a **default cadence** of 2 to 10. A test in that
+environment with no mark of its own is judged as if it were marked with that
+cadence: it counts as failing only once its N most recent runs have failed,
+and is flaking until then. A mark on the test wins over the default. The
+default covers mainline and every build of the environment. Only a `FAIL` is
+judged by it, and it appears as `flaky.source: "default"` on the row (see
+above). Setting one posts no comment.
+
+Body `{"username", "cadence", "reason"}`:
+
+- `cadence`: a whole number 2..10 sets or changes the default; `null` removes
+  it. A body with no `cadence` key is a `400`, so a client that forgot the
+  field cannot remove a default by omission. Anything else (out of range,
+  strings, booleans, fractions, lists) is a `400`.
+- `reason` is required for all three acts (a string, at most 500 characters
+  once trimmed): a missing, null or blank one, a non-string, or an overlong
+  one is a `400`.
+- `username` must be a known, active user; a missing, unknown or deactivated
+  one is a `400`. A default never creates its user.
+- An environment that has never reported a run and has no declaration is a
+  `404` (`unknown environment: <name>`). Only `PUT` is accepted.
+- A removal where there is no default, or the same cadence and reason again,
+  is not an error: it answers `unchanged` and writes nothing.
+
+Response `200`:
+
+```json
+{"environment": "linux-sim", "action": "set",
+ "flaky_default": {"cadence": 2, "set_by": "amy",
+                   "set_at": "2026-07-26T12:00:00.000000",
+                   "reason": "two servers; investigate failures on both"}}
+```
+
+`action` is `set` (there was none), `cadence` (the cadence moved; the new
+reason replaces the old), `reason` (same cadence, another reason), `clear`
+(`flaky_default` is then `null`) or `unchanged` (`flaky_default` is what is
+stored). Every act other than `unchanged` is one transaction with its history
+row.
+
+`GET /api/environments` gains two keys on each environment: `flaky_default`,
+`null` or `{cadence, set_by, set_at, reason}` (the last act's user and time),
+and `flaky_default_history`, the newest 20 acts, newest first, each `{id,
+action, cadence, reason, actor, acted_at}`. A `clear` row has `cadence: null`.
+
 ### PUT /api/tests/{env}/{script}/{test}/retired — approve a disappeared test
 
 A test that stops being reported shows up as "not run" forever. Retiring it is a
@@ -954,6 +1115,10 @@ functions. Exact semantics:
   - `flaky` — score >= threshold (default **0.2**)
   - `stable-fail` — not flaky and newest run is `FAIL`
   - `stable-pass` — otherwise
+
+  `flaky` here is the computed classification: a test that flips often, which
+  is how the board words it on screen. It is not the flaky **mark** a person
+  sets (see "Flaky marks" above).
 - **By day** (`by_day`): per calendar day within the window, the count of each
   result. Zero-filled between the first and last day with a run so gaps show,
   but not padded to the full 90 days. This is the "results over time" chart on

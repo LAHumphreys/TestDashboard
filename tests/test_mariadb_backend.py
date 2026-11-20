@@ -61,6 +61,53 @@ EXCLUDED_CLASSES = {
         "The delete itself runs against MariaDB in "
         "DeleteStreamEnvironmentTest's generated variant; which index "
         "MariaDB chooses for it has no automated pin here.",
+    "NoMarksAddsNothingTest":
+        "counts and reads statements with sqlite3's set_trace_callback "
+        "(WP-44): the instrument is SQLite's. The values the reads "
+        "return with the flaky tables present and empty are every "
+        "other generated class's, which run here on a schema carrying "
+        "them.",
+    "FlakyStatementsTest":
+        "counts and reads statements with sqlite3's set_trace_callback "
+        "(WP-44 item 6): the instrument is SQLite's. The values those "
+        "reads return are compared on MariaDB by "
+        "FlakyAgreesWithAnalyticsTest, PromotionTest and FixedRuleTest, "
+        "with 101 marked tests in one environment (decision 22), and "
+        "their plans by FlakyPlanTest.",
+    "MarksNoDefaultAddsNothingTest":
+        "counts and digests statements through sqlite3's connection and "
+        "trace (migration 13, NoMarksAddsNothingTest's marks twin): the "
+        "instrument is SQLite's. The values the reads return with marks "
+        "and no default are every other generated class's, which run "
+        "here.",
+    "DefaultStatementsTest":
+        "counts statements with sqlite3's set_trace_callback (migration "
+        "13, the default flaky cadence's cache guards): the instrument "
+        "is SQLite's. The values those reads return are compared on "
+        "MariaDB by DefaultEqualsMarksTest (the emulation as oracle), "
+        "DefaultPromotionTest, DefaultEdgesTest and DefaultQ2HeldTest, "
+        "and their plans by DefaultPlanTest.",
+    "DefaultTrendStatementsTest":
+        "counts statements with sqlite3's set_trace_callback (the per-day "
+        "chart's default read, flaky-default-r0 §2 B.5): the instrument "
+        "is SQLite's. The values those reads return are compared on "
+        "MariaDB by DefaultTrendTest (the pure rule as oracle), "
+        "DefaultTrendExampleTest and DefaultEqualsMarksTest, and the "
+        "memo's keys by TargetedInvalidationTest's "
+        "test_the_default_trend_is_kept_per_stream_and_environment.",
+    "NotRunMutedStatementsTest":
+        "counts and reads statements with sqlite3's set_trace_callback "
+        "(WP-44 item 20): the instrument is SQLite's. The values those "
+        "reads return, the expiry with no write included, are "
+        "NotRunMutedTest's and NotRunMutedApiTest's, which run here.",
+    "EnvironmentsListStatementsTest":
+        "counts GET /api/environments' statements with sqlite3's "
+        "set_trace_callback (migration 13, the default flaky cadence). "
+        "That the one statement it adds runs once on MariaDB, however "
+        "long the history, is FlakyDefaultHistoryReadTest's "
+        "test_one_statement_however_long_the_history, which counts the "
+        "server's own Questions here; the payload is "
+        "EnvironmentsListFlakyDefaultTest's, which runs here.",
     "TestEnvironmentListingCost":
         "counts sqlite page reads to pin a query-shape regression; "
         "the instrument is engine-specific even though the shape "
@@ -279,6 +326,79 @@ EXCLUDED_TESTS = {
     "SummaryAssignedSplitTest"
     ".test_the_part_is_one_read_of_runs_cold_none_warm":
         "counts statements with sqlite3's set_trace_callback (WP-43).",
+    "NamesPartTest.test_the_cold_count_is_pinned_and_warm_runs_no_more":
+        "counts statements with sqlite3's set_trace_callback (WP-44). "
+        "That the part runs no headline, trend or queue read is "
+        "test_no_headline_trend_or_queue_read_runs, which runs here.",
+    "FlakyCadenceTest.test_q2_costs_one_statement_per_hundred_tests":
+        "counts statements with sqlite3's set_trace_callback (WP-44). "
+        "That both a full statement and a second one execute on MariaDB "
+        "is test_q2_over_more_than_one_statement, which runs here "
+        "(decision 22).",
+    "FlakyDefaultHistoryReadTest"
+    ".test_each_history_member_is_a_range_of_its_index":
+        "reads the statement with sqlite3's set_trace_callback and "
+        "asserts SQLite's EXPLAIN QUERY PLAN (migration 13). The same "
+        "members are parenthesised on MariaDB, as Q2's are; that they "
+        "return the newest twenty there is "
+        "test_the_newest_twenty_newest_first_per_environment, which "
+        "runs here.",
+    "FlakyCadenceTest.test_the_marks_reads_are_driven_by_their_keys":
+        "reads statements with sqlite3's set_trace_callback and asserts "
+        "SQLite's EXPLAIN QUERY PLAN (WP-44). Q2's plan guard, "
+        "test_q2_is_a_runs_unique_range_on_both_backends, runs here.",
+    "FlakyBoardApiTest"
+    ".test_the_headline_pays_q1_qc_and_one_q2_cold_and_nothing_warm":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 6). The values the read returns are compared on MariaDB by "
+        "the rest of FlakyBoardApiTest.",
+    "FlakyBoardApiTest"
+    ".test_browse_pays_one_q2_for_its_page_and_its_count_nothing":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 6).",
+    "FlakyBoardApiTest.test_the_queue_part_costs":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 6).",
+    "FlakyBoardApiTest.test_the_full_payload_and_watch_pay_once":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 6).",
+    "FlakyPlanTest.test_the_trend_reaches_runs_from_each_mark":
+        "the per-day chart's marks-to-runs read (WP-44 item 8) has the "
+        "shape of WP-43's assignments-to-runs read: on CI's few-row runs "
+        "table MariaDB reasonably scans runs (1,621 rows here) where a "
+        "production table reads each mark's range, so its plan is taken "
+        "by hand on a production-scale copy in the measured pass, as "
+        "AssignedTrendTest's is (WP-43 decision 12). The SQLite plan is "
+        "pinned by the same test, which runs there.",
+    "FlakyPlanTest.test_the_default_trend_drives_from_the_fail_range":
+        "the per-day chart's default read (flaky-default-r0 §2 B.5 and "
+        "§3a) is planned by MariaDB from its estimates: "
+        "on CI's few-row runs table the covering range of "
+        "idx_runs_start_time_result need not be its choice, where at "
+        "production scale it is (range, Using index; eq_ref PRIMARY; a "
+        "DEPENDENT SUBQUERY ref on uq_runs_identity, on 12.3). That plan "
+        "is taken by hand with EXPLAIN on a production-scale copy, "
+        "10.3 included, as the marks' trend read's is. The SQLite "
+        "plan is pinned by the same test, which runs there; the values "
+        "are DefaultTrendTest's, which runs here.",
+    "FlakyBoardApiTest.test_the_filtered_reads_cost":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 8). The rows and totals those reads return are compared on "
+        "MariaDB by OpenActionsSetAsideTest and BrowseFlakingFilterTest, "
+        "with 101 marked tests (decision 22), and their plans by "
+        "FlakyPlanTest.",
+    "FlakyBoardApiTest.test_no_count_joins_the_marks_with_marks":
+        "reads statements with sqlite3's set_trace_callback (WP-44 item "
+        "8); the statement text is the same on both engines.",
+    "FlakyBoardApiTest.test_the_trend_part_costs":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 8). The values are FlakyTrendTest's, which runs here.",
+    "FlakyBoardApiTest.test_the_flaking_queue_costs":
+        "counts statements with sqlite3's set_trace_callback (WP-44 "
+        "item 14). The values are FlakingQueueTest's and "
+        "FlakingQueueAgreesWithHeadlineTest's, and the rows read's plan "
+        "FlakyPlanTest's, which run here; that the rows are read in two "
+        "statements at the cap is FlakingQueueTest's, by its own spy.",
     "TestBulkSetAssignee.test_empty_input_issues_no_writes":
         "counts queries via sqlite3's set_trace_callback.",
     "TestBulkSetAssigneeForTriples."

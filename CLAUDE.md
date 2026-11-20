@@ -24,6 +24,19 @@ gained or is missing. It is a tool with a purpose, reached for when needed; it
 is not the main driver of a developer's day, and no design decision may assume
 it is.
 
+**Triage is the morning touch point.** Home's Triage section is where a
+developer reviews the state of the tests each morning, and the board
+succeeds or fails by it: it carries no noise. A tab there is a queue of
+tests that need a look that day, drawn as its neighbours are, with the
+run's output and the review acts on every row. It is never a place to keep
+things only so that they can be found; that is what All tests and a test's
+own page are for. A mute sets a test aside whole while a product is sorted
+out; a flaky mark changes what counts as a failure for that test, which
+then sorts by its state as any test does. A design for a triage surface is
+compared with New failures and Still failing column by column and act by
+act, and every difference is put to the owner as a named decision before it
+is built.
+
 **Start every session by reading `docs/SESSION_HANDOVER.md`**: one screen of
 state, rewritten rather than appended. Then, as needed:
 

@@ -55,6 +55,10 @@ PING_IDLE_SECONDS = 60.0
 #: Rides in init_command so a driver-level reconnect re-applies it.
 _INIT_COMMAND = "SET SESSION innodb_lock_wait_timeout=10"
 
+#: Server errors after which the whole transaction may simply be run
+#: again (``MariaDBBackend.restartable``): ER_CHECKREAD, ER_LOCK_DEADLOCK.
+_RESTARTABLE_ERRNOS = (1020, 1213)
+
 #: MariaDB spells "no limit" as the largest possible row count; -1 is
 #: a syntax error there (the SQLite spelling lives in _SqliteBackend).
 _LIMIT_ALL_OFFSET = " LIMIT 18446744073709551615 OFFSET ?"
@@ -69,6 +73,16 @@ _LIMIT_ALL_OFFSET = " LIMIT 18446744073709551615 OFFSET ?"
 _LIKE_TEST_NAME = (
     "lr.test_name COLLATE utf8mb4_general_ci LIKE ? ESCAPE '\\\\'"
 )
+
+#: A ``UNION ALL`` member with its own ORDER BY and LIMIT (WP-44's
+#: ``Storage.cadence_runs``), parenthesised: the same rows as SQLite's
+#: subquery spelling, 1.5 to 2 ms cheaper per statement on MariaDB
+#: (measured on 12.3, design doc section 3c). The index is unused here.
+_LIMITED_UNION_MEMBER = "({0})"
+
+#: The right-hand side of a row-value ``IN`` over a bound list (WP-44
+#: item 6): the tuples themselves, where SQLite needs a VALUES clause.
+_ROW_VALUE_LIST = "{0}"
 
 
 def _driver() -> Any:
@@ -180,6 +194,27 @@ class MariaDBBackend(object):
 
     like_test_name = _LIKE_TEST_NAME
     limit_all_offset = _LIMIT_ALL_OFFSET
+    limited_union_member = _LIMITED_UNION_MEMBER
+
+    #: A read that locks the row it finds until the transaction ends
+    #: (``Storage.set_flaky_default``): ``START TRANSACTION`` takes no
+    #: lock, so a plain read can be stale by the time the write lands.
+    locking_read = " FOR UPDATE"
+    row_value_list = _ROW_VALUE_LIST
+
+    #: WP-44 item 16: ``Storage._rows_by_key`` keeps the row-value
+    #: ``IN`` here, which 10.3 and 12.3 read by the whole primary key;
+    #: SQLite drives the read from the keys instead.
+    rows_by_key_from_keys = False
+
+    #: WP-44 item 8: Open Actions' unassigned flaking tests are bound as
+    #: a gated row-value term on the rows and their count here; the keys
+    #: form brought nothing on this engine (design §3b).
+    set_aside_by_keys = False
+
+    #: No ceiling: the driver interpolates the values client-side, so a
+    #: bound list is never refused for its length (design §3b).
+    max_bound_parameters = None  # type: Optional[int]
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -188,6 +223,16 @@ class MariaDBBackend(object):
         self.integrity_error = driver.IntegrityError
         self._driver_module = driver
         self._sql_cache = {}  # type: Dict[str, str]
+
+    def restartable(self, exc: BaseException) -> bool:
+        """True for the two errors InnoDB answers with "try restarting
+        transaction" (``Storage.set_flaky_default`` starts again on
+        them): 1020, a locking read of a row another transaction changed
+        since this one's snapshot (``innodb_snapshot_isolation``, on by
+        default since 11.6; 10.3 reads the new row instead), and 1213,
+        a deadlock this transaction was chosen to lose."""
+        return (isinstance(exc, self._driver_module.OperationalError)
+                and bool(exc.args) and exc.args[0] in _RESTARTABLE_ERRNOS)
 
     # ------------------------------------------------------------------
     # Connections

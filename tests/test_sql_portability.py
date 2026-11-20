@@ -44,8 +44,10 @@ EXPECTED = {
     "INSERT OR REPLACE": 2,
     # SQLite spelling; MariaDB wants AUTO_INCREMENT. WP-21 adds one:
     # streams.id (migration 9). WP-40 adds one more:
-    # mute_history.id (migration 11).
-    "AUTOINCREMENT": 5,
+    # mute_history.id (migration 11). WP-44 adds one more:
+    # flaky_mark_history.id (migration 12), and one more again:
+    # flaky_default_history.id (migration 13).
+    "AUTOINCREMENT": 7,
     # Date functions: removed by migration 3 and must stay removed.
     "julianday": 0,
     "strftime": 0,

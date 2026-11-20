@@ -25,6 +25,7 @@
       <a href="timeline.html">Timeline</a>
       <a href="watch.html">Watch</a>
       <a href="metrics.html">Metrics</a>
+      <a href="admin.html">Admin</a>
       <a id="nav-whatsnew" href="whatsnew.html" aria-current="page">What's new</a>
     </nav>
     <div id="user-widget" class="user-widget"></div>
@@ -43,6 +44,45 @@
          invisible to all three, so
          tests/test_frontend_calls.py::DropDateTest fails the build if one
          is missing or disagrees with the heading a human reads. -->
+
+    <section class="release" data-drop-date="2026-11-20">
+      <div class="section-head">
+        <h2 class="eyebrow">20 November 2026</h2>
+        <span class="muted">New: flaky tests. Mark one test, or set a default for an environment, and the board tells flaking from failing</span>
+      </div>
+
+      <h3>What's new</h3>
+      <ul>
+        <li><strong>Mark a test as flaky.</strong> Tick its rows, or use the
+          top of the test&rsquo;s own page, and give a reason and how many
+          failures in a row count as failing (2 to 10). The mark covers
+          mainline and every build until someone chooses
+          <strong>Unmark</strong>; <strong>Set cadence</strong> changes the
+          number.</li>
+        <li><strong>Flaking is its own state.</strong> A flaky test that
+          fails fewer times in a row than its cadence reads
+          <em>FLAKING</em>, in its own colour: on its own Triage tab, in
+          the charts, beside the failing figures it is taken out
+          of (&ldquo;+4 flaking&rdquo;) and under a FLAKING filter in All
+          tests. It still counts against the pass rate. The night it fails
+          past its cadence it is a new failure, red again.</li>
+        <li><strong>A flaky default, for an environment that needs
+          one.</strong> Some environments are noisier than others. Where a
+          single failure in an environment is usually not the test, give
+          that environment a default on the new Admin page (&ldquo;fail
+          after 2 in a row&rdquo;) instead of marking its tests one by one.
+          Every test there with no mark of its own is then flaky at that
+          cadence; other environments are not affected. It reads a
+          test&rsquo;s most recent runs, not one night&rsquo;s, so one
+          failure on each of two nights counts. Every change takes a reason
+          and is kept under <strong>History</strong>.</li>
+        <li><strong>Also.</strong> Manage people and Environment
+          expectations have moved from the foot of Open Actions to
+          <strong>Admin</strong>, in the navigation bar. Muting a test that
+          has stopped running takes it off Not run. Failing runs per day now
+          draws once, a moment after the rest of the page.</li>
+      </ul>
+    </section>
 
     <section class="release" data-drop-date="2026-10-13">
       <div class="section-head">
@@ -524,7 +564,7 @@
           queue no longer means losing it.</li>
         <li><strong>Every failing row says when it last passed</strong> — and
           whether it broke or is just unreliable: <em>"failed every one of the
-          last 20 runs"</em> versus <em>"flaky — flips about 1 run in 3"</em>.
+          last 20 runs"</em> versus <em>"flips about 1 run in 3"</em>.
           Those need opposite responses and used to look identical. The open
           panel shows the last 20 runs as a strip.</li>
         <li><strong>Columns sort.</strong> Sorting covers the whole queue, not

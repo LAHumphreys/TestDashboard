@@ -49,9 +49,11 @@ import os
 import sqlite3
 import threading
 import time
+import types
 import zlib
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     NamedTuple,
@@ -70,6 +72,7 @@ __all__ = [
     "describe_open_error",
     "DASHBOARD_SORTS",
     "QUEUE_KINDS",
+    "FLAKING_QUEUE",
     "COMPARE_CATEGORIES",
     "TestSummaryRow",
     "TestStatusRow",
@@ -144,6 +147,27 @@ _SUMMARY_CACHE_MAX_ENTRIES = 128
 #: several thousand simultaneously-failing tests before the same
 #: full-clear-and-refill policy kicks in.
 _STREAK_CACHE_MAX_ENTRIES = 4096
+
+#: Cap on Q2's answers (``Storage._cadence_runs_cache``, WP-44 item 6):
+#: one entry per marked test read (a marked FAIL/FAIL test, or a "Newly
+#: fixed" candidate, per stream read; 83 on mainline at 1,000 marks on
+#: the production-scale seed), cleared in full when full, the streak
+#: memo's policy and size.
+_CADENCE_RUNS_CACHE_MAX_ENTRIES = 4096
+
+#: The time a Q2 answer for a test judged by its environment's default is
+#: stored at (design flaky-default-r0 decision 5): later than any clock,
+#: so the age check (now minus stored, against the memo's minute) never
+#: expires it. It goes when the environment is next pushed into, or by a
+#: delete, or with the cache's full clear at its cap.
+#:
+#: What drops a held answer: a push through THIS process into its
+#: (stream, environment), a stream or environment delete or a prune
+#: (each clears the cache whole), the full clear at the cap. What does
+#: not: another process writing the same database (an offline tool, a
+#: second server), which only the memo's minute used to bound; that is
+#: the existing single-writer assumption, made explicit here.
+_HELD_FOREVER = float("inf")
 
 #: Connections are thread-local and the page cache is per connection, so
 #: a cache budget has to be divided by the number of threads that might
@@ -913,12 +937,167 @@ MIGRATIONS = [
             "ON mute_history (environment, script, test_name, id)",
         ],
     ),
+    (
+        12,
+        [
+            # WP-44: the flaky mark. A named user accepts a test as
+            # flaky with a cadence N (2..10): the test counts as failing
+            # only once its N most recent runs on a stream have all
+            # failed. Keyed by the TRIPLE, like an assignment: one mark
+            # covers the test in its environment on mainline and on
+            # every build, and each stream judges the cadence on its
+            # own runs at read time (nothing is stored per stream and
+            # nothing is added to the push path). It never expires.
+            #
+            # `test_flaky_marks` is the current mark; `flaky_mark_history`
+            # one row per act (mark / cadence / unmark).
+            #
+            # Creates only; touches no existing table — so on MariaDB
+            # (tools/upgrade_mariadb_schema.py's ledger, step 11->12,
+            # alters=()) the server may keep running through it.
+            # Takes 12 from WP-15's parked reservation, which moves to
+            # 13 — the seventh time (UPGRADE_PLAN.md §1).
+            """
+            CREATE TABLE test_flaky_marks (
+                environment TEXT NOT NULL,
+                script TEXT NOT NULL,
+                test_name TEXT NOT NULL,
+                cadence INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                marked_by TEXT NOT NULL REFERENCES users(username),
+                marked_at TEXT NOT NULL,
+                PRIMARY KEY (environment, script, test_name)
+            )
+            """,
+            """
+            CREATE TABLE flaky_mark_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                environment TEXT NOT NULL,
+                script TEXT NOT NULL,
+                test_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                cadence INTEGER,
+                reason TEXT,
+                actor TEXT NOT NULL REFERENCES users(username),
+                acted_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX idx_flaky_mark_history_triple "
+            "ON flaky_mark_history (environment, script, test_name, id)",
+        ],
+    ),
+    (
+        13,
+        [
+            # An environment's default flaky cadence (design
+            # flaky-default-r0 §2 B.2): a standing cadence N (2..10) for
+            # every test in the environment that has no mark of its own.
+            # Keyed by the environment's NAME: a renamed environment
+            # starts with none, and a dropped one takes its default and
+            # history with it (_ENVIRONMENT_TABLES).
+            #
+            # `environment_flaky_defaults` is the current default, one row
+            # per environment: `set_by`/`set_at` are the last act's, and
+            # `cadence_at` moves only when the cadence does (a set or a
+            # cadence change, never a reason edit), so a later reader can
+            # tell which runs predate the cadence. `flaky_default_history`
+            # is one row per act (set / cadence / reason / clear); a
+            # reason is required for every act, a removal included.
+            #
+            # Creates only; touches no existing table, so on MariaDB
+            # (tools/upgrade_mariadb_schema.py's ledger, step 12->13,
+            # alters=()) the server may keep running through it. Not a
+            # column on environment_expectations or environment_products:
+            # their rows live only while their declaration does, and a
+            # column would be an ALTER.
+            """
+            CREATE TABLE environment_flaky_defaults (
+                environment TEXT NOT NULL PRIMARY KEY,
+                cadence INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                set_by TEXT NOT NULL REFERENCES users(username),
+                set_at TEXT NOT NULL,
+                cadence_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE flaky_default_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                environment TEXT NOT NULL,
+                action TEXT NOT NULL,
+                cadence INTEGER,
+                reason TEXT NOT NULL,
+                actor TEXT NOT NULL REFERENCES users(username),
+                acted_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX idx_flaky_default_history_env "
+            "ON flaky_default_history (environment, id)",
+        ],
+    ),
 ]  # type: List[Tuple[int, List[str]]]
 
 #: WP-40: the longest a mute can run, in HOURS (seven days), on any
 #: stream. Refused
 #: above this by the API AND by storage (:meth:`Storage.mute_tests`).
 MUTE_MAX_HOURS = 168
+
+#: WP-44: the cadence a flaky mark may carry, inclusive. A mark of N
+#: means "count the test as failing only once its N most recent runs on
+#: a stream have all failed". Refused outside this by the API and by
+#: storage (:meth:`Storage.mark_flaky`); :func:`analytics.flaky_state`
+#: applies it.
+FLAKY_CADENCE_MIN = 2
+FLAKY_CADENCE_MAX = 10
+
+#: How many of an environment's default acts ``GET /api/environments``
+#: carries, newest first (design flaky-default-r0 §2 B.3, decision 8).
+FLAKY_DEFAULT_HISTORY_SHOWN = 20
+
+#: The actions a ``flaky_default_history`` row can record, and the one
+#: answer of :meth:`Storage.set_flaky_default` that records nothing.
+FLAKY_DEFAULT_SET = "set"
+FLAKY_DEFAULT_CADENCE = "cadence"
+FLAKY_DEFAULT_REASON = "reason"
+FLAKY_DEFAULT_CLEAR = "clear"
+FLAKY_DEFAULT_UNCHANGED = "unchanged"
+
+#: The longest reason a default may carry, in characters after trimming.
+#: A default's reason is repeated on every failing row of its
+#: environment that it judges, so it is a sentence, not a comment.
+FLAKY_DEFAULT_REASON_MAX = 500
+
+#: How many times :meth:`Storage.set_flaky_default` starts again when
+#: another writer moved the row under it. Two writers need two; a third
+#: is for three at once.
+_FLAKY_DEFAULT_ATTEMPTS = 3
+
+
+class FlakyDefaultRefused(ValueError):
+    """A default act refused for something the caller sent or named (the
+    API's 400). Any other error out of :meth:`Storage.set_flaky_default`
+    is the server's own."""
+
+
+def flaky_default_reason(raw: Any) -> str:
+    """The rule for a default's reason, in one place (decision 7): it is
+    required to set, change and remove a default, a string, and at most
+    :data:`FLAKY_DEFAULT_REASON_MAX` characters once trimmed. Returns it
+    trimmed; refuses with :class:`FlakyDefaultRefused`. The API applies
+    it before anything is read, and storage again for its other
+    callers."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raise FlakyDefaultRefused(
+            "reason: required, to set, change or remove a default")
+    if not isinstance(raw, str):
+        raise FlakyDefaultRefused(
+            "reason: must be a string, got {0}".format(type(raw).__name__))
+    reason = raw.strip()
+    if len(reason) > FLAKY_DEFAULT_REASON_MAX:
+        raise FlakyDefaultRefused(
+            "reason: at most {0} characters, got {1}".format(
+                FLAKY_DEFAULT_REASON_MAX, len(reason)))
+    return reason
 
 #: Prefix marking a migration step that runs Python instead of SQL.
 #:
@@ -1310,6 +1489,10 @@ class TestSummaryRow(NamedTuple):
     #: expired (the reader compares ``expires_at`` with its own now);
     #: None when there has never been one, or it was unmuted.
     mute: Optional["Mute"]
+    #: WP-44 item 6: the test's flaky mark and its state on this
+    #: stream; None for an unmarked test, and on every row of a read
+    #: that was not asked for marks (no mark exists anywhere).
+    flaky: Optional["FlakyRow"]
 
 
 class TestStatusRow(NamedTuple):
@@ -1337,6 +1520,8 @@ class TestStatusRow(NamedTuple):
     latest_comment: Optional["LatestComment"]
     mute: Optional["Mute"]
     prev_result: Optional[Result]
+    #: WP-44 item 6 — see :attr:`TestSummaryRow.flaky`.
+    flaky: Optional["FlakyRow"]
 
 
 class Mute(NamedTuple):
@@ -1397,6 +1582,314 @@ class ExpiringMute(NamedTuple):
     stream_name: str
     result: Result
     assignee: Optional[str]
+
+
+class FlakyMark(NamedTuple):
+    """WP-44: a test's current flaky mark. One per TRIPLE: it covers the
+    test on mainline and on every build, and each stream judges the
+    cadence on its own runs (``analytics.flaky_state``)."""
+
+    environment: str
+    script: str
+    test_name: str
+    #: N, 2..10: failing only once the N most recent runs all FAILed.
+    cadence: int
+    reason: str
+    #: Who accepted the flakiness. A record, not an assignment.
+    marked_by: str
+    marked_at: datetime.datetime
+
+
+class FlakyMarkAct(NamedTuple):
+    """One row of ``flaky_mark_history``: who did what, when."""
+
+    id: int
+    environment: str
+    script: str
+    test_name: str
+    #: ``mark``, ``cadence`` or ``unmark``.
+    action: str
+    #: The cadence the act set; for ``unmark``, the one it removed.
+    cadence: Optional[int]
+    reason: Optional[str]
+    actor: str
+    acted_at: datetime.datetime
+
+
+class FlakyMarkResult(NamedTuple):
+    """What :meth:`Storage.mark_flaky` did with a selection."""
+
+    #: Tests marked afresh.
+    marked: int
+    #: Tests already marked at another cadence, moved to this one.
+    changed: int
+    #: Tests already marked at this cadence: nothing written.
+    unchanged: int
+    #: Requested tests with no ``latest_runs`` row on any stream —
+    #: skipped, never a hard failure (a stale page).
+    unknown: int
+
+
+class FlakyDefault(NamedTuple):
+    """An environment's default flaky cadence (migration 13): the
+    cadence every test in it that has no mark of its own is judged at."""
+
+    environment: str
+    #: N, 2..10, as a mark's.
+    cadence: int
+    reason: str
+    #: Who made the last act on it, and when.
+    set_by: str
+    set_at: datetime.datetime
+    #: When the cadence last moved (a set or a cadence change; a reason
+    #: edit leaves it).
+    cadence_at: datetime.datetime
+
+
+class FlakyDefaultAct(NamedTuple):
+    """One row of ``flaky_default_history``: who did what, when, in the
+    mark history's fields."""
+
+    id: int
+    environment: str
+    #: ``set``, ``cadence``, ``reason`` or ``clear``.
+    action: str
+    #: The cadence the act left; None for ``clear``.
+    cadence: Optional[int]
+    reason: str
+    actor: str
+    acted_at: datetime.datetime
+
+
+class FlakyDefaultChange(NamedTuple):
+    """What :meth:`Storage.set_flaky_default` did."""
+
+    #: One of the act's ``action`` values, or ``unchanged`` (nothing
+    #: written).
+    action: str
+    #: The default as it stands after the act; None when there is none.
+    flaky_default: Optional[FlakyDefault]
+
+
+class TestActs(NamedTuple):
+    """What the test page shows of a test's human acts beyond its
+    comments and assignee, read in ONE statement
+    (:meth:`Storage.test_acts`): every mute act on any stream, the
+    current flaky mark and every act on it, each list newest first,
+    and its environment's default flaky cadence (migration 13), which
+    judges the test when it has no mark of its own."""
+
+    mute_history: List[MuteAct]
+    flaky_mark: Optional[FlakyMark]
+    flaky_history: List[FlakyMarkAct]
+    flaky_default: Optional[FlakyDefault]
+
+
+#: The three states a marked test can be in on a stream (WP-44, design
+#: §2 B.1). ``analytics.flaky_state`` is the one rule that decides them;
+#: they live here, beside the types that carry them, because this module
+#: cannot import analytics at load (analytics imports it).
+FLAKY_PASSING = "passing"
+FLAKY_FLAKING = "flaking"
+FLAKY_FAILING = "failing"
+
+
+class FlakyState(NamedTuple):
+    """A marked test's state on one stream (WP-44, design §2 B.1).
+
+    ``streak`` is the consecutive FAILs ending at the latest run, capped
+    at the cadence. ``runs`` is how many runs the stream has of the
+    test, capped at the cadence, and is given only when ``state`` is
+    ``failing`` (the one place the page reads it: "every run here has
+    failed, 2 of 2"); ``None`` otherwise.
+    """
+
+    state: str
+    streak: int
+    runs: Optional[int]
+
+
+#: Where a test's cadence comes from (design flaky-default-r0 §2 B.1): its
+#: own mark, or, with none, its environment's default. The wire's
+#: ``flaky.source``.
+FLAKY_SOURCE_MARK = "mark"
+FLAKY_SOURCE_DEFAULT = "default"
+
+
+class FlakyRow(NamedTuple):
+    """WP-44 item 6: what a listed row says of its flaky mark: the mark,
+    and its state on the row's stream (``None`` only for a test with no
+    run there, which a row never is).
+
+    Migration 13: *source* says whether *mark* is the test's own mark or
+    its environment's default, read as a mark (the default's cadence,
+    reason, ``set_by`` as ``marked_by`` and ``set_at`` as
+    ``marked_at``). A default's is given only on a FAIL row."""
+
+    mark: FlakyMark
+    state: Optional[FlakyState]
+    source: str
+
+
+#: The three ways a marked test moves a count (WP-44 item 6, design §1
+#: "Counted once" and "Going over the cadence", decision 3).
+#: ``flaking``: F, a tolerated failure, set aside from the failing
+#: figures. ``promoted``: P, over its cadence on this run and not on the
+#: one before, a New failure tonight instead of Still failing.
+#: ``tolerated``: a pass after a tolerated failure, in no Fixed figure.
+FLAKY_ROLE_FLAKING = "flaking"
+FLAKY_ROLE_PROMOTED = "promoted"
+FLAKY_ROLE_TOLERATED = "tolerated"
+
+
+class FlakyCount(NamedTuple):
+    """One marked test that moves a count, unmuted and unretired (a
+    live mute wins over the mark; a retired test is in no count)."""
+
+    environment: str
+    script: str
+    test_name: str
+    #: One of the ``FLAKY_ROLE_*`` values.
+    role: str
+    #: For ``flaking``: its previous result was a FAIL, so it leaves
+    #: Still failing; otherwise it leaves New failures.
+    prev_fail: bool
+    #: It has a current assignee (the charts' split).
+    assigned: bool
+
+
+class FlakyView(NamedTuple):
+    """WP-44 item 6: a stream's marked tests in one scope, as the counts
+    and the lists need them (:meth:`Storage.flaky_view`)."""
+
+    #: The tests that move a count, in scope.
+    counted: List[FlakyCount]
+    #: ``status.flaky_total``: every un-retired mark in scope whose test
+    #: has a run on the stream (0 unless the marks were asked for).
+    marks: int
+    #: The state of every un-muted, un-retired marked test in scope whose
+    #: latest result is FAIL, by triple.
+    states: Dict[Tuple[str, str, str], FlakyState]
+
+
+class _FlakyFailingRow(NamedTuple):
+    """One row of Q1: a marked test whose latest result on the stream is
+    FAIL, with what its state and its counting need."""
+
+    environment: str
+    script: str
+    test_name: str
+    cadence: int
+    prev_result: Optional[Result]
+    #: ISO text, as stored: Q2's upper bound and its cache key.
+    start_time: str
+    mute_expires_at: Optional[str]
+    retired: bool
+    assignee: Optional[str]
+    #: When the cadence in force was set (the mark's newest act), ISO
+    #: text: a test goes over its cadence on a RUN, so a latest run
+    #: older than the cadence cannot be the night it went over. For a
+    #: test judged by its environment's default, the default's
+    #: ``cadence_at``.
+    cadence_set_at: Optional[str]
+    #: Judged by its environment's default (migration 13), not a mark.
+    default: bool
+
+
+class _FlakyFailing(NamedTuple):
+    """The ``flaky_states`` memo entry of one (stream, environment): Q1's
+    rows, the newest N+1 results Q2 has read for them so far, and each
+    row's state and whether it went over on its latest run, decided once
+    (``Storage._flaky_decide``) for every read the entry serves.
+
+    Migration 13: a defaulted FAIL-after-FAIL row at a default of 2 is
+    decided by its pair on a rows path, which reads no promotion
+    (design flaky-default-r0 §3a, L): ``decided`` then holds ``(state,
+    None)``, "went over" not known, and a count path decides it again.
+    *third* is whether the entry was read with the third run of each
+    such row (Q1's run-3 column, held in ``runs``): a count path reads
+    the entry again with it when it was not."""
+
+    rows: Tuple[_FlakyFailingRow, ...]
+    runs: Dict[Tuple[str, str, str], Tuple[Result, ...]]
+    decided: Dict[Tuple[str, str, str], Tuple[FlakyState, Optional[bool]]]
+    third: bool
+
+
+class _FlakyCandidate(NamedTuple):
+    """One "Newly fixed" candidate of Qc (decision 3): a marked,
+    un-retired test whose latest result is not FAIL and whose previous
+    one is."""
+
+    environment: str
+    script: str
+    test_name: str
+    cadence: int
+    start_time: str
+    mute_expires_at: Optional[str]
+    #: Judged by its environment's default (migration 13), not a mark.
+    default: bool
+
+
+class _FlakyMarked(NamedTuple):
+    """Qc's memo entry, one per stream: un-retired marks with a run on
+    the stream, per environment, the fix candidates, and the newest N+1
+    results Q2 has read for them."""
+
+    marks: Dict[str, int]
+    candidates: Tuple[_FlakyCandidate, ...]
+    runs: Dict[Tuple[str, str, str], Tuple[Result, ...]]
+    #: Each candidate's "is this pass a real fix", decided once.
+    fixes: Dict[Tuple[str, str, str], bool]
+
+
+class _SetAside(NamedTuple):
+    """WP-44 item 8 (design §2 B.3(b), (c)): what a list read leaves out
+    of its FAIL rows for the mark, from the ``flaky_states`` memo, scoped
+    to the request's environments and script.
+
+    *keep* is the browse Result filter's mode: True keeps only F among
+    the FAIL rows (``result=FLAKING``), False leaves F out (``result=FAIL``
+    alone), None does neither. *unowned* is X, Open Actions' set-aside:
+    F's members with no assignee, not retired. *states* is the state of
+    every marked FAIL test in scope, for the page's rows.
+
+    Migration 13 (design flaky-default-r0 §2 B.1, §3a shape 3): *flaking*
+    and *unowned* hold every member, a test judged by its environment's
+    default included (the keys form drops them in Python). The bound
+    form binds F by key only for *listed* (F's marked members and a
+    default's FAIL-after-FAIL flaking at 3 to 10); the rest, every FAIL
+    after a non-FAIL in *default_envs*, is a predicate over ``lr``, less
+    *default_except* (the tests there under a live mute, which the
+    predicate would otherwise take in). *unowned_listed* is X's members
+    the predicate does not take in: where it is shorter than *unowned*,
+    the read takes the keys form (``Storage._set_aside_by_keys``), so X
+    is bound only as a whole list. With no default the predicate fields
+    are empty and the listed sets are the whole ones."""
+
+    keep: Optional[bool]
+    flaking: Tuple[Tuple[str, str, str], ...]
+    unowned: Tuple[Tuple[str, str, str], ...]
+    states: Dict[Tuple[str, str, str], FlakyState]
+    listed: Tuple[Tuple[str, str, str], ...]
+    unowned_listed: Tuple[Tuple[str, str, str], ...]
+    default_envs: Tuple[str, ...]
+    default_except: Tuple[Tuple[str, str, str], ...]
+
+
+class DailyFlakingFailures(NamedTuple):
+    """WP-44 item 8: of one UTC day's FAIL runs, how many were a marked
+    test's tolerated failure as it stood that night, under today's marks
+    and with no live mute now (``flaking``), and how many of those belong
+    to a test with an assignee now (``assigned``, taken off the day's
+    ``FAIL_ASSIGNED``: counted once). See
+    :meth:`Storage.daily_flaking_failures`, and for the same figures
+    under an environment's default (design flaky-default-r0 §2 B.5),
+    :meth:`Storage.daily_default_flaking_failures`."""
+
+    day: datetime.date
+    flaking: int
+    assigned: int
 
 
 class DailyResultCount(NamedTuple):
@@ -1499,6 +1992,9 @@ class ScriptFailures(NamedTuple):
     script: str
     failing: int
     muted: int
+    #: WP-44 item 6: the failing tests that are flaking (marked, under
+    #: their cadence, no live mute), set aside from ``failing``.
+    flaking: int
 
 
 class FailureStreak(NamedTuple):
@@ -1881,6 +2377,14 @@ _ENVIRONMENT_TABLES = (
     "test_retirements",
     "test_mutes",
     "mute_history",
+    # WP-44: a dropped environment takes its marks and their history
+    # with it (decision 11); retiring a test or deleting a build does not.
+    "test_flaky_marks",
+    "flaky_mark_history",
+    # Migration 13: so does its default flaky cadence and every act on
+    # it (decision 13 of flaky-default-r0); a renamed one starts with none.
+    "environment_flaky_defaults",
+    "flaky_default_history",
     "environment_expectations",
     "environment_products",
     "activity_hours",
@@ -1905,6 +2409,16 @@ QUEUE_KINDS = (
     "not_run",
     "assigned",
 )
+
+#: WP-44 item 14 (design §14): the Flaking tab's queue, the tests flaking
+#: now (:meth:`Storage.flaky_view`'s ``flaking`` entries in scope). A
+#: VIRTUAL kind, as the API's ``mine`` is: :meth:`Storage.status_queue`
+#: and :meth:`Storage.status_queue_count_and_bits` take it, but it is not
+#: in :data:`QUEUE_KINDS`, so no ``queue_totals`` figure, no unsliced
+#: payload and no grouped count carries it. Its set is the view's, never
+#: a predicate over ``latest_runs``: there is no entry for it in
+#: ``_QUEUE_PREDICATES``.
+FLAKING_QUEUE = "flaking"
 
 #: WP-40: the row's own stream's current mute, reached by
 #: its primary key — one seek per row, on a table of human-rate size.
@@ -1977,6 +2491,22 @@ _QUEUE_PREDICATES = {
     )
     for kind, sql in _QUEUE_PREDICATES.items()
 }
+
+
+def _mute_live(expires_at: Optional[str], at_iso: str) -> bool:
+    """:data:`_MUTE_LIVE` over a row already read: live iff
+    ``expires_at > now``, both ISO text, as the SQL compares them."""
+    return expires_at is not None and expires_at > at_iso
+
+
+def _flaky_rules() -> types.ModuleType:
+    """``testboard.analytics``, home of the flaky rule (``flaky_state``
+    and its two siblings), imported when first needed rather than at
+    load: analytics imports this module for its types, so the reverse
+    import cannot be at the top. One rule, applied here and on the test
+    page alike (WP-44 item 6)."""
+    from testboard import analytics
+    return analytics
 
 
 def _escape_like(text: str) -> str:
@@ -2150,28 +2680,28 @@ def _latest_comment_from(row: Sequence[Any]) -> Optional[LatestComment]:
     )
 
 
-def _summary_row_from(
-    row: Sequence[Any], latest_comment: Optional[LatestComment] = None
-) -> TestSummaryRow:
-    """Convert a row in ``Storage._STATUS_COLUMNS`` order to a TestSummaryRow."""
-    return TestSummaryRow(
-        environment=row[0],
-        script=row[1],
-        test_name=row[2],
-        run_id=int(row[3]),
-        result=Result(row[4]),
-        start_time=model.parse_iso(row[5]),
-        end_time=model.parse_iso(row[6]),
-        source_link=row[7],
-        known_failure_reason=row[8],
-        assignee=row[9],
-        assignment_stream_id=(
-            None if row[10] is None else int(row[10])
-        ),
-        retired_at=None if row[11] is None else model.parse_iso(row[11]),
-        retired_by=row[12],
-        latest_comment=latest_comment,
-        mute=(
+def _row_fields(
+    row: Sequence[Any], latest_comment: Optional[LatestComment],
+) -> Tuple[Any, ...]:
+    """The fields a TestSummaryRow and a TestStatusRow share, in their
+    order, from a row in ``Storage._STATUS_COLUMNS`` order: each row
+    type is built once from these, with its own fields after them."""
+    return (
+        row[0],
+        row[1],
+        row[2],
+        int(row[3]),
+        Result(row[4]),
+        model.parse_iso(row[5]),
+        model.parse_iso(row[6]),
+        row[7],
+        row[8],
+        row[9],
+        None if row[10] is None else int(row[10]),
+        None if row[11] is None else model.parse_iso(row[11]),
+        row[12],
+        latest_comment,
+        (
             None if row[15] is None else Mute(
                 stream_id=int(row[18]),
                 environment=row[0], script=row[1], test_name=row[2],
@@ -2183,6 +2713,14 @@ def _summary_row_from(
             )
         ),
     )
+
+
+def _summary_row_from(
+    row: Sequence[Any], latest_comment: Optional[LatestComment] = None,
+    flaky: Optional["FlakyRow"] = None,
+) -> TestSummaryRow:
+    """Convert a row in ``Storage._STATUS_COLUMNS`` order to a TestSummaryRow."""
+    return TestSummaryRow(*(_row_fields(row, latest_comment) + (flaky,)))
 
 
 class _SqliteBackend(object):
@@ -2210,6 +2748,13 @@ class _SqliteBackend(object):
     #: Raised on a unique-key race; ensure_user/create_user catch it.
     integrity_error = sqlite3.IntegrityError
 
+    @staticmethod
+    def restartable(exc: BaseException) -> bool:
+        """Never here: ``BEGIN IMMEDIATE`` serialises the writers, so no
+        transaction is asked to start again (MariaDB's counterpart says
+        which of its errors are)."""
+        return False
+
     #: SQLite owns its schema: MIGRATIONS run at startup. The MariaDB
     #: backend never runs DDL — its schema is created by the migration
     #: tooling (docs/MARIADB_MIGRATION.md §D) and only VERIFIED here.
@@ -2225,6 +2770,52 @@ class _SqliteBackend(object):
     #: "No limit, but an offset" — SQLite spells no-limit as -1, which
     #: MariaDB rejects outright.
     limit_all_offset = " LIMIT -1 OFFSET ?"
+
+    #: One member of a ``UNION ALL`` that carries its own ``ORDER BY``
+    #: and ``LIMIT`` (WP-44's :meth:`Storage.cadence_runs`), formatted
+    #: with the member's SQL and its index. SQLite allows them only
+    #: inside a subquery and rejects a parenthesised member; MariaDB
+    #: takes the member in parentheses, which it reads cheaper.
+    limited_union_member = "SELECT * FROM ({0}) AS q{1}"
+
+    #: Appended to a read that must lock the row it finds until the
+    #: transaction ends (:meth:`Storage.set_flaky_default`). Nothing here:
+    #: ``BEGIN IMMEDIATE`` already holds the whole database for writing.
+    locking_read = ""
+
+    #: The right-hand side of a row-value ``IN`` over a bound list
+    #: (WP-44 item 6: the New failures queue's promoted tests), formatted
+    #: with the ``(?, ?, ?), ...`` tuples. SQLite reads a list of row
+    #: values only as a VALUES clause; MariaDB takes the tuples bare.
+    row_value_list = "VALUES {0}"
+
+    #: WP-44 item 16: :meth:`Storage._rows_by_key` drives its read FROM
+    #: the keys here: a compound select of the bound triples, ``CROSS
+    #: JOIN``-ed to ``latest_runs`` on all four columns of its primary
+    #: key. The row-value ``IN (VALUES ...)`` it replaces read the
+    #: stream's whole partition on SQLite 3.26 (RHEL 8's, the 3.6.8
+    #: target's), which cannot drive an index from a list of row values;
+    #: a current SQLite happens to. SQLite documents that the left side
+    #: of a CROSS JOIN is always the outer loop, and a compound select
+    #: whose arms have no FROM is never flattened, so the plan is one
+    #: full-key probe per key on every version. MariaDB reads the
+    #: row-value form by the key and keeps it.
+    rows_by_key_from_keys = True
+
+    #: WP-44 item 8 (design §3b, §3c): Open Actions leaves out its
+    #: unassigned flaking tests by the KEYS form on this engine (the
+    #: matched keys in order, the set dropped in Python, the page fetched
+    #: by key), which measured cheaper here than a bound term at every
+    #: size and has no parameter ceiling; MariaDB binds them as a term.
+    set_aside_by_keys = True
+
+    #: How many parameters one statement may bind: SQLite allows 999
+    #: before version 3.32 and 32766 from it.
+    #: A read that binds a list checks it and widens instead above it.
+    #: An instance attribute may lower it: a test plants the ceiling.
+    max_bound_parameters = (
+        999 if sqlite3.sqlite_version_info < (3, 32, 0) else 32766
+    )  # type: Optional[int]
 
     def __init__(self, path: str, cache_mb: Optional[int],
                  mmap_mb: Optional[int], max_connections: int) -> None:
@@ -2420,6 +3011,14 @@ class Storage:
         # finished using them.
         self._streak_cache = {}  # type: Dict[Tuple[Any, ...], Tuple[float, Any]]
         self._streak_lock = threading.Lock()
+        # WP-44 item 6: Q2's answers, (stream_id, triple, latest start,
+        # cadence) -> (stored at, the newest cadence+1 results). Its own
+        # dict, so no act's full clear of the summary memo touches it:
+        # its key pins the window, and nothing but a run can move one.
+        # Dropped by what changes runs (_invalidate_trend_cache's
+        # callers): a push its streams' entries, a prune or a delete all.
+        self._cadence_runs_cache = {}  # type: Dict[Tuple[Any, ...], Tuple[float, Tuple[Result, ...]]]
+        self._cadence_runs_lock = threading.Lock()
         # WP-37: how the summary memo is doing, for the Metrics page --
         # [hits, misses, clears]. Stepped under _summary_lock, which
         # every one of those paths already holds.
@@ -2940,7 +3539,8 @@ class Storage:
             written.update((key[0], key[1]) for key in grown)
             written.update((key[0], key[1]) for key in recompute)
             self._invalidate_trend_cache(
-                set(pair[0] for pair in written) if written else None)
+                set(pair[0] for pair in written) if written else None,
+                written or None)
             self._invalidate_summary_cache_for(written or None)
         return UpsertCounts(
             inserted=inserted, updated=updated, unchanged=unchanged,
@@ -3411,6 +4011,18 @@ class Storage:
             clauses.append(_MUTE_LIVE if muted else _NOT_MUTE_LIVE)
             params.append(model.format_iso(now or model.utcnow()))
 
+        # WP-44 item 20: "not run recently" leaves out the tests under a
+        # live mute, as the Not run queue does. The epoch is read only
+        # when that filter is on (memoized; None, the common case, adds
+        # no term and so no join); `muted=False` already says it, and
+        # with `muted=True` the two together match nothing, by the
+        # owner's rule. The statements join `tm` for it by
+        # :meth:`_reads_mutes`.
+        if (stale_before is not None and muted is not False
+                and self.mute_epoch(stream_id, now) is not None):
+            clauses.append(_NOT_MUTE_LIVE)
+            params.append(model.format_iso(now or model.utcnow()))
+
         if assignment_origin == "build":
             clauses.append("(ca.stream_id IS NOT NULL AND ca.stream_id != ?)")
             params.append(MAINLINE_STREAM_ID)
@@ -3423,6 +4035,14 @@ class Storage:
                 "got {!r}".format(assignment_origin)
             )
         return clauses, params
+
+    @staticmethod
+    def _reads_mutes(clauses: Sequence[str]) -> bool:
+        """Whether :meth:`_dashboard_filters`' *clauses* read ``tm``: the
+        *muted* filter or the stale filter's live-mute term (WP-44 item
+        20). A count or keys statement appends :data:`_MUTE_JOIN` then
+        and only then; see :attr:`_LATEST_COUNT_JOIN`."""
+        return _MUTE_LIVE in clauses or _NOT_MUTE_LIVE in clauses
 
     @staticmethod
     def _order_by(sort: str, descending: bool) -> str:
@@ -3463,10 +4083,45 @@ class Storage:
         open_items: bool = False,
         muted: Optional[bool] = None,
         now: Optional[datetime.datetime] = None,
+        with_flaky: bool = False,
+        floor: Optional[datetime.datetime] = None,
+        flaking: Optional[bool] = None,
+        total: Optional[List[int]] = None,
+        flaky_defaults: Optional[Dict[str, FlakyDefault]] = None,
     ) -> List[TestSummaryRow]:
         """Return ONE PAGE of the latest run per test, never with ``output``.
 
+        *flaky_defaults* (migration 13) is the caller's defaults map,
+        read because the "any default" bit it took from a statement it
+        already ran said one exists (:meth:`environment_products_and_bits`),
+        as *with_flaky* is its "any mark" bit; None or empty, none. With
+        it, each FAIL row of a test with no mark in an environment with a
+        default carries the default as its ``flaky`` (source
+        ``default``), the rows select the previous result (and join the
+        marks only where a mark exists), and the FLAKING and Open Actions
+        terms judge it; see :meth:`dashboard_page`.
+
         *muted*/*now* (WP-40) — see :meth:`_dashboard_filters`.
+
+        WP-44 item 8: with the bit (*with_flaky*), *flaking* and
+        *open_items* leave FAIL rows out for the mark (design §2 B.3(b),
+        (c)); see :meth:`dashboard_page`. *total*, when given, receives
+        :meth:`dashboard_count`'s answer for the same filters, from the
+        same read where the keys form answers both: how
+        :meth:`dashboard_page` reads its page, so ``/api/dashboard``'s
+        rows still pass through this method.
+
+        *with_flaky* (WP-44 item 6) is the caller's "any mark" bit
+        (:meth:`environment_products_and_bits`): each row then carries
+        its mark and its state on the stream (``TestSummaryRow.flaky``),
+        through a primary-key join onto the marks appended to this rows
+        statement and to no count. No Q1 is read: the state comes from
+        the row's own result, previous result and cadence, and only the
+        page's marked FAIL-after-FAIL rows at a cadence of 3 to 10 need
+        their recent runs, from a memo when a page has read them, else
+        one Q2 for the page (:meth:`_flaky_rows`). *floor* is a
+        build stream's first run, bounding that read (None on mainline).
+        Without the bit the statement is exactly what it was.
 
         Filters: exact *environment*, exact *script*, ``result IN``
         *results* (an explicitly empty sequence matches nothing), *q* as a
@@ -3499,11 +4154,147 @@ class Storage:
         materialize an estate. :meth:`dashboard_count` gives the exact
         total for the same filters.
         """
+        page, counted = self._dashboard_read(
+            environment, script, results, q, stale_before, include_retired,
+            assignees, include_unassigned, with_latest_comment, sort,
+            descending, limit, offset, environments, stream_id,
+            assignment_origin, assigned_only, open_items, muted, now,
+            with_flaky, floor, flaking, total is not None, flaky_defaults)
+        if total is not None and counted is not None:
+            total.append(counted)
+        return page
+
+    def dashboard_page(
+        self,
+        environment: Optional[str] = None,
+        script: Optional[str] = None,
+        results: Optional[Sequence[Result]] = None,
+        q: Optional[str] = None,
+        stale_before: Optional[datetime.datetime] = None,
+        include_retired: bool = False,
+        assignees: Optional[Sequence[str]] = None,
+        include_unassigned: bool = False,
+        with_latest_comment: bool = False,
+        sort: str = "environment",
+        descending: bool = False,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+        assignment_origin: Optional[str] = None,
+        assigned_only: bool = False,
+        open_items: bool = False,
+        muted: Optional[bool] = None,
+        now: Optional[datetime.datetime] = None,
+        with_flaky: bool = False,
+        floor: Optional[datetime.datetime] = None,
+        flaking: Optional[bool] = None,
+        flaky_defaults: Optional[Dict[str, FlakyDefault]] = None,
+    ) -> Tuple[List[TestSummaryRow], int]:
+        """:meth:`dashboard`'s page and :meth:`dashboard_count`'s total
+        for the same filters, in one call: ``/api/dashboard``'s read.
+
+        Migration 13: *flaky_defaults* as for :meth:`dashboard`. A test
+        judged by its environment's default is in F and X as a marked one
+        is; its FAIL after a non-FAIL leaves by a predicate over ``lr``
+        (:meth:`_default_predicate`), never a bound list, so the terms do
+        not grow with an environment's failures.
+
+        WP-44 item 8 (design §2 B.3(b), (c)). With the "any mark" bit
+        (*with_flaky*, the caller's, read on a statement it already ran):
+
+        - *flaking* is the browse Result filter's FLAKING mode: True keeps
+          only F among the FAIL rows (``result=FLAKING``), False leaves F
+          out (``result=FAIL`` alone); None, neither. F is the stream's
+          marked tests flaking under no live mute, exactly the rows that
+          read FLAKING, scoped in Python to the request's environments
+          and script. Non-FAIL rows are never touched, so every other
+          filter composes by AND.
+        - *open_items* (Open Actions) leaves out X, F's members with no
+          assignee and not retired, in every mode and owner filter; an
+          assigned test is listed whatever its state.
+
+        Both come from the ``flaky_states`` memo (Q1, and Q2 for what the
+        latest pair cannot decide): cold, Q1 and one Q2 per 100 such
+        tests more than the base, as ``/api/dashboard`` reads it (the
+        environments that hold a mark ride the statement that carries the
+        bit, :meth:`_flaky_environments`; called alone, one read of the
+        marks' key finds them); warm, none. How the rows leave:
+
+        - bound, on both engines: ``AND NOT (lr.result = ? AND
+          (lr.<triple>) IN (<F>))`` or ``AND (lr.result <> ? OR
+          (lr.<triple>) IN (<F>))``, and on MariaDB X's gated ``AND NOT
+          (lr.result = ? AND ca.assignee IS NULL AND (lr.<triple>) IN
+          (<X>))``, on the rows and their count alike. F's term reads
+          ``lr`` alone and X's ``ca``, which the count already joins: no
+          join is added to a count. Paging, sort and total stay SQL.
+        - by KEYS on SQLite whenever X is not empty, and on either term
+          above the backend's ceiling on bound parameters (999 before
+          SQLite 3.32): one statement returns the matched keys in sort
+          order (no ``runs`` or mute join unless the filters read one),
+          Python drops the set, the total is what is left, and the page
+          is fetched by key, at most 250 keys a statement. It replaces
+          both the rows and the count.
+
+        With no mark, or nothing to leave out, the statements are
+        exactly :meth:`dashboard`'s and :meth:`dashboard_count`'s; FLAKING
+        alone with no mark is an empty page answered without one.
+        """
+        box = []  # type: List[int]
+        page = self.dashboard(
+            environment=environment, script=script, results=results, q=q,
+            stale_before=stale_before, include_retired=include_retired,
+            assignees=assignees, include_unassigned=include_unassigned,
+            with_latest_comment=with_latest_comment, sort=sort,
+            descending=descending, limit=limit, offset=offset,
+            environments=environments, stream_id=stream_id,
+            assignment_origin=assignment_origin,
+            assigned_only=assigned_only, open_items=open_items,
+            muted=muted, now=now, with_flaky=with_flaky, floor=floor,
+            flaking=flaking, total=box, flaky_defaults=flaky_defaults)
+        return page, box[0]
+
+    def _dashboard_read(
+        self,
+        environment: Optional[str],
+        script: Optional[str],
+        results: Optional[Sequence[Result]],
+        q: Optional[str],
+        stale_before: Optional[datetime.datetime],
+        include_retired: bool,
+        assignees: Optional[Sequence[str]],
+        include_unassigned: bool,
+        with_latest_comment: bool,
+        sort: str,
+        descending: bool,
+        limit: Optional[int],
+        offset: int,
+        environments: Optional[Sequence[str]],
+        stream_id: int,
+        assignment_origin: Optional[str],
+        assigned_only: bool,
+        open_items: bool,
+        muted: Optional[bool],
+        now: Optional[datetime.datetime],
+        with_flaky: bool,
+        floor: Optional[datetime.datetime],
+        flaking: Optional[bool],
+        counted: bool,
+        flaky_defaults: Optional[Dict[str, FlakyDefault]] = None,
+    ) -> Tuple[List[TestSummaryRow], Optional[int]]:
+        """:meth:`dashboard_page`'s body; the total only when *counted*."""
         result_values = (
             None if results is None else [r.value for r in results]
         )  # type: Optional[List[str]]
         if result_values is not None and not result_values:
-            return []
+            return [], 0 if counted else None
+        defaults = flaky_defaults or {}
+        result_values, aside = self._set_aside(
+            stream_id, environment, environments, script, result_values,
+            include_retired, assignees, include_unassigned, assigned_only,
+            open_items, flaking, now, floor, with_flaky, defaults)
+        if result_values is not None and not result_values:
+            return [], 0 if counted else None
 
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
@@ -3511,25 +4302,665 @@ class Storage:
             stream_id, assignment_origin, assigned_only, open_items,
             muted, now,
         )
+        self._sort_columns(sort)
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
             columns += ", " + _LATEST_COMMENT_COLUMNS
-        sql = "SELECT {} {}".format(columns, self._LATEST_JOIN)
+        join = self._LATEST_JOIN
+        judged = with_flaky or bool(defaults)
+        if judged:
+            columns += ", lr.prev_result, " + self._flaky_columns(with_flaky)
+            if with_flaky:
+                join += " " + self._FLAKY_JOIN
+
+        total = None  # type: Optional[int]
+        if aside is not None and self._set_aside_by_keys(aside, len(params)):
+            keys = self._matched_keys(
+                clauses, params, sort, descending, aside)
+            page = (keys[offset:] if limit is None
+                    else keys[offset:offset + limit])
+            rows = self._rows_by_key(stream_id, page, columns, join)
+            if counted:
+                total = len(keys)
+        else:
+            if aside is not None:
+                terms, term_params = self._set_aside_terms(aside)
+                clauses = clauses + terms
+                params = params + term_params
+            sql = "SELECT {} {}".format(columns, join)
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += self._order_by(sort, descending)
+            row_params = list(params)
+            if limit is not None:
+                sql += " LIMIT ? OFFSET ?"
+                row_params.extend([limit, offset])
+            elif offset:
+                sql += self._backend.limit_all_offset
+                row_params.append(offset)
+            rows = self._conn().execute(sql, row_params).fetchall()
+            if counted:
+                total = self._count_matched(clauses, params)
+
+        if not judged:
+            if not with_latest_comment:
+                return [_summary_row_from(row) for row in rows], total
+            return [_summary_row_from(row, _latest_comment_from(row))
+                    for row in rows], total
+        flakies = self._flaky_rows(
+            stream_id, rows, len(_STATUS_COLUMN_NAMES) + (
+                _LATEST_COMMENT_COUNT if with_latest_comment else 0),
+            floor, None if aside is None else aside.states, defaults)
+        return [
+            _summary_row_from(
+                row,
+                _latest_comment_from(row) if with_latest_comment else None,
+                flaky)
+            for row, flaky in zip(rows, flakies)
+        ], total
+
+    def _sort_columns(self, sort: str) -> Tuple[str, ...]:
+        """The :data:`DASHBOARD_SORTS` entry for *sort*, or the same
+        ``ValueError`` :meth:`_order_by` raises, before any statement."""
+        try:
+            return DASHBOARD_SORTS[sort]
+        except KeyError:
+            raise ValueError("unknown sort key: {!r}".format(sort))
+
+    def _list_bits(
+        self, applies: bool, stream_id: int,
+        now: Optional[datetime.datetime],
+    ) -> Tuple[bool, Dict[str, FlakyDefault]]:
+        """A list read's ``(any mark, defaults map)`` when its caller did
+        not give them: read from the mute epoch's entry (the map only
+        where its bit says a default exists), and only when a term could
+        apply (*applies*); else ``(False, {})`` with no statement."""
+        if not applies:
+            return False, {}
+        marked, defaulted = self.flaky_bits(stream_id, now)
+        return marked, self.flaky_defaults_map() if defaulted else {}
+
+    def _count_matched(
+        self, clauses: Sequence[str], params: Sequence[Any],
+    ) -> int:
+        """The dashboard's ``COUNT(*)`` over *clauses*: the count join
+        (``ca`` and ``tr``) and the mute join only when a clause reads
+        it (:meth:`_reads_mutes`), never the marks' (the count-join
+        rule)."""
+        sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
+        if self._reads_mutes(clauses):
+            # The only filters that read `tm`; see _LATEST_COUNT_JOIN.
+            sql += " " + _MUTE_JOIN
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        row = self._conn().execute(sql, list(params)).fetchone()
+        return int(row[0])
+
+    # ------------------------------------------------------------------
+    # What a list leaves out for the mark (WP-44 item 8, design §2 B.3)
+    # ------------------------------------------------------------------
+
+    def _flaky_scope(
+        self,
+        stream_id: int,
+        environment: Optional[str],
+        environments: Optional[Sequence[str]],
+        script: Optional[str],
+        floor: Optional[datetime.datetime],
+        include_retired: bool = False,
+        defaults: Optional[Dict[str, FlakyDefault]] = None,
+        marked: bool = True,
+    ) -> List[Tuple[_FlakyFailingRow, Optional[FlakyState]]]:
+        """Every marked FAIL test of *stream_id* in scope (Q1's rows from
+        the ``flaky_states`` memo, :meth:`_flaky_failing`), each with its
+        state, retired ones only when *include_retired* (the read keeps
+        them). Muted ones too: the page's rows read their states from
+        here, so it reads no Q2 of its own.
+
+        A state is the memo's where a read has decided it (Home's
+        headline decides every un-retired one, so a list after a Home
+        load reads none); else its pair's, where the latest two results
+        decide it (every row but a FAIL after a FAIL at a cadence of 3
+        to 10: a cadence of 2 is "failing" by its pair, and only whether
+        it went over tonight, which no list asks, needs runs); else by
+        :meth:`_flaky_decide`, in one Q2 for the rest.
+
+        Migration 13: with the defaults map (*defaults*), each test
+        judged by its environment's default too, read from Q1's default
+        members with no third run (a rows path reads no promotion,
+        design flaky-default-r0 §3a L); *marked* is the "any mark" bit."""
+        allowed = None if environments is None else set(environments)
+        if allowed is not None and not allowed:
+            return []
+        rules = _flaky_rules()
+        entries = self._flaky_failing(stream_id, defaults, marked, floor)
+        scoped = []  # type: List[Tuple[_FlakyFailingRow, _FlakyFailing]]
+        undecided = []  # type: List[Tuple[_FlakyFailingRow, _FlakyFailing]]
+        for name in sorted(entries):
+            if ((environment is not None and name != environment)
+                    or (allowed is not None and name not in allowed)):
+                continue
+            entry = entries[name]
+            for row in entry.rows:
+                if script is not None and row.script != script:
+                    continue
+                if row.retired and not include_retired:
+                    continue
+                scoped.append((row, entry))
+                triple = (row.environment, row.script, row.test_name)
+                if (triple not in entry.decided
+                        and row.prev_result is Result.FAIL
+                        and row.cadence > 2):
+                    undecided.append((row, entry))
+        self._flaky_decide(stream_id, undecided, None, (), floor)
+        out = []  # type: List[Tuple[_FlakyFailingRow, Optional[FlakyState]]]
+        by_pair = {}  # type: Dict[Tuple[int, Optional[Result]], Optional[FlakyState]]
+        for row, entry in scoped:
+            triple = (row.environment, row.script, row.test_name)
+            found = entry.decided.get(triple)
+            if found is not None:
+                out.append((row, found[0]))
+                continue
+            key = (row.cadence, row.prev_result)
+            if key not in by_pair:
+                by_pair[key] = rules.flaky_state(
+                    row.cadence,
+                    (Result.FAIL,) if row.prev_result is None
+                    else (Result.FAIL, row.prev_result))
+            out.append((row, by_pair[key]))
+        return out
+
+    def _set_aside(
+        self,
+        stream_id: int,
+        environment: Optional[str],
+        environments: Optional[Sequence[str]],
+        script: Optional[str],
+        result_values: Optional[List[str]],
+        include_retired: bool,
+        assignees: Optional[Sequence[str]],
+        include_unassigned: bool,
+        assigned_only: bool,
+        open_items: bool,
+        flaking: Optional[bool],
+        now: Optional[datetime.datetime],
+        floor: Optional[datetime.datetime],
+        marked: bool,
+        defaults: Optional[Dict[str, FlakyDefault]] = None,
+    ) -> Tuple[Optional[List[str]], Optional[_SetAside]]:
+        """The result values a list read binds, and what it leaves out
+        for the mark (None: nothing, today's statements exactly).
+
+        Migration 13 (design flaky-default-r0 §2 B.1, §3a shape 3): with
+        the defaults map (*defaults*; *marked* stays the "any mark"
+        bit), a test judged by its environment's default is in F and X
+        as a marked one is. Its FAIL after a non-FAIL is flaking at any
+        default, so those are left to a predicate over ``lr`` per
+        environment that has one flaking (:attr:`_SetAside.default_envs`),
+        less the tests there it would wrongly take in, those under a
+        live mute (:attr:`_SetAside.default_except`); only the rest of F
+        and X is bound by key.
+
+        Nothing is read unless a term can apply: a mark exists (*marked*,
+        the caller's bit), FAIL is among *result_values*, and either the
+        FLAKING mode is set or the read is Open Actions' (*open_items*)
+        with an owner filter that can match an unassigned test. FLAKING
+        alone where nothing is flaking (no mark, or none in scope) binds
+        no FAIL at all, so FLAKING alone is an empty list answered
+        without a statement."""
+        fail = Result.FAIL.value
+        if flaking is None and not open_items:
+            return result_values, None
+        if result_values is not None and fail not in result_values:
+            return result_values, None
+        unowned_wanted = (open_items and not assigned_only
+                          and (not assignees or include_unassigned))
+        if flaking is None and not unowned_wanted:
+            return result_values, None
+        defaults = defaults or {}
+        if not marked and not defaults:
+            if not flaking:
+                return result_values, None
+            if result_values is None:
+                return None, _SetAside(
+                    keep=True, flaking=(), unowned=(), states={}, listed=(),
+                    unowned_listed=(), default_envs=(), default_except=())
+            return [value for value in result_values if value != fail], None
+        at_iso = model.format_iso(now or model.utcnow())
+        scoped = self._flaky_scope(
+            stream_id, environment, environments, script, floor,
+            include_retired, defaults, marked)
+        flaking_set = []  # type: List[Tuple[str, str, str]]
+        unowned = []  # type: List[Tuple[str, str, str]]
+        listed = []  # type: List[Tuple[str, str, str]]
+        unowned_listed = []  # type: List[Tuple[str, str, str]]
+        by_predicate = set()  # type: Set[str]
+        excepted = []  # type: List[Tuple[str, str, str]]
+        states = {}  # type: Dict[Tuple[str, str, str], FlakyState]
+        for row, state in scoped:
+            triple = (row.environment, row.script, row.test_name)
+            if state is None:
+                continue
+            states[triple] = state
+            # What the predicate over lr takes in: a FAIL after a
+            # non-FAIL in an environment with a default, marked or not.
+            matched = (row.environment in defaults
+                       and row.prev_result is not None
+                       and row.prev_result is not Result.FAIL)
+            muted = _mute_live(row.mute_expires_at, at_iso)
+            if matched and muted:
+                excepted.append(triple)
+            if state.state != FLAKY_FLAKING or muted:
+                continue
+            if include_retired or not row.retired:
+                flaking_set.append(triple)
+                if matched:
+                    by_predicate.add(row.environment)
+                else:
+                    listed.append(triple)
+            if unowned_wanted and row.assignee is None and not row.retired:
+                unowned.append(triple)
+                if matched:
+                    by_predicate.add(row.environment)
+                else:
+                    unowned_listed.append(triple)
+        default_envs = tuple(sorted(by_predicate))
+        default_except = tuple(sorted(
+            triple for triple in excepted if triple[0] in by_predicate))
+        keep = flaking
+        if keep is True and not flaking_set and result_values is not None:
+            result_values = [value for value in result_values
+                             if value != fail]
+            if not result_values:
+                return result_values, None
+            keep = None
+        if keep is False and not flaking_set:
+            keep = None
+        if keep is None and not unowned:
+            return result_values, None
+        return result_values, _SetAside(
+            keep=keep, flaking=tuple(sorted(flaking_set)),
+            unowned=tuple(sorted(unowned)), states=states,
+            listed=tuple(sorted(listed)),
+            unowned_listed=tuple(sorted(unowned_listed)),
+            default_envs=default_envs, default_except=default_except)
+
+    def _set_aside_by_keys(self, aside: _SetAside, bound: int) -> bool:
+        """Whether a read leaves *aside* out by the keys form: always for
+        X where the backend says so (SQLite), else only when the bound
+        terms would take a statement over the backend's ceiling on bound
+        parameters (*bound* is what the filters bind already; the rows
+        add a limit and an offset). F is counted only where its term is
+        bound (*keep* set): with *keep* None only X's term is.
+
+        Migration 13: also, on every backend, whenever X leaves some of
+        its members to a default's predicate (Open Actions with a default
+        in scope). A bound X predicate reads ``lr.prev_result``, which
+        ``idx_latest_runs_result`` (the index the open-items count reads
+        covering) does not carry, so MariaDB leaves that index for a scan
+        of ``latest_runs``, and the rows walk further along the primary
+        key for their page. The keys form drops X in Python; on MariaDB
+        12.3 its statement reads, in Open Actions' default mode, the
+        stream's partition as one primary-key range (12,800 rows on the
+        production-scale seed), and in its Failing mode
+        ``idx_latest_runs_result`` alone, index-only. SQLite takes it
+        for any X already. With marks alone X stays bound on MariaDB: its
+        list reads no column the covering index lacks."""
+        if aside.unowned and (
+                self._backend.set_aside_by_keys
+                or len(aside.unowned_listed) < len(aside.unowned)):
+            return True
+        ceiling = self._backend.max_bound_parameters
+        if ceiling is None:
+            return False
+        _terms, params = self._set_aside_terms(aside)
+        return bound + len(params) + 2 > ceiling
+
+    def _row_value_in(
+        self, triples: Sequence[Tuple[str, str, str]],
+    ) -> Tuple[str, List[Any]]:
+        """``(lr.<triple>) IN (<triples>)``, the list spelled by the
+        backend (``VALUES`` on SQLite, the bare tuples on MariaDB), and
+        its parameters."""
+        term = "(lr.environment, lr.script, lr.test_name) IN ({0})".format(
+            self._backend.row_value_list.format(
+                ", ".join("(?, ?, ?)" for _ in triples)))
+        return term, [value for triple in triples for value in triple]
+
+    def _set_aside_terms(
+        self, aside: _SetAside,
+    ) -> Tuple[List[str], List[Any]]:
+        """*aside* as bound terms over ``lr`` (F) and ``ca`` (X), each
+        gated on ``lr.result``, so a non-FAIL row is never touched and
+        the engine can reject a row before it probes the list.
+
+        Migration 13: F is its listed members OR, where a default leaves
+        some to it, :meth:`_default_predicate`, reading ``lr`` only: no
+        join is added to a count. X is bound only when every member is
+        listed (marks alone): where a default leaves members of X to the
+        predicate, the read takes the keys form instead
+        (:meth:`_set_aside_by_keys`), so X's term here is always today's
+        list. With no default the terms are today's text."""
+        fail = Result.FAIL.value
+        terms = []  # type: List[str]
+        params = []  # type: List[Any]
+        predicate = None  # type: Optional[Tuple[str, List[Any]]]
+        if aside.default_envs:
+            predicate = self._default_predicate(
+                aside.default_envs, aside.default_except)
+        if aside.keep is True:
+            if aside.flaking:
+                term, term_params = self._either(aside.listed, predicate)
+                terms.append("(lr.result <> ? OR {0})".format(term))
+                params.append(fail)
+                params.extend(term_params)
+            else:
+                terms.append("lr.result <> ?")
+                params.append(fail)
+        elif aside.keep is False and aside.flaking:
+            term, term_params = self._either(aside.listed, predicate)
+            terms.append("NOT (lr.result = ? AND {0})".format(term))
+            params.append(fail)
+            params.extend(term_params)
+        if aside.unowned:
+            term, term_params = self._row_value_in(aside.unowned)
+            terms.append(
+                "NOT (lr.result = ? AND ca.assignee IS NULL AND {0})".format(
+                    term))
+            params.append(fail)
+            params.extend(term_params)
+        return terms, params
+
+    def _either(
+        self,
+        listed: Sequence[Tuple[str, str, str]],
+        predicate: Optional[Tuple[str, List[Any]]],
+    ) -> Tuple[str, List[Any]]:
+        """F's term: its *listed* keys as a row-value list, OR the
+        *predicate*, or whichever of the two there is; a lone list is
+        today's term."""
+        parts = []  # type: List[str]
+        params = []  # type: List[Any]
+        if listed:
+            term, term_params = self._row_value_in(listed)
+            parts.append(term)
+            params.extend(term_params)
+        if predicate is not None:
+            parts.append("({0})".format(predicate[0]))
+            params.extend(predicate[1])
+        # Never empty: a member the predicate does not take in is listed,
+        # and one it does put its environment in the predicate.
+        if len(parts) == 1:
+            return parts[0], params
+        return "({0})".format(" OR ".join(parts)), params
+
+    def _default_predicate(
+        self,
+        environments: Sequence[str],
+        excepted: Sequence[Tuple[str, str, str]],
+    ) -> Tuple[str, List[Any]]:
+        """"Flaking by default" at a FAIL after a non-FAIL, as a condition
+        on the row (design flaky-default-r0 §2 B.1, §3a shape 3): in one
+        of *environments*, a previous result that exists and is not a
+        FAIL (a first run that failed has none and stays a failure), and
+        not one of *excepted* (a live mute there wins). The caller gates
+        it on ``lr.result``. It reads ``lr`` alone and never drives the
+        read: the statement keeps the stream's FAIL range."""
+        fail = Result.FAIL.value
+        sql = (
+            "lr.environment IN ({0}) AND lr.prev_result IS NOT NULL "
+            "AND lr.prev_result <> ?").format(
+                ", ".join("?" for _ in environments))
+        params = list(environments) + [fail]  # type: List[Any]
+        if excepted:
+            term, term_params = self._row_value_in(excepted)
+            sql += " AND NOT {0}".format(term)
+            params.extend(term_params)
+        return sql, params
+
+    @staticmethod
+    def _set_aside_keeps(
+        aside: _SetAside,
+    ) -> Callable[[Tuple[str, str, str], str], bool]:
+        """The terms of :meth:`_set_aside_terms` as a Python predicate
+        over a matched row's triple and result: the keys form's drop."""
+        fail = Result.FAIL.value
+        flaking = frozenset(aside.flaking)
+        unowned = frozenset(aside.unowned)
+        keep = aside.keep
+
+        def kept(triple: Tuple[str, str, str], result: str) -> bool:
+            if result != fail:
+                return True
+            if triple in unowned:
+                return False
+            if keep is True:
+                return triple in flaking
+            if keep is False:
+                return triple not in flaking
+            return True
+
+        return kept
+
+    def _matched_keys(
+        self,
+        clauses: Sequence[str],
+        params: Sequence[Any],
+        sort: str,
+        descending: bool,
+        aside: _SetAside,
+    ) -> List[Tuple[str, str, str]]:
+        """The keys form's one statement: every key the filters match, in
+        the sort's order, over the count's join (the mute join only when
+        a clause reads it, :meth:`_reads_mutes`; every sort reads ``lr``
+        or ``ca``), with *aside* dropped in Python."""
+        sql = ("SELECT lr.environment, lr.script, lr.test_name, lr.result "
+               + self._LATEST_COUNT_JOIN)
+        if self._reads_mutes(clauses):
+            sql += " " + _MUTE_JOIN
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += self._order_by(sort, descending)
-        if limit is not None:
-            sql += " LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
-        elif offset:
-            sql += self._backend.limit_all_offset
-            params.append(offset)
+        kept = self._set_aside_keeps(aside)
+        out = []  # type: List[Tuple[str, str, str]]
+        for row in self._conn().execute(sql, list(params)).fetchall():
+            triple = (row[0], row[1], row[2])
+            if kept(triple, row[3]):
+                out.append(triple)
+        return out
 
-        rows = self._conn().execute(sql, params).fetchall()
-        if not with_latest_comment:
-            return [_summary_row_from(row) for row in rows]
-        return [_summary_row_from(row, _latest_comment_from(row))
-                for row in rows]
+    def _rows_by_key(
+        self,
+        stream_id: int,
+        keys: Sequence[Tuple[str, str, str]],
+        columns: str,
+        join: str,
+    ) -> List[Sequence[Any]]:
+        """The rows of *keys* on *stream_id*, in *keys*' order: the keys
+        form's page, by the partition's primary key, at most 250 keys a
+        statement (fewer under a lower ceiling) and ordered in Python,
+        since the keys already carry the sort. *join* is one of the
+        ``FROM latest_runs AS lr ...`` joins.
+
+        Spelled by the backend (WP-44 item 16): where it drives the read
+        from the keys (SQLite), :meth:`_keys_driven_rows`; elsewhere a
+        row-value ``IN`` on the stream's partition. Both bind three
+        parameters a key and one for the stream."""
+        if not keys:
+            return []
+        per = 250
+        ceiling = self._backend.max_bound_parameters
+        if ceiling is not None:
+            per = max(1, min(per, (ceiling - 1) // 3))
+        from_keys = self._backend.rows_by_key_from_keys
+        found = {}  # type: Dict[Tuple[str, str, str], Sequence[Any]]
+        conn = self._conn()
+        for start in range(0, len(keys), per):
+            chunk = keys[start:start + per]
+            if from_keys:
+                sql, params = self._keys_driven_rows(
+                    stream_id, chunk, columns, join)
+            else:
+                term, term_params = self._row_value_in(chunk)
+                sql = "SELECT {0} {1} WHERE lr.stream_id = ? AND {2}".format(
+                    columns, join, term)
+                params = [stream_id] + term_params
+            for row in conn.execute(sql, params).fetchall():
+                found[(row[0], row[1], row[2])] = row
+        return [found[key] for key in keys if key in found]
+
+    #: The head every join :meth:`_rows_by_key` is given starts with.
+    _ROWS_BY_KEY_FROM = "FROM latest_runs AS lr "
+
+    def _keys_driven_rows(
+        self,
+        stream_id: int,
+        chunk: Sequence[Tuple[str, str, str]],
+        columns: str,
+        join: str,
+    ) -> Tuple[str, List[Any]]:
+        """One statement of :meth:`_rows_by_key` driven from its keys:
+        *join*'s leading ``latest_runs`` becomes ``k CROSS JOIN
+        latest_runs`` on all four columns of its primary key, where ``k``
+        is the chunk's triples as a compound select, each arm a constant
+        row; the rest of *join* follows unchanged. The left side of a
+        CROSS JOIN is always SQLite's outer loop, so each key is one
+        probe of the partition's primary key on every version (3.26
+        read the stream's whole partition for the row-value ``IN`` this
+        replaces). The arms are bound in triple order, so the probes
+        walk the index forwards; the caller restores its own order. At
+        most 250 arms, inside SQLite's default limit of 500 on a
+        compound select."""
+        if not join.startswith(self._ROWS_BY_KEY_FROM):
+            raise ValueError(
+                "_rows_by_key reads latest_runs AS lr first: {0!r}".format(
+                    join[:60]))
+        ordered = sorted(chunk)
+        arms = " UNION ALL ".join(
+            ["SELECT ? AS environment, ? AS script, ? AS test_name"]
+            + ["SELECT ?, ?, ?"] * (len(ordered) - 1))
+        sql = (
+            "SELECT {0} FROM ({1}) AS k "
+            "CROSS JOIN latest_runs AS lr "
+            "ON lr.stream_id = ? AND lr.environment = k.environment "
+            "AND lr.script = k.script AND lr.test_name = k.test_name "
+            "{2}").format(
+                columns, arms, join[len(self._ROWS_BY_KEY_FROM):])
+        params = [value for triple in ordered for value in triple]
+        params.append(stream_id)
+        return sql, params
+
+    def _flaky_rows(
+        self,
+        stream_id: int,
+        rows: Sequence[Sequence[Any]],
+        at: int,
+        floor: Optional[datetime.datetime],
+        known: Optional[Dict[Tuple[str, str, str], FlakyState]],
+        defaults: Optional[Dict[str, FlakyDefault]] = None,
+    ) -> List[Optional[FlakyRow]]:
+        """Each raw row's :class:`FlakyRow`, or None for an unmarked test
+        (WP-44 item 6), without Q1 (design §2 B.4: unfiltered browse
+        never runs it). A raw row is a rows statement's: the triple
+        first, ``lr.result`` fifth, ``lr.start_time`` sixth, and from
+        column *at* ``(prev_result, cadence, reason, marked_by,
+        marked_at)`` from its join onto the marks (cadence NULL: no
+        mark).
+
+        Migration 13 (design flaky-default-r0 §2 B.3, decision 12): an
+        unmarked FAIL row in an environment of *defaults* (the map)
+        carries the default, read as a mark, its state by the same rule
+        at the default's cadence; any other unmarked row None. A FAIL
+        after a FAIL at 3 to 10 reads its runs as a marked one does, its
+        answer held until the environment's next push (decision 5).
+
+        The row's own result, previous result and cadence decide every
+        row of the rule's table but FAIL after FAIL at a cadence of 3 to
+        10; those come from *known* (a :class:`FlakyView`'s states), the
+        stream's ``flaky_states`` entry or Q2's cache when a page has
+        read them, and otherwise one Q2 for the page's few (one
+        statement per 100), filled in after the one pass.
+
+        A page's worth of Python on Home's first paint, so it does only
+        what differs by row: the rule is asked once per (cadence, pair),
+        and a bulk act's one timestamp is parsed once. At 1,000 marks an
+        unfiltered 250-row page spent about 1 ms here, so the two
+        NamedTuples are built positionally, about 1 µs a row less than by
+        keyword, and a row's triple only where it is looked up; the
+        result is the same objects.
+        """
+        rules = _flaky_rules()
+        fail = Result.FAIL.value
+        defaults = defaults or {}
+        decided = {}  # type: Dict[Tuple[int, str, Optional[str]], FlakyState]
+        parsed = {}  # type: Dict[Any, datetime.datetime]
+        holders = {}  # type: Dict[str, Dict[Tuple[str, str, str], Tuple[Result, ...]]]
+        need = []  # type: List[Tuple[Tuple[str, str, str], str, int, Dict[Tuple[str, str, str], Tuple[Result, ...]]]]
+        waiting = []  # type: List[Tuple[int, FlakyMark, Tuple[str, str, str], int, str]]
+        held = set()  # type: Set[Tuple[str, str, str]]
+        out = []  # type: List[Optional[FlakyRow]]
+        append = out.append
+        for row in rows:
+            cadence_cell = row[at + 1]
+            result, prev = row[4], row[at]
+            if cadence_cell is None:
+                default = defaults.get(row[0]) if defaults else None
+                if default is None or result != fail:
+                    append(None)
+                    continue
+                # Read as a mark: the default's cadence and reason, its
+                # last act's user and time.
+                cadence = default.cadence
+                mark = FlakyMark(row[0], row[1], row[2], cadence,
+                                 default.reason, default.set_by,
+                                 default.set_at)
+                source = FLAKY_SOURCE_DEFAULT
+            else:
+                cadence = int(cadence_cell)
+                text = row[at + 4]
+                marked_at = parsed.get(text)
+                if marked_at is None:
+                    marked_at = parsed[text] = model.parse_iso(str(text))
+                # FlakyMark's field order: the triple, cadence, reason,
+                # marked_by, marked_at.
+                mark = FlakyMark(row[0], row[1], row[2], cadence,
+                                 row[at + 2], row[at + 3], marked_at)
+                source = FLAKY_SOURCE_MARK
+            if known is not None:
+                triple = (row[0], row[1], row[2])
+                if triple in known:
+                    append(FlakyRow(mark, known[triple], source))
+                    continue
+            if result != fail or prev != fail or cadence == 2:
+                pair_key = (cadence, result, prev)
+                state = decided.get(pair_key)
+                if state is None:
+                    pair = (
+                        (Result(result),) if result != fail or prev is None
+                        else (Result(result), Result(prev))
+                    )  # type: Tuple[Result, ...]
+                    state = decided[pair_key] = rules.flaky_state(
+                        cadence, pair)
+                append(FlakyRow(mark, state, source))
+                continue
+            triple = (row[0], row[1], row[2])
+            environment = row[0]
+            if environment not in holders:
+                entry = self._cached_summary(
+                    ("flaky_states", stream_id, environment))
+                holders[environment] = {} if entry is None else entry.runs
+            need.append((triple, str(row[5]), cadence,
+                         holders[environment]))
+            if source == FLAKY_SOURCE_DEFAULT:
+                held.add(triple)
+            waiting.append((len(out), mark, triple, cadence, source))
+            append(None)
+        if need:
+            runs = self._cadence_results(stream_id, need, floor, held)
+            for index, mark, triple, cadence, source in waiting:
+                out[index] = FlakyRow(
+                    mark, rules.flaky_state(cadence, runs[triple]), source)
+        return out
 
     def dashboard_count(
         self,
@@ -3548,11 +4979,32 @@ class Storage:
         open_items: bool = False,
         muted: Optional[bool] = None,
         now: Optional[datetime.datetime] = None,
+        flaking: Optional[bool] = None,
+        floor: Optional[datetime.datetime] = None,
+        marks: Optional[bool] = None,
+        flaky_defaults: Optional[Dict[str, FlakyDefault]] = None,
     ) -> int:
-        """Exact number of tests matching the same filters as :meth:`dashboard`."""
+        """Exact number of tests matching the same filters as :meth:`dashboard`.
+
+        WP-44 item 8: *flaking* and *open_items* leave the same rows out
+        as :meth:`dashboard_page` does, by the same form; *marks* is the
+        "any mark" bit when the caller has it, else it is read (from the
+        mute epoch's entry) only when one of the two could apply. The
+        count's WHERE reads ``lr`` and ``ca`` only: no join is added.
+        Migration 13: *flaky_defaults* is the caller's defaults map with
+        its bit; read from that same entry when *marks* is."""
         result_values = (
             None if results is None else [r.value for r in results]
         )  # type: Optional[List[str]]
+        if result_values is not None and not result_values:
+            return 0
+        if marks is None:
+            marks, flaky_defaults = self._list_bits(
+                flaking is not None or open_items, stream_id, now)
+        result_values, aside = self._set_aside(
+            stream_id, environment, environments, script, result_values,
+            include_retired, assignees, include_unassigned, assigned_only,
+            open_items, flaking, now, floor, bool(marks), flaky_defaults)
         if result_values is not None and not result_values:
             return 0
         clauses, params = self._dashboard_filters(
@@ -3561,14 +5013,14 @@ class Storage:
             stream_id, assignment_origin, assigned_only, open_items,
             muted, now,
         )
-        sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
-        if muted is not None:
-            # The only filter that reads `tm`; see _LATEST_COUNT_JOIN.
-            sql += " " + _MUTE_JOIN
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        row = self._conn().execute(sql, params).fetchone()
-        return int(row[0])
+        if aside is not None:
+            if self._set_aside_by_keys(aside, len(params)):
+                return len(self._matched_keys(
+                    clauses, params, "environment", False, aside))
+            terms, term_params = self._set_aside_terms(aside)
+            clauses = clauses + terms
+            params = params + term_params
+        return self._count_matched(clauses, params)
 
     def environments(
         self, environments: Optional[Sequence[str]] = None,
@@ -4264,6 +5716,45 @@ class Storage:
         ).fetchall()
         return {row[0]: row[1] for row in rows}
 
+    def environment_products_and_bits(
+        self,
+    ) -> Tuple[Dict[str, str], bool, bool]:
+        """:meth:`environment_products_map`, the "any mark" bit and the
+        "any default" bit, ``(mapping, marked, defaulted)``, in ONE
+        statement: ``/api/dashboard``'s carrier of both bits, read before
+        its rows so they know whether to join the marks and to read the
+        defaults map.
+
+        The marks ride it as one ``UNION ALL`` row per environment that
+        holds a mark (WP-44 items 6 and 8; none with no mark: the bit is
+        False), with no environment in the first column (the column is
+        the table's key, never NULL), and they are memoized for
+        :meth:`_flaky_environments`, so the marks' memo of a cold Open
+        Actions or filtered browse read reads no environment list of its
+        own. The default rides it (design flaky-default-r0 §2 B.1) as
+        one more row, the defaults' primary-key ``MIN`` with no product:
+        a declaration's product is never NULL, nor is a mark's
+        environment, so that row is the one whose second column is NULL,
+        whichever way an engine orders them."""
+        mapping = {}  # type: Dict[str, str]
+        marked = []  # type: List[str]
+        defaulted = False
+        for row in self._conn().execute(
+                "SELECT environment, product FROM environment_products "
+                "UNION ALL SELECT DISTINCT NULL, environment "
+                "FROM test_flaky_marks "
+                "UNION ALL SELECT MIN(environment), NULL "
+                "FROM environment_flaky_defaults").fetchall():
+            if row[1] is None:
+                defaulted = row[0] is not None
+            elif row[0] is None:
+                marked.append(row[1])
+            else:
+                mapping[row[0]] = row[1]
+        if marked:
+            self._store_marked_environments(marked)
+        return mapping, bool(marked), defaulted
+
     def list_environment_products(self) -> List[EnvironmentProduct]:
         """Every declaration, ordered by environment."""
         rows = self._conn().execute(
@@ -4293,6 +5784,30 @@ class Storage:
             "ORDER BY product"
         ).fetchall()
         return [row[0] for row in rows]
+
+    def distinct_products_and_marks(self) -> Tuple[List[str], bool]:
+        """:meth:`distinct_products`, and the "any mark" bit (WP-44 item
+        6) as a ``UNION ALL`` row on the same statement: the names
+        part's ``flaky_marks``, at no statement of its own. The bit's
+        row is the one with no product (``product`` is NOT NULL), and
+        ``ORDER BY 1`` keeps the products sorted whichever way an engine
+        places it."""
+        products = []  # type: List[str]
+        marked = False
+        # Migration 13: the "any default" bit is one more such row (design
+        # flaky-default-r0 §2 B.3, P3): the part's ``flaky_marks`` is true
+        # where a mark OR a default exists.
+        for row in self._conn().execute(
+                "SELECT DISTINCT product, NULL FROM environment_products "
+                "UNION ALL SELECT NULL, MIN(environment) "
+                "FROM test_flaky_marks "
+                "UNION ALL SELECT NULL, MIN(environment) "
+                "FROM environment_flaky_defaults ORDER BY 1").fetchall():
+            if row[0] is None:
+                marked = marked or row[1] is not None
+            else:
+                products.append(row[0])
+        return products, marked
 
     def environments_for_product(self, product: str) -> List[str]:
         """Environments declared as belonging to *product*, sorted.
@@ -5872,8 +7387,18 @@ class Storage:
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
         now: Optional[datetime.datetime] = None,
+        flaking: Optional[Dict[Tuple[str, str], int]] = None,
     ) -> List[ScriptFailures]:
         """Scripts with the most currently-failing tests, worst first.
+
+        *flaking* (WP-44 item 6) is the caller's count of flaking tests
+        per (environment, script), from :meth:`flaky_view`: each comes
+        off its script's ``failing`` and is reported as ``flaking``, and
+        the scripts are ranked again by what is left. The statement is
+        the same with ``LIMIT`` raised by the number of scripts that have
+        any (k): the true top *limit* lies within the statement's top
+        *limit* + k, since only those k scripts can fall in the ranking
+        and none can rise. Without it, nothing here changes.
 
         *environments* is the WP-20 ``product=`` filter — see
         :meth:`_environments_clause`. *stream_id* (WP-23, default
@@ -5895,6 +7420,33 @@ class Storage:
         drops the memo.
         """
         at = now or model.utcnow()
+        if flaking:
+            fetched = self._top_failing_scripts(
+                environment, limit + len(flaking), environments, stream_id,
+                at)
+            adjusted = [
+                entry._replace(
+                    failing=entry.failing - flaking.get(
+                        (entry.environment, entry.script), 0),
+                    flaking=flaking.get((entry.environment, entry.script), 0))
+                for entry in fetched
+            ]
+            adjusted.sort(key=lambda entry: (
+                -entry.failing, -entry.muted, entry.environment,
+                entry.script))
+            return adjusted[:limit]
+        return self._top_failing_scripts(
+            environment, limit, environments, stream_id, at)
+
+    def _top_failing_scripts(
+        self,
+        environment: Optional[str],
+        limit: int,
+        environments: Optional[Sequence[str]],
+        stream_id: int,
+        at: datetime.datetime,
+    ) -> List[ScriptFailures]:
+        """:meth:`top_failing_scripts`' statement and memo."""
         epoch = self.mute_epoch(stream_id, at)
         envs_key = (
             None if environments is None else tuple(sorted(environments))
@@ -5947,7 +7499,7 @@ class Storage:
         result = [
             ScriptFailures(
                 environment=row[0], script=row[1], failing=int(row[2]),
-                muted=int(row[3]),
+                muted=int(row[3]), flaking=0,
             )
             for row in self._conn().execute(sql, params).fetchall()
         ]
@@ -5964,8 +7516,23 @@ class Storage:
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
         now: Optional[datetime.datetime] = None,
+        also_new: Optional[Tuple[str, List[Any]]] = None,
+        quiet_mutes: bool = False,
     ) -> Tuple[str, List[Any]]:
         """Build the WHERE clause for one triage queue.
+
+        *quiet_mutes* (WP-44 item 20, ``not_run`` only) leaves out the
+        tests under a live mute: :data:`_NOT_MUTE_LIVE`, *now* bound
+        after the cutoff. The caller passes it only when the stream's
+        mute epoch is not None, so with no live mute the statement is
+        exactly what it was, and only where ``tm`` is joined (the rows
+        always; a count only when it appends :data:`_MUTE_JOIN`).
+
+        *also_new* (WP-44 item 6, ``new_failures`` only) is one more way
+        into the New failures queue beside "previous result not FAIL",
+        as SQL over ``lr``/``fm`` and its parameters: the tests that went
+        over their cadence on this run (design §3c's condition), still
+        under the queue's FAIL, live-mute and retirement terms.
 
         *now* (WP-40) is bound into the three :data:`_NOW_QUEUES`
         predicates — "live" is ``expires_at > now`` and nothing else.
@@ -5991,17 +7558,30 @@ class Storage:
             predicate = _QUEUE_PREDICATES[kind]
         except KeyError:
             raise ValueError("unknown queue kind: {!r}".format(kind))
+        params = [stream_id]  # type: List[Any]
+        if also_new is not None:
+            if kind != "new_failures":
+                raise ValueError("also_new is the New failures queue's")
+            predicate = (
+                "lr.result = ? AND (lr.prev_result IS NULL "
+                "OR lr.prev_result <> ? OR {0}) AND {1}".format(
+                    also_new[0], _NOT_MUTE_LIVE))
+            params.extend([Result.FAIL.value, Result.FAIL.value])
+            params.extend(also_new[1])
+        if quiet_mutes:
+            if kind != "not_run":
+                raise ValueError("quiet_mutes is the Not run queue's")
+            predicate = predicate + " AND " + _NOT_MUTE_LIVE
         sql = " WHERE lr.stream_id = ? AND {} AND {}".format(
             predicate, Storage._NOT_RETIRED
         )
-        params = [stream_id]  # type: List[Any]
         if kind in _STALE_QUEUES:
             if stale_before is None:
                 raise ValueError(
                     "queue {!r} needs stale_before".format(kind)
                 )
             params.append(model.format_iso(stale_before))
-        if kind in _NOW_QUEUES:
+        if kind in _NOW_QUEUES or quiet_mutes:
             params.append(model.format_iso(now or model.utcnow()))
         if environment is not None:
             sql += " AND lr.environment = ?"
@@ -6028,8 +7608,37 @@ class Storage:
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
         now: Optional[datetime.datetime] = None,
+        marks: Optional[bool] = None,
+        floor: Optional[datetime.datetime] = None,
+        flaky_defaults: Optional[Dict[str, FlakyDefault]] = None,
     ) -> List[TestStatusRow]:
         """Return one triage queue (see :data:`QUEUE_KINDS`), newest info first.
+
+        Migration 13 (design flaky-default-r0 §2 B.1, B.4): *marks* stays
+        the "any mark" bit and *flaky_defaults* is the defaults map, both
+        the caller's (from a statement it ran: the queue part's count,
+        the headline's mute epoch); with *marks* None both are read from
+        the mute epoch's entry. A test judged by its environment's
+        default moves the three queues as a marked one does, its row
+        carries the default (FAIL rows), and New failures leaves its
+        FAIL after a non-FAIL out by a predicate, not by key.
+
+        WP-44 item 6. *marks* is the "any mark" bit when the caller has
+        it (the queue part reads it from its count, the full payload
+        from the mute epoch); None reads it from :meth:`mute_epoch`'s
+        entry. With it, every row carries its mark and state
+        (``TestStatusRow.flaky``) through a primary-key join onto the
+        marks, and three queues act on the mark, from
+        :meth:`flaky_view`: New failures leaves out F and takes in P,
+        bound as a row-value list (``OR (lr.<triple>) IN (<P>)``; above
+        the backend's parameter ceiling it widens to every marked test
+        and keeps P); Still failing leaves out F and P; Fixed leaves out
+        a pass after a tolerated failure, keyed on the mute epoch then,
+        because a live mute wins over the mark. Each over-fetches by
+        what it may leave out and drops it, so *limit* is exact. A row
+        needs no new field for a promotion: ``prev_result`` FAIL with
+        state ``failing`` on a New failures row is one. *floor* is a
+        build's first run, bounding Q2 (None on mainline).
 
         *now* (WP-40) — see :meth:`_queue_clause`. For the three queues
         that read mutes the memo is keyed on the
@@ -6062,55 +7671,315 @@ class Storage:
         :meth:`add_comment` and :meth:`set_retired` (which also posts
         one) both invalidate this alongside the runs/assignment/
         retirement writes every other cached method already needs.
+
+        WP-44 item 14: *kind* may also be :data:`FLAKING_QUEUE`, the
+        virtual kind read by :meth:`_flaking_queue` (its own order, no
+        predicate; *assignee* and *stale_before* do not apply to it).
         """
+        if kind == FLAKING_QUEUE:
+            return self._flaking_queue(
+                environment, limit, with_latest_comment, environments,
+                stream_id, now, marks, floor, flaky_defaults)
         envs_key = (
             None if environments is None else tuple(sorted(environments))
         )
+        if marks is None:
+            marked, defaults = self._list_bits(True, stream_id, now)
+        else:
+            marked = marks
+            defaults = flaky_defaults or {}
+        judged = marked or bool(defaults)
+        # WP-44 item 20: the Not run queue reads the epoch too. A live
+        # mute leaves a quiet test out of it, so its key carries the
+        # epoch (an expiry puts the test back with no write) and its
+        # statement binds the term only when the epoch is not None.
         epoch = (
             self.mute_epoch(stream_id, now)
-            if kind in _NOW_QUEUES else None
+            if kind in _NOW_QUEUES or kind == "not_run"
+            or (judged and kind == "fixed")
+            else None
         )
         key = (
             "status_queue", kind, environment, limit, assignee,
             stale_before, with_latest_comment, envs_key, stream_id, epoch,
+            marked, bool(defaults),
         )
         cached = self._cached_summary(key)
         if cached is not None:
             return cached
+        view = None  # type: Optional[FlakyView]
+        if (judged and assignee is None
+                and kind in ("new_failures", "still_failing", "fixed")):
+            view = self.flaky_view(
+                stream_id, now, environment, environments,
+                marks=kind == "fixed", failing=kind != "fixed",
+                floor=floor, marked=marked, defaults=defaults)
+        drop = set()  # type: Set[Tuple[str, str, str]]
+        promoted = set()  # type: Set[Tuple[str, str, str]]
+        # Migration 13: New failures leaves out a FAIL after a non-FAIL
+        # in an environment with a default by a predicate over lr, not
+        # by key (design flaky-default-r0 §2 B.1): every such row the
+        # queue holds (un-muted, un-retired) is flaking there, marked or
+        # not, so nothing is over-fetched for them.
+        by_predicate = set()  # type: Set[str]
+        widened = False
+        extra = 0
+        also_new = None  # type: Optional[Tuple[str, List[Any]]]
+        if view is not None:
+            for entry in view.counted:
+                triple = (entry.environment, entry.script, entry.test_name)
+                if entry.role == FLAKY_ROLE_PROMOTED:
+                    promoted.add(triple)
+                elif (entry.role == FLAKY_ROLE_FLAKING
+                      and kind == "new_failures" and not entry.prev_fail
+                      and entry.environment in defaults):
+                    by_predicate.add(entry.environment)
+                elif ((entry.role == FLAKY_ROLE_FLAKING
+                       and kind == ("still_failing" if entry.prev_fail
+                                    else "new_failures"))
+                      or (entry.role == FLAKY_ROLE_TOLERATED
+                          and kind == "fixed")):
+                    drop.add(triple)
+            if kind == "still_failing":
+                drop |= promoted
+            extra = len(drop)
+            if kind == "new_failures" and promoted:
+                also_new = self._promoted_term(sorted(promoted))
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
-            stream_id, now,
+            stream_id, now, also_new,
+            quiet_mutes=kind == "not_run" and epoch is not None,
         )
+        leave_out = None  # type: Optional[Tuple[str, List[Any]]]
+        if by_predicate:
+            leave_out = self._default_predicate(sorted(by_predicate), ())
+            where += " AND NOT ({0})".format(leave_out[0])
+            params.extend(leave_out[1])
+        ceiling = self._backend.max_bound_parameters
+        if (also_new is not None and ceiling is not None
+                and len(params) + 1 > ceiling):
+            # Above the backend's ceiling (999 bound parameters before
+            # SQLite 3.32), the term widens to every marked test over
+            # the rows' join (and, migration 13, every test of an
+            # environment with a default), the read over-fetches by
+            # every un-muted judged FAIL test in scope, and only P is
+            # kept: the same answer, exactly.
+            widened = True
+            extra += len(view.states) if view is not None else 0
+            wide = []  # type: List[str]
+            wide_params = []  # type: List[Any]
+            if marked:
+                wide.append("fm.cadence IS NOT NULL")
+            if defaults:
+                wide.append("lr.environment IN ({0})".format(
+                    ", ".join("?" for _ in defaults)))
+                wide_params.extend(sorted(defaults))
+            where, params = self._queue_clause(
+                kind, environment, assignee, stale_before, environments,
+                stream_id, now, (" OR ".join(wide), wide_params),
+            )
+            if leave_out is not None:
+                where += " AND NOT ({0})".format(leave_out[0])
+                params.extend(leave_out[1])
         columns = self._STATUS_COLUMNS
         if with_latest_comment:
             columns += ", " + _LATEST_COMMENT_COLUMNS
-        sql = "SELECT {}, lr.prev_result {}{}".format(
-            columns, self._LATEST_JOIN, where
-        )
+        join = self._LATEST_JOIN
+        if judged:
+            columns += ", lr.prev_result, " + self._flaky_columns(marked)
+            if marked:
+                join += " " + self._FLAKY_JOIN
+        else:
+            columns += ", lr.prev_result"
+        sql = "SELECT {} {}{}".format(columns, join, where)
         sql += self._order_by("environment", False)
         if limit is not None:
             sql += " LIMIT ?"
-            params.append(limit)
-        # A TestStatusRow is a TestSummaryRow plus prev_result, in that
-        # field order, so the shared converter builds the common part.
-        # prev_result is selected last, after any comment columns.
+            params.append(limit + extra)
+        # A TestStatusRow is a TestSummaryRow's fields plus prev_result
+        # and flaky. The previous result is selected after any comment
+        # columns, and the mark's columns, when joined, after it.
         prev_index = len(_STATUS_COLUMN_NAMES) + (
             _LATEST_COMMENT_COUNT if with_latest_comment else 0
         )
+        rows = self._conn().execute(sql, params).fetchall()
+        if drop or widened:
+            rows = [
+                row for row in rows
+                if (row[0], row[1], row[2]) not in drop
+                and not (widened
+                         and (row[prev_index + 1] is not None
+                              or row[0] in defaults)
+                         and row[prev_index] == Result.FAIL.value
+                         and (row[0], row[1], row[2]) not in promoted)]
+        if limit is not None:
+            rows = rows[:limit]
+        flakies = (
+            self._flaky_rows(stream_id, rows, prev_index, floor,
+                             None if view is None else view.states,
+                             defaults)
+            if judged else [None] * len(rows)
+        )  # type: Sequence[Optional[FlakyRow]]
         result = [
-            TestStatusRow(
-                *_summary_row_from(
+            TestStatusRow(*(_row_fields(
+                row,
+                _latest_comment_from(row) if with_latest_comment else None)
+                + (None if row[prev_index] is None
+                   else Result(row[prev_index]), flaky)))
+            for row, flaky in zip(rows, flakies)
+        ]  # type: List[TestStatusRow]
+        self._store_summary(key, result, stream_id)
+        return result
+
+    def _promoted_term(
+        self, promoted: Sequence[Tuple[str, str, str]],
+    ) -> Tuple[str, List[Any]]:
+        """The New failures queue's way in for P (design §3c): bound as a
+        row-value list from the memo, ``(lr.<triple>) IN (<P>)``, spelled
+        by the backend, and its parameters. :meth:`status_queue` checks
+        the statement against the backend's ceiling on bound parameters
+        and widens instead above it."""
+        term = "(lr.environment, lr.script, lr.test_name) IN ({0})".format(
+            self._backend.row_value_list.format(
+                ", ".join("(?, ?, ?)" for _ in promoted)))
+        return term, [value for triple in promoted for value in triple]
+
+    def _flaking_queue(
+        self,
+        environment: Optional[str],
+        limit: Optional[int],
+        with_latest_comment: bool,
+        environments: Optional[Sequence[str]],
+        stream_id: int,
+        now: Optional[datetime.datetime],
+        marks: Optional[bool],
+        floor: Optional[datetime.datetime],
+        flaky_defaults: Optional[Dict[str, FlakyDefault]] = None,
+    ) -> List[TestStatusRow]:
+        """The Flaking queue (WP-44 item 14, design §14): the tests
+        flaking now in scope on *stream_id* (marked, failing within their
+        cadence, under no live mute, not retired), each a queue row in
+        the shape every other kind returns, its ``flaky`` never None.
+
+        Migration 13: a test flaking by its environment's default is one
+        of them (its row's ``flaky`` the default's). This is a rows path:
+        its view reads no promotion (design flaky-default-r0 §3a L), so
+        a default's FAIL after a FAIL at 2 costs it no third run. *marks*
+        and *flaky_defaults* are the caller's bits as for
+        :meth:`status_queue`; the mute epoch's entry is read regardless.
+
+        The set is :meth:`flaky_view`'s ``flaking`` entries, asked with
+        the Still failing queue's arguments so the two share its memo:
+        the number of rows before any cap is the headline's
+        ``status.flaking`` in the same scope, by construction. Ordered
+        nearest to counting as a failure first (``cadence - streak``
+        ascending), then environment, script, test name; the cadence
+        comes from Q1's memoized rows and the streak from the view's
+        states, so the keys are sorted and capped at *limit* BEFORE any
+        row is read. The capped keys alone are then fetched by the
+        partition's primary key (:meth:`_rows_by_key`: at most 250 a
+        statement, so two at the queue's cap), and each row's mark and
+        state come from the view's states, so no runs are read for them.
+
+        Never through :meth:`_queue_clause` or the other kinds'
+        over-fetch and drop, which read the stream's FAIL range rather
+        than the keys. With no mark anywhere, the "any mark" bit (*marks*
+        when the caller has it, else the mute epoch's memoized
+        statement) answers an empty queue and nothing else is read.
+
+        Memoized as every kind is, keyed on the mute epoch: no write
+        drops the memo when a mute lapses, and the epoch moves then, so
+        the next read has the test the mute held back. A row that is no
+        longer a flaking test's when read (an act or a push between the
+        view and this read) is left out, never shown with no mark.
+        """
+        at = now or model.utcnow()
+        if marks is None:
+            marked, defaults = self._list_bits(True, stream_id, at)
+        else:
+            marked = marks
+            defaults = flaky_defaults or {}
+        if not marked and not defaults:
+            return []
+        epoch = self.mute_epoch(stream_id, at)
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        # The key has the other kinds' layout; no assignee and no cutoff
+        # apply to this kind.
+        key = (
+            "status_queue", FLAKING_QUEUE, environment, limit, None, None,
+            with_latest_comment, envs_key, stream_id, epoch, marked,
+            bool(defaults),
+        )
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        view = self.flaky_view(
+            stream_id, at, environment, environments, marks=False,
+            failing=True, floor=floor, marked=marked, defaults=defaults,
+            promotion=False)
+        result = []  # type: List[TestStatusRow]
+        flaking = [] if view is None else [
+            (count.environment, count.script, count.test_name)
+            for count in view.counted if count.role == FLAKY_ROLE_FLAKING]
+        if view is not None and flaking:
+            # Each flaking test's cadence, from the Q1 rows the view has
+            # just used or filled (memoized: no statement). A flaking
+            # triple missing here is skipped, silently, on purpose: the
+            # view's entries are built from these same Q1 entries, so it
+            # happens only when the view is served from its memo while a
+            # Q1 entry was dropped (time limit, size cap, another
+            # thread's invalidation) and re-read after another process
+            # changed that test; ``total`` then counts it until the view
+            # is next read, as the headline does.
+            failing = self._flaky_failing(
+                stream_id, defaults, marked, floor)
+            wanted = set(flaking)
+            cadences = {}  # type: Dict[Tuple[str, str, str], int]
+            for name in sorted(set(triple[0] for triple in flaking)):
+                entry = failing.get(name)
+                if entry is None:
+                    continue
+                for q1_row in entry.rows:
+                    triple = (q1_row.environment, q1_row.script,
+                              q1_row.test_name)
+                    if triple in wanted:
+                        cadences[triple] = q1_row.cadence
+            states = view.states
+            keys = sorted(
+                (triple for triple in flaking if triple in cadences),
+                key=lambda triple: (
+                    cadences[triple] - states[triple].streak,
+                    triple[0], triple[1], triple[2]))
+            if limit is not None:
+                keys = keys[:limit]
+            columns = self._STATUS_COLUMNS
+            if with_latest_comment:
+                columns += ", " + _LATEST_COMMENT_COLUMNS
+            columns += ", lr.prev_result, " + self._flaky_columns(marked)
+            prev_index = len(_STATUS_COLUMN_NAMES) + (
+                _LATEST_COMMENT_COUNT if with_latest_comment else 0
+            )
+            fail = Result.FAIL.value
+            rows = [
+                row for row in self._rows_by_key(
+                    stream_id, keys, columns,
+                    self._LATEST_JOIN + (
+                        " " + self._FLAKY_JOIN if marked else ""))
+                if row[4] == fail and (row[prev_index + 1] is not None
+                                       or row[0] in defaults)]
+            flakies = self._flaky_rows(
+                stream_id, rows, prev_index, floor, states, defaults)
+            result = [
+                TestStatusRow(*(_row_fields(
                     row,
                     _latest_comment_from(row) if with_latest_comment
-                    else None,
-                ),
-                prev_result=(
-                    None if row[prev_index] is None
-                    else Result(row[prev_index])
-                )
-            )
-            for row in self._conn().execute(sql, params).fetchall()
-        ]
+                    else None)
+                    + (None if row[prev_index] is None
+                       else Result(row[prev_index]), flaky)))
+                for row, flaky in zip(rows, flakies)
+            ]
         self._store_summary(key, result, stream_id)
         return result
 
@@ -6123,22 +7992,101 @@ class Storage:
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
         now: Optional[datetime.datetime] = None,
+        floor: Optional[datetime.datetime] = None,
     ) -> int:
         """Exact size of a triage queue, ignoring any display cap.
 
         *stream_id* (WP-23, default mainline) and *now* (WP-40) — see
-        :meth:`_queue_clause`.
+        :meth:`_queue_clause`. WP-44 item 6: see
+        :meth:`status_queue_count_and_bits`, whose count this is.
         """
+        return self.status_queue_count_and_bits(
+            kind, environment, assignee, stale_before, environments,
+            stream_id, now, floor)[0]
+
+    def status_queue_count_and_bits(
+        self,
+        kind: str,
+        environment: Optional[str] = None,
+        assignee: Optional[str] = None,
+        stale_before: Optional[datetime.datetime] = None,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+        now: Optional[datetime.datetime] = None,
+        floor: Optional[datetime.datetime] = None,
+    ) -> Tuple[int, bool, Dict[str, FlakyDefault]]:
+        """:meth:`status_queue_count`, with the "any mark" bit and the
+        "any default" bit riding its statement as two ``MIN`` columns,
+        over the marks' and the defaults' primary keys, and the defaults
+        map where the second says one exists (one statement, memoized
+        estate-wide): ``(count, any mark, defaults)``. The queue part's
+        carrier of both, read before its rows so they know whether to
+        join the marks, and passed to them. No join is added to the
+        count. With a mark or a default, New failures, Still failing and
+        Fixed move by :meth:`flaky_view`'s roles, as :meth:`queue_counts`
+        does (:meth:`_subtract_flaky`); the statement is the same. (WP-44
+        item 6; migration 13, design flaky-default-r0 §2 B.1.)
+
+        WP-44 item 14: :data:`FLAKING_QUEUE` runs no count statement. Its
+        bits are the mute epoch's memoized statement's and its count the
+        view's ``flaking`` entries in scope, the headline's
+        ``status.flaking``; *assignee* does not apply."""
+        if kind == FLAKING_QUEUE:
+            marked, defaults = self._list_bits(True, stream_id, now)
+            view = self.flaky_view(
+                stream_id, now, environment, environments, marks=False,
+                failing=True, floor=floor, marked=marked,
+                defaults=defaults, promotion=False)
+            return (0 if view is None else sum(
+                1 for entry in view.counted
+                if entry.role == FLAKY_ROLE_FLAKING)), marked, defaults
+        # WP-44 item 20: the Not run count leaves out the quiet tests
+        # under a live mute. The statement stays the one it was, with no
+        # mute join (a count carries no join its WHERE does not read),
+        # and the muted cells that did not run since the cutoff come off
+        # it: the cells the headline has read, on the same cutoff and
+        # scope (none, and no statement, with no live mute). They carry
+        # no owner, so an *assignee* (no API caller passes one for this
+        # kind) joins the mutes and binds the term instead.
+        quiet_cells = []  # type: List[RollupCount]
+        quiet_join = False
+        if kind == "not_run" and stale_before is not None:
+            if assignee is None:
+                quiet_cells = [
+                    cell for cell in self.muted_cells(
+                        now, stale_before, environment, environments,
+                        stream_id)
+                    if not cell.recent]
+            else:
+                quiet_join = self.mute_epoch(stream_id, now) is not None
         where, params = self._queue_clause(
             kind, environment, assignee, stale_before, environments,
-            stream_id, now,
+            stream_id, now, quiet_mutes=quiet_join,
         )
-        sql = "SELECT COUNT(*) " + self._LATEST_COUNT_JOIN
-        if kind in _NOW_QUEUES:
-            # These three predicates read `tm`; see _LATEST_COUNT_JOIN.
+        sql = (
+            "SELECT COUNT(*), (SELECT MIN(environment) "
+            "FROM test_flaky_marks), (SELECT MIN(environment) "
+            "FROM environment_flaky_defaults) " + self._LATEST_COUNT_JOIN)
+        if kind in _NOW_QUEUES or quiet_join:
+            # These predicates read `tm`; see _LATEST_COUNT_JOIN.
             sql += " " + _MUTE_JOIN
         sql += where
-        return int(self._conn().execute(sql, params).fetchone()[0])
+        row = self._conn().execute(sql, params).fetchone()
+        count = int(row[0]) - sum(cell.count for cell in quiet_cells)
+        marked = row[1] is not None
+        defaults = (self.flaky_defaults_map() if row[2] is not None
+                    else {})  # type: Dict[str, FlakyDefault]
+        if ((marked or defaults) and assignee is None
+                and kind in ("new_failures", "still_failing", "fixed")):
+            counts = self._subtract_flaky(
+                {"new_failures": 0, "still_failing": 0, "fixed": 0},
+                self.flaky_view(
+                    stream_id, now, environment, environments,
+                    marks=kind == "fixed",
+                    failing=kind != "fixed", floor=floor, marked=marked,
+                    defaults=defaults))
+            count += counts[kind]
+        return count, marked, defaults
 
     def queue_counts(
         self,
@@ -6148,14 +8096,23 @@ class Storage:
         environments: Optional[Sequence[str]] = None,
         stream_id: int = MAINLINE_STREAM_ID,
         now: Optional[datetime.datetime] = None,
+        floor: Optional[datetime.datetime] = None,
     ) -> Dict[str, int]:
         """Exact size of EVERY triage queue, in one grouped pass.
+
+        WP-44 item 6: after the mutes, the flaky roles
+        (:meth:`flaky_view`, from its memos: the summary that calls this
+        has read it) move New failures, Still failing and Fixed
+        (:meth:`_subtract_flaky`), on the same copy; with no mark,
+        nothing is read. *floor* is a build's first run.
 
         WP-40: the memoized counts are the base figures; the live
         mutes (:meth:`muted_cells`, read fresh — tiny,
         time-dependent) are subtracted from ``new_failures``/
-        ``still_failing`` (FAIL cells only) and ALL summed into ``muted`` on every
-        call, so expiry is exact without touching the memo.
+        ``still_failing`` (FAIL cells only), from ``not_run`` (the cells
+        that did not run recently, WP-44 item 20) and ALL summed into
+        ``muted`` on every call, so expiry is exact without touching the
+        memo.
 
         WP-23 perf pass: ``/api/summary``'s full payload used to call
         :meth:`status_queue_count` once per :data:`QUEUE_KINDS` entry for
@@ -6198,9 +8155,12 @@ class Storage:
         )
         cached = self._cached_summary(key)
         if cached is not None:
-            return self._subtract_muted(
-                dict(cached), now, stale_before, environment, environments,
-                stream_id)
+            return self._subtract_flaky(
+                self._subtract_muted(
+                    dict(cached), now, stale_before, environment,
+                    environments, stream_id),
+                self.flaky_view(
+                    stream_id, now, environment, environments, marks=True, floor=floor))
         # WP-36. The five result-shaped queues are sums over the rollup
         # cells the same summary has already computed (same stream,
         # same cutoff, same scope) -- each predicate below is
@@ -6258,9 +8218,12 @@ class Storage:
         counts["assigned"] = int(row[0] or 0)
         counts["mine"] = int(row[1] or 0) if assignee else 0
         self._store_summary(key, counts, stream_id)
-        return self._subtract_muted(
-            dict(counts), now, stale_before, environment, environments,
-            stream_id)
+        return self._subtract_flaky(
+            self._subtract_muted(
+                dict(counts), now, stale_before, environment,
+                environments, stream_id),
+            self.flaky_view(
+                stream_id, now, environment, environments, marks=True, floor=floor))
 
     def recent_results(
         self,
@@ -6790,12 +8753,35 @@ class Storage:
 
     def _invalidate_trend_cache(
         self, stream_ids: Optional[Set[int]] = None,
+        written: Optional[Set[Tuple[int, str]]] = None,
     ) -> None:
         """Drop memoized trends: the runs they were computed from changed.
 
         *stream_ids* (WP-38) narrows it to the streams whose runs did;
         a trend key's first element is its stream. ``None`` drops all.
+
+        Q2's answers (``_cadence_runs_cache``, WP-44 item 6) go the same
+        way, as a matter of correctness rather than hygiene: their key
+        pins the latest start, but a re-pushed or late older run changes
+        the window under the same key (design §3c). This is the push's
+        only addition, a pass over that dict's keys: no statement, no
+        read. *written* (design flaky-default-r0 decision 5), the
+        ``(stream, environment)`` pairs the push wrote, narrows that
+        drop to them: an answer is one test's runs, and a push into one
+        environment changes no other environment's, so a default's
+        answers are kept until ITS environment's next push. The same
+        pass over the same keys, with a pair for a stream.
         """
+        with self._cadence_runs_lock:
+            if stream_ids is None:
+                self._cadence_runs_cache.clear()
+            else:
+                for key in [
+                        key for key in self._cadence_runs_cache
+                        if key[0] in stream_ids and (
+                            written is None
+                            or (key[0], key[1][0]) in written)]:
+                    del self._cadence_runs_cache[key]
         with self._trend_lock:
             if stream_ids is None:
                 self._trend_cache.clear()
@@ -8572,6 +10558,314 @@ class Storage:
         self._store_summary(key, frozen, stream_id, environment)
         return result
 
+    def daily_flaking_failures(
+        self,
+        since: datetime.datetime,
+        now: Optional[datetime.datetime],
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+        floor: Optional[datetime.datetime] = None,
+    ) -> List[DailyFlakingFailures]:
+        """WP-44 item 8 (design §1 "The trend", decision 2): of each UTC
+        day's FAIL runs on *stream_id* since *since*, those of a marked
+        test that were a tolerated failure AS IT STOOD THAT NIGHT, under
+        today's mark (:func:`analytics.flaking_that_night`), with no live
+        mute now; and how many of those belong to a test with an
+        assignee now. Counted once, as every figure is: muted, else
+        flaking, else assigned, so the caller takes ``assigned`` off the
+        day's ``FAIL_ASSIGNED`` and ``FAIL_FLAKING`` is disjoint from it
+        and from ``FAIL_MUTED``. No retirement filter, because the day's
+        FAIL has none.
+
+        With no mark (the bit, from the mute epoch's entry that
+        :meth:`daily_assigned_failures` has just read), nothing is read.
+        Otherwise one statement, two ``UNION ALL`` members both driven
+        from the marks in scope: each mark with its assignee and its
+        mute by key, and every run of each marked test on the stream
+        since *since*, reached by the runs UNIQUE (triple, start_time)
+        range (``CROSS JOIN`` pins the marks first). It reads every run
+        of every marked test in the window, which is the cost decision
+        21 left to the open trend decision. A test whose first run in
+        the window failed needs the runs before it to judge that night:
+        its newest N+1 up to that run, by Q2 (:meth:`_cadence_results`,
+        cached, one statement per 100 such tests; *floor* bounds it on a
+        build).
+
+        Memoized as :meth:`daily_assigned_failures` is: keyed on the mute
+        epoch, tagged with the stream and the environment when scoped to
+        one, so pushes, acts and the TTL all drop it.
+        """
+        at = now or model.utcnow()
+        if not self.flaky_marks_exist(stream_id, at):
+            return []
+        epoch = self.mute_epoch(stream_id, at)
+        since_iso = model.format_iso(since)
+        envs_key = (
+            None if environments is None else tuple(sorted(environments))
+        )
+        key = ("flaky_trend", stream_id, since_iso, environment, envs_key,
+               epoch)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return list(cached)
+        allowed = None if environments is None else list(environments)
+        if allowed is not None and not allowed:
+            nothing = ()  # type: Tuple[DailyFlakingFailures, ...]
+            self._store_summary(key, nothing, stream_id, environment)
+            return []
+        scope = ""
+        scope_params = []  # type: List[Any]
+        if environment is not None:
+            scope += " AND fm.environment = ?"
+            scope_params.append(environment)
+        if allowed is not None:
+            scope += " AND fm.environment IN ({0})".format(
+                ", ".join("?" for _ in allowed))
+            scope_params.extend(allowed)
+        sql = (
+            "SELECT fm.environment, fm.script, fm.test_name, fm.cadence, "
+            "ca.assignee, tm.expires_at FROM test_flaky_marks AS fm "
+            "LEFT JOIN current_assignments AS ca "
+            "  ON ca.environment = fm.environment "
+            " AND ca.script = fm.script AND ca.test_name = fm.test_name "
+            "LEFT JOIN test_mutes AS tm "
+            "  ON tm.stream_id = ? AND tm.environment = fm.environment "
+            " AND tm.script = fm.script AND tm.test_name = fm.test_name "
+            "WHERE 1 = 1" + scope
+            + " UNION ALL SELECT fm.environment, fm.script, fm.test_name, "
+            "NULL, r.start_time, r.result FROM test_flaky_marks AS fm "
+            "CROSS JOIN runs AS r "
+            "  ON r.environment = fm.environment "
+            " AND r.script = fm.script AND r.test_name = fm.test_name "
+            " AND r.start_time >= ? "
+            "WHERE r.stream_id = ?" + scope
+        )
+        params = ([stream_id] + scope_params + [since_iso, stream_id]
+                  + scope_params)  # type: List[Any]
+        at_iso = model.format_iso(at)
+        marks = {}  # type: Dict[Tuple[str, str, str], Tuple[int, bool, bool]]
+        runs = {}  # type: Dict[Tuple[str, str, str], List[Tuple[str, Result]]]
+        for row in self._conn().execute(sql, params).fetchall():
+            triple = (row[0], row[1], row[2])
+            if row[3] is not None:
+                marks[triple] = (
+                    int(row[3]), row[4] is not None,
+                    _mute_live(None if row[5] is None else str(row[5]),
+                               at_iso))
+            else:
+                runs.setdefault(triple, []).append(
+                    (str(row[4]), Result(row[5])))
+        tests = []  # type: List[Tuple[Tuple[str, str, str], int, bool, List[Tuple[str, Result]]]]
+        need = []  # type: List[Tuple[Tuple[str, str, str], str, int, Dict[Tuple[str, str, str], Tuple[Result, ...]]]]
+        for triple in sorted(runs):
+            cadence, assigned, muted = marks[triple]
+            if muted:
+                continue  # a live mute wins: FAIL_MUTED's, not these
+            window = sorted(runs[triple])
+            tests.append((triple, cadence, assigned, window))
+            if window[0][1] is Result.FAIL:
+                need.append((triple, window[0][0], cadence, {}))
+        before = (
+            self._cadence_results(stream_id, need, floor) if need else {}
+        )  # type: Dict[Tuple[str, str, str], Tuple[Result, ...]]
+        rules = _flaky_rules()
+        by_day = {}  # type: Dict[str, List[int]]
+        for triple, cadence, assigned, window in tests:
+            prior = list(reversed(before.get(triple, ())[1:]))
+            flags = rules.flaking_that_night(
+                cadence, prior + [result for _start, result in window],
+                len(prior))
+            for (start, _result), flaking in zip(window, flags):
+                if not flaking:
+                    continue
+                bucket = by_day.setdefault(start[:10], [0, 0])
+                bucket[0] += 1
+                if assigned:
+                    bucket[1] += 1
+        result = [
+            DailyFlakingFailures(
+                day=datetime.datetime.strptime(day, "%Y-%m-%d").date(),
+                flaking=bucket[0], assigned=bucket[1])
+            for day, bucket in sorted(by_day.items())
+        ]
+        frozen = tuple(result)
+        self._store_summary(key, frozen, stream_id, environment)
+        return result
+
+    def daily_default_flaking_failures(
+        self,
+        since: datetime.datetime,
+        now: Optional[datetime.datetime],
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+        floor: Optional[datetime.datetime] = None,
+    ) -> List[DailyFlakingFailures]:
+        """Design flaky-default-r0 §2 B.5 and §3a (the per-day chart): of
+        each UTC day's FAIL runs on *stream_id* since *since*, those of a
+        test with NO mark of its own, in an environment with a default
+        today, that were a tolerated failure as the night stood then
+        under today's default (:func:`analytics.flaking_that_night` at
+        the default's cadence), with no live mute now; and how many of
+        those belong to a test with an assignee now. The default's half
+        of the per-day chart's ``FAIL_FLAKING``, disjoint from
+        :meth:`daily_flaking_failures` (the marks' half: a mark wins
+        whole), counted once as that is.
+
+        With no default (the bit, from the mute epoch's entry that
+        :meth:`daily_assigned_failures` has just read, by
+        :meth:`_list_bits`) nothing is read;
+        with defaults only outside the scope, the map alone (memoized
+        estate-wide, so after a headline nothing). Otherwise one
+        statement per defaulted environment in scope
+        (:meth:`_default_trend_environment`), each with its own memo
+        entry, so a product or an unscoped read shares the
+        environment's."""
+        at = now or model.utcnow()
+        marked, defaults = self._list_bits(True, stream_id, at)
+        if not defaults:
+            return []
+        names = sorted(defaults)
+        if environment is not None:
+            names = [name for name in names if name == environment]
+        if environments is not None:
+            allowed = set(environments)
+            names = [name for name in names if name in allowed]
+        by_day = {}  # type: Dict[datetime.date, List[int]]
+        for name in names:
+            for entry in self._default_trend_environment(
+                    since, at, name, defaults[name], stream_id, floor,
+                    marked):
+                bucket = by_day.setdefault(entry.day, [0, 0])
+                bucket[0] += entry.flaking
+                bucket[1] += entry.assigned
+        return [
+            DailyFlakingFailures(day=day, flaking=bucket[0],
+                                 assigned=bucket[1])
+            for day, bucket in sorted(by_day.items())
+        ]
+
+    def _default_trend_environment(
+        self,
+        since: datetime.datetime,
+        at: datetime.datetime,
+        environment: str,
+        default: FlakyDefault,
+        stream_id: int,
+        floor: Optional[datetime.datetime],
+        marked: bool,
+    ) -> List[DailyFlakingFailures]:
+        """One defaulted environment's tolerated failures per day
+        (:meth:`daily_default_flaking_failures`), in ONE statement
+        judged in the engine (design §3a, "The cheapest read-time
+        shape"); no Python per run and no Q2.
+
+        - **Driven from the window's FAIL runs** by the covering
+          ``idx_runs_start_time_result`` range (the row id is in the
+          entry), each reached in ``runs`` by its primary key: the
+          ``CROSS JOIN`` keeps that order. It grows with the estate's
+          failed runs in the window, not with the environment's tests;
+          driven from the environment's prefix of the runs UNIQUE index
+          instead, SQLite reads its whole history.
+        - **Judged by N-1 backward steps** of the runs UNIQUE (triple,
+          start_time) index: a FAIL run at cadence N is tolerated when
+          any of its N-1 previous runs on the stream is not a FAIL, one
+          correlated scalar subquery per step (``LIMIT 1 OFFSET k``); a
+          step with no run reads as a FAIL, so a stream with fewer runs
+          than N, all failed, is over it. That is ``flaky_state``'s
+          rule, and the steps reach before the window, so nothing is
+          read twice. *floor* (a build's first run) stops a build's walk
+          back through mainline's runs of the same test.
+        - **Set aside in the engine:** a test with a mark of its own
+          (joined only where a mark exists) and a test under a live
+          mute now (joined only while the stream has one). No
+          retirement filter, because the day's FAIL has none.
+        - Window functions over the environment's runs, a nested
+          subquery in the judging one, and a narrowing by the scripts
+          that failed were each slower, or a full scan on one engine
+          (§3a).
+
+        Memo: one entry per (stream, environment), keyed by the window,
+        the cadence, ``cadence_at`` and the mute epoch, tagged with both,
+        so a push into the environment, every act, a mute expiry and
+        the TTL drop it and a push elsewhere leaves it; no hold past
+        the usual expiry. *marked* is the "any mark" bit, from the same
+        memoized entry as the epoch."""
+        epoch = self.mute_epoch(stream_id, at)
+        since_iso = model.format_iso(since)
+        floor_iso = None if floor is None else model.format_iso(floor)
+        cadence = default.cadence
+        cadence_at = model.format_iso(default.cadence_at)
+        key = ("default_trend", stream_id, environment, since_iso, cadence,
+               cadence_at, epoch, floor_iso)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return list(cached)
+        fail = Result.FAIL.value
+        # A build has no run before its floor, so its driving range
+        # starts at the later of the window and the floor: the same rows,
+        # fewer index entries read. Mainline binds the window as before.
+        lower_iso = (since_iso if floor_iso is None
+                     else max(since_iso, floor_iso))
+        step = (
+            "COALESCE((SELECT p.result FROM runs AS p "
+            "WHERE p.environment = r.environment AND p.script = r.script "
+            "AND p.test_name = r.test_name AND p.stream_id = r.stream_id "
+            "AND p.start_time < r.start_time"
+            + ("" if floor_iso is None else " AND p.start_time >= ?")
+            + " ORDER BY p.start_time DESC LIMIT 1 OFFSET {0}), ?) <> ?")
+        steps = " OR ".join(step.format(k) for k in range(cadence - 1))
+        sql = (
+            "SELECT SUBSTR(r.start_time, 1, 10) AS day, "
+            "CASE WHEN ca.assignee IS NULL THEN 0 ELSE 1 END AS assigned, "
+            "COUNT(*) FROM (SELECT f.id FROM runs AS f "
+            "WHERE f.start_time >= ? AND f.result = ?) AS k "
+            "CROSS JOIN runs AS r ON r.id = k.id "
+            "LEFT JOIN current_assignments AS ca "
+            "  ON ca.environment = r.environment "
+            " AND ca.script = r.script AND ca.test_name = r.test_name"
+            + (" LEFT JOIN test_flaky_marks AS fm "
+               "  ON fm.environment = r.environment "
+               " AND fm.script = r.script AND fm.test_name = r.test_name"
+               if marked else "")
+            + (" LEFT JOIN test_mutes AS tm "
+               "  ON tm.stream_id = r.stream_id "
+               " AND tm.environment = r.environment "
+               " AND tm.script = r.script AND tm.test_name = r.test_name"
+               if epoch is not None else "")
+            + " WHERE r.environment = ? AND r.stream_id = ?"
+            # A marked or muted test's FAIL runs are judged by the steps
+            # and then dropped here: SQLite attaches the steps at r's
+            # loop. Cheap while marks are few; a set-aside before the
+            # steps was not measured on MariaDB, where an EXISTS
+            # judgement has become a semi-join.
+            + (" AND fm.environment IS NULL" if marked else "")
+            + (" AND " + _NOT_MUTE_LIVE if epoch is not None else "")
+            + " AND (" + steps + ") GROUP BY day, assigned")
+        params = [lower_iso, fail, environment, stream_id]  # type: List[Any]
+        if epoch is not None:
+            params.append(model.format_iso(at))
+        for _k in range(cadence - 1):
+            if floor_iso is not None:
+                params.append(floor_iso)
+            params.extend([fail, fail])
+        by_day = {}  # type: Dict[str, List[int]]
+        for row in self._conn().execute(sql, params).fetchall():
+            bucket = by_day.setdefault(str(row[0]), [0, 0])
+            bucket[0] += int(row[2])
+            if row[1]:
+                bucket[1] += int(row[2])
+        result = [
+            DailyFlakingFailures(
+                day=datetime.datetime.strptime(day, "%Y-%m-%d").date(),
+                flaking=bucket[0], assigned=bucket[1])
+            for day, bucket in sorted(by_day.items())
+        ]
+        frozen = tuple(result)
+        self._store_summary(key, frozen, stream_id, environment)
+        return result
+
     def _subtract_muted(
         self,
         counts: Dict[str, int],
@@ -8584,10 +10878,15 @@ class Storage:
         """:meth:`queue_counts`' last step, on a COPY of the memoized
         dict: the live mutes on FAILING tests come off ``new_failures``/
         ``still_failing``, and EVERY live mute — failing or passing —
-        becomes ``muted``, so the tab's badge is its row count."""
+        becomes ``muted``, so the tab's badge is its row count. WP-44
+        item 20: a live mute that has not run since *stale_before* (any
+        result) comes off ``not_run``; the cells' ``recent`` is read on
+        that same cutoff, so this is the queue's own predicate."""
         counts["muted"] = 0
         for cell in self.muted_cells(
                 now, stale_before, environment, environments, stream_id):
+            if not cell.recent:
+                counts["not_run"] -= cell.count
             if cell.result is Result.FAIL:
                 if cell.prev_result is Result.FAIL:
                     counts["still_failing"] -= cell.count
@@ -8613,22 +10912,96 @@ class Storage:
         moved past a row that was still live then. Passing the epoch
         recomputes, and so does the first read after a push to the
         stream (the entry is whole-stream tagged) — one indexed MIN.
+
+        WP-44 item 6: the same statement carries the "any mark" bit
+        (:meth:`flaky_marks_exist`) as a second column, the marks'
+        ``MIN(environment)``, read from the primary key's first entry
+        ("Select tables optimized away" on MariaDB). The return value
+        here is unchanged: five callers test it for None.
         """
+        return self._mute_epoch_entry(stream_id, now)[0]
+
+    def flaky_marks_exist(
+        self, stream_id: int, now: Optional[datetime.datetime],
+    ) -> bool:
+        """The "any mark" bit (WP-44 item 6, design §2 B.4): is there a
+        flaky mark anywhere? Read from :meth:`mute_epoch`'s entry, which
+        every summary read has already made, so it costs no statement of
+        its own; with no mark, no read of the board joins or reads the
+        marks beyond the bit. Estate-wide on purpose: every act on a mark
+        drops every memo, so the entry cannot outlive a change to it."""
+        return self._mute_epoch_entry(stream_id, now)[1]
+
+    def flaky_bits(
+        self, stream_id: int, now: Optional[datetime.datetime],
+    ) -> Tuple[bool, bool]:
+        """``(any mark, any default)`` from :meth:`mute_epoch`'s entry.
+
+        The "any default" bit (design flaky-default-r0 §2 B.1) is a third
+        column on that statement, the defaults' primary-key ``MIN``, as
+        the mark bit is the second: no statement of its own. The two are
+        kept apart on purpose: a read that judges marks only (the per-day
+        chart's marks statement) must not run where only a default
+        exists."""
+        entry = self._mute_epoch_entry(stream_id, now)
+        return entry[1], entry[2]
+
+    def _mute_epoch_entry(
+        self, stream_id: int, now: Optional[datetime.datetime],
+    ) -> Tuple[Optional[str], bool, bool]:
+        """:meth:`mute_epoch`, :meth:`flaky_marks_exist` and
+        :meth:`flaky_bits`' one entry, ``(computed_for, epoch,
+        marked, defaulted)``, and its one statement."""
         at = model.format_iso(now or model.utcnow())
         key = ("mute_epoch", stream_id)
         cached = self._cached_summary(key)
         if cached is not None:
-            computed_for, epoch = cached
+            computed_for, epoch, marked, defaulted = cached
             if computed_for <= at and (epoch is None or epoch > at):
-                return epoch
+                return epoch, marked, defaulted
         row = self._conn().execute(
-            "SELECT MIN(expires_at) FROM test_mutes "
-            "WHERE stream_id = ? AND expires_at > ?",
+            "SELECT MIN(expires_at), "
+            "(SELECT MIN(environment) FROM test_flaky_marks), "
+            "(SELECT MIN(environment) FROM environment_flaky_defaults) "
+            "FROM test_mutes WHERE stream_id = ? AND expires_at > ?",
             (stream_id, at)).fetchone()
         epoch = None if row is None or row[0] is None else str(row[0])
-        entry = (at, epoch)
+        marked = row is not None and row[1] is not None
+        defaulted = row is not None and row[2] is not None
+        entry = (at, epoch, marked, defaulted)
         self._store_summary(key, entry, stream_id)
-        return epoch
+        return epoch, marked, defaulted
+
+    #: The memo key of every environment's default flaky cadence,
+    #: estate-wide (:meth:`flaky_defaults_map`).
+    _DEFAULTS_MAP_KEY = ("flaky_defaults_map",)
+
+    def flaky_defaults_map(self) -> Dict[str, FlakyDefault]:
+        """Every environment's default flaky cadence, by environment
+        (design flaky-default-r0 §2 B.1, "the defaults map"): ONE
+        statement, a read of ``environment_flaky_defaults`` whole (a row
+        per environment with a default, at most the estate's
+        environments), memoized estate-wide. A caller reads it only when
+        a bit says a default exists, so with none it costs nothing.
+
+        The value reads no stream's partition, only the defaults, which
+        change by a default act or an environment delete, and both drop
+        every memo. The tag is nominal, as the marked environments' is
+        (a mainline push drops it too, which is only early)."""
+        cached = self._cached_summary(self._DEFAULTS_MAP_KEY)
+        if cached is not None:
+            return cached
+        found = {}  # type: Dict[str, FlakyDefault]
+        for row in self._conn().execute(
+                "SELECT environment, cadence, reason, set_by, set_at, "
+                "cadence_at FROM environment_flaky_defaults").fetchall():
+            found[row[0]] = FlakyDefault(
+                environment=row[0], cadence=int(row[1]), reason=row[2],
+                set_by=row[3], set_at=model.parse_iso(row[4]),
+                cadence_at=model.parse_iso(row[5]))
+        self._store_summary(
+            self._DEFAULTS_MAP_KEY, found, MAINLINE_STREAM_ID)
+        return found
 
     def expiring_mutes(
         self,
@@ -8679,6 +11052,1411 @@ class Storage:
                 result=Result(row[11]), assignee=row[12])
             for row in self._conn().execute(sql, params).fetchall()
         ]
+
+    # ------------------------------------------------------------------
+    # Flaky marks (migration 12, WP-44)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _require_active_user(
+        conn: sqlite3.Connection, username: str,
+        act: str = "mark a test as flaky or change or remove a mark",
+    ) -> None:
+        """Inside the caller's transaction: refuse a flaky act by anyone
+        but a known, active user (decision 12). Unlike a comment or an
+        assignment, a mark never creates its actor: the person marking
+        is the mark's owner, so the name must already be a person here.
+        ``ValueError`` names the ``username`` field for the API's 400.
+        *act* is what the refusal says the user cannot do: an
+        environment's default (migration 13) is refused in its own
+        words, by the same rule."""
+        row = conn.execute(
+            "SELECT deactivated_at FROM users WHERE username = ?",
+            (username,)).fetchone()
+        if row is None:
+            raise ValueError(
+                "username: {0} is not a known user; only a known, "
+                "active user can {1}".format(username, act))
+        if row[0] is not None:
+            raise ValueError(
+                "username: {0} has been deactivated and cannot "
+                "{1}".format(username, act))
+
+    def mark_flaky(
+        self,
+        tests: Sequence[Tuple[str, str, str, Optional[int]]],
+        cadence: int,
+        reason: Optional[str],
+        marked_by: str,
+        when: datetime.datetime,
+    ) -> FlakyMarkResult:
+        """Mark EXACTLY the given tests as flaky at *cadence*, or move an
+        existing mark to it — one transaction.
+
+        *tests* is ``(environment, script, test_name, stream_id)``. The
+        mark is the TRIPLE's (it covers every stream); *stream_id* is
+        only the stream the person was looking at, and tags the reason's
+        comment (decision 10). A triple named twice is acted on once,
+        tagged with its first entry's stream. A test with no
+        ``latest_runs`` row on any stream is ``unknown`` and skipped.
+
+        *cadence* is 2..10 (``ValueError`` otherwise; the API refuses
+        first). A test with no mark is MARKED: *reason* is required
+        (``ValueError`` naming how many lacked one, nothing written) and
+        *marked_by* owns it. A test marked at another cadence is
+        CHANGED: the cadence moves, the owner does not, and *reason*,
+        when given, replaces the old one. A test already marked at this
+        cadence is UNCHANGED: nothing is written for it.
+
+        *marked_by* must be a known, active user and is the only owner
+        a mark can have (decision 12). Each act is a
+        ``flaky_mark_history`` row (``mark`` or ``cadence``), and a given
+        *reason* is posted as a comment on each test acted on, tagged
+        with its stream (``None`` for mainline, the assignment
+        convention). Drops every memo, like the mute and assignment
+        acts; nothing on the push path changes.
+        """
+        if (not isinstance(cadence, int) or isinstance(cadence, bool)
+                or cadence < FLAKY_CADENCE_MIN
+                or cadence > FLAKY_CADENCE_MAX):
+            raise ValueError(
+                "cadence: must be a whole number from {0} to {1}, got "
+                "{2!r}".format(FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX,
+                               cadence))
+        origins = {}  # type: Dict[Tuple[str, str, str], Optional[int]]
+        order = []  # type: List[Tuple[str, str, str]]
+        for env, scr, test, sid in tests:
+            triple = (env, scr, test)
+            if triple not in origins:
+                origins[triple] = (
+                    None if sid is None or int(sid) == MAINLINE_STREAM_ID
+                    else int(sid))
+                order.append(triple)
+        if not order:
+            return FlakyMarkResult(marked=0, changed=0, unchanged=0,
+                                   unknown=0)
+        has_reason = bool(reason and reason.strip())
+        when_iso = model.format_iso(when)
+
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_active_user(conn, marked_by)
+            # Found triple -> its current cadence (None: not marked).
+            current = {}  # type: Dict[Tuple[str, str, str], Optional[int]]
+            for start in range(0, len(order), _RECENT_CHUNK):
+                chunk = order[start:start + _RECENT_CHUNK]
+                clause = " OR ".join(
+                    "(lr.environment = ? AND lr.script = ? "
+                    "AND lr.test_name = ?)" for _ in chunk)
+                params = []  # type: List[Any]
+                for triple in chunk:
+                    params.extend(triple)
+                # Driven from latest_runs (the LEFT JOIN pins it), each
+                # triple an idx_latest_runs_triple range, the mark by its
+                # primary key.
+                rows = conn.execute(
+                    "SELECT DISTINCT lr.environment, lr.script, "
+                    "lr.test_name, fm.cadence FROM latest_runs AS lr "
+                    "LEFT JOIN test_flaky_marks AS fm "
+                    "  ON fm.environment = lr.environment "
+                    " AND fm.script = lr.script "
+                    " AND fm.test_name = lr.test_name "
+                    "WHERE " + clause,
+                    tuple(params)).fetchall()
+                for row in rows:
+                    current[(row[0], row[1], row[2])] = (
+                        None if row[3] is None else int(row[3]))
+            fresh = [t for t in order if t in current and current[t] is None]
+            changed = [t for t in order
+                       if t in current and current[t] is not None
+                       and current[t] != cadence]
+            unchanged = len([t for t in order if current.get(t) == cadence])
+            if fresh and not has_reason:
+                raise ValueError(
+                    "reason is required: {0} of these tests {1} not yet "
+                    "marked as flaky".format(
+                        len(fresh), "is" if len(fresh) == 1 else "are"))
+            if fresh:
+                conn.executemany(
+                    "INSERT INTO test_flaky_marks (environment, script, "
+                    "test_name, cadence, reason, marked_by, marked_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(env, scr, test, cadence, reason, marked_by, when_iso)
+                     for (env, scr, test) in fresh])
+            # One UPDATE per chunk, not per test: the request carries one
+            # cadence (and at most one reason), and the vendored driver
+            # sends an executemany of anything but an all-placeholder
+            # INSERT as a statement per row (item 3's measured pass: 105
+            # server statements for 100 tests on MariaDB).
+            setting = (
+                "UPDATE test_flaky_marks SET cadence = ?, reason = ? "
+                if has_reason else "UPDATE test_flaky_marks SET cadence = ? ")
+            for start in range(0, len(changed), _RECENT_CHUNK):
+                chunk = changed[start:start + _RECENT_CHUNK]
+                params = (
+                    [cadence, reason] if has_reason else [cadence]
+                )  # type: List[Any]
+                for triple in chunk:
+                    params.extend(triple)
+                conn.execute(
+                    setting + "WHERE " + " OR ".join(
+                        "(environment = ? AND script = ? "
+                        "AND test_name = ?)" for _ in chunk),
+                    tuple(params))
+            acted = fresh + changed
+            if acted:
+                logged_reason = reason if has_reason else None
+                conn.executemany(
+                    "INSERT INTO flaky_mark_history (environment, "
+                    "script, test_name, action, cadence, reason, actor, "
+                    "acted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(env, scr, test, "mark", cadence, logged_reason,
+                      marked_by, when_iso) for (env, scr, test) in fresh]
+                    + [(env, scr, test, "cadence", cadence, logged_reason,
+                        marked_by, when_iso)
+                       for (env, scr, test) in changed])
+            if acted and has_reason:
+                conn.executemany(
+                    "INSERT INTO comments (environment, script, "
+                    "test_name, author, created_at, text, stream_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(env, scr, test, marked_by, when_iso, reason,
+                      origins[(env, scr, test)])
+                     for (env, scr, test) in acted])
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if fresh or changed:
+            self._invalidate_summary_cache()
+        return FlakyMarkResult(
+            marked=len(fresh), changed=len(changed), unchanged=unchanged,
+            unknown=len(order) - len(current))
+
+    def unmark_flaky(
+        self,
+        tests: Sequence[Tuple[str, str, str]],
+        unmarked_by: str,
+        when: datetime.datetime,
+    ) -> int:
+        """Remove the flaky mark of each given test that has one; return
+        how many went. Anyone known and active may (decision 12's
+        "anyone, recorded"): each removal is an ``unmark`` row of
+        ``flaky_mark_history`` carrying the cadence it removed. Drops
+        every memo when anything went."""
+        order = []  # type: List[Tuple[str, str, str]]
+        seen = set()  # type: Set[Tuple[str, str, str]]
+        for env, scr, test in tests:
+            triple = (env, scr, test)
+            if triple not in seen:
+                seen.add(triple)
+                order.append(triple)
+        if not order:
+            return 0
+        when_iso = model.format_iso(when)
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_active_user(conn, unmarked_by)
+            existing = []  # type: List[Tuple[str, str, str, int]]
+            for start in range(0, len(order), _RECENT_CHUNK):
+                chunk = order[start:start + _RECENT_CHUNK]
+                clause = " OR ".join(
+                    "(environment = ? AND script = ? AND test_name = ?)"
+                    for _ in chunk)
+                params = []  # type: List[Any]
+                for triple in chunk:
+                    params.extend(triple)
+                found = [
+                    (row[0], row[1], row[2], int(row[3]))
+                    for row in conn.execute(
+                        "SELECT environment, script, test_name, cadence "
+                        "FROM test_flaky_marks WHERE " + clause,
+                        tuple(params)).fetchall()]
+                if found:
+                    # The chunk's own clause: one DELETE per chunk, where
+                    # an executemany is a statement per test on MariaDB.
+                    conn.execute(
+                        "DELETE FROM test_flaky_marks WHERE " + clause,
+                        tuple(params))
+                    existing.extend(found)
+            if existing:
+                # Every value a placeholder, so the vendored driver sends
+                # the rows as one multi-row INSERT (it batches nothing
+                # else).
+                conn.executemany(
+                    "INSERT INTO flaky_mark_history (environment, "
+                    "script, test_name, action, cadence, reason, actor, "
+                    "acted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(env, scr, test, "unmark", cad, None, unmarked_by,
+                      when_iso)
+                     for (env, scr, test, cad) in existing])
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if existing:
+            self._invalidate_summary_cache()
+        return len(existing)
+
+    # ------------------------------------------------------------------
+    # An environment's default flaky cadence (migration 13)
+    # ------------------------------------------------------------------
+
+    def set_flaky_default(
+        self,
+        environment: str,
+        cadence: Optional[int],
+        reason: str,
+        actor: str,
+        when: datetime.datetime,
+    ) -> FlakyDefaultChange:
+        """Set, change or remove *environment*'s default flaky cadence,
+        in one transaction with its history row (design flaky-default-r0
+        §2 B.3; decisions 7 and 8).
+
+        *cadence* 2..10 sets the default, or changes it; None removes it.
+        *reason* is required for all three (:func:`flaky_default_reason`
+        states the rule). *actor* must be a known, active user, as for a
+        mark; a default never creates its user. Every refusal meant for
+        the caller is a :class:`FlakyDefaultRefused`. The action is
+        ``set`` (there was none), ``cadence`` (the cadence moved; the
+        reason given replaces the old), ``reason`` (same cadence, another
+        reason), ``clear``, or ``unchanged`` (the same cadence and reason
+        again, or a removal where there is none), which writes nothing.
+        ``cadence_at`` moves on ``set`` and ``cadence`` only.
+
+        Two writers at once. The act is judged against the row as it is
+        stored when the write happens, never against an earlier read.
+        On MariaDB, where ``BEGIN IMMEDIATE`` is a plain ``START
+        TRANSACTION`` and a read takes no lock, a row that exists is
+        read again under a lock (the backend's ``locking_read``), and a
+        first set that loses the race to another first set (the primary
+        key refuses the second INSERT) starts again and is judged
+        against the row that won. So does an act whose locking read the
+        server refuses because the row changed after this transaction's
+        snapshot (``innodb_snapshot_isolation``, on by default from
+        11.6; the backend's ``restartable``). On SQLite ``BEGIN IMMEDIATE`` already
+        serialises the writers. So each writer's answer is true of what
+        it found, and the history holds exactly one row per act that
+        changed something. No lock is taken on a row that does not
+        exist: two such locks (InnoDB gap locks) followed by two INSERTs
+        would deadlock.
+
+        Whether *environment* exists is the caller's question (the API's
+        404, as the expected count's). An act drops every memo, as a
+        mark's does: whatever later reads the default is recomputed. It
+        posts no comment and adds nothing to the push path.
+        """
+        if cadence is not None and (
+                not isinstance(cadence, int) or isinstance(cadence, bool)
+                or cadence < FLAKY_CADENCE_MIN
+                or cadence > FLAKY_CADENCE_MAX):
+            raise FlakyDefaultRefused(
+                "cadence: must be a whole number from {0} to {1} or null, "
+                "got {2!r}".format(FLAKY_CADENCE_MIN, FLAKY_CADENCE_MAX,
+                                   cadence))
+        reason = flaky_default_reason(reason)
+        when_iso = model.format_iso(when)
+        conn = self._conn()
+        outcome = None  # type: Optional[Tuple[str, Optional[FlakyDefault]]]
+        for _attempt in range(_FLAKY_DEFAULT_ATTEMPTS):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                try:
+                    self._require_active_user(
+                        conn, actor,
+                        act="set, change or remove a flaky default")
+                except ValueError as exc:
+                    raise FlakyDefaultRefused(str(exc))
+                try:
+                    outcome = self._flaky_default_act(
+                        conn, environment, cadence, reason, actor, when_iso)
+                except Exception as exc:
+                    if not self._backend.restartable(exc):
+                        raise
+                    outcome = None
+                if outcome is not None:
+                    conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            if outcome is not None:
+                break
+            # Another writer moved the row between the read and the
+            # write: start again, against what it left.
+            conn.execute("ROLLBACK")
+        if outcome is None:
+            raise RuntimeError(
+                "the default of {0} kept changing under this act; nothing "
+                "was written".format(environment))
+        action, current = outcome
+        if action == FLAKY_DEFAULT_UNCHANGED:
+            return FlakyDefaultChange(action=action, flaky_default=current)
+        self._invalidate_summary_cache()
+        after = None  # type: Optional[FlakyDefault]
+        if cadence is not None:
+            after = FlakyDefault(
+                environment=environment, cadence=cadence, reason=reason,
+                set_by=actor, set_at=model.parse_iso(when_iso),
+                cadence_at=(
+                    current.cadence_at
+                    if action == FLAKY_DEFAULT_REASON and current is not None
+                    else model.parse_iso(when_iso)))
+        return FlakyDefaultChange(action=action, flaky_default=after)
+
+    def _read_flaky_default(
+        self, conn: sqlite3.Connection, environment: str, lock: bool,
+    ) -> Optional[FlakyDefault]:
+        """*environment*'s stored default, read under a row lock when
+        *lock* (MariaDB's ``FOR UPDATE``; nothing on SQLite, whose
+        ``BEGIN IMMEDIATE`` already holds the database)."""
+        row = conn.execute(
+            "SELECT cadence, reason, set_by, set_at, cadence_at "
+            "FROM environment_flaky_defaults WHERE environment = ?"
+            + (self._backend.locking_read if lock else ""),
+            (environment,)).fetchone()
+        if row is None:
+            return None
+        return FlakyDefault(
+            environment=environment, cadence=int(row[0]), reason=row[1],
+            set_by=row[2], set_at=model.parse_iso(row[3]),
+            cadence_at=model.parse_iso(row[4]))
+
+    def _flaky_default_act(
+        self, conn: sqlite3.Connection, environment: str,
+        cadence: Optional[int], reason: str, actor: str, when_iso: str,
+    ) -> Optional[Tuple[str, Optional[FlakyDefault]]]:
+        """Inside the caller's transaction: judge the act against the
+        stored row and write it, returning ``(action, the row it was
+        judged against)``; None when another writer moved the row in
+        between and the act must start again (see
+        :meth:`set_flaky_default`)."""
+        current = self._read_flaky_default(conn, environment, lock=False)
+        if current is not None:
+            # The row exists: lock it and judge against what is stored
+            # now, which a writer that got there first may have moved.
+            current = self._read_flaky_default(conn, environment, lock=True)
+            if current is None:
+                return None
+        if cadence is None:
+            action = (FLAKY_DEFAULT_UNCHANGED if current is None
+                      else FLAKY_DEFAULT_CLEAR)
+        elif current is None:
+            action = FLAKY_DEFAULT_SET
+        elif current.cadence != cadence:
+            action = FLAKY_DEFAULT_CADENCE
+        elif current.reason != reason:
+            action = FLAKY_DEFAULT_REASON
+        else:
+            action = FLAKY_DEFAULT_UNCHANGED
+        if action == FLAKY_DEFAULT_SET:
+            try:
+                conn.execute(
+                    "INSERT INTO environment_flaky_defaults (environment, "
+                    "cadence, reason, set_by, set_at, cadence_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (environment, cadence, reason, actor, when_iso,
+                     when_iso))
+            except self._backend.integrity_error:
+                # Another first set committed since the read. Only the
+                # primary key can fire here: every column is bound non-
+                # null, and set_by's user was validated in this same
+                # transaction (MariaDB carries no foreign keys, runbook B.6).
+                return None
+        elif action == FLAKY_DEFAULT_CADENCE:
+            conn.execute(
+                "UPDATE environment_flaky_defaults SET cadence = ?, "
+                "reason = ?, set_by = ?, set_at = ?, cadence_at = ? "
+                "WHERE environment = ?",
+                (cadence, reason, actor, when_iso, when_iso, environment))
+        elif action == FLAKY_DEFAULT_REASON:
+            conn.execute(
+                "UPDATE environment_flaky_defaults SET reason = ?, "
+                "set_by = ?, set_at = ? WHERE environment = ?",
+                (reason, actor, when_iso, environment))
+        elif action == FLAKY_DEFAULT_CLEAR:
+            conn.execute(
+                "DELETE FROM environment_flaky_defaults "
+                "WHERE environment = ?", (environment,))
+        if action != FLAKY_DEFAULT_UNCHANGED:
+            conn.execute(
+                "INSERT INTO flaky_default_history (environment, "
+                "action, cadence, reason, actor, acted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (environment, action, cadence, reason, actor, when_iso))
+        return action, current
+
+    def flaky_defaults_with_history(
+        self, environments: Sequence[str],
+    ) -> Tuple[Dict[str, FlakyDefault], Dict[str, List[FlakyDefaultAct]]]:
+        """Every environment's default flaky cadence, and the newest
+        :data:`FLAKY_DEFAULT_HISTORY_SHOWN` acts on each of
+        *environments*, newest first, in ONE statement (design
+        flaky-default-r0 §2 B.3: ``GET /api/environments``' one more).
+
+        The defaults are a member reading ``environment_flaky_defaults``
+        whole (a row per environment with a default, at most the
+        estate's environments); each environment's history is a member
+        of its own, an ``idx_flaky_default_history_env`` range read
+        backwards and stopped at the limit, so the cost is bounded by
+        the environments times the limit and never by how long the
+        history has grown. Members are spelled by the backend
+        (``limited_union_member``), as :meth:`cadence_runs`' are. Past
+        :data:`_RECENT_CHUNK` environments, one statement more per
+        hundred. An environment named twice is read once.
+
+        Read by the Admin page's one request; no first-paint read calls
+        it, and nothing here judges a default.
+        """
+        order = []  # type: List[str]
+        for environment in environments:
+            if environment not in order:
+                order.append(environment)
+        defaults = {}  # type: Dict[str, FlakyDefault]
+        history = {}  # type: Dict[str, List[FlakyDefaultAct]]
+        if not order:
+            return defaults, history
+        current = (
+            "SELECT 0 AS kind, environment, NULL AS id, NULL AS action, "
+            "cadence, reason, set_by AS actor, set_at AS acted_at, "
+            "cadence_at FROM environment_flaky_defaults")
+        member = (
+            "SELECT 1 AS kind, environment, id, action, cadence, reason, "
+            "actor, acted_at, NULL AS cadence_at FROM flaky_default_history "
+            "WHERE environment = ? ORDER BY id DESC LIMIT {0}".format(
+                FLAKY_DEFAULT_HISTORY_SHOWN))
+        spelling = self._backend.limited_union_member
+        conn = self._conn()
+        rows = []  # type: List[Any]
+        for start in range(0, len(order), _RECENT_CHUNK):
+            chunk = order[start:start + _RECENT_CHUNK]
+            members = [spelling.format(member, index)
+                       for index in range(len(chunk))]
+            if start == 0:
+                members.insert(0, spelling.format(current, "c"))
+            rows.extend(conn.execute(
+                " UNION ALL ".join(members), tuple(chunk)).fetchall())
+        for row in rows:
+            environment = row[1]
+            if int(row[0]) == 0:
+                defaults[environment] = FlakyDefault(
+                    environment=environment, cadence=int(row[4]),
+                    reason=row[5], set_by=row[6],
+                    set_at=model.parse_iso(row[7]),
+                    cadence_at=model.parse_iso(row[8]))
+            else:
+                history.setdefault(environment, []).append(FlakyDefaultAct(
+                    id=int(row[2]), environment=environment, action=row[3],
+                    cadence=None if row[4] is None else int(row[4]),
+                    reason=row[5], actor=row[6],
+                    acted_at=model.parse_iso(row[7])))
+        for acts in history.values():
+            # A UNION ALL promises no order across or within members.
+            acts.sort(key=lambda act: act.id, reverse=True)
+        return defaults, history
+
+    def test_acts(
+        self, environment: str, script: str, test_name: str,
+    ) -> TestActs:
+        """The test page's mute history, flaky mark and flaky history, in
+        the ONE statement the page already ran for its mute history
+        (WP-40): the mark is a primary-key read and its history an
+        ``idx_flaky_mark_history_triple`` range, carried as two
+        ``UNION ALL`` members, so a test with no mark costs no statement
+        more than it did before the mark existed (and nothing is
+        consulted to know there is none). Every list newest first.
+
+        Migration 13 (design flaky-default-r0 §2 B.1): the environment's
+        default rides it as a fourth member, its row by the defaults'
+        primary key (its ``cadence_at`` in the expiry's column), so the
+        page judges an unmarked test by it at no statement more."""
+        triple = (environment, script, test_name)
+        rows = self._conn().execute(
+            "SELECT 0 AS kind, id, stream_id, action, reason, expires_at, "
+            "NULL AS cadence, actor, acted_at FROM mute_history "
+            "WHERE environment = ? AND script = ? AND test_name = ? "
+            "UNION ALL SELECT 1, id, NULL, action, reason, NULL, cadence, "
+            "actor, acted_at FROM flaky_mark_history "
+            "WHERE environment = ? AND script = ? AND test_name = ? "
+            "UNION ALL SELECT 2, NULL, NULL, NULL, reason, NULL, cadence, "
+            "marked_by, marked_at FROM test_flaky_marks "
+            "WHERE environment = ? AND script = ? AND test_name = ? "
+            "UNION ALL SELECT 3, NULL, NULL, NULL, reason, cadence_at, "
+            "cadence, set_by, set_at FROM environment_flaky_defaults "
+            "WHERE environment = ?",
+            triple + triple + triple + (environment,)).fetchall()
+        mutes = []  # type: List[MuteAct]
+        acts = []  # type: List[FlakyMarkAct]
+        mark = None  # type: Optional[FlakyMark]
+        default = None  # type: Optional[FlakyDefault]
+        for row in rows:
+            kind = int(row[0])
+            if kind == 0:
+                mutes.append(MuteAct(
+                    id=int(row[1]), stream_id=int(row[2]),
+                    environment=environment, script=script,
+                    test_name=test_name, action=row[3], reason=row[4],
+                    expires_at=(None if row[5] is None
+                                else model.parse_iso(row[5])),
+                    actor=row[7], acted_at=model.parse_iso(row[8])))
+            elif kind == 1:
+                acts.append(FlakyMarkAct(
+                    id=int(row[1]), environment=environment, script=script,
+                    test_name=test_name, action=row[3],
+                    cadence=None if row[6] is None else int(row[6]),
+                    reason=row[4], actor=row[7],
+                    acted_at=model.parse_iso(row[8])))
+            elif kind == 2:
+                mark = FlakyMark(
+                    environment=environment, script=script,
+                    test_name=test_name, cadence=int(row[6]),
+                    reason=row[4], marked_by=row[7],
+                    marked_at=model.parse_iso(row[8]))
+            else:
+                default = FlakyDefault(
+                    environment=environment, cadence=int(row[6]),
+                    reason=row[4], set_by=row[7],
+                    set_at=model.parse_iso(row[8]),
+                    cadence_at=model.parse_iso(row[5]))
+        mutes.sort(key=lambda act: act.id, reverse=True)
+        acts.sort(key=lambda act: act.id, reverse=True)
+        return TestActs(mute_history=mutes, flaky_mark=mark,
+                        flaky_history=acts, flaky_default=default)
+
+    def cadence_runs(
+        self,
+        stream_id: int,
+        tests: Sequence[Tuple[str, str, str, datetime.datetime, int]],
+        floor: Optional[datetime.datetime] = None,
+    ) -> Dict[Tuple[str, str, str], List[Result]]:
+        """Q2 (WP-44, design §2 B.3(a)): the newest results of many tests
+        on ONE stream, newest first, for :func:`analytics.flaky_state`.
+
+        *tests* is ``(environment, script, test_name, latest_start,
+        limit)``: at most *limit* runs of the triple on *stream_id*, none
+        later than *latest_start* (the start ``latest_runs`` holds, so a
+        run pushed since the caller read it cannot move the window). A
+        triple named twice is read once, as first named. *floor*, the
+        stream's first run (``streams.first_seen``), is for BUILD streams
+        only: it stops a build's read of a test it ran fewer than *limit*
+        times from walking back through mainline's year of the same
+        triple; mainline passes None (its ``first_seen`` predates its
+        migrated history, design §3a).
+
+        One statement per :data:`_RECENT_CHUNK` (100) tests: each test a
+        member of a ``UNION ALL``, each member a range of the runs
+        UNIQUE (triple, start_time) index read backwards from
+        *latest_start*, so the cost is bounded by the tests times their
+        limits (and on a build by the floor), never by the estate. The
+        members are spelled by the backend (``limited_union_member``):
+        SQLite allows ``ORDER BY``/``LIMIT`` in a member only inside a
+        subquery; MariaDB reads a parenthesised member 1.5 to 2 ms
+        cheaper for the same rows (design §3c). A tests list of one is
+        a plain statement on both. Every requested triple is in the
+        answer, empty when it has no run there.
+        """
+        return self._cadence_runs_iso(
+            stream_id,
+            [(env, scr, test, model.format_iso(latest), limit)
+             for env, scr, test, latest, limit in tests],
+            floor)
+
+    def _cadence_runs_iso(
+        self,
+        stream_id: int,
+        tests: Sequence[Tuple[str, str, str, str, int]],
+        floor: Optional[datetime.datetime] = None,
+    ) -> Dict[Tuple[str, str, str], List[Result]]:
+        """:meth:`cadence_runs` with each latest start as the ISO text
+        ``latest_runs`` stores, which is what the board's reads hold:
+        nothing parsed to be formatted straight back."""
+        order = []  # type: List[Tuple[str, str, str, str, int]]
+        out = {}  # type: Dict[Tuple[str, str, str], List[Result]]
+        for env, scr, test, latest_iso, limit in tests:
+            triple = (env, scr, test)
+            if triple in out:
+                continue
+            if not isinstance(limit, int) or limit < 1:
+                raise ValueError(
+                    "limit must be a positive whole number, got "
+                    "{0!r}".format(limit))
+            out[triple] = []
+            order.append((env, scr, test, latest_iso, limit))
+        if not order:
+            return out
+        # Each member names its test by its place in the chunk, a
+        # literal, rather than returning the triple on every row: the
+        # same rows, three strings fewer each to decode (14 % of the
+        # statement on the production-scale seed, SQLite; more through
+        # MariaDB's pure-Python driver).
+        member = (
+            "SELECT {0} AS k, start_time, result "
+            "FROM runs WHERE environment = ? AND script = ? "
+            "AND test_name = ? AND stream_id = ? AND start_time <= ?"
+            + ("" if floor is None else " AND start_time >= ?")
+            + " ORDER BY start_time DESC LIMIT ?")
+        floor_iso = None if floor is None else model.format_iso(floor)
+        spelling = self._backend.limited_union_member
+        conn = self._conn()
+        for start in range(0, len(order), _RECENT_CHUNK):
+            chunk = order[start:start + _RECENT_CHUNK]
+            params = []  # type: List[Any]
+            for env, scr, test, latest_iso, limit in chunk:
+                params.extend([env, scr, test, stream_id, latest_iso])
+                if floor_iso is not None:
+                    params.append(floor_iso)
+                params.append(limit)
+            if len(chunk) == 1:
+                sql = member.format(0)
+            else:
+                sql = " UNION ALL ".join(
+                    spelling.format(member.format(index), index)
+                    for index in range(len(chunk)))
+            found = {}  # type: Dict[int, List[Tuple[str, str]]]
+            for row in conn.execute(sql, tuple(params)).fetchall():
+                found.setdefault(int(row[0]), []).append(
+                    (str(row[1]), str(row[2])))
+            for index, runs in found.items():
+                # A UNION ALL promises no order across or within members.
+                runs.sort(reverse=True)
+                env, scr, test = chunk[index][:3]
+                out[(env, scr, test)] = [
+                    Result(result) for _start, result in runs]
+        return out
+
+    # ------------------------------------------------------------------
+    # The board acts on the mark (WP-44 item 6, design §2 B.3, B.4)
+    # ------------------------------------------------------------------
+
+    #: A rows statement's join onto the marks: the row's own test's mark
+    #: by its primary key, driven from ``latest_runs`` (the LEFT JOIN
+    #: pins that side). Appended only when a mark exists, and never to a
+    #: count.
+    _FLAKY_JOIN = (
+        "LEFT JOIN test_flaky_marks AS fm "
+        "  ON fm.environment = lr.environment "
+        " AND fm.script = lr.script AND fm.test_name = lr.test_name"
+    )
+    _FLAKY_COLUMNS = "fm.cadence, fm.reason, fm.marked_by, fm.marked_at"
+
+    @classmethod
+    def _flaky_columns(cls, marked: bool) -> str:
+        """:attr:`_FLAKY_COLUMNS` where a mark exists (the join then
+        reads them); with only a default (migration 13), four NULLs in
+        their place, so the row's layout is the same and the marks are
+        not joined at all."""
+        return cls._FLAKY_COLUMNS if marked else "NULL, NULL, NULL, NULL"
+
+    #: The memo key of the environments that hold a flaky mark, estate-
+    #: wide (:meth:`_flaky_environments`).
+    _MARKED_ENVIRONMENTS_KEY = ("flaky_marked_environments",)
+
+    def _store_marked_environments(self, names: Sequence[str]) -> None:
+        """Memoize the environments that hold a mark, sorted. The value
+        reads no stream's partition: only the marks, which change by an
+        act or an environment delete, and both drop every memo. The tag
+        is nominal (a mainline push drops it too, which is only early)."""
+        frozen = sorted(set(names))
+        self._store_summary(
+            self._MARKED_ENVIRONMENTS_KEY, frozen, MAINLINE_STREAM_ID)
+
+    def _flaky_environments(
+        self, stream_id: int, marked: bool = True,
+        defaults: Optional[Dict[str, FlakyDefault]] = None,
+    ) -> List[str]:
+        """:meth:`_marked_environments` where a mark exists (*marked*),
+        and every environment with a default (*defaults*, the map; design
+        flaky-default-r0 §2 B.1): with no mark, no read of the marks'
+        key; with no default, exactly the marked environments' list."""
+        found = self._marked_environments(stream_id) if marked else []
+        if not defaults:
+            return found
+        return sorted(set(found) | set(defaults))
+
+    def _marked_environments(self, stream_id: int) -> List[str]:
+        """The environments :meth:`_flaky_failing` keeps an entry for,
+        without reading the stream's whole environment list:
+
+        - those that hold a mark, when known: ``/api/dashboard`` reads
+          them on the statement that already carries the "any mark" bit
+          (:meth:`environment_products_and_bits`), so no statement;
+        - else the stream's environment names, when a summary has
+          memoized them (Home's rollup reads them for itself): no
+          statement, and an environment with no mark gets an empty entry;
+        - else ``SELECT DISTINCT environment FROM test_flaky_marks``, one
+          read of the marks' key, memoized estate-wide.
+
+        The three give the same answers: Q1 returns rows only from an
+        environment that holds a mark, so they differ only in which
+        environments get an empty entry. After a read that took the
+        stream's names (Home's headline first), a marked environment
+        with no run on the stream has no entry, so the next read through
+        the marked environments runs Q1 once more for it, finds nothing
+        and keeps its empty entry: one statement, once, never a
+        different answer.
+        """
+        marked = self._cached_summary(self._MARKED_ENVIRONMENTS_KEY)
+        if marked is not None:
+            return marked
+        names = self._cached_summary(("stream_environment_names", stream_id))
+        if names is not None:
+            return names
+        found = [row[0] for row in self._conn().execute(
+            "SELECT DISTINCT environment FROM test_flaky_marks").fetchall()]
+        self._store_marked_environments(found)
+        return sorted(set(found))
+
+    def _flaky_failing(
+        self, stream_id: int,
+        defaults: Optional[Dict[str, FlakyDefault]] = None,
+        marked: bool = True,
+        floor: Optional[datetime.datetime] = None,
+        third: bool = False,
+    ) -> Dict[str, _FlakyFailing]:
+        """The ``flaky_states`` memo of every environment of *stream_id*:
+        Q1's rows (design §2 B.3(a)), the marked tests whose latest
+        result there is FAIL, and the Q2 answers read for them so far.
+
+        One entry per (stream, environment), tagged so, so a push into
+        one environment drops that environment's alone; an act on a
+        mark, a mute, an assignment or a retirement drops them all (Q1
+        reads all four). Filled by whichever page reads first: the
+        environments with no entry are read in ONE statement, the whole
+        stream's when none has one, so a scoped read fills the stream
+        and the next scope is served.
+
+        Q1 is driven from the stream's FAIL rows (the
+        ``idx_latest_runs_result`` range), each reaching its mark by the
+        mark's primary key: ``CROSS JOIN`` pins that order on SQLite,
+        where an inner join let the planner scan the partition (design
+        §6); its cost grows with the stream's failures, not its marks.
+
+        WP-44 item 8: the environments read are those that hold a mark
+        (:meth:`_flaky_environments`): Q1 returns rows from no other, so
+        an environment with no mark has no entry and every reader finds
+        nothing there, as it found an empty entry before, with no
+        statement.
+
+        Migration 13 (design flaky-default-r0 §2 B.1, §3a shapes 1 and
+        2). *defaults* is the map (empty: today's statement exactly,
+        *marked* the "any mark" bit). Each environment with a default
+        that has no entry adds one ``UNION ALL`` member to the same
+        statement: its FAIL rows on the stream (the
+        ``idx_latest_runs_result`` range on stream, FAIL and the
+        environment), each with no mark of its own (the marks by their
+        primary key, only where a mark exists), with its mute, retirement
+        and assignee as Q1 reads them; the cadence and its ``cadence_at``
+        come from the map. *third* (a count path, which decides
+        promotion): at a default of 2 each FAIL-after-FAIL row also
+        carries its third run on the stream, a scalar subquery on the
+        runs UNIQUE index from its latest start (bounded below by
+        *floor* on a build), held as the row's newest three results, so
+        no Q2 is read for it. A rows path reads no promotion and passes
+        False; an entry read so is read again by the first count path
+        that needs the third run. With a default, the marks member
+        carries one NULL column to match.
+        """
+        defaults = defaults or {}
+        names = self._flaky_environments(stream_id, marked, defaults)
+        entries = {}  # type: Dict[str, _FlakyFailing]
+        missing = []  # type: List[str]
+        for name in names:
+            cached = self._cached_summary(("flaky_states", stream_id, name))
+            if cached is None or (third and not cached.third):
+                missing.append(name)
+            else:
+                entries[name] = cached
+        if not missing:
+            return entries
+        fail = Result.FAIL.value
+        defaulted = [name for name in missing if name in defaults]
+        members = []  # type: List[str]
+        params = []  # type: List[Any]
+        if marked:
+            sql = (
+                "SELECT lr.environment, lr.script, lr.test_name, fm.cadence, "
+                "lr.prev_result, lr.start_time, tm.expires_at, "
+                "tr.retired_at, ca.assignee, (SELECT h.acted_at FROM "
+                "flaky_mark_history AS h WHERE h.environment = "
+                "lr.environment AND h.script = lr.script "
+                "AND h.test_name = lr.test_name ORDER BY h.id DESC LIMIT 1)"
+                + (", NULL" if defaulted else "") + " "
+                "FROM latest_runs AS lr "
+                "CROSS JOIN test_flaky_marks AS fm "
+                "  ON fm.environment = lr.environment "
+                " AND fm.script = lr.script AND fm.test_name = lr.test_name "
+                + _MUTE_JOIN + " "
+                "LEFT JOIN test_retirements AS tr "
+                "  ON tr.environment = lr.environment "
+                " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+                "LEFT JOIN current_assignments AS ca "
+                "  ON ca.environment = lr.environment "
+                " AND ca.script = lr.script AND ca.test_name = lr.test_name "
+                "WHERE lr.stream_id = ? AND lr.result = ?"
+            )
+            params.extend([stream_id, fail])
+            if len(missing) < len(names):
+                sql += " AND lr.environment IN ({0})".format(
+                    ", ".join("?" for _ in missing))
+                params.extend(missing)
+            members.append(sql)
+        for name in defaulted:
+            run3 = third and defaults[name].cadence == 2
+            column, column_params = (
+                self._third_run_column(floor) if run3 else ("NULL", []))
+            members.append(
+                "SELECT lr.environment, lr.script, lr.test_name, NULL, "
+                "lr.prev_result, lr.start_time, tm.expires_at, "
+                "tr.retired_at, ca.assignee, NULL, " + column + " "
+                "FROM latest_runs AS lr "
+                + (self._FLAKY_JOIN + " " if marked else "")
+                + _MUTE_JOIN + " "
+                "LEFT JOIN test_retirements AS tr "
+                "  ON tr.environment = lr.environment "
+                " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+                "LEFT JOIN current_assignments AS ca "
+                "  ON ca.environment = lr.environment "
+                " AND ca.script = lr.script AND ca.test_name = lr.test_name "
+                "WHERE lr.stream_id = ? AND lr.result = ? "
+                "AND lr.environment = ?"
+                + (" AND fm.environment IS NULL" if marked else ""))
+            params.extend(column_params)
+            params.extend([stream_id, fail, name])
+        grouped = {}  # type: Dict[str, List[_FlakyFailingRow]]
+        held = {}  # type: Dict[str, Dict[Tuple[str, str, str], Tuple[Result, ...]]]
+        rows_read = (
+            self._conn().execute(" UNION ALL ".join(members),
+                                 params).fetchall()
+            if members else [])
+        # A default's rows are hundreds on a bad night, so what is the
+        # same for all of them is worked out once: the cadence_at text,
+        # and each result's enum member.
+        set_at = dict(
+            (name, model.format_iso(defaults[name].cadence_at))
+            for name in defaulted)  # type: Dict[str, str]
+        as_result = dict(
+            (member.value, member) for member in Result
+        )  # type: Dict[Any, Result]
+        for row in rows_read:
+            environment = row[0]
+            if row[3] is None:
+                cadence = defaults[environment].cadence
+                cadence_set_at = set_at[environment]  # type: Optional[str]
+                is_default = True
+            else:
+                cadence = int(row[3])
+                cadence_set_at = None if row[9] is None else str(row[9])
+                is_default = False
+            prev = None if row[4] is None else as_result[row[4]]
+            # _FlakyFailingRow's field order: the triple, cadence,
+            # prev_result, start_time, mute_expires_at, retired,
+            # assignee, cadence_set_at, default.
+            grouped.setdefault(environment, []).append(_FlakyFailingRow(
+                environment, row[1], row[2], cadence, prev, str(row[5]),
+                None if row[6] is None else str(row[6]), row[7] is not None,
+                row[8], cadence_set_at, is_default))
+            if (is_default and third and cadence == 2
+                    and prev is Result.FAIL):
+                # The newest three on the stream, or all it has: what Q2
+                # at LIMIT 3 would have read, so it reads nothing here.
+                results = (Result.FAIL, Result.FAIL) + (
+                    () if row[10] is None else (Result(row[10]),))
+                held.setdefault(environment, {})[
+                    (environment, row[1], row[2])] = results
+        for name in missing:
+            rows = tuple(grouped.get(name, ()))
+            entry = _FlakyFailing(
+                rows=rows, runs=held.get(name, {}), decided={},
+                third=third or name not in defaults
+                or defaults[name].cadence != 2)
+            key = ("flaky_states", stream_id, name)
+            self._store_summary(key, entry, stream_id, name)
+            entries[name] = entry
+        return entries
+
+    def _third_run_column(
+        self, floor: Optional[datetime.datetime],
+    ) -> Tuple[str, List[Any]]:
+        """Q1's and Qc's run-3 column for a defaulted row at a default of
+        2 (design flaky-default-r0 §3a, shape 1): where the row's previous
+        result is a FAIL, the result of the run before that one on the
+        row's stream, by the runs UNIQUE (triple, start_time) index read
+        backwards from the latest start, two entries; NULL where there is
+        none. *floor* (a build's first run) stops a build's walk back
+        through mainline's year of the same triple. Its parameters come
+        first in the member: the column precedes the WHERE."""
+        sql = (
+            "CASE WHEN lr.prev_result = ? THEN (SELECT r3.result FROM runs "
+            "AS r3 WHERE r3.environment = lr.environment "
+            "AND r3.script = lr.script AND r3.test_name = lr.test_name "
+            "AND r3.stream_id = lr.stream_id "
+            "AND r3.start_time < lr.start_time"
+            + ("" if floor is None else " AND r3.start_time >= ?")
+            + " ORDER BY r3.start_time DESC LIMIT 1 OFFSET 1) END")
+        params = [Result.FAIL.value]  # type: List[Any]
+        if floor is not None:
+            params.append(model.format_iso(floor))
+        return sql, params
+
+    def _flaky_marked(
+        self, stream_id: int,
+        defaults: Optional[Dict[str, FlakyDefault]] = None,
+        marked: bool = True,
+        floor: Optional[datetime.datetime] = None,
+    ) -> _FlakyMarked:
+        """Qc (design §2 B.3(a)), summary paths only, its own entry: the
+        un-retired marks whose test has a run on *stream_id*, counted per
+        environment (``status.flaky_total``), and decision 3's "Newly
+        fixed" candidates, the marked, un-retired tests whose latest
+        result is not FAIL and whose previous one is.
+
+        One statement, two ``UNION ALL`` members, both driven from the
+        marks (``CROSS JOIN``), each mark reaching its ``latest_runs``
+        row by that table's primary key: it counts every mark, so it
+        reads every mark, and nothing else. One entry per stream (a
+        push to any of its environments drops it): one more memo entry
+        per stream read, not one per environment.
+
+        Migration 13 (design flaky-default-r0 §2 B.1, §3a shape 1): with
+        the defaults map (*defaults*; empty, today's statement exactly),
+        each environment with a default adds one member: its fix
+        candidates with no mark of its own (previous result FAIL, latest
+        not, un-retired), read from the environment's primary-key range
+        of the stream's partition and filtered in the engine. They are
+        not counted in ``marks``. At a default of 2 each carries its
+        third run (Q1's run-3 column), held with its latest two, so no
+        Q2 reads it; *floor* bounds that on a build. The marks members
+        then carry two NULL columns to match; with no mark (*marked*
+        False) they are left out."""
+        key = ("flaky_marked", stream_id)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        defaults = defaults or {}
+        fail = Result.FAIL.value
+        pad = ", NULL, NULL" if defaults else ""
+        on_marks = (
+            "FROM test_flaky_marks AS fm CROSS JOIN latest_runs AS lr "
+            "  ON lr.stream_id = ? AND lr.environment = fm.environment "
+            " AND lr.script = fm.script AND lr.test_name = fm.test_name "
+            "LEFT JOIN test_retirements AS tr "
+            "  ON tr.environment = lr.environment "
+            " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+        )
+        members = []  # type: List[str]
+        params = []  # type: List[Any]
+        if marked:
+            members.append(
+                "SELECT lr.environment, lr.script, lr.test_name, fm.cadence, "
+                "lr.start_time, tm.expires_at" + pad + " " + on_marks
+                + _MUTE_JOIN + " WHERE tr.retired_at IS NULL "
+                "AND lr.result <> ? AND lr.prev_result = ?")
+            params.extend([stream_id, fail, fail])
+        for name in sorted(defaults):
+            column, column_params = (
+                self._third_run_column(floor)
+                if defaults[name].cadence == 2 else ("NULL", []))
+            members.append(
+                "SELECT lr.environment, lr.script, lr.test_name, NULL, "
+                "lr.start_time, tm.expires_at, lr.result, " + column + " "
+                "FROM latest_runs AS lr "
+                + (self._FLAKY_JOIN + " " if marked else "")
+                + "LEFT JOIN test_retirements AS tr "
+                "  ON tr.environment = lr.environment "
+                " AND tr.script = lr.script AND tr.test_name = lr.test_name "
+                + _MUTE_JOIN + " WHERE lr.stream_id = ? "
+                "AND lr.environment = ? AND lr.prev_result = ? "
+                "AND lr.result <> ? AND tr.retired_at IS NULL"
+                + (" AND fm.environment IS NULL" if marked else ""))
+            params.extend(column_params)
+            params.extend([stream_id, name, fail, fail])
+        if marked:
+            members.append(
+                "SELECT lr.environment, NULL, NULL, COUNT(*), NULL, "
+                "NULL" + pad + " " + on_marks + "WHERE tr.retired_at IS NULL "
+                "GROUP BY lr.environment")
+            params.append(stream_id)
+        rows = (
+            self._conn().execute(" UNION ALL ".join(members),
+                                 params).fetchall()
+            if members else [])
+        marks = {}  # type: Dict[str, int]
+        candidates = []  # type: List[_FlakyCandidate]
+        held = {}  # type: Dict[Tuple[str, str, str], Tuple[Result, ...]]
+        for row in rows:
+            if row[1] is None:
+                marks[row[0]] = int(row[3])
+                continue
+            if row[3] is None:
+                cadence = defaults[row[0]].cadence
+                is_default = True
+                if cadence == 2:
+                    held[(row[0], row[1], row[2])] = (
+                        Result(row[6]), Result.FAIL) + (
+                            () if row[7] is None else (Result(row[7]),))
+            else:
+                cadence = int(row[3])
+                is_default = False
+            candidates.append(_FlakyCandidate(
+                environment=row[0], script=row[1], test_name=row[2],
+                cadence=cadence, start_time=str(row[4]),
+                mute_expires_at=None if row[5] is None else str(row[5]),
+                default=is_default))
+        frozen = tuple(candidates)
+        entry = _FlakyMarked(marks=marks, candidates=frozen, runs=held,
+                             fixes={})
+        self._store_summary(key, entry, stream_id)
+        return entry
+
+    def _cadence_results(
+        self,
+        stream_id: int,
+        items: Sequence[Tuple[Tuple[str, str, str], str, int,
+                              Dict[Tuple[str, str, str], Tuple[Result, ...]]]],
+        floor: Optional[datetime.datetime],
+        held: Optional[Set[Tuple[str, str, str]]] = None,
+    ) -> Dict[Tuple[str, str, str], Tuple[Result, ...]]:
+        """The newest N+1 results of each test in *items* on *stream_id*:
+        ``(triple, latest start as stored, cadence N, holder)``.
+
+        *held* (design flaky-default-r0 decision 5): the tests judged by
+        their environment's default, at 3 to 10 the one case that still
+        reads Q2. Their answers are kept until the environment's next
+        push, not for the memo's minute: stored at :data:`_HELD_FOREVER`,
+        which no age exceeds. A push into the pair drops them, as any
+        (:meth:`_invalidate_trend_cache`), and the key carries the latest
+        start, so a new run is a new key.
+
+        Served first from *holder* (the memo entry the test came from,
+        or a throwaway dict), then from ``_cadence_runs_cache`` (key
+        ``(stream, triple, latest start, N)``, which no act touches, so a
+        cold read after an act runs Q1 and not Q2), and the rest read in
+        ONE Q2 (:meth:`_cadence_runs_iso`) at LIMIT N+1, one statement
+        per 100 tests. N+1, not N: run N+1 is what says whether a test
+        went over its cadence on this run (decision 25) and whether a
+        pass fixed a real failure (decision 3), so one read serves every
+        list. Each answer is written back to both. *floor* is a build's
+        first run (``None`` on mainline): see :meth:`cadence_runs`.
+        """
+        out = {}  # type: Dict[Tuple[str, str, str], Tuple[Result, ...]]
+        missing = []  # type: List[Tuple[Tuple[str, str, str], str, int, Dict[Tuple[str, str, str], Tuple[Result, ...]]]]
+        wanted = set()  # type: Set[Tuple[str, str, str]]
+        clock = time.time()
+        with self._cadence_runs_lock:
+            for triple, start, cadence, holder in items:
+                if triple in out or triple in wanted:
+                    continue
+                kept = holder.get(triple)
+                if kept is not None:
+                    out[triple] = kept
+                    continue
+                entry = self._cadence_runs_cache.get(
+                    (stream_id, triple, start, cadence))
+                if (entry is not None
+                        and clock - entry[0] <= _TREND_CACHE_TTL_SECONDS):
+                    out[triple] = entry[1]
+                    holder[triple] = entry[1]
+                    continue
+                wanted.add(triple)
+                missing.append((triple, start, cadence, holder))
+        if not missing:
+            return out
+        read = self._cadence_runs_iso(
+            stream_id,
+            [triple + (start, cadence + 1)
+             for triple, start, cadence, _holder in missing],
+            floor)
+        stored = time.time()
+        with self._cadence_runs_lock:
+            for triple, start, cadence, holder in missing:
+                results = tuple(read.get(triple, []))
+                if (len(self._cadence_runs_cache)
+                        >= _CADENCE_RUNS_CACHE_MAX_ENTRIES):
+                    self._cadence_runs_cache.clear()
+                self._cadence_runs_cache[
+                    (stream_id, triple, start, cadence)] = (
+                        _HELD_FOREVER if held and triple in held
+                        else stored, results)
+                holder[triple] = results
+                out[triple] = results
+        return out
+
+    def flaky_view(
+        self,
+        stream_id: int,
+        now: Optional[datetime.datetime],
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
+        marks: bool = False,
+        failing: bool = True,
+        floor: Optional[datetime.datetime] = None,
+        marked: Optional[bool] = None,
+        defaults: Optional[Dict[str, FlakyDefault]] = None,
+        promotion: bool = True,
+    ) -> Optional[FlakyView]:
+        """What the counts and the lists need of *stream_id*'s marked
+        tests in one scope (WP-44 item 6), or None when no mark exists
+        anywhere, known from the bit (*marked*, else
+        :meth:`flaky_marks_exist`) with no statement of its own.
+
+        Migration 13 (design flaky-default-r0 §2 B.1, B.4): every test
+        with no mark of its own in an environment with a default is
+        judged at the default's cadence, as a marked test is, and moves
+        the same counts. *defaults*
+        is the map when the caller has it, else read where the mute
+        epoch's entry (which this read makes anyway) says a default
+        exists; None is returned only with no mark and no default.
+        ``marks`` still counts marks alone (``flaky_total``).
+        *promotion* False is a rows path (the Flaking queue, design
+        §3a L): a defaulted FAIL after a FAIL at a default of 2 is then
+        decided by its pair and nothing reads its third run; P is not
+        known, so such a view moves no count by promotion. It changes
+        nothing where no default exists.
+
+        *failing* reads Q1 (:meth:`_flaky_failing`) and gives every
+        un-muted, un-retired marked FAIL test in scope its state (the
+        rule is ``analytics.flaky_state``): the ``flaking`` ones are F,
+        set aside; a test over its cadence that went over on its latest
+        run is P (decision 25). *marks* reads Qc (:meth:`_flaky_marked`):
+        ``marks`` (``flaky_total``) and the "Newly fixed" candidates, a
+        pass that follows a tolerated failure being in no Fixed figure
+        (decision 3). Each test is classified once per memo entry
+        (:meth:`_flaky_decide`, with the one Q2 those need), so the
+        headline, the queue counts and each queue share the rule's
+        answers.
+
+        A live mute wins over the mark, so a muted test moves no count
+        here (the mute rule already moved it); mute liveness is compared
+        with *now*, never memoized. A retired test is in no count.
+        Counts are exact without a pass of their own: they are sums over
+        ``counted``, as :meth:`_subtract_muted` does it.
+        """
+        at = now or model.utcnow()
+        if marked is None or defaults is None:
+            bit_marked, bit_defaulted = self.flaky_bits(stream_id, at)
+            if marked is None:
+                marked = bit_marked
+            if defaults is None:
+                defaults = (
+                    self.flaky_defaults_map() if bit_defaulted else {})
+        if not marked and not defaults:
+            return None
+        promote = promotion or not defaults
+        # The answer itself is memoized too, whole-stream, keyed on the
+        # mute epoch like every mute-aware memo (which mutes are live
+        # cannot change before it except by a write, which drops it).
+        epoch = self.mute_epoch(stream_id, at)
+        envs_key = (
+            None if environments is None else tuple(sorted(environments)))
+        key = ("flaky_view", stream_id, environment, envs_key, marks,
+               failing, epoch, promote)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return cached
+        at_iso = model.format_iso(at)
+        allowed = None if environments is None else set(environments)
+
+        def in_scope(name: str) -> bool:
+            return ((environment is None or name == environment)
+                    and (allowed is None or name in allowed))
+
+        rows = []  # type: List[Tuple[_FlakyFailingRow, _FlakyFailing]]
+        # WP-44 item 8: a muted test moves no count, but the lists show
+        # its state, and the assigned queue read its own runs for one
+        # after a Home load until it was decided here too (it is
+        # assigned, so on the assigned queue and Open Actions), and the
+        # one a pair cannot decide needs Q2. It is read in this one Q2,
+        # so a list after a Home load reads none; a muted test whose
+        # pair decides it costs nothing here.
+        decide = []  # type: List[Tuple[_FlakyFailingRow, _FlakyFailing]]
+        if failing:
+            entries = self._flaky_failing(
+                stream_id, defaults, marked, floor, third=promote)
+            for name in sorted(entries):
+                if not in_scope(name):
+                    continue
+                entry = entries[name]
+                for row in entry.rows:
+                    if row.retired:
+                        continue
+                    if _mute_live(row.mute_expires_at, at_iso):
+                        if (row.prev_result is Result.FAIL
+                                and row.cadence > 2):
+                            decide.append((row, entry))
+                        continue
+                    rows.append((row, entry))
+                    decide.append((row, entry))
+        candidates = []  # type: List[_FlakyCandidate]
+        marked_entry = None  # type: Optional[_FlakyMarked]
+        total = 0
+        if marks:
+            marked_entry = self._flaky_marked(
+                stream_id, defaults, marked, floor)
+            total = sum(count for name, count in marked_entry.marks.items()
+                        if in_scope(name))
+            candidates = [
+                candidate for candidate in marked_entry.candidates
+                if in_scope(candidate.environment)
+                and not _mute_live(candidate.mute_expires_at, at_iso)]
+        self._flaky_decide(stream_id, decide, marked_entry, candidates, floor,
+                           promote)
+        states = {}  # type: Dict[Tuple[str, str, str], FlakyState]
+        counted = []  # type: List[FlakyCount]
+        for row, entry in rows:
+            triple = (row.environment, row.script, row.test_name)
+            state, over = entry.decided[triple]
+            states[triple] = state
+            if state.state == FLAKY_FLAKING:
+                counted.append(FlakyCount(
+                    environment=row.environment, script=row.script,
+                    test_name=row.test_name, role=FLAKY_ROLE_FLAKING,
+                    prev_fail=row.prev_result is Result.FAIL,
+                    assigned=row.assignee is not None))
+            elif over:
+                counted.append(FlakyCount(
+                    environment=row.environment, script=row.script,
+                    test_name=row.test_name, role=FLAKY_ROLE_PROMOTED,
+                    prev_fail=True, assigned=row.assignee is not None))
+        for candidate in candidates:
+            triple = (candidate.environment, candidate.script,
+                      candidate.test_name)
+            if marked_entry is not None and not marked_entry.fixes[triple]:
+                counted.append(FlakyCount(
+                    environment=candidate.environment,
+                    script=candidate.script,
+                    test_name=candidate.test_name,
+                    role=FLAKY_ROLE_TOLERATED, prev_fail=True,
+                    assigned=False))
+        view = FlakyView(counted=counted, marks=total, states=states)
+        self._store_summary(key, view, stream_id)
+        return view
+
+    def _flaky_decide(
+        self,
+        stream_id: int,
+        rows: Sequence[Tuple[_FlakyFailingRow, _FlakyFailing]],
+        marked_entry: Optional[_FlakyMarked],
+        candidates: Sequence[_FlakyCandidate],
+        floor: Optional[datetime.datetime],
+        promotion: bool = True,
+    ) -> None:
+        """Classify, once per memo entry, each of *rows* and *candidates*
+        not classified yet: a Q1 row's state and whether it went over on
+        its latest run, into its ``flaky_states`` entry's ``decided``; a
+        candidate's "is this pass a real fix", into Qc's ``fixes``.
+
+        Migration 13: a row or candidate judged by its environment's
+        default is classified by the same rule at the default's cadence;
+        at a default of 2 its newest three are already in its holder
+        (Q1's and Qc's run-3 column), so Q2 reads nothing for it, and at
+        3 to 10 its Q2 answer is held until the environment's next push
+        (decision 5). With *promotion* False (a rows path, design §3a L)
+        a defaulted FAIL after a FAIL at 2 whose third run is not held
+        is decided by its pair, "went over" left unknown (None), and a
+        later count path decides it again.
+
+        Q2 is read, in one :meth:`_cadence_results`, only for what the
+        latest two results cannot decide (design §2 B.1): a FAIL after a
+        FAIL (at a cadence of 3 to 10 for its state; at 2 for whether it
+        went over, the state being "failing" either way) and each fix
+        candidate. Every other row is decided by its own pair, the rule
+        asked once per (cadence, pair). A test goes over on a RUN, so
+        one whose latest run is older than its cadence (a mark or a
+        cadence change since) is not New (design §1: a cadence change
+        brings no run); Q1 carries the mark's newest act for this.
+        """
+        rules = _flaky_rules()
+        todo = []  # type: List[Tuple[_FlakyFailingRow, _FlakyFailing]]
+        need = []  # type: List[Tuple[Tuple[str, str, str], str, int, Dict[Tuple[str, str, str], Tuple[Result, ...]]]]
+        by_pair = {}  # type: Dict[Tuple[int, Optional[Result]], FlakyState]
+        held = set()  # type: Set[Tuple[str, str, str]]
+
+        def pair_state(row: _FlakyFailingRow) -> FlakyState:
+            pair_key = (row.cadence, row.prev_result)
+            state = by_pair.get(pair_key)
+            if state is None:
+                state = by_pair[pair_key] = rules.flaky_state(
+                    row.cadence,
+                    (Result.FAIL,) if row.prev_result is None
+                    else (Result.FAIL, row.prev_result))
+            return state
+
+        for row, entry in rows:
+            triple = (row.environment, row.script, row.test_name)
+            found = entry.decided.get(triple)
+            if found is not None and (found[1] is not None or not promotion):
+                continue
+            # At a cadence of 2 a FAIL after a FAIL is "failing" by its
+            # pair; Q2 would only say whether it went over on this run,
+            # which it cannot have when the cadence was set after it.
+            settled = (row.cadence == 2 and row.cadence_set_at is not None
+                       and row.start_time < row.cadence_set_at)
+            if row.prev_result is Result.FAIL and not settled:
+                if (not promotion and row.default and row.cadence == 2
+                        and triple not in entry.runs):
+                    entry.decided[triple] = (pair_state(row), None)
+                    continue
+                todo.append((row, entry))
+                need.append((triple, row.start_time, row.cadence,
+                             entry.runs))
+                if row.default:
+                    held.add(triple)
+                continue
+            entry.decided[triple] = (pair_state(row), False)
+        open_candidates = []  # type: List[_FlakyCandidate]
+        if marked_entry is not None:
+            for candidate in candidates:
+                triple = (candidate.environment, candidate.script,
+                          candidate.test_name)
+                if triple in marked_entry.fixes:
+                    continue
+                open_candidates.append(candidate)
+                need.append((triple, candidate.start_time, candidate.cadence,
+                             marked_entry.runs))
+                if candidate.default:
+                    held.add(triple)
+        if not need:
+            return
+        runs = self._cadence_results(stream_id, need, floor, held)
+        for row, entry in todo:
+            triple = (row.environment, row.script, row.test_name)
+            results = runs[triple]
+            state = rules.flaky_state(row.cadence, results)
+            over = (state is not None and state.state == FLAKY_FAILING
+                    and (row.cadence_set_at is None
+                         or row.start_time >= row.cadence_set_at)
+                    and rules.flaky_went_over(row.cadence, results))
+            entry.decided[triple] = (state, over)
+        if marked_entry is not None:
+            for candidate in open_candidates:
+                triple = (candidate.environment, candidate.script,
+                          candidate.test_name)
+                marked_entry.fixes[triple] = rules.flaky_fix_counts(
+                    candidate.cadence, runs.get(triple, ()))
+
+    def _subtract_flaky(
+        self, counts: Dict[str, int], view: Optional[FlakyView],
+    ) -> Dict[str, int]:
+        """:meth:`queue_counts`' step after :meth:`_subtract_muted`, on
+        the same copy: F leaves New failures or Still failing by its
+        previous result, P moves from Still failing to New failures, and
+        a pass after a tolerated failure leaves Fixed (design §2
+        B.3(d), decision 3). Every other queue is as it was: the
+        open-assignment figures do not move."""
+        if view is None:
+            return counts
+        for entry in view.counted:
+            if entry.role == FLAKY_ROLE_FLAKING:
+                counts["still_failing" if entry.prev_fail
+                       else "new_failures"] -= 1
+            elif entry.role == FLAKY_ROLE_PROMOTED:
+                counts["new_failures"] += 1
+                counts["still_failing"] -= 1
+            elif entry.role == FLAKY_ROLE_TOLERATED:
+                counts["fixed"] -= 1
+        return counts
 
     def set_assignee(
         self,
@@ -8891,12 +12669,24 @@ class Storage:
         open_items: bool = False,
         muted: Optional[bool] = None,
         now: Optional[datetime.datetime] = None,
+        flaking: Optional[bool] = None,
+        floor: Optional[datetime.datetime] = None,
+        marks: Optional[bool] = None,
+        flaky_defaults: Optional[Dict[str, FlakyDefault]] = None,
     ) -> int:
         """Assign or clear EVERY test matching the SAME filters
         :meth:`dashboard` would return, in one transaction. Returns the
         number of matched triples — always equal to
         :meth:`dashboard_count` for the identical filters, since both
         read :meth:`_dashboard_filters`'s clauses over the same join.
+
+        WP-44 item 8: *flaking* and *open_items* leave out exactly what
+        :meth:`dashboard_page` leaves out (WP-26's agreement of rows,
+        total and bulk), read before the transaction from the same memo
+        and dropped from the matched keys in Python on both engines: the
+        read already returns every matched key, so a bound list would
+        only lengthen it. *marks* is the "any mark" bit when the caller
+        has it, else it is read only when one of the two could apply.
 
         Open Actions' bulk assign/unassign (2026-08-10, found while
         cleaning up assignments a dead build left behind — cleanup was
@@ -8946,6 +12736,15 @@ class Storage:
         )  # type: Optional[List[str]]
         if result_values is not None and not result_values:
             return 0
+        if marks is None:
+            marks, flaky_defaults = self._list_bits(
+                flaking is not None or open_items, stream_id, now)
+        result_values, aside = self._set_aside(
+            stream_id, environment, environments, script, result_values,
+            include_retired, assignees, include_unassigned, assigned_only,
+            open_items, flaking, now, floor, bool(marks), flaky_defaults)
+        if result_values is not None and not result_values:
+            return 0
         clauses, params = self._dashboard_filters(
             environment, script, result_values, q, stale_before,
             include_retired, assignees, include_unassigned, environments,
@@ -8954,18 +12753,23 @@ class Storage:
         )
         sql = (
             "SELECT lr.environment, lr.script, lr.test_name, "
-            "ca.environment IS NOT NULL " + self._LATEST_COUNT_JOIN
+            "ca.environment IS NOT NULL, lr.result "
+            + self._LATEST_COUNT_JOIN
         )
-        if muted is not None:
-            # The only filter that reads `tm`; see _LATEST_COUNT_JOIN.
+        if self._reads_mutes(clauses):
+            # The only filters that read `tm`; see _LATEST_COUNT_JOIN.
             sql += " " + _MUTE_JOIN
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
+        kept = None if aside is None else self._set_aside_keeps(aside)
 
         conn = self._conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
             rows = conn.execute(sql, params).fetchall()
+            if kept is not None:
+                rows = [row for row in rows
+                        if kept((row[0], row[1], row[2]), row[4])]
             if not rows:
                 conn.execute("COMMIT")
                 return 0

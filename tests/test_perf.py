@@ -265,6 +265,12 @@ class RouteLabelTest(unittest.TestCase):
         self.assertEqual(
             perf.route_label("PUT", "/api/environments/win-sim/product"),
             "PUT /api/environments/*/product")
+        # Migration 13: an environment's default flaky cadence is not
+        # the expected count's or the product's row.
+        self.assertEqual(
+            perf.route_label(
+                "PUT", "/api/environments/win-sim/flaky-default"),
+            "PUT /api/environments/*/flaky-default")
         self.assertEqual(
             perf.route_label(
                 "GET", "/api/tests/linux/suite.py/test_x/streams"),

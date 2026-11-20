@@ -47,8 +47,12 @@
 "use strict";
 
 import {
+  FLAKY_BAR_OWN_MARK_CLAUSE,
+  FLAKY_BAR_UNMARK_TITLE,
   clearNode,
   el,
+  flakyCadenceSelect,
+  hasOwnMark,
   muteDurationSelect,
   postJson,
   rememberUser,
@@ -57,7 +61,13 @@ import {
   userPickerSelect,
 } from "./api.js";
 import { entryKey } from "./review.js";
-import { apiUrl, bulkMutesUrl, unmuteUrl } from "./urls.js";
+import {
+  apiUrl,
+  bulkFlakyUrl,
+  bulkMutesUrl,
+  unmarkFlakyUrl,
+  unmuteUrl,
+} from "./urls.js";
 
 /**
  * The bulk endpoint's URL, EVERY scope level explicitly cleared.
@@ -91,7 +101,12 @@ function bulkCommentsUrl() {
   );
 }
 
-/** key -> {environment, script, test_name, stream_id, namespace}. */
+/** key -> {environment, script, test_name, stream_id, marked,
+ * underDefault, namespace}.
+ * `marked` is whether the row came with a flaky mark of its own (WP-44):
+ * a row under its environment's default has none (hasOwnMark()), so the
+ * bar offers it Mark, which gives it one, and never touches the default
+ * (flaky-default design §3 U5); `underDefault` is such a row. */
 const selected = new Map();
 
 /** Functions to call after a successful bulk action, one per mount. */
@@ -109,6 +124,20 @@ let commentBtnEl = null;
 let muteDurationEl = null;
 let muteBtnEl = null;
 let unmuteBtnEl = null;
+let flakyCadenceEl = null;
+let flakyBtnEl = null;
+let unmarkBtnEl = null;
+/** True while a mark, cadence or unmark request is in flight. */
+let flakyInFlight = false;
+
+const MARK_FLAKY_TITLE = "Mark the selected tests as flaky at the "
+  + "cadence chosen, on mainline and every build, until the mark is "
+  + "removed. Needs a reason (the note box) and a cadence. You own the "
+  + "mark; the “Assign to” box is not read. The reason is also "
+  + "posted as a comment.";
+const SET_CADENCE_TITLE = "Change the cadence of the selected tests’ "
+  + "flaky marks; each keeps its owner. A note, if there is one, is "
+  + "posted as a comment.";
 
 function selectionEntries() {
   return Array.from(selected.values());
@@ -190,6 +219,7 @@ function updateCommentButtonState() {
   commentBtnEl.disabled =
     noteInputEl.value.trim() === "" || selected.size === 0;
   updateMuteButtonState();
+  updateFlakyButtonState();
 }
 
 /** Mute needs all three: an owner (the "Assign to" box), a reason (the
@@ -205,6 +235,62 @@ function updateMuteButtonState() {
     || !userSelectEl.value
     || noteInputEl.value.trim() === ""
     || !muteDurationEl.value;
+}
+
+/** True when every ticked row came with a flaky mark of its own, so the
+ * act is a cadence change, which needs no reason. A row with no `flaky`
+ * field is an unmarked test (the lists send the field from WP-44's item
+ * 6; until then the bar always offers Mark), and a row under its
+ * environment's default is not marked. */
+function allSelectedMarked() {
+  if (selected.size === 0) {
+    return false;
+  }
+  for (const entry of selected.values()) {
+    if (!entry.marked) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** True when a ticked row is under its environment's flaky default
+ * (`underDefault`): Mark's title then says such a test gets a mark of
+ * its own (flaky-default design §3 U5), as the Review panel's does. */
+function anySelectedUnderDefault() {
+  for (const entry of selected.values()) {
+    if (entry.underDefault) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** The Flaky group's one button (WP-44): "Mark as flaky", or "Set
+ * cadence" when every ticked row is marked already. Marking needs a
+ * reason (the note box) and a cadence, changing a cadence only the
+ * cadence; the button stays disabled until it has them, so the bar
+ * says what is missing before the server has to. Nobody is named: the
+ * mark belongs to whoever makes it (decision 12).
+ *
+ * Also the one place Unmark's state is derived, and both stay disabled
+ * while a Flaky request is in flight (`flakyInFlight`): typing in the
+ * note box, changing the cadence or ticking a row reaches this function,
+ * and none of them may re-arm a button whose request has not answered. */
+function updateFlakyButtonState() {
+  if (!flakyBtnEl) {
+    return;
+  }
+  const cadenceOnly = allSelectedMarked();
+  flakyBtnEl.textContent = cadenceOnly ? "Set cadence" : "Mark as flaky";
+  flakyBtnEl.title = cadenceOnly ? SET_CADENCE_TITLE
+    : MARK_FLAKY_TITLE + (anySelectedUnderDefault()
+      ? " " + FLAKY_BAR_OWN_MARK_CLAUSE : "");
+  flakyBtnEl.disabled = flakyInFlight
+    || selected.size === 0
+    || !flakyCadenceEl.value
+    || (!cadenceOnly && noteInputEl.value.trim() === "");
+  unmarkBtnEl.disabled = flakyInFlight || selected.size === 0;
 }
 
 /**
@@ -373,6 +459,83 @@ async function doUnmute() {
   }
 }
 
+/**
+ * Mark every selected test as flaky, or change the cadence of their
+ * marks (WP-44), mirroring doMute: the reason is the note box, the
+ * cadence the select beside the button. The person marking owns the
+ * mark, so the "Assign to" box is not read and no owner is sent. The
+ * server answers {marked, changed, unchanged, unknown}; like the mute
+ * group's counts they are not shown, and the bar clears and the page
+ * refreshes as it does after a mute.
+ */
+async function doMarkFlaky() {
+  if (flakyInFlight) {
+    return;
+  }
+  const me = requireUsername();
+  if (!me) {
+    showError(
+      "Set a username first (the “Change” button, top right) "
+      + "— flaky marks are recorded against a name.");
+    return;
+  }
+  const cadence = Number(flakyCadenceEl.value);
+  const reason = noteInputEl.value.trim();
+  if (!cadence || selected.size === 0
+      || (!reason && !allSelectedMarked())) {
+    return;
+  }
+  const body = { username: me, cadence: cadence, tests: testsPayload() };
+  if (reason) {
+    body.reason = reason;
+  }
+  flakyInFlight = true;
+  updateFlakyButtonState();
+  try {
+    await postJson(bulkFlakyUrl(), body);
+    noteInputEl.value = "";
+    flakyCadenceEl.value = "";
+    clearSelection();
+    notifyChanged();
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    flakyInFlight = false;
+    updateFlakyButtonState();
+  }
+}
+
+/** Remove the flaky mark of every selected test that has one (WP-44).
+ * Needs only a selection, as Unmute does: rows with no mark are left
+ * alone. */
+async function doUnmarkFlaky() {
+  if (flakyInFlight) {
+    return;
+  }
+  const me = requireUsername();
+  if (!me) {
+    showError(
+      "Set a username first (the “Change” button, top right) "
+      + "— this is recorded against your name.");
+    return;
+  }
+  if (selected.size === 0) {
+    return;
+  }
+  flakyInFlight = true;
+  updateFlakyButtonState();
+  try {
+    await postJson(unmarkFlakyUrl(), { username: me, tests: testsPayload() });
+    clearSelection();
+    notifyChanged();
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    flakyInFlight = false;
+    updateFlakyButtonState();
+  }
+}
+
 function ensureBar() {
   if (barEl) {
     return;
@@ -451,6 +614,29 @@ function ensureBar() {
 
   barEl.appendChild(el("span", "selection-sep", "·"));
 
+  flakyCadenceEl = flakyCadenceSelect("selection-cadence-select");
+  flakyCadenceEl.addEventListener("change", updateFlakyButtonState);
+  barEl.appendChild(document.createTextNode("Flaky "));
+  barEl.appendChild(flakyCadenceEl);
+
+  flakyBtnEl = el("button", "selection-flaky-btn", "Mark as flaky");
+  flakyBtnEl.type = "button";
+  flakyBtnEl.disabled = true;
+  flakyBtnEl.title = MARK_FLAKY_TITLE;
+  flakyBtnEl.addEventListener("click", doMarkFlaky);
+  barEl.appendChild(flakyBtnEl);
+
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
+  unmarkBtnEl = el("button", "selection-unmark-btn", "Unmark");
+  unmarkBtnEl.type = "button";
+  unmarkBtnEl.disabled = true;
+  unmarkBtnEl.title = FLAKY_BAR_UNMARK_TITLE;
+  unmarkBtnEl.addEventListener("click", doUnmarkFlaky);
+  barEl.appendChild(unmarkBtnEl);
+
+  barEl.appendChild(el("span", "selection-sep", "·"));
+
   const clearBtn = el("button", "selection-clear-btn", "Clear selection");
   clearBtn.type = "button";
   clearBtn.addEventListener("click", clearSelection);
@@ -476,6 +662,8 @@ function renderBar() {
   updateAssignButtonState();
   unassignBtnEl.disabled = false;
   unmuteBtnEl.disabled = false;
+  // Unmark's state is updateFlakyButtonState()'s, reached above through
+  // updateAssignButtonState(): it holds while a Flaky request is out.
 }
 
 /**
@@ -538,6 +726,8 @@ export function mountSelectableTable(table, options) {
           test_name: entry.test_name,
           stream_id: entry.stream_id !== undefined
             ? entry.stream_id : null,
+          marked: hasOwnMark(entry.flaky),
+          underDefault: Boolean(entry.flaky) && !hasOwnMark(entry.flaky),
           namespace: namespace,
         });
       } else {
