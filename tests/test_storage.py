@@ -77,6 +77,49 @@ def make_record(
     )
 
 
+def plan_searches(line: str, alias: str) -> bool:
+    """Is *line*, an upper-cased ``EXPLAIN QUERY PLAN`` detail, a SEARCH
+    of the table aliased *alias*? SQLite before 3.36 (3.26 on the
+    deployment's RHEL 8) writes ``SEARCH TABLE RUNS AS F USING ...``,
+    later versions ``SEARCH F USING ...``: the alias is read as a token,
+    as the plan guards of FlakyPlanTest and DefaultPlanTest read it
+    (``" F " in line + " "``), never as the word after SEARCH. An alias
+    is never a table's name: the old wording names the table too."""
+    return (line.startswith("SEARCH")
+            and " {0} ".format(alias.upper()) in line + " ")
+
+
+class PlanWordingTest(unittest.TestCase):
+    """The plan guards' reading of a SEARCH line holds on both wordings,
+    so a guard written against one SQLite fails here, on any machine,
+    and not only on the version it was not written on."""
+
+    OLD = ("SEARCH TABLE RUNS AS F USING COVERING INDEX "
+           "IDX_RUNS_START_TIME_RESULT (START_TIME>?)")
+    NEW = ("SEARCH F USING COVERING INDEX IDX_RUNS_START_TIME_RESULT "
+           "(START_TIME>?)")
+
+    def test_both_wordings_read_alike(self) -> None:
+        for line in (self.OLD, self.NEW):
+            self.assertTrue(plan_searches(line, "f"), line)
+            self.assertFalse(plan_searches(line, "r"), line)
+            self.assertIn("COVERING INDEX IDX_RUNS_START_TIME_RESULT", line)
+        self.assertTrue(plan_searches(
+            "SEARCH TABLE RUNS AS P USING INDEX SQLITE_AUTOINDEX_RUNS_1 "
+            "(ENVIRONMENT=? AND SCRIPT=? AND TEST_NAME=? AND START_TIME>? "
+            "AND START_TIME<?)", "p"))
+        self.assertTrue(plan_searches(
+            "SEARCH P USING INDEX SQLITE_AUTOINDEX_RUNS_1 (ENVIRONMENT=? "
+            "AND SCRIPT=? AND TEST_NAME=? AND START_TIME>? AND "
+            "START_TIME<?)", "p"))
+        self.assertFalse(plan_searches(
+            "SCAN TABLE RUNS AS F", "f"))
+        # The reading that failed on 3.26: the alias as the word after
+        # SEARCH holds on the new wording only.
+        self.assertFalse(self.OLD.startswith("SEARCH F"))
+        self.assertTrue(self.NEW.startswith("SEARCH F"))
+
+
 class StorageTestBase(unittest.TestCase):
     """Creates a Storage on a temp-file database with safe cleanup."""
 
@@ -16398,11 +16441,12 @@ class DefaultTrendStatementsTest(_DefaultTrendBase):
         note = (sqlite3.sqlite_version, plan)
         self.assertIn("COVERING INDEX IDX_RUNS_START_TIME_RESULT", plan[0],
                       note)
-        self.assertTrue(plan[0].startswith("SEARCH F"), note)
-        r = [line for line in plan if line.startswith("SEARCH R ")]
+        # Both wordings (SQLite 3.26 and 3.50): plan_searches.
+        self.assertTrue(plan_searches(plan[0], "f"), note)
+        r = [line for line in plan if plan_searches(line, "r")]
         self.assertEqual(len(r), 1, note)
         self.assertIn("INTEGER PRIMARY KEY", r[0], note)
-        p = [line for line in plan if line.startswith("SEARCH P ")]
+        p = [line for line in plan if plan_searches(line, "p")]
         self.assertEqual(len(p), 2, note)
         for line in p:
             self.assertIn("SQLITE_AUTOINDEX_RUNS_1", line, note)
