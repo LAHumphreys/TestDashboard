@@ -48,74 +48,39 @@
     <section class="release" data-drop-date="2026-11-11">
       <div class="section-head">
         <h2 class="eyebrow">11 November 2026</h2>
-        <span class="muted">New: mark a test as flaky, and the board tells a flaking test from a failing one</span>
+        <span class="muted">New: flaky tests. Mark one test, or set a default for an environment, and the board tells flaking from failing</span>
       </div>
 
       <h3>What's new</h3>
       <ul>
-        <li><strong>Mark a test as flaky.</strong> Tick its rows and choose
-          <strong>Mark as flaky</strong>, or choose it at the top of the
-          test&rsquo;s own page, under its latest result, whether it is
-          passing or failing, with a reason and how many failures in a row count as
-          failing, from 2 to 10. The mark covers mainline and every build
-          until someone chooses <strong>Unmark</strong>; <strong>Set
-          cadence</strong> changes the number.</li>
-        <li><strong>Flaking is its own state.</strong> A marked test that
-          fails, but fewer times in a row than its cadence, reads
-          <em>FLAKING</em> in its own colour, and the figures it is taken
-          out of say so beside them (&ldquo;+4 flaking&rdquo;); it still
-          counts against the pass rate. The charts draw it as its own part, after
-          muted. The night it fails past its cadence it is a new failure,
-          red again: <em>FLAKING &rarr; FAIL</em>.</li>
-        <li><strong>Open Actions leaves out unassigned tests that are
-          flaking</strong> until they fail past their cadence, and says so
-          under the count; an assigned one stays, reading FLAKING.
-          &ldquo;All clear&rdquo; on the home page names what is set
-          aside.</li>
-        <li><strong>All tests gains a FLAKING filter</strong>, beside FAIL,
-          once a test in view is marked; FAIL now leaves the flaking tests
-          out, and the two together are every failing test.</li>
-        <li><strong>A Flaking tab in Triage</strong> lists the tests
-          flaking now, nearest to their cadence first, each with its
-          streak (&ldquo;2 in a row, failing after 3&rdquo;). You review them
-          as on any other tab: the run&rsquo;s output, comments, assigning,
-          muting, and the mark&rsquo;s reason, <strong>Set
-          cadence</strong> and <strong>Unmark</strong> are under
-          <strong>Review</strong> on every row. The &ldquo;flaking&rdquo;
-          count under &ldquo;All clear&rdquo; opens it.</li>
-        <li><strong>Muting a test that has stopped running takes it off
-          Not run</strong>: the tile, the tab and the &ldquo;Not run
-          recently&rdquo; filter in All tests leave it out, as the failing
-          figures leave out a muted failure, and the tile says how many
-          (&ldquo;+2 muted&rdquo;). The Muted tab still lists it.</li>
-        <li><strong>Admin</strong>: Manage people and Environment
-          expectations have moved from the foot of Open Actions to their
-          own page, Admin, in the navigation bar, as People and
-          Environments.</li>
-        <li><strong>A flaky default for an environment</strong>, set on
-          Admin in the environment&rsquo;s row with a reason (&ldquo;fail
-          after 2 in a row&rdquo;, 2 to 10): a test there with no mark of
-          its own counts as failing only once its last N runs have failed.
-          It reads the most recent runs, not one night&rsquo;s: one
-          failure on each of two nights counts, and the test may then show
-          under Fixed. <strong>Change</strong> and <strong>Remove</strong>
-          take a reason too, and every change is kept under the
-          row&rsquo;s <strong>History</strong>.</li>
-        <li><strong>A test flaking under a default reads as a marked one
-          does</strong>: <em>FLAKING</em>, counted as flaking and listed in
-          the Flaking tab and under the FLAKING filter, with no
-          &ldquo;flaky&rdquo; pill. Under <strong>Review</strong> it says
-          the cadence is the environment&rsquo;s default and offers
-          <strong>Mark as flaky</strong>, which gives the test a mark of its
-          own that wins over the default, and <strong>Change the
-          default</strong>, which opens the environment&rsquo;s row on
-          Admin. The test&rsquo;s own page says the default whatever its
-          result.</li>
-        <li><strong>Failing runs per day counts the default too</strong>:
-          failures a default tolerated draw as flaking, as everywhere else.
-          The chart now draws once, a moment after the rest of the page,
-          with every part in place; if its parts cannot be loaded it draws
-          the totals and says so.</li>
+        <li><strong>Mark a test as flaky.</strong> Tick its rows, or use the
+          top of the test&rsquo;s own page, and give a reason and how many
+          failures in a row count as failing (2 to 10). The mark covers
+          mainline and every build until someone chooses
+          <strong>Unmark</strong>; <strong>Set cadence</strong> changes the
+          number.</li>
+        <li><strong>Flaking is its own state.</strong> A flaky test that
+          fails fewer times in a row than its cadence reads
+          <em>FLAKING</em>, in its own colour: on its own tile and Triage
+          tab, in the charts, beside the failing figures it is taken out
+          of (&ldquo;+4 flaking&rdquo;) and under a FLAKING filter in All
+          tests. It still counts against the pass rate. The night it fails
+          past its cadence it is a new failure, red again.</li>
+        <li><strong>A flaky default, for an environment that needs
+          one.</strong> Some environments are noisier than others. Where a
+          single failure in an environment is usually not the test, give
+          that environment a default on the new Admin page (&ldquo;fail
+          after 2 in a row&rdquo;) instead of marking its tests one by one.
+          Every test there with no mark of its own is then flaky at that
+          cadence; other environments are not affected. It reads a
+          test&rsquo;s most recent runs, not one night&rsquo;s, so one
+          failure on each of two nights counts. Every change takes a reason
+          and is kept under <strong>History</strong>.</li>
+        <li><strong>Also.</strong> Manage people and Environment
+          expectations have moved from the foot of Open Actions to
+          <strong>Admin</strong>, in the navigation bar. Muting a test that
+          has stopped running takes it off Not run. Failing runs per day now
+          draws once, a moment after the rest of the page.</li>
       </ul>
     </section>
 

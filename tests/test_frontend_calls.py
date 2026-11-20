@@ -2650,7 +2650,10 @@ class FirstPaintTest(unittest.TestCase):
 
     def test_the_placeholders_are_the_real_tiles(self) -> None:
         """Same labels, same order, same classes: the numbers replace
-        the placeholders and nothing on the page moves."""
+        the placeholders and nothing on the page moves. Every tile drawn
+        on every board has one; the Flaking tile, drawn only where a
+        flaky mark or default is in scope (FlakingTileTest), has none, so
+        a board without one never flashes an eighth box."""
         html = read("index.html")
         row = html[html.index('id="stat-tiles"'):]
         row = row[:row.index("</div>\n    </section>")]
@@ -2663,6 +2666,10 @@ class FirstPaintTest(unittest.TestCase):
         self.assertEqual(row.count('class="tile '), len(real))
         self.assertIn('class="tile tile-hero tile-skeleton"', row)
         self.assertEqual(row.count("tile-skeleton"), len(real))
+        # The Flaking tile's label is its tab's (api.js spells every
+        # flaky word), so the literal scan above does not see it.
+        self.assertIn("label: FLAKING_TAB_LABEL,", code)
+        self.assertNotIn(">Flaking<", row)
 
     def test_the_numbers_replace_the_placeholders(self) -> None:
         body = _strip_comments(_function_body(
@@ -9611,6 +9618,10 @@ for (const [action, arg, wait] of fixture.steps) {
   } else if (action === "asideLink") {
     await byId["all-clear-aside"].children.find(
       (c) => c.tagName === "BUTTON" && c.textContent === arg).click();
+  } else if (action === "tile") {
+    // A click on the stat tile whose label is arg.
+    await byId["stat-tiles"].children.find(
+      (c) => c.children[0].textContent === arg).click();
   } else if (action === "scriptBar") {
     await byId["scripts-chart"].children.filter(
       (c) => c.className === "bar-row")[arg].click();
@@ -11344,6 +11355,116 @@ class FlakyDefaultDomTest(unittest.TestCase):
         self.assertEqual(answer["ticked"][0], "Set cadence")
 
 
+#: Home's tiles as drawn on every board, in order; the Flaking tile goes
+#: after Still failing where a flaky mark or default is in scope.
+_SEVEN_TILES = ["Pass rate", "Reported", "New failures", "Still failing",
+                "Newly fixed", "Stale annotations", "Not run"]
+_EIGHT_TILES = _SEVEN_TILES[:4] + ["Flaking"] + _SEVEN_TILES[4:]
+
+
+def _tiles(answer: Dict[str, Any]) -> List[List[str]]:
+    """Each stat tile of a Home walk: tag, class, label, value, sub-line."""
+    return [[tile[0], tile[1]] + [_dom_text(part) for part in tile[7][:3]]
+            for tile in answer["regions"]["stat-tiles"][7]]
+
+
+class FlakingTileTest(unittest.TestCase):
+    """Home's Flaking tile: the tests flaking now (``status.flaking``, the
+    figure the Flaking tab counts) beside Still failing, opening the
+    Flaking tab, in the flaking colour above zero. Drawn only where a
+    flaky mark or default is in scope (flakyScope()); a board with
+    neither, and an older server, draw the seven tiles they always drew
+    (FlakyStateDomTest's base digests pin those byte for byte)."""
+
+    _walks = {}  # type: Dict[str, Dict[str, Any]]
+
+    def _walk(self, kind: str) -> Dict[str, Any]:
+        if kind not in self._walks:
+            if kind == "default":
+                fixture = _default_state_fixture()
+            else:
+                fixture = _state_fixture(
+                    "flaky" if kind == "flaky-zero" else kind, False,
+                    [[0, 1], [1, 5]])
+                if kind == "flaky-zero":
+                    fixture["headline"]["status"]["flaking"] = 0
+            self._walks[kind] = _shim(fixture, _HOME_STATE_DRIVER)
+        return self._walks[kind]
+
+    def test_the_tile_in_the_source(self) -> None:
+        code = _strip_comments(_function_body(
+            read("app.js"), "function renderStatus()"))
+        order = [code.index(token) for token in (
+            'label: "Still failing"', "if (flakyScope()) {",
+            "label: FLAKING_TAB_LABEL,", 'label: "Newly fixed"')]
+        self.assertEqual(order, sorted(order))
+        block = code[order[1]:order[3]]
+        for token in ("const flaking = flakingNow();",
+                      "value: flaking.toLocaleString(),",
+                      'accent: flaking > 0 ? FLAKING_TILE_ACCENT : '
+                      '"accent-zero",',
+                      "sub: FLAKING_TILE_SUB,",
+                      "onClick: () => openQueue(FLAKING_QUEUE),"):
+            self.assertIn(token, block)
+        api = _strip_comments(read("api.js"))
+        self.assertIn('export const FLAKING_TILE_SUB = "failed, within '
+                      'cadence";', api)
+        self.assertIn('export const FLAKING_TILE_ACCENT = "accent-flaking";',
+                      api)
+        # One new rule, in the colour the Flaking rows' edge already uses.
+        rules = _css_rule_bodies(read_text("style.css"))
+        self.assertEqual(rules[".tile.accent-flaking"],
+                         ["border-top-color: var(--c-flaking-strong);"])
+        self.assertIn("box-shadow: inset 3px 0 0 var(--c-flaking-strong);",
+                      rules["tr.result-flaking"])
+        self.assertNotIn("and no Flaking one", read("app.js"))
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_drawn_in_scope_with_the_headlines_figure(self) -> None:
+        """A mark in scope, and a default with no mark: the tile after
+        Still failing, a button, with ``status.flaking``; at zero, drawn
+        all the same in the zero accent."""
+        for kind, cls, value in (("flaky", "tile accent-flaking", "6"),
+                                 ("default", "tile accent-flaking", "6"),
+                                 ("flaky-zero", "tile accent-zero", "0")):
+            with self.subTest(kind=kind):
+                tiles = _tiles(self._walk(kind))
+                self.assertEqual([tile[2] for tile in tiles], _EIGHT_TILES)
+                self.assertEqual(tiles[4], ["BUTTON", cls, "Flaking", value,
+                                            "failed, within cadence"])
+        # The neighbours keep their "+N flaking" suffixes.
+        subs = {tile[2]: tile[4] for tile in _tiles(self._walk("flaky"))}
+        self.assertEqual(subs["Still failing"],
+                         "failed before too · +6 muted · +2 flaking")
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_not_drawn_out_of_scope_or_from_an_older_server(self) -> None:
+        for kind in ("zero", "older"):
+            with self.subTest(kind=kind):
+                self.assertEqual([tile[2] for tile in _tiles(self._walk(kind))],
+                                 _SEVEN_TILES)
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
+    def test_a_click_opens_the_flaking_tab(self) -> None:
+        """The tile asks for the Flaking queue and opens its tab, as
+        "6 flaking" under All clear does; at zero the tab is drawn while
+        it is open, on its empty state."""
+        load, opened = _lists_walk("flaky", [["tile", "Flaking"]])
+        self.assertEqual(opened["asked"], [_FLAKING_QUEUE_ASK])
+        self.assertEqual([tab[0] for tab in opened["tabs"]
+                          if tab[2] == "true"], ["Flaking"])
+        self.assertEqual(opened["head"], _FLAKING_HEAD)
+        load, opened = _lists_walk("flaky", [["tile", "Flaking"]],
+                                   flaking=0, rows=[])
+        self.assertNotIn("Flaking", [tab[0] for tab in load["tabs"]])
+        self.assertEqual(opened["asked"], [_FLAKING_QUEUE_ASK])
+        self.assertEqual(opened["tabs"][3], ["Flaking", "0", "true"])
+        self.assertEqual(opened["empty"], [False, "Nothing is flaking."])
+
+
 #: The settings that moved from Open Actions to the Admin page
 #: (flaky-default design §3 U1): their sections, their reads and the
 #: functions that drew them. None may come back to Open Actions.
@@ -12118,6 +12239,70 @@ class AdminStylingTest(unittest.TestCase):
             planted = css.replace(old, new, 1)
             self.assertNotEqual(planted, css, old)
             self.assertNotEqual(_admin_css_problems(planted), [], old)
+
+
+def _admin_text_problems(html: str, css: str) -> List[str]:
+    """Where Admin's running text is not one treatment: a paragraph that
+    is not a section's loading, empty or failed state without the shared
+    class, the flaky default's note not a paragraph of its own shipped
+    hidden, or the shared rule capping its width."""
+    found = []  # type: List[str]
+    markup = re.sub(r"<!--.*?-->", " ", html, flags=re.S)
+    for tag in re.findall(r"<p\b[^>]*>", markup):
+        name = re.search(r'\sid="([^"]+)"', tag)
+        if name and re.search(r"-(loading|empty|failed)$", name.group(1)):
+            continue
+        classes = re.search(r'\sclass="([^"]*)"', tag)
+        if not classes or not {"muted", "admin-note"} <= set(
+                classes.group(1).split()):
+            found.append("not the running text's treatment: " + tag)
+    note = re.search(r'<(\w+)\b[^>]*\sid="envs-flaky-note"[^>]*>', markup)
+    if not note or note.group(1) != "p" or not re.search(
+            r"\shidden(?=[\s>/])", note.group(0)):
+        found.append("the flaky default's note is not its own hidden <p>")
+    rules = _css_rule_bodies(css)
+    if not rules.get(".admin-note"):
+        found.append("no .admin-note rule")
+    for selector, bodies in rules.items():
+        if "admin-note" in selector and "max-width" in " ".join(bodies):
+            found.append("capped: " + selector)
+    if ".people-note" in rules:
+        found.append(".people-note is still styled")
+    return found
+
+
+class AdminRunningTextTest(unittest.TestCase):
+    """Admin's running text is one treatment: the line under the heading,
+    both sections' notes, the flaky default's note (a paragraph of its
+    own) and the quiet-test cutoff share size, line height and colour,
+    and run the width the tables do."""
+
+    def test_one_treatment(self) -> None:
+        self.assertEqual(_admin_text_problems(read("admin.html"),
+                                              read_text("style.css")), [])
+        for name in os.listdir(STATIC_DIR):
+            if name.endswith((".js", ".html", ".css")):
+                self.assertNotIn("people-note", read_text(name), name)
+
+    def test_the_detector_can_fail(self) -> None:
+        html, css = read("admin.html"), read_text("style.css")
+        for old, new, in_css in (
+                ('<p id="envs-cutoff" class="muted admin-note">',
+                 '<p id="envs-cutoff" class="muted">', False),
+                ('<p id="envs-flaky-note" class="muted admin-note" hidden></p>',
+                 '<span id="envs-flaky-note" hidden></span>', False),
+                ('<p id="envs-flaky-note" class="muted admin-note" hidden>',
+                 '<p id="envs-flaky-note" class="muted admin-note">', False),
+                (".admin-note {\n", ".admin-note {\n  max-width: 62ch;\n",
+                 True),
+                (".admin-note {\n", ".people-note { color: red; }\n"
+                 ".admin-note {\n", True)):
+            source = css if in_css else html
+            planted = source.replace(old, new, 1)
+            self.assertNotEqual(planted, source, old)
+            self.assertNotEqual(
+                _admin_text_problems(html if in_css else planted,
+                                     planted if in_css else css), [], old)
 
 
 if __name__ == "__main__":

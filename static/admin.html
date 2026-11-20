@@ -41,7 +41,7 @@
     <div id="error-banner" class="error-banner" role="alert" hidden></div>
 
     <h1>Admin</h1>
-    <p class="muted">
+    <p class="muted admin-note">
       Settings for the whole board, rarely changed. Every change is
       recorded against your name.
     </p>
@@ -57,7 +57,7 @@
       <div class="section-head">
         <h2 id="envs-heading" class="eyebrow">Environments</h2>
       </div>
-      <p class="muted people-note">
+      <p class="muted admin-note">
         How many tests each environment is supposed to run. testboard
         decides whether a test has gone quiet by looking at whether the
         suite has been round since — and a night only counts as a full
@@ -65,9 +65,9 @@
         that “half” is measured against every test ever seen in the
         environment, which only grows. Set the real number here if the
         passes below are not counting.
-        <span id="envs-flaky-note" hidden></span>
       </p>
-      <p id="envs-cutoff" class="muted"></p>
+      <p id="envs-flaky-note" class="muted admin-note" hidden></p>
+      <p id="envs-cutoff" class="muted admin-note"></p>
       <!-- Upgrade-day bulk assign (WP-23 addendum): before any product
            is declared, every environment is implicitly product "" —
            this turns "declare N environments one at a time" into one
@@ -116,7 +116,7 @@
       <div class="section-head">
         <h2 id="people-heading" class="eyebrow">People</h2>
       </div>
-      <p class="muted people-note">
+      <p class="muted admin-note">
         Deactivating someone removes them from every assignee dropdown.
         Their comments and past assignments are kept exactly as they are.
         Reassign anything they still own first — testboard will refuse

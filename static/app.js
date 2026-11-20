@@ -44,6 +44,8 @@ import {
   FLAKING_TAB_EMPTY,
   FLAKING_TAB_LABEL,
   FLAKING_TAB_NOTE,
+  FLAKING_TILE_ACCENT,
+  FLAKING_TILE_SUB,
   failToggleTitle,
   flakySentence,
   flakyStreakWords,
@@ -794,9 +796,11 @@ function windowPhrase(summary) {
 
 /** A tile's sub-line with " · +3 muted · +4 flaking" appended for the
  * failures set aside from its figure (WP-40, WP-44). There is no Muted
- * tile and no Flaking one: they ride beside the number they were taken
- * out of, and the Muted queue tab lists every live mute. Tiles are
- * buttons, so the suffix is text, never a link. */
+ * tile: muted failures ride beside the number they were taken out of,
+ * and the Muted queue tab lists every live mute. The flaking ones ride
+ * there too, and where the scope has a flaky mark or default the
+ * Flaking tile also counts the tests flaking now, as its tab does.
+ * Tiles are buttons, so the suffix is text, never a link. */
 function withSetAside(text, muted, flaking) {
   const suffix = setAsideSuffix(muted, flaking);
   return suffix ? text + " · " + suffix : text;
@@ -885,6 +889,22 @@ function renderStatus() {
       status.flaking_still_failing),
     onClick: () => openQueue("still_failing"),
   }));
+  // The tests flaking now, the figure the Flaking tab counts, drawn only
+  // where a mark or a default is in scope (flakyScope()): without either
+  // the row is the seven tiles it always was, and index.html ships no
+  // placeholder for it, so such a board never flashes an eighth box. At
+  // zero it is drawn all the same and still opens the tab, which
+  // flakyTabShown() then draws on its empty state.
+  if (flakyScope()) {
+    const flaking = flakingNow();
+    container.appendChild(buildTile({
+      label: FLAKING_TAB_LABEL,
+      value: flaking.toLocaleString(),
+      accent: flaking > 0 ? FLAKING_TILE_ACCENT : "accent-zero",
+      sub: FLAKING_TILE_SUB,
+      onClick: () => openQueue(FLAKING_QUEUE),
+    }));
+  }
   container.appendChild(buildTile({
     label: "Newly fixed",
     value: status.fixed.toLocaleString(),
