@@ -4,30 +4,32 @@
 The log is [`UPGRADE_PLAN_STATUS.md`](UPGRADE_PLAN_STATUS.md) and is append-only; this
 is a snapshot, and a snapshot that has been appended to is just a worse log.
 
-Last rewritten: **2026-11-20, the default flaky cadence built overnight.**
-`/overnight flaky-default-r0` ran the frozen plan unattended on the
-owner's go: all seven items, 21 to 27, are committed on
-`wp-44-flaky-mark`, pushed to PR #21, each through verify on both
-backends, the measured pass where it was on a trigger path, fresh-eyes
-review and, for the UI items, a walk. Nothing was parked. The owner then
-began the click-through and asked for changes, now committed: What's new
-cut from ten lines to four, and Admin's running text in one treatment. A
-Flaking tile on Home was built too (`1ec02d2`) and taken out again by the
-owner in `b11864c`. **Nothing is
-merged or deployed. What is left is the rest of the owner's click-through
-on the play server, then the drop.**
+Last rewritten: **2026-11-20, for the drop of 2026-11-20.** PR #21 is the
+drop: WP-44 (mark a test as flaky) and, built on it overnight by
+`/overnight flaky-default-r0`, the default flaky cadence for an
+environment with the Admin page. After a first click-through on a play
+server the owner asked for What's new cut from ten lines to four and
+Admin's running text in one treatment; a Flaking tile on Home was built
+(`1ec02d2`) and taken out again (`b11864c`). The owner then said to merge
+and deploy the same day. **This file is written into the drop's PR: where
+you read it on `master`, PR #21 is squash-merged and the squash commit is
+`master`'s head. The owner was about to deploy; nothing has been reported
+back yet, and nothing below assumes it went in.**
 
 ## Where things stand
 
 - **Production is MariaDB, schema v11**, `--workers 16`, served over HTTPS
   behind a reverse proxy; the Python server speaks plain HTTP behind it.
   **It is the only deployment.** The owner said on 2026-11-19 that the drop
-  of 2026-10-13 is live, so production runs `origin/master` (`6cba071`).
-  Nothing else was reported of either deploy.
-- **Built, not merged, not deployed: WP-44 and, on top of it, the default
-  flaky cadence for an environment**, branch `wp-44-flaky-mark`, PR #21,
-  code at `b11864c`. **Migrations 12 and 13 run**, both create-only;
-  production stays at 11 until the drop. The designs are
+  of 2026-10-13 is live, so production ran `6cba071` going into this
+  drop. Nothing else was reported of either deploy. **Until the owner
+  reports the drop of 2026-11-20 deployed, treat production as still on
+  `6cba071` at v11.**
+- **Merged as the drop of 2026-11-20, deployment not yet reported: WP-44
+  and, on top of it, the default flaky cadence for an environment**, PR
+  #21, squash-merged from `wp-44-flaky-mark` (its last code commit was
+  `b11864c`). **Migrations 12 and 13 run**, both create-only, in one
+  upgrade; the operator note is `docs/drops/2026-11-20.md`. The designs are
   `docs/design/flaky-mark-r0.md` (strip in §12) and
   `docs/design/flaky-default-r0.md` (plan and strip in §6, every item
   ticked).
@@ -55,23 +57,25 @@ on the play server, then the drop.**
   default is in scope: -6.3 to -6.9 ms at 50 and -8.4 to -9.5 at 500.
 - **CI is green on `b11864c`, all twelve jobs**, Python 3.6.8 with SQLite
   3.26 and both MariaDB 10.3 legs included; all the code is in that commit.
-  The commit after it changes documents only. CI failed twice during the
+  The drop's own commit after it changes documents, the README and the
+  date on What's new, and was green before the merge. CI failed twice during the
   build and was fixed each time, both in tests and both of a kind only
   another SQLite version shows: item 21's fixture doubled a run a second
   late where SQLite 3.45 rounds a time with a modifier, and item 24's
   plan guard read only the newer wording of SQLite's query plan (3.26
   writes "SEARCH TABLE runs AS f").
 - **No ledger in `.claude/work/`, no agent running, no heartbeat.**
-- **A play server is up for the owner's click-through**: port 8944, from
-  the main checkout (started at `0f2c755`; since then only a test,
-  documents and static files have changed, and static files are read per
-  request, so it serves the branch head's pages), on
-  `.scratch/play/play-2026-11-20.db` (below). It stops with the session
-  that started it.
-- **The drop is still to be dated.** What's new's section carries
-  `data-drop-date="2026-11-11"` and the operator note is still
-  `docs/drops/2026-11-11.md`; it says nothing yet of the default, the
-  Admin page or migration 13.
+- **The play server of the click-through** (port 8944, on
+  `.scratch/play/play-2026-11-20.db`, below) stopped with the session that
+  started it; "Verification tooling" has the command. Its data reads the
+  wall clock and is stale after 2026-11-21.
+- **The drop's documents are done**: the operator note covers both
+  migrations, with the upgrade tool's dry-run and upgrade output quoted
+  from a run against a database at 11 on the local MariaDB 12.3; What's
+  new's section is dated 2026-11-20; the README documents the default's
+  `PUT`, the two keys on `GET /api/environments`, `status.flaky_defaults`
+  and `flaky.source`. **Not done: a hand `EXPLAIN` on MariaDB 10.3** of
+  the default's two new statements; no 10.3 server could be reached.
 - **The owner said a drop centred on performance should follow this one.**
   Candidates are under "Next session's plan".
 - **`_rows_by_key` is written differently on each backend, on purpose**:
@@ -109,32 +113,25 @@ on the play server, then the drop.**
 
 ## Next session's plan
 
-1. **The owner's click-through**, on the play server (port 8944; start it
-   again if it has stopped, "Verification tooling" has the command). The
-   play database's README, `.scratch/play/fd-play-README.txt`, says what
-   is in it. A natural order, signed in as the fixture user amy: Home
-   scoped to atlas-lab-alpha (the tiles, then the chart's last column and
-   caption); the Flaking tab and the Review panel on a row under the
-   default and on a marked row; New failures for a test that failed on
-   both servers last night; "Change the default" through to the Admin
-   page, its History, and the second environment at 3; atlas-lab-delta,
-   which has no default, as the control; a build tab in alpha; a passing
-   test's own page. What only a browser can show is listed under "Needs a
-   person" item 1.
-2. **The owner's open points from the build** ("Needs a person" items 2
-   and 3): confirm, or ask for a change before the drop.
-3. **Ship it** when the owner says so (`/drop`): the operator note renamed
-   to the real date and extended (migrations 12 and 13: yes, both
-   create-only, the server keeps serving; the Admin page; the default; the
-   chart drawing once); What's new dated with it; the README's API section
-   (the PUT, the two keys on `GET /api/environments`,
-   `status.flaky_defaults`, `flaky.source`); **PR #21's body rewritten**,
-   which is the squash-commit message and still describes WP-44's first
-   build; a hand `EXPLAIN` on MariaDB 10.3 of the two new statements if a
-   10.3 server can be reached (the per-day chart's read and Open Actions'
-   keys statement: nothing in the build or CI shows their plans there);
-   squash-merge; the housekeeping below; then record what the operator
-   reports.
+1. **Record the deploy** (`/drop` §5), from what the owner reports and
+   nothing else. Unknowns to ask: whether it was deployed and when; the dry
+   run's `schema_version` and `SERVER:` line; whether every table read
+   "matches the v13 oracle"; the start-up output; the Metrics page's
+   schema version (13); whether steps 3 to 6 of the note were done in one
+   sitting; how the pages look in a browser, which nothing here has seen;
+   whether a default has been set on a real environment and what Home
+   then showed. Then stamp the note "Shipped 2026-11-20 (PR #21, <sha>)",
+   log it, and rewrite this file.
+2. **Housekeeping after the merge**, none of it done: fast-forward the
+   local `master`; delete the local `wp-44-flaky-mark` and
+   `design-flaky-mark`; remove the worktrees and snapshot branches in the
+   table below, copying out the agent memory notes that are wanted first.
+3. **The owner's open points from the build**, shipped as built ("Needs a
+   person" items 2 and 3): confirm, or ask for a change in the next drop.
+   One small `backend-engineer` cleanup with them: the docstrings of the
+   default's `PUT` and of `GET /api/environments` in `testboard/api.py`
+   still say nothing judges a default yet, which stopped being true when
+   the headline began to.
 4. **The drop centred on performance** that the owner wants after this
    one. Candidates so far: a failure streak or a per-run flag kept at push
    time (the default's decisions 2 and 24: it would make the headline's
@@ -159,8 +156,8 @@ on the play server, then the drop.**
 
 | | |
 |---|---|
-| `origin/master` | `6cba071` — the drop of 2026-10-13 (PR #20) on top of the drop of 2026-10-12 (PR #19); live in production, by the owner's word on 2026-11-19 |
-| `wp-44-flaky-mark` | **The next drop**, PR #21: WP-44's design arc and items 1 to 20, the default's design, then the build: `50df8bb` (21), `8ba7953` (25), `941d1a0` (21's CI fix), `3a0a158` (22, migration 13), `3335911` (27), `7ee508a` (the owner on item 22), `5707775` (23), `fc43eed` (26), `5f0992a` (24), `0f2c755` and `1861f3b` (the log and this handover), `eeb8792` (24's CI fix), `6c1bde9` (documents), `1ec02d2` (What's new in four lines, Admin's text, a Flaking tile), `b11864c` (the tile out again), then this handover. Squash-merge, delete |
+| `origin/master` | its head is **the drop of 2026-11-20 (PR #21, one squash commit)**, on top of `6cba071`, the drop of 2026-10-13 (PR #20), which production ran going into this drop |
+| `wp-44-flaky-mark` | merged as PR #21 and deleted on the remote; the local branch still holds the build commit by commit (WP-44's items 1 to 20, the default's items 21 to 27, `1ec02d2` and `b11864c` after the click-through, then the drop's documents). **Delete it** once nothing more is wanted from its history |
 | `fd-21-perf-wt`, `fd-22-backend-wt`, `fd-23-backend-wt`, `fd-23-perf-wt`, `fd-24-backend-wt`, `fd-24-perf-wt`, `fd-25-ui-wt`, `fd-26-ui-wt`, `fd-27-ui-wt`, `fd-int-wt`, `fd-final-wt`, `fd-polish-wt`, `fd-23-staged` | the build's snapshot and integration branches, each but the last with a worktree under `.claude/worktrees/fd-*`; their work is in the commits above. Remove the worktrees, then the branches, after the merge. **Agent memory notes from this build sit in those worktrees** (`.claude/agent-memory/` in each, gitignored): copy out what is wanted first |
 | `design-flaky-mark` | the WP-44 arc's frozen doc, local only, already the base of the build branch; **delete after the merge** |
 | `wp44-11-wt` … `wp44-19-wt`, `wp44-14-base`, `wp44-20-backend-wt`, and the `worktree-agent-*` of 2026-11-12 and 2026-11-19 | WP-44's rework and item 20: snapshot branches and agent worktrees under `.claude/worktrees/`; remove after the merge. **The backend agent's worktree of item 16 holds an unmerged memory note** (how to build SQLite 3.26 in the Linux subsystem): copy it out first if it is wanted |
@@ -180,8 +177,8 @@ A local `master` exists since 2026-10-03; keep it a mirror of
 | Plan | Spec | Branch | Status |
 |---|---|---|---|
 | WP-43: the dashboard charts split assigned from unassigned | `docs/design/charts-assigned-split-r0.md` §8, status strip §9 (frozen 2026-10-13) | `wp-43-charts-assigned-split` | **merged as PR #20**; deployment not reported; one owner decision still open in its §7 (item 9 below) |
-| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11); the triage tab's contract is §14 | `wp-44-flaky-mark`, PR #21 | **built, every item done (1 to 20); not merged, not deployed.** The status strip is the doc's §12. Its item 3 claimed migration 12 |
-| A default flaky cadence for an environment, with the Admin page (ships in WP-44's drop) | `docs/design/flaky-default-r0.md` §6, status strip in §6 (frozen 2026-11-19 after round 1) | `wp-44-flaky-mark`, PR #21 | **built, every item done (21 to 27), 2026-11-20; not merged, not deployed.** Item 22 claimed migration 13. Both of §3a's bars are met. Waits on the owner's click-through, then the drop |
+| WP-44: mark a test as flaky | `docs/design/flaky-mark-r0.md` §11, contract §1 (frozen 2026-11-11); the triage tab's contract is §14 | `wp-44-flaky-mark`, PR #21 | **merged as the drop of 2026-11-20; deployment not reported.** Every item done (1 to 20). The status strip is the doc's §12. Its item 3 claimed migration 12 |
+| A default flaky cadence for an environment, with the Admin page (ships in WP-44's drop) | `docs/design/flaky-default-r0.md` §6, status strip in §6 (frozen 2026-11-19 after round 1) | `wp-44-flaky-mark`, PR #21 | **merged as the drop of 2026-11-20; deployment not reported.** Every item done (21 to 27). Item 22 claimed migration 13. Both of §3a's bars are met |
 
 ## Needs a person, not a commit
 
@@ -421,10 +418,9 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 
 ```bash
 git fetch origin --prune
-git log --oneline -4 origin/master   # 6cba071 on top = the drop of 2026-10-13, which production runs
-git log --oneline -3                 # on wp-44-flaky-mark: this handover on top of b11864c
-gh pr list --state open              # expect #9, #17 (close it) and #21 (the next drop)
-gh pr checks 21                      # green on b11864c, all twelve jobs; documents only since
+git log --oneline -3 origin/master   # the drop of 2026-11-20 (#21) on top of 6cba071, the drop of 2026-10-13
+git checkout master && git merge --ff-only origin/master   # the local master is a mirror, and is behind
+gh pr list --state open              # expect #9 and #17 (close it)
 python -m unittest discover          # tclsh and node on PATH: expect 3308 OK (skipped 1), SQLite; 4612 OK (skipped 93) with MariaDB
 python tools/dev/install_hooks.py    # once per clone: the publication gate's hooks
 ```

@@ -5842,3 +5842,49 @@ the publication gate. Main checkout, `tclsh` and `node` on PATH, on
 `b11864c`: 3308 OK (skipped 1) on SQLite and 4612 OK (skipped 93) with the MariaDB
 variants on a local 12.3 (3311 and 4615 on `1ec02d2`). CI was green on
 `1ec02d2` and on `b11864c`, all twelve jobs each. No browser has rendered either.
+
+## The drop of 2026-11-20: WP-44 and the default flaky cadence (PR #21)
+
+The owner, after the first click-through and the three changes above:
+"OK - merge that branch. This will have to do. I'm about to deploy". The
+drop was prepared and merged the same day.
+
+**What shipped**, as one squash commit: marking a test as flaky (items 1
+to 20), the default flaky cadence for an environment with the Admin page
+(items 21 to 27), the per-day chart drawing once, a muted test that has
+stopped running leaving Not run, and Open Actions' first paint on the
+catalogue alone. **Migrations 12 and 13**, create-only, four tables and
+two indexes, in one run of the upgrade tool.
+
+**The drop's documents.** The operator note, renamed from its provisional
+date to `docs/drops/2026-11-20.md` and rewritten for both parts. Its
+upgrade output is quoted from a run, not derived: a fresh schema on the
+local MariaDB 12.3 put at 11 by removing the four tables, then the tool's
+dry run (`steps to run: 11 -> 13`, `SERVER: may keep running`), the
+upgrade (twenty tables, each "matches the v13 oracle"), and the rollback
+statement, after which the dry run offered the same two steps. Writing it
+found one thing no earlier note said: between the checkout and the restart
+the old process serves the new static pages, and production's code answers
+400 to the names request the new Open Actions makes, so the note says to
+do those steps in one sitting. What's new's section is dated 2026-11-20.
+The README documents the default's `PUT`, the two keys on
+`GET /api/environments`, `status.flaky_defaults` and `flaky.source`; the
+README had no line of the default before.
+
+**Counts**, main checkout, `tclsh` and `node` on PATH: 3308 OK (skipped 1)
+on SQLite and 4612 OK (skipped 93) with the MariaDB variants on a local
+12.3; 2751 and 3769 at the previous drop. CI green on `b11864c`, the last
+commit that changed code, on all twelve jobs.
+
+**Shipped as built, the owner's to confirm afterwards**: unmarking a test
+under a default can make that night's run a New failure; on an environment
+that runs each test more than once a night the tiles count tests and the
+chart counts runs; the selection bar's Unmark stays enabled over rows
+flaking by a default. **Not verified**: a browser; any query plan on
+MariaDB 10.3 for the default's two new statements (no 10.3 server could be
+reached, so the hand `EXPLAIN` the handover asked for was not done).
+**Found and left for a small backend brief**: two docstrings in
+`testboard/api.py` still say nothing judges a default yet.
+
+Deployment is the owner's and is not recorded here: nothing has been
+reported.
