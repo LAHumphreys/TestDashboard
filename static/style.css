@@ -465,16 +465,9 @@ h2.eyebrow {
 
 /* ---------- KPI tiles ---------- */
 
-/* Eight tiles (the Flaking one drawn where a flaky mark or default is in
-   scope) take nine tracks, the hero spanning two. 133px is the largest
-   minimum that fits nine in the 1300px a 1340px main.wide leaves inside
-   its padding: (1300 + 12) / 9 - 12 = 133.8. A tile is then 103px inside
-   its padding, wider than its longest label ("Stale annotations", about
-   100px at 12px semibold) and its longest unbroken word, so labels stay
-   on one line and sub-lines wrap only between words. */
 .tile-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(133px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
   align-items: stretch;
 }
@@ -539,7 +532,6 @@ button.tile:focus-visible {
 .tile.accent-pass { border-top-color: var(--c-pass); }
 .tile.accent-up { border-top-color: var(--c-up); }
 .tile.accent-warn { border-top-color: var(--c-fae); }
-.tile.accent-flaking { border-top-color: var(--c-flaking-strong); }
 .tile.accent-zero { border-top-color: var(--border); }
 
 /* The placeholders index.html ships in the tile row (WP-38): the frame

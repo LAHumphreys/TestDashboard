@@ -1113,12 +1113,6 @@ export const FLAKING_TAB_NOTE = "Every test here failed its latest run, "
   + "first.";
 export const FLAKING_TAB_EMPTY = "Nothing is flaking.";
 
-/** Home's Flaking tile, labelled as the tab it opens: its sub-line, and
- * its accent (the flaking colour's top border) while any test is
- * flaking. */
-export const FLAKING_TILE_SUB = "failed, within cadence";
-export const FLAKING_TILE_ACCENT = "accent-flaking";
-
 /** The title of "All clear"'s "4 flaking", which opens the Flaking tab. */
 export const FLAKING_LINK_TITLE = "Open the Flaking tab";
 
