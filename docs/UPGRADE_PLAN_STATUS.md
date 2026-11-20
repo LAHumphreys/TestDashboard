@@ -5772,3 +5772,28 @@ move with it.
 Not verified by anything in the build: a browser; plans on MariaDB 10.3
 for the two new statements (the per-day chart's read and Open Actions'
 keys statement).
+
+## The default flaky cadence: CI on item 24, and the build's final counts (2026-11-20)
+
+CI's three Python 3.6.8 jobs failed on item 24's commit: its new plan
+guard for a build asserted that the plan's first line starts with
+`SEARCH F`, and SQLite before 3.36 (3.26 on those jobs) writes `SEARCH
+TABLE runs AS f`. The plan 3.26 chose was the designed one; only the
+test's reading was wrong. Fixed in `eeb8792`, tests only: the guard reads
+the alias as a token, as its neighbours do, and `PlanWordingTest` holds a
+3.26 line and a 3.50 line as literals so the assumption cannot return
+unnoticed where only a newer SQLite is to hand. No interpreter on the
+machine that built this carries SQLite 3.26, so CI was the first place it
+could show; it was the second of the build's two CI failures, both in
+tests, both of a kind only another SQLite version shows.
+
+**CI is green on `eeb8792`, all twelve jobs**: Python 3.6.8 with SQLite
+3.26, both MariaDB 10.3 legs (the suite, and the suite on a database
+built by the upgrade tool through step 12 to 13), Python 3.8, 3.8 with
+Tcl, and 3.14.
+
+The build's final counts, in the main checkout on `eeb8792`, `tclsh` and
+`node` on PATH: 3305 OK (skipped 1) on SQLite and 4609 OK (skipped 93)
+with the MariaDB variants on a local 12.3. They were 3093 and 4285 at the
+kickoff: 212 tests on SQLite and 324 with the MariaDB variants are the
+build's.

@@ -22,7 +22,7 @@ server, then the drop.**
   Nothing else was reported of either deploy.
 - **Built, not merged, not deployed: WP-44 and, on top of it, the default
   flaky cadence for an environment**, branch `wp-44-flaky-mark`, PR #21,
-  head `0f2c755`. **Migrations 12 and 13 run**, both create-only;
+  code at `eeb8792`. **Migrations 12 and 13 run**, both create-only;
   production stays at 11 until the drop. The designs are
   `docs/design/flaky-mark-r0.md` (strip in §12) and
   `docs/design/flaky-default-r0.md` (plan and strip in §6, every item
@@ -49,15 +49,18 @@ server, then the drop.**
   rows on MariaDB at 50 failing read +12.3 ms on a 57 ms base (the count
   had left its covering index for a scan). It now reads by keys where a
   default is in scope: -6.3 to -6.9 ms at 50 and -8.4 to -9.5 at 500.
-- **CI: green on `fc43eed`, all twelve jobs**, Python 3.6.8 with SQLite
-  3.26 and both MariaDB 10.3 legs included; that commit has items 21, 22,
-  23, 25, 26 and 27. **The runs on `5f0992a` (item 24) and `0f2c755` were
-  in progress when this was written: check them first.** One CI failure
-  happened and was fixed during the build (item 21's fixture doubled a
-  run a second late where SQLite 3.45 rounds a time with a modifier).
+- **CI is green on `eeb8792`, all twelve jobs**, Python 3.6.8 with SQLite
+  3.26 and both MariaDB 10.3 legs included; every item is in that commit.
+  The commit after it changes documents only. CI failed twice during the
+  build and was fixed each time, both in tests and both of a kind only
+  another SQLite version shows: item 21's fixture doubled a run a second
+  late where SQLite 3.45 rounds a time with a modifier, and item 24's
+  plan guard read only the newer wording of SQLite's query plan (3.26
+  writes "SEARCH TABLE runs AS f").
 - **No ledger in `.claude/work/`, no agent running, no heartbeat.**
 - **A play server is up for the owner's click-through**: port 8944, from
-  the main checkout at `0f2c755`, on
+  the main checkout (started at `0f2c755`; nothing but a test and
+  documents has changed since), on
   `.scratch/play/play-2026-11-20.db` (below). It stops with the session
   that started it.
 - **The drop is still to be dated.** What's new's section carries
@@ -152,7 +155,7 @@ server, then the drop.**
 | | |
 |---|---|
 | `origin/master` | `6cba071` — the drop of 2026-10-13 (PR #20) on top of the drop of 2026-10-12 (PR #19); live in production, by the owner's word on 2026-11-19 |
-| `wp-44-flaky-mark` | **The next drop**, PR #21, head `0f2c755`: WP-44's design arc and items 1 to 20, the default's design, then the build: `50df8bb` (21), `8ba7953` (25), `941d1a0` (21's CI fix), `3a0a158` (22, migration 13), `3335911` (27), `7ee508a` (the owner on item 22), `5707775` (23), `fc43eed` (26), `5f0992a` (24), `0f2c755` (a log entry). Squash-merge, delete |
+| `wp-44-flaky-mark` | **The next drop**, PR #21: WP-44's design arc and items 1 to 20, the default's design, then the build: `50df8bb` (21), `8ba7953` (25), `941d1a0` (21's CI fix), `3a0a158` (22, migration 13), `3335911` (27), `7ee508a` (the owner on item 22), `5707775` (23), `fc43eed` (26), `5f0992a` (24), `0f2c755` and `1861f3b` (the log and this handover), `eeb8792` (24's CI fix), then this handover's last rewrite. Squash-merge, delete |
 | `fd-21-perf-wt`, `fd-22-backend-wt`, `fd-23-backend-wt`, `fd-23-perf-wt`, `fd-24-backend-wt`, `fd-24-perf-wt`, `fd-25-ui-wt`, `fd-26-ui-wt`, `fd-27-ui-wt`, `fd-int-wt`, `fd-final-wt`, `fd-23-staged` | the build's snapshot and integration branches, each but the last with a worktree under `.claude/worktrees/fd-*`; their work is in the commits above. Remove the worktrees, then the branches, after the merge. **Agent memory notes from this build sit in those worktrees** (`.claude/agent-memory/` in each, gitignored): copy out what is wanted first |
 | `design-flaky-mark` | the WP-44 arc's frozen doc, local only, already the base of the build branch; **delete after the merge** |
 | `wp44-11-wt` … `wp44-19-wt`, `wp44-14-base`, `wp44-20-backend-wt`, and the `worktree-agent-*` of 2026-11-12 and 2026-11-19 | WP-44's rework and item 20: snapshot branches and agent worktrees under `.claude/worktrees/`; remove after the merge. **The backend agent's worktree of item 16 holds an unmerged memory note** (how to build SQLite 3.26 in the Linux subsystem): copy it out first if it is wanted |
@@ -404,10 +407,10 @@ All of `.scratch/` is gitignored — it exists on this machine only.
 ```bash
 git fetch origin --prune
 git log --oneline -4 origin/master   # 6cba071 on top = the drop of 2026-10-13, which production runs
-git log --oneline -3                 # on wp-44-flaky-mark: this handover on top of 0f2c755
+git log --oneline -3                 # on wp-44-flaky-mark: this handover on top of eeb8792
 gh pr list --state open              # expect #9, #17 (close it) and #21 (the next drop)
-gh pr checks 21                      # green on fc43eed; the runs for item 24's commit were in progress
-python -m unittest discover          # tclsh and node on PATH: expect 3304 OK (skipped 1), SQLite; 4608 OK (skipped 93) with MariaDB
+gh pr checks 21                      # green on eeb8792, all twelve jobs; documents only since
+python -m unittest discover          # tclsh and node on PATH: expect 3305 OK (skipped 1), SQLite; 4609 OK (skipped 93) with MariaDB
 python tools/dev/install_hooks.py    # once per clone: the publication gate's hooks
 ```
 
