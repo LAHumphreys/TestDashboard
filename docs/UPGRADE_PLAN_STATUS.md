@@ -5797,3 +5797,48 @@ The build's final counts, in the main checkout on `eeb8792`, `tclsh` and
 with the MariaDB variants on a local 12.3. They were 3093 and 4285 at the
 kickoff: 212 tests on SQLite and 324 with the MariaDB variants are the
 build's.
+
+## The default flaky cadence: changes from the owner's first click-through (2026-11-20)
+
+The owner clicked through the build on a play server and asked for three
+things, built by `ui-engineer` as `1ec02d2`; one of them, a Flaking tile,
+the owner then took out again, in `b11864c`. Frontend only; no request,
+fetch or query is added by either commit.
+
+**What's new, cut from ten lines to four.** The owner: "it's a wall of
+text, no one is going to read it. It needs fewer headlines." Then, of a
+five-line draft: the line on the Flaking tab and Open Actions "is
+redundant though and can be removed", and the default's line should "make
+it more obvious this is about supporting specific environments that want
+to set a default level of flakiness". The tab is now three words in the
+state's line; Open Actions leaving out unassigned flaking tests has no
+line of its own any more, by that decision.
+
+**Admin's running text in one treatment.** Two notes were capped at 62ch
+while the lines round them and the tables ran the page's width. The cap is
+gone and all five paragraphs share one class; the wording is unchanged.
+Put to the owner: the Environments note now runs about 200 characters a
+line, and if that grates the remedy is a shorter note, not a cap.
+
+**A Flaking tile on Home: built, then removed.** WP-44's design gave
+flaking no tile: the count rides beside the two failing figures ("+N
+flaking") and on the tab's badge. The owner asked for "a top row box for
+flaking, like we do with still failing, newly fixed", and `1ec02d2` built
+one between Still failing and Newly fixed, drawn only where a mark or a
+default is in scope. A read-only walk on the play server showed what it
+cost: the tile equals the Flaking tab's total on every scope (37 unscoped,
+22 and 15 in the two environments with a default, none on the control),
+and so the row carried one figure three times (unscoped: +30, +7 and 37).
+Told so, the owner: "let's hide the flaking tile for now - letting the
+other tiles tell the story". `b11864c` removes it whole, with its colour
+rule, its tests and the 133px track minimum that existed only to fit an
+eighth tile; `static/app.js` and `static/api.js` are byte for byte what
+they were before it, and `FlakyStateDomTest.test_no_flaking_tile` now
+pins the seven tiles in a scope with a mark. The design's original
+decision stands. The tile is whole in `1ec02d2` if it is wanted again.
+
+Verified, each commit: a fresh-eyes review with no blocking finding and
+the publication gate. Main checkout, `tclsh` and `node` on PATH, on
+`b11864c`: 3308 OK (skipped 1) on SQLite and 4612 OK (skipped 93) with the MariaDB
+variants on a local 12.3 (3311 and 4615 on `1ec02d2`). CI was green on
+`1ec02d2` and on `b11864c`, all twelve jobs each. No browser has rendered either.
