@@ -1164,7 +1164,7 @@ says why:
 - [x] 23 the default judged
 - [ ] 24 the per-day chart's late part
 - [x] 25 the Admin page
-- [ ] 26 a row flaking by default
+- [x] 26 a row flaking by default
 - [x] 27 the per-day chart waits and draws once
 
 Done when §0's "Done means" holds with the chart included, both of §3a's

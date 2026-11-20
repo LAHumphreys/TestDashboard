@@ -6123,11 +6123,12 @@ class MutedBesideFailingTest(unittest.TestCase):
         """WP-44 item 7 (design §3 U6): each failing tile's suffix names
         its own flaking figure after its muted one, through the one
         set-aside helper, and the New failures line says "or flaking"
-        only where the scope has a mark."""
+        only where the scope has a mark (widened for the flaky default,
+        its design U7: or a default, flakyScope()'s one predicate)."""
         status = _strip_comments(_function_body(
             read("app.js"), "function renderStatus()"))
         self.assertRegex(status, r"withSetAside\(newFailuresSub\("
-                                 r"status\.flaky_total\),\s*status\."
+                                 r"flakyScope\(\)\),\s*status\."
                                  r"muted_new_failures, status\."
                                  r"flaking_new_failures\)")
         self.assertRegex(status, r'withSetAside\("failed before too", '
@@ -6179,7 +6180,11 @@ class AssignedSplitTest(unittest.TestCase):
         self.assertRegex(
             bar, r"failingSplit\(failing, entry\.assigned, entry\.muted,"
                  r"\s*flakyScope\(\) \? entry\.flaking \|\| 0 : null\)")
-        self.assertIn("return state.summary.status.flaky_total > 0;",
+        # Widened for the flaky default (its design decision 11, item 26):
+        # a mark or an environment's default, an older server's absent
+        # `flaky_defaults` read as 0.
+        self.assertIn("return status.flaky_total > 0 "
+                      "|| (status.flaky_defaults || 0) > 0;",
                       _function_body(self._app(), "function flakyScope()"))
         legend = _function_body(self._app(), "function failingLegend(")
         self.assertIn("FAILING_SPLIT_LEGEND.concat([FLAKING_BAR])", legend)
@@ -7388,7 +7393,10 @@ class OpenActionsCatalogueDomTest(unittest.TestCase):
 #: §3 U2), matched case-insensitively inside string literals: FLAKING and
 #: the sentences that say where a marked test stands, and "flips", the
 #: computed signal's word since decision 6 gave "flaky" to the mark.
-_FLAKY_WORDS = ("flaking", "marked flaky", "flips")
+#: Widened for the flaky default (flaky-default-r0 §3 U3, U9): the words
+#: that say a test is judged by its environment's default.
+_FLAKY_WORDS = ("flaking", "marked flaky", "flips", "environment's default",
+                "environment default")
 
 #: Any one-line JavaScript string literal, in either quote, or a template.
 _STRING_LITERAL_RE = re.compile(
@@ -7425,6 +7433,11 @@ _FLAKY_HELPERS = (
     # The per-day chart's caption and its "Not split" line (flaky-default
     # design §3 U7a).
     "trendFlakingCaption", "trendNotSplitLine",
+    # A row under its environment's default (flaky-default design §3 U3,
+    # U5): whose cadence it is, whether the test has a mark of its own,
+    # the default in words, who set it, and the link to change it.
+    "flakySource", "hasOwnMark", "flakyDefaultWords", "flakySetBy",
+    "flakyDefaultLink",
 )
 
 
@@ -7445,7 +7458,12 @@ class FlakyWordingTest(unittest.TestCase):
         # And api.js does spell them, or the scan proves nothing.
         api = _flaky_wording_offenders(read("api.js"))
         for needle in ("FLAKING", "Flaking: ", "Marked flaky, ",
-                       " in a row", "flips about 1 run in ", "flips often"):
+                       " in a row", "flips about 1 run in ", "flips often",
+                       # Widened for the flaky default (its design §3 U3).
+                       "Flaking under the environment's default: ",
+                       "Environment default, ", "environment default · ",
+                       "; the environment's default is ",
+                       "or as the environment's default says"):
             self.assertTrue(any(needle in text for text in api), needle)
 
     def test_the_detector_can_fail(self) -> None:
@@ -7455,7 +7473,9 @@ class FlakyWordingTest(unittest.TestCase):
                 'if (entry.flaky && entry.flaky.state === "flaking") {}',
                 "const words = cadence + ' in a row';",
                 'line.textContent = "Marked flaky, " + n;',
-                'return "flaky — flips about 1 run in " + period;'):
+                'return "flaky — flips about 1 run in " + period;',
+                'cell.title = "Under the environment\'s default";',
+                'span.textContent = "Environment default, " + n;'):
             self.assertTrue(_flaky_wording_offenders(planted), planted)
         self.assertEqual(_flaky_wording_offenders(
             '// FLAKING is made in api.js\nconst a = "Mark as flaky";'), [])
@@ -7624,8 +7644,14 @@ class FlakyMarkControlsTest(unittest.TestCase):
         self.assertIn(
             'flakyCadenceEl.addEventListener("change", updateFlakyButtonState)',
             code)
-        self.assertIn("marked: Boolean(entry.flaky)",
+        # Widened for the flaky default (its design §3 U5): a row under
+        # its environment's default has no mark of its own, so the bar
+        # offers it Mark and never a cadence change of the default.
+        self.assertIn("marked: hasOwnMark(entry.flaky)",
                       _function_body(code, "function rowCell("))
+        self.assertIn('return Boolean(flaky) && flakySource(flaky) === "mark";',
+                      _function_body(_strip_comments(read("api.js")),
+                                     "export function hasOwnMark("))
 
     def test_the_bar_acts_post_the_mark_and_name_no_owner(self) -> None:
         code = _strip_comments(read("selection.js"))
@@ -7705,27 +7731,34 @@ class FlakyMarkControlsTest(unittest.TestCase):
         link opens it and draws none of its own."""
         code = _strip_comments(read("test.js"))
         banner = _function_body(code, "function renderFlakyBanner(")
-        for needle in ('classList.toggle("is-offer", !flaky)',
+        # Widened for the flaky default (its design §3 U5, item 26): the
+        # offer is drawn for every test without a mark of its own, a test
+        # under its environment's default included, and the form, its
+        # Cancel and its titles carry what the slot drew before it.
+        for needle in ('classList.toggle("is-offer", !hasOwnMark(flaky))',
                        'el("span", "kf-label", "Flaky")', '"Mark as flaky"',
-                       'addEventListener("click", openFlakyForm)',
-                       "open.title = MARK_FLAKY_TITLE"):
+                       'addEventListener("click", () => '
+                       "openFlakyForm(flaky, muteLive))",
+                       "open.title = flaky ? FLAKY_OWN_MARK_TITLE "
+                       ": MARK_FLAKY_TITLE"):
             self.assertIn(needle, banner)
         # A mark is made while the test passes too: nothing but the mark
         # gates the offer, neither the result nor a mute.
         offer = banner[:banner.index("return;")]
-        self.assertIn("if (!flaky) {", offer)
+        self.assertIn("if (!hasOwnMark(flaky)) {", offer)
         for needle in ("latest", "FAIL", "failing", "if (muteLive"):
             self.assertNotIn(needle, offer)
         form = _function_body(code, "function openFlakyForm(")
         self.assertIn('document.getElementById("flaky-banner")', form)
-        self.assertIn("renderFlakyBanner(null)", form)
+        self.assertIn("renderFlakyBanner(flaky, muteLive)", form)
         # The submit explains the act as the opener does, as Mute's act
         # button carries its own: one constant, used twice.
-        self.assertIn("mark.title = MARK_FLAKY_TITLE", form)
+        self.assertIn(
+            "mark.title = flaky ? FLAKY_OWN_MARK_TITLE : MARK_FLAKY_TITLE", form)
         self.assertEqual(code.count("MARK_FLAKY_TITLE"), 3)
         card = _function_body(code, "function renderFlakyCard(")
         for needle in ('el("button", "linkish", "Mark as flaky")',
-                       "openFlakyForm()",
+                       "openFlakyForm(flaky, muteLive)",
                        'getElementById("flaky-banner").scrollIntoView('):
             self.assertIn(needle, card)
         for needle in ("createElement(", "flakyCadenceSelect(",
@@ -7805,6 +7838,35 @@ class FlakyMarkControlsTest(unittest.TestCase):
         for name in ("selection.js", "review.js", "test.js", "api.js"):
             self.assertNotIn("innerHTML", _strip_comments(read(name)), name)
 
+    def test_under_a_default_mark_and_the_link_only(self) -> None:
+        """The flaky default (its design §3 U5, decision 21), held as
+        source so a run without node still sees it: "Change the default"
+        is one URL, the Admin page's row with every scope cleared; the
+        panel and the page draw Set cadence and Unmark only where the
+        test has a mark of its own; every Unmark title says a test
+        returns to its environment's default."""
+        urls = _strip_comments(read("urls.js"))
+        link = _function_body(urls, "export function flakyDefaultAdminUrl(")
+        for needle in ('pageUrl("admin", { environment: environment },',
+                       "{ product: null, stream: null, baseline: null })",
+                       '+ "#envs-section"'):
+            self.assertIn(needle, link)
+        api = _strip_comments(read("api.js"))
+        for name in ("FLAKY_UNMARK_TITLE", "FLAKY_BAR_UNMARK_TITLE"):
+            start = api.index("export const " + name + " = ")
+            self.assertIn("or as the environment's default says",
+                          api[start:api.index(";\n", start)], name)
+        self.assertIn("unmarkBtnEl.title = FLAKY_BAR_UNMARK_TITLE;",
+                      _strip_comments(read("selection.js")))
+        for name, signature in (("review.js", "function buildFlakyGroup("),
+                                ("test.js", "function renderFlakyBanner(")):
+            body = _function_body(_strip_comments(read(name)), signature)
+            gate = body.index("hasOwnMark(flaky)")
+            self.assertLess(gate, body.index('"Set cadence"'), name)
+            self.assertLess(gate, body.index('"Unmark"'), name)
+            self.assertIn("flakyDefaultLink(\n", body, name)
+            self.assertIn("flakyDefaultAdminUrl(", body, name)
+
 
 def _iso_days_ago(days: float) -> str:
     moment = (datetime.datetime.now(datetime.timezone.utc)
@@ -7817,6 +7879,16 @@ def _flaky(state: Any, streak: Any = None, runs: Any = None) -> Dict[str, Any]:
     marked 12 days ago."""
     return {"cadence": 3, "marked_by": "dev1",
             "marked_at": _iso_days_ago(12.1), "reason": "race in teardown",
+            "state": state, "streak": streak, "runs": runs}
+
+
+def _default_flaky(state: Any, streak: Any = None,
+                   runs: Any = None) -> Dict[str, Any]:
+    """A ``flaky`` under an environment's default of 2, in the server's
+    shape (flaky-default design §2 B.3): ``source`` "default", and the
+    cadence, who set it, when (3 days ago) and why are the default's."""
+    return {"source": "default", "cadence": 2, "marked_by": "dev2",
+            "marked_at": _iso_days_ago(3.1), "reason": "two servers",
             "state": state, "streak": streak, "runs": runs}
 
 
@@ -7941,6 +8013,11 @@ if (fixture.surface === "test") {
       card: words(byId["flaky-mark"]),
       cardTags: byId["flaky-mark"].children.map((c) => c.tagName),
       signal: byId["flakiness"].children[0].textContent,
+      // The header's links ("Change the default"), as [text, href].
+      links: byId["flaky-banner"].children.filter((c) => c.tagName === "A")
+        .map((c) => [c.textContent, c.href]),
+      openerTitle: (button(byId["flaky-banner"], "Mark as flaky") || {})
+        .title || null,
       historyHidden: byId["flaky-history-section"].hidden,
       history: byId["flaky-history-body"].children.map((tr) => words(tr)),
     };
@@ -8082,6 +8159,7 @@ if (fixture.surface === "test") {
   }
   await tick();
   out.ticked = seen();
+  out.tickedTitle = flakyBtn.title;
   cadence.value = "3";
   await cadence.dispatch("change");
   out.withCadence = seen();
@@ -8115,7 +8193,10 @@ if (fixture.surface === "test") {
   out.group = group.children.map((c) => [c.tagName,
     c.tagName === "SELECT" ? c.value
       : c.tagName === "SPAN" ? c.children.map((x) => x.textContent)
-        : (c.placeholder || c.textContent)]);
+        : c.tagName === "A" ? [c.textContent, c.href]
+          : (c.placeholder || c.textContent)]);
+  out.titles = group.children.filter((c) => c.tagName === "BUTTON")
+    .map((c) => [c.textContent, c.title]);
   if (fixture.act === "mark") {
     await button(group, "Mark as flaky").click();
     out.emptyError = errorShown();
@@ -9893,9 +9974,11 @@ class FlakyTabTest(unittest.TestCase):
             _function_body(api, "export function flakyStreakWords(flaky)"))
         # The sentence beside it (its title) says the cadence the same
         # way, "after", as the select's "fail after…" does; held here
-        # too so a run without node still sees it.
+        # too so a run without node still sees it. Widened for the flaky
+        # default (its design §3 U3): the same clause after either lead.
         self.assertIn(
-            'return "Flaking: " + failed + "; counts as failing after "\n'
+            'return (byDefault ? "Flaking under the environment\'s default: "\n'
+            '      : "Flaking: ") + failed + "; counts as failing after "\n'
             '      + cadenceWords(cadence);',
             _function_body(api, "export function flakySentence("))
         self.assertLess(api.index("export function flakySentence("),
@@ -10333,6 +10416,21 @@ class FlakingFilterTest(unittest.TestCase):
 
     @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
                      "are optional dev tooling, the source guards still run")
+    def test_shown_where_the_scope_has_only_a_default(self) -> None:
+        """Widened for the flaky default (its design decision 11, U7): an
+        environment's default in scope (``status.flaky_defaults``) shows
+        the toggle as a mark does, through flakyScope(); a headline with
+        ``flaky_defaults: 0`` and no mark keeps it hidden."""
+        for defaults, hidden in ((1, False), (2, False), (0, True)):
+            with self.subTest(defaults=defaults):
+                toggles = _lists_walk("zero", [], defaults=defaults)[0][
+                    "toggles"]
+                self.assertEqual(toggles[2][:2], ["FLAKING", hidden])
+                self.assertEqual(toggles[1][3], "" if hidden else
+                                 "Failing, flaking tests left out")
+
+    @unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                     "are optional dev tooling, the source guards still run")
     def test_read_at_load_and_shown_while_pressed(self) -> None:
         """A link (or a bookmark) pressing FLAKING on a scope with no mark
         still shows the toggle it pressed; on a build it opens "Its own
@@ -10395,6 +10493,24 @@ class FlakingTrendTest(unittest.TestCase):
                 self.assertEqual(load["trendLegend"][3], "Flaking")
                 self.assertEqual(load["caption"], [False, False, said])
 
+    def test_drawn_where_the_scope_has_only_a_default(self) -> None:
+        """Widened for item 26 (flakyScope() takes a default, decision
+        11): no mark and one environment default in scope draw the
+        series, its column and the default's caption; zero defaults and
+        no mark draw today's chart."""
+        load = _lists_walk("zero", [], defaults=1)[0]
+        self.assertEqual(load["trendLegend"], [
+            "Unassigned", "Assigned", "Muted", "Flaking", "Unexpected pass"])
+        self.assertEqual(load["trendRow"],
+                         ["Oct 1", "9", "3", "3", "2", "1", "2", "62"])
+        self.assertEqual(load["caption"], [
+            False, False, " Flaking: the day's tolerated failures, by "
+            "today's environment default."])
+        none = _lists_walk("zero", [], defaults=0)[0]
+        self.assertEqual(none["trendLegend"], [
+            "Unassigned", "Assigned", "Muted", "Unexpected pass"])
+        self.assertEqual(none["caption"], [False, True, ""])
+
     def test_the_four_captions(self) -> None:
         """Marks only, default(s) only, both, neither; a server that
         sends no ``flaky_defaults`` (the second argument absent or
@@ -10456,9 +10572,12 @@ class TrendSplitAfterHeadlineDomTest(unittest.TestCase):
 
     def test_the_first_batch_is_three_and_the_split_follows(self) -> None:
         """No mark, a mark, and a default in scope (flaky default design
-        §3 U7a): the same three first, the same one split after."""
-        for marks, defaults in (("zero", None), ("flaky", None),
-                                ("zero", 1)):
+        §3 U7a): the same three first, the same one split after. Widened
+        by item 26 (flakyScope() takes a default): the default's split
+        carries the Flaking series, as a mark's does."""
+        for marks, defaults, flaking in (("zero", None, False),
+                                         ("flaky", None, True),
+                                         ("zero", 1, True)):
             with self.subTest(marks=marks, defaults=defaults):
                 load = _lists_walk(marks, [], defaults=defaults,
                                    headline_delay=self._DELAY)[0]
@@ -10468,8 +10587,10 @@ class TrendSplitAfterHeadlineDomTest(unittest.TestCase):
                 self.assertEqual(_parts(load["asked"]).count(
                     "assigned_trend"), 1)
                 # Once it lands, the trend carries the split.
-                self.assertEqual(load["trendLegend"][:3],
-                                 ["Unassigned", "Assigned", "Muted"])
+                self.assertEqual(load["trendLegend"],
+                                 self._SPLIT if flaking else
+                                 ["Unassigned", "Assigned", "Muted",
+                                  "Unexpected pass"])
 
     def test_every_refresh_asks_once_after_its_headline(self) -> None:
         """Reload, an environment chosen and a Take (the coalescer)."""
@@ -10592,10 +10713,11 @@ class TrendDrawsOnceDomTest(unittest.TestCase):
     _TOTALS = ["Failed", "Unexpected pass"]
 
     #: (marks, flaky_defaults, the split's legend): no mark, a mark, a
-    #: default only (flakyScope() is item 26's to widen), and a server
-    #: from before WP-44's fields.
+    #: default only, and a server from before WP-44's fields. Widened by
+    #: item 26, which widened flakyScope() to a default (the design's
+    #: decision 11): a default alone now draws the Flaking series.
     _FIXTURES = (("zero", None, _SPLIT), ("flaky", None, _FLAKING),
-                 ("flaky", 2, _FLAKING), ("zero", 1, _SPLIT),
+                 ("flaky", 2, _FLAKING), ("zero", 1, _FLAKING),
                  ("older", None, _SPLIT))
 
     def test_one_drawing_per_load_and_refresh(self) -> None:
@@ -10796,6 +10918,430 @@ class OpenActionsFlakingDomTest(unittest.TestCase):
         self.assertFalse(answer["note"][0])
         self.assertTrue(answer["note"][1].startswith("Unassigned tests that "
                                                      "are flaking"))
+
+    def test_a_row_under_a_default_reads_as_a_marked_one(self) -> None:
+        """Widened for the flaky default (its design §3 U4, U7): an
+        assigned row flaking under its environment's default reads
+        FLAKING, and the footer follows the names part's ``flaky_marks``,
+        which the server makes true for a default (§2 B.3, P3). Over its
+        cadence it reads FAIL."""
+        answer = _actions_modes_walk(True, dict(
+            _ACTIONS_ROW, assignee="dev1", flaky=_default_flaky("flaking", 1)))
+        self.assertEqual(answer["firstRow"],
+                         ["result-flaking", "chip result-flaking:FLAKING"])
+        self.assertFalse(answer["note"][0])
+        over = _actions_modes_walk(True, dict(
+            _ACTIONS_ROW, assignee="dev1",
+            flaky=_default_flaky("failing", 2, 2)))
+        self.assertEqual(over["firstRow"],
+                         ["result-fail", "chip result-fail:FAIL"])
+
+
+#: A row under its environment's default, as the Review panel and the
+#: test page say it (flaky-default design §3 U3, U5), for a default of 2
+#: set by dev2 three days ago, "two servers".
+_DEFAULT_SENTENCE = ("Flaking under the environment's default: failed its "
+                     "last run; counts as failing after 2 in a row")
+_DEFAULT_DETAIL = ("environment default · set by dev2 · 3 days ago · "
+                   "two servers")
+_DEFAULT_LINK = ["Change the default",
+                 "admin.html?environment=env-a#envs-section"]
+_OWN_MARK_TITLE = ("Give this test a mark of its own: its cadence and your "
+                   "reason replace the environment's default for it, until "
+                   "the mark is removed.")
+#: The selection bar's "Mark as flaky" title, and the clause it gains
+#: where a ticked row is under its environment's default.
+_BAR_MARK_TITLE = ("Mark the selected tests as flaky at the cadence chosen, "
+                   "on mainline and every build, until the mark is removed. "
+                   "Needs a reason (the note box) and a cadence. You own the "
+                   "mark; the “Assign to” box is not read. The "
+                   "reason is also posted as a comment.")
+_BAR_OWN_MARK_CLAUSE = ("A test under its environment's default gets a mark "
+                        "of its own: its cadence and your reason replace the "
+                        "default for it, until the mark is removed.")
+
+
+def _as_default(row: Dict[str, Any]) -> None:
+    """Put a walk *row* (server's shape, marked) under its environment's
+    default of 2 instead, in place: a FAIL row's ``flaky`` becomes the
+    default's, flaking at 1 or failing at 2 of 2; any other result
+    carries none (§2 B.3, P2). Rows are shared between queues, so a row
+    already converted is left alone."""
+    flaky = row.get("flaky")
+    if not flaky or flaky.get("source") == "default":
+        return
+    if row["result"] != "FAIL":
+        row["flaky"] = None
+    elif flaky["state"] == "flaking":
+        row["flaky"] = _default_flaky("flaking", 1)
+    else:
+        row["flaky"] = _default_flaky("failing", 2, 2)
+
+
+def _default_state_fixture() -> Dict[str, Any]:
+    """The Home state walk's fixture with no mark and one environment
+    default in scope: the flaking figures as a mark's walk has them, every
+    FAIL row's ``flaky`` the default's, ``flaky_total`` 0 and
+    ``flaky_defaults`` 1."""
+    fixture = _state_fixture("flaky", False, [[0, 1], [1, 5]])
+    fixture["headline"]["status"].update({"flaky_total": 0,
+                                          "flaky_defaults": 1})
+    for queue in fixture["queues"].values():
+        for row in queue["tests"]:
+            _as_default(row)
+    for row in fixture["dashboard"]["tests"]:
+        _as_default(row)
+    return fixture
+
+
+def _default_flaking_row(name: str, **extra: Any) -> Dict[str, Any]:
+    """One row of ``queue=flaking`` flaking under its environment's
+    default: the Flaking tab's row shape, the default's ``flaky``."""
+    row = _flaking_row(name, 1, **extra)
+    row["flaky"] = _default_flaky("flaking", 1)
+    return row
+
+
+@unittest.skipIf(NODE is None, "node is not on PATH: the DOM-shim walks "
+                 "are optional dev tooling, the source guards still run")
+class FlakyDefaultDomTest(unittest.TestCase):
+    """The flaky default (its design §3 U4 to U6, U9; decisions 19 to 22)
+    over the DOM shim: a row flaking under its environment's default
+    draws exactly as a marked one does (the chip, the edge, the Streak
+    cell), with no "flaky" pill in any state; its words say the cadence
+    is the environment's; its acts are "Mark as flaky", which gives the
+    test a mark of its own, and the link "Change the default", never Set
+    cadence or Unmark; the selection bar reads it as not marked; the
+    test's own page says the default in every state; and a ``flaky``
+    with no ``source`` draws WP-44's DOM. No browser: the DOM drawn and
+    the requests made, not the look."""
+
+    _home = None  # type: Optional[Dict[str, Any]]
+
+    def _home_walk(self) -> Dict[str, Any]:
+        if FlakyDefaultDomTest._home is None:
+            FlakyDefaultDomTest._home = _shim(_default_state_fixture(),
+                                              _HOME_STATE_DRIVER)
+        return FlakyDefaultDomTest._home
+
+    def _page(self, detail: Dict[str, Any], act: Any = None,
+              after: Any = None) -> Dict[str, Any]:
+        return _shim({
+            "surface": "test", "act": act, "detail": detail, "after": after,
+            "ids": re.findall(r'id="([^"]+)"', read("test.html")),
+            "url": "http://127.0.0.1/test.html?environment=env-a"
+                   "&script=s1.py&test_name=t1"}, _FLAKY_SHIM_DRIVER)
+
+    def _panel(self, flaky: Any, act: str = "mark",
+               mute: Any = None) -> Dict[str, Any]:
+        entry = dict(_ONE_TEST, run_id=7, result="FAIL",
+                     start_time="2026-11-10T02:14:00", assignee=None,
+                     mute=mute, flaky=flaky)
+        return _shim({"surface": "panel", "entry": entry, "act": act,
+                      "ids": ["error-banner"],
+                      "url": "http://127.0.0.1/index.html"},
+                     _FLAKY_SHIM_DRIVER)
+
+    @staticmethod
+    def _detail(result: str, flaky: Any,
+                mute: Any = None) -> Dict[str, Any]:
+        """The test detail under a default: the test's own mark history
+        only, so none (§2 B.3)."""
+        detail = _test_detail(result, flaky, mute)
+        detail["flaky_history"] = []
+        return detail
+
+    def test_rows_draw_as_a_marks_and_carry_no_pill(self) -> None:
+        """U4 and decision 19: FLAKING and its edge under the cadence,
+        FAIL and red over it, a passing row with no ``flaky`` at all, a
+        live mute's own; no "flaky" pill on any row of the browse list
+        or of any queue tab."""
+        answer = self._home_walk()
+        rows = [_row_shape(tr)
+                for tr in answer["regions"]["dashboard-body"][7]]
+        self.assertEqual(rows, [
+            ["result-flaking", [["chip result-flaking", "FLAKING"]]],
+            ["result-fail", [["chip result-fail", "FAIL"]]],
+            ["result-pass", [["chip result-pass", "PASS"]]],
+            ["result-unexpected-pass", [
+                ["chip result-unexpected-pass", "UNEXPECTED_PASS"]]],
+            ["result-fail", [["chip result-fail", "FAIL"],
+                             ["mute-tag", "muted"]]],
+            ["result-fail", [["chip result-fail", "FAIL"]]],
+            ["result-flaking", [["chip result-flaking", "FLAKING"]]],
+        ])
+        queues = answer["queues"]
+        self.assertEqual([_row_shape(tr) for tr in queues["Flaking"][2][7]],
+                         [["result-flaking", []]])
+        # The night it goes over: FLAKING → FAIL, as a mark's (U4).
+        self.assertEqual(
+            [_row_shape(tr) for tr in queues["New failures"][2][7]][0],
+            ["result-fail", [["chip chip-ghost result-flaking", "FLAKING"],
+                             ["chip result-fail", "FAIL"]]])
+        pills = [node for region in list(answer["regions"].values())
+                 + [part for parts in queues.values() for part in parts]
+                 for node in _dom_walk(region)
+                 if "flaky-tag" in str(node[1]).split()]
+        self.assertEqual(pills, [])
+
+    def test_the_figures_follow_flakyScope_and_no_request_is_added(
+            self) -> None:
+        """U7, decision 11: with a default and no mark in scope, the New
+        failures tile says "or flaking" and the bar cards key their
+        flaking part, as with a mark; Home asks for exactly what it asks
+        for without one."""
+        answer = self._home_walk()
+        tiles = answer["regions"]["stat-tiles"][7]
+        subs = {_dom_text(tile[7][0]): _dom_text(tile[7][2])
+                for tile in tiles}
+        self.assertEqual(
+            subs["New failures"],
+            "were passing or flaking before · +3 muted · +4 flaking")
+        legends = [[_dom_text(item) for item in node[7]]
+                   for node in _dom_walk(answer["regions"]["env-chart"])
+                   if node[1] == "chart-legend"]
+        self.assertEqual(legends, [["Unassigned", "Assigned", "Muted",
+                                    "Flaking"]])
+        self.assertEqual(answer["asked"], [
+            "api/products", "api/users", "headline", "queue",
+            "api/dashboard", "assigned_trend"])
+
+    def test_the_bar_reads_a_default_as_not_marked(self) -> None:
+        """U5: ``marked`` is hasOwnMark(): two rows flaking under the
+        default offer Mark, where two marked rows offer Set cadence; a
+        mixed selection offers Mark; marking sends each a mark of its
+        own, and Unmark sends only the unmark the bar always sends."""
+        self.assertEqual(self._home_walk()["ticked"],
+                         ["Mark as flaky", "Mark as flaky"])
+        default = dict(_ONE_TEST, flaky=_default_flaky("flaking", 1))
+        marked = dict(_ONE_TEST, test_name="t2", flaky=_flaky("flaking", 1))
+        bar = _shim({"surface": "bar", "ids": ["error-banner"],
+                     "url": "http://127.0.0.1/index.html",
+                     "rows": [default, dict(default, test_name="t3")]},
+                    _FLAKY_SHIM_DRIVER)
+        self.assertEqual(bar["ticked"], ["Mark as flaky", True])
+        self.assertEqual(bar["withReason"], ["Mark as flaky", False])
+        tests = [_ONE_TEST, dict(_ONE_TEST, test_name="t3")]
+        self.assertEqual(bar["posts"], [
+            ["api/flaky/bulk", {"username": "dev1", "cadence": 3,
+                                "reason": "race in teardown", "tests": tests}],
+            ["api/flaky/unmark", {"username": "dev1", "tests": tests}]])
+        mixed = _shim({"surface": "bar", "ids": ["error-banner"],
+                       "url": "http://127.0.0.1/index.html",
+                       "rows": [default, marked]}, _FLAKY_SHIM_DRIVER)
+        self.assertEqual(mixed["withCadence"], ["Mark as flaky", True])
+        both = _shim({"surface": "bar", "ids": ["error-banner"],
+                      "url": "http://127.0.0.1/index.html",
+                      "rows": [marked, dict(marked, test_name="t4")]},
+                     _FLAKY_SHIM_DRIVER)
+        self.assertEqual(both["withCadence"], ["Set cadence", False])
+        plain = _shim({"surface": "bar", "ids": ["error-banner"],
+                       "url": "http://127.0.0.1/index.html",
+                       "rows": [dict(_ONE_TEST, flaky=None)]},
+                      _FLAKY_SHIM_DRIVER)
+        # Mark's title says a mark of its own wherever a ticked row is
+        # under a default (U5, as the panel's title says it), the plain
+        # title otherwise; Set cadence keeps its own.
+        self.assertEqual(bar["tickedTitle"],
+                         _BAR_MARK_TITLE + " " + _BAR_OWN_MARK_CLAUSE)
+        self.assertEqual(mixed["tickedTitle"],
+                         _BAR_MARK_TITLE + " " + _BAR_OWN_MARK_CLAUSE)
+        self.assertEqual(plain["tickedTitle"], _BAR_MARK_TITLE)
+        self.assertTrue(both["tickedTitle"].startswith(
+            "Change the cadence of the selected tests"))
+
+    def test_the_review_panel_offers_mark_and_the_link_only(self) -> None:
+        """U5, decision 21: the default's sentence and small print, the
+        mark form with its sentence about a mark of its own, and the
+        link to the environment's row on Admin; no Set cadence, no
+        Unmark. Marking posts a mark of its own, as for an unmarked
+        test."""
+        for name, flaky, mute, sentence in (
+                ("flaking", _default_flaky("flaking", 1), None,
+                 _DEFAULT_SENTENCE),
+                ("over", _default_flaky("failing", 2, 2), None,
+                 "Failing: its last 2 runs all failed; the environment's "
+                 "default is 2 in a row"),
+                ("muted", _default_flaky("flaking", 1), _LIVE_MUTE,
+                 "Under the environment's default; the mute comes first "
+                 "until it runs out")):
+            with self.subTest(name):
+                answer = self._panel(flaky, mute=mute)
+                self.assertEqual(answer["group"], [
+                    ["LABEL", "Flaky"],
+                    ["SPAN", [sentence, _DEFAULT_DETAIL]],
+                    ["INPUT", "Why is this test flaky? (required)"],
+                    ["SELECT", ""], ["BUTTON", "Mark as flaky"],
+                    ["A", _DEFAULT_LINK]])
+                self.assertEqual(answer["titles"],
+                                 [["Mark as flaky", _OWN_MARK_TITLE]])
+                self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+                    "username": "dev1", "reason": "race in teardown",
+                    "cadence": 3, "tests": [_ONE_TEST]}]])
+                self.assertEqual(answer["reloads"], 1)
+
+    def test_the_test_page_says_the_default_in_every_state(self) -> None:
+        """U5: the header in the offer's quiet slot, the default, who set
+        it and the sentence for this stream, "Mark as flaky" and the
+        link; the card names the default before its link; no pill and no
+        history; the chip as a mark's. ``state: null`` included."""
+        cases = (
+            ("FAIL", _default_flaky("flaking", 1), None,
+             ["chip result-flaking", "FLAKING"], _DEFAULT_SENTENCE),
+            ("FAIL", _default_flaky("failing", 2, 2), None,
+             ["chip result-fail", "FAIL"],
+             "Failing: its last 2 runs all failed; the environment's "
+             "default is 2 in a row"),
+            ("FAIL", _default_flaky("failing", 1, 1), None,
+             ["chip result-fail", "FAIL"],
+             "Failing: its only run here failed; the environment's "
+             "default is 2 in a row"),
+            ("PASS", _default_flaky("passing", 0), None,
+             ["chip result-pass", "PASS"],
+             "The environment's default: counts as failing once its last "
+             "2 runs have failed"),
+            ("FAIL", _default_flaky("flaking", 1), _LIVE_MUTE,
+             ["chip result-fail", "FAIL"],
+             "Under the environment's default; the mute comes first until "
+             "it runs out"),
+            ("PASS", _default_flaky(None), None, ["chip result-pass", "PASS"],
+             "Environment default, 2 in a row; no run here yet"),
+        )
+        for result, flaky, mute, chip, sentence in cases:
+            with self.subTest(sentence=sentence):
+                first = self._page(self._detail(result, flaky, mute))["first"]
+                self.assertEqual(first["chip"], chip)
+                self.assertIsNone(first["tag"])
+                self.assertEqual(first["banner"], [
+                    "Flaky", "Environment default, 2 in a row",
+                    "set by dev2 · 3 days ago · two servers", sentence,
+                    "Mark as flaky", "Change the default"])
+                self.assertTrue(first["offer"])
+                self.assertEqual(first["links"], [_DEFAULT_LINK])
+                self.assertEqual(first["openerTitle"], _OWN_MARK_TITLE)
+                self.assertEqual(first["card"], [
+                    "Environment default, 2 in a row", "·", "Mark as flaky"])
+                self.assertTrue(first["historyHidden"])
+
+    def test_the_test_page_marks_and_cancel_returns_to_the_default(
+            self) -> None:
+        """Mark from the header gives the test a mark of its own (the
+        page then draws the mark); the card's link opens the same form,
+        and Cancel draws the default again, not the bare offer."""
+        detail = self._detail("FAIL", _default_flaky("flaking", 1))
+        marked = _test_detail("FAIL", _flaky("flaking", 1))
+        answer = self._page(detail, "mark", marked)
+        self.assertEqual(answer["form"],
+                         ["SPAN", "INPUT", "SELECT", "BUTTON", "BUTTON"])
+        self.assertEqual(answer["posts"], [["api/flaky/bulk", {
+            "username": "dev1", "reason": "race in teardown", "cadence": 3,
+            "tests": [_ONE_TEST]}]])
+        self.assertEqual(answer["after"]["banner"][0],
+                         "Marked flaky, 3 in a row")
+        self.assertFalse(answer["after"]["offer"])
+        self.assertEqual(answer["after"]["links"], [])
+        card = self._page(detail, "card", marked)
+        self.assertEqual(card["cancelled"], [[
+            "Flaky", "Environment default, 2 in a row",
+            "set by dev2 · 3 days ago · two servers", _DEFAULT_SENTENCE,
+            "Mark as flaky", "Change the default"], True])
+
+    def test_no_source_draws_wp44s_dom(self) -> None:
+        """§1a: a ``flaky`` with no ``source`` is a mark, so a server from
+        before the default draws exactly what ``source: "mark"`` draws."""
+        for flaky in (_flaky("flaking", 1), _flaky("passing", 0)):
+            with self.subTest(state=flaky["state"]):
+                older = self._page(_test_detail("FAIL", flaky))["first"]
+                newer = self._page(_test_detail(
+                    "FAIL", dict(flaky, source="mark")))["first"]
+                self.assertEqual(older, newer)
+                self.assertEqual(older["banner"][-2:],
+                                 ["Set cadence", "Unmark"])
+        older = self._panel(_flaky("flaking", 1), "cadence")
+        newer = self._panel(dict(_flaky("flaking", 1), source="mark"),
+                            "cadence")
+        self.assertEqual(older["group"], newer["group"])
+        self.assertEqual([part[1] for part in older["group"][-2:]],
+                         ["Set cadence", "Unmark"])
+
+    def test_the_flaking_tab_against_its_neighbours(self) -> None:
+        """U6, decisions 21 and 22: on the Flaking tab a row under the
+        default has the columns, row controls and Review panel groups a
+        marked row has, Still failing's groups; its Streak cell says the
+        default's cadence and its title the default's sentence. The one
+        difference is the Flaky group: Mark and the link, where a mark
+        has Set cadence and Unmark. Every tab's Review opens the same
+        panel for it."""
+        rows = [_default_flaking_row("dns_timeout"),
+                _default_flaking_row("cache_warm", assignee="dev1")]
+        opened, ticked = _lists_walk(
+            "zero", [["tab", "Flaking"], ["review", 0], ["tick", [0, 1]]],
+            rows=rows, flaking=2, defaults=1)[2:]
+        marked = _lists_walk("flaky", [["tab", "Flaking"],
+                                       ["review", 0]])[2]
+        still = _lists_walk("zero", [["tab", "Still failing"],
+                                     ["review", 0]], defaults=1)[2]
+        self.assertEqual(opened["head"], _FLAKING_HEAD)
+        self.assertEqual(opened["head"], marked["head"])
+        drawn = opened["rows"]
+        self.assertEqual([row["cells"][:2] for row in drawn], [
+            ["dns_timeoutenv-a · s1.py", "1 in a row, failing after 2"],
+            ["cache_warmenv-a · s1.py", "1 in a row, failing after 2"]])
+        self.assertEqual([row["titles"][1] for row in drawn],
+                         [_DEFAULT_SENTENCE] * 2)
+        self.assertEqual([row["edge"] for row in drawn],
+                         ["result-flaking"] * 2)
+        self.assertEqual([row["marks"] for row in drawn], [[], []])
+        self.assertEqual([row["take"] for row in drawn], [1, 0])
+        self.assertEqual([row["review"] for row in drawn],
+                         [["Close"], ["Review"]])
+        self.assertEqual(opened["panel"]["labels"],
+                         marked["panel"]["labels"])
+        self.assertEqual(opened["panel"]["labels"],
+                         still["panel"]["labels"])
+        self.assertEqual(opened["panel"]["flaky"], [
+            ["SPAN", [_DEFAULT_SENTENCE, _DEFAULT_DETAIL]],
+            ["INPUT", ""], ["SELECT", ""], ["BUTTON", "Mark as flaky"],
+            ["A", "Change the default"]])
+        self.assertEqual([part[0] for part in marked["panel"]["flaky"]],
+                         ["SPAN", "SELECT", "BUTTON", "BUTTON"])
+        self.assertEqual(ticked["ticked"], ["Mark as flaky", False])
+        each = _lists_walk("zero", [["reviewEach", None]], flaking=1,
+                           defaults=1, queue_row=rows[0])[1]["each"]
+        self.assertEqual(_tabs_without_review(each), [])
+        self.assertEqual({json.dumps(tab["panel"]) for tab in each},
+                         {json.dumps(opened["panel"])})
+
+    def test_the_detector_can_fail(self) -> None:
+        """Planted: a copy of the static tree whose flakyTag() draws the
+        pill for a default and whose bar reads any ``flaky`` as marked,
+        as WP-44's code did before the default."""
+        with tempfile.TemporaryDirectory() as scratch:
+            shutil.copytree(STATIC_DIR, os.path.join(scratch, "static"))
+            os.makedirs(os.path.join(scratch, "tools", "dev", "net"))
+            shutil.copy(
+                os.path.join(REPO_DIR, "tools", "dev", "net", "domshim.mjs"),
+                os.path.join(scratch, "tools", "dev", "net"))
+            for name, old, new in (
+                    ("api.js", "  if (!hasOwnMark(flaky)) {\n"
+                               "    return null;\n  }\n  const muteLive",
+                     "  if (!flaky) {\n    return null;\n  }\n"
+                     "  const muteLive"),
+                    ("selection.js", "marked: hasOwnMark(entry.flaky),",
+                     "marked: Boolean(entry.flaky),")):
+                path = os.path.join(scratch, "static", name)
+                with io.open(path, encoding="utf-8") as handle:
+                    source = handle.read()
+                planted = source.replace(old, new, 1)
+                self.assertNotEqual(planted, source, name)
+                with io.open(path, "w", encoding="utf-8") as handle:
+                    handle.write(planted)
+            answer = _shim(_default_state_fixture(), _HOME_STATE_DRIVER,
+                           scratch)
+        rows = [_row_shape(tr)
+                for tr in answer["regions"]["dashboard-body"][7]]
+        self.assertEqual(rows[1][1][-1][:2], ["flaky-tag", "flaky"])
+        self.assertEqual(answer["ticked"][0], "Set cadence")
 
 
 #: The settings that moved from Open Actions to the Admin page

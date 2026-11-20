@@ -101,6 +101,16 @@
           under Fixed. <strong>Change</strong> and <strong>Remove</strong>
           take a reason too, and every change is kept under the
           row&rsquo;s <strong>History</strong>.</li>
+        <li><strong>A test flaking under a default reads as a marked one
+          does</strong>: <em>FLAKING</em>, counted as flaking and listed in
+          the Flaking tab and under the FLAKING filter, with no
+          &ldquo;flaky&rdquo; pill. Under <strong>Review</strong> it says
+          the cadence is the environment&rsquo;s default and offers
+          <strong>Mark as flaky</strong>, which gives the test a mark of its
+          own that wins over the default, and <strong>Change the
+          default</strong>, which opens the environment&rsquo;s row on
+          Admin. The test&rsquo;s own page says the default whatever its
+          result.</li>
         <li><strong>Failing runs per day counts the default too</strong>:
           failures a default tolerated draw as flaking, as everywhere else.
           The chart now draws once, a moment after the rest of the page,

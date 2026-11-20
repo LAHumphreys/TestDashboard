@@ -706,17 +706,19 @@ export function setAsideWords(muted, flaking) {
 }
 
 /** The New failures tile's sub-line before its suffix. On the night a
- * marked test goes over its cadence it is a new failure that was
- * flaking, not passing, so where the scope has any mark
- * (`flakyTotal` > 0) the line says so; elsewhere it is today's. */
-export function newFailuresSub(flakyTotal) {
-  return flakyTotal > 0 ? "were passing or flaking before"
+ * flaking test goes over its cadence it is a new failure that was
+ * flaking, not passing, so where the scope has a mark or an environment
+ * default (`flakyInScope`, the page's flakyScope()) the line says so;
+ * elsewhere it is today's. */
+export function newFailuresSub(flakyInScope) {
+  return flakyInScope ? "were passing or flaking before"
     : "were passing before";
 }
 
 /** The flaking part of a failing bar (WP-44): its legend key, tooltip
  * swatch and segment class, all in the chart token. Drawn after the
- * grey muted part, and keyed only where the scope has a mark. The same
+ * grey muted part, and keyed only where the scope has a mark or an
+ * environment default. The same
  * object is the per-day chart's fourth series: `key` is the night's
  * count in `parts=assigned_trend`, `segClass` its column segment. */
 export const FLAKING_BAR = {
@@ -869,7 +871,28 @@ export function mutedTag(entry) {
  * Every helper reads a mark defensively: an entry with no `flaky`
  * field, or a null one, is an unmarked test. Lists gain the field after
  * the test detail does, and an older server sends none at all.
+ *
+ * An environment's flaky default (flaky-default design §3 U3) arrives in
+ * the same `flaky` object with `source` "default": the cadence, who set
+ * it, when and why are the default's. Such a test draws exactly as a
+ * marked one (FLAKING, the edge, the Streak cell); only the words say
+ * whose cadence it is, and only the acts differ: there is no mark to
+ * change or remove (hasOwnMark()).
  */
+
+/** "default" for a test judged by its environment's default, "mark" for
+ * a test with a mark of its own. A `flaky` with no `source` (a server
+ * from before the default) is a mark. */
+export function flakySource(flaky) {
+  return flaky && flaky.source === "default" ? "default" : "mark";
+}
+
+/** Whether the test carries a mark of its own: what "Set cadence",
+ * "Unmark" and the selection bar's `marked` read. False for no `flaky`
+ * and for a test under its environment's default. */
+export function hasOwnMark(flaky) {
+  return Boolean(flaky) && flakySource(flaky) === "mark";
+}
 
 /** The cadences a mark may have. The server takes a whole number from
  * 2 to 10, and the UI offers every one of them. */
@@ -959,6 +982,12 @@ export function flakyMarkWords(cadence) {
   return "Marked flaky, " + cadenceWords(cadence);
 }
 
+/** "Environment default, 2 in a row": the environment's default as it
+ * applies to one test, without its state; flakyMarkWords()' twin. */
+export function flakyDefaultWords(cadence) {
+  return "Environment default, " + cadenceWords(cadence);
+}
+
 /**
  * The one sentence that says where a marked test stands on this stream:
  * the title of its pill, the line in the Review panel and the test
@@ -966,17 +995,22 @@ export function flakyMarkWords(cadence) {
  * the server, with `streak` (failures in a row, capped at the cadence)
  * and `runs` (how many runs the stream has, capped at the cadence, given
  * when the state is failing). A null state is a stream the test has not
- * run on yet.
+ * run on yet. Under the environment's default (flakySource()) each state
+ * says so instead of "marked flaky" (design §3 U3, decision 20: "the
+ * environment's default", never its name).
  */
 export function flakySentence(flaky, muteLive) {
   const cadence = flaky.cadence;
+  const byDefault = flakySource(flaky) === "default";
   if (muteLive) {
-    return "Marked flaky; the mute comes first until it runs out";
+    return (byDefault ? "Under the environment's default" : "Marked flaky")
+      + "; the mute comes first until it runs out";
   }
   if (flaky.state === "flaking") {
     const failed = flaky.streak > 1
       ? "failed its last " + flaky.streak + " runs" : "failed its last run";
-    return "Flaking: " + failed + "; counts as failing after "
+    return (byDefault ? "Flaking under the environment's default: "
+      : "Flaking: ") + failed + "; counts as failing after "
       + cadenceWords(cadence);
   }
   if (flaky.state === "failing") {
@@ -989,12 +1023,16 @@ export function flakySentence(flaky, muteLive) {
     } else {
       failed = "every run here has failed (" + runs + " of " + runs + ")";
     }
-    return "Failing: " + failed + "; marked flaky, " + cadenceWords(cadence);
+    return "Failing: " + failed + (byDefault
+      ? "; the environment's default is " : "; marked flaky, ")
+      + cadenceWords(cadence);
   }
   if (flaky.state === "passing") {
-    return "Marked flaky: " + cadenceSentence(cadence);
+    return (byDefault ? "The environment's default: " : "Marked flaky: ")
+      + cadenceSentence(cadence);
   }
-  return flakyMarkWords(cadence) + "; no run here yet";
+  return (byDefault ? flakyDefaultWords(cadence) : flakyMarkWords(cadence))
+    + "; no run here yet";
 }
 
 /**
@@ -1009,28 +1047,49 @@ export function flakyStreakWords(flaky) {
   return cadenceWords(flaky.streak) + ", failing after " + flaky.cadence;
 }
 
-/** "by alice · 12 days ago · race in teardown": who made a mark, how
- * long ago, and why. The small print beside its sentence. */
-export function flakyDetail(flaky, nowMs) {
-  const parts = [
-    "by " + flaky.marked_by,
-    ageText(flaky.marked_at, nowMs === undefined ? Date.now() : nowMs),
-  ];
-  if (flaky.reason) {
-    parts.push(flaky.reason);
+/** "<who> · 12 days ago · <why>": the one shape of the small print under
+ * a mark, a default and each change of a default. */
+function whoWhenWhy(who, at, reason, nowMs) {
+  const parts = [who, ageText(at, nowMs === undefined ? Date.now() : nowMs)];
+  if (reason) {
+    parts.push(reason);
   }
   return parts.join(" · ");
+}
+
+/** "by alice · 12 days ago · race in teardown": who made a mark, how
+ * long ago, and why. The small print beside its sentence. Under the
+ * environment's default: "environment default · set by amy · 3 days ago
+ * · two servers", whose cadence it is, then flakySetBy(). */
+export function flakyDetail(flaky, nowMs) {
+  if (flakySource(flaky) === "default") {
+    return "environment default · " + flakySetBy(flaky, nowMs);
+  }
+  return whoWhenWhy("by " + flaky.marked_by, flaky.marked_at, flaky.reason,
+    nowMs);
+}
+
+/** "set by amy · 3 days ago · two servers": who set the environment's
+ * default a test is judged by, how long ago and why, from that test's
+ * `flaky` (the default's own act, carried as `marked_by`/`marked_at`).
+ * The test page's header, after flakyDefaultWords(). */
+export function flakySetBy(flaky, nowMs) {
+  return whoWhenWhy("set by " + flaky.marked_by, flaky.marked_at,
+    flaky.reason, nowMs);
 }
 
 /**
  * The small "flaky" pill, for a marked test whose result does not read
  * FLAKING (over its cadence, passing, or under a live mute); null for
  * an unmarked test, and for one reading FLAKING, whose chip says it
- * already. `entry` carries `result`, `flaky` and `mute` as a row does.
+ * already. Null too, in every state, for a test under its environment's
+ * default (decision 19): every row there would carry one, and its own
+ * page is where the default is said. `entry` carries `result`, `flaky`
+ * and `mute` as a row does.
  */
 export function flakyTag(entry) {
   const flaky = entry && entry.flaky;
-  if (!flaky) {
+  if (!hasOwnMark(flaky)) {
     return null;
   }
   const muteLive = Boolean(entry.mute && entry.mute.live);
@@ -1063,11 +1122,42 @@ export const OPEN_ACTIONS_FLAKING_NOTE = "Unassigned tests that are "
   + "flaking are left out until they fail past their cadence.";
 
 /** The titles of one marked test's "Set cadence" and "Unmark", in the
- * Review panel and on the test page alike. */
+ * Review panel and on the test page alike. Unmark returns a test to its
+ * environment's default where there is one (decision 10), so it says so;
+ * the selection bar's Unmark, for many tests, says the same. */
 export const FLAKY_CADENCE_TITLE = "Change how many failures in a row "
   + "count as failing. The mark keeps its owner.";
 export const FLAKY_UNMARK_TITLE = "Remove the flaky mark; a failure "
-  + "counts as failing again.";
+  + "counts as failing again, or as the environment's default says.";
+export const FLAKY_BAR_UNMARK_TITLE = "Remove the flaky mark of the "
+  + "selected tests; their failures count as failing again, "
+  + "or as the environment's default says. Rows that were not marked are "
+  + "left alone.";
+
+/** The selection bar's "Mark as flaky" title gains this clause where a
+ * ticked row is under its environment's default (design §3 U5, as the
+ * panel's FLAKY_OWN_MARK_TITLE below says it for one test). */
+export const FLAKY_BAR_OWN_MARK_CLAUSE = "A test under its environment's "
+  + "default gets a mark of its own: its cadence and your reason replace "
+  + "the default for it, until the mark is removed.";
+
+/** "Mark as flaky"'s title for a test under its environment's default
+ * (design §3 U5), in the Review panel and on the test page. */
+export const FLAKY_OWN_MARK_TITLE = "Give this test a mark of its own: its "
+  + "cadence and your reason replace the environment's default for it, "
+  + "until the mark is removed.";
+
+/** "Change the default": a test under its environment's default, in the
+ * Review panel and on the test page, links to that environment's row on
+ * the Admin page (`href`, urls.js's flakyDefaultAdminUrl()). A link, not
+ * an act: the default is changed there, with its reason (decision 21). */
+export function flakyDefaultLink(href) {
+  const link = el("a", "", "Change the default");
+  link.href = href;
+  link.title = "Open this environment's row on the Admin page, where its "
+    + "flaky default is set";
+  return link;
+}
 
 /** The reason box of a fresh mark, in the Review panel and on the test
  * page: its placeholder and its accessible label. */
@@ -1100,14 +1190,8 @@ export function flakyDefaultEffect(cadence) {
 /** "set by amy · 3 days ago · two servers": who set the default in
  * force, how long ago and why; the line under its cadence. */
 export function flakyDefaultSetBy(flakyDefault, nowMs) {
-  const parts = [
-    "set by " + flakyDefault.set_by,
-    ageText(flakyDefault.set_at, nowMs === undefined ? Date.now() : nowMs),
-  ];
-  if (flakyDefault.reason) {
-    parts.push(flakyDefault.reason);
-  }
-  return parts.join(" · ");
+  return whoWhenWhy("set by " + flakyDefault.set_by, flakyDefault.set_at,
+    flakyDefault.reason, nowMs);
 }
 
 /** "removed by ben · 9 days ago · trial over": one recorded change of a
@@ -1127,14 +1211,8 @@ export function flakyDefaultChange(change, nowMs) {
   } else {
     what = String(change.action);
   }
-  const parts = [
-    what + " by " + change.actor,
-    ageText(change.acted_at, nowMs === undefined ? Date.now() : nowMs),
-  ];
-  if (change.reason) {
-    parts.push(change.reason);
-  }
-  return parts.join(" · ");
+  return whoWhenWhy(what + " by " + change.actor, change.acted_at,
+    change.reason, nowMs);
 }
 
 /**

@@ -47,9 +47,12 @@
 "use strict";
 
 import {
+  FLAKY_BAR_OWN_MARK_CLAUSE,
+  FLAKY_BAR_UNMARK_TITLE,
   clearNode,
   el,
   flakyCadenceSelect,
+  hasOwnMark,
   muteDurationSelect,
   postJson,
   rememberUser,
@@ -98,8 +101,12 @@ function bulkCommentsUrl() {
   );
 }
 
-/** key -> {environment, script, test_name, stream_id, marked, namespace}.
- * `marked` is whether the row came with a flaky mark (WP-44). */
+/** key -> {environment, script, test_name, stream_id, marked,
+ * underDefault, namespace}.
+ * `marked` is whether the row came with a flaky mark of its own (WP-44):
+ * a row under its environment's default has none (hasOwnMark()), so the
+ * bar offers it Mark, which gives it one, and never touches the default
+ * (flaky-default design §3 U5); `underDefault` is such a row. */
 const selected = new Map();
 
 /** Functions to call after a successful bulk action, one per mount. */
@@ -230,10 +237,11 @@ function updateMuteButtonState() {
     || !muteDurationEl.value;
 }
 
-/** True when every ticked row came with a flaky mark, so the act is a
- * cadence change, which needs no reason. A row with no `flaky` field
- * is an unmarked test (the lists send the field from WP-44's item 6;
- * until then the bar always offers Mark). */
+/** True when every ticked row came with a flaky mark of its own, so the
+ * act is a cadence change, which needs no reason. A row with no `flaky`
+ * field is an unmarked test (the lists send the field from WP-44's item
+ * 6; until then the bar always offers Mark), and a row under its
+ * environment's default is not marked. */
 function allSelectedMarked() {
   if (selected.size === 0) {
     return false;
@@ -244,6 +252,18 @@ function allSelectedMarked() {
     }
   }
   return true;
+}
+
+/** True when a ticked row is under its environment's flaky default
+ * (`underDefault`): Mark's title then says such a test gets a mark of
+ * its own (flaky-default design §3 U5), as the Review panel's does. */
+function anySelectedUnderDefault() {
+  for (const entry of selected.values()) {
+    if (entry.underDefault) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** The Flaky group's one button (WP-44): "Mark as flaky", or "Set
@@ -263,7 +283,9 @@ function updateFlakyButtonState() {
   }
   const cadenceOnly = allSelectedMarked();
   flakyBtnEl.textContent = cadenceOnly ? "Set cadence" : "Mark as flaky";
-  flakyBtnEl.title = cadenceOnly ? SET_CADENCE_TITLE : MARK_FLAKY_TITLE;
+  flakyBtnEl.title = cadenceOnly ? SET_CADENCE_TITLE
+    : MARK_FLAKY_TITLE + (anySelectedUnderDefault()
+      ? " " + FLAKY_BAR_OWN_MARK_CLAUSE : "");
   flakyBtnEl.disabled = flakyInFlight
     || selected.size === 0
     || !flakyCadenceEl.value
@@ -609,9 +631,7 @@ function ensureBar() {
   unmarkBtnEl = el("button", "selection-unmark-btn", "Unmark");
   unmarkBtnEl.type = "button";
   unmarkBtnEl.disabled = true;
-  unmarkBtnEl.title = "Remove the flaky mark of the selected tests; their "
-    + "failures count as failing again. Rows that were not marked are "
-    + "left alone.";
+  unmarkBtnEl.title = FLAKY_BAR_UNMARK_TITLE;
   unmarkBtnEl.addEventListener("click", doUnmarkFlaky);
   barEl.appendChild(unmarkBtnEl);
 
@@ -706,7 +726,8 @@ export function mountSelectableTable(table, options) {
           test_name: entry.test_name,
           stream_id: entry.stream_id !== undefined
             ? entry.stream_id : null,
-          marked: Boolean(entry.flaky),
+          marked: hasOwnMark(entry.flaky),
+          underDefault: Boolean(entry.flaky) && !hasOwnMark(entry.flaky),
           namespace: namespace,
         });
       } else {

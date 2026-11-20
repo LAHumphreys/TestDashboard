@@ -606,7 +606,8 @@ function renderHeadline() {
   // its split has answered.
   renderBars();
   renderQueues();
-  // The FLAKING toggle shows once the headline says the scope has a mark.
+  // The FLAKING toggle shows once the headline says the scope has a mark
+  // or an environment default (flakyScope()).
   syncResultToggles();
   populateScriptOptions();
   updateProductColumn();
@@ -872,7 +873,7 @@ function renderStatus() {
     label: "New failures",
     value: status.new_failures.toLocaleString(),
     accent: status.new_failures > 0 ? "accent-fail" : "accent-zero",
-    sub: withSetAside(newFailuresSub(status.flaky_total),
+    sub: withSetAside(newFailuresSub(flakyScope()),
       status.muted_new_failures, status.flaking_new_failures),
     onClick: () => openQueue("new_failures"),
   }));
@@ -937,7 +938,7 @@ const TREND_SPLIT_SERIES = [
 ];
 const FAILING_SPLIT_LEGEND = TREND_SPLIT_SERIES.slice(0, 3);
 /* WP-44 (design §3 U7): the flaking runs as a fourth part after the
- * grey, where the scope has a mark. */
+ * grey, where the scope has a mark or a default (flakyScope()). */
 const TREND_FLAKING_SERIES = FAILING_SPLIT_LEGEND.concat(
   [FLAKING_BAR], TREND_SPLIT_SERIES.slice(3));
 
@@ -976,8 +977,8 @@ function splitNights(nights, split, withFlaking) {
   return merged;
 }
 
-/** Whether the trend draws its flaking series: the scope has a mark
- * (decision 5) and every night of the split carries the count, so an
+/** Whether the trend draws its flaking series: the scope has a mark or
+ * a default (flakyScope()) and every night of the split carries the count, so an
  * older server's split draws today's chart. */
 function trendFlaking(split) {
   return flakyScope() && Boolean(split) && Boolean(split.trend)
@@ -1058,11 +1059,16 @@ function renderTrend() {
   }
 }
 
-/** Whether the scope has a flaky mark (WP-44, decision 5): only then do
- * the bars key, tooltip and name their flaking part. With none, every
- * bar card is exactly the WP-43 card. */
+/** Whether the scope has a flaky mark (WP-44, decision 5) or an
+ * environment with a flaky default (flaky-default design decision 11,
+ * `status.flaky_defaults`, read as 0 where an older server sends no such
+ * key): only then do the bars key, tooltip and name their flaking part,
+ * the FLAKING filter show, the per-day chart draw its flaking series and
+ * the New failures tile say "or flaking". With neither, every bar card is
+ * exactly the WP-43 card. */
 function flakyScope() {
-  return state.summary.status.flaky_total > 0;
+  const status = state.summary.status;
+  return status.flaky_total > 0 || (status.flaky_defaults || 0) > 0;
 }
 
 /**
@@ -1106,7 +1112,8 @@ function failingBar(item, entry, failing, failingLabel, moreRows) {
 
 /** The bar cards' legend, drawn whenever the payload carries the split
  * (zeros included, so a card's height never changes on a "Take"), with
- * the flaking key after the muted one where the scope has a mark. */
+ * the flaking key after the muted one where the scope has a mark or a
+ * default (flakyScope()). */
 function failingLegend(entries) {
   if (!entries.every((entry) => typeof entry.assigned === "number")) {
     return {};
@@ -2071,7 +2078,7 @@ function buildResultToggles() {
 
 /**
  * Each toggle's pressed state. The FLAKING toggle is hidden until the
- * headline says the scope has a mark (`status.flaky_total` > 0), and is
+ * headline says the scope has a mark or a default (flakyScope()), and is
  * shown whenever it is pressed, so a filter in force is never invisible
  * (a link or the address bar can press it first). While it shows, FAIL
  * is only the other half of the failing tests, and its title says so.

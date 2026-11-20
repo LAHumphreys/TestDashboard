@@ -5634,3 +5634,36 @@ night's run a New failure, kept as built and pinned (the design's
 test at a cadence of 3 or more is not dropped when another process
 writes the database, where the minute's expiry used to bound it.
 Not taken: plans on MariaDB 10.3 and SQLite 3.26, which CI's jobs run.
+
+## The default flaky cadence, item 26: a row flaking by default (2026-11-20)
+
+A row under an environment's default draws as a marked row does and says
+whose cadence it is; under a default the Review panel and the test's page
+offer "Mark as flaky" and a link to the Admin page's row, and Set cadence
+and Unmark only where the test has a mark of its own. No pill for a
+default anywhere. `flakyScope()` is widened to a default, so the FLAKING
+filter, the charts' Flaking series and the tile's sub-line follow it. No
+page gains a request. The commit message has the sentences, the acts and
+the tests.
+
+The triage comparison the project requires, the Flaking tab against New
+failures and Still failing, column by column and act by act: nothing
+differs that did not before, except the Flaky group under a default,
+which is decision 21.
+
+Review: fresh eyes read every site that decides an act and every changed
+assertion, clean. The walk, on a play server with a default of 2 set on
+one environment through the PUT and then removed, read the same figure
+on the Flaking tab, the FLAKING filter, Watch and "Set aside" (49), did
+Mark and Unmark through the panel, and read the test's page in six
+states; it asked for one clause in the selection bar's title.
+
+Put to the owner, none built: the selection bar's Unmark stays enabled
+over a selection with no marked row (older than this item; under a
+default it can be clicked on rows reading FLAKING with nothing to
+remove); at a default of 2 every such row's Streak cell reads "1 in a
+row, failing after 2", so a Flaking row showing no time is felt more;
+Newly fixed drops the morning a default is set; the sentence explaining
+"Mark as flaky" on a row already reading FLAKING is the button's title
+only. Not walked on a live server: a test under a default with no run on
+a stream, and one with a single run.

@@ -332,6 +332,16 @@ export function unmarkFlakyUrl() {
   );
 }
 
+/* An environment's flaky default (flaky-default design §3 U1, U5): its
+ * row on the Admin page, which outlines the row `environment=` names and
+ * is never scoped (not in NAV_SCOPE_PAGES), so every scope level is
+ * cleared and `environment` travels as the row's identity. The anchor is
+ * the Environments section. "Change the default" is its one link. */
+export function flakyDefaultAdminUrl(environment) {
+  return pageUrl("admin", { environment: environment },
+    { product: null, stream: null, baseline: null }) + "#envs-section";
+}
+
 /** The current page, scoped to a different stream (null = mainline).
  * Resets `baseline` (a stream's own comparison choice belongs to THAT
  * stream) per the hierarchy rule; leaves `product`/`environment` alone,

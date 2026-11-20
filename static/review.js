@@ -28,6 +28,7 @@ import {
   assigneeSelect,
   clearNode,
   FLAKY_CADENCE_TITLE,
+  FLAKY_OWN_MARK_TITLE,
   FLAKY_REASON_LABEL,
   FLAKY_REASON_PLACEHOLDER,
   FLAKY_UNMARK_TITLE,
@@ -37,9 +38,11 @@ import {
   fetchJson,
   fillOutput,
   flakyCadenceSelect,
+  flakyDefaultLink,
   flakyDetail,
   flakySentence,
   getUsername,
+  hasOwnMark,
   runStrip,
   postJson,
   preselectUser,
@@ -52,6 +55,7 @@ import {
 import {
   bulkFlakyUrl,
   bulkMutesUrl,
+  flakyDefaultAdminUrl,
   unmarkFlakyUrl,
   unmuteUrl,
   pageUrl,
@@ -376,6 +380,12 @@ function buildMuteGroup(entry, opts) {
  * otherwise a reason, a cadence and "Mark as flaky". The person acting
  * owns the mark (decision 12), so no owner is picked here. Reads
  * `entry.flaky` defensively: absent or null is an unmarked test.
+ *
+ * Under the environment's default (flaky-default design §3 U5, decision
+ * 21): the default's sentence and small print, then "Mark as flaky",
+ * which gives the test a mark of its own, and "Change the default", a
+ * link to the environment's row on the Admin page. No Set cadence and
+ * no Unmark: there is no mark (hasOwnMark()).
  */
 function buildFlakyGroup(entry, opts) {
   const group = el("div", "review-group review-group-wide");
@@ -411,11 +421,14 @@ function buildFlakyGroup(entry, opts) {
 
   if (flaky) {
     const muteLive = Boolean(entry.mute && entry.mute.live);
-    // The sentence, with who, when and why under it (a block sub-line).
+    // The sentence, with who, when and why under it (a block sub-line):
+    // the mark's, or the environment's default's.
     const line = el("span", "mute-line");
     line.appendChild(document.createTextNode(flakySentence(flaky, muteLive)));
     line.appendChild(el("span", "row-sub", flakyDetail(flaky)));
     group.appendChild(line);
+  }
+  if (hasOwnMark(flaky)) {
     const cadence = flakyCadenceSelect("review-cadence-select", flaky.cadence);
     const change = el("button", "", "Set cadence");
     change.type = "button";
@@ -447,9 +460,10 @@ function buildFlakyGroup(entry, opts) {
   const cadence = flakyCadenceSelect("review-cadence-select");
   const mark = el("button", "", "Mark as flaky");
   mark.type = "button";
-  mark.title = "Tolerate this test's failures until they reach the "
-    + "cadence chosen, on mainline and every build, until the mark is "
-    + "removed. You own the mark, and your reason is posted as a comment.";
+  mark.title = flaky ? FLAKY_OWN_MARK_TITLE
+    : "Tolerate this test's failures until they reach the "
+      + "cadence chosen, on mainline and every build, until the mark is "
+      + "removed. You own the mark, and your reason is posted as a comment.";
   mark.addEventListener("click", () => {
     const text = reason.value.trim();
     if (!text) {
@@ -470,6 +484,10 @@ function buildFlakyGroup(entry, opts) {
   group.appendChild(reason);
   group.appendChild(cadence);
   group.appendChild(mark);
+  if (flaky) {
+    group.appendChild(flakyDefaultLink(
+      flakyDefaultAdminUrl(entry.environment)));
+  }
   return group;
 }
 

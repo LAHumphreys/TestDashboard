@@ -15,6 +15,7 @@ import {
   clearError,
   clearNode,
   FLAKY_CADENCE_TITLE,
+  FLAKY_OWN_MARK_TITLE,
   FLAKY_REASON_LABEL,
   FLAKY_REASON_PLACEHOLDER,
   FLAKY_UNMARK_TITLE,
@@ -26,13 +27,17 @@ import {
   fetchJson,
   fillOutput,
   flakyCadenceSelect,
+  flakyDefaultLink,
+  flakyDefaultWords,
   flakyDetail,
   flakyMarkWords,
   flakySentence,
+  flakySetBy,
   flakyTag,
   formatDuration,
   formatTime,
   getUsername,
+  hasOwnMark,
   loadUsers,
   postJson,
   preselectUser,
@@ -57,6 +62,7 @@ import {
   apiUrl,
   bulkFlakyUrl,
   bulkMutesUrl,
+  flakyDefaultAdminUrl,
   unmarkFlakyUrl,
   unmuteUrl,
   pageUrl,
@@ -317,12 +323,16 @@ function renderMuteHistory(history) {
  * the history are drawn from what the page already has, and an act
  * refreshes through refreshActs(), the one request a mute costs. Every
  * word comes from api.js's flaky helpers. `flaky` absent or null is an
- * unmarked test (and an older server).
+ * unmarked test (and an older server); one with `source` "default" is a
+ * test under its environment's default, which the detail carries in
+ * every state (flaky-default design §2 B.3), so this page is the one
+ * quiet place that says the default (decision 19).
  */
 function renderFlaky(detail) {
   const flaky = detail.flaky || null;
-  renderFlakyBanner(flaky, Boolean(detail.mute && detail.mute.live));
-  renderFlakyCard(flaky);
+  const muteLive = Boolean(detail.mute && detail.mute.live);
+  renderFlakyBanner(flaky, muteLive);
+  renderFlakyCard(flaky, muteLive);
   renderFlakyHistory(detail.flaky_history || []);
 }
 
@@ -333,19 +343,34 @@ function renderFlaky(detail) {
  * property of the test, made while it passes as well as while it
  * fails): the offer, the act's subject as its label (as Mute's offer
  * is labelled) and the button that opens the form here, drawn quieter
- * than the mark: no tint, a neutral edge, a muted label. */
+ * than the mark: no tint, a neutral edge, a muted label. Under the
+ * environment's default (design §3 U5) the offer says it too: the
+ * default and who set it, the sentence for this stream, then "Mark as
+ * flaky", which gives the test a mark of its own, and "Change the
+ * default", a link to the environment's row on the Admin page. No Set
+ * cadence and no Unmark: there is no mark. */
 function renderFlakyBanner(flaky, muteLive) {
   const banner = document.getElementById("flaky-banner");
   clearNode(banner);
-  banner.classList.toggle("is-offer", !flaky);
+  banner.classList.toggle("is-offer", !hasOwnMark(flaky));
   banner.hidden = false;
-  if (!flaky) {
+  if (!hasOwnMark(flaky)) {
     banner.appendChild(el("span", "kf-label", "Flaky"));
+    if (flaky) {
+      banner.appendChild(el("span", "", flakyDefaultWords(flaky.cadence)));
+      banner.appendChild(el("span", "kf-reason", flakySetBy(flaky)));
+      banner.appendChild(el("span", "flaky-sentence",
+        flakySentence(flaky, muteLive)));
+    }
     const open = el("button", "", "Mark as flaky");
     open.type = "button";
-    open.title = MARK_FLAKY_TITLE;
-    open.addEventListener("click", openFlakyForm);
+    open.title = flaky ? FLAKY_OWN_MARK_TITLE : MARK_FLAKY_TITLE;
+    open.addEventListener("click", () => openFlakyForm(flaky, muteLive));
     banner.appendChild(open);
+    if (flaky) {
+      banner.appendChild(flakyDefaultLink(
+        flakyDefaultAdminUrl(ident.environment)));
+    }
     return;
   }
   banner.appendChild(el("span", "kf-label", flakyMarkWords(flaky.cadence)));
@@ -391,19 +416,24 @@ function renderFlakyBanner(flaky, muteLive) {
 
 /** The Flakiness card's mark: the mark in words, or, unmarked, a link
  * that opens the one form, in the header's slot, and takes the reader
- * there; the computed signal above it is what prompts some marks. */
-function renderFlakyCard(flaky) {
+ * there; the computed signal above it is what prompts some marks. Under
+ * the environment's default, the default in words before the link. */
+function renderFlakyCard(flaky, muteLive) {
   const box = document.getElementById("flaky-mark");
   clearNode(box);
-  if (flaky) {
+  if (hasOwnMark(flaky)) {
     box.appendChild(el("span", "", flakyMarkWords(flaky.cadence)));
     return;
+  }
+  if (flaky) {
+    box.appendChild(el("span", "", flakyDefaultWords(flaky.cadence)));
+    box.appendChild(el("span", "muted", "·"));
   }
   const open = el("button", "linkish", "Mark as flaky");
   open.type = "button";
   open.title = "Opens the form at the top of the page";
   open.addEventListener("click", () => {
-    openFlakyForm();
+    openFlakyForm(flaky, muteLive);
     document.getElementById("flaky-banner").scrollIntoView(
       { block: "nearest" });
   });
@@ -414,8 +444,9 @@ function renderFlakyCard(flaky) {
  * card's link: a reason (required, and posted as a comment), a cadence,
  * and the act. The person marking owns the mark (decision 12), so there
  * is no owner to pick. Already open, it keeps what was typed and only
- * takes the focus. */
-function openFlakyForm() {
+ * takes the focus. `flaky` and `muteLive` are what the slot drew before
+ * it, null or the environment's default, which Cancel draws again. */
+function openFlakyForm(flaky, muteLive) {
   const box = document.getElementById("flaky-banner");
   const drawn = box.querySelector(".flaky-reason-input");
   if (drawn) {
@@ -432,10 +463,10 @@ function openFlakyForm() {
   const cadence = flakyCadenceSelect("review-cadence-select");
   const mark = el("button", "", "Mark as flaky");
   mark.type = "button";
-  mark.title = MARK_FLAKY_TITLE;
+  mark.title = flaky ? FLAKY_OWN_MARK_TITLE : MARK_FLAKY_TITLE;
   const cancel = el("button", "", "Cancel");
   cancel.type = "button";
-  cancel.addEventListener("click", () => renderFlakyBanner(null));
+  cancel.addEventListener("click", () => renderFlakyBanner(flaky, muteLive));
   mark.addEventListener("click", () => {
     const text = reason.value.trim();
     const chosen = Number(cadence.value);
