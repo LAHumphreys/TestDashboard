@@ -1883,7 +1883,9 @@ class DailyFlakingFailures(NamedTuple):
     and with no live mute now (``flaking``), and how many of those belong
     to a test with an assignee now (``assigned``, taken off the day's
     ``FAIL_ASSIGNED``: counted once). See
-    :meth:`Storage.daily_flaking_failures`."""
+    :meth:`Storage.daily_flaking_failures`, and for the same figures
+    under an environment's default (design flaky-default-r0 §2 B.5),
+    :meth:`Storage.daily_default_flaking_failures`."""
 
     day: datetime.date
     flaking: int
@@ -4597,8 +4599,11 @@ class Storage:
         ``idx_latest_runs_result`` (the index the open-items count reads
         covering) does not carry, so MariaDB leaves that index for a scan
         of ``latest_runs``, and the rows walk further along the primary
-        key for their page. The keys form reads the partition by primary
-        key once, in sort order, and drops X in Python. SQLite takes it
+        key for their page. The keys form drops X in Python; on MariaDB
+        12.3 its statement reads, in Open Actions' default mode, the
+        stream's partition as one primary-key range (12,800 rows on the
+        production-scale seed), and in its Failing mode
+        ``idx_latest_runs_result`` alone, index-only. SQLite takes it
         for any X already. With marks alone X stays bound on MariaDB: its
         list reads no column the covering index lacks."""
         if aside.unowned and (
@@ -10678,6 +10683,179 @@ class Storage:
                 bucket[0] += 1
                 if assigned:
                     bucket[1] += 1
+        result = [
+            DailyFlakingFailures(
+                day=datetime.datetime.strptime(day, "%Y-%m-%d").date(),
+                flaking=bucket[0], assigned=bucket[1])
+            for day, bucket in sorted(by_day.items())
+        ]
+        frozen = tuple(result)
+        self._store_summary(key, frozen, stream_id, environment)
+        return result
+
+    def daily_default_flaking_failures(
+        self,
+        since: datetime.datetime,
+        now: Optional[datetime.datetime],
+        environment: Optional[str] = None,
+        environments: Optional[Sequence[str]] = None,
+        stream_id: int = MAINLINE_STREAM_ID,
+        floor: Optional[datetime.datetime] = None,
+    ) -> List[DailyFlakingFailures]:
+        """Design flaky-default-r0 §2 B.5 and §3a (the per-day chart): of
+        each UTC day's FAIL runs on *stream_id* since *since*, those of a
+        test with NO mark of its own, in an environment with a default
+        today, that were a tolerated failure as the night stood then
+        under today's default (:func:`analytics.flaking_that_night` at
+        the default's cadence), with no live mute now; and how many of
+        those belong to a test with an assignee now. The default's half
+        of the per-day chart's ``FAIL_FLAKING``, disjoint from
+        :meth:`daily_flaking_failures` (the marks' half: a mark wins
+        whole), counted once as that is.
+
+        With no default (the bit, from the mute epoch's entry that
+        :meth:`daily_assigned_failures` has just read, by
+        :meth:`_list_bits`) nothing is read;
+        with defaults only outside the scope, the map alone (memoized
+        estate-wide, so after a headline nothing). Otherwise one
+        statement per defaulted environment in scope
+        (:meth:`_default_trend_environment`), each with its own memo
+        entry, so a product or an unscoped read shares the
+        environment's."""
+        at = now or model.utcnow()
+        marked, defaults = self._list_bits(True, stream_id, at)
+        if not defaults:
+            return []
+        names = sorted(defaults)
+        if environment is not None:
+            names = [name for name in names if name == environment]
+        if environments is not None:
+            allowed = set(environments)
+            names = [name for name in names if name in allowed]
+        by_day = {}  # type: Dict[datetime.date, List[int]]
+        for name in names:
+            for entry in self._default_trend_environment(
+                    since, at, name, defaults[name], stream_id, floor,
+                    marked):
+                bucket = by_day.setdefault(entry.day, [0, 0])
+                bucket[0] += entry.flaking
+                bucket[1] += entry.assigned
+        return [
+            DailyFlakingFailures(day=day, flaking=bucket[0],
+                                 assigned=bucket[1])
+            for day, bucket in sorted(by_day.items())
+        ]
+
+    def _default_trend_environment(
+        self,
+        since: datetime.datetime,
+        at: datetime.datetime,
+        environment: str,
+        default: FlakyDefault,
+        stream_id: int,
+        floor: Optional[datetime.datetime],
+        marked: bool,
+    ) -> List[DailyFlakingFailures]:
+        """One defaulted environment's tolerated failures per day
+        (:meth:`daily_default_flaking_failures`), in ONE statement
+        judged in the engine (design §3a, "The cheapest read-time
+        shape"); no Python per run and no Q2.
+
+        - **Driven from the window's FAIL runs** by the covering
+          ``idx_runs_start_time_result`` range (the row id is in the
+          entry), each reached in ``runs`` by its primary key: the
+          ``CROSS JOIN`` keeps that order. It grows with the estate's
+          failed runs in the window, not with the environment's tests;
+          driven from the environment's prefix of the runs UNIQUE index
+          instead, SQLite reads its whole history.
+        - **Judged by N-1 backward steps** of the runs UNIQUE (triple,
+          start_time) index: a FAIL run at cadence N is tolerated when
+          any of its N-1 previous runs on the stream is not a FAIL, one
+          correlated scalar subquery per step (``LIMIT 1 OFFSET k``); a
+          step with no run reads as a FAIL, so a stream with fewer runs
+          than N, all failed, is over it. That is ``flaky_state``'s
+          rule, and the steps reach before the window, so nothing is
+          read twice. *floor* (a build's first run) stops a build's walk
+          back through mainline's runs of the same test.
+        - **Set aside in the engine:** a test with a mark of its own
+          (joined only where a mark exists) and a test under a live
+          mute now (joined only while the stream has one). No
+          retirement filter, because the day's FAIL has none.
+        - Window functions over the environment's runs, a nested
+          subquery in the judging one, and a narrowing by the scripts
+          that failed were each slower, or a full scan on one engine
+          (§3a).
+
+        Memo: one entry per (stream, environment), keyed by the window,
+        the cadence, ``cadence_at`` and the mute epoch, tagged with both,
+        so a push into the environment, every act, a mute expiry and
+        the TTL drop it and a push elsewhere leaves it; no hold past
+        the usual expiry. *marked* is the "any mark" bit, from the same
+        memoized entry as the epoch."""
+        epoch = self.mute_epoch(stream_id, at)
+        since_iso = model.format_iso(since)
+        floor_iso = None if floor is None else model.format_iso(floor)
+        cadence = default.cadence
+        cadence_at = model.format_iso(default.cadence_at)
+        key = ("default_trend", stream_id, environment, since_iso, cadence,
+               cadence_at, epoch, floor_iso)
+        cached = self._cached_summary(key)
+        if cached is not None:
+            return list(cached)
+        fail = Result.FAIL.value
+        # A build has no run before its floor, so its driving range
+        # starts at the later of the window and the floor: the same rows,
+        # fewer index entries read. Mainline binds the window as before.
+        lower_iso = (since_iso if floor_iso is None
+                     else max(since_iso, floor_iso))
+        step = (
+            "COALESCE((SELECT p.result FROM runs AS p "
+            "WHERE p.environment = r.environment AND p.script = r.script "
+            "AND p.test_name = r.test_name AND p.stream_id = r.stream_id "
+            "AND p.start_time < r.start_time"
+            + ("" if floor_iso is None else " AND p.start_time >= ?")
+            + " ORDER BY p.start_time DESC LIMIT 1 OFFSET {0}), ?) <> ?")
+        steps = " OR ".join(step.format(k) for k in range(cadence - 1))
+        sql = (
+            "SELECT SUBSTR(r.start_time, 1, 10) AS day, "
+            "CASE WHEN ca.assignee IS NULL THEN 0 ELSE 1 END AS assigned, "
+            "COUNT(*) FROM (SELECT f.id FROM runs AS f "
+            "WHERE f.start_time >= ? AND f.result = ?) AS k "
+            "CROSS JOIN runs AS r ON r.id = k.id "
+            "LEFT JOIN current_assignments AS ca "
+            "  ON ca.environment = r.environment "
+            " AND ca.script = r.script AND ca.test_name = r.test_name"
+            + (" LEFT JOIN test_flaky_marks AS fm "
+               "  ON fm.environment = r.environment "
+               " AND fm.script = r.script AND fm.test_name = r.test_name"
+               if marked else "")
+            + (" LEFT JOIN test_mutes AS tm "
+               "  ON tm.stream_id = r.stream_id "
+               " AND tm.environment = r.environment "
+               " AND tm.script = r.script AND tm.test_name = r.test_name"
+               if epoch is not None else "")
+            + " WHERE r.environment = ? AND r.stream_id = ?"
+            # A marked or muted test's FAIL runs are judged by the steps
+            # and then dropped here: SQLite attaches the steps at r's
+            # loop. Cheap while marks are few; a set-aside before the
+            # steps was not measured on MariaDB, where an EXISTS
+            # judgement has become a semi-join.
+            + (" AND fm.environment IS NULL" if marked else "")
+            + (" AND " + _NOT_MUTE_LIVE if epoch is not None else "")
+            + " AND (" + steps + ") GROUP BY day, assigned")
+        params = [lower_iso, fail, environment, stream_id]  # type: List[Any]
+        if epoch is not None:
+            params.append(model.format_iso(at))
+        for _k in range(cadence - 1):
+            if floor_iso is not None:
+                params.append(floor_iso)
+            params.extend([fail, fail])
+        by_day = {}  # type: Dict[str, List[int]]
+        for row in self._conn().execute(sql, params).fetchall():
+            bucket = by_day.setdefault(str(row[0]), [0, 0])
+            bucket[0] += int(row[2])
+            if row[1]:
+                bucket[1] += int(row[2])
         result = [
             DailyFlakingFailures(
                 day=datetime.datetime.strptime(day, "%Y-%m-%d").date(),

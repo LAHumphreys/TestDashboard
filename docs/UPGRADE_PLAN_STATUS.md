@@ -5667,3 +5667,39 @@ Newly fixed drops the morning a default is set; the sentence explaining
 "Mark as flaky" on a row already reading FLAKING is the button's title
 only. Not walked on a live server: a test under a default with no run on
 a stream, and one with a single run.
+
+## The default flaky cadence, item 24: the per-day chart counts the default (2026-11-20)
+
+The chart's late part, `parts=assigned_trend`, now counts in each day's
+`FAIL_FLAKING` the failed runs an environment's default tolerated, by one
+statement per environment with a default in scope, in the shape the
+design's round 1 measured and chose. With it every surface that shows
+flaking agrees about a default, which is the design's "Done means". The
+commit message has the rule, the read, the table against the bar and the
+tests.
+
+The measured pass (`performance-engineer`, the recipe's nightly-50 and
+nightly-500 fixtures, cold, three arms, a quiet machine, SQLite 3.50 ; a
+local MariaDB 12.3): inside the round 1 bar on every row. At 14 days with
+a default of 2 the part costs +36 to +37 ; +71 to +75 ms at 50 failing a
+night (bar +70 ; +80) and +135 to +139 ; +583 to +600 at 500 (bar +250 ;
++750). The nights equal the oracle with no mismatch in every scope; every
+first-paint request has the statements, the text and the body it had; the
+part's own statement counts are as designed. From its findings a build's
+range now starts at the build's first run; setting marked tests aside
+before the judgement is not built, being measured on SQLite only.
+
+With the same pass, item 23's Open Actions fix was re-measured as a whole
+request: on MariaDB 12.3, default mode -6.3 to -6.9 ms at 50 failing,
+where it had read +12.3, and -8.4 to -9.5 at 500.
+
+Review: fresh eyes found the read right against the design clause by
+clause and the memo hardly tested warm; the warm tests and the whole
+cadence range were added and found nothing wrong. The item was built on
+a snapshot of item 23 while that item was still under review, and was
+merged twice as it changed; the merged result was read again.
+
+Every item of the plan is now committed: 21 to 27. Not taken anywhere in
+the build: plans on MariaDB 10.3, which CI's jobs do not show (they check
+the answers). That is a hand `EXPLAIN` for the drop, on the two new
+statements: the per-day chart's read and Open Actions' keys statement.

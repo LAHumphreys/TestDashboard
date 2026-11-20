@@ -7585,6 +7585,60 @@ class TargetedInvalidationTest(StorageTestBase):
         self.store._invalidate_summary_cache()
         self.assertEqual(served, self._warm(self.mainline)["assigned_cells"])
 
+    def test_the_default_trend_is_kept_per_stream_and_environment(
+            self) -> None:
+        """Design flaky-default-r0 §2 B.5, §3a: the per-day chart's
+        default half is one entry per (stream, environment), tagged with
+        both. A push into linux-sim drops linux-sim's and leaves
+        win-sim's, which is still what a cold read gives; a build's push
+        leaves mainline's; a push into win-sim drops win-sim's; an act
+        drops both. By the memo's keys, so on both backends."""
+        self.store.upsert_runs([
+            make_record(environment="win-sim", test_name="test_w",
+                        start=BASE - datetime.timedelta(days=1)),
+            make_record(environment="win-sim", test_name="test_w",
+                        result=Result.FAIL),
+            make_record(test_name="test_a",
+                        start=BASE - datetime.timedelta(days=1)),
+        ])
+        self.store.ensure_user("alice", CREATED)
+        for environment in ("linux-sim", "win-sim"):
+            self.store.set_flaky_default(
+                environment, 2, "two servers", "alice", CREATED)
+        since = BASE - datetime.timedelta(days=2)
+
+        def entries() -> Dict[str, Any]:
+            with self.store._summary_lock:
+                return {key[2]: entry[1]
+                        for key, entry in self.store._summary_cache.items()
+                        if key[0] == "default_trend"}
+
+        def read() -> List[Any]:
+            return self.store.daily_default_flaking_failures(
+                since, self.NOW)
+
+        first = read()
+        self.assertEqual(sorted(entries()), ["linux-sim", "win-sim"])
+        self.assertEqual(sum(e.flaking for e in first), 2)
+        self._push(None)     # linux-sim
+        self.assertEqual(sorted(entries()), ["win-sim"])
+        served = entries()["win-sim"]
+        self.store._invalidate_summary_cache()
+        cold = self.store.daily_default_flaking_failures(
+            since, self.NOW, environment="win-sim")
+        self.assertEqual(list(served), cold)
+        read()
+        self._push("feat/x", test_name="test_on_the_build")
+        self.assertEqual(sorted(entries()), ["linux-sim", "win-sim"])
+        self.store.upsert_runs([make_record(
+            environment="win-sim", test_name="test_w2",
+            start=BASE + datetime.timedelta(hours=6))])
+        self.assertEqual(sorted(entries()), ["linux-sim"])
+        read()
+        self.store.set_assignee(
+            "win-sim", "suite.py", "test_w", "alice", "amy", CREATED)
+        self.assertEqual(entries(), {})
+
     def test_the_memo_report_counts_a_narrowed_clear(self) -> None:
         self.store.reset_memo_counts()
         self._warm(self.mainline)
@@ -12332,6 +12386,49 @@ class FlakyPlanTest(FlakyEstateBase):
         self.assertTrue(runs[0].startswith("SEARCH"), plan)
         self.assertIn("START_TIME>?", runs[0].replace(" ", ""), plan)
 
+    def test_the_default_trend_drives_from_the_fail_range(self) -> None:
+        """WIDENED (design flaky-default-r0 §2 B.5 and §3a) to the
+        default's member of the per-day chart: the
+        window's FAIL runs by the covering (start_time, result) range
+        FIRST, each run by its primary key, and each backward step by
+        the runs UNIQUE index below the run's start; never the
+        environment's prefix of the UNIQUE index as the driver (SQLite
+        then reads the environment's whole history). SQLite's plan
+        only, at 3 backward steps' worth of cadence; on MariaDB this
+        test is excluded by name, as the marks' trend guard above is:
+        its plan is checked by hand on a production-scale copy."""
+        self.store.set_flaky_default(self.ENV, 3, "two servers", "alice",
+                                     CREATED)
+        self.store._invalidate_summary_cache()
+        sql, params = self._statement(
+            lambda: self.store.daily_default_flaking_failures(
+                BASE, self.NOW, environment=self.ENV),
+            "CROSS JOIN runs AS r ON r.id = k.id")
+        plan = self._explain(sql, params)
+        note = (sqlite3.sqlite_version, plan)
+        f = [index for index, line in enumerate(plan)
+             if " F " in line + " "]
+        r = [index for index, line in enumerate(plan)
+             if " R " in line + " "]
+        p = [line for line in plan if " P " in line + " "]
+        self.assertEqual((len(f), len(r)), (1, 1), note)
+        self.assertEqual(f[0], 0, note)
+        self.assertTrue(plan[f[0]].startswith("SEARCH"), note)
+        self.assertIn("COVERING INDEX IDX_RUNS_START_TIME_RESULT",
+                      plan[f[0]], note)
+        self.assertIn("START_TIME>?", plan[f[0]].replace(" ", ""), note)
+        self.assertLess(f[0], r[0], note)
+        self.assertTrue(plan[r[0]].startswith("SEARCH"), note)
+        self.assertIn("INTEGER PRIMARY KEY", plan[r[0]], note)
+        self.assertEqual(len(p), 2, note)
+        for line in p:
+            self.assertTrue(line.startswith("SEARCH"), note)
+            self.assertIn("SQLITE_AUTOINDEX_RUNS_1", line, note)
+            self.assertIn("START_TIME<?", line.replace(" ", ""), note)
+        self.assertEqual(
+            len([line for line in plan
+                 if "CORRELATED SCALAR SUBQUERY" in line]), 2, note)
+
 
 class FlakyListsBase(FlakyEstateBase):
     """WP-44 item 8: FlakyEstateBase with the sets the lists act on,
@@ -14065,9 +14162,10 @@ class DefaultEqualsMarksTest(DefaultOracleBase):
     their ``source``, ``marked_by`` and ``reason``. Two environments at
     different defaults, with marked tests that are muted, retired and
     assigned, a test whose mute expired, on mainline and on a build, at
-    env-d defaults of 2, 3 and 5. Browse and Open Actions in every mix,
-    sort and page are DefaultPredicateTermTest's. On MariaDB through the
-    generated variant."""
+    env-d defaults of 2, 3 and 5; and (item 24, §2 B.5) the per-day
+    chart's FAIL_FLAKING nights in four scopes. Browse and Open Actions
+    in every mix, sort and page are DefaultPredicateTermTest's. On
+    MariaDB through the generated variant."""
 
     #: Every queue kind the view moves, read again with the ceiling on
     #: bound parameters forced to one (the widened branch).
@@ -14113,7 +14211,31 @@ class DefaultEqualsMarksTest(DefaultOracleBase):
         out["browse"] = self.rows(self.store.dashboard(
             with_flaky=marked, flaky_defaults=defaults, include_retired=True,
             now=self.NOW, stream_id=stream_id, floor=floor))
+        self._trend(out, stream_id, floor)
         return out
+
+    def _trend(self, out: Dict[Any, Any], stream_id: int,
+               floor: Optional[datetime.datetime]) -> None:
+        """Item 24 (§2 B.5): the per-day chart's FAIL_FLAKING, both
+        halves added as ``parts=assigned_trend`` adds them, by night,
+        with the assigned among them, over three windows, unscoped and
+        scoped to each environment that can carry a default."""
+        for days in (0, 8, 9):
+            for scope in ({}, {"environment": self.ENV},
+                          {"environment": self.SECOND},
+                          {"environments": [self.ENV, self.OTHER]}):
+                self.store._invalidate_summary_cache()
+                nights = {}  # type: Dict[datetime.date, Tuple[int, int]]
+                for half in (self.store.daily_flaking_failures,
+                             self.store.daily_default_flaking_failures):
+                    for entry in half(BASE + datetime.timedelta(days=days),
+                                      self.NOW, stream_id=stream_id,
+                                      floor=floor, **scope):
+                        flaking, assigned = nights.get(entry.day, (0, 0))
+                        nights[entry.day] = (flaking + entry.flaking,
+                                             assigned + entry.assigned)
+                out["trend {0} {1}".format(days, sorted(scope.items()))] = (
+                    nights)
 
     def _compare(self, cadence: int) -> None:
         self.judge(cadence)
@@ -14703,9 +14825,12 @@ class DefaultEdgesTest(FlakyDefaultEstateBase):
         self.assertEqual((marked, sorted(defaults)), (False, [self.ENV]))
         # The names part's bit is "a mark or a default".
         self.assertTrue(self.store.distinct_products_and_marks()[1])
-        # The marks-only trend reads nothing here (item 24's to change).
+        # The per-day chart: the marks' half reads nothing with no mark,
+        # the default's half judges the default (item 24).
         self.assertEqual(self.store.daily_flaking_failures(
             BASE, self.NOW), [])
+        self.assertTrue(self.store.daily_default_flaking_failures(
+            BASE, self.NOW))
         # Judged with no mark anywhere.
         self.assertIn("d_new", [c.test_name for c in self.view().counted])
 
@@ -15540,3 +15665,780 @@ class DefaultOpenActionsFormTest(FlakyDefaultEstateBase):
             self.assertTrue([s for s in reads if s.startswith(
                 "SELECT lr.environment, lr.script, lr.test_name, lr.result "
                 "FROM latest_runs AS lr")], reads)
+
+
+# ----------------------------------------------------------------------
+# The per-day chart judged by the default (design flaky-default-r0 §2
+# B.5 and §3a; decisions 3, 24 and 27)
+# ----------------------------------------------------------------------
+
+
+class _DefaultTrendBase(FlakyDefaultEstateBase):
+    """FlakyDefaultEstateBase with the per-day chart's two halves read
+    together, as ``parts=assigned_trend`` adds them, and its oracle: the
+    pure rule over each test's whole stored history on the stream, at
+    its mark's cadence, else its environment's default as it is now,
+    else unread; a live mute now sets a test aside; no retirement
+    filter (the day's FAIL has none)."""
+
+    #: Mainline's live mutes of the fixture run a day from NOW - 1 h.
+    LATER = FlakyDefaultEstateBase.NOW + datetime.timedelta(days=2)
+
+    def own_cadences(self) -> Dict[Tuple[str, str, str], int]:
+        """Each mark of the fixture by its triple, with its cadence."""
+        return {(environment, self.SCRIPT, name): cadence
+                for environment, histories in self._estates()
+                for name, (cadence, _results) in histories.items()
+                if cadence is not None}
+
+    def trend(self, since: datetime.datetime,
+              now: Optional[datetime.datetime] = None, cold: bool = True,
+              **scope: Any) -> Dict[datetime.date, Tuple[int, int]]:
+        """``{day: (flaking, assigned)}``, both halves added."""
+        if cold:
+            self.store._invalidate_summary_cache()
+            self.store._cadence_runs_cache.clear()
+        at = now or self.NOW
+        out = {}  # type: Dict[datetime.date, Tuple[int, int]]
+        for half in (self.store.daily_flaking_failures,
+                     self.store.daily_default_flaking_failures):
+            for entry in half(since, at, **scope):
+                flaking, assigned = out.get(entry.day, (0, 0))
+                out[entry.day] = (flaking + entry.flaking,
+                                  assigned + entry.assigned)
+        return out
+
+    def oracle_trend(
+        self, since: datetime.datetime,
+        defaults: Dict[str, int],
+        marks: Optional[Dict[Tuple[str, str, str], int]] = None,
+        muted: Sequence[Tuple[str, str]] = FlakyDefaultEstateBase.MUTED,
+        stream_id: int = storage.MAINLINE_STREAM_ID,
+        environments: Optional[Sequence[str]] = None,
+    ) -> Dict[datetime.date, Tuple[int, int]]:
+        """*muted* is the (environment, name) pairs under a live mute at
+        the read's clock. The assigned are the rows' assignees now: a
+        mute assigns its test, and the assignee outlives the mute."""
+        own = self.own_cadences() if marks is None else marks
+        owners = {}  # type: Dict[Tuple[str, str, str], bool]
+        for row in self.store.dashboard(include_retired=True,
+                                        stream_id=stream_id):
+            owners[(row.environment, row.script, row.test_name)] = (
+                row.assignee is not None)
+        out = {}  # type: Dict[datetime.date, Tuple[int, int]]
+        for triple in sorted(set(own) | set(owners)):
+            if environments is not None and triple[0] not in environments:
+                continue
+            cadence = own.get(triple, defaults.get(triple[0]))
+            if cadence is None or (triple[0], triple[2]) in muted:
+                continue
+            runs = list(reversed(self.store.run_history(
+                triple[0], triple[1], triple[2], limit=1000,
+                stream_id=stream_id)))
+            flags = analytics.flaking_that_night(
+                cadence, [run.result for run in runs])
+            for run, flaking in zip(runs, flags):
+                if not flaking or run.start_time < since:
+                    continue
+                day = run.start_time.date()
+                count, owned = out.get(day, (0, 0))
+                out[day] = (count + 1,
+                            owned + (1 if owners.get(triple) else 0))
+        return out
+
+
+class DefaultTrendTest(_DefaultTrendBase):
+    """Design flaky-default-r0 §2 B.5, replacing the marks-only reading
+    of the per-day chart (FlakyTrendTest keeps the marks' half): each
+    night's tolerated failures by c = the test's mark, else its
+    environment's default as it is today. FlakyTrendTest's oracle over
+    every test's whole history; the worked example in both push orders;
+    a mark wins; a live mute wins and then expires with no write; the
+    runs before the window; a build's floor; a default set after the
+    nights; removal; the assigned counted once. On MariaDB through the
+    generated variant."""
+
+    def _windows(self) -> List[datetime.datetime]:
+        return [BASE + datetime.timedelta(days=days)
+                for days in (0, 6, 8, 9)]
+
+    def test_each_night_by_mark_else_default(self) -> None:
+        """env-d at 2, 3 and 5 beside env-e at 4 (marked tests there
+        muted, retired and assigned, and a mute run out), on mainline
+        and on the build b9 from its floor."""
+        self.set_second_default()
+        build = self.build()
+        for cadence in (2, 3, 5):
+            self.set_default(cadence, reason="at {0}".format(cadence))
+            defaults = {self.ENV: cadence, self.SECOND: self.SECOND_CADENCE}
+            for since in self._windows():
+                self.assertEqual(
+                    self.trend(since),
+                    self.oracle_trend(since, defaults),
+                    (cadence, since))
+                self.assertEqual(
+                    self.trend(since, stream_id=build.stream_id,
+                               floor=build.first_seen),
+                    self.oracle_trend(since, defaults, muted=(),
+                                      stream_id=build.stream_id),
+                    (cadence, since, "build"))
+            whole = self.trend(BASE)
+            # Not the marks' figures alone: the default counts.
+            self.assertNotEqual(whole, self.oracle_trend(BASE, {}), cadence)
+
+    def test_the_hand_reading_at_2(self) -> None:
+        """Night 9 by hand, env-d: d_new, d_new_up, d_assigned, d_muted
+        and d_retired fail after a pass (d_muted under a live mute),
+        d_marked2 is its own mark's at 2, d_marked's third FAIL at 4
+        flakes, and every FAIL after a FAIL is over 2. env-o adds
+        o_marked's (its mark at 3; o_new has no default), and env-e, with
+        no default here, its marks': e_marked_retired's and
+        e_marked_assigned's (assigned), e_marked_muted's under its mute."""
+        self.set_default(2)
+        night9 = self._night(9).date()
+        self.assertEqual(
+            self.trend(self._night(9), environment=self.ENV),
+            {night9: (6, 1)})
+        self.assertEqual(
+            self.trend(self._night(9), environment=self.OTHER),
+            {night9: (1, 0)})
+        self.assertEqual(
+            self.trend(self._night(9), environment=self.SECOND),
+            {night9: (2, 1)})
+        self.assertEqual(self.trend(self._night(9)), {night9: (9, 2)})
+
+    def test_the_runs_before_the_window_are_judged(self) -> None:
+        """Seen from night 9 alone at 3, d_ff's last FAIL (P F F) flakes
+        only by the pass two nights before the window; by hand the
+        default's half is d_new, d_new_up, d_ff, d_assigned and
+        d_retired."""
+        self.set_default(3)
+        since = self._night(9)
+        self.assertEqual(
+            self.trend(since, environment=self.ENV),
+            self.oracle_trend(since, {self.ENV: 3}, environments=[self.ENV]))
+        self.store._invalidate_summary_cache()
+        default_half = {
+            e.day: (e.flaking, e.assigned)
+            for e in self.store.daily_default_flaking_failures(
+                since, self.NOW, environment=self.ENV)}
+        self.assertEqual(default_half, {since.date(): (5, 1)})
+
+    def test_a_live_mute_wins_then_expires(self) -> None:
+        self.set_default(2)
+        now = self.trend(BASE, self.NOW, environment=self.ENV)
+        later = self.trend(BASE, self.LATER, environment=self.ENV)
+        self.assertEqual(now, self.oracle_trend(
+            BASE, {self.ENV: 2}, environments=[self.ENV]))
+        # A mute assigns its test, and the assignee stays past expiry.
+        self.assertEqual(later, self.oracle_trend(
+            BASE, {self.ENV: 2}, muted=(), environments=[self.ENV]))
+        # d_muted (P F) flakes once its mute is out; d_muted_ff never.
+        self.assertEqual(
+            sum(c for c, _a in later.values())
+            - sum(c for c, _a in now.values()), 1)
+
+    def test_a_mark_wins_whole(self) -> None:
+        """d_fff (P F F F) under a default of 2 flakes on its first FAIL
+        only; marked at 4 it flakes on all three. Unmarked, the default
+        returns."""
+        self.set_default(2)
+        triple = (self.ENV, self.SCRIPT, "d_fff")
+        before = self.trend(BASE, environment=self.ENV)
+        self.store.mark_flaky([triple + (None,)], 4, "own", "bob", CREATED)
+        marks = self.own_cadences()
+        marks[triple] = 4
+        after = self.trend(BASE, environment=self.ENV)
+        self.assertEqual(after, self.oracle_trend(
+            BASE, {self.ENV: 2}, marks=marks, environments=[self.ENV]))
+        self.assertEqual(sum(c for c, _a in after.values())
+                         - sum(c for c, _a in before.values()), 2)
+        self.store.unmark_flaky([triple], "bob", self.NOW)
+        self.assertEqual(self.trend(BASE, environment=self.ENV), before)
+
+    def test_set_after_the_nights_judges_them_by_today(self) -> None:
+        """Decision 27: no night is judged by the default it had then;
+        a default set this morning re-judges every night drawn."""
+        self.set_default(2, when=CREATED)
+        early = self.trend(BASE)
+        self.set_default(None, when=self.NOW, reason="again")
+        self.set_default(2, when=self.NOW)
+        self.assertEqual(self.trend(BASE), early)
+
+    def test_removal_leaves_the_marks_alone(self) -> None:
+        marks_only = self.trend(BASE)
+        self.set_default(2)
+        self.assertNotEqual(self.trend(BASE), marks_only)
+        self.set_default(None, reason="trial over")
+        self.assertEqual(self.trend(BASE), marks_only)
+        self.assertEqual(self.trend(BASE), self.oracle_trend(BASE, {}))
+        self.assertEqual(self.store.daily_default_flaking_failures(
+            BASE, self.NOW), [])
+
+    def test_the_assigned_are_counted_once(self) -> None:
+        """d_assigned's tolerated FAIL is in ``assigned``, so the caller
+        takes it off FAIL_ASSIGNED; the split's assigned figure holds
+        it, and nothing else of env-d's is assigned."""
+        self.set_default(2)
+        night9 = self._night(9).date()
+        split = {e.day: e.assigned for e in
+                 self.store.daily_assigned_failures(
+                     BASE, self.NOW, environment=self.ENV)}
+        self.assertEqual(split.get(night9), 1)
+        self.assertEqual(self.trend(BASE, environment=self.ENV)[night9][1],
+                         1)
+
+    def test_a_build_is_judged_on_its_own_runs(self) -> None:
+        """The default covers every stream; a build's nights read its
+        own runs, its first run the floor of every backward step."""
+        last = self._night(self.NIGHTS - 1)
+        self.store.upsert_runs([
+            make_record(environment=self.ENV, test_name=name,
+                        result=result, build="b1",
+                        start=last + datetime.timedelta(hours=hours))
+            for name, result, hours in (
+                ("d_ff", Result.FAIL, 4),
+                ("d_new", Result.FAIL, 4), ("d_new", Result.FAIL, 6),
+                ("d_pass", Result.PASS, 4), ("d_pass", Result.FAIL, 6),
+                ("d_over", Result.UNEXPECTED_PASS, 4),
+                ("d_over", Result.FAIL, 6), ("d_over", Result.FAIL, 7))])
+        build = [stream for stream in self.store.list_streams("")
+                 if stream.name == "b1"][0]
+        self.set_default(2)
+        for floor in (build.first_seen, None):
+            got = self.trend(BASE, stream_id=build.stream_id, floor=floor)
+            self.assertEqual(got, self.oracle_trend(
+                BASE, {self.ENV: 2}, muted=(),
+                stream_id=build.stream_id), floor)
+        # d_pass's FAIL after its pass and d_over's after its unexpected
+        # pass; d_ff's single FAIL is every run it has there: failing.
+        self.assertEqual(
+            self.trend(BASE, stream_id=build.stream_id,
+                       floor=build.first_seen),
+            {last.date(): (2, 0)})
+
+    def _bound(self, call: Callable[[], Any]) -> Tuple[str, List[Any]]:
+        """The default read's statement and its parameters, on either
+        backend."""
+        captured = []  # type: List[Tuple[str, List[Any]]]
+        store = self.store
+        real = store._conn
+
+        class Spy(object):
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                captured.append((" ".join(sql.split()), list(params)))
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, attr: str) -> Any:
+                return getattr(self._conn, attr)
+
+        store._invalidate_summary_cache()
+        store._conn = lambda: Spy(real())  # type: ignore
+        try:
+            call()
+        finally:
+            del store._conn  # type: ignore
+        found = [c for c in captured
+                 if "CROSS JOIN runs AS r ON r.id = k.id" in c[0]]
+        self.assertEqual(len(found), 1, captured)
+        return found[0]
+
+    def test_a_builds_range_starts_at_the_later_bound(self) -> None:
+        """A build has no run before its floor, so its driving range
+        binds the later of the window's start and the floor; mainline
+        binds the window's start, its statement the one with no floor
+        term. The nights are the rule's either way (the sweeps above)."""
+        self.set_default(2)
+        build = self.build()
+        floor_iso = model.format_iso(build.first_seen)
+        for since in (BASE, self._night(9)):
+            since_iso = model.format_iso(since)
+            sql, params = self._bound(
+                lambda: self.store.daily_default_flaking_failures(
+                    since, self.NOW, environment=self.ENV,
+                    stream_id=build.stream_id, floor=build.first_seen))
+            self.assertEqual(params[0], max(since_iso, floor_iso), since)
+            self.assertIn("AND p.start_time >= ?", sql)
+            main_sql, main_params = self._bound(
+                lambda: self.store.daily_default_flaking_failures(
+                    since, self.NOW, environment=self.ENV))
+            self.assertEqual(main_params[0], since_iso)
+            # Mainline's text is pinned byte for byte by the API's
+            # WITH_DEFAULT_BARE_SQL digest of the chart's part.
+            self.assertNotIn("p.start_time >= ?", main_sql)
+            self.assertNotIn(floor_iso, main_params)
+        # The window opens before the floor here: the floor is bound.
+        self.assertLess(BASE, build.first_seen)
+
+    def test_scopes_share_the_environments_entry(self) -> None:
+        """Environment, product and unscoped: the same nights for the
+        environment, and its figures in a wider scope's sum."""
+        self.store.set_environment_product(self.ENV, "Atlas", "alice",
+                                           CREATED)
+        self.set_default(3)
+        alone = self.store.daily_default_flaking_failures(
+            BASE, self.NOW, environment=self.ENV)
+        self.assertTrue(alone)
+        for scope in ({"environments": [self.ENV]},
+                      {"environments": [self.ENV, self.OTHER]}, {}):
+            self.assertEqual(self.store.daily_default_flaking_failures(
+                BASE, self.NOW, **scope), alone, scope)
+        self.assertEqual(self.store.daily_default_flaking_failures(
+            BASE, self.NOW, environment=self.OTHER), [])
+        self.assertEqual(self.store.daily_default_flaking_failures(
+            BASE, self.NOW, environments=[]), [])
+
+
+class DefaultTrendWarmTest(_DefaultTrendBase):
+    """The per-day chart's default half against a WARM memo (item 24):
+    for each act, the chart is read, the act made, and the
+    chart read again with nothing cleared; the second read must equal a
+    cold read of the new state, so an act whose drop were missing would
+    fail here as a stale chart. The marks' bit is not in the entry's key
+    (a mark act drops every memo), nor is the default's reason. On both
+    backends: by values and the memo's keys, no trace."""
+
+    def _entries(self) -> List[Any]:
+        with self.store._summary_lock:
+            return sorted(key for key in self.store._summary_cache
+                          if key[0] == "default_trend")
+
+    def _warm(self, act: Callable[[], Any],
+              before: Optional[datetime.datetime] = None,
+              after: Optional[datetime.datetime] = None,
+              moves: bool = True) -> List[Any]:
+        """Read warm at *before*, act, read warm at *after*; the second
+        equals a cold read; the nights move by the act or not, as
+        *moves* says. Returns the default entries the act left."""
+        self.store._invalidate_summary_cache()
+        first = self.trend(BASE, before, cold=False, environment=self.ENV)
+        act()
+        left = self._entries()
+        second = self.trend(BASE, after or before, cold=False,
+                            environment=self.ENV)
+        cold = self.trend(BASE, after or before, environment=self.ENV)
+        self.assertEqual(second, cold)
+        if moves:
+            self.assertNotEqual(second, first)
+        else:
+            self.assertEqual(second, first)
+        return left
+
+    def test_a_default_set(self) -> None:
+        self.assertEqual(self._warm(lambda: self.set_default(2)), [])
+
+    def test_its_cadence_changed(self) -> None:
+        self.set_default(2)
+        self.assertEqual(self._warm(lambda: self.set_default(3)), [])
+
+    def test_its_reason_edited_moves_nothing_and_drops(self) -> None:
+        """A reason edit changes no night; it is a default act, which
+        drops every memo, so the entry is read again (pinned)."""
+        self.set_default(2)
+        change = []  # type: List[Any]
+        left = self._warm(
+            lambda: change.append(self.set_default(2, reason="reworded")),
+            moves=False)
+        self.assertEqual(change[0].action, "reason")
+        self.assertEqual(left, [])
+
+    def test_a_default_removed(self) -> None:
+        self.set_default(2)
+        self.assertEqual(
+            self._warm(lambda: self.set_default(None, reason="over")), [])
+
+    def test_a_mark_and_an_unmark(self) -> None:
+        """The marks' bit and the marks are not in the key: a mark act's
+        drop is what keeps the entry right, pinned both ways."""
+        self.set_default(2)
+        triple = (self.ENV, self.SCRIPT, "d_fff")
+        self.assertEqual(self._warm(lambda: self.store.mark_flaky(
+            [triple + (None,)], 4, "own", "bob", CREATED)), [])
+        self.assertEqual(self._warm(lambda: self.store.unmark_flaky(
+            [triple], "bob", self.NOW)), [])
+
+    def test_a_mute_and_an_unmute(self) -> None:
+        self.set_default(2)
+        key = (self.ENV, self.SCRIPT, "d_new", self.MAINLINE)
+        self.assertEqual(self._warm(lambda: self.store.mute_tests(
+            [key], "infra", 24, "bob", "alice", self.NOW)), [])
+        self.assertEqual(self._warm(lambda: self.store.unmute_tests(
+            [(self.ENV, self.SCRIPT, "d_muted", self.MAINLINE)], "bob",
+            self.NOW)), [])
+
+    def test_a_retirement_and_its_return_move_nothing(self) -> None:
+        """No retirement filter (the day's FAIL has none): the nights
+        stay, and the act drops the entry as every act does."""
+        self.set_default(2)
+        for retired in (True, False):
+            self.assertEqual(self._warm(
+                lambda: self.store.set_retired(
+                    self.ENV, self.SCRIPT, "d_new", retired, "alice", "why",
+                    CREATED),
+                moves=False), [])
+
+    def test_a_mutes_expiry_with_no_write(self) -> None:
+        """The clock moves past the mutes' day and nothing is cleared:
+        the epoch in the key moves, so the entry at NOW is not served
+        at LATER."""
+        self.set_default(2)
+        left = self._warm(lambda: None, before=self.NOW, after=self.LATER)
+        self.assertEqual(len(left), 1)
+        # The entry at LATER is keyed by another epoch (index 6).
+        later = self._entries()
+        self.assertEqual(len(later), 1)
+        self.assertNotEqual(later[0][6], left[0][6])
+        self.assertEqual(later[0][:6], left[0][:6])
+
+
+class DefaultTrendWholeRangeTest(_DefaultTrendBase):
+    """Every cadence the builder accepts, 2 to 10 (one to nine backward
+    steps, OFFSET 0 to 8), against ``flaking_that_night``, with env-e at
+    4 beside it, on mainline and on b9; and two histories long enough
+    that the step furthest back decides a night: ``env-long`` at 10 (a
+    pass, then eleven FAILs: the ninth flakes by the pass nine back,
+    the tenth and eleventh are over) and ``env-long4`` at 4 (a pass,
+    then five FAILs: the third flakes by the pass three back). On both
+    backends."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        P, F = Result.PASS, Result.FAIL
+        records = [make_record(environment="env-long", test_name="t_long",
+                               result=P, start=self._night(0))]
+        starts = ([self._night(0) + datetime.timedelta(hours=6)]
+                  + [self._night(day) for day in range(1, self.NIGHTS)]
+                  + [self._night(self.NIGHTS - 1)
+                     + datetime.timedelta(hours=6)])
+        records.extend(make_record(environment="env-long",
+                                   test_name="t_long", result=F, start=start)
+                       for start in starts)
+        records.append(make_record(environment="env-long4",
+                                   test_name="t_long4", result=P,
+                                   start=self._night(4)))
+        records.extend(make_record(environment="env-long4",
+                                   test_name="t_long4", result=F,
+                                   start=self._night(day))
+                       for day in range(5, self.NIGHTS))
+        self.store.upsert_runs(records)
+
+    def test_every_cadence_against_the_rule(self) -> None:
+        self.set_second_default()
+        build = self.build()
+        for cadence in range(2, 11):
+            self.set_default(cadence, reason="at {0}".format(cadence))
+            defaults = {self.ENV: cadence, self.SECOND: self.SECOND_CADENCE}
+            for since in (BASE, self._night(8)):
+                self.assertEqual(self.trend(since),
+                                 self.oracle_trend(since, defaults),
+                                 (cadence, since))
+                self.assertEqual(
+                    self.trend(since, stream_id=build.stream_id,
+                               floor=build.first_seen),
+                    self.oracle_trend(since, defaults, muted=(),
+                                      stream_id=build.stream_id),
+                    (cadence, since, "build"))
+
+    def test_the_step_furthest_back_decides(self) -> None:
+        self.store.set_flaky_default("env-long", 10, "ten", "alice",
+                                     CREATED)
+        self.store.set_flaky_default("env-long4", 4, "four", "alice",
+                                     CREATED)
+        nights = {day: (1, 0) for day in range(0, 9)}
+        got = self.trend(BASE, environment="env-long")
+        self.assertEqual(
+            {(day - BASE.date()).days: value for day, value in got.items()},
+            nights)
+        self.assertEqual(got, self.oracle_trend(
+            BASE, {"env-long": 10}, environments=["env-long"]))
+        got4 = self.trend(BASE, environment="env-long4")
+        self.assertEqual(
+            {(day - BASE.date()).days: value for day, value in got4.items()},
+            {5: (1, 0), 6: (1, 0), 7: (1, 0)})
+        self.assertEqual(got4, self.oracle_trend(
+            BASE, {"env-long4": 4}, environments=["env-long4"]))
+        # The tenth FAIL and the ninth are one step apart in the rule.
+        F, P = Result.FAIL, Result.PASS
+        self.assertEqual(
+            analytics.flaking_that_night(10, [P] + [F] * 11)[9:],
+            [True, False, False])
+
+
+class DefaultTrendExampleTest(StorageTestBase):
+    """Design §2 B.5's worked example, default 2, servers A then B
+    nightly: ``P · F P · F P · F P · F F``. Nights 1 to 3 read FAIL 1,
+    FAIL_FLAKING 1; night 4 reads 2 and 1. B first on night 3
+    (``… P F · F F``): 1/1, then 2/0. A mark of 3 makes night 4 2/2; a
+    live mute moves the test's FAILs out. Nights 1 to 4 here are 6 to
+    9."""
+
+    NOW = BASE + datetime.timedelta(days=9, hours=10)
+    SCRIPT = "suite.py"
+
+    def setUp(self) -> None:
+        super().setUp()
+        records = []  # type: List[RunRecord]
+        for environment, test, b_first in (("env-x", "t_ex", None),
+                                           ("env-y", "t_ord", 8)):
+            records.append(make_record(
+                environment=environment, test_name=test, result=Result.PASS,
+                start=self._at(5, 1)))
+            for night in (6, 7, 8, 9):
+                a_hour, b_hour = (4, 1) if night == b_first else (1, 4)
+                b_result = Result.FAIL if night == 9 else Result.PASS
+                records.append(make_record(
+                    environment=environment, test_name=test,
+                    result=Result.FAIL, start=self._at(night, a_hour)))
+                records.append(make_record(
+                    environment=environment, test_name=test,
+                    result=b_result, start=self._at(night, b_hour)))
+        self.store.upsert_runs(records)
+        self.store.ensure_user("alice", CREATED)
+        for environment in ("env-x", "env-y"):
+            self.store.set_flaky_default(
+                environment, 2, "two servers", "alice", CREATED)
+
+    def _at(self, night: int, hour: int) -> datetime.datetime:
+        return BASE + datetime.timedelta(days=night, hours=hour)
+
+    def _nights(self, environment: str) -> Dict[int, Tuple[int, int]]:
+        """``{night: (FAIL, FAIL_FLAKING)}`` from the trend and its
+        default half."""
+        self.store._invalidate_summary_cache()
+        since = self._at(5, -2)
+        fails = {}  # type: Dict[datetime.date, int]
+        for count in self.store.daily_result_counts(
+                since, environment=environment):
+            if count.result is Result.FAIL:
+                fails[count.day] = count.count
+        flaking = {
+            entry.day: entry.flaking
+            for half in (self.store.daily_flaking_failures,
+                         self.store.daily_default_flaking_failures)
+            for entry in half(since, self.NOW, environment=environment)}
+        return {
+            night: (fails.get(self._at(night, 0).date(), 0),
+                    flaking.get(self._at(night, 0).date(), 0))
+            for night in (6, 7, 8, 9)}
+
+    def test_a_then_b(self) -> None:
+        self.assertEqual(self._nights("env-x"),
+                         {6: (1, 1), 7: (1, 1), 8: (1, 1), 9: (2, 1)})
+
+    def test_b_first_on_the_third_night(self) -> None:
+        self.assertEqual(self._nights("env-y"),
+                         {6: (1, 1), 7: (1, 1), 8: (1, 1), 9: (2, 0)})
+
+    def test_a_mark_of_3_wins(self) -> None:
+        self.store.mark_flaky([("env-x", self.SCRIPT, "t_ex", None)], 3,
+                              "own", "alice", CREATED)
+        self.assertEqual(self._nights("env-x")[9], (2, 2))
+
+    def test_a_live_mute_takes_the_test_out(self) -> None:
+        self.store.mute_tests(
+            [("env-x", self.SCRIPT, "t_ex", storage.MAINLINE_STREAM_ID)],
+            "infra", 24, "alice", "alice", self.NOW)
+        self.assertEqual(self._nights("env-x"),
+                         {6: (1, 0), 7: (1, 0), 8: (1, 0), 9: (2, 0)})
+
+    def test_the_pure_rule_agrees(self) -> None:
+        F, P = Result.FAIL, Result.PASS
+        self.assertEqual(
+            analytics.flaking_that_night(2, [P, F, P, F, P, F, P, F, F]),
+            [False, True, False, True, False, True, False, True, False])
+        self.assertEqual(
+            analytics.flaking_that_night(2, [P, F, P, F, P, P, F, F, F]),
+            [False, True, False, True, False, False, True, False, False])
+
+
+class DefaultTrendStatementsTest(_DefaultTrendBase):
+    """The per-day chart's cache guards with a default (design §2 B.5,
+    §3a), by sqlite3's trace (excluded on MariaDB by name; the values
+    are DefaultTrendTest's, which runs there): cold, the part's
+    statements are today's plus the map plus one per defaulted
+    environment in scope, and no Q2; with a default only outside the
+    scope, the map alone and no runs read; with none, nothing; warm,
+    nothing; a wider scope reads the environment's entry."""
+
+    #: The default's statement, by its driving join.
+    READ = "CROSS JOIN runs AS r ON r.id = k.id"
+    #: A Q2 member's head.
+    Q2 = DefaultStatementsTest.Q2
+    #: The defaults map's one statement.
+    MAP_READ = ("SELECT environment, cadence, reason, set_by, set_at, "
+                "cadence_at FROM environment_flaky_defaults")
+
+    def _statements(self, call: Callable[[], Any]) -> List[str]:
+        seen = []  # type: List[str]
+        conn = self.store._conn()
+        trace_sql_into(conn, seen)
+        try:
+            call()
+        finally:
+            conn.set_trace_callback(None)
+        return [" ".join(s.split()) for s in seen
+                if s.strip().upper().startswith("SELECT")]
+
+    def _part(self, **scope: Any) -> Callable[[], Any]:
+        """The part's three storage reads, as the handler makes them."""
+        def read() -> None:
+            since = BASE
+            self.store.daily_assigned_failures(since, self.NOW, **scope)
+            self.trend(since, cold=False, **scope)
+        return read
+
+    def _cold(self, **scope: Any) -> List[str]:
+        self.store._invalidate_summary_cache()
+        self.store._cadence_runs_cache.clear()
+        return self._statements(self._part(**scope))
+
+    def test_cold_is_todays_plus_the_map_plus_one_per_environment(
+            self) -> None:
+        for scope in ({"environment": self.ENV},
+                      {"environments": [self.ENV, self.OTHER]}, {}):
+            today = self._cold(**scope)
+            self.set_default(2)
+            cold = self._cold(**scope)
+            added = list(cold)
+            for statement in today:
+                added.remove(statement)
+            self.assertEqual(len(added), 2, (scope, added))
+            self.assertTrue(added[0].startswith(
+                self.MAP_READ), added)
+            self.assertIn(self.READ, added[1])
+            self.assertFalse([s for s in added if self.Q2.search(s)])
+            self.assertEqual(self._statements(self._part(**scope)), [],
+                             scope)
+            self.set_default(None, reason="again")
+
+    def test_two_defaulted_environments_are_two_statements(self) -> None:
+        today = self._cold()
+        self.set_default(3)
+        self.store.set_flaky_default(self.OTHER, 2, "both", "alice",
+                                     CREATED)
+        cold = self._cold()
+        self.assertEqual(len(cold), len(today) + 3, cold)
+        reads = [s for s in cold if self.READ in s]
+        self.assertEqual(len(reads), 2, reads)
+        # N - 1 backward steps each: 2 at a default of 3, 1 at 2.
+        steps = sorted(s.count("LIMIT 1 OFFSET") for s in reads)
+        self.assertEqual(steps, [1, 2], reads)
+
+    def test_a_default_only_outside_the_scope_reads_the_map(self) -> None:
+        today = self._cold(environment=self.OTHER)
+        self.set_default(2)
+        cold = self._cold(environment=self.OTHER)
+        self.assertEqual(len(cold), len(today) + 1, cold)
+        self.assertEqual(
+            [s for s in cold if s not in today and not s.startswith(
+                self.MAP_READ)], [], cold)
+        self.assertFalse([s for s in cold if self.READ in s])
+        # After a headline the map is a memo hit: nothing more at all.
+        self.store._invalidate_summary_cache()
+        self.store.flaky_defaults_map()
+        self.store.mute_epoch(self.MAINLINE, self.NOW)
+        after = self._statements(self._part(environment=self.OTHER))
+        self.assertEqual(len(after), len(today) - 1, (after, today))
+
+    def test_with_no_default_the_half_reads_nothing(self) -> None:
+        self.store.daily_assigned_failures(BASE, self.NOW)
+        self.assertEqual(self._statements(
+            lambda: self.store.daily_default_flaking_failures(
+                BASE, self.NOW)), [])
+
+    def test_no_mark_no_mute_join(self) -> None:
+        """The marks' join only where a mark exists, the mutes' only
+        while the stream has a live one; the WHERE reads both."""
+        self.set_default(2)
+        statement = [s for s in self._cold(environment=self.ENV)
+                     if self.READ in s][0]
+        self.assertIn("LEFT JOIN test_flaky_marks AS fm", statement)
+        self.assertIn("fm.environment IS NULL", statement)
+        self.assertIn("LEFT JOIN test_mutes AS tm", statement)
+        self.store.unmark_flaky(list(self.own_marks()), "bob", self.NOW)
+        statement = [s for s in self._statements(
+            lambda: self.store.daily_default_flaking_failures(
+                BASE, self.LATER, environment=self.ENV))
+            if self.READ in s][0]
+        self.assertNotIn("test_flaky_marks", statement)
+        self.assertNotIn("test_mutes", statement)
+
+    def test_a_builds_plan_drives_from_the_fail_range(self) -> None:
+        """The plan guard of FlakyPlanTest on a build: its range bound by
+        the floor still drives first by the covering (start_time, result)
+        index, each run by its primary key, each step by the runs UNIQUE
+        index between the floor and the run's start."""
+        self.set_default(3)
+        build = self.build()
+        self.store._invalidate_summary_cache()
+        captured = []  # type: List[Tuple[str, List[Any]]]
+        real = self.store._conn
+
+        class Spy(object):
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                captured.append((sql, list(params)))
+                return self._conn.execute(sql, params)
+
+        self.store._conn = lambda: Spy(real())  # type: ignore
+        try:
+            self.store.daily_default_flaking_failures(
+                BASE, self.NOW, environment=self.ENV,
+                stream_id=build.stream_id, floor=build.first_seen)
+        finally:
+            del self.store._conn  # type: ignore
+        (sql, params), = [c for c in captured if self.READ in c[0]]
+        plan = [str(row[-1]).upper() for row in self.store._conn().execute(
+            "EXPLAIN QUERY PLAN " + sql, params).fetchall()]
+        note = (sqlite3.sqlite_version, plan)
+        self.assertIn("COVERING INDEX IDX_RUNS_START_TIME_RESULT", plan[0],
+                      note)
+        self.assertTrue(plan[0].startswith("SEARCH F"), note)
+        r = [line for line in plan if line.startswith("SEARCH R ")]
+        self.assertEqual(len(r), 1, note)
+        self.assertIn("INTEGER PRIMARY KEY", r[0], note)
+        p = [line for line in plan if line.startswith("SEARCH P ")]
+        self.assertEqual(len(p), 2, note)
+        for line in p:
+            self.assertIn("SQLITE_AUTOINDEX_RUNS_1", line, note)
+            compact = line.replace(" ", "")
+            self.assertIn("START_TIME>?", compact, note)
+            self.assertIn("START_TIME<?", compact, note)
+
+    def test_a_wider_scope_reads_the_environments_entry(self) -> None:
+        self.set_default(2)
+        self.store.daily_default_flaking_failures(
+            BASE, self.NOW, environment=self.ENV)
+        for scope in ({"environments": [self.ENV]}, {}):
+            self.assertEqual(self._statements(
+                lambda: self.store.daily_default_flaking_failures(
+                    BASE, self.NOW, **scope)), [], scope)
+
+    def test_the_push_path_gains_nothing(self) -> None:
+        """An import after the chart was read with a default runs the
+        statements it runs with none."""
+        def push(name: str, night: int) -> List[str]:
+            seen = []  # type: List[str]
+            conn = self.store._conn()
+            trace_sql_into(conn, seen)
+            try:
+                self.store.upsert_runs([make_record(
+                    environment=self.ENV, test_name=name,
+                    result=Result.FAIL, start=self._night(night))])
+            finally:
+                conn.set_trace_callback(None)
+            return [re.sub(r"[0-9]+", "N",
+                           " ".join(s.split()).replace(name, "NAME"))
+                    for s in seen]
+
+        self._part()()
+        without = push("p_one", self.NIGHTS)
+        self.set_default(2)
+        self._part()()
+        with_default = push("p_two", self.NIGHTS + 1)
+        self.assertEqual(with_default, without)

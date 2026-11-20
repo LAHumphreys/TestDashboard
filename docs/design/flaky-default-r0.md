@@ -1162,7 +1162,7 @@ says why:
 - [x] 21 the fixture for both bars
 - [x] 22 the default kept and recorded (migration 13)
 - [x] 23 the default judged
-- [ ] 24 the per-day chart's late part
+- [x] 24 the per-day chart's late part
 - [x] 25 the Admin page
 - [x] 26 a row flaking by default
 - [x] 27 the per-day chart waits and draws once

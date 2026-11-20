@@ -87,6 +87,14 @@ EXCLUDED_CLASSES = {
         "MariaDB by DefaultEqualsMarksTest (the emulation as oracle), "
         "DefaultPromotionTest, DefaultEdgesTest and DefaultQ2HeldTest, "
         "and their plans by DefaultPlanTest.",
+    "DefaultTrendStatementsTest":
+        "counts statements with sqlite3's set_trace_callback (the per-day "
+        "chart's default read, flaky-default-r0 §2 B.5): the instrument "
+        "is SQLite's. The values those reads return are compared on "
+        "MariaDB by DefaultTrendTest (the pure rule as oracle), "
+        "DefaultTrendExampleTest and DefaultEqualsMarksTest, and the "
+        "memo's keys by TargetedInvalidationTest's "
+        "test_the_default_trend_is_kept_per_stream_and_environment.",
     "NotRunMutedStatementsTest":
         "counts and reads statements with sqlite3's set_trace_callback "
         "(WP-44 item 20): the instrument is SQLite's. The values those "
@@ -362,6 +370,17 @@ EXCLUDED_TESTS = {
         "by hand on a production-scale copy in the measured pass, as "
         "AssignedTrendTest's is (WP-43 decision 12). The SQLite plan is "
         "pinned by the same test, which runs there.",
+    "FlakyPlanTest.test_the_default_trend_drives_from_the_fail_range":
+        "the per-day chart's default read (flaky-default-r0 §2 B.5 and "
+        "§3a) is planned by MariaDB from its estimates: "
+        "on CI's few-row runs table the covering range of "
+        "idx_runs_start_time_result need not be its choice, where at "
+        "production scale it is (range, Using index; eq_ref PRIMARY; a "
+        "DEPENDENT SUBQUERY ref on uq_runs_identity, on 12.3). That plan "
+        "is taken by hand with EXPLAIN on a production-scale copy, "
+        "10.3 included, as the marks' trend read's is. The SQLite "
+        "plan is pinned by the same test, which runs there; the values "
+        "are DefaultTrendTest's, which runs here.",
     "FlakyBoardApiTest.test_the_filtered_reads_cost":
         "counts statements with sqlite3's set_trace_callback (WP-44 "
         "item 8). The rows and totals those reads return are compared on "

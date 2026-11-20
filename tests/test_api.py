@@ -8473,23 +8473,30 @@ class NoMarksAddsNothingTest(ApiCase):
     #: that leave flaking rows out, and the rows and count that FLAKING
     #: alone now runs. The detail carries the default on its acts read
     #: (its build reads one Q2, as a mark's does: one FAIL there, under
-    #: 2); names and the per-day chart's part read no default (the chart
-    #: is item 24's).
+    #: 2); names reads no default.
+    #:
+    #: Item 24 (§2 B.5, §3a, the per-day chart): the chart's
+    #: part judges the default too, at 14 days and at 90: its two
+    #: statements, the map and ONE read for the one defaulted
+    #: environment in scope, 2 to 4; no Q2 (the marks' statement runs
+    #: only where a mark exists, and there is none here).
     WITH_DEFAULT_COLD_SELECTS = {
         "headline": 25, "full": 32, "browse": 4, "open_actions": 15,
         "watch": 15, "detail": 5, "detail_build": 10, "names": 9,
-        "assigned_trend": 2,
+        "assigned_trend": 4,
         "queue_new_failures": 11, "queue_still_failing": 11,
         "queue_muted": 10, "queue_fixed": 11, "queue_unexpected_passes": 9,
         "queue_not_run": 11, "queue_assigned": 9, "queue_mine": 12,
         "queue_flaking": 10,
         "browse_fail": 5, "browse_fail_flaking": 4, "browse_flaking": 5,
-        "open_actions_failing": 15, "assigned_trend_90": 2,
+        "open_actions_failing": 15, "assigned_trend_90": 4,
     }
 
     #: The reads that judge nothing by a default, so read no map.
-    NO_MAP = ("detail", "detail_build", "names", "assigned_trend",
-              "assigned_trend_90")
+    NO_MAP = ("detail", "detail_build", "names")
+
+    #: The per-day chart's default read, by its driving join (item 24).
+    TREND_READ = "CROSS JOIN runs AS r ON r.id = k.id"
 
     MAP_READ = ("SELECT environment, cadence, reason, set_by, set_at, "
                 "cadence_at FROM environment_flaky_defaults")
@@ -8581,6 +8588,92 @@ class NoMarksAddsNothingTest(ApiCase):
             self.assertFalse(
                 [s for s in seen if " ".join(s.split()).startswith(
                     self.MAP_READ)], name)
+
+    #: Item 24: every read's cold SELECTs with the default of
+    #: :meth:`_set_default`, carriers out, digested as BASE_BARE_SQL is.
+    #: Taken on the build before this item (every read judging a
+    #: default but the chart) and here, by the same method: equal for every read but the chart's
+    #: part, so no first-paint request gains or changes a statement.
+    #: The part's two are this item's own (the map and the one read).
+    WITH_DEFAULT_BARE_SQL = {
+        "headline": "07035832c6d253f3", "full": "71398ad83f3c90e4",
+        "browse": "cd7b3b6ed785904e", "open_actions": "81181b5fbd902cdc",
+        "watch": "f62f570629a02ce0", "detail": "6c68d6b49beaa19e",
+        "detail_build": "ca547c886877cca4", "names": "c47aae065b57f5f7",
+        "assigned_trend": "ba774add07621e40",
+        "browse_fail": "8340d1cc8e1dca90",
+        "browse_fail_flaking": "35208371305bc4ec",
+        "browse_flaking": "84332faec488fbfe",
+        "open_actions_failing": "cecc1f43cbff9642",
+        "assigned_trend_90": "ba774add07621e40",
+        "queue_new_failures": "ccaa61886d07de50",
+        "queue_still_failing": "b7af10c9caabe3de",
+        "queue_muted": "bd81707aba073c46",
+        "queue_fixed": "136eebb10096a8e3",
+        "queue_unexpected_passes": "c74e80361f1be1ca",
+        "queue_not_run": "dfe47222b840fa12",
+        "queue_assigned": "5ad6d699dc41a6c8",
+        "queue_mine": "b180063e1c19f011",
+        "queue_flaking": "1bb941f653a70b97",
+    }
+
+    def test_with_a_default_every_other_read_is_the_bases(self) -> None:
+        self._set_default()
+        self.assertEqual(sorted(self.WITH_DEFAULT_BARE_SQL),
+                         sorted(self.BASE_COLD_SELECTS))
+        for name, path, query in self._reads():
+            self.assertEqual(self._digest(self._bare_sql(path, query)),
+                             self.WITH_DEFAULT_BARE_SQL[name], name)
+
+    def test_the_trend_reads_the_default_once_in_its_scope(self) -> None:
+        """Item 24: with the default on linux-sim the per-day chart's
+        part reads it with one statement, at 14 days and at 90, and no
+        Q2; warm, nothing."""
+        self._set_default()
+        for name in ("assigned_trend", "assigned_trend_90"):
+            query = dict(self._reads_by_name()[name])
+            cold = self._cold_selects("/api/summary", query)
+            self.assertEqual(
+                len([s for s in cold if self.TREND_READ in s]), 1, cold)
+            self.assertFalse([s for s in cold if "AS k, start_time, result "
+                              "FROM runs WHERE" in s], cold)
+            seen = []  # type: List[str]
+            conn = self.storage._conn()
+            _trace_sql_into(conn, seen)
+            try:
+                self.call("GET", "/api/summary", query=query)
+            finally:
+                conn.set_trace_callback(None)
+            self.assertEqual(seen, [], name)
+
+    def test_a_default_outside_the_scope_reads_the_map_alone(self) -> None:
+        """Item 24 (§2 B.5, §3a): a default only outside the chart's
+        scope costs the map, one statement cold, and reads no runs; the
+        rest is the statements of no default, by text. At 14 and 90
+        days, scoped to the environment and to its product."""
+        scopes = ({"environment": ["linux-sim"]}, {"product": ["Atlas"]})
+        today = {}  # type: Dict[Any, List[str]]
+        for scope in scopes:
+            for days in ("14", "90"):
+                query = dict(scope, parts=["assigned_trend"], days=[days])
+                today[(sorted(scope)[0], days)] = self._cold_selects(
+                    "/api/summary", query)
+        self.storage.ensure_user("bob", datetime.datetime(2026, 7, 1))
+        self.call("PUT", "/api/environments/env2/flaky-default",
+                  body={"username": "bob", "cadence": 2, "reason": "r"})
+        for scope in scopes:
+            for days in ("14", "90"):
+                query = dict(scope, parts=["assigned_trend"], days=[days])
+                cold = self._cold_selects("/api/summary", query)
+                maps = [s for s in cold if s.startswith(self.MAP_READ)]
+                self.assertEqual(len(maps), 1, cold)
+                self.assertEqual(
+                    [s for s in cold if s not in maps],
+                    today[(sorted(scope)[0], days)], (scope, days))
+                self.assertFalse([s for s in cold if self.TREND_READ in s])
+
+    def _reads_by_name(self) -> Dict[str, Dict[str, List[str]]]:
+        return {name: query for name, _path, query in self._reads()}
 
     def test_with_a_default_no_count_joins_a_flaky_table(self) -> None:
         """The count-join guard with a default: the F predicate and the
@@ -8843,6 +8936,135 @@ class DefaultJudgedApiTest(ApiCase):
         after = self._answers()
         for name in sorted(before):
             self.assertEqual(after[name], before[name], name)
+
+
+class AssignedTrendDefaultTest(ApiCase):
+    """Design flaky-default-r0 §2 B.5 (decisions 3, 24, 27), item 24:
+    ``parts=assigned_trend`` counts in each day's ``FAIL_FLAKING`` the
+    failed runs linux-sim's default of 2 tolerated, in every scope, with
+    the same keys throughout; where the headline's ``flaky_defaults`` is
+    above 0, the same scope's ``FAIL_FLAKING`` holds the default's runs
+    (ask 1); an assigned or muted test's runs are counted once; the
+    headline's trend and the full payload are unchanged and carry no
+    split. On both backends.
+
+    TestSummary's estate, linux-sim declared as Atlas: test_new_fail
+    (P on the 25th, F on the 26th) tolerated on the 26th;
+    test_still_fail (P F F F from the 23rd) tolerated on the 24th only;
+    test_fixed's first-run FAIL on the 25th, and env2's on the 26th,
+    failing. On build b1, test_new_fail passes and then fails on the
+    26th: tolerated there too."""
+
+    #: ``{date: (FAIL_ASSIGNED, FAIL_MUTED, FAIL_FLAKING)}``, the nights
+    #: that are not all zero.
+    JUDGED = {"2026-07-24": (0, 0, 1), "2026-07-26": (0, 0, 1)}
+
+    def setUp(self) -> None:
+        super().setUp()
+        TestSummary.seed(self)  # type: ignore
+        self.import_runs([
+            record(test_name="test_new_fail", result=result, build="b1",
+                   start_time="2026-07-26T{0}:00:00.000000".format(hour),
+                   end_time="2026-07-26T{0}:30:00.000000".format(hour))
+            for result, hour in (("PASS", "04"), ("FAIL", "06"))])
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.build = self.storage.list_streams("")[0].stream_id
+        self.storage.ensure_user("bob", datetime.datetime(2026, 7, 1))
+
+    def _put(self, cadence: Optional[int], reason: str = "two servers"
+             ) -> None:
+        self.call("PUT", "/api/environments/linux-sim/flaky-default",
+                  body={"username": "bob", "cadence": cadence,
+                        "reason": reason})
+
+    def _nights(self, **scope: List[str]) -> Dict[str, Tuple[int, int, int]]:
+        self.storage._invalidate_summary_cache()
+        data = self.call("GET", "/api/summary",
+                         query=dict(scope, parts=["assigned_trend"]))
+        self.assertEqual(data["trend"]["days"], 14)
+        out = {}  # type: Dict[str, Tuple[int, int, int]]
+        for night in data["trend"]["nights"]:
+            self.assertEqual(sorted(night),
+                             sorted(("date",) + ASSIGNED_SPLIT_KEYS))
+            figures = tuple(night[key] for key in ASSIGNED_SPLIT_KEYS)
+            if any(figures):
+                out[night["date"]] = figures  # type: ignore
+        return out
+
+    def _defaults(self, **scope: List[str]) -> int:
+        return self.call("GET", "/api/summary", query=dict(
+            scope, parts=["headline"]))["status"]["flaky_defaults"]
+
+    def test_three_scopes_and_ask_one(self) -> None:
+        self.assertEqual(self._nights(), {})
+        self._put(2)
+        for scope, expected in (
+                ({}, self.JUDGED),
+                ({"product": ["Atlas"]}, self.JUDGED),
+                ({"environment": ["linux-sim"]}, self.JUDGED),
+                ({"environment": ["env2"]}, {}),
+                ({"stream": [str(self.build)]},
+                 {"2026-07-26": (0, 0, 1)})):
+            nights = self._nights(**scope)
+            self.assertEqual(nights, expected, scope)
+            if self._defaults(**scope) > 0:
+                self.assertGreater(
+                    sum(f[2] for f in nights.values()), 0, scope)
+            else:
+                self.assertEqual(nights, {}, scope)
+
+    def test_assigned_and_muted_are_counted_once(self) -> None:
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_new_fail", "/assignee"),
+                  body={"username": "alice", "assigned_by": "bob"})
+        self.call("POST", "/api/mutes/bulk", body={
+            "username": "bob", "reason": "infra", "hours": 24,
+            "assignee": "carol",
+            "tests": [{"environment": "linux-sim",
+                       "script": "suite/alpha.py",
+                       "test_name": "test_still_fail"}]})
+        before = self._nights()
+        self.assertEqual(before["2026-07-26"], (1, 1, 0))
+        self._put(2)
+        after = self._nights()
+        # test_new_fail's tolerated FAIL leaves FAIL_ASSIGNED for
+        # FAIL_FLAKING; test_still_fail's stay FAIL_MUTED (a mute wins).
+        self.assertEqual(after["2026-07-26"], (0, 1, 1))
+        self.assertEqual(after["2026-07-24"], before["2026-07-24"])
+        self.assertEqual(after["2026-07-24"][2], 0)
+
+    def test_the_headline_and_the_full_payload_are_unchanged(self) -> None:
+        headline = {"parts": ["headline"]}
+        trend_before = self.call("GET", "/api/summary",
+                                 query=headline)["trend"]
+        full_before = self.call("GET", "/api/summary")["trend"]
+        self._put(2)
+        self.storage._invalidate_summary_cache()
+        after = self.call("GET", "/api/summary", query=headline)
+        full = self.call("GET", "/api/summary")
+        self.assertEqual(after["trend"], trend_before)
+        self.assertEqual(full["trend"], full_before)
+        assert_no_trend_split(self, after)
+        assert_no_trend_split(self, full)
+
+    def test_removal_and_a_mark_judge_by_today(self) -> None:
+        """Decision 27: the nights follow today's default at once; a mark
+        of 3 wins whole on test_still_fail (its 25th then flakes too)."""
+        self._put(2)
+        self.assertEqual(self._nights(), self.JUDGED)
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+        self.call("POST", "/api/flaky/bulk", body={
+            "username": "dev1", "reason": "own", "cadence": 3,
+            "tests": [{"environment": "linux-sim",
+                       "script": "suite/alpha.py",
+                       "test_name": "test_still_fail"}]})
+        self.assertEqual(self._nights(), {
+            "2026-07-24": (0, 0, 1), "2026-07-25": (0, 0, 1),
+            "2026-07-26": (0, 0, 1)})
+        self._put(None, "trial over")
+        self.assertEqual(self._nights(), {
+            "2026-07-24": (0, 0, 1), "2026-07-25": (0, 0, 1)})
 
 
 class FlakyDefaultApiTest(ApiCase):

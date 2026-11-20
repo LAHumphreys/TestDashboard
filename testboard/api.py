@@ -1537,6 +1537,15 @@ def _assigned_trend_nights(
     ``FAIL_ASSIGNED``, so the three stay disjoint. With no mark it reads
     nothing and is 0. *floor* is a build's first run, bounding the runs
     read before the window.
+
+    Design flaky-default-r0 §2 B.5 (decisions 3, 24, 27): an
+    environment's default counts here too, judged by the default as it
+    is today, for every test with no mark of its own
+    (:meth:`Storage.daily_default_flaking_failures`, one statement per
+    defaulted environment in scope, judged in the engine). The two
+    halves are disjoint (a mark wins whole), so they add; with no
+    default anywhere nothing more is read, and with one only outside
+    the scope, the defaults map alone.
     """
     first_day = current.date() - datetime.timedelta(days=days - 1)
     since = datetime.datetime.combine(first_day, datetime.time())
@@ -1546,23 +1555,25 @@ def _assigned_trend_nights(
             stream_id=stream_id,
         )
     }
-    flaking = {
-        entry.day: entry for entry in storage.daily_flaking_failures(
-            since, current, environment, environments=environments,
-            stream_id=stream_id, floor=floor,
-        )
-    }
+    flaking = {}  # type: Dict[datetime.date, List[int]]
+    for half in (storage.daily_flaking_failures,
+                 storage.daily_default_flaking_failures):
+        for tolerated in half(since, current, environment,
+                              environments=environments,
+                              stream_id=stream_id, floor=floor):
+            bucket = flaking.setdefault(tolerated.day, [0, 0])
+            bucket[0] += tolerated.flaking
+            bucket[1] += tolerated.assigned
     nights = {}  # type: Dict[str, Dict[str, int]]
     for offset in range(days):
         day = first_day + datetime.timedelta(days=offset)
         entry = split.get(day)
-        tolerated = flaking.get(day)
+        counted = flaking.get(day, [0, 0])
         nights[day.isoformat()] = {
             "FAIL_ASSIGNED": (
-                (0 if entry is None else entry.assigned)
-                - (0 if tolerated is None else tolerated.assigned)),
+                (0 if entry is None else entry.assigned) - counted[1]),
             "FAIL_MUTED": 0 if entry is None else entry.muted,
-            "FAIL_FLAKING": 0 if tolerated is None else tolerated.flaking,
+            "FAIL_FLAKING": counted[0],
         }
     return nights
 
@@ -1824,8 +1835,9 @@ def _handle_summary(
       tab's rows, ``total`` the headline's ``status.flaking``);
     - ``parts=assigned_trend`` (WP-43) — ``{"trend": {"days", "from",
       "to", "nights": [{"date", "FAIL_ASSIGNED", "FAIL_MUTED",
-      "FAIL_FLAKING"}]}}`` (``FAIL_FLAKING``: WP-44 item 8) for
-      the same ``days``/``environment``/``product``/``stream``: the
+      "FAIL_FLAKING"}]}}`` (``FAIL_FLAKING``: WP-44 item 8; an
+      environment's default counts in it too, flaky-default-r0 §2
+      B.5) for the same ``days``/``environment``/``product``/``stream``: the
       trend's split by who owns each failing test now. The page sends
       it in the same parallel batch as the headline. It is the ONLY
       carrier of the two keys: neither the headline nor the full
