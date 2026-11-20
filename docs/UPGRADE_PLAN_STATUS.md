@@ -5728,3 +5728,47 @@ against +583 to +600 before, and +126 on SQLite against +135 to +138,
 the SQL text unchanged. The nights equal the oracle with no mismatch at
 50 and 500, at 2, at 3 and with two environments, at 14 and 90 days, on
 mainline and on the build.
+
+## The default flaky cadence: every item committed, the build's last walk (2026-11-20)
+
+Items 21 to 27 are committed on `wp-44-flaky-mark` and pushed; the plan's
+strip is ticked and no ledger is left. Counts in the main checkout at
+item 24's commit, `tclsh` and `node` on PATH: 3304 OK (skipped 1) on
+SQLite and 4608 OK (skipped 93) with the MariaDB variants on a local
+12.3. Migration 13 runs, create-only.
+
+The last walk was the first to see the per-day chart with a default in
+scope on a live server. It ran on a play database made for the owner's
+click-through: the recipe's two-server fixture (90 nights, every test of
+one 8,000-test environment run twice a night, about 50 failing a night)
+shifted so the newest night is last night, with a default of 2 on that
+environment, a default of 3 on a second, twelve marks, and a third
+environment with no default as the control. Five runs were changed by
+hand and the times of the acts moved back, both listed in the database's
+README; nothing in the product was touched to make the data.
+
+What it found: no defect. All seven scopes by fourteen nights of the
+chart were recomputed from the runs with none of the product's code and
+agreed, before and after every act; each night's columns add up to its
+failed runs; the caption follows the scope ("by today's marks and
+environment default", "defaults", "by today's environment default",
+none on the control). Changing the default from 2 to 3 in the Admin
+page's editor re-judged the tiles, the Flaking tab and every night of
+the chart at once; removing it returned the chart to marks alone. A
+refused late part drew the totals with the amber "Not split" line. Every
+page's first paint with a default set answered 200 with no error. Each
+of What's new's four lines for this build is true of it; the section is
+still dated 2026-11-11, which the drop sets.
+
+Put to the owner, not defects: on a two-server environment the tiles say
+how many tests are flaking this morning (22) and the chart's last column
+how many failed runs were tolerated last night (52), because a test that
+failed on the first server and passed on the second is passing now and
+in no tab; the heading and the caption say runs, and the two figures
+will still be read side by side. Changing a default's cadence re-dates
+what counts as a promotion, as designed, so New failures and Newly fixed
+move with it.
+
+Not verified by anything in the build: a browser; plans on MariaDB 10.3
+for the two new statements (the per-day chart's read and Open Actions'
+keys statement).
