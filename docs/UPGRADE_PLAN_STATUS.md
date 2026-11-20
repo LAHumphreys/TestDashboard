@@ -5703,3 +5703,28 @@ Every item of the plan is now committed: 21 to 27. Not taken anywhere in
 the build: plans on MariaDB 10.3, which CI's jobs do not show (they check
 the answers). That is a hand `EXPLAIN` for the drop, on the two new
 statements: the per-day chart's read and Open Actions' keys statement.
+
+## The default flaky cadence, item 24: the build tab re-measured (2026-11-20)
+
+The re-measure item 24's commit promised (`performance-engineer`, the
+build head before item 24 against the committed item, cold, in-process,
+three arms, 24 calls, a quiet machine, the A/A arm within 1 ms). The
+per-day chart's late part on a build tab in the environment with the
+default, 14 days, now that a build's range starts at its first run, with
+the first pass's figure in brackets:
+
+| | SQLite 3.50 | a local MariaDB 12.3 |
+|---|---|---|
+| default 2, 50 failing a night | +22 ms (+37) | +39 (+70 to +74) |
+| default 2, 500 | +24 (+52) | +47 (+82 to +84) |
+| default 3, 50 | +24 (+38) | +62 (+95 to +107) |
+| default 3, 500 | +27 (+61) | +69 (+106) |
+
+Every row is under the cadence-3 figure of the bar (+85 on MariaDB),
+which has no build row of its own. On MariaDB the build's driving range
+reads 159,840 index entries where it read 334,240. Mainline did not
+move: unscoped at 500 failing with a default of 2, +587 ms on MariaDB
+against +583 to +600 before, and +126 on SQLite against +135 to +138,
+the SQL text unchanged. The nights equal the oracle with no mismatch at
+50 and 500, at 2, at 3 and with two environments, at 14 and 90 days, on
+mainline and on the build.
