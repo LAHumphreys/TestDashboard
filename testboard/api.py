@@ -56,6 +56,8 @@ from testboard.storage import (
     FLAKY_CADENCE_MAX,
     FLAKY_CADENCE_MIN,
     FLAKY_ROLE_FLAKING,
+    FLAKY_SOURCE_DEFAULT,
+    FLAKY_SOURCE_MARK,
     FLAKING_QUEUE,
     MAINLINE_STREAM_ID,
     QUEUE_KINDS,
@@ -428,17 +430,24 @@ def _flaky_row_json(
     *shared* is the caller's per-response dict of the objects already
     built: a bulk act gives many rows the same mark fields and a page
     repeats a few states, so equal values are one object, built once,
-    serialized wherever it appears. Nothing mutates them."""
+    serialized wherever it appears. Nothing mutates them.
+
+    ``source`` (design flaky-default-r0 §1a, §2 B.3): ``"mark"``, or
+    ``"default"`` for a test judged by its environment's default, whose
+    ``cadence``, ``marked_by``, ``marked_at`` and ``reason`` are then the
+    default's (its last act's user and time). A row carries a default's
+    only where its result is FAIL."""
     if flaky is None:
         return None
     state = flaky.state
     key = (flaky.mark.cadence, flaky.mark.marked_by, flaky.mark.marked_at,
-           flaky.mark.reason, state)
+           flaky.mark.reason, state, flaky.source)
     if shared is not None:
         found = shared.get(key)
         if found is not None:
             return found
     built = {
+        "source": flaky.source,
         "cadence": flaky.mark.cadence,
         "marked_by": flaky.mark.marked_by,
         "marked_at": model.format_iso(flaky.mark.marked_at),
@@ -1127,14 +1136,20 @@ def _handle_dashboard(
     # product-aware endpoint reads from environment_products. WP-44
     # item 6: read FIRST, because the "any mark" bit rides it as one
     # UNION ALL row, and the rows join the marks only when one exists.
-    env_to_product, marked = storage.environment_products_and_marks()
+    # Migration 13: the "any default" bit rides it too, and the defaults
+    # map (one statement, memoized) is read only where it says one
+    # exists (design flaky-default-r0 §2 B.1).
+    env_to_product, marked, defaulted = (
+        storage.environment_products_and_bits())
+    defaults = storage.flaky_defaults_map() if defaulted else {}
     # WP-44 item 8: the page and its total in one call, because where a
     # read leaves flaking tests out by the keys form (Open Actions on
     # SQLite), one statement answers both.
     rows, total = storage.dashboard_page(
         sort=sort, descending=(order == "desc"), limit=limit,
         offset=offset, with_latest_comment=with_comment,
-        with_flaky=marked, floor=parsed.floor, **filters
+        with_flaky=marked, floor=parsed.floor, flaky_defaults=defaults,
+        **filters
     )
     flaky_shared = {}  # type: Dict[Tuple[Any, ...], Dict[str, Any]]
     payload = [
@@ -1343,15 +1358,20 @@ def _summary_queue_json(
     now_value: Optional[datetime.datetime] = None,
     marks: Optional[bool] = None,
     floor: Optional[datetime.datetime] = None,
+    flaky_defaults: Optional[Dict[str, FlakyDefault]] = None,
 ) -> Dict[str, Any]:
     """Serialize one triage queue: exact total plus capped, enriched entries.
+
+    Migration 13: *flaky_defaults* is the defaults map beside *marks*
+    when the caller has the bits (the full payload, from its headline's
+    mute epoch); the single-queue path takes both from its count.
 
     WP-44 item 6: *marks* is the "any mark" bit when the caller has it
     (the full payload, from the mute epoch its headline read). Without
     it — the single-queue ``parts=queue`` path — the count is read FIRST
-    and carries the bit (:meth:`Storage.status_queue_count_and_marks`),
-    so the rows know whether to join the marks at no statement of the
-    bit's own. *floor* is a build stream's first run, bounding the
+    and carries both bits (:meth:`Storage.status_queue_count_and_bits`),
+    so the rows know whether to join the marks and judge a default at no
+    statement of the bits' own. *floor* is a build stream's first run, bounding the
     marked tests' runs read (None on mainline).
 
     *kind* is any storage queue kind, or ``"mine"`` — the assignee's
@@ -1409,18 +1429,21 @@ def _summary_queue_json(
     if queue_counts is not None:
         total = queue_counts[kind]
     else:
-        total, counted_marks = storage.status_queue_count_and_marks(
-            storage_kind, environment, assignee=queue_assignee,
-            stale_before=recent_cutoff, environments=environments,
-            stream_id=stream_id, now=now_value, floor=floor,
-        )
+        total, counted_marks, counted_defaults = (
+            storage.status_queue_count_and_bits(
+                storage_kind, environment, assignee=queue_assignee,
+                stale_before=recent_cutoff, environments=environments,
+                stream_id=stream_id, now=now_value, floor=floor,
+            ))
         if marks is None:
             marks = counted_marks
+            flaky_defaults = counted_defaults
     rows = storage.status_queue(
         storage_kind, environment, limit=_SUMMARY_QUEUE_CAP,
         assignee=queue_assignee, stale_before=recent_cutoff,
         with_latest_comment=True, environments=environments,
         stream_id=stream_id, now=now_value, marks=marks, floor=floor,
+        flaky_defaults=flaky_defaults,
     )
     if with_streaks:
         needed = [
@@ -1995,6 +2018,18 @@ def _handle_summary(
     )
     flaky_counted = (
         [] if flaky is None else flaky.counted)  # type: List[FlakyCount]
+    # Migration 13 (design flaky-default-r0 §2 B.3, P3): the bits the
+    # view has just read from the mute epoch's entry, and the defaults
+    # map it read where a default exists: no statement here.
+    flaky_marked, flaky_defaulted = storage.flaky_bits(stream_id, current)
+    flaky_defaults = (
+        storage.flaky_defaults_map() if flaky_defaulted
+        else {})  # type: Dict[str, FlakyDefault]
+    # ``status.flaky_defaults``: the environments in scope with a default
+    # and a run on the stream, from the cells the headline has read.
+    defaults_in_scope = len(
+        set(cell.environment for cell in estate_rollup)
+        & set(flaky_defaults)) if flaky_defaults else 0
     estate = analytics.summarize_rollup(
         estate_rollup,
         storage.assigned_open_count(
@@ -2180,6 +2215,13 @@ def _handle_summary(
                 "flaking_new_failures": status.flaking_new_failures,
                 "flaking_still_failing": status.flaking_still_failing,
                 "flaky_total": status.flaky_total,
+                # Migration 13: how many environments in scope carry a
+                # default flaky cadence and have run on the stream.
+                # ``flaky_total`` above still counts marks alone; where
+                # this is above zero the flaking figures, the FLAKING
+                # filter and the charts' flaking series apply the
+                # default too.
+                "flaky_defaults": defaults_in_scope,
                 # WP-44 item 20: ``not_run`` above EXCLUDES the tests
                 # under a live mute that have not run since
                 # ``stale_before``; this is how many it left out, never
@@ -2255,14 +2297,15 @@ def _handle_summary(
     # runs measured +14-19 ms cold there on the production-scale seed.
     # parts=assigned_trend only.
     streaks = {}  # type: Dict[Tuple[str, str, str], FailureStreak]
-    # WP-44 item 6: the bit the headline read with the mute epoch.
-    marked = flaky is not None
+    # WP-44 item 6: the bit the headline read with the mute epoch, and
+    # (migration 13) the defaults map beside it.
     queues = {
         kind: _summary_queue_json(
             storage, kind, environment, None, recent_cutoff, streaks,
             environments=environments, env_to_product=env_to_product,
             stream_id=stream_id, queue_counts=queue_totals,
-            now_value=current, marks=marked, floor=floor,
+            now_value=current, marks=flaky_marked, floor=floor,
+            flaky_defaults=flaky_defaults,
         )
         for kind in QUEUE_KINDS
     }
@@ -2270,7 +2313,8 @@ def _handle_summary(
         storage, "mine", environment, assignee, recent_cutoff, streaks,
         environments=environments, env_to_product=env_to_product,
         stream_id=stream_id, queue_counts=queue_totals,
-        now_value=current, marks=marked, floor=floor,
+        now_value=current, marks=flaky_marked, floor=floor,
+        flaky_defaults=flaky_defaults,
     )
     payload["queues"] = queues
     return _json_response(200, payload)
@@ -2360,7 +2404,8 @@ def _handle_test_detail(
             # with its state on THIS stream, and every act on it, newest
             # first, so opening the history fetches nothing.
             "flaky": _flaky_detail_json(
-                storage, acts.flaky_mark, stream, latest, runs),
+                storage, acts.flaky_mark, stream, latest, runs,
+                acts.flaky_default),
             "flaky_history": [
                 {
                     "id": act.id,
@@ -2382,9 +2427,18 @@ def _flaky_detail_json(
     stream: Optional[Stream],
     latest: StoredRun,
     runs: Sequence[StoredRun],
+    default: Optional[FlakyDefault] = None,
 ) -> Optional[Dict[str, Any]]:
     """The test detail's ``flaky``: the mark and its state on the
     detail's stream (WP-44), or None for a test with no mark.
+
+    Migration 13 (design flaky-default-r0 §2 B.3, decision 12): a test
+    with no mark in an environment with a *default* is judged by it, in
+    every state (a list row carries a default's only where it fails):
+    ``source`` ``"default"``, and the default's cadence, reason and last
+    act's user and time as ``marked_by`` and ``marked_at``. A mark wins
+    whole (``source`` ``"mark"``). Its state is read as a mark's is, from
+    the same window, at no statement more while that window decides it.
 
     The state needs the stream's newest N results. The detail already
     holds its analytics window (*runs*: this stream's runs of the test
@@ -2397,8 +2451,16 @@ def _flaky_detail_json(
     build's first run. *stream* is None on mainline, as the detail
     holds it.
     """
+    source = FLAKY_SOURCE_MARK
     if mark is None:
-        return None
+        if default is None:
+            return None
+        mark = FlakyMark(
+            environment=latest.environment, script=latest.script,
+            test_name=latest.test_name, cadence=default.cadence,
+            reason=default.reason, marked_by=default.set_by,
+            marked_at=default.set_at)
+        source = FLAKY_SOURCE_DEFAULT
     cadence = mark.cadence
     results = [run.result for run in runs]
     if (len(results) < cadence
@@ -2415,6 +2477,7 @@ def _flaky_detail_json(
         )[(mark.environment, mark.script, mark.test_name)]
     state = analytics.flaky_state(cadence, results)
     return {
+        "source": source,
         "cadence": cadence,
         "marked_by": mark.marked_by,
         "marked_at": model.format_iso(mark.marked_at),

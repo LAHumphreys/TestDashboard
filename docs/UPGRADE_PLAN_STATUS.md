@@ -5591,3 +5591,46 @@ confirm seem fine to me".
 Read as: the first two are confirmed as built and need nothing more.
 The third is accepted as left for this drop; it stays on the handover's
 list as a known gap in the mark's write path, not as a question.
+
+## The default flaky cadence, item 23: the default judged (2026-11-20)
+
+Every read that judges a mark now judges an environment's default for
+the tests in it with no mark of their own: tiles, queues and badges,
+browse and its filters, Open Actions, Watch, the test's page. Built in
+the cheaper shape the design's measured pass chose (the third run riding
+the existing members at a default of 2, rows paths reading no promotion,
+"flaking by default" as a condition on the latest-run rows). The per-day
+chart's late part is item 24. The commit message has the rule, the shape,
+the table against the bar and the tests.
+
+The measured pass (`performance-engineer`, the recipe's latest-50 and
+latest-500 fixtures, cold, three arms, a quiet machine, SQLite ; a local
+MariaDB 12.3): inside the bar on every row but one. Home's headline with
+a default of 2 reads +2.8 ; +5.8 ms at 50 failing and +11.8 to +12.7 ;
++17.3 to +18.1 at 500, against +7 to +10 ; +6 and +29 to +31 ; +19 to
++33. With no default the statement counts are equal on all 24 reads, with
+and without marks; the push path runs the same statements; every Known
+slow row reads "same". A default of 3 at 500 costs the headline +30.2 ;
++45.8, inside what decision 4 accepted; the list reads at 3 cost +15 to
++44, which the design had not priced, and a cheaper shape for them is
+named and not built.
+
+The one regression: Open Actions' rows on MariaDB at 50 failing, +12.3 ms
+on a 57 ms base against "level", the count having left its covering
+index for a scan. Fixed by reading Open Actions by keys where a default
+is in scope, the form SQLite already took; by the implementer's figures
+the two statements are now below the base at 50 and +5.5 ms at 500. The
+performance engineer's re-measure of the whole request is taken with
+item 24's pass.
+
+Review, three times: the item (fresh eyes probed it from outside the
+tests and found the rule right), then the round of tests and dead code
+it asked for, then the fix. The last found tracked text that cited the
+review and an untracked ledger; reworded before the commit.
+
+Put to the owner: unmarking a test under a default can make that
+night's run a New failure, kept as built and pinned (the design's
+"unmarking returns it to the default"); a held answer for a defaulted
+test at a cadence of 3 or more is not dropped when another process
+writes the database, where the minute's expiry used to bound it.
+Not taken: plans on MariaDB 10.3 and SQLite 3.26, which CI's jobs run.

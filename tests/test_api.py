@@ -18,6 +18,7 @@ Covers, per the build-spec checklist:
 """
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -25,7 +26,9 @@ import re
 import sqlite3
 import unittest
 import urllib.parse
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    Any, Dict, List, Optional, Sequence, Set, Tuple, Union,
+)
 
 from testboard import api
 from testboard.model import format_iso
@@ -7898,8 +7901,10 @@ class FlakyApiTest(ApiCase):
     STILL = ("linux-sim", "suite/alpha.py", "test_still_fail")
     NEW = ("linux-sim", "suite/alpha.py", "test_new_fail")
     FIXED = ("linux-sim", "suite/alpha.py", "test_fixed")
-    FLAKY_KEYS = {"cadence", "marked_by", "marked_at", "reason", "state",
-                  "streak", "runs"}
+    #: Migration 13 widens the shape by ``source`` ("mark" here; a
+    #: default's reads "default"): flaky-default-r0 §1a.
+    FLAKY_KEYS = {"source", "cadence", "marked_by", "marked_at", "reason",
+                  "state", "streak", "runs"}
     HISTORY_KEYS = {"id", "action", "cadence", "reason", "actor",
                     "acted_at"}
 
@@ -7981,7 +7986,7 @@ class FlakyApiTest(ApiCase):
         # F F F (P): at 3 every one of the newest three failed.
         self.assertEqual(
             data["flaky"],
-            {"cadence": 3, "marked_by": "alice",
+            {"source": "mark", "cadence": 3, "marked_by": "alice",
              "marked_at": format_iso(NOW), "reason": "race in teardown",
              "state": "failing", "streak": 3, "runs": 3})
         history = data["flaky_history"]
@@ -8234,7 +8239,19 @@ class NoMarksAddsNothingTest(ApiCase):
     #: UNION ALL row on /api/dashboard's environment-products read, and
     #: one on the names part's products read (with the column it needs
     #: and ORDER BY 1, mapped back to the base's text).
+    #:
+    #: Migration 13 (flaky-default-r0 §2 B.1, §3a) widens it by the
+    #: "any default" bit, one more primary-key MIN on the same four
+    #: carriers, taken out first: a column on the mute epoch's read and
+    #: on the queue part's count, one UNION ALL row on /api/dashboard's
+    #: products read (the defaults' MIN with no product) and one on the
+    #: names part's.
     CARRIERS = (
+        (", (SELECT MIN(environment) FROM environment_flaky_defaults)", ""),
+        (" UNION ALL SELECT MIN(environment), NULL "
+         "FROM environment_flaky_defaults", ""),
+        (" UNION ALL SELECT NULL, MIN(environment) "
+         "FROM environment_flaky_defaults", ""),
         (", (SELECT MIN(environment) FROM test_flaky_marks)", ""),
         (" UNION ALL SELECT NULL, MIN(environment) FROM test_flaky_marks "
          "ORDER BY 1", " ORDER BY product"),
@@ -8343,14 +8360,19 @@ class NoMarksAddsNothingTest(ApiCase):
                 continue
             self.assertEqual(carrying, [], name)
             # The detail: its one acts read, the mute history first and
-            # the mark's two tables only as UNION ALL members of it.
+            # the mark's two tables only as UNION ALL members of it, and
+            # (migration 13) the environment's default as a fourth,
+            # read by the defaults' primary key.
             self.assertEqual(len(touching), 1, (name, touching))
             members = touching[0].split(" UNION ALL ")
-            self.assertEqual(len(members), 3, touching)
+            self.assertEqual(len(members), 4, touching)
             self.assertIn("FROM mute_history WHERE", members[0])
             self.assertNotIn("flaky", members[0].lower())
             self.assertIn("FROM flaky_mark_history WHERE", members[1])
             self.assertIn("FROM test_flaky_marks WHERE", members[2])
+            self.assertIn(
+                "FROM environment_flaky_defaults WHERE environment = ",
+                members[3])
             self.assertEqual(cold[-1], touching[0], name)
 
     def test_no_statement_joins_or_counts_the_marks(self) -> None:
@@ -8406,39 +8428,228 @@ class NoMarksAddsNothingTest(ApiCase):
             self.call("GET", self.DETAIL, query=build)["flaky"]["state"],
             "failing")
 
-    def test_a_default_is_read_by_no_first_paint_read(self) -> None:
-        """Design flaky-default-r0 item 22: an environment's default is
-        kept and shown, and nothing judges it yet. With a default of 2
-        (and its history) on linux-sim, every read above runs exactly
-        the statements it ran without one, cold, byte for byte, and none
-        of them names the default's tables. Item 23 is where this
-        changes, by design."""
-        before = {name: self._cold_selects(path, query)
-                  for name, path, query in self._reads()}
+    #: Migration 13: the detail's fourth member, the environment's
+    #: default by its key, taken out with the carriers for the digest.
+    DETAIL_RIDER = (
+        " UNION ALL SELECT 3, NULL, NULL, NULL, reason, cadence_at, "
+        "cadence, set_by, set_at FROM environment_flaky_defaults "
+        "WHERE environment = ?")
+
+    #: Migration 13 (flaky-default-r0 §0 "Done means", §3a): every read's
+    #: cold SELECTs as executed (placeholders, not the trace's values),
+    #: the carriers and the detail's rider taken out, as the first
+    #: sixteen hex digits of their SHA-1. Taken at b0a0611, the base
+    #: before any read judged a default, and here, by the same method on
+    #: this fixture: equal for every read. With no default the
+    #: statements are the base's by count and by text, the riders the
+    #: only change.
+    BASE_BARE_SQL = {
+        "headline": "3862902df604baf5", "full": "aba5cb2995164a2a",
+        "browse": "7f174103975e28ba", "open_actions": "5c3419d394e9bbb3",
+        "watch": "83c1af46a20c2975", "detail": "6c68d6b49beaa19e",
+        "detail_build": "8a598bf68a493897", "names": "c47aae065b57f5f7",
+        "assigned_trend": "0bb18651229bb914",
+        "browse_fail": "08f0348a3ec10aef",
+        "browse_fail_flaking": "08f0348a3ec10aef",
+        "browse_flaking": "4eb48ec2d84744bb",
+        "open_actions_failing": "ae25dc05c3a3a7f1",
+        "assigned_trend_90": "0bb18651229bb914",
+        "queue_new_failures": "b87340a23f097ffe",
+        "queue_still_failing": "0f9fa07823832d6e",
+        "queue_muted": "f368a5f387f0c5b7",
+        "queue_fixed": "34ad7d296bad9541",
+        "queue_unexpected_passes": "ee820f5e8b3746b4",
+        "queue_not_run": "5e9979c006185aa6",
+        "queue_assigned": "53c0745f09a02adf",
+        "queue_mine": "8789afa13beebd0e",
+        "queue_flaking": "f58d51af52bf62fc",
+    }
+
+    #: Migration 13: cold SELECTs per read with a default of 2 on
+    #: linux-sim and no mark anywhere. Each judging read is its no-default
+    #: count plus the map (one statement, memoized estate-wide) plus
+    #: what judges the default: Q1's and Qc's members (the headline, the
+    #: full payload, Watch, the three queues that move), Q1 on the lists
+    #: that leave flaking rows out, and the rows and count that FLAKING
+    #: alone now runs. The detail carries the default on its acts read
+    #: (its build reads one Q2, as a mark's does: one FAIL there, under
+    #: 2); names and the per-day chart's part read no default (the chart
+    #: is item 24's).
+    WITH_DEFAULT_COLD_SELECTS = {
+        "headline": 25, "full": 32, "browse": 4, "open_actions": 15,
+        "watch": 15, "detail": 5, "detail_build": 10, "names": 9,
+        "assigned_trend": 2,
+        "queue_new_failures": 11, "queue_still_failing": 11,
+        "queue_muted": 10, "queue_fixed": 11, "queue_unexpected_passes": 9,
+        "queue_not_run": 11, "queue_assigned": 9, "queue_mine": 12,
+        "queue_flaking": 10,
+        "browse_fail": 5, "browse_fail_flaking": 4, "browse_flaking": 5,
+        "open_actions_failing": 15, "assigned_trend_90": 2,
+    }
+
+    #: The reads that judge nothing by a default, so read no map.
+    NO_MAP = ("detail", "detail_build", "names", "assigned_trend",
+              "assigned_trend_90")
+
+    MAP_READ = ("SELECT environment, cadence, reason, set_by, set_at, "
+                "cadence_at FROM environment_flaky_defaults")
+
+    def _bare_sql(self, path: str, query: Dict[str, List[str]]
+                  ) -> List[str]:
+        """The cold read's SELECTs as executed, with their placeholders
+        (the instrument is the storage's connection, not the trace, so
+        no bound value or SQLite version shows), each with the carriers
+        and the detail's rider taken out."""
+        self.storage._invalidate_summary_cache()
+        self.storage._invalidate_trend_cache()
+        seen = []  # type: List[str]
+        store = self.storage
+        real = store._conn
+
+        class Spy(object):
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                seen.append(sql)
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, attr: str) -> Any:
+                return getattr(self._conn, attr)
+
+        store._conn = lambda: Spy(real())  # type: ignore
+        try:
+            self.call("GET", path, query=query)
+        finally:
+            del store._conn  # type: ignore
+        return [self._bare(" ".join(s.split())).replace(
+                    self.DETAIL_RIDER, "")
+                for s in seen if s.strip().upper().startswith("SELECT")]
+
+    @staticmethod
+    def _digest(statements: Sequence[str]) -> str:
+        return hashlib.sha1(
+            "\n".join(statements).encode("utf-8")).hexdigest()[:16]
+
+    def test_with_no_default_the_text_is_the_bases(self) -> None:
+        """No mark and no default: every read's SQL, carriers out, is the
+        base's text exactly (§0 "Done means")."""
+        self.assertEqual(sorted(self.BASE_BARE_SQL),
+                         sorted(self.BASE_COLD_SELECTS))
+        for name, path, query in self._reads():
+            self.assertEqual(self._digest(self._bare_sql(path, query)),
+                             self.BASE_BARE_SQL[name], name)
+
+    def _set_default(self) -> None:
+        self.storage.ensure_user("bob", datetime.datetime(2026, 7, 1))
         self.call("PUT", "/api/environments/linux-sim/flaky-default",
                   body={"username": "bob", "cadence": 3, "reason": "r1"})
         self.call("PUT", "/api/environments/linux-sim/flaky-default",
                   body={"username": "bob", "cadence": 2, "reason": "r2"})
+
+    def test_a_default_reads_the_map_and_what_judges_it(self) -> None:
+        """With a default of 2 (and its history) on linux-sim, each read's
+        cold cost is pinned; the map is read once by every read that
+        judges and by no other; nothing names the defaults' tables but
+        the map, the riders and the detail's member; warm, the map is
+        not read again."""
+        self._set_default()
+        self.assertEqual(sorted(self.WITH_DEFAULT_COLD_SELECTS),
+                         sorted(self.BASE_COLD_SELECTS))
         for name, path, query in self._reads():
             cold = self._cold_selects(path, query)
-            self.assertEqual(cold, before[name], name)
-            self.assertEqual(len(cold), self.BASE_COLD_SELECTS[name], name)
+            self.assertEqual(len(cold), self.WITH_DEFAULT_COLD_SELECTS[name],
+                             (name, cold))
+            maps = [s for s in cold if s.startswith(self.MAP_READ)]
+            self.assertEqual(len(maps), 0 if name in self.NO_MAP else 1,
+                             (name, cold))
             for statement in cold:
-                self.assertNotIn("flaky_default", statement, name)
-                self.assertNotIn("environment_flaky_defaults", statement,
+                if statement in maps:
+                    continue
+                bare = self._bare(statement)
+                if name.startswith("detail") and "UNION ALL SELECT 3," in bare:
+                    continue
+                self.assertNotIn("environment_flaky_defaults", bare, name)
+            self.call("GET", path, query=query)
+            seen = []  # type: List[str]
+            conn = self.storage._conn()
+            _trace_sql_into(conn, seen)
+            try:
+                self.call("GET", path, query=query)
+            finally:
+                conn.set_trace_callback(None)
+            self.assertFalse(
+                [s for s in seen if " ".join(s.split()).startswith(
+                    self.MAP_READ)], name)
+
+    def test_with_a_default_no_count_joins_a_flaky_table(self) -> None:
+        """The count-join guard with a default: the F predicate and the
+        bits ride counts, which name no flaky table but by a rider and
+        join nothing their WHERE does not read."""
+        self._set_default()
+        for name, path, query in self._reads():
+            for statement in self._cold_selects(path, query):
+                upper = statement.upper()
+                self.assertNotIn("JOIN TEST_FLAKY_MARKS", upper, name)
+                self.assertNotIn("JOIN ENVIRONMENT_FLAKY_DEFAULTS", upper,
                                  name)
+                if "COUNT(" in upper:
+                    self.assertNotIn(
+                        "FLAKY", self._bare(statement).upper(), name)
 
 
-class DefaultJudgesNothingYetTest(ApiCase):
-    """Design flaky-default-r0 item 22, on both backends: a default is
-    kept and shown and judges nothing yet. With a default of 2 on
-    linux-sim (whose tests fail after a pass, fail after a fail, and are
-    fixed), every first-paint read answers byte for byte as it did
-    without one; no payload carries ``status.flaky_defaults`` or a
-    ``flaky.source``, which are item 23's. ``NoMarksAddsNothingTest``'s
-    reads, its fixture and its statement guard (SQLite) pin the cost."""
+class MarksNoDefaultAddsNothingTest(ApiCase):
+    """The marks twin of NoMarksAddsNothingTest (flaky-default-r0 §2 B.8,
+    §3a): with marks and no default anywhere, every read's cold SQL, the
+    default's riders taken out, is the base's (b0a0611) by count and by
+    text, measured by the same method on this fixture (NoMarksAddsNothing
+    Test's, with three marks); no statement names the defaults' tables
+    but a rider and the detail's member. SQLite's instrument, as its
+    twin's."""
+
+    MARKS = (
+        (3, [("linux-sim", "suite/alpha.py", "test_new_fail")]),
+        (2, [("linux-sim", "suite/alpha.py", "test_fixed"),
+             ("env2", "smoke.py", "test_first")]),
+    )
+
+    COLD_SELECTS = {
+        "headline": 25, "full": 32, "browse": 3, "open_actions": 14,
+        "watch": 15, "detail": 5, "detail_build": 9, "names": 9,
+        "assigned_trend": 4,
+        "queue_new_failures": 10, "queue_still_failing": 10,
+        "queue_muted": 9, "queue_fixed": 11, "queue_unexpected_passes": 8,
+        "queue_not_run": 10, "queue_assigned": 8, "queue_mine": 11,
+        "queue_flaking": 9,
+        "browse_fail": 4, "browse_fail_flaking": 3, "browse_flaking": 4,
+        "open_actions_failing": 14, "assigned_trend_90": 4,
+    }
+
+    BASE_BARE_SQL = {
+        "headline": "d82f7f3f3b5b6744", "full": "86c71c5817707fd9",
+        "browse": "705168651aa1e6cb", "open_actions": "ee3026dadc4b3679",
+        "watch": "e529712448b819d5", "detail": "6c68d6b49beaa19e",
+        "detail_build": "8a598bf68a493897", "names": "c47aae065b57f5f7",
+        "assigned_trend": "bdee31bee908c951",
+        "browse_fail": "ce7e19ca79646fd5",
+        "browse_fail_flaking": "624a8254cef13a96",
+        "browse_flaking": "08bbe12ac9280cd9",
+        "open_actions_failing": "eff3995f1a996608",
+        "assigned_trend_90": "bdee31bee908c951",
+        "queue_new_failures": "0fbdc9088dded272",
+        "queue_still_failing": "7b189e888ed9bce5",
+        "queue_muted": "575329a5a912f1b2",
+        "queue_fixed": "d6f42ea342cbbe27",
+        "queue_unexpected_passes": "297e319ad277b3c2",
+        "queue_not_run": "b0b0df8a13f8c444",
+        "queue_assigned": "feb6b0cbf1a9266a",
+        "queue_mine": "75f97e6423480d4b",
+        "queue_flaking": "67b0bc3039b2d264",
+    }
 
     DETAIL = NoMarksAddsNothingTest.DETAIL
+    CARRIERS = NoMarksAddsNothingTest.CARRIERS
+    DETAIL_RIDER = NoMarksAddsNothingTest.DETAIL_RIDER
 
     def setUp(self) -> None:
         super().setUp()
@@ -8453,7 +8664,71 @@ class DefaultJudgesNothingYetTest(ApiCase):
         self.call("PUT", test_path("linux-sim", "suite/alpha.py",
                                    "test_new_fail", "/assignee"),
                   body={"username": "alice", "assigned_by": "bob"})
+        self.call("POST", "/api/mutes/bulk", body={
+            "username": "bob", "reason": "infra", "hours": 24,
+            "assignee": "carol",
+            "tests": [{"environment": "linux-sim",
+                       "script": "suite/alpha.py",
+                       "test_name": "test_still_fail"}]})
         self.build = self.storage.list_streams("")[0].stream_id
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+        for cadence, tests in self.MARKS:
+            self.call("POST", "/api/flaky/bulk", body={
+                "username": "dev1", "reason": "why", "cadence": cadence,
+                "tests": [{"environment": e, "script": s, "test_name": t}
+                          for e, s, t in tests]})
+
+    def test_with_marks_and_no_default_the_text_is_the_bases(self) -> None:
+        reads = NoMarksAddsNothingTest._reads(self)  # type: ignore
+        self.assertEqual(sorted(name for name, _p, _q in reads),
+                         sorted(self.BASE_BARE_SQL))
+        for name, path, query in reads:
+            bare = NoMarksAddsNothingTest._bare_sql(  # type: ignore
+                self, path, query)
+            self.assertEqual(len(bare), self.COLD_SELECTS[name], name)
+            self.assertEqual(NoMarksAddsNothingTest._digest(bare),
+                             self.BASE_BARE_SQL[name], name)
+            for statement in bare:
+                self.assertNotIn("environment_flaky_defaults", statement,
+                                 name)
+
+    def _bare(self, statement: str) -> str:
+        return NoMarksAddsNothingTest._bare(self, statement)  # type: ignore
+
+
+class DefaultJudgedApiTest(ApiCase):
+    """Design flaky-default-r0 §1a and §2 B.3, on both backends: with a
+    default of 2 on
+    linux-sim, every surface judges it. test_new_fail (a FAIL after a
+    pass) is flaking by default; test_still_fail (four nights, three
+    FAILs) is failing and Still failing; test_fixed passes and carries
+    no default on its row, but its own page does; env2 has none. The
+    payloads (§1a, §2 B.3): ``flaky.source``, ``status.flaky_defaults``,
+    ``flaky_total`` unchanged, the names part's bit; removing the default
+    answers every read as before it, byte for byte."""
+
+    DETAIL = NoMarksAddsNothingTest.DETAIL
+
+    def setUp(self) -> None:
+        super().setUp()
+        TestSummary.seed(self)  # type: ignore
+        self.import_runs([
+            record(test_name="test_still_fail", result="FAIL", build="b1",
+                   start_time="2026-07-26T05:00:00.000000",
+                   end_time="2026-07-26T06:00:00.000000"),
+        ])
+        self.call("PUT", "/api/environments/linux-sim/product",
+                  body={"product": "Atlas", "username": "amy"})
+        self.call("PUT", test_path("linux-sim", "suite/alpha.py",
+                                   "test_fixed", "/assignee"),
+                  body={"username": "alice", "assigned_by": "bob"})
+        self.build = self.storage.list_streams("")[0].stream_id
+
+    def _put(self, cadence: Optional[int], reason: str = "two servers"
+             ) -> Dict[str, Any]:
+        return self.call(
+            "PUT", "/api/environments/linux-sim/flaky-default",
+            body={"username": "bob", "cadence": cadence, "reason": reason})
 
     def _answers(self) -> Dict[str, Any]:
         answers = {}  # type: Dict[str, Any]
@@ -8464,28 +8739,110 @@ class DefaultJudgesNothingYetTest(ApiCase):
             answers[name] = self.call("GET", path, query=query)
         return answers
 
-    def _keys(self, value: Any, into: Set[str]) -> None:
-        if isinstance(value, dict):
-            for key, inner in value.items():
-                into.add(key)
-                self._keys(inner, into)
-        elif isinstance(value, list):
-            for inner in value:
-                self._keys(inner, into)
+    def _by_name(self, tests: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {entry["test_name"]: entry for entry in tests}
 
-    def test_every_answer_is_the_same_with_a_default(self) -> None:
+    def test_every_surface_judges_the_default(self) -> None:
+        self._put(2)
+        headline = self.call("GET", "/api/summary",
+                             query={"parts": ["headline"]})
+        status = headline["status"]
+        self.assertEqual(status["flaky_defaults"], 1)
+        self.assertEqual(status["flaky_total"], 0)
+        self.assertEqual(status["flaking"], 1)
+        self.assertEqual(status["flaking_new_failures"], 1)
+        self.assertEqual(status["flaking_still_failing"], 0)
+        new = self.call("GET", "/api/summary", query={
+            "parts": ["queue"], "queue": ["new_failures"]})["queue"]
+        self.assertEqual(sorted(self._by_name(new["tests"])),
+                         ["test_first"])
+        flaking = self.call("GET", "/api/summary", query={
+            "parts": ["queue"], "queue": ["flaking"]})["queue"]
+        self.assertEqual(flaking["total"], 1)
+        row = flaking["tests"][0]
+        self.assertEqual(row["test_name"], "test_new_fail")
+        self.assertEqual(row["flaky"], {
+            "source": "default", "cadence": 2, "marked_by": "bob",
+            "marked_at": row["flaky"]["marked_at"],
+            "reason": "two servers", "state": "flaking", "streak": 1,
+            "runs": None})
+        browse = self._by_name(self.call(
+            "GET", "/api/dashboard", query={"limit": ["250"]})["tests"])
+        self.assertEqual(browse["test_new_fail"]["flaky"]["source"],
+                         "default")
+        self.assertEqual(browse["test_still_fail"]["flaky"]["state"],
+                         "failing")
+        # A default rides FAIL rows only (decision 12), and only its
+        # environment's.
+        self.assertIsNone(browse["test_fixed"]["flaky"])
+        self.assertIsNone(browse["test_first"]["flaky"])
+        only = self.call("GET", "/api/dashboard", query={
+            "result": ["FLAKING"], "limit": ["250"]})
+        self.assertEqual([t["test_name"] for t in only["tests"]],
+                         ["test_new_fail"])
+        self.assertEqual(only["total"], 1)
+        failing = self.call("GET", "/api/dashboard", query={
+            "result": ["FAIL"], "limit": ["250"]})
+        self.assertEqual(sorted(t["test_name"] for t in failing["tests"]),
+                         ["test_first", "test_still_fail"])
+        # Open Actions leaves the unassigned flaking test out.
+        opened = self.call("GET", "/api/dashboard", query={
+            "open": ["1"], "limit": ["100"]})
+        self.assertNotIn("test_new_fail",
+                         [t["test_name"] for t in opened["tests"]])
+        names = self.call("GET", "/api/summary", query={"parts": ["names"]})
+        self.assertTrue(names["flaky_marks"])
+
+    def test_the_detail_carries_the_default_in_every_state(self) -> None:
+        self._put(2)
+        fixed = self.call(
+            "GET", test_path("linux-sim", "suite/alpha.py", "test_fixed"))
+        self.assertEqual(fixed["flaky"]["source"], "default")
+        self.assertEqual(fixed["flaky"]["state"], "passing")
+        self.assertEqual(fixed["flaky"]["streak"], 0)
+        self.assertEqual(fixed["flaky"]["cadence"], 2)
+        self.assertEqual(fixed["flaky_history"], [])
+        other = self.call(
+            "GET", test_path("env2", "smoke.py", "test_first"))
+        self.assertIsNone(other["flaky"])
+        still = self.call("GET", self.DETAIL)
+        self.assertEqual(
+            (still["flaky"]["source"], still["flaky"]["state"]),
+            ("default", "failing"))
+        # A mark wins whole.
+        self.storage.ensure_user("dev1", datetime.datetime(2026, 7, 1))
+        self.call("POST", "/api/flaky/bulk", body={
+            "username": "dev1", "reason": "own", "cadence": 4,
+            "tests": [{"environment": "linux-sim",
+                       "script": "suite/alpha.py",
+                       "test_name": "test_still_fail"}]})
+        marked = self.call("GET", self.DETAIL)["flaky"]
+        self.assertEqual(
+            (marked["source"], marked["cadence"], marked["state"]),
+            ("mark", 4, "flaking"))
+
+    def test_scope_counts_the_defaults_in_it(self) -> None:
+        self._put(2)
+        for query, expected in (
+                ({"product": ["Atlas"]}, 1),
+                ({"environment": ["env2"]}, 0),
+                ({"environment": ["linux-sim"]}, 1),
+                ({"stream": [str(self.build)]}, 1)):
+            query = dict(query, parts=["headline"])
+            self.assertEqual(
+                self.call("GET", "/api/summary", query=query)[
+                    "status"]["flaky_defaults"], expected, query)
+
+    def test_removal_answers_as_before(self) -> None:
         before = self._answers()
-        for cadence in (3, 2):
-            self.call("PUT", "/api/environments/linux-sim/flaky-default",
-                      body={"username": "bob", "cadence": cadence,
-                            "reason": "two servers"})
+        self._put(2)
+        judged = self._answers()
+        self.assertNotEqual(judged["headline"]["status"],
+                            before["headline"]["status"])
+        self._put(None, "trial over")
         after = self._answers()
         for name in sorted(before):
             self.assertEqual(after[name], before[name], name)
-            keys = set()  # type: Set[str]
-            self._keys(after[name], keys)
-            self.assertNotIn("flaky_defaults", keys, name)
-            self.assertNotIn("source", keys, name)
 
 
 class FlakyDefaultApiTest(ApiCase):
@@ -8898,7 +9255,7 @@ class FlakyBoardApiTest(ApiCase):
         self.assertEqual(promoted["prev_result"], "FAIL")
         self.assertEqual(
             promoted["flaky"],
-            {"cadence": 3, "marked_by": "dev1",
+            {"source": "mark", "cadence": 3, "marked_by": "dev1",
              "marked_at": "2026-07-20T00:00:00.000000",
              "reason": "known race", "state": "failing", "streak": 3,
              "runs": 3})
@@ -9192,7 +9549,7 @@ class FlakyBoardApiTest(ApiCase):
         self.assertEqual(data["queue"]["total"], 2)
         self.assertEqual(sorted(tests[0]), sorted(new["queue"]["tests"][0]))
         self.assertEqual(tests[0]["flaky"], {
-            "cadence": 3, "marked_by": "dev1",
+            "source": "mark", "cadence": 3, "marked_by": "dev1",
             "marked_at": "2026-07-20T00:00:00.000000",
             "reason": "known race", "state": "flaking", "streak": 2,
             "runs": None})

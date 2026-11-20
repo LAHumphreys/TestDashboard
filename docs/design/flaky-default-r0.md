@@ -1161,7 +1161,7 @@ says why:
 
 - [x] 21 the fixture for both bars
 - [x] 22 the default kept and recorded (migration 13)
-- [ ] 23 the default judged
+- [x] 23 the default judged
 - [ ] 24 the per-day chart's late part
 - [x] 25 the Admin page
 - [ ] 26 a row flaking by default

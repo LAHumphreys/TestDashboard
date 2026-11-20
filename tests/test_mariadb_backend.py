@@ -74,6 +74,19 @@ EXCLUDED_CLASSES = {
         "FlakyAgreesWithAnalyticsTest, PromotionTest and FixedRuleTest, "
         "with 101 marked tests in one environment (decision 22), and "
         "their plans by FlakyPlanTest.",
+    "MarksNoDefaultAddsNothingTest":
+        "counts and digests statements through sqlite3's connection and "
+        "trace (migration 13, NoMarksAddsNothingTest's marks twin): the "
+        "instrument is SQLite's. The values the reads return with marks "
+        "and no default are every other generated class's, which run "
+        "here.",
+    "DefaultStatementsTest":
+        "counts statements with sqlite3's set_trace_callback (migration "
+        "13, the default flaky cadence's cache guards): the instrument "
+        "is SQLite's. The values those reads return are compared on "
+        "MariaDB by DefaultEqualsMarksTest (the emulation as oracle), "
+        "DefaultPromotionTest, DefaultEdgesTest and DefaultQ2HeldTest, "
+        "and their plans by DefaultPlanTest.",
     "NotRunMutedStatementsTest":
         "counts and reads statements with sqlite3's set_trace_callback "
         "(WP-44 item 20): the instrument is SQLite's. The values those "
